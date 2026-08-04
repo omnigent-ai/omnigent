@@ -343,26 +343,12 @@ describe("BlockRenderer dispatch", () => {
         { kind: "text", itemId: "m1", text: "Done.", final: true },
       ];
 
-      it("snaps the row into view when the expanded trace won't fit", () => {
-        // Scroll anchoring keeps the answer below the fold stationary on
-        // expand, so the trace opens above the viewport — the row reads
-        // as off-screen and the click must correct the scroll.
-        render(
-          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-            <BlockRenderer items={settledItems()} sessionStatus="idle" />
-          </FileViewerContext.Provider>,
-        );
-        const row = screen.getByTestId("turn-worked-fold").firstElementChild as HTMLElement;
-        row.getBoundingClientRect = () =>
-          ({ top: -50, bottom: -28, left: 0, right: 0, height: 22, width: 0 }) as DOMRect;
-        fireEvent.click(screen.getByText("Worked"));
-        expect(scrollSpy).toHaveBeenCalledTimes(1);
-        expect(scrollSpy).toHaveBeenCalledWith({ block: "start" });
-      });
-
-      it("leaves the scroll alone when the row and trace already fit", () => {
-        // jsdom's zero-height layout always "fits" — the guard must
-        // decline to scroll rather than snapping on every expand.
+      it("snaps the row into view on a user expand", () => {
+        // Growing the trace never keeps the row put on its own: the
+        // stick-to-bottom scroller re-pins the bottom on the last turn,
+        // and native scroll anchoring pins the answer elsewhere. Every
+        // user expand snaps the row to the top so the trace reads from
+        // its beginning.
         render(
           <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
             <BlockRenderer items={settledItems()} sessionStatus="idle" />
@@ -370,7 +356,34 @@ describe("BlockRenderer dispatch", () => {
         );
         fireEvent.click(screen.getByText("Worked"));
         expect(screen.getByText("Called 1 tool")).toBeDefined();
-        expect(scrollSpy).not.toHaveBeenCalled();
+        expect(scrollSpy).toHaveBeenCalledTimes(1);
+        expect(scrollSpy).toHaveBeenCalledWith({ block: "start" });
+      });
+
+      it("parks the scroller's scroll anchoring for the expand animation", () => {
+        // Even a fits-on-screen expand grows the trace over the 200ms
+        // height animation; with anchoring live, the browser pins the
+        // answer below and glides the row off the top. The scroller
+        // must run with overflow-anchor: none for the hold window.
+        vi.useFakeTimers();
+        try {
+          render(
+            <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+              <div style={{ overflowY: "auto" }} data-testid="scroller">
+                <BlockRenderer items={settledItems()} sessionStatus="idle" />
+              </div>
+            </FileViewerContext.Provider>,
+          );
+          const scroller = screen.getByTestId("scroller");
+          fireEvent.click(screen.getByText("Worked"));
+          expect(scroller.style.overflowAnchor).toBe("none");
+          act(() => {
+            vi.advanceTimersByTime(400);
+          });
+          expect(scroller.style.overflowAnchor).toBe("");
+        } finally {
+          vi.useRealTimers();
+        }
       });
 
       it("never scrolls on the animateCollapse mount-close cycle", async () => {

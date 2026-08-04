@@ -320,6 +320,12 @@ const FOLD_SETTLE_DEBOUNCE_MS = 500;
 const RECENT_ACTIVITY_WINDOW_S = 15;
 const FOLD_RECENT_MOUNT_DEBOUNCE_MS = 3_000;
 
+// How long a user-initiated fold expand parks the scroller's scroll
+// anchoring. Covers the 200ms `turn-fold-expand` height animation (see
+// index.css) with slack — anchoring would otherwise pin the answer
+// below the fold and glide the growing trace off the top.
+const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
+
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
@@ -678,13 +684,16 @@ function TurnWorkedFold({
   }, [animateCollapse]);
 
   // On a USER-initiated expand (never the animateCollapse mount-close),
-  // bring the start of the trace into view. Without this, the browser's
-  // scroll anchoring holds the answer BELOW the fold stationary while
-  // the trace expands above it, so the work opens off the top of the
-  // viewport and the click appears to do nothing. Runs before paint so
-  // the correction and the anchor adjustment land as one jump.
+  // snap the fold row to the top of the scroller so the trace reads
+  // from its beginning. Without this the growing trace doesn't stay
+  // put: viewing the LAST turn, the stick-to-bottom scroller treats the
+  // 200ms height animation as appended content and re-pins the bottom;
+  // elsewhere, native scroll anchoring pins the answer below — either
+  // way the row glides off the top and the click appears to do nothing.
+  // The upward snap doubles as a user-scroll signal that unpins
+  // stick-to-bottom; parking overflow-anchor covers the native case for
+  // the rest of the animation.
   const rowRef = useRef<HTMLDivElement | null>(null);
-  const contentRef = useRef<HTMLDivElement | null>(null);
   const scrollOnOpenRef = useRef(false);
   const handleOpenChange = (next: boolean) => {
     scrollOnOpenRef.current = next;
@@ -695,15 +704,16 @@ function TurnWorkedFold({
     scrollOnOpenRef.current = false;
     const row = rowRef.current;
     if (!row) return;
-    const scrollerRect = nearestScrollContainer(row)?.getBoundingClientRect();
-    const topLimit = scrollerRect?.top ?? 0;
-    const bottomLimit = scrollerRect?.bottom ?? window.innerHeight;
-    const rowRect = row.getBoundingClientRect();
-    const traceHeight = contentRef.current?.offsetHeight ?? 0;
-    // Fully visible row + trace needs no correction; otherwise snap the
-    // row to the top so the expanded work reads from its beginning.
-    if (rowRect.top >= topLimit && rowRect.bottom + traceHeight <= bottomLimit) return;
-    row.scrollIntoView({ block: "start" });
+    const scroller = nearestScrollContainer(row);
+    // The restore deliberately outlives the effect (no cleanup): the
+    // timer must fire even if the fold re-renders or unmounts mid-hold.
+    if (scroller) {
+      scroller.style.overflowAnchor = "none";
+      window.setTimeout(() => {
+        scroller.style.overflowAnchor = "";
+      }, FOLD_EXPAND_ANCHOR_HOLD_MS);
+    }
+    row.scrollIntoView?.({ block: "start" });
   }, [open]);
 
   return (
@@ -732,9 +742,7 @@ function TurnWorkedFold({
           this animation exists to remove. Expanded spacing comes from
           the row's hairline above and the message column's gap below. */}
       <CollapsibleContent className="turn-fold-content">
-        <div ref={contentRef} className="flex flex-col gap-2">
-          {children}
-        </div>
+        <div className="flex flex-col gap-2">{children}</div>
       </CollapsibleContent>
     </Collapsible>
   );
