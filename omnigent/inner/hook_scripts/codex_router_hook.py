@@ -107,6 +107,7 @@ def spawn_model_translator(
 
 def finalize_spawn_input(
     output: dict[str, Any] | None,  # type: ignore[explicit-any]  # hook output JSON
+    tool_input: dict[str, Any] | None = None,  # type: ignore[explicit-any]  # hook payload JSON
 ) -> dict[str, Any] | None:  # type: ignore[explicit-any]  # hook output JSON
     """
     Clamp the rewritten spawn's effort, then announce the routed model.
@@ -117,10 +118,14 @@ def finalize_spawn_input(
     approved. The notice comes second because a rewrite is otherwise
     invisible: codex reports no model change of its own, so the top-level
     ``systemMessage`` (alongside, not inside, ``hookSpecificOutput``) is the
-    only place the decision shows up.
+    only place the decision shows up. When the spawn named a model of its
+    own and the router picked another, the notice says so — otherwise the
+    parent reads its own ask back and never learns it was substituted.
 
     :param output: Hook output from ``decision_to_hook_output``, or
         ``None`` for "no opinion".
+    :param tool_input: The spawn's incoming ``tool_input``, whose ``model``
+        is the ask the routed model replaced.
     :returns: *output* with the effort clamped and a ``systemMessage``,
         when it rewrote the spawn's model; otherwise *output* unchanged.
     """
@@ -143,7 +148,24 @@ def finalize_spawn_input(
             "updatedInput": {**updated_input, "reasoning_effort": clamped},
         }
         output = {**output, "hookSpecificOutput": hook_output}
-    return {**output, "systemMessage": f"Using Smart Routing. Routing to {model}."}
+    return {**output, "systemMessage": _routing_notice(tool_input, model)}
+
+
+def _routing_notice(
+    tool_input: dict[str, Any] | None,  # type: ignore[explicit-any]  # hook payload JSON
+    model: str,
+) -> str:
+    """
+    Word the TUI notice for a rewritten spawn.
+
+    :param tool_input: The spawn's incoming ``tool_input``, when available.
+    :param model: The slug the spawn now runs on.
+    :returns: The ``systemMessage`` text.
+    """
+    asked = (tool_input or {}).get("model")
+    if isinstance(asked, str) and asked and asked != model:
+        return f"Using Smart Routing. Requested {asked}; routing to {model}."
+    return f"Using Smart Routing. Routing to {model}."
 
 
 def _payload_model(payload: dict[str, Any]) -> str | None:  # type: ignore[explicit-any]  # hook payloads are untrusted JSON
@@ -161,7 +183,9 @@ def _payload_model(payload: dict[str, Any]) -> str | None:  # type: ignore[expli
 #: name, its task-name keys, the ``message`` prompt key (delivered plaintext
 #: in hook payloads — measured, not encrypted as once assumed), its own
 #: spawn-model vocabulary, and the effort clamp plus TUI routing notice a
-#: rewrite needs.
+#: rewrite needs. ``requested_model_resolver_factory`` stays unset: codex
+#: spells the ask in slugs the server's bare-id comparison already lands, so
+#: the ask is forwarded verbatim.
 ROUTE_SEAMS: dict[str, Any] = {  # type: ignore[explicit-any]  # route_pre_tool_use seams
     "tool_matcher": is_spawn_agent_tool,
     "task_keys": ("task_name", "agent_name"),
@@ -169,6 +193,7 @@ ROUTE_SEAMS: dict[str, Any] = {  # type: ignore[explicit-any]  # route_pre_tool_
     "prompt_keys": ("message",),
     "parent_model_resolver": _payload_model,
     "model_translator_factory": spawn_model_translator,
+    "requested_model_resolver_factory": None,
     "post_process": finalize_spawn_input,
 }
 

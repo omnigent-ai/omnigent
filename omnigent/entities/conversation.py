@@ -556,9 +556,11 @@ class RoutingDecisionData(BaseModel):
     :param raw_model: The router-vocabulary pick before resolution to a
         servable catalog id, e.g. ``"gpt-5-6-sol"``. ``None`` when the
         pick needed no resolution.
-    :param attempted_override: Model an LLM-supplied ``args.model``
-        asked for and the router overrode, e.g.
-        ``"databricks-gpt-5-5"``. ``None`` when nothing was attempted.
+    :param attempted_override: Model the spawning agent asked for and the
+        router overrode, e.g. ``"databricks-gpt-5-5"`` — an LLM-supplied
+        ``args.model`` on a child session, or a native spawn's own
+        ``requested_model``. ``None`` when nothing was asked for, or when
+        the router's pick names the same arm as the ask.
     """
 
     model: str

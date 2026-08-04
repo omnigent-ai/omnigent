@@ -17,7 +17,7 @@ export interface RoutingDecisionExtras {
   decisionId?: string | null;
   /** Router-vocabulary pick before catalog resolution, e.g. `"gpt-5-6-sol"`. */
   rawModel?: string | null;
-  /** LLM-supplied `args.model` the router overrode, when there was one. */
+  /** Model the spawn asked for and the router overrode, when there was one. */
   attemptedOverride?: string | null;
 }
 

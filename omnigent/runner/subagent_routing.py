@@ -94,13 +94,12 @@ AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
 #: Task label scored for a codex spawn that carries no prompt and no
-#: task/agent name. Codex encrypts the spawn message, so such a spawn has
-#: nothing of its own to score; rather than skip the router and let it
-#: inherit the parent's — possibly expensive — model, route it on this
-#: placeholder so it lands on the router's floor arm. Mirrors ucode PR 251's
-#: ``default_task_label`` ("Codex subagent task"). Every unnamed spawn scores
-#: the same string, so they share one (floor) arm — a cheap default, not
-#: per-spawn intelligence.
+#: task/agent name. Such a spawn has nothing of its own to score; rather than
+#: skip the router and let it inherit the parent's — possibly expensive —
+#: model, route it on this placeholder so it lands on the router's floor arm.
+#: Mirrors ucode PR 251's ``default_task_label`` ("Codex subagent task").
+#: Every unnamed spawn scores the same string, so they share one (floor)
+#: arm — a cheap default, not per-spawn intelligence.
 _PLACEHOLDER_TASK = "Codex subagent task"
 #: Agent-authored, so bounded before it is stored or echoed anywhere.
 _TASK_NAME_CAP = 200
@@ -193,8 +192,9 @@ class SubagentRouteRequest:
     :param parent_model: Model the parent session runs on, e.g.
         ``"databricks-claude-sonnet-4-6"``.
     :param requested_model: Model the spawning agent explicitly asked for
-        in the spawn arguments, if any. Honored when it is among the
-        spawn's candidates; otherwise routed over and recorded as
+        in the spawn arguments, if any. Never bypasses the router: the
+        router always decides, the ask is called honored only when the
+        pick names the same arm, and a mismatch is recorded as
         ``attempted_override``.
     """
 
@@ -308,14 +308,14 @@ def decision_record(
     :returns: Item data ready for :func:`persist_subagent_decision`.
     """
     from omnigent.entities.conversation import RoutingDecisionData
-    from omnigent.server.smart_routing import _bare_id
 
-    model = decision.model or req.parent_model or "unrouted"
-    # An explicit ask that routing did NOT land is an override attempt worth
-    # recording; an honored ask is just the model and stays out of the field.
-    attempted = req.requested_model
-    if attempted and _bare_id(attempted) == _bare_id(model):
-        attempted = None
+    # No routed model means the verdict left ``tool_input`` alone, so the spawn
+    # runs on whatever it asked for and only then on the inherited model.
+    model = decision.model or req.requested_model or req.parent_model or "unrouted"
+    # An explicit ask the router did NOT land is an override attempt worth
+    # recording; an ask it happened to match is just the model, and stays out
+    # of the field.
+    attempted = None if _requested_match(req, model) else req.requested_model
     return RoutingDecisionData(
         model=model,
         applied=decision.action in ("rewrite", "redirect"),
@@ -602,15 +602,11 @@ async def _decide(
     if not candidates:
         return _unavailable_decision(f"no candidate models for harness {req.harness}")
 
-    # A spawn that names its own model made a deliberate choice; routing
-    # exists to pick for spawns that didn't. Honor the ask when it is an
-    # arm this spawn could have been routed to anyway — the candidate set
-    # already encodes the family policy — instead of overriding it with a
-    # scored default.
-    honored = _honored_request(req, candidates)
-    if honored is not None:
-        return honored
-
+    # An explicit ``requested_model`` never short-circuits this call: the
+    # router's pick is the verdict, and the ask only decides how the rationale
+    # words it. Fail-open still preserves the ask — a router outage returns an
+    # allow with no model, the hook leaves ``tool_input`` untouched, and the
+    # spawn runs on exactly the model it named.
     try:
         result = await client.route(task, candidates)
     except Exception:  # noqa: BLE001 — router outages are a normal path here
@@ -625,39 +621,40 @@ async def _decide(
     return _decision_from_result(req, result, candidates)
 
 
-def _honored_request(
-    req: SubagentRouteRequest,
-    candidates: Mapping[str, list[str]],
-) -> SubagentRouteDecision | None:
-    """Honor an explicitly requested model the spawn's own harness serves.
+def _requested_match(req: SubagentRouteRequest, model: str | None) -> bool:
+    """Report whether the spawn's explicit ask names the same arm as *model*.
 
     Matches on the bare arm so any spelling of the ask (catalog id, codex
-    slug, servable alias) lands the candidate set's servable spelling.
-    Only the requesting harness's own row counts: a rewrite runs in-place,
-    so honoring a counterpart-family arm would hand the spawn tool a model
-    it cannot speak. Everything else returns ``None`` — the router
-    decides, and the record carries the ask as ``attempted_override``.
+    slug, servable alias, ``[1m]`` variant) compares against the servable
+    id the verdict carries.
 
-    :param req: The spawn awaiting a verdict.
-    :param candidates: Harness → servable model ids this spawn may use.
-    :returns: A rewrite honoring the ask, or ``None`` to route normally.
+    :param req: The spawn that was routed.
+    :param model: The model the spawn will actually run on.
+    :returns: ``True`` when the spawn asked for that same arm.
     """
-    if not req.requested_model:
-        return None
+    if not req.requested_model or not model:
+        return False
     from omnigent.server.smart_routing import _bare_id
 
-    wanted = _bare_id(req.requested_model)
-    for model in candidates.get(req.harness, []):
-        if _bare_id(model) == wanted:
-            return SubagentRouteDecision(
-                action="rewrite",
-                model=model,
-                rationale=(
-                    f"Spawn requested {req.requested_model}; honored — "
-                    "it is a routable arm for this session."
-                ),
-            )
-    return None
+    return _bare_id(req.requested_model) == _bare_id(model)
+
+
+def _ask_note(req: SubagentRouteRequest, model: str) -> str:
+    """Say what became of the spawn's explicit model ask.
+
+    Appended after the router's own rationale, which stays first and intact.
+    "honored" is only ever claimed on a match — the router strictly decides,
+    so an ask is honored by coincidence, never by carve-out.
+
+    :param req: The spawn that was routed.
+    :param model: The model the router picked.
+    :returns: A sentence to append, or ``""`` when the spawn asked for nothing.
+    """
+    if not req.requested_model:
+        return ""
+    if _requested_match(req, model):
+        return f" Spawn requested {req.requested_model}; honored — the router picked the same arm."
+    return f" Spawn requested {req.requested_model}; overridden — the router picked {model}."
 
 
 def _decision_from_result(
@@ -691,24 +688,27 @@ def _decision_from_result(
                 family = _harness_family(harness_id)
                 break
     target = _target_harness(req.harness, picked_harness, family)
+    # The deny above carries no note: nothing spawned, so there is no ask to
+    # call honored or overridden.
+    note = _ask_note(req, model)
 
     if target == req.harness:
         if req.parent_model is not None and model == req.parent_model:
             return SubagentRouteDecision(
                 action="allow",
-                rationale=rationale or "Router kept the parent model",
+                rationale=(rationale or "Router kept the parent model") + note,
                 model=model,
                 raw_model=raw_model,
             )
         return SubagentRouteDecision(
             action="rewrite",
-            rationale=rationale or f"Router selected {model}",
+            rationale=(rationale or f"Router selected {model}") + note,
             model=model,
             raw_model=raw_model,
         )
     return SubagentRouteDecision(
         action="redirect",
-        rationale=rationale or f"Router selected {target}/{model}",
+        rationale=(rationale or f"Router selected {target}/{model}") + note,
         model=model,
         harness=target,
         raw_model=raw_model,

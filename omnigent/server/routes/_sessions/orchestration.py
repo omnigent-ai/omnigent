@@ -4518,11 +4518,17 @@ async def _forward_event_to_runner(
             _decision_scope = "child_session" if _parent_routing_on else "turn"
             if _turn_unapplied:
                 _verdict = _unapplied_routed_verdict(_routed_model, _verdict)
-            # The router wins over the orchestrator's own pick; the attempt
-            # is recorded so the UI can show what it overrode.
+            # The router wins over the orchestrator's own pick; the attempt is
+            # recorded so the UI can show what it overrode. Compared on the bare
+            # arm, so another spelling of the same model (a spawn's
+            # ``system.ai.glm-5-2`` against the router's ``databricks-glm-5-2``)
+            # is not reported as an override.
+            from omnigent.server.smart_routing import _bare_id as _bare_model_id
+
             _overridden = (
                 _attempted_override
-                if _attempted_override is not None and _attempted_override != _routed_model
+                if _attempted_override is not None
+                and _bare_model_id(_attempted_override) != _bare_model_id(_routed_model)
                 else None
             )
             _decision_id = await _emit_server_routing_decision(

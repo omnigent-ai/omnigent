@@ -129,6 +129,20 @@ function rawPickName(model: string, rawModel: string | null | undefined): string
   return raw === shortModelName(model) ? null : raw;
 }
 
+/**
+ * Short name of the model the spawn asked for, when Smart Routing picked a
+ * different one. `null` when nothing was attempted or both names collapse to
+ * the same tier — a struck-through name identical to the pill reads as a bug.
+ */
+function attemptedPickName(
+  model: string,
+  attemptedOverride: string | null | undefined,
+): string | null {
+  if (!attemptedOverride) return null;
+  const attempted = shortModelName(attemptedOverride);
+  return attempted === shortModelName(model) ? null : attempted;
+}
+
 interface RoutingDecisionCardProps {
   model: string;
   applied: boolean;
@@ -159,6 +173,7 @@ export function RoutingDecisionCard({
   const { harness, scope, decisionId, rawModel, attemptedOverride } = routing ?? {};
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
+  const attemptedShort = attemptedPickName(model, attemptedOverride);
   const scopeLabel = subagentScopeLabel(scope, agent);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
@@ -214,11 +229,25 @@ export function RoutingDecisionCard({
       </div>
       <div className="flex items-center gap-2 text-sm">
         <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        {attemptedShort ? (
+          // The spawn named its own model and the router picked another — the
+          // substitution is the whole point of the row, so it shows at a glance.
+          <span
+            className="ml-auto shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground line-through"
+            data-testid="routing-decision-attempted-override"
+            title="The spawn asked for this model; Smart Routing picked the one on the right."
+          >
+            {attemptedShort}
+          </span>
+        ) : null}
         {rawShort ? (
           // Router vocabulary pick that had to be mapped to a servable id —
           // show what the router said next to what actually ran.
           <span
-            className="ml-auto shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground"
+            className={cn(
+              "shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground",
+              !attemptedShort && "ml-auto",
+            )}
             data-testid="routing-decision-raw-model"
           >
             {rawShort} →
@@ -227,7 +256,7 @@ export function RoutingDecisionCard({
         <span
           className={cn(
             "shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground",
-            !rawShort && "ml-auto",
+            !rawShort && !attemptedShort && "ml-auto",
           )}
         >
           {short}

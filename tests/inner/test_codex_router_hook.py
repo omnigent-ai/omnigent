@@ -279,6 +279,35 @@ def test_routing_notice_announces_only_a_routed_model(
         assert "systemMessage" not in out["hookSpecificOutput"]
 
 
+@pytest.mark.parametrize(
+    ("asked", "expected_notice"),
+    [
+        # The parent asked for one arm and the router picked another. Codex
+        # reports no model change of its own, so without naming the ask the
+        # parent reads its own choice back and never learns it was substituted.
+        ("gpt-5.6-sol", "Using Smart Routing. Requested gpt-5.6-sol; routing to gpt-5.6-luna."),
+        # The router agreed with the ask — nothing was substituted.
+        ("gpt-5.6-luna", "Using Smart Routing. Routing to gpt-5.6-luna."),
+        # No ask at all.
+        (None, "Using Smart Routing. Routing to gpt-5.6-luna."),
+    ],
+)
+def test_the_notice_names_a_model_the_router_substituted(
+    tmp_path: Path,
+    router: _Router,
+    asked: str | None,
+    expected_notice: str,
+) -> None:
+    advertise_router(tmp_path)
+    router.response = {"action": "rewrite", "model": "databricks-gpt-5-6-luna", "rationale": "r"}
+    tool_input = {} if asked is None else {"model": asked}
+
+    out = _route(_payload(**tool_input), router_dir=tmp_path)
+
+    assert out is not None
+    assert out["systemMessage"] == expected_notice
+
+
 def test_finalize_spawn_input_passes_no_opinion_through() -> None:
     assert hook.finalize_spawn_input(None) is None
 

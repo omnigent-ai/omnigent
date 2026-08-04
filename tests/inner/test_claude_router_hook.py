@@ -18,11 +18,15 @@ def _payload(
     tool_name: str = "Agent",
     subagent_type: str = "code-reviewer",
     prompt: str = "review the diff",
+    model: str | None = None,
 ) -> dict[str, Any]:
+    tool_input: dict[str, Any] = {"subagent_type": subagent_type, "prompt": prompt}
+    if model is not None:
+        tool_input["model"] = model
     return {
         "hook_event_name": "PreToolUse",
         "tool_name": tool_name,
-        "tool_input": {"subagent_type": subagent_type, "prompt": prompt},
+        "tool_input": tool_input,
         "tool_use_id": "toolu_1",
     }
 
@@ -321,6 +325,49 @@ def test_fork_typed_spawn_routes_like_any_other(
         "parent_model": None,
         "requested_model": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("asked", "forwarded"),
+    [
+        # Claude's Agent tool spells the ask as a family alias, so forwarding it
+        # verbatim would compare "opus" against a catalog id and report every
+        # honored ask as overridden.
+        ("opus", "databricks-claude-opus-4-8"),
+        ("OPUS", "databricks-claude-opus-4-8"),
+        # Already a catalog id, which compares as-is: passed through.
+        ("databricks-claude-opus-4-8", "databricks-claude-opus-4-8"),
+        ("system.ai.claude-sonnet-5", "system.ai.claude-sonnet-5"),
+        # An alias this session pins nothing to resolves to a vendor id we
+        # cannot name, so the body claims no ask at all.
+        ("sonnet", None),
+        # Sentinels are not model asks.
+        ("inherit", None),
+        ("default", None),
+    ],
+)
+def test_an_alias_ask_is_resolved_to_the_pinned_catalog_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    asked: str,
+    forwarded: str | None,
+) -> None:
+    router_dir = advertise_router(tmp_path)
+    (tmp_path / "bridge.json").write_text(
+        json.dumps(
+            {
+                "active_session_id": "conv_abc",
+                "model_env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"},
+            }
+        )
+    )
+    _out, requests = _run_hook(
+        monkeypatch,
+        router_dir,
+        _payload(model=asked),
+        {"action": "allow", "rationale": "", "decision_id": "d"},
+    )
+    assert requests[0]["body"]["requested_model"] == forwarded
 
 
 def test_endpoint_down_allows_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -136,11 +136,55 @@ describe("routing decision — harness / scope / raw pick", () => {
     // The badge's exact wording is pinned once, on subagentScopeLabel.
     expect(screen.getByTestId("routing-decision-scope")).toBeTruthy();
     expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");
-    // Identity + attempted override are audit data — they belong in the
-    // expandable verdict, not the glance row.
+    // The overridden ask is the point of the row, so it shows at a glance; the
+    // decision id stays audit data behind the chevron.
+    expect(screen.getByTestId("routing-decision-attempted-override")).toHaveTextContent("opus");
     fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
     expect(screen.getByText(/"decision_id"/)).toBeInTheDocument();
     expect(screen.getByText(/"attempted_override"/)).toBeInTheDocument();
+  });
+
+  // Strict adherence to the router means a spawn's own model ask is applied
+  // only when the router agrees; when it doesn't, the substitution has to be
+  // visible without expanding the verdict.
+  it.each([
+    ["databricks-claude-opus-4-8", "opus"],
+    // Same short name as the pill — a struck-through duplicate reads as a bug.
+    ["system.ai.claude-sonnet-5", null],
+  ] as const)("card: attempted override %s is disclosed as %s", (attemptedOverride, shown) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="Spawn requested databricks-claude-opus-4-8; overridden."
+        routing={{ attemptedOverride }}
+      />,
+    );
+    if (shown === null) {
+      expect(screen.queryByTestId("routing-decision-attempted-override")).toBeNull();
+    } else {
+      const span = screen.getByTestId("routing-decision-attempted-override");
+      expect(span).toHaveTextContent(shown);
+      expect(span.className).toContain("line-through");
+      // Only the first of (attempted, raw pick, pill) pushes the group right.
+      expect(span.className).toContain("ml-auto");
+    }
+  });
+
+  it("card: the attempted override takes ml-auto ahead of the raw pick", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={{ attemptedOverride: "databricks-claude-opus-4-8", rawModel: "gpt-5-6-sol" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-attempted-override").className).toContain(
+      "ml-auto",
+    );
+    // Exactly one spacer, else the row splits into two right-aligned groups.
+    expect(screen.getByTestId("routing-decision-raw-model").className).not.toContain("ml-auto");
   });
 
   it("card: omits the new rows and JSON keys when the fields are absent", () => {
@@ -150,6 +194,7 @@ describe("routing decision — harness / scope / raw pick", () => {
     expect(screen.queryByTestId("routing-decision-harness")).toBeNull();
     expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
     expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-attempted-override")).toBeNull();
     fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
     expect(screen.queryByText(/"harness"/)).toBeNull();
     expect(screen.queryByText(/"raw_model"/)).toBeNull();

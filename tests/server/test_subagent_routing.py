@@ -278,39 +278,149 @@ async def test_same_family_pick_rewrites() -> None:
     assert len(decision.decision_id) == 36
 
 
-async def test_an_explicit_in_family_ask_is_honored_without_routing() -> None:
-    """A spawn that names a routable arm keeps it — glm included.
+@pytest.mark.parametrize(
+    ("picked", "note", "recorded_override"),
+    [
+        # The router happened to pick the arm the spawn named: honored by
+        # coincidence, and an honored ask is just the model.
+        (GLM_SERVABLE, "honored — the router picked the same arm", None),
+        # It picked another: the router's pick is applied and the ask is
+        # recorded as the override attempt.
+        (GPT_MODEL, "overridden — the router picked databricks-gpt-5-5", GLM_SERVABLE),
+    ],
+    ids=["match", "mismatch"],
+)
+async def test_an_explicit_in_family_ask_is_still_routed(
+    picked: str,
+    note: str,
+    recorded_override: str | None,
+) -> None:
+    """An explicit ask never short-circuits the router.
 
-    Placeholder-scored routing would otherwise override every deliberate
-    pick with the default arm, making glm unreachable from a spawn.
+    The spawn names a routable arm, so the old policy honored it without
+    asking. Strict adherence means the router still decides: the ask only
+    words the rationale, and it lands only when the pick agrees.
     """
-    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="default arm"))
+    client = FakeRoutingClient(RoutingResult(model=picked, rationale="default arm"))
+    req = _request(harness="codex-native", prompt=None, requested_model=GLM_SERVABLE)
     decision = await resolve_subagent_route(
         "conv_1",
-        _request(harness="codex-native", prompt=None, requested_model=GLM_SERVABLE),
+        req,
         caps=FakeCaps(routing_client=client),
         catalog={"self": [GPT_MODEL, GLM_MODEL]},
     )
+    assert len(client.calls) == 1
     assert decision.action == "rewrite"
-    assert decision.model == GLM_SERVABLE
-    assert client.calls == []  # honored, never routed
-    record = decision_record(
-        _request(harness="codex-native", requested_model=GLM_SERVABLE), decision
-    )
-    assert record.attempted_override is None  # honored asks are not overrides
+    assert decision.model == picked
+    # The router's own rationale stays first and intact.
+    assert decision.rationale == f"default arm Spawn requested {GLM_SERVABLE}; {note}."
+    assert decision_record(req, decision).attempted_override == recorded_override
 
 
-async def test_an_ask_matches_candidates_on_the_bare_arm() -> None:
-    """Any spelling of the ask lands the candidate set's servable spelling."""
-    client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="default arm"))
+async def test_the_router_is_called_even_when_the_spawn_names_a_model() -> None:
+    """Regression: a ``requested_model`` used to skip ``client.route`` entirely,
+    so every rationale read "it is a routable arm" and no rule trace existed."""
+    client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning"))
     decision = await resolve_subagent_route(
         "conv_1",
-        _request(harness="codex-native", prompt=None, requested_model=GLM_MODEL),
+        _request(requested_model=CLAUDE_MODEL),
+        caps=FakeCaps(routing_client=client),
+    )
+    assert len(client.calls) == 1
+    assert decision.rationale.startswith("deep reasoning")
+    assert "it is a routable arm" not in decision.rationale
+
+
+async def test_an_ask_matches_the_pick_on_the_bare_arm() -> None:
+    """Any spelling of the ask compares against the arm the router picked."""
+    client = FakeRoutingClient(RoutingResult(model=GLM_SERVABLE, rationale="delegate down"))
+    req = _request(harness="codex-native", prompt=None, requested_model=GLM_MODEL)
+    decision = await resolve_subagent_route(
+        "conv_1",
+        req,
         caps=FakeCaps(routing_client=client),
         catalog={"self": [GPT_MODEL, GLM_MODEL]},
     )
-    assert decision.action == "rewrite"
     assert decision.model == GLM_SERVABLE
+    assert "honored" in decision.rationale
+    assert decision_record(req, decision).attempted_override is None
+
+
+async def test_a_long_context_suffix_is_the_same_arm() -> None:
+    """``[1m]`` names a context window, not another arm."""
+    client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning"))
+    req = _request(requested_model=f"{CLAUDE_MODEL}[1m]")
+    decision = await resolve_subagent_route("conv_1", req, caps=FakeCaps(routing_client=client))
+    assert "honored" in decision.rationale
+    assert decision_record(req, decision).attempted_override is None
+
+
+async def test_a_matching_ask_on_an_allow_is_honored_too() -> None:
+    """The router keeping the parent model still answers the ask."""
+    client = FakeRoutingClient(RoutingResult(model=PARENT_MODEL, rationale="parent model fits"))
+    req = _request(requested_model=PARENT_MODEL)
+    decision = await resolve_subagent_route("conv_1", req, caps=FakeCaps(routing_client=client))
+    assert decision.action == "allow"
+    assert decision.rationale == (
+        f"parent model fits Spawn requested {PARENT_MODEL}; honored — "
+        "the router picked the same arm."
+    )
+    assert decision_record(req, decision).attempted_override is None
+
+
+async def test_a_matching_ask_on_a_redirect_is_honored_too() -> None:
+    """A cross-harness pick the spawn asked for is still the ask, honored."""
+    client = FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
+    )
+    req = _request(requested_model=GPT_MODEL)
+    decision = await resolve_subagent_route(
+        "conv_1", req, caps=FakeCaps(routing_client=client), cross_harness=True
+    )
+    assert decision.action == "redirect"
+    assert "honored — the router picked the same arm" in decision.rationale
+    assert decision_record(req, decision).attempted_override is None
+
+
+async def test_a_deny_claims_nothing_about_the_ask() -> None:
+    """Nothing spawned, so there is no ask to call honored or overridden."""
+    client = FakeRoutingClient(
+        RoutingResult(model="databricks-kimi-k2", rationale="unavailable", harness="claude-sdk")
+    )
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(requested_model=CLAUDE_MODEL),
+        caps=FakeCaps(routing_client=client),
+    )
+    assert decision.action == "deny"
+    assert "honored" not in decision.rationale
+    assert "overridden" not in decision.rationale
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        FakeRoutingClient(error=RuntimeError("router down")),
+        FakeRoutingClient(None, last_error="menu mismatch"),
+        None,
+    ],
+    ids=["outage", "no-verdict", "no-client"],
+)
+async def test_fail_open_leaves_the_spawn_on_the_model_it_asked_for(
+    client: FakeRoutingClient | None,
+) -> None:
+    """A router outage allows the spawn with no model, so the hook leaves
+    ``tool_input`` alone and the spawn runs on exactly what it named — the
+    audit record has to say so rather than name the inherited model."""
+    req = _request(requested_model=GLM_SERVABLE)
+    decision = await resolve_subagent_route("conv_1", req, caps=FakeCaps(routing_client=client))
+    assert decision.action == "allow"
+    assert decision.model is None
+    assert "honored" not in decision.rationale
+    record = decision_record(req, decision)
+    assert record.model == GLM_SERVABLE
+    assert record.applied is False
+    assert record.attempted_override is None
 
 
 async def test_a_cross_family_ask_on_an_auto_session_is_not_honored_in_place() -> None:
@@ -326,6 +436,7 @@ async def test_a_cross_family_ask_on_an_auto_session_is_not_honored_in_place() -
     assert decision.action == "rewrite"
     assert decision.model == GPT_MODEL
     assert len(client.calls) == 1
+    assert f"Spawn requested {CLAUDE_MODEL}; overridden" in decision.rationale
 
 
 async def test_an_out_of_family_ask_is_routed_over_and_recorded() -> None:
@@ -341,6 +452,7 @@ async def test_an_out_of_family_ask_is_routed_over_and_recorded() -> None:
     assert decision.action == "rewrite"
     assert decision.model == GPT_MODEL
     assert len(client.calls) == 1  # not honored — routed normally
+    assert f"overridden — the router picked {GPT_MODEL}" in decision.rationale
     assert decision_record(req, decision).attempted_override == CLAUDE_MODEL
 
 

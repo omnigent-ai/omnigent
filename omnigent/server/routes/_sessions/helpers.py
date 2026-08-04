@@ -5621,8 +5621,10 @@ async def _emit_server_routing_decision(
     :param harness: Harness the decision applies to, when it picked one.
     :param decision_id: Decision identity shared with the child-sessions
         API. ``None`` mints one.
-    :param attempted_override: Model an LLM-supplied ``args.model`` asked
-        for and the router overrode. ``None`` when nothing was attempted.
+    :param attempted_override: Model the spawning agent asked for and the
+        router overrode — an LLM-supplied ``args.model``, or a native
+        spawn's own ``requested_model``. ``None`` when nothing was asked
+        for, or when the pick names the same arm as the ask.
     :returns: The decision id, so callers can join it onto the session
         row, or ``None`` when the payload failed validation and no chip
         was recorded.

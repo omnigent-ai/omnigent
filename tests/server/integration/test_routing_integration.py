@@ -121,6 +121,46 @@ async def test_router_overrides_llm_supplied_child_model(
     assert refreshed.labels.get(ROUTING_DECISION_LABEL_KEY) == data.decision_id
 
 
+async def test_another_spelling_of_the_routed_model_is_no_override(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``sys_session_send`` and the router can spell one arm two ways.
+
+    The child path used to compare raw strings, so a GLM ask that routing
+    landed exactly was still reported as an overridden attempt.
+    """
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="routing-spelling",
+        child_model_override=GLM_SERVABLE,
+    )
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
+            RoutingResult(model=GLM_MODEL, rationale="delegate down", harness="claude_code")
+        )
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "fix the typo"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id,
+                child,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    decisions = _routing_decisions(conv_store, child.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.model == GLM_MODEL
+    assert decisions[0].data.attempted_override is None
+
+
 async def test_routed_model_publishes_session_model_event(
     client: httpx.AsyncClient,
     db_uri: str,

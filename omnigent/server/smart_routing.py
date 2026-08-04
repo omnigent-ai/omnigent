@@ -742,12 +742,14 @@ def _configured_prefixes(prefixes: Sequence[str] | None) -> Sequence[str]:
 def _bare_id(model: str, prefixes: Sequence[str] | None = None) -> str:
     """Strip a catalog prefix so ids compare across vocabularies.
 
-    Comparison spelling only, never a model id to send anywhere: dots read as
-    dashes (a picker's ``gpt-5.6-sol`` is the router's ``gpt-5-6-sol``) and case
-    is folded.
+    Comparison spelling only, never a model id to send anywhere: the ``[1m]``
+    long-context suffix is dropped (it names a context window, not another
+    arm), dots read as dashes (a picker's ``gpt-5.6-sol`` is the router's
+    ``gpt-5-6-sol``) and case is folded.
     """
     bare = strip_catalog_prefix(model, _configured_prefixes(prefixes))
-    return bare.replace(".", "-").lower()
+    # Folded last so an upper-case ``[1M]`` is dropped too.
+    return bare.replace(".", "-").lower().removesuffix("[1m]")
 
 
 def _model_family(model: str) -> str:

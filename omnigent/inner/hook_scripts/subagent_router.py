@@ -34,7 +34,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from omnigent.claude_model_vocabulary import claude_model_alias
+from omnigent.claude_model_vocabulary import (
+    CLAUDE_MODEL_ALIASES,
+    alias_pins,
+    claude_model_alias,
+    normalized_model_id,
+)
 
 # Advertisement file written by the runner's subagent-routing endpoint,
 # mirroring the ``tool_relay.json`` discovery pattern.
@@ -336,6 +341,7 @@ def build_route_request(
     task_keys: Sequence[str] = DEFAULT_TASK_KEYS,
     include_prompt: bool = True,
     prompt_keys: Sequence[str] = ("prompt",),
+    requested_model_resolver: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:  # type: ignore[explicit-any]
     """
     Build the ``route-subagent`` request body.
@@ -349,6 +355,9 @@ def build_route_request(
         whose spawn payload carries no usable task text.
     :param prompt_keys: ``tool_input`` keys carrying the task text, in
         preference order (codex spells it ``message``).
+    :param requested_model_resolver: Turns the spawn tool's own ``model``
+        spelling into a catalog id the server can compare. ``None``
+        forwards it verbatim, which is what codex's slugs need.
     :returns: JSON-serializable request body.
     """
     prompt = None
@@ -359,14 +368,18 @@ def build_route_request(
                 prompt = value
                 break
     requested = tool_input.get("model")
+    requested = requested if isinstance(requested, str) and requested else None
+    if requested is not None and requested_model_resolver is not None:
+        requested = requested_model_resolver(requested)
     return {
         "harness": harness,
         "task_name": spawn_task_name(tool_input, task_keys),
         "prompt": prompt,
         "parent_model": parent_model,
-        # The model the spawning agent asked for, if any — the server honors
-        # an in-family ask instead of overriding a deliberate choice.
-        "requested_model": requested if isinstance(requested, str) and requested else None,
+        # The model the spawning agent asked for, if any. The router still
+        # decides; the ask only shows up in the rationale and, on a mismatch,
+        # as the recorded ``attempted_override``.
+        "requested_model": requested,
     }
 
 
@@ -446,6 +459,38 @@ def claude_model_translator(
     # spawn dies. Same vocabulary as ``/model``.
     vocabulary_env = resolve_model_vocabulary_env(bridge_dir)
     return lambda model: claude_model_alias(model, vocabulary_env)
+
+
+def claude_requested_model_resolver(
+    bridge_dir: str | Path | None,
+) -> Callable[[str], str | None]:
+    """
+    Build the ask normalizer for Claude's spawn tool.
+
+    Claude spells the Agent/Task ``model`` as a family alias, so forwarding
+    it verbatim would compare ``"opus"`` against a catalog id and report
+    every honored ask as overridden. Resolve the alias through the same
+    pinning :func:`claude_model_translator` inverts, so the comparison is
+    between two catalog ids.
+
+    :param bridge_dir: Directory whose ``bridge.json`` records the
+        session's alias pinning.
+    :returns: Callable mapping a spawn's ``model`` to a catalog id, or
+        ``None`` when the spelling names no concrete model (``"inherit"``,
+        ``"default"``, an unpinned alias) — the body then claims no ask.
+    """
+    pins = alias_pins(resolve_model_vocabulary_env(bridge_dir))
+
+    def resolve(model: str) -> str | None:
+        candidate = model.strip().lower()
+        if candidate in CLAUDE_MODEL_ALIASES:
+            return pins.get(candidate)
+        # A catalog id already compares; anything else (``inherit``,
+        # ``default``, an unknown label) names no model, and claiming it as an
+        # ask would report a phantom override.
+        return model if normalized_model_id(model) != candidate else None
+
+    return resolve
 
 
 # Opening clause of every routed-spawn instruction. Naming the user's own
@@ -725,7 +770,10 @@ def route_pre_tool_use(
     parent_model_resolver: Callable[[dict[str, Any]], str | None] | None = None,  # type: ignore[explicit-any]
     model_translator_factory: Callable[[str | Path | None], Callable[[str], str | None]]
     | None = claude_model_translator,
-    post_process: Callable[[dict[str, Any] | None], dict[str, Any] | None] | None = None,  # type: ignore[explicit-any]
+    requested_model_resolver_factory: Callable[[str | Path | None], Callable[[str], str | None]]
+    | None = claude_requested_model_resolver,
+    post_process: Callable[[dict[str, Any] | None, dict[str, Any]], dict[str, Any] | None]  # type: ignore[explicit-any]
+    | None = None,
 ) -> dict[str, Any] | None:  # type: ignore[explicit-any]
     """
     Route one ``PreToolUse`` payload end to end.
@@ -748,8 +796,11 @@ def route_pre_tool_use(
     :param model_translator_factory: Builds the decision-model translator
         for this harness's spawn tool. ``None`` injects the routed id
         verbatim, which is what codex's ``spawn_agent`` expects.
-    :param post_process: Last pass over the hook output, e.g. codex's
-        routed-model notice.
+    :param requested_model_resolver_factory: Builds the normalizer for the
+        spawn's own ``model`` ask. ``None`` forwards it verbatim, which is
+        what codex's slugs need.
+    :param post_process: Last pass over the hook output, given the
+        incoming ``tool_input`` too, e.g. codex's routed-model notice.
     :returns: Hook output, or ``None`` for "no opinion" — every failure
         lands here so a spawn is never blocked by routing infrastructure.
     """
@@ -782,6 +833,11 @@ def route_pre_tool_use(
         task_keys=task_keys,
         include_prompt=include_prompt,
         prompt_keys=prompt_keys,
+        requested_model_resolver=(
+            requested_model_resolver_factory(bridge_dir or router_dir)
+            if requested_model_resolver_factory is not None
+            else None
+        ),
     )
     decision = request_decision(endpoint, resolved_session, body, timeout=timeout)
     if decision is None:
@@ -798,7 +854,7 @@ def route_pre_tool_use(
         requesting_harness=harness,
         available_tools=advertised_relay_tools(bridge_dir or discovered_dir),
     )
-    return post_process(output) if post_process is not None else output
+    return post_process(output, tool_input) if post_process is not None else output
 
 
 def read_stdin_payload(
