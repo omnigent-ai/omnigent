@@ -5107,6 +5107,16 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        # This path rebuilds the body field by field, so anything on the
+        # inbound body that is not threaded through here is dropped.
+        # Forward a normalised ``{"effort": ...}`` rather than the inbound
+        # object: the harness scaffold types ``reasoning`` as
+        # ``dict[str, str]``, so a non-string sibling key would fail the
+        # turn at decode where today it is simply dropped.
+        _reasoning = msg_body.get("reasoning")
+        _effort = _reasoning.get("effort") if isinstance(_reasoning, dict) else None
+        if isinstance(_effort, str) and _effort:
+            harness_body["reasoning"] = {"effort": _effort}
         if _session_histories[conv]:
             history = _session_histories[conv]
             if any("created_by" in item for item in history):

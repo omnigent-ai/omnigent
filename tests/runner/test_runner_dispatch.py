@@ -1245,6 +1245,241 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
     assert "file_id" not in flat, f"unresolved file_id present in forwarded history: {flat}"
 
 
+async def _reasoning_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+    """
+    Resolve a minimal spec on a benign test harness.
+
+    :param agent_id: Agent id the runner resolved (unused).
+    :param session_id: Session id (unused).
+    :returns: A minimal spec whose harness is ``runner-test-resolved``.
+    """
+    del agent_id, session_id
+    return AgentSpec(
+        spec_version=1,
+        name="reasoning-agent",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "runner-test-resolved"},
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_background_turn_forwards_reasoning_to_harness() -> None:
+    """A ``reasoning`` field on the inbound body must reach the harness.
+
+    The background path (no ``?stream=true``) is the one the Omnigent
+    server posts to. It does not forward the inbound body: it rebuilds a
+    fresh ``harness_body`` field by field, so any field not threaded
+    through explicitly is dropped. ``reasoning`` was one of them, which
+    means a turn's reasoning effort could not reach an in-process harness
+    on that path even when the body carried it.
+
+    This asserts the field survives the rebuild, the same way ``model``
+    and the client half of ``tools`` are already taken off the inbound
+    body in that builder.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_reasoning_bg"
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_reasoning_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                # No ``?stream=true`` → background turn, the production
+                # path the Omnigent server uses to forward session messages.
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_reasoning",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                    "reasoning": {"effort": "high"},
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        runner_app._session_histories_ref.pop(conv, None)
+
+    body = captured["body"]
+    assert body.get("reasoning") == {"effort": "high"}, (
+        f"reasoning dropped from the rebuilt background-turn body: keys={sorted(body)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_turn_forwards_reasoning_to_harness() -> None:
+    """The ``?stream=true`` branch must keep carrying ``reasoning``.
+
+    That branch passes the inbound body through rather than rebuilding
+    it, so it already carries the field and this passes without the
+    accompanying fix. It is a drift guard, not coverage of a live path:
+    it fails if that branch is ever changed to rebuild the body the way
+    the background path does, which is exactly how the two paths came
+    apart in the first place. Note the stream branch has no production
+    caller today; the Omnigent server always posts without the query
+    parameter.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_reasoning_stream"
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_reasoning_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_reasoning",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                    "reasoning": {"effort": "high"},
+                },
+            )
+            assert response.status_code == 200
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        runner_app._session_histories_ref.pop(conv, None)
+
+    body = captured["body"]
+    assert body.get("reasoning") == {"effort": "high"}, (
+        f"reasoning lost on the passthrough branch: keys={sorted(body)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_background_turn_normalises_reasoning_to_effort() -> None:
+    """Sibling keys are dropped rather than forwarded to the harness.
+
+    The harness scaffold types ``reasoning`` as ``dict[str, str]``, so a
+    caller that sends a non-string sibling alongside the effort — the
+    shape both the Anthropic and OpenAI reasoning objects use — would
+    fail the turn at decode. Forwarding a normalised object keeps a field
+    that is dropped today from becoming a hard failure.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_reasoning_sibling"
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_reasoning_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_reasoning",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                    "reasoning": {"effort": "high", "budget_tokens": 8000},
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        runner_app._session_histories_ref.pop(conv, None)
+
+    body = captured["body"]
+    assert body.get("reasoning") == {"effort": "high"}, (
+        f"non-string sibling forwarded to the harness: {body.get('reasoning')!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param({}, id="empty-dict"),
+        pytest.param({"effort": ""}, id="empty-effort"),
+        pytest.param({"effort": None}, id="null-effort"),
+        pytest.param("high", id="bare-string"),
+    ],
+)
+async def test_runner_background_turn_omits_unusable_reasoning(
+    reasoning: object,
+) -> None:
+    """No ``reasoning`` key is invented from an absent or unusable value.
+
+    Effort is only meaningful when it is a non-empty string, so the
+    builder forwards nothing otherwise rather than handing the harness a
+    value it would have to interpret. This keeps a malformed field from
+    turning a silently dropped value into a failed turn, and pins that a
+    session with no effort set is left alone.
+
+    :param reasoning: Inbound ``reasoning`` value, or ``None`` to omit
+        the key entirely.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_reasoning_none"
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_reasoning_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    payload: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_reasoning",
+        "model": "x",
+        "content": [{"type": "input_text", "text": "hi"}],
+    }
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json=payload)
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        runner_app._session_histories_ref.pop(conv, None)
+
+    body = captured["body"]
+    assert "reasoning" not in body, (
+        f"invented a reasoning key from {reasoning!r}: {body.get('reasoning')!r}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
