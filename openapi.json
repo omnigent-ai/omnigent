@@ -170,7 +170,7 @@
         "description": "Request body for the current-agent automatic rename endpoint.",
         "properties": {
           "title": {
-            "maxLength": 60,
+            "maxLength": 120,
             "minLength": 2,
             "title": "Title",
             "type": "string"
@@ -536,7 +536,7 @@
                 "type": "null"
               }
             ],
-            "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
+            "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. For Claude-native children this is the raw Claude `subagent_id`, kept for correlation rather than display. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
           },
           "title": {
@@ -560,7 +560,7 @@
                 "type": "null"
               }
             ],
-            "description": "UI-facing sub-agent label. For Omnigent-spawned children this is derived from the prefix of `title` before the first `\":\"`, e.g. `\"researcher\"`. For Codex-native children this is the Codex-assigned `agent_nickname` when available, then `agent_role`, then `\"Codex\"`. Falls back to the raw title for legacy / malformed rows; `None` only when `title` itself is `None` or empty.",
+            "description": "UI-facing sub-agent label. For Omnigent-spawned children this is derived from the prefix of `title` before the first `\":\"`, e.g. `\"researcher\"`. For Codex-native children this is the Codex-assigned `agent_nickname` when available, then `agent_role`, then `\"Codex\"`. For Claude-native children this is the Task tool's `description` (e.g. `\"wave-worker-696\"`), then the agent type's trailing segment (`\"rpw-published:debug-lead\"` \u2192 `\"debug-lead\"`) \u2014 their title is an opaque uniqueness key, not a display string. Falls back to the raw title for legacy / malformed rows; `None` only when nothing readable exists.",
             "title": "Tool"
           },
           "updated_at": {
@@ -9363,7 +9363,7 @@
     },
     "/v1/sessions/{session_id}/auto-title": {
       "post": {
-        "description": "Replace the deterministic first-message title when still current.",
+        "description": "Rename a session on the agent's behalf, unless a person owns the title.\n\nThe first rename may only replace the deterministic first-message\nseed. After that the row is marked agent-titled, so later renames\nare allowed \u2014 a session's subject changes as work moves on, and a\none-shot rename would freeze the sidebar on the opening topic. A\nmanual rename (`PATCH /sessions/{id}`) marks the row user-titled\nand ends agent renaming for good. Both paths write conditionally on\nthe title read in this request, so a concurrent rename still wins.",
         "operationId": "automatically_rename_session_v1_sessions__session_id__auto_title_post",
         "parameters": [
           {

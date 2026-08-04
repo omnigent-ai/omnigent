@@ -111,7 +111,11 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { isNativeTerminalSession, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import {
+  claudeNativeSubagentLabel,
+  isNativeTerminalSession,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -4025,6 +4029,9 @@ function ComposerStatusLine({
  * so the suffix is still the human name. Falls back to the bare title,
  * then the sub-agent type, then the bound agent name.
  *
+ * Claude Code sub-agents are the exception: their title ends in an opaque
+ * hex id, so the Task description on their labels is the readable name.
+ *
  * @param session - The active session snapshot, or ``null`` while it loads
  *   / on the new-chat landing.
  * @returns The tray label, e.g. ``"check-account-eligibility"``; ``null``
@@ -4032,9 +4039,14 @@ function ComposerStatusLine({
  *   loaded — both hide the tray.
  */
 export function subAgentComposerLabel(
-  session: Pick<Session, "parentSessionId" | "title" | "subAgentName" | "agentName"> | null,
+  session: Pick<
+    Session,
+    "parentSessionId" | "title" | "subAgentName" | "agentName" | "labels"
+  > | null,
 ): string | null {
   if (!session || session.parentSessionId == null) return null;
+  const claudeLabel = claudeNativeSubagentLabel(session.labels, session.subAgentName);
+  if (claudeLabel) return claudeLabel;
   // Strip the user-added "ui:" sentinel so its "agent:name" suffix reads
   // like an LLM-spawned title.
   let title = session.title ?? null;

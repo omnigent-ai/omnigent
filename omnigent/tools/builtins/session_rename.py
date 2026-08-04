@@ -19,10 +19,15 @@ class SysSessionRenameTool(Tool):
     def description(cls) -> str:
         """Return the LLM-facing description."""
         return (
-            "Rename the current top-level session with a short summary-style title "
-            "(3-6 words, action-first). Strip filler and keep the noun plus verb. "
-            "Never copy a conversational question or greeting verbatim. "
-            "The rename is ignored if the session title changed concurrently."
+            "Rename the current top-level session. Default to a short "
+            "summary-style title (3-6 words, action-first): strip filler, keep "
+            "the noun plus verb, and never copy a conversational question or "
+            "greeting verbatim. When the user asks for a structured title "
+            "instead - for example 'repo::branch::date::role' - write it "
+            "exactly as asked; structured titles are supported up to 120 "
+            "characters. Rename again whenever the session's subject moves on. "
+            "The rename is ignored once the user has renamed the session by "
+            "hand, and if the title changed concurrently."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -38,11 +43,14 @@ class SysSessionRenameTool(Tool):
                         "title": {
                             "type": "string",
                             "description": (
-                                "Short summary-style, action-first session title, for "
-                                "example 'Debug authentication timeout'."
+                                "Session title. Either a short summary-style, "
+                                "action-first phrase such as 'Debug authentication "
+                                "timeout', or a structured title the user asked for "
+                                "such as "
+                                "'my-repo::feat/some-branch::2026-08-04::supervisor'."
                             ),
                             "minLength": 2,
-                            "maxLength": 60,
+                            "maxLength": 120,
                         }
                     },
                     "required": ["title"],
