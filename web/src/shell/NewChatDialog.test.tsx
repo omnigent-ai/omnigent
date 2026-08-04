@@ -788,6 +788,26 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
   });
 
+  it("inherits the configured UI font in the landing composer", () => {
+    mockAgents([
+      {
+        id: "ag_debby",
+        name: "debby",
+        display_name: "Debby",
+        description: "Multi-agent debate",
+        harness: "claude-sdk",
+        skills: [{ name: "debate", description: "Have both heads argue it out" }],
+      },
+    ]);
+    renderLanding();
+
+    const input = screen.getByTestId("new-chat-landing-input");
+    const prompt = screen.getByText("Describe a task, or try a skill");
+
+    expect(input.className).not.toMatch(/\bfont-\[/);
+    expect(prompt.className).not.toMatch(/\bfont-\[/);
+  });
+
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
     // Navigating into an existing session and back unmounts the landing
     // screen; the draft is stashed at module scope so the half-composed
