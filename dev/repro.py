@@ -21,6 +21,7 @@ Usage (from the repo root):
   python dev/repro.py                     # prompts for the bug URL
   python dev/repro.py https://github.com/omnigent-ai/omnigent/issues/1234
   python dev/repro.py OMNI-1234 --server http://localhost:6767
+  python dev/repro.py <bug_url> --public  # share the session public-read at start
 
 Reproducing runs against whatever server ``omnigent run`` uses (the local server
 it spins up by default, or the one you pass with ``--server``).
@@ -109,6 +110,13 @@ def _parse_args() -> argparse.Namespace:
         help="Omnigent server URL to reproduce against. Omit to use the local "
         "server omnigent run spins up.",
     )
+    p.add_argument(
+        "--public",
+        action="store_true",
+        help="Share the reproduction session public-read (anyone who can reach "
+        "the server) right after it starts. Off by default — useful when "
+        "watching a live run or reproducing against a shared --server.",
+    )
     return p.parse_args()
 
 
@@ -127,9 +135,13 @@ def main() -> None:
     if not bug_url:
         _die("no bug URL given")
 
-    # The agent's input contract is just the bug URL; it always reproduces
-    # against the running build (latest main), so there's no version to pass.
-    prompt = json.dumps({"bug_url": bug_url})
+    # The agent's input contract is the bug URL (it always reproduces against the
+    # running build, so there's no version to pass), plus an optional `public`
+    # flag telling it to share the session public-read right after it starts.
+    payload: dict[str, object] = {"bug_url": bug_url}
+    if args.public:
+        payload["public"] = True
+    prompt = json.dumps(payload)
 
     # Create the isolated worktree off the CURRENT checkout's HEAD. We resolve
     # HEAD to a concrete commit and pass it as the base, because create_worktree

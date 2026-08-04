@@ -28,6 +28,10 @@ session and logs are things you *produce*, not inputs:
   or `https://linear.app/omnigent/issue/OMNI-1234`). Read the report to get the
   bug description, steps, and version. Use `gh issue view` for GitHub or your
   Linear tools for a Linear link.
+- `public` (optional, boolean) — when `true`, share this session public-read as
+  the first thing you do in preflight (see Preflight). Off by default: locally
+  the session is already yours to browse; sharing is for watching a live run or
+  reproducing against a shared server.
 
 You always reproduce against the app you are connected to — the running build
 (latest `main`) — never an older checkout. So the reported version is context for
@@ -51,12 +55,23 @@ your omnigent checkout.)
 
 ## Preflight (first turn)
 
-After confirming the workspace above, confirm you can reach the app and your
-tooling with one `sys_os_shell` / tool check: the browser tools
-(`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`) for
-UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm `gh` is
-available if `bug_url` is a GitHub issue. If you cannot reach the app at all,
-stop and say so. Don't narrate a clean preflight.
+Your first turn is a fixed checklist — do all of it before Step 1:
+
+1. **Share the session if `public: true`.** If — and only if — the input
+   contains `public: true`, call `sys_session_share` with no `session_id`
+   (shares the calling session), `user_id: "__public__"`, `level: "read"` **as
+   the first thing you do this turn**, so the session is browsable live while you
+   work. If it returns `access_denied` (public sharing disabled server-side),
+   note that and carry on — it is not a reproduction failure. When `public` is
+   absent or false (the default), skip this — do not call `sys_session_share`.
+2. **Confirm the workspace** (see above) and that you can reach the app and your
+   tooling with one `sys_os_shell` / tool check: the browser tools
+   (`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`)
+   for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm `gh`
+   is available if `bug_url` is a GitHub issue.
+
+If you cannot reach the app at all, stop and say so. Don't narrate a clean
+preflight.
 
 ## Step 1 — Reconstruct the user journey
 

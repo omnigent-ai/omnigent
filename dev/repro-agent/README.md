@@ -43,7 +43,12 @@ checkout, and runs the agent from there.
 python dev/repro.py                     # prompts for the bug URL
 python dev/repro.py https://github.com/omnigent-ai/omnigent/issues/1234
 python dev/repro.py OMNI-1234 --server http://localhost:6767
+python dev/repro.py <bug_url> --public  # share the session public-read at start
 ```
+
+`--public` shares the session read-only (anyone who can reach the server) right
+after it starts — useful for watching a live run or reproducing against a shared
+`--server`. Off by default.
 
 It always keeps the worktree and prints its path + branch at the end; remove it
 with `git worktree remove <path>` when done.

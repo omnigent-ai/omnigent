@@ -54,6 +54,14 @@ executor:
 # The full operating procedure lives in AGENTS.md, read at startup.
 instructions: AGENTS.md
 
+# Grant sys_session_share authority to grant the __public__ sentinel (anonymous
+# read-only). Locally your session is already yours to browse, so sharing is
+# opt-in: the agent only shares when invoked with `public: true` (the
+# `dev/repro.py --public` flag). Useful when watching a live run or reproducing
+# against a shared --server. Still gated by the server's own public-sharing
+# switch.
+agent_session_sharing: public
+
 async: true
 cancellable: true
 
