@@ -166,9 +166,9 @@ def test_chat_turn_rail_matches_baseline(
     conversation area is narrow enough that the centered column would reach the
     rail. At the suite's default 1280px the area stays wide and the auto-margins
     alone clear the rail, so the guard would be a no-op; 1024px puts the area in
-    the capped regime this baseline is meant to hold — the inset at its 3rem
-    maximum, column edge parked clear of the ticks (still past the ``md``
-    breakpoint that gates the rail's visibility).
+    the capped regime this baseline is meant to hold — the inset at its maximum,
+    column edge parked clear of the ticks (still past the ``md`` breakpoint that
+    gates the rail's visibility).
     """
     page = snapshot_page
     page.set_viewport_size({"width": 1024, "height": 800})
@@ -199,11 +199,14 @@ def test_chat_turn_rail_matches_baseline(
     expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
     expect(page.locator('[data-testid="composer-model-effort-label"]')).to_be_visible()
 
-    # Park the pointer clear of both the top hover band (which reveals the "Jump
-    # to top" pill) and the left rail (hovering a tick pops its preview box), so
-    # neither transient chrome leaks into the resting-state capture. Playwright's
-    # virtual mouse starts at (0,0), which is inside both zones.
-    page.mouse.move(512, 700)
+    # Hide the "Jump to top" pill for the capture: the initial layout settle
+    # fires a scroll that reveals it for a ~2s window, so whether it's on screen
+    # is a race the baseline shouldn't encode. Force it out like settle does the
+    # caret. The left rail's tick preview needs no such handling — it's hover-only
+    # and Playwright fires no hover at rest.
+    page.add_style_tag(
+        content='[aria-label="Jump to the first message"] { display: none !important; }'
+    )
 
     settle_for_snapshot(page)
 
