@@ -61,6 +61,7 @@ if TYPE_CHECKING:
 
     from omnigent.llms.context_window import ModelPricing
 
+from omnigent import native_bridge_common
 from omnigent.inner.bundle_skills import claude_native_skill_args
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
@@ -880,7 +881,24 @@ def prepare_bridge_dir(
     ):
         with contextlib.suppress(FileNotFoundError):
             (bridge_dir / filename).unlink()
+    # Owner-pid marker for the periodic dead-owner prune; refreshed every
+    # turn so it always names the current runner. See native_bridge_common.
+    native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove claude-native bridge dirs whose owner process is provably dead.
+
+    Delegates to the shared sweep against this harness's bridge root; the
+    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    at startup to reclaim dirs leaked by a prior runner that died without
+    running the explicit delete path.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
 
 
 def ensure_claude_workspace_trusted(workspace: Path) -> None:

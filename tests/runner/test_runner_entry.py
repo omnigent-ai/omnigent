@@ -2131,3 +2131,26 @@ def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
     dest = _agent_cache_dest(cache_root, "ag_abc123", "3")
 
     assert dest == cache_root / "ag_abc123-v3"
+
+
+def test_create_app_wires_native_bridge_dir_startup_sweep() -> None:
+    """The runner startup path must invoke the native bridge-dir sweep.
+
+    The prune logic is dead unless ``create_app`` actually calls
+    ``reap_orphaned_native_bridge_dirs`` — the highest-risk path in the
+    bridge-dir-reaping change. A full ``create_app()`` call needs heavy
+    server/token/process-manager scaffolding, so the wiring is guarded by
+    inspecting the factory's source: the sweep must be present and must run
+    after the terminal reap (the placement the design requires).
+
+    :returns: None.
+    """
+    import inspect
+
+    from omnigent.runner._entry import create_app
+
+    src = inspect.getsource(create_app)
+
+    assert "reap_orphaned_native_bridge_dirs()" in src
+    # The native bridge-dir sweep runs after the terminal reap.
+    assert src.index("reap_orphaned_terminals()") < src.index("reap_orphaned_native_bridge_dirs()")

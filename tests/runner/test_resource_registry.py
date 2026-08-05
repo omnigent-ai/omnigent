@@ -1209,3 +1209,45 @@ def test_resolve_environment_runner_workspace_overrides_absolute_spec_cwd(
     # Compare via realpath because tmp_path on macOS goes through
     # /var → /private/var symlinks.
     assert os.path.realpath(env.cwd) == os.path.realpath(workspace)
+
+
+# ── native bridge-dir reaping: live-session regression ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_preserves_live_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cleanup_session must NOT delete a live session's native bridge dir.
+
+    Bridge-dir deletion is deliberately kept OUT of cleanup_session because
+    the in-place agent-switch reset (reset_session_state) reuses
+    cleanup_session while the session — and its bridge — lives on. Wiring a
+    reap in here would rmtree a live session's ``bridge.json`` +
+    ``permission_hook.json`` and break approval routing until cold launch.
+    This guard fails if any such deletion is ever wired back in.
+
+    :param tmp_path: Pytest temp dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.claude_native_bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+
+    # A live session's bridge dir: current-process owner.pid + the token and
+    # permission-hook files that must survive an agent-switch reset.
+    bridge_dir = claude_bridge.prepare_bridge_dir("conv_live", workspace=tmp_path)
+    permission_hook = bridge_dir / "permission_hook.json"
+    permission_hook.write_text("{}", encoding="utf-8")
+    assert (bridge_dir / "bridge.json").exists()
+    assert (bridge_dir / "owner.pid").exists()
+
+    registry = SessionResourceRegistry()
+    await registry.cleanup_session("conv_live")
+
+    assert bridge_dir.exists()
+    assert (bridge_dir / "bridge.json").exists()
+    assert permission_hook.exists()

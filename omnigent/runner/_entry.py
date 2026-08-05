@@ -1252,6 +1252,19 @@ def create_app(
             _reaped_terminals,
         )
 
+    # Reap per-session native-harness bridge dirs (bridge.json token, MCP/
+    # policy config, permission_hook.json) leaked by a prior runner that died
+    # without running the explicit delete path. Dynamic across all native
+    # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
+    from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+    _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
+    if _reaped_bridge_dirs:
+        _logger.info(
+            "Reaped %d orphaned native bridge dir(s) from prior runs",
+            _reaped_bridge_dirs,
+        )
+
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
     # CLI launcher and this runner process via env var.
