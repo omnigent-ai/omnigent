@@ -4,20 +4,48 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections import Counter
 from typing import Any
 
-AUTO_CLOSE_CONFIDENCE = 0.92
+
+def _tunable(name: str, default: float) -> float:
+    """Read a threshold from the environment so it can be calibrated in place."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else default
+
+
+# Closing is destructive, so it needs strong lexical agreement AND high model
+# confidence. The similar thresholds only gate a comment, so they sit lower —
+# but non-zero, to keep coincidental keyword hits out of public links.
+AUTO_CLOSE_CONFIDENCE = _tunable("DUPLICATE_CLOSE_MIN_CONFIDENCE", 0.92)
+CLOSE_COSINE_FLOOR = _tunable("DUPLICATE_CLOSE_MIN_COSINE", 0.45)
+SIMILAR_MIN_CONFIDENCE = _tunable("DUPLICATE_SIMILAR_MIN_CONFIDENCE", 0.5)
+SIMILAR_COSINE_FLOOR = _tunable("DUPLICATE_SIMILAR_MIN_COSINE", 0.12)
+
 MAX_CANDIDATES = 10
-MAX_SEARCH_QUERIES = 4
 MAX_EXPLICIT_REFERENCES = 5
 MAX_SIMILAR_ISSUES = 3
-MIN_CLOSE_TITLE_TOKENS = 4
-MIN_CLOSE_DOCUMENT_TOKENS = 8
-MIN_CLOSE_TITLE_JACCARD = 0.8
-MIN_CLOSE_DOCUMENT_JACCARD = 0.25
-MIN_CLOSE_DOCUMENT_CONTAINMENT = 0.5
+MIN_SIMILARITY_TOKENS = 4
+DOCUMENT_BODY_CHARS = 2000
+
+# Crash reports are filed by the crash handler and share a long traceback
+# preamble (click/cli frames, "File ...", indented source lines). Left in, that
+# boilerplate alone scores unrelated crashes at 0.79 cosine.
+_CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
+_TRACEBACK_LINE = re.compile(
+    r"^\s*(?:Traceback \(most recent call last\)|File \".*?\", line \d+"
+    r"|During handling of the above exception.*|The above exception was.*"
+    r"|\s{4}\S.*)$",
+    re.MULTILINE,
+)
 
 _STOP_WORDS = {
     "a",
@@ -50,7 +78,7 @@ _STOP_WORDS = {
     "with",
 }
 
-_SEARCH_NOISE = {
+_FILLER_WORDS = {
     "ability",
     "add",
     "allow",
@@ -73,33 +101,6 @@ _SEARCH_NOISE = {
 }
 
 _SHORT_TECH_TERMS = {"ci", "db", "go", "os", "ui"}
-
-
-def build_search_queries(issue: dict[str, Any], limit: int = MAX_SEARCH_QUERIES) -> list[str]:
-    """Build short phrase queries spread across an issue title."""
-    if limit <= 0:
-        return []
-
-    title = str(issue.get("title") or "")
-    body = str(issue.get("body") or "")[:1000]
-    title_tokens = _query_tokens(title)
-    tokens = title_tokens if len(title_tokens) >= 2 else title_tokens + _query_tokens(body)
-
-    if not tokens:
-        return []
-    if len(tokens) == 1:
-        return tokens
-
-    pairs = list(
-        dict.fromkeys(" ".join(tokens[index : index + 2]) for index in range(len(tokens) - 1))
-    )
-    if limit == 1:
-        return pairs[:1]
-    if len(pairs) <= limit:
-        return pairs
-
-    indexes = [index * (len(pairs) - 1) // (limit - 1) for index in range(limit)]
-    return [pairs[index] for index in dict.fromkeys(indexes)]
 
 
 def extract_issue_references(
@@ -139,57 +140,51 @@ def extract_issue_references(
 
 def rank_candidates(
     issue: dict[str, Any],
-    search_candidates: list[dict[str, Any]],
-    referenced_candidates: list[dict[str, Any]],
+    corpus: list[dict[str, Any]],
     limit: int = MAX_CANDIDATES,
+    repository: str | None = None,
+    floor: float = SIMILAR_COSINE_FLOOR,
 ) -> list[dict[str, Any]]:
-    """Normalize, deduplicate, and rank candidate issues for classification."""
+    """Rank every older issue in the repository against `issue`.
+
+    Scoring the whole repository rather than keyword-search hits keeps IDF
+    weights fixed: a pair's score no longer depends on how many unrelated
+    issues a query happened to return. Candidates below the floor are dropped
+    rather than padding the list out to `limit`.
+    """
     issue_number = issue.get("number")
     if isinstance(issue_number, bool) or not isinstance(issue_number, int):
         return []
 
-    explicit_numbers = set(extract_issue_references(issue))
+    explicit_numbers = set(extract_issue_references(issue, repository))
     candidates_by_number: dict[int, dict[str, Any]] = {}
-    search_hits: Counter[int] = Counter()
-
-    for candidate in search_candidates:
+    for candidate in corpus:
         normalized = _normalize_candidate(issue_number, candidate)
-        if normalized is None:
-            continue
-        number = normalized["number"]
-        search_hits[number] += 1
-        candidates_by_number.setdefault(number, normalized)
+        if normalized is not None:
+            candidates_by_number.setdefault(normalized["number"], normalized)
 
-    for candidate in referenced_candidates:
-        normalized = _normalize_candidate(issue_number, candidate)
-        if normalized is not None and normalized["number"] in explicit_numbers:
-            candidates_by_number[normalized["number"]] = normalized
+    candidates = list(candidates_by_number.values())
+    for candidate, score in zip(candidates, similarity_scores(issue, candidates), strict=True):
+        candidate["similarity"] = round(score, 3)
+        candidate["explicitReference"] = candidate["number"] in explicit_numbers
 
-    issue_tokens = set(_query_tokens(str(issue.get("title") or "")))
-
-    def score(candidate: dict[str, Any]) -> tuple[Any, ...]:
-        number = candidate["number"]
-        candidate_tokens = set(_query_tokens(candidate["title"]))
-        shared = issue_tokens & candidate_tokens
-        union = issue_tokens | candidate_tokens
-        overlap = len(shared) / len(union) if union else 0.0
-        technical_matches = sum(_is_technical_token(token) for token in shared)
-        return (
-            number in explicit_numbers,
-            search_hits[number],
-            technical_matches,
-            len(shared),
-            overlap,
+    # An explicitly referenced issue is kept regardless of wording: the author
+    # pointed at it deliberately.
+    retained = [
+        candidate
+        for candidate in candidates
+        if candidate["similarity"] >= floor or candidate["explicitReference"]
+    ]
+    retained.sort(
+        key=lambda candidate: (
+            candidate["explicitReference"],
+            candidate["similarity"],
             candidate["state"] == "OPEN",
-            number,
-        )
-
-    ranked = sorted(candidates_by_number.values(), key=score, reverse=True)[:limit]
-    for candidate in ranked:
-        number = candidate["number"]
-        candidate["explicitReference"] = number in explicit_numbers
-        candidate["searchHits"] = search_hits[number]
-    return ranked
+            candidate["number"],
+        ),
+        reverse=True,
+    )
+    return retained[:limit]
 
 
 def format_candidates_for_prompt(candidates: list[dict[str, Any]]) -> str:
@@ -215,39 +210,54 @@ def parse_triage_output(raw: str) -> dict[str, Any]:
     return result
 
 
-def deterministic_duplicate_match(issue: dict[str, Any], candidate: dict[str, Any]) -> bool:
-    """Require strong lexical agreement before auto-closing."""
-    issue_title = set(_similarity_tokens(str(issue.get("title") or "")))
-    candidate_title = set(_similarity_tokens(str(candidate.get("title") or "")))
-    if len(issue_title) < MIN_CLOSE_TITLE_TOKENS or len(candidate_title) < MIN_CLOSE_TITLE_TOKENS:
-        return False
+def document_tokens(issue: dict[str, Any]) -> list[str]:
+    """Tokenize an issue's title plus a bounded prefix of its prose body."""
+    body = str(issue.get("body") or "")
+    body = _TRACEBACK_LINE.sub(" ", _CODE_FENCE.sub(" ", body))
+    return _similarity_tokens(f"{issue.get('title') or ''}\n{body[:DOCUMENT_BODY_CHARS]}")
 
-    title_union = issue_title | candidate_title
-    title_jaccard = len(issue_title & candidate_title) / len(title_union)
-    if title_jaccard < MIN_CLOSE_TITLE_JACCARD:
-        return False
 
-    issue_document = set(
-        _similarity_tokens(f"{issue.get('title') or ''}\n{str(issue.get('body') or '')[:2000]}")
-    )
-    candidate_document = set(
-        _similarity_tokens(
-            f"{candidate.get('title') or ''}\n{str(candidate.get('body') or '')[:2000]}"
-        )
-    )
-    if (
-        len(issue_document) < MIN_CLOSE_DOCUMENT_TOKENS
-        or len(candidate_document) < MIN_CLOSE_DOCUMENT_TOKENS
-    ):
-        return False
+def similarity_scores(issue: dict[str, Any], candidates: list[dict[str, Any]]) -> list[float]:
+    """Score each candidate against the issue with TF-IDF cosine similarity.
 
-    shared_document = issue_document & candidate_document
-    document_jaccard = len(shared_document) / len(issue_document | candidate_document)
-    document_containment = len(shared_document) / min(len(issue_document), len(candidate_document))
-    return (
-        document_jaccard >= MIN_CLOSE_DOCUMENT_JACCARD
-        and document_containment >= MIN_CLOSE_DOCUMENT_CONTAINMENT
-    )
+    Rare terms dominate, so two reports of the same bug score highly even when
+    worded differently, while a shared generic word like "web" barely counts.
+    """
+    documents = [document_tokens(issue)] + [document_tokens(candidate) for candidate in candidates]
+    vectors = _tfidf_vectors(documents)
+    return [_cosine(vectors[0], vector) for vector in vectors[1:]]
+
+
+def _tfidf_vectors(documents: list[list[str]]) -> list[dict[str, float]]:
+    total = len(documents)
+    frequencies: Counter[str] = Counter()
+    for tokens in documents:
+        frequencies.update(set(tokens))
+    idf = {term: math.log((total + 1) / (count + 1)) + 1 for term, count in frequencies.items()}
+
+    vectors = []
+    for tokens in documents:
+        if not tokens:
+            vectors.append({})
+            continue
+        counts = Counter(tokens)
+        length = len(tokens)
+        vectors.append({term: (count / length) * idf[term] for term, count in counts.items()})
+    return vectors
+
+
+def _cosine(left: dict[str, float], right: dict[str, float]) -> float:
+    if not left or not right:
+        return 0.0
+    smaller, larger = (left, right) if len(left) <= len(right) else (right, left)
+    dot = sum(weight * larger.get(term, 0.0) for term, weight in smaller.items())
+    if dot == 0.0:
+        return 0.0
+    left_norm = math.sqrt(sum(weight * weight for weight in left.values()))
+    right_norm = math.sqrt(sum(weight * weight for weight in right.values()))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
 
 def validate_duplicate_decision(
@@ -275,19 +285,43 @@ def validate_duplicate_decision(
         else None
     )
     similar_issues = _validated_issue_numbers(result.get("similar_issues"), candidate_numbers)
+    similarity = _similarity_map(issue, list(candidates_by_number.values()))
+
+    def close_authorized(number: int) -> bool:
+        """Both signals must agree: lexical similarity AND model confidence."""
+        candidate = candidates_by_number[number]
+        if (
+            len(set(document_tokens(issue))) < MIN_SIMILARITY_TOKENS
+            or len(set(document_tokens(candidate))) < MIN_SIMILARITY_TOKENS
+        ):
+            return False
+        return (
+            confidence >= auto_close_confidence
+            and similarity.get(number, 0.0) >= CLOSE_COSINE_FLOOR
+        )
+
+    def linkable(numbers: list[int]) -> list[int]:
+        """Keep only links the model is reasonably sure of and text agrees with."""
+        if confidence < SIMILAR_MIN_CONFIDENCE:
+            return []
+        return [
+            number for number in numbers if similarity.get(number, 0.0) >= SIMILAR_COSINE_FLOOR
+        ]
+
     decision = "none"
     if requested_decision == "duplicate" and duplicate_of is not None:
-        if confidence >= auto_close_confidence and deterministic_duplicate_match(
-            issue, candidates_by_number[duplicate_of]
-        ):
+        if close_authorized(duplicate_of):
             decision = "duplicate"
             similar_issues = []
         else:
-            decision = "similar"
-            similar_issues = _deduplicate([duplicate_of, *similar_issues])[:MAX_SIMILAR_ISSUES]
+            similar_issues = linkable(
+                _deduplicate([duplicate_of, *similar_issues])[:MAX_SIMILAR_ISSUES]
+            )
+            decision = "similar" if similar_issues else "none"
             duplicate_of = None
     elif requested_decision == "similar" and similar_issues:
-        decision = "similar"
+        similar_issues = linkable(similar_issues)
+        decision = "similar" if similar_issues else "none"
         duplicate_of = None
     else:
         duplicate_of = None
@@ -346,24 +380,41 @@ def build_duplicate_comment(decision: dict[str, Any], *, close_issue: bool) -> s
     return f"{marker}\n{message}\n"
 
 
-def _search_tokens(text: str) -> list[str]:
-    return [
-        token
-        for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_-]+", text.lower())
-        if (len(token) >= 3 or token in _SHORT_TECH_TERMS) and token not in _STOP_WORDS
-    ]
+def _similarity_map(issue: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[int, float]:
+    """Collect the similarity score for each candidate.
 
-
-def _query_tokens(text: str) -> list[str]:
-    return [token for token in _search_tokens(text) if token not in _SEARCH_NOISE]
+    `rank_candidates` scores against the whole repository, so its cached value
+    is authoritative: IDF weights are relative to the documents they are
+    computed over, and rescoring a short list would silently shift the gate.
+    """
+    missing = [candidate for candidate in candidates if candidate.get("similarity") is None]
+    rescored = dict(
+        zip(
+            (candidate["number"] for candidate in missing),
+            similarity_scores(issue, missing),
+            strict=True,
+        )
+    )
+    return {
+        candidate["number"]: (
+            float(candidate["similarity"])
+            if candidate.get("similarity") is not None
+            else rescored[candidate["number"]]
+        )
+        for candidate in candidates
+    }
 
 
 def _similarity_tokens(text: str) -> list[str]:
-    return _query_tokens(text.replace("_", " ").replace("-", " "))
-
-
-def _is_technical_token(token: str) -> bool:
-    return "_" in token or "-" in token or any(character.isdigit() for character in token)
+    """Split into scoring terms, dropping stop words and issue-tracker filler."""
+    normalized = text.lower().replace("_", " ").replace("-", " ")
+    return [
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9]+", normalized)
+        if (len(token) >= 3 or token in _SHORT_TECH_TERMS)
+        and token not in _STOP_WORDS
+        and token not in _FILLER_WORDS
+    ]
 
 
 def _normalize_candidate(issue_number: int, candidate: dict[str, Any]) -> dict[str, Any] | None:

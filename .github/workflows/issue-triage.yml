@@ -134,6 +134,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          # Every issue ever filed, so long-closed reports stay discoverable.
+          # Raise this as the repository grows.
+          CORPUS_LIMIT: "2000"
         run: |
           set -euo pipefail
 
@@ -145,76 +148,38 @@ jobs:
             --json number,title,body,labels,author,state,createdAt,comments \
             > /tmp/issue.json
 
+          # Rank against every issue in the repo rather than keyword-search
+          # hits: search missed the correct match entirely on most issues, and
+          # a query-dependent candidate set makes IDF — and so the closure
+          # threshold — depend on what search happened to return.
+          gh issue list --repo "$REPO" --state all --limit "$CORPUS_LIMIT" \
+            --json number,title,body,state,url,createdAt,updatedAt,labels \
+            > /tmp/corpus.json
+
           PYTHONPATH=.github/scripts python3 <<'PYEOF'
           import json
           import os
           import pathlib
 
-          from issue_duplicates import build_search_queries, extract_issue_references
+          from issue_duplicates import extract_issue_references, rank_candidates
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
-          queries = build_search_queries(issue)
+          corpus = json.loads(pathlib.Path("/tmp/corpus.json").read_text())
           references = extract_issue_references(issue, os.environ["REPO"])
-          pathlib.Path("/tmp/search-queries.json").write_text(json.dumps(queries))
-          pathlib.Path("/tmp/issue-references.json").write_text(
-              json.dumps(references)
-          )
-          print(f"Duplicate search queries: {queries}")
+          print(f"Corpus size: {len(corpus)}")
           print(f"Explicit issue references: {references}")
-          PYEOF
-
-          # Pass each sanitized pair as AND terms, not one exact phrase.
-          # Trusted ranking below caps the broader result union.
-          search_index=0
-          while IFS= read -r query; do
-            read -r -a query_terms <<< "$query"
-            gh search issues --repo "$REPO" --limit 10 \
-              --json number,title,body,state,url,createdAt,updatedAt,labels \
-              "${query_terms[@]}" > "/tmp/search-candidates-$search_index.json" \
-              2>/dev/null \
-              || echo "[]" > "/tmp/search-candidates-$search_index.json"
-            search_index=$((search_index + 1))
-          done < <(jq -r '.[]' /tmp/search-queries.json)
-
-          # Explicit references are always candidates, including related issues
-          # that keyword search would not rediscover. Pull requests are removed
-          # by the trusted state validator below.
-          reference_index=0
-          while IFS= read -r reference; do
-            gh issue view "$reference" --repo "$REPO" \
-              --json number,title,body,state,url,createdAt,updatedAt,labels \
-              > "/tmp/reference-candidate-$reference_index.json" \
-              2>/dev/null \
-              || echo "{}" > "/tmp/reference-candidate-$reference_index.json"
-            reference_index=$((reference_index + 1))
-          done < <(jq -r '.[]' /tmp/issue-references.json)
-
-          PYTHONPATH=.github/scripts python3 <<'PYEOF'
-          import json
-          import pathlib
-
-          from issue_duplicates import rank_candidates
-
-          issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
-          search_candidates = []
-          for path in pathlib.Path("/tmp").glob("search-candidates-*.json"):
-              result = json.loads(path.read_text())
-              if isinstance(result, list):
-                  search_candidates.extend(result)
-
-          referenced_candidates = []
-          for path in pathlib.Path("/tmp").glob("reference-candidate-*.json"):
-              result = json.loads(path.read_text())
-              if isinstance(result, dict) and result:
-                  referenced_candidates.append(result)
 
           candidates = rank_candidates(
-              issue, search_candidates, referenced_candidates
+              issue,
+              corpus,
+              repository=os.environ["REPO"],
           )
           pathlib.Path("/tmp/duplicates.json").write_text(json.dumps(candidates))
+          # Log scores even when nothing fires so the thresholds can be
+          # calibrated from real distributions during the observation period.
           print(
               "Ranked duplicate candidates: "
-              f"{[candidate['number'] for candidate in candidates]}"
+              f"{[(c['number'], c['similarity']) for c in candidates]}"
           )
           PYEOF
 
@@ -502,8 +467,14 @@ jobs:
           )
           candidates = json.loads(pathlib.Path("/tmp/duplicates.json").read_text())
           duplicate = validate_duplicate_decision(result, issue_data, candidates)
+
+          # The duplicate call is made once, at open time. On the re-triage path
+          # (needs-info removed) the label, comment, and closure decision were
+          # all settled then, so they are left exactly as they are.
+          is_open_event = os.environ.get("EVENT_ACTION") == "opened"
+          is_duplicate = duplicate["duplicate_decision"] == "duplicate" and is_open_event
           close_duplicate_issue = (
-              duplicate["duplicate_decision"] == "duplicate"
+              is_duplicate
               and os.environ.get("CLOSE_DUPLICATE_ISSUES", "").strip().lower() == "true"
           )
 
@@ -511,51 +482,47 @@ jobs:
           labels_remove = []
           valid_priority = None
 
-          # `unlabeled` re-triage runs skip the duplicate call entirely.
-          is_open_event = os.environ.get("EVENT_ACTION") == "opened"
+          if is_duplicate:
+              labels_add.append("duplicate")
 
-          # Duplicate labeling and closure happen only on the initial open. On
-          # the re-triage path the duplicate call was already made at open time,
-          # so the label and its explanatory comment stay consistent.
-          if duplicate["duplicate_decision"] == "duplicate" and is_open_event:
-              labels_add.extend(["duplicate", "triaged"])
+          # A duplicate left open (the default) still needs its component and
+          # priority, or it matches no maintainer queue filter at all.
+          if result.get("needs_info") and not is_duplicate:
+              if "needs-info" not in existing_labels:
+                  labels_add.append("needs-info")
           else:
-              if result.get("needs_info"):
-                  if "needs-info" not in existing_labels:
-                      labels_add.append("needs-info")
-              else:
-                  # No longer needs info. On the re-triage path the label is
-                  # already gone (its removal triggered this run); this is a
-                  # safety net for any case where it lingers.
-                  if "needs-info" in existing_labels:
-                      labels_remove.append("needs-info")
+              # No longer needs info. On the re-triage path the label is already
+              # gone (its removal triggered this run); this is a safety net for
+              # any case where it lingers.
+              if "needs-info" in existing_labels:
+                  labels_remove.append("needs-info")
 
-                  issue_type = result.get("type")
-                  if isinstance(issue_type, str) and issue_type in ALLOWED_TYPES:
-                      labels_add.append(issue_type)
+              issue_type = result.get("type")
+              if isinstance(issue_type, str) and issue_type in ALLOWED_TYPES:
+                  labels_add.append(issue_type)
 
-                  components = result.get("components", [])
-                  if not v2_owns_scoring and isinstance(components, list):
-                      labels_add.extend(
-                          component
-                          for component in components
-                          if isinstance(component, str)
-                          and component in ALLOWED_COMPONENTS
-                      )
+              components = result.get("components", [])
+              if not v2_owns_scoring and isinstance(components, list):
+                  labels_add.extend(
+                      component
+                      for component in components
+                      if isinstance(component, str)
+                      and component in ALLOWED_COMPONENTS
+                  )
 
-                  priority = result.get("priority")
-                  if (
-                      not v2_owns_scoring
-                      and isinstance(priority, str)
-                      and priority in ALLOWED_PRIORITIES
-                  ):
-                      labels_add.append(priority)
-                      valid_priority = priority
+              priority = result.get("priority")
+              if (
+                  not v2_owns_scoring
+                  and isinstance(priority, str)
+                  and priority in ALLOWED_PRIORITIES
+              ):
+                  labels_add.append(priority)
+                  valid_priority = priority
 
-                  if result.get("help_wanted"):
-                      labels_add.append("help wanted")
+              if result.get("help_wanted") and not is_duplicate:
+                  labels_add.append("help wanted")
 
-              labels_add.append("triaged")
+          labels_add.append("triaged")
 
           if "needs-triage" in existing_labels:
               labels_remove.append("needs-triage")
@@ -596,7 +563,13 @@ jobs:
               "components": valid_components,
               "ranked_owners": ranked_owners,
               **duplicate,
+              # Re-triage runs neither re-label, re-comment, nor close: the
+              # duplicate call was already made and acted on at open time.
+              "duplicate_decision": (
+                  duplicate["duplicate_decision"] if is_open_event else "none"
+              ),
               "close_duplicate_issue": close_duplicate_issue,
+              "post_duplicate_comment": is_open_event,
               # Left as None while Databricks owns scoring.
               "priority": valid_priority,
               "needs_info": bool(result.get("needs_info")),
@@ -644,21 +617,25 @@ jobs:
           print(f"Reasoning: {json.dumps(output['reasoning'], ensure_ascii=True)}")
           PYEOF
 
-          # Keep exactly one duplicate-check comment across workflow reruns.
+          # Execute the validated label changes.
+          bash /tmp/triage_commands.sh
+
+          # Post the duplicate-check result once, on the initial open. Re-triage
+          # runs skip it, and an existing comment is never overwritten so a human
+          # override survives workflow reruns.
+          post_duplicate_comment=$(jq -r '.post_duplicate_comment' /tmp/triage_result.json)
           comment_id=$(gh api --paginate \
             "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- omnigent-duplicate-check -->"))) | .id' \
             | sed -n '1p')
-          if [ -n "$comment_id" ]; then
+          if [ "$post_duplicate_comment" != "true" ]; then
+            echo "Re-triage run; leaving the existing duplicate-check result in place."
+          elif [ -n "$comment_id" ]; then
             echo "Duplicate-check result already exists; preserving any human override."
-            exit 0
+          else
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
+              --body-file /tmp/duplicate_comment.md
           fi
-
-          # Execute the validated label changes.
-          bash /tmp/triage_commands.sh
-
-          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" \
-            --body-file /tmp/duplicate_comment.md
 
           # Refresh state after labeling/commenting so closure and assignment do
           # not rely on the earlier read.
