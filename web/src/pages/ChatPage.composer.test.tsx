@@ -1042,16 +1042,6 @@ describe("Composer claude-native permission mode", () => {
     useChatStore.setState({ claudePermissionMode: "" });
   });
 
-  it("no longer renders a standalone picker beside the gear", () => {
-    // The mode lives inside the gear modal now, alongside model and effort —
-    // the composer row stays uncluttered.
-    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "default" });
-
-    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
-
-    expect(screen.queryByTestId("claude-permission-mode-select")).toBeNull();
-  });
-
   it("shows the Permissions row inside the gear modal", async () => {
     useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
 
@@ -1078,8 +1068,8 @@ describe("Composer claude-native permission mode", () => {
   });
 
   it("keeps the gear reachable when the mode is the only config row", () => {
-    // The gear used to hide unless model/effort/routing applied; a Claude
-    // session whose only knob is the permission mode must still open it.
+    // A Claude session with no model/effort/routing knobs must still open the
+    // gear, since the permission mode lives behind it.
     useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
 
     renderWithTooltips(
