@@ -10,11 +10,15 @@ runner-path forwarding is verified here by stubbing
 
 from __future__ import annotations
 
+import io
+import json
+import tarfile
 from typing import Any
 from unittest.mock import patch
 
 import httpx
 import pytest
+import yaml
 
 from tests.server.helpers import create_test_agent
 
@@ -38,6 +42,47 @@ async def _create_session(
     )
     assert resp.status_code == 201
     return resp.json()
+
+
+def _build_bundle_with_reasoning_effort(reasoning_effort: str) -> bytes:
+    """Build a multipart bundle whose ``llm`` block declares *reasoning_effort*."""
+    config = {
+        "spec_version": 1,
+        "name": "bundle-effort-agent",
+        "llm": {
+            "model": "bundle-effort-agent",
+            "connection": {"api_key": "test-key"},
+            "reasoning_effort": reasoning_effort,
+        },
+        "executor": {"config": {"harness": "claude-sdk"}},
+    }
+    config_bytes = yaml.dump(config, sort_keys=False).encode()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        archive.addfile(info, io.BytesIO(config_bytes))
+    return buffer.getvalue()
+
+
+async def _create_bundled_session(
+    client: httpx.AsyncClient,
+    *,
+    yaml_reasoning_effort: str,
+    metadata: dict[str, Any],
+) -> httpx.Response:
+    """Create a session directly from a bundle with an LLM effort default."""
+    return await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_bundle_with_reasoning_effort(yaml_reasoning_effort),
+                "application/gzip",
+            )
+        },
+    )
 
 
 async def test_patch_model_override_round_trips_through_snapshot(
@@ -289,6 +334,59 @@ async def test_create_session_rejects_invalid_reasoning_effort(
     assert resp.status_code == 400, (
         f"reasoning_effort 'turbo' should 400, got {resp.status_code}: {resp.text}"
     )
+
+
+async def test_multipart_bundle_inherits_llm_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """An unset multipart metadata effort inherits the validated YAML value."""
+    resp = await _create_bundled_session(
+        client,
+        yaml_reasoning_effort="high",
+        metadata={},
+    )
+    assert resp.status_code == 201, resp.text
+
+    snapshot = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["reasoning_effort"] == "high"
+
+
+async def test_multipart_metadata_reasoning_effort_overrides_bundle_default(
+    client: httpx.AsyncClient,
+) -> None:
+    """An explicit multipart metadata effort wins over the YAML default."""
+    resp = await _create_bundled_session(
+        client,
+        yaml_reasoning_effort="high",
+        metadata={"reasoning_effort": "low"},
+    )
+    assert resp.status_code == 201, resp.text
+
+    snapshot = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["reasoning_effort"] == "low"
+
+
+async def test_multipart_bundle_rejects_invalid_llm_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """An invalid YAML effort returns INVALID_INPUT without creating a session."""
+    before = await client.get("/v1/sessions")
+    assert before.status_code == 200, before.text
+    before_ids = {session["id"] for session in before.json()["data"]}
+
+    resp = await _create_bundled_session(
+        client,
+        yaml_reasoning_effort="turbo",
+        metadata={},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    after = await client.get("/v1/sessions")
+    assert after.status_code == 200, after.text
+    assert {session["id"] for session in after.json()["data"]} == before_ids
 
 
 class _CaptureClient:
