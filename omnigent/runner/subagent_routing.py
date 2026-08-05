@@ -1288,9 +1288,10 @@ def ensure_session_router(
             loop=resolver_loop,
         )
         _session_routers[session_id] = router
-    # The URL is not logged: it is a field of the same handle that holds the
-    # bearer token, and the advertisement on disk already names both.
-    _logger.info("subagent router started: session=%s dir=%s", session_id, bridge_dir)
+    # Nothing from the rendezvous is logged — neither the URL nor the paths
+    # and ids that reach it — so a log file can never carry the bearer token
+    # or the identifiers that address it. The advertisement on disk names both.
+    _logger.info("subagent router started")
     return router
 
 

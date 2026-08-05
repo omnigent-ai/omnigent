@@ -1279,7 +1279,7 @@ def _write_turn_routing_marker(
     ):
         return True
     print(
-        f"omnigent claude route-turn hook: could not write the marker in {bridge_dir}",
+        "omnigent claude route-turn hook: could not write the turn marker",
         file=sys.stderr,
     )
     return False

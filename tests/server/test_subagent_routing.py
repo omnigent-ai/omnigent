@@ -1172,6 +1172,9 @@ def test_router_startup_log_omits_the_rendezvous(
             assert "subagent router started" in text
             assert router.token not in text
             assert router.url not in text
+            # Nothing that addresses the rendezvous is logged either.
+            assert "conv_log_redaction" not in text
+            assert str(tmp_path) not in text
         finally:
             shutdown_session_router("conv_log_redaction")
 
