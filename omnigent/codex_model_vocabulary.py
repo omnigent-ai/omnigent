@@ -50,7 +50,10 @@ from typing import Any
 #: ``tests/test_codex_model_vocabulary.py``); duplicated because this module
 #: stays stdlib-only for hook subprocesses, which also means it cannot honour
 #: a deployment's ``routing.model_prefix`` override.
-_CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
+#: The prefix a gateway model ROUTE carries, as opposed to a serving
+#: endpoint's ``databricks-``; the extended catalog's ids are spelled with it.
+_MODEL_ROUTE_PREFIX = "system.ai."
+_CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", _MODEL_ROUTE_PREFIX)
 
 #: A bare gpt id, split into family, version digits, and optional tier —
 #: ``gpt-5-6-luna`` → ``("gpt", "5", "6", "luna")``. Codex spells the
@@ -61,18 +64,19 @@ _GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)-(\d+)(?:-([a-z0-9]+))?$")
 #: omnigent adds them to the session's own catalog (``model_catalog_json``)
 #: to make them spawnable. Bare id → the exact slug the entry is written
 #: under, which is also the id the gateway serves the model as.
-EXTENDED_CATALOG_MODELS: dict[str, str] = {"glm-5-2": "system.ai.glm-5-2"}
+_GLM_ARM = "glm-5-2"
+EXTENDED_CATALOG_MODELS: dict[str, str] = {_GLM_ARM: f"{_MODEL_ROUTE_PREFIX}{_GLM_ARM}"}
 
 #: Efforts each extended model's catalog entry declares. Codex refuses any
 #: other value for that model, so this is both the entry's ladder and the
 #: clamp the spawn hook applies. Cheapest-safe fallback first.
-EXTENDED_MODEL_EFFORTS: dict[str, tuple[str, ...]] = {"glm-5-2": ("low", "medium", "high")}
+EXTENDED_MODEL_EFFORTS: dict[str, tuple[str, ...]] = {_GLM_ARM: ("low", "medium", "high")}
 
 #: Effort an extended model falls back to when the session asks for one its
 #: ladder bars. Must agree with
 #: :data:`omnigent.reasoning_effort._MODEL_EFFORT_FALLBACK` (asserted by
 #: ``test_codex_effort_clamp_matches_the_runtime_clamp``).
-EXTENDED_MODEL_DEFAULT_EFFORT: dict[str, str] = {"glm-5-2": "medium"}
+EXTENDED_MODEL_DEFAULT_EFFORT: dict[str, str] = {_GLM_ARM: "medium"}
 
 
 def bare_model_id(model: str) -> str:

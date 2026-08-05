@@ -181,6 +181,18 @@ RouteTurnFn = Callable[[str | None, str], Awaitable[tuple[str | None, dict[str, 
 Resolver = Callable[[str, "TurnRouteRequest"], Awaitable["TurnRouteDecision"]]
 
 
+async def _awaited(pending: Awaitable[TurnRouteDecision]) -> TurnRouteDecision:
+    """Wrap a resolver's awaitable as a coroutine for the handler thread.
+
+    ``asyncio.run_coroutine_threadsafe`` accepts coroutines only, while a
+    :data:`Resolver` may return any awaitable.
+
+    :param pending: The resolver's awaitable result.
+    :returns: The resolved decision.
+    """
+    return await pending
+
+
 # ── Hook-side trace ────────────────────────────────────────────────────────
 
 
@@ -661,7 +673,9 @@ def _handler_factory(
                 self._send(400, {"error": str(exc)})
                 return
             try:
-                future = asyncio.run_coroutine_threadsafe(resolver(session_id, req), loop)
+                future = asyncio.run_coroutine_threadsafe(
+                    _awaited(resolver(session_id, req)), loop
+                )
                 decision = future.result(timeout=request_timeout_s)
             except Exception:  # noqa: BLE001 — never wedge a user's prompt
                 _logger.warning(

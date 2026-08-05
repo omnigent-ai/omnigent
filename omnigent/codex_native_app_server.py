@@ -1311,12 +1311,12 @@ def _codex_policy_hooks_settings(
         session that will never route pays no per-prompt round trip.
     :returns: A ``hooks.json``-shaped dict.
     """
-    hook = {
+    hook: _JsonObject = {
         "type": "command",
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
-    prompt_submit = [hook]
+    prompt_submit: list[_JsonObject] = [hook]
     if turn_routing:
         prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
     return {

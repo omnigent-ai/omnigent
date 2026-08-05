@@ -4295,6 +4295,8 @@ async def _forward_event_to_runner(
     # before the routing card, matching the message routing path).
     _auto_card_model: str | None = None
     _auto_card_verdict: dict[str, Any] | None = None
+    # The resolved harness, read back at card-emission time below.
+    _auto_harness: str | None = None
     if conv.harness_override == "auto" and body.type == "message":
         from omnigent.server.smart_routing import (
             _AUTO_ROUTING_HARNESSES,
@@ -4364,6 +4366,7 @@ async def _forward_event_to_runner(
     # the native-subagent hook and the child-create path gate on, so one visible
     # knob governs every spawn.
     _parent_routing_on = False
+    _parent_conv: Conversation | None = None
     if conv.parent_conversation_id is not None:
         _parent_conv = await asyncio.to_thread(
             conversation_store.get_conversation, conv.parent_conversation_id
@@ -7202,7 +7205,13 @@ async def _create_session_from_existing_agent(
             conv.id,
             {AUTO_HARNESS_LABEL_KEY: "1"},
         )
-        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if updated_conv is None:
+            raise OmnigentError(
+                f"Session {conv.id!r} disappeared while setting the auto-harness label",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        conv = updated_conv
 
     if _native_smart_routing:
         # Surface the create-time pick as a transcript card, so the user sees

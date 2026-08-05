@@ -18,6 +18,16 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
+from omnigent.model_fallbacks import (
+    SMART_ROUTING_CLAUDE_LADDER,
+    SMART_ROUTING_CURRENT_GENERATION_GPT,
+    SMART_ROUTING_FAMILY_FALLBACKS,
+    SMART_ROUTING_GPT_LADDER,
+    SMART_ROUTING_PI_EXCLUDED,
+    SMART_ROUTING_PI_LADDER,
+    SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
+    SMART_ROUTING_TASK_V1_CODEX_ARMS,
+)
 from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
@@ -39,31 +49,13 @@ ROUTES_SELECT_PATH = "routes:select"
 # Ordered cheapest → most powerful within each family. Live per-session catalogs
 # win wherever one is in reach (:func:`fetch_runner_models`); this table is the
 # fallback, so a stale entry pushes a router pick through the substitution path.
+# The ids themselves are owned records in :mod:`omnigent.model_fallbacks`.
 
 MODEL_LISTS: dict[str, list[str]] = {
-    "claude": [
-        "databricks-claude-haiku-4-5",
-        "databricks-claude-sonnet-4-6",
-        "databricks-claude-sonnet-5",
-        "databricks-claude-opus-4-8",
-    ],
-    "gpt": [
-        "databricks-gpt-5-4-nano",
-        "databricks-gpt-5-4-mini",
-        "databricks-gpt-5-4",
-        "databricks-gpt-5-5",
-    ],
+    "claude": list(SMART_ROUTING_CLAUDE_LADDER),
+    "gpt": list(SMART_ROUTING_GPT_LADDER),
     # pi is multi-model: Claude and GPT both available.
-    "pi": [
-        "databricks-gpt-5-4-nano",
-        "databricks-claude-haiku-4-5",
-        "databricks-gpt-5-4-mini",
-        "databricks-claude-sonnet-4-6",
-        "databricks-claude-sonnet-5",
-        "databricks-gpt-5-4",
-        "databricks-gpt-5-5",
-        "databricks-claude-opus-4-8",
-    ],
+    "pi": list(SMART_ROUTING_PI_LADDER),
 }
 
 # The router's own current arms, offered as candidates so a routed arm resolves
@@ -79,13 +71,7 @@ MODEL_LISTS: dict[str, list[str]] = {
 # A workspace-probed fact, so ``routing.current_generation_models`` overrides it
 # (:class:`RoutingSettings`) rather than a managed deployment forking this module.
 _CURRENT_GENERATION_MODELS: Mapping[str, tuple[str, ...]] = MappingProxyType(
-    {
-        "gpt": (
-            "databricks-glm-5-2",
-            "databricks-gpt-5-6-luna",
-            "databricks-gpt-5-6-sol",
-        ),
-    }
+    {"gpt": SMART_ROUTING_CURRENT_GENERATION_GPT}
 )
 
 _HARNESS_FAMILY: dict[str, str] = {
@@ -638,7 +624,10 @@ DEFAULT_ROUTER_NAME = "task_v1"
 # different ones sets ``routing.model_prefix``. Kept in sync with
 # ``claude_model_vocabulary._CATALOG_PREFIXES``, which the hook path uses
 # because it cannot read server config.
-MODEL_ID_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
+# The prefix a gateway model ROUTE carries (as opposed to a serving endpoint's
+# ``databricks-`` prefix); also how a servable alias below is spelled.
+_MODEL_ROUTE_PREFIX = "system.ai."
+MODEL_ID_PREFIXES: tuple[str, ...] = ("databricks-", _MODEL_ROUTE_PREFIX)
 
 
 def strip_catalog_prefix(model: str, prefixes: Sequence[str]) -> str:
@@ -662,8 +651,10 @@ def strip_catalog_prefix(model: str, prefixes: Sequence[str]) -> str:
 # and then requires that scenario's full arm menu (extra models are tolerated
 # and ignored); a partial menu is rejected. Menu ids need not be servable in
 # the workspace — the router requires them anyway and may select them.
-_TASK_V1_CLAUDE_ARMS: tuple[str, ...] = ("claude-opus-4-8", "claude-sonnet-5")
-_TASK_V1_CODEX_ARMS: tuple[str, ...] = ("glm-5-2", "gpt-5-6-sol", "gpt-5-6-luna")
+_TASK_V1_CLAUDE_ARMS: tuple[str, ...] = SMART_ROUTING_TASK_V1_CLAUDE_ARMS
+_TASK_V1_CODEX_ARMS: tuple[str, ...] = SMART_ROUTING_TASK_V1_CODEX_ARMS
+# The glm arm, named on its own for the servable alias below.
+_GLM_ARM = _TASK_V1_CODEX_ARMS[0]
 
 # Scenario → the full arm menu task_v1 requires when that scenario is inferred.
 # A router fronting a different catalog has a different menu, so this is the
@@ -683,10 +674,11 @@ TASK_V1_MENUS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 # hardcoded id; gpt and glm both land on luna, itself a frozen arm that serves
 # codex-side, so a glm fallback never leaves its harness. glm resolves to the
 # "gpt" family (model_family_token), so one gpt entry covers it.
+_CLAUDE_FAMILY_FALLBACK, _GPT_FAMILY_FALLBACK = SMART_ROUTING_FAMILY_FALLBACKS
 _FAMILY_FALLBACK: Mapping[str, str] = MappingProxyType(
     {
-        "claude": "claude-sonnet-5",
-        "gpt": "gpt-5-6-luna",
+        "claude": _CLAUDE_FAMILY_FALLBACK,
+        "gpt": _GPT_FAMILY_FALLBACK,
     }
 )
 
@@ -702,7 +694,9 @@ _FAMILY_FALLBACK: Mapping[str, str] = MappingProxyType(
 # working spelling has to be named here.
 # One workspace's probe, so ``routing.servable_aliases`` replaces it for a
 # gateway that spells its models differently (:class:`RoutingSettings`).
-_SERVABLE_ALIASES: Mapping[str, str] = MappingProxyType({"glm-5-2": "system.ai.glm-5-2"})
+_SERVABLE_ALIASES: Mapping[str, str] = MappingProxyType(
+    {_GLM_ARM: f"{_MODEL_ROUTE_PREFIX}{_GLM_ARM}"}
+)
 
 #: The scenario key a menu-less router is offered under: no arms, catalog only.
 _NO_MENUS: Mapping[str, tuple[str, ...]] = MappingProxyType({})
@@ -960,16 +954,7 @@ _MULTI_MODEL_FAMILY = "pi"
 # models on its ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models
 # on its openai-completions default ``reasoning_effort``. See
 # designs/LIVE_MODEL_STATE.md.
-_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
-    "pi": (
-        "databricks-claude-haiku-4-5",
-        "databricks-gpt-5-5",
-        "databricks-gpt-5-5-pro",
-        "databricks-gpt-5-6-luna",
-        "databricks-gpt-5-6-terra",
-        "databricks-gpt-5-6-sol",
-    ),
-}
+_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {"pi": SMART_ROUTING_PI_EXCLUDED}
 
 
 def _configured_prefixes(prefixes: Sequence[str] | None) -> Sequence[str]:

@@ -44,6 +44,7 @@ from omnigent.codex_model_vocabulary import (
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.spec.types import RetryPolicy
 
@@ -1216,7 +1217,7 @@ _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
 _CODEX_MODEL_CATALOG_FILENAME = "model_catalog.json"
 # Entry a gateway-only model is cloned from: the cheapest current arm, so an
 # unset field inherits a sane current-generation value rather than a frozen one.
-_CATALOG_CLONE_SOURCE_SLUG = "gpt-5.6-luna"
+_CATALOG_CLONE_SOURCE_SLUG = CODEX_CATALOG_CLONE_SOURCE_SLUG
 
 
 def extended_model_catalog(
