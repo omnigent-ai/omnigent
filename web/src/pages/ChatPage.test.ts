@@ -438,6 +438,132 @@ describe("mergePendingBubbles", () => {
       "pend_1",
     ]);
   });
+
+  it("places the pending bubble at its wire position, above the turn it started", () => {
+    // Issue #3983: on a smart-routed turn the ack is withheld across the
+    // router call and the runner forward, so the routing card and the
+    // first reply tokens commit while the message is still optimistic.
+    // Trailing it renders the user's message UNDER the answer to it.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 1 },
+      { ...assistantText("a2"), blockStart: 4 },
+    ];
+    // Sent when 3 blocks were committed — so it belongs above `a2`.
+    const pending = [{ ...userBubble("pend_1"), blockStart: 3 }];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "u1",
+      "a1",
+      "pend_1",
+      "a2",
+    ]);
+  });
+
+  it("still trails when every committed bubble predates the send", () => {
+    // The ordinary case: nothing committed between the POST and the ack,
+    // so the wire position IS the bottom and the bubble trails as before.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 1 },
+    ];
+    const pending = [{ ...userBubble("pend_1"), blockStart: 3 }];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual(["u1", "a1", "pend_1"]);
+  });
+
+  it("keeps a burst sharing an anchor contiguous", () => {
+    // Two sends before either is acked resolve to the same slot, so they
+    // come out adjacent without any special-casing.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 5 },
+    ];
+    const pending = [
+      { ...userBubble("pend_1"), blockStart: 1 },
+      { ...userBubble("pend_2"), blockStart: 1 },
+    ];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "u1",
+      "pend_1",
+      "pend_2",
+      "a1",
+    ]);
+  });
+
+  it("places each pending bubble at its own wire position", () => {
+    // Distinct anchors must resolve to distinct slots. Positioning the
+    // whole group by its head would put `pend_2` above `a1` — and it
+    // would then visibly jump down when its own ack committed it at
+    // anchor 6, which is precisely the artifact this placement removes.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 1 },
+      { ...assistantText("a2"), blockStart: 6 },
+    ];
+    const pending = [
+      { ...userBubble("pend_1"), blockStart: 1 },
+      { ...userBubble("pend_2"), blockStart: 6 },
+    ];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "u1",
+      "pend_1",
+      "a1",
+      "pend_2",
+      "a2",
+    ]);
+  });
+
+  it("keeps FIFO order when a later anchor resolves to an earlier slot", () => {
+    // Defensive: anchors should be non-decreasing in FIFO order, but a
+    // stale one must never let a later send overtake an earlier one.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 4 },
+    ];
+    const pending = [
+      { ...userBubble("pend_1"), blockStart: 4 },
+      { ...userBubble("pend_2"), blockStart: 0 },
+    ];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "u1",
+      "pend_1",
+      "pend_2",
+      "a1",
+    ]);
+  });
+
+  it("trails an entry with no wire position even when later bubbles exist", () => {
+    // Snapshot-replayed / stash-restored entries carry no anchor — their
+    // index would point into a different blocks array — so they keep the
+    // historical trailing behaviour.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 9 },
+    ];
+    const pending = [userBubble("pending_srv_1")];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "u1",
+      "a1",
+      "pending_srv_1",
+    ]);
+  });
+
+  it("still lifts an anchored prompt above a request-phase card", () => {
+    // The two placement rules compose: the anchor picks the slot, then the
+    // elicitation walk-back moves further up if that slot lands after a
+    // standalone REQUEST-phase card.
+    const committed = [
+      { ...assistantText("a1"), blockStart: 0 },
+      { ...elicitationBubble("e1", "request"), blockStart: 4 },
+      { ...assistantText("a2"), blockStart: 5 },
+    ];
+    const pending = [{ ...userBubble("pend_1"), blockStart: 4 }];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "a1",
+      "pend_1",
+      "e1",
+      "a2",
+    ]);
+  });
 });
 
 // ── reorderCommittedRequestElicitations ─────────────────────────────────────

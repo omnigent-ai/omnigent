@@ -5,7 +5,8 @@ exercise the path a queued/optimistic user message takes:
 
     send → optimistic bubble renders immediately → server consumes it
     (``session.input.consumed``) → bubble promotes into committed
-    history (not dropped, not duplicated) → survives navigation.
+    history (not dropped, not duplicated, at the right transcript
+    position) → survives navigation.
 
 They guard the store wiring this change refactored — the
 ``session.input.consumed`` promotion in ``chatStore.handleSessionEvent``
@@ -49,6 +50,8 @@ _NAV_MSG = "sentinel-nav-7f3a remember this exact phrase"
 _PROMOTE_MSG = "sentinel-promote-91b2 keep this bubble"
 _QUEUE_MSG_A = "sentinel-queue-a-4d1e first of two"
 _QUEUE_MSG_B = "sentinel-queue-b-8c6f second of two"
+_ORDER_MSG_A = "sentinel-order-a-2b7d first turn prompt"
+_ORDER_MSG_B = "sentinel-order-b-5e9c second turn prompt"
 
 _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
 
@@ -56,6 +59,31 @@ _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
 def _user_bubble(page: Page, text: str):
     """Locator for the user-message bubble carrying ``text``."""
     return page.locator('[data-testid="message-bubble"][data-role="user"]').filter(has_text=text)
+
+
+def _bubble_roles(page: Page) -> list[str]:
+    """Roles of every rendered bubble, in transcript (DOM) order.
+
+    ``["user", "assistant", "user", "assistant"]`` for a clean two-turn
+    conversation. Reading the roles rather than the texts keeps the
+    assertion independent of what the model actually replied.
+    """
+    bubbles = page.locator('[data-testid="message-bubble"]')
+    return [b.get_attribute("data-role") or "" for b in bubbles.all()]
+
+
+def _index_of_user_bubble(page: Page, text: str) -> int:
+    """Transcript position of the user bubble carrying ``text``.
+
+    Indexes across ALL bubbles (both roles) so the result can be
+    compared against an assistant bubble's position. Returns ``-1`` when
+    the bubble isn't rendered.
+    """
+    bubbles = page.locator('[data-testid="message-bubble"]')
+    for index, bubble in enumerate(bubbles.all()):
+        if bubble.get_attribute("data-role") == "user" and text in (bubble.inner_text() or ""):
+            return index
+    return -1
 
 
 def _send(page: Page, text: str) -> None:
@@ -183,3 +211,76 @@ def test_second_message_queued_while_first_streams_both_render(
     expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_A)).to_have_count(1, timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_B)).to_have_count(1, timeout=60_000)
+
+
+def test_user_message_renders_above_the_reply_it_prompted(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The prompt stays ABOVE the answer to it, live and across turns.
+
+    Guards the transcript position of a user message end-to-end
+    (issue #3983). A user message is the only transcript content with no
+    position of its own: every other block is appended in stream-arrival
+    order, while the message renders as an optimistic bubble and is then
+    injected out-of-band by the ``session.input.consumed`` handler. If
+    that injection appends instead of placing the message at its wire
+    position, the message renders BELOW the reply it prompted and stays
+    there for the rest of the live session.
+
+    Asserted here:
+
+    1. The user bubble sits above the assistant bubble within a turn —
+       checked live, without a reload, since a reload reads the
+       (already-correct) persisted order and would mask the defect.
+    2. A second turn interleaves correctly, giving
+       ``[user, assistant, user, assistant]`` — a promotion that appends
+       would pile both prompts after the replies.
+
+    Scope caveat, in the spirit of the module docstring: this harness
+    runs an ``openai-agents`` agent with no smart routing, so the ack
+    (``session.input.consumed``) lands before any block commits and the
+    ordering here is correct even without the fix. What makes the defect
+    visible is a turn that commits blocks while the message is still
+    optimistic — smart routing's router-call + runner-forward window, or
+    a native-terminal harness that has no ``input.consumed`` until the
+    CLI echoes. Neither is available here. This test pins the invariant
+    (prompt above its answer, in the live view) so a future regression
+    in the placement path is caught; the racing behaviour itself is
+    covered by the ``chatStore`` and ``mergePendingBubbles`` unit suites.
+    """
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # ── turn 1 ──
+    _send(page, _ORDER_MSG_A)
+    expect(_user_bubble(page, _ORDER_MSG_A)).to_be_visible(timeout=10_000)
+
+    first_reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+    expect(first_reply).to_have_text(re.compile(r"\S"), timeout=60_000)
+
+    # (1) The prompt precedes the reply in the live transcript. Read
+    # positions across ALL bubbles so this compares transcript order, not
+    # per-role order.
+    user_index = _index_of_user_bubble(page, _ORDER_MSG_A)
+    assert user_index == 0, f"expected the prompt to open the transcript, got index {user_index}"
+    assert _bubble_roles(page)[:2] == ["user", "assistant"], (
+        f"reply rendered above the prompt: {_bubble_roles(page)}"
+    )
+
+    # ── turn 2, sent once the first turn is idle ──
+    _send(page, _ORDER_MSG_B)
+    expect(_user_bubble(page, _ORDER_MSG_B)).to_be_visible(timeout=10_000)
+    expect(page.locator('[data-testid="message-bubble"][data-role="assistant"]')).to_have_count(
+        2, timeout=60_000
+    )
+    second_reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]').nth(1)
+    expect(second_reply).to_have_text(re.compile(r"\S"), timeout=60_000)
+
+    # (2) Turns interleave — neither prompt slid below its reply.
+    assert _bubble_roles(page) == ["user", "assistant", "user", "assistant"], (
+        f"turns did not interleave: {_bubble_roles(page)}"
+    )
+    assert _index_of_user_bubble(page, _ORDER_MSG_B) == 2, (
+        "second prompt is not at the head of its own turn"
+    )

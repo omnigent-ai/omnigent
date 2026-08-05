@@ -48,6 +48,7 @@ import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
+  appendInWireOrder,
   consumePendingInitialPrompt,
   handleSessionEvent,
   reviveStrayCompletedResponse,
@@ -97,6 +98,29 @@ function assistantMessage(responseId: string, text: string): ConversationItem {
     status: "completed",
     model: "test-agent",
     content: [{ type: "output_text", text }],
+  };
+}
+
+function blockCtx(responseId: string, itemId: string): AnyBlock["ctx"] {
+  return { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId };
+}
+
+function textBlock(responseId: string, itemId: string, fullText: string): AnyBlock {
+  return {
+    type: "text_done",
+    ctx: blockCtx(responseId, itemId),
+    fullText,
+    hasCodeBlocks: false,
+  };
+}
+
+function routingCardBlock(responseId: string, itemId: string): AnyBlock {
+  return {
+    type: "routing_decision",
+    ctx: blockCtx(responseId, itemId),
+    model: "test-model",
+    applied: true,
+    rationale: "cheap enough",
   };
 }
 
@@ -4323,6 +4347,254 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.blocks).toHaveLength(1);
       expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_hi");
     });
+
+    it("commits the message at its wire position, above blocks that raced it", () => {
+      // Issue #3983: on a smart-routed turn the consumed event only fires
+      // after the router LLM call and the runner forward, so the routing
+      // card and the first reply tokens commit while the message is still
+      // optimistic. Appending on promotion would leave the user's message
+      // UNDER the answer to it for the rest of the live session. The
+      // pending entry carries the block count from send time, so the
+      // promoted block splices in ahead of everything the send caused.
+      const priorTurn = textBlock("resp_prev", "msg_prev", "earlier reply");
+      const card = routingCardBlock("resp_new", "item_card");
+      const firstTokens = textBlock("resp_new", "msg_reply", "on it");
+      useChatStore.setState({
+        blocks: [priorTurn, card, firstTokens],
+        pendingUserMessages: [
+          {
+            tempId: "pend_1",
+            content: [{ type: "input_text", text: "ship it" }],
+            // Only `priorTurn` was committed when the user hit send.
+            anchorIndex: 1,
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_ship",
+        itemType: "message",
+        clearedPendingId: "pend_1",
+        data: { role: "user", content: [{ type: "input_text", text: "ship it" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_prev",
+        "msg_ship",
+        "item_card",
+        "msg_reply",
+      ]);
+    });
+
+    it("keeps a burst of sends in order when they share an anchor", () => {
+      // Two sends before either is consumed share a wire position. The
+      // first promotion shifts the second's anchor, so FIFO promotion
+      // still renders them in the order they were typed.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "first" }], anchorIndex: 0 },
+          { tempId: "pend_2", content: [{ type: "input_text", text: "second" }], anchorIndex: 0 },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_1",
+        itemType: "message",
+        clearedPendingId: "pend_1",
+        data: { role: "user", content: [{ type: "input_text", text: "first" }] },
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_2",
+        itemType: "message",
+        clearedPendingId: "pend_2",
+        data: { role: "user", content: [{ type: "input_text", text: "second" }] },
+      });
+
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["msg_1", "msg_2"]);
+    });
+
+    it("appends when the entry carries no wire position", () => {
+      // Snapshot-replayed and stash-restored bubbles have no anchor
+      // (their index would point into a different blocks array), so they
+      // keep the historical append-on-consumed behaviour.
+      const prior = textBlock("resp_prev", "msg_prev", "earlier reply");
+      useChatStore.setState({
+        blocks: [prior],
+        pendingUserMessages: [
+          { tempId: "pending_srv", content: [{ type: "input_text", text: "replayed" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_replayed",
+        itemType: "message",
+        clearedPendingId: "pending_srv",
+        data: { role: "user", content: [{ type: "input_text", text: "replayed" }] },
+      });
+
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_prev",
+        "msg_replayed",
+      ]);
+    });
+
+    it("appends another viewer's message instead of using our reserved position", () => {
+      // Shared session: a collaborator's consumed event names a server
+      // pending id we don't hold, which is indistinguishable from our own
+      // POST not having returned its id yet — so it lands in the FIFO-head
+      // branch. Committing THEIR message at OUR wire position would lift
+      // it above blocks that preceded it, so a foreign author appends.
+      vi.mocked(getCurrentAuthorId).mockReturnValue("alice@example.com");
+      const prior = textBlock("resp_prev", "msg_prev", "earlier reply");
+      const during = textBlock("resp_new", "msg_reply", "streaming");
+      useChatStore.setState({
+        blocks: [prior, during],
+        pendingUserMessages: [
+          {
+            tempId: "pend_1",
+            content: [{ type: "input_text", text: "mine" }],
+            anchorIndex: 1,
+            author: "alice@example.com",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_bob",
+        itemType: "message",
+        clearedPendingId: "pending_srv_9",
+        createdBy: "bob@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from bob" }] },
+      });
+
+      // Appended, NOT spliced at index 1 above `msg_reply`.
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_prev",
+        "msg_reply",
+        "msg_bob",
+      ]);
+    });
+
+    it("still uses our wire position when the event carries our own author", () => {
+      // Same branch, our own message: `createdBy` matching the viewer (or
+      // absent entirely) means the FIFO head really is this message, so
+      // the reserved position applies.
+      vi.mocked(getCurrentAuthorId).mockReturnValue("alice@example.com");
+      const prior = textBlock("resp_prev", "msg_prev", "earlier reply");
+      const during = textBlock("resp_new", "msg_reply", "streaming");
+      useChatStore.setState({
+        blocks: [prior, during],
+        pendingUserMessages: [
+          {
+            tempId: "pend_1",
+            content: [{ type: "input_text", text: "mine" }],
+            anchorIndex: 1,
+            author: "alice@example.com",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_mine",
+        itemType: "message",
+        clearedPendingId: "pending_srv_9",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "mine" }] },
+      });
+
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_prev",
+        "msg_mine",
+        "msg_reply",
+      ]);
+    });
+
+    it("clears the optimistic bubble when the block already committed", () => {
+      // Issue #3983: a snapshot merge or the native transcript relay can
+      // commit the block before the consumed event lands. Only one
+      // consumed event ever fires, so bailing out on the dedupe check
+      // without popping the entry stranded the optimistic bubble at the
+      // bottom of the transcript until reload.
+      const committed: UserMessageBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "",
+          itemId: "msg_raced",
+        },
+        content: [{ type: "input_text", text: "already here" }],
+      };
+      useChatStore.setState({
+        blocks: [committed],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "already here" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_raced",
+        itemType: "message",
+        clearedPendingId: "pend_1",
+        data: { role: "user", content: [{ type: "input_text", text: "already here" }] },
+      });
+
+      const state = useChatStore.getState();
+      // No duplicate bubble, and nothing left pinned to the bottom.
+      expect(state.blocks).toEqual([committed]);
+      expect(state.pendingUserMessages).toEqual([]);
+    });
+
+    it("clears the bubble on an already-committed item the server names by an id we don't hold", () => {
+      // Same race as above, but the consumed event arrived before the POST
+      // returned the server pending id for us to adopt — so the entry is
+      // still keyed `pend_N` and the named id matches nothing. That is the
+      // normal shape of this race, not evidence the bubble is someone
+      // else's, so fall back to the FIFO head like branch 2 does. Bailing
+      // out here would strand the bubble.
+      const committed: UserMessageBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "",
+          itemId: "msg_raced",
+        },
+        content: [{ type: "input_text", text: "already here" }],
+      };
+      useChatStore.setState({
+        blocks: [committed],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "already here" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_raced",
+        itemType: "message",
+        clearedPendingId: "pending_srv_9",
+        data: { role: "user", content: [{ type: "input_text", text: "already here" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([committed]);
+      expect(state.pendingUserMessages).toEqual([]);
+    });
   });
 
   describe("slash_command (claude-native skill / surfaced command)", () => {
@@ -4414,6 +4686,77 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       // Same reference — no setState call fired.
       expect(useChatStore.getState()).toBe(before);
     });
+  });
+});
+
+describe("appendInWireOrder", () => {
+  it("hoists a late routing card above the reply it routed", () => {
+    // Issue #3983: the server publishes the card only after the router
+    // call and the runner forward, so it can land after the first deltas
+    // of its own turn. `renderItems` breaks bubble groups on
+    // `routing_decision`, so an in-place append paints the reply as two
+    // streaming bubbles split by the card.
+    const blocks = [
+      textBlock("resp_new", "msg_reply_a", "starting"),
+      textBlock("resp_new", "msg_reply_b", " work"),
+    ];
+    const out = appendInWireOrder(blocks, [routingCardBlock("resp_new", "item_card")], "resp_new");
+    expect(out.map((b) => b.ctx.itemId)).toEqual(["item_card", "msg_reply_a", "msg_reply_b"]);
+  });
+
+  it("never hoists a card past its own turn", () => {
+    // The walk stops at the first block of another response, so a card
+    // stays inside the turn it describes even when earlier turns sit
+    // directly above it.
+    const blocks = [
+      textBlock("resp_prev", "msg_prev", "earlier reply"),
+      textBlock("resp_new", "msg_reply", "starting"),
+    ];
+    const out = appendInWireOrder(blocks, [routingCardBlock("resp_new", "item_card")], "resp_new");
+    expect(out.map((b) => b.ctx.itemId)).toEqual(["msg_prev", "item_card", "msg_reply"]);
+  });
+
+  it("leaves a card that already leads its turn untouched", () => {
+    // The common (non-racing) case must stay a plain append — same order,
+    // and the blocks that were already committed keep their references so
+    // the renderer's incremental bubble cache still applies.
+    const prior = textBlock("resp_prev", "msg_prev", "earlier reply");
+    const card = routingCardBlock("resp_new", "item_card");
+    const out = appendInWireOrder([prior], [card], "resp_new");
+    expect(out).toEqual([prior, card]);
+    expect(out[0]).toBe(prior);
+  });
+
+  it("passes through blocks that are not routing cards", () => {
+    const prior = textBlock("resp_prev", "msg_prev", "earlier reply");
+    const fresh = textBlock("resp_new", "msg_reply", "starting");
+    expect(appendInWireOrder([prior], [fresh], "resp_new")).toEqual([prior, fresh]);
+  });
+
+  it("leaves a card stamped with a non-streaming response alone", () => {
+    // The chip ships with no `response_id` on the wire, so blockStream
+    // stamps it from `state.responseId` — which, for a card arriving BEFORE
+    // its own `response.created` (the intended order), is still the
+    // PREVIOUS turn's id. Walking back on that id would hoist the chip
+    // above the previous turn's reply. Only a card matching the streaming
+    // response may move.
+    const blocks = [
+      textBlock("resp_prev", "msg_prev_a", "earlier"),
+      textBlock("resp_prev", "msg_prev_b", " reply"),
+    ];
+    const stale = routingCardBlock("resp_prev", "item_card");
+    // Prior turn finished; nothing is streaming yet.
+    expect(appendInWireOrder(blocks, [stale], null).map((b) => b.ctx.itemId)).toEqual([
+      "msg_prev_a",
+      "msg_prev_b",
+      "item_card",
+    ]);
+    // A different turn streaming must not license the walk either.
+    expect(appendInWireOrder(blocks, [stale], "resp_new").map((b) => b.ctx.itemId)).toEqual([
+      "msg_prev_a",
+      "msg_prev_b",
+      "item_card",
+    ]);
   });
 });
 
