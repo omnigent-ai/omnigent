@@ -83,7 +83,7 @@ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { overlayTitleIntoCaches, type ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -4175,6 +4175,19 @@ export function handleSessionEvent(event: StreamEvent): void {
           ? { selectedModel: event.model, sessionModelOverride: event.model }
           : {},
       );
+      return;
+    case "session_title":
+      // A `/rename` typed inside a native terminal. The server already
+      // persisted `title`, so a reload restores it; patch the caches the
+      // sidebar and session snapshot render from so the new name shows
+      // without waiting for the next list reconcile. Writes are keyed by
+      // the event's own conversation id, so no open-session guard is
+      // needed (this stream only carries the open session anyway).
+      // Sessions renamed while NOT open converge via the
+      // `WS /v1/sessions/updates` diff instead.
+      if (queryClient !== null) {
+        overlayTitleIntoCaches(queryClient, event.conversationId, event.title);
+      }
       return;
     case "session_reasoning_effort":
       // A thinking-level switch made inside a native terminal. Reflect it
