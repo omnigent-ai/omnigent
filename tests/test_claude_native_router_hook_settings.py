@@ -12,7 +12,7 @@ from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_MATCHER
 
 #: Claude Code's default command-hook timeout for ``UserPromptSubmit``, which is
 #: shorter than the default for other events. Not importable — it is the CLI's,
-#: not ours — so it is pinned here as the number the registration must beat.
+#: not ours — so it is pinned here as the number the registration must undercut.
 _CLAUDE_USER_PROMPT_SUBMIT_DEFAULT_TIMEOUT_S = 30
 
 
@@ -57,9 +57,11 @@ def test_router_hook_registered_when_router_dir_set(tmp_path: Path) -> None:
     assert "omnigent.inner.hook_scripts.claude_router_hook" in hook["command"]
     assert f"--bridge-dir {bridge_dir}" in hook["command"]
     assert f"--router-dir {bridge_dir}" in hook["command"]
-    # Must exceed the hook script's own 30s request timeout, so the script's
-    # fail-open branch runs before Claude kills the hook.
-    assert hook["timeout"] == 40
+    # Derived from the hook script's own request budget, so it always exceeds
+    # it and the script's fail-open branch runs before Claude kills the hook.
+    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S
+
+    assert hook["timeout"] == int(HOOK_TIMEOUT_S)
 
 
 def test_router_hook_coexists_with_policy_hooks(tmp_path: Path) -> None:
@@ -122,13 +124,15 @@ def test_the_route_turn_hook_is_registered_above_its_own_request_budget(
     tmp_path: Path,
 ) -> None:
     """
-    Add #23: claude's 30 s ``UserPromptSubmit`` default is explicitly overridden.
+    Add #23: claude's ``UserPromptSubmit`` default is explicitly overridden.
 
-    ``UserPromptSubmit`` has a *shorter* default timeout than other Claude Code
-    events, so the codex ladder's 45 s outer hop does not transfer — the entry
-    must carry its own larger number. Without it Claude kills the hook before
-    the hook's own fail-open branch runs, and a killed ``UserPromptSubmit`` hook
-    is exactly the case that can eat a typed prompt.
+    The entry must carry our own number rather than inherit Claude Code's,
+    for two reasons that now pull in the same direction. It has to sit ABOVE
+    the hook script's own HTTP budget, or Claude kills the hook before its
+    fail-open branch runs — and a killed ``UserPromptSubmit`` hook is exactly
+    the case that can eat a typed prompt. And it has to sit BELOW the CLI's
+    own default, because the default is what a wedged hook would cost the
+    user: routing is not allowed to hold a prompt for half a minute.
     """
     from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S, HOOK_REQUEST_TIMEOUT_S
 
@@ -142,10 +146,8 @@ def test_the_route_turn_hook_is_registered_above_its_own_request_budget(
     assert len(entries) == 1
     registered = entries[0]["timeout"]
     assert registered == HARNESS_HOOK_TIMEOUT_S
-    # The whole point of registering it: above the script's own HTTP budget, and
-    # above the 30 s default this event would otherwise have used.
     assert registered > HOOK_REQUEST_TIMEOUT_S
-    assert registered > _CLAUDE_USER_PROMPT_SUBMIT_DEFAULT_TIMEOUT_S
+    assert registered < _CLAUDE_USER_PROMPT_SUBMIT_DEFAULT_TIMEOUT_S
 
 
 def test_the_subagent_router_hook_is_registered_above_its_own_request_budget(

@@ -98,14 +98,24 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 # ``omnigent.runner.subagent_routing``: larger than the runner's own wait so
 # the runner answers first, smaller than the harness's hook timeout so this
 # script's fail-open branch can run.
-REQUEST_TIMEOUT_S = 30.0
+#
+# Single digits on purpose. This gate holds the parent agent's spawn tool open
+# until it answers, so a fail-open that takes half a minute stalls the agent as
+# surely as an error would; the routing call inside it runs on a 5s budget
+# (``omnigent.server.smart_routing.ROUTING_REQUEST_TIMEOUT_S``).
+REQUEST_TIMEOUT_S = 8.0
+
+# Headroom hop 1 adds over hop 2. Enough for interpreter start-up and the
+# script's fail-open branch, and no more — every second here is a second the
+# harness waits after the request has already given up.
+HOOK_TIMEOUT_HEADROOM_S = 4.0
 
 # Hop 1: the budget a harness registers on its own spawn hook. STRICTLY larger
 # than ``REQUEST_TIMEOUT_S`` — a hook killed at the same instant its HTTP call
 # gives up never reaches its fail-open branch, and the harness sees a dead hook
 # instead of "no opinion". The claude-native and codex entries derive the same
-# +10s headroom; the in-process claude-sdk hook reads this constant.
-HOOK_TIMEOUT_S = REQUEST_TIMEOUT_S + 10.0
+# headroom; the in-process claude-sdk hook reads this constant.
+HOOK_TIMEOUT_S = REQUEST_TIMEOUT_S + HOOK_TIMEOUT_HEADROOM_S
 
 # ``tool_input`` keys naming the requested subagent, in preference order.
 # Claude Code sends ``subagent_type``; codex sends ``task_name`` /

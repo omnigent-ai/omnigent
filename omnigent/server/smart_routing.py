@@ -44,6 +44,22 @@ _logger = logging.getLogger(__name__)
 # router's base URL, e.g. ``<base_url>/routes:select``.
 ROUTES_SELECT_PATH = "routes:select"
 
+#: Per-call budget for ONE routing request — the external ``routes:select``
+#: POST and the built-in judge's own LLM call alike. The innermost number in
+#: every routing timeout ladder, so a wedged router degrades to "not routed"
+#: before any hop above it gives up on the hook that is holding a prompt or a
+#: spawn.
+#:
+#: Sized from the observed round trip: healthy ``routes:select`` answers land
+#: in ~1.4–3s, and the slowest sample on record (~6.7s) was a gateway 500, not
+#: a verdict. Five seconds therefore covers the healthy case with headroom
+#: while capping the hazard paths — a first-message hook and a subagent spawn
+#: gate — at a blink instead of the 30–45s a wedged server used to cost.
+#:
+#: One attempt, no retry: on an interactive path a second try only doubles the
+#: stall, and falling open onto the harness's own model is the better answer.
+ROUTING_REQUEST_TIMEOUT_S = 5.0
+
 # ── Model lists per harness family ──────────────────────────────────────────
 #
 # Ordered cheapest → most powerful within each family. Live per-session catalogs
@@ -426,7 +442,15 @@ _VERDICT_SCHEMA: dict[str, object] = {
 
 
 class LLMRoutingClient:
-    """Default routing client using the server-level PolicyLLMClient."""
+    """Default routing client using the server-level PolicyLLMClient.
+
+    The judge call is capped at :data:`ROUTING_REQUEST_TIMEOUT_S` rather than
+    left on the server ``llm:`` block's own ``request_timeout`` (300s by
+    default, multiplied by every configured fallback model). A judge that slow
+    is not a verdict anybody is still waiting for: the prompt or spawn it
+    belongs to has long since needed an answer, so it degrades to "not routed"
+    on the same budget the external router gets.
+    """
 
     def __init__(self, llm_client: Any) -> None:
         self._llm = llm_client
@@ -438,6 +462,8 @@ class LLMRoutingClient:
         message: str,
         available_models: dict[str, list[str]],
     ) -> RoutingResult | None:
+        import asyncio
+
         flat = _flatten_models(available_models)
         rubric = _build_rubric(available_models)
         _logger.info(
@@ -447,22 +473,29 @@ class LLMRoutingClient:
         )
         self.last_error = None
         try:
-            response = await self._llm.create(
-                instructions=rubric,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": message[:4000]}],
-                    }
-                ],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "routing_verdict",
-                        "strict": True,
-                        "schema": _VERDICT_SCHEMA,
-                    }
-                },
+            # Both bounds are needed: ``timeout`` is the adapter's own per-call
+            # HTTP budget, and ``wait_for`` covers everything it does not (a
+            # fallback chain, a token refresh, a stalled stream read).
+            response = await asyncio.wait_for(
+                self._llm.create(
+                    instructions=rubric,
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": message[:4000]}],
+                        }
+                    ],
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": "routing_verdict",
+                            "strict": True,
+                            "schema": _VERDICT_SCHEMA,
+                        }
+                    },
+                    timeout=ROUTING_REQUEST_TIMEOUT_S,
+                ),
+                timeout=ROUTING_REQUEST_TIMEOUT_S,
             )
             text = response.output[0].content[0].text
             # The verdict can echo prompt text in its rationale, so keep it off
@@ -1474,7 +1507,7 @@ class ExternalRoutingClient:
         databricks_profile: str | None = None,
         auth_provider: Callable[[], Mapping[str, str] | None] | None = None,
         model_prefixes: Sequence[str] | None = None,
-        request_timeout: float = 20.0,
+        request_timeout: float = ROUTING_REQUEST_TIMEOUT_S,
         selection_model: str | None = None,
         menus: Mapping[str, Sequence[str]] | None = None,
         servable_aliases: Mapping[str, str] | None = None,
@@ -1504,8 +1537,10 @@ class ExternalRoutingClient:
         :param model_prefixes: Prefixes this deployment's catalog attaches to
             model ids the router keys bare, stripped on the way out and
             restored on its answer. ``None`` uses :data:`MODEL_ID_PREFIXES`.
-        :param request_timeout: Per-call timeout in seconds; routing
-            runs once per turn so a slow router can't stall forever.
+        :param request_timeout: Per-call timeout in seconds, defaulting to
+            :data:`ROUTING_REQUEST_TIMEOUT_S`. The innermost wait in every
+            routing ladder, so a slow router degrades to "not routed" long
+            before the hook holding the user's prompt or spawn is killed.
         :param selection_model: Model the router should use for its own
             extraction call, sent as ``route_selector.config.model`` so a
             deployment can pin one it has query access to. ``None`` omits

@@ -24,15 +24,23 @@ handler forwards to it with :func:`make_server_relay_resolver`.
 strictly larger than the hop it waits on — otherwise an inner hop's
 fail-open branch can never run. Canonical values, outermost first:
 
-1. harness hook timeout — 40s (``claude_native_bridge``'s PreToolUse entry,
+1. harness hook timeout — 12s (``claude_native_bridge``'s PreToolUse entry,
    codex's spawn hook, and ``HOOK_TIMEOUT_S`` for the in-process claude-sdk
    hook). Strictly larger than hop 2, never equal to it: a hook killed at the
    same instant its request gives up never reaches its fail-open branch.
-2. hook script HTTP request — :data:`HOOK_REQUEST_TIMEOUT_S` (30s, defined
+2. hook script HTTP request — :data:`HOOK_REQUEST_TIMEOUT_S` (8s, defined
    as ``REQUEST_TIMEOUT_S`` in ``omnigent.inner.hook_scripts.subagent_router``,
    which stays stdlib-only and cannot import this module)
-3. runner loopback relay wait — :data:`RELAY_TIMEOUT_S` (20s)
-4. server relay hop — :data:`SERVER_HOP_TIMEOUT_S` (15s)
+3. runner loopback relay wait — :data:`RELAY_TIMEOUT_S` (7s)
+4. server relay hop — :data:`SERVER_HOP_TIMEOUT_S` (6s), inside which the
+   routing call itself runs on
+   :data:`omnigent.server.smart_routing.ROUTING_REQUEST_TIMEOUT_S` (5s)
+
+**The ladder is tight on purpose.** A spawn gate holds the parent agent's
+tool call open until it answers, so a fail-open that takes 30 seconds stalls
+the agent even though nothing errored. One second per step keeps a wedged
+server to a visible pause while leaving every hop room for its own fail-open
+branch.
 """
 
 from __future__ import annotations
@@ -73,14 +81,15 @@ SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-subagent"
 
 #: Seconds the runner's loopback relay waits for a verdict. Hop 3 of the
 #: timeout budget in the module docstring.
-RELAY_TIMEOUT_S = 20.0
+RELAY_TIMEOUT_S = 7.0
 
-#: Seconds the runner waits on the server relay route. Hop 4 (innermost).
-SERVER_HOP_TIMEOUT_S = 15.0
+#: Seconds the runner waits on the server relay route. Hop 4, inside which
+#: the routing call itself runs on ``ROUTING_REQUEST_TIMEOUT_S`` (5s).
+SERVER_HOP_TIMEOUT_S = 6.0
 
 #: Hop 2 of the budget, restated for the docstring cross-reference. The hook
 #: script owns the value; it cannot import this module (stdlib-only).
-HOOK_REQUEST_TIMEOUT_S = 30.0
+HOOK_REQUEST_TIMEOUT_S = 8.0
 
 #: Conversation label carrying the routing decision behind a session's
 #: ``model_override``, so the child-sessions API can join the two without

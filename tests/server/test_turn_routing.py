@@ -1137,6 +1137,104 @@ def test_the_router_clients_own_timeout_sits_inside_the_hook_budget() -> None:
     assert 0 < default < HOOK_REQUEST_TIMEOUT_S
 
 
+def test_every_routing_budget_stays_in_single_digits() -> None:
+    """
+    The owner's ruling: a fail-open that takes 30s is blocking in practice.
+
+    The relation tests above only pin the ORDERING, which a 45s ladder
+    satisfies just as well as a 15s one. This pins the magnitude: the two
+    hazard paths — a first-message hook holding a typed prompt and a spawn gate
+    holding an agent's tool call — must give up within seconds, so every
+    request budget on them is a single digit and the harness-registered kill is
+    well inside a quarter of a minute.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import (
+        HOOK_TIMEOUT_S as SPAWN_HOOK_TIMEOUT_S,
+    )
+    from omnigent.inner.hook_scripts.subagent_router import (
+        REQUEST_TIMEOUT_S as SPAWN_REQUEST_TIMEOUT_S,
+    )
+    from omnigent.runner import subagent_routing, turn_routing
+    from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S
+
+    # The routing call itself, the innermost wait on every path.
+    assert ROUTING_REQUEST_TIMEOUT_S <= 8.0
+    # Each hook's own HTTP budget — what the user actually waits out.
+    for budget in (
+        turn_routing.HOOK_REQUEST_TIMEOUT_S,
+        turn_routing.RELAY_TIMEOUT_S,
+        turn_routing.SERVER_HOP_TIMEOUT_S,
+        turn_routing.SETTINGS_UPDATE_TIMEOUT_S,
+        subagent_routing.HOOK_REQUEST_TIMEOUT_S,
+        subagent_routing.RELAY_TIMEOUT_S,
+        subagent_routing.SERVER_HOP_TIMEOUT_S,
+        SPAWN_REQUEST_TIMEOUT_S,
+    ):
+        assert 0 < budget < 10.0, budget
+    # The outermost hop is the harness's own kill, which only needs enough
+    # headroom for the hook script to reach its fail-open branch.
+    assert turn_routing.HARNESS_HOOK_TIMEOUT_S <= 15
+    assert SPAWN_HOOK_TIMEOUT_S <= 15
+
+
+def test_the_subagent_ladder_is_strictly_decreasing_inwards() -> None:
+    """
+    The spawn gate's own four hops, mirroring the turn ladder's relations.
+
+    ``subagent_routing`` restates the hook script's budget for its docstring
+    cross-reference (the script is stdlib-only and cannot import it), so the
+    two spellings must agree or the documented ladder is fiction.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S, REQUEST_TIMEOUT_S
+    from omnigent.runner.subagent_routing import (
+        HOOK_REQUEST_TIMEOUT_S,
+        RELAY_TIMEOUT_S,
+        SERVER_HOP_TIMEOUT_S,
+    )
+    from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S
+
+    assert HOOK_REQUEST_TIMEOUT_S == REQUEST_TIMEOUT_S
+    assert HOOK_TIMEOUT_S > REQUEST_TIMEOUT_S > RELAY_TIMEOUT_S > SERVER_HOP_TIMEOUT_S
+    assert SERVER_HOP_TIMEOUT_S > ROUTING_REQUEST_TIMEOUT_S
+
+
+def test_the_routing_call_is_the_innermost_wait_on_the_turn_path() -> None:
+    """
+    The turn ladder bottoms out on the routing call, not the other way round.
+
+    ``SERVER_HOP_TIMEOUT_S`` is the runner's wait on the server relay route,
+    and the routing client runs inside it. Equal numbers are not enough: the
+    hop has to outlast the call so the server's own fail-open answer ("no
+    verdict") reaches the runner instead of the runner giving up first and
+    reporting the vaguer "routing server unreachable".
+    """
+    from omnigent.runner.turn_routing import SERVER_HOP_TIMEOUT_S
+    from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S
+
+    assert SERVER_HOP_TIMEOUT_S > ROUTING_REQUEST_TIMEOUT_S
+
+
+def test_the_builtin_judge_shares_the_external_routers_budget() -> None:
+    """
+    The judge is a routing call too, so it cannot inherit the ``llm:`` timeout.
+
+    ``PolicyLLMClient`` defaults to a 300s request timeout and multiplies it by
+    every configured fallback model. Left alone, picking the built-in judge as
+    the routing source turned a fail-open into a multi-minute hang, on exactly
+    the paths a wedged router is supposed to cost seconds.
+    """
+    import inspect
+
+    from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S, LLMRoutingClient
+
+    source = inspect.getsource(LLMRoutingClient.route)
+    # Both bounds: the adapter's own per-call HTTP timeout, and a wait_for that
+    # covers the fallback chain and any pre-request token refresh.
+    assert "timeout=ROUTING_REQUEST_TIMEOUT_S" in source
+    assert "asyncio.wait_for" in source
+    assert ROUTING_REQUEST_TIMEOUT_S <= 8.0
+
+
 # ── Route-once under load, and the manual-pin gap ───────────────────
 
 

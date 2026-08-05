@@ -52,13 +52,23 @@ launch left behind.
 strictly larger than the hop it waits on — otherwise an inner hop's
 fail-open branch can never run. Canonical values, outermost first:
 
-1. harness hook timeout — :data:`HARNESS_HOOK_TIMEOUT_S` (45s, registered
+1. harness hook timeout — :data:`HARNESS_HOOK_TIMEOUT_S` (15s, registered
    on each harness's ``UserPromptSubmit`` entry)
 2. hook script HTTP request + model switch —
-   :data:`HOOK_REQUEST_TIMEOUT_S` (25s) then
-   :data:`SETTINGS_UPDATE_TIMEOUT_S` (15s)
-3. runner loopback relay wait — :data:`RELAY_TIMEOUT_S` (20s)
-4. server relay hop — :data:`SERVER_HOP_TIMEOUT_S` (15s)
+   :data:`HOOK_REQUEST_TIMEOUT_S` (8s) then
+   :data:`SETTINGS_UPDATE_TIMEOUT_S` (5s)
+3. runner loopback relay wait — :data:`RELAY_TIMEOUT_S` (7s)
+4. server relay hop — :data:`SERVER_HOP_TIMEOUT_S` (6s)
+
+Inside hop 4 sits the routing call itself
+(:data:`omnigent.server.smart_routing.ROUTING_REQUEST_TIMEOUT_S`, 5s).
+
+**The ladder is tight on purpose.** This is a hazard path: the prompt is
+frozen in the pane until the hook answers, so a fail-open that takes 30
+seconds is blocking in practice even though nothing errored. Every step is
+one second, from the 5s routing call outwards, so a wedged server costs a
+visible pause rather than a hang — and each hop still has room to run its
+own fail-open branch before the hop above it gives up.
 """
 
 from __future__ import annotations
@@ -125,21 +135,27 @@ ROUTE_PATH_TEMPLATE = "/v1/sessions/{session_id}/route-turn"
 #: process is the only one holding ``RuntimeCaps.routing_client``).
 SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-turn"
 
-#: Hop 1: the timeout registered on the harness's hook entry.
-HARNESS_HOOK_TIMEOUT_S = 45
+#: Hop 1: the timeout registered on the harness's hook entry. Covers the
+#: hook script's whole life (hop 2a + hop 2b) with one second to spare, so
+#: the harness only steps in when the script itself wedged.
+HARNESS_HOOK_TIMEOUT_S = 15
 
-#: Hop 2a: the hook script's HTTP budget for the routing verdict.
-HOOK_REQUEST_TIMEOUT_S = 25.0
+#: Hop 2a: the hook script's HTTP budget for the routing verdict. The
+#: user-visible cost of a wedged router — the prompt sits in the pane until
+#: this expires — so it stays in single digits.
+HOOK_REQUEST_TIMEOUT_S = 8.0
 
 #: Hop 2b: the codex hook's ``thread/settings/update`` budget, after the
-#: verdict. Claude's hook applies nothing, so it has no hop 2b.
-SETTINGS_UPDATE_TIMEOUT_S = 15.0
+#: verdict. Claude's hook applies nothing, so it has no hop 2b. A local
+#: app-server RPC over a unix socket, so seconds is already generous.
+SETTINGS_UPDATE_TIMEOUT_S = 5.0
 
 #: Hop 3: seconds the runner's loopback relay waits for a verdict.
-RELAY_TIMEOUT_S = 20.0
+RELAY_TIMEOUT_S = 7.0
 
-#: Hop 4 (innermost): seconds the runner waits on the server relay route.
-SERVER_HOP_TIMEOUT_S = 15.0
+#: Hop 4: seconds the runner waits on the server relay route. The routing
+#: call itself (``ROUTING_REQUEST_TIMEOUT_S``, 5s) runs inside this.
+SERVER_HOP_TIMEOUT_S = 6.0
 
 #: Seconds the replay waits for the hook to confirm it blocked the prompt
 #: (:data:`MARKER_FILE`). Timing out means the hook fell open, so the
@@ -481,8 +497,8 @@ async def resolve_turn_route(
         # Terminal: the hook is only registered for a session that launched
         # with routing on, so this answer means it was turned off afterwards.
         # Left non-terminal, every prompt for the rest of the session paid a
-        # full round trip (25s worst case on a degraded server) to be told the
-        # same thing. The cost of terminality is narrow — routing toggled off
+        # full round trip (the hook's whole HTTP budget on a degraded server)
+        # to be told the same thing. The cost of terminality is narrow — off
         # and back on again before the FIRST prompt no longer routes that
         # prompt in the TUI; the composer gate and create-time path are
         # unaffected.

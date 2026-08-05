@@ -53,7 +53,19 @@ AUTO_HARNESS = "auto"
 #: own presentation labels (``omnigent.ui`` / ``omnigent.wrapper``) over it.
 ROUTING_SESSION_LABELS = {"omnigent.smart_routing": "cli-route"}
 
+#: Budget for the routed ``POST /v1/sessions``. Generous on the read because
+#: this is a session CREATE, not a routing call: it validates the workspace on
+#: the host, may cut a worktree, and resolves a pre-launch model catalog. A
+#: short budget here would abandon creates that were merely slow and drop the
+#: user into an unrouted session for no good reason.
 _TIMEOUT = httpx.Timeout(10.0, read=60.0)
+
+#: Budget for the preflight reads (``/v1/info``, ``/v1/hosts``). These ARE
+#: routing calls, they answer in milliseconds on a healthy server, and every
+#: failure already degrades to "unknown" — which does not gate — so there is
+#: nothing to win by waiting. Keeping it short stops a wedged server from
+#: stalling the launch before the session even exists.
+_PREFLIGHT_TIMEOUT = httpx.Timeout(5.0)
 
 
 @dataclass(frozen=True)
@@ -438,7 +450,9 @@ def _get_json(*, base_url: str, path: str) -> dict[str, Any]:
     GET *path* and return its JSON object, or ``{}`` on any failure.
 
     Preflight reads treat an unreadable answer as "unknown" and let the
-    caller's own defaults decide, so this never raises.
+    caller's own defaults decide, so this never raises — and a timeout is one
+    of those unreadable answers, which is why the budget is
+    :data:`_PREFLIGHT_TIMEOUT` rather than the create's.
 
     :param base_url: Omnigent server base URL.
     :param path: Request path, e.g. ``"/v1/info"``.
@@ -446,7 +460,7 @@ def _get_json(*, base_url: str, path: str) -> dict[str, Any]:
     """
     try:
         with httpx.Client(
-            base_url=base_url, headers=_headers(base_url), timeout=_TIMEOUT
+            base_url=base_url, headers=_headers(base_url), timeout=_PREFLIGHT_TIMEOUT
         ) as client:
             resp = client.get(path)
             if resp.status_code >= 400:

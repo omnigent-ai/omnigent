@@ -1489,14 +1489,16 @@ def build_hook_settings(
             "--router-dir",
             str(subagent_router_dir),
         ]
+        from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S
+
         router_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(router_command_parts),
             # Outermost hop of the routing timeout budget documented in
-            # ``omnigent.runner.subagent_routing``: it must exceed the hook
-            # script's own 30s request timeout so the script's fail-open
-            # branch can actually run before Claude kills it.
-            "timeout": 40,
+            # ``omnigent.runner.subagent_routing``: derived from the hook
+            # script's own request budget so it always exceeds it and the
+            # script's fail-open branch runs before Claude kills it.
+            "timeout": int(HOOK_TIMEOUT_S),
         }
         hooks.setdefault("PreToolUse", []).append(
             {"matcher": CLAUDE_SUBAGENT_TOOL_MATCHER, "hooks": [router_hook]}

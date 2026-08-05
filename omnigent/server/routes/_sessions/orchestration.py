@@ -3942,6 +3942,14 @@ async def _persist_session_event(
     return item_id
 
 
+# How long routing waits on a stale catalog refresh. The fetch itself retries
+# a booting runner for ~30s, and it is only ever awaited to sharpen a routing
+# candidate list — a wait that long would make the whole routing hazard path
+# stall on a catalog rather than on the router. Bounding the AWAIT (not the
+# task) leaves the single-flight running to fill the cache for the next turn.
+_ROUTING_CATALOG_WAIT_S = 3.0
+
+
 async def _refresh_stale_native_model_options(
     session_id: str,
     runner_client: httpx.AsyncClient | None,
@@ -3956,8 +3964,9 @@ async def _refresh_stale_native_model_options(
     turn routing offers a vocabulary the pane does not have. Once a runner
     is bound its ``claude-model-options`` endpoint reports the pinned
     aliases, so await that fetch before reading the cache. Leaves the stale
-    entry in place when there is no runner or the fetch fails — a stale
-    vocabulary still beats none.
+    entry in place when there is no runner, the fetch fails, or it outruns
+    :data:`_ROUTING_CATALOG_WAIT_S` — a stale vocabulary still beats none,
+    and beats holding a prompt while the catalog retries a booting runner.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param runner_client: HTTP client pointed at the bound runner, or
@@ -3967,8 +3976,7 @@ async def _refresh_stale_native_model_options(
         return
     inflight = _model_options_inflight.get(session_id)
     if inflight is not None:
-        with contextlib.suppress(Exception):
-            await asyncio.shield(inflight)
+        await _await_briefly(inflight)
         return
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
     task = asyncio.create_task(
@@ -3976,8 +3984,21 @@ async def _refresh_stale_native_model_options(
     )
     _model_options_inflight[session_id] = task
     task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
+    await _await_briefly(task)
+
+
+async def _await_briefly(task: asyncio.Task[None]) -> None:
+    """
+    Wait up to :data:`_ROUTING_CATALOG_WAIT_S` for *task*, then give up on it.
+
+    Shielded, so timing out abandons the wait rather than the fetch: the
+    single-flight keeps running and its result lands in the cache for whoever
+    reads it next.
+
+    :param task: The in-flight model-options fetch.
+    """
     with contextlib.suppress(Exception):
-        await asyncio.shield(task)
+        await asyncio.wait_for(asyncio.shield(task), timeout=_ROUTING_CATALOG_WAIT_S)
 
 
 async def _native_turn_catalog(

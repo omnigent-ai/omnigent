@@ -72,6 +72,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
+from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
@@ -921,7 +922,7 @@ _CODEX_SPAWN_AGENT_MATCHER = r".*spawn_agent"
 # Kept just above the hook's own request budget so codex's kill is the
 # outermost bound: the hook fails open on its timeout, codex only steps in
 # if the hook itself wedged.
-_CODEX_ROUTER_HOOK_TIMEOUT_SECONDS = int(_ROUTER_REQUEST_TIMEOUT_S) + 10
+_CODEX_ROUTER_HOOK_TIMEOUT_SECONDS = int(_ROUTER_REQUEST_TIMEOUT_S + _ROUTER_HOOK_HEADROOM_S)
 # Codex release the ``PreToolUse`` spawn gate is verified against. Older CLIs
 # spell the flattened spawn tool name differently (or lack ``PreToolUse``
 # entirely), so the matcher above never fires and routing silently no-ops.
