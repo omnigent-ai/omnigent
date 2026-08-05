@@ -36,10 +36,10 @@ function getOrCreate(sessionId: string): SessionLog {
   return log;
 }
 
-// Cache the debug flag so pushSseEvent is a single boolean check per call.
-// Reads both ?debug=1 (URL) and localStorage "debug"="1".
-// Updated on popstate so SPA navigation that adds/removes ?debug=1 is picked up.
-function readDebugMode(): boolean {
+// Re-read on every call: localStorage and window.location.search are both
+// fast O(1) reads. Caching against popstate was unreliable because React
+// Router uses pushState/replaceState which do not fire popstate.
+function isDebugMode(): boolean {
   if (typeof window === "undefined") return false;
   if (new URLSearchParams(window.location.search).get("debug") === "1") return true;
   try {
@@ -49,17 +49,11 @@ function readDebugMode(): boolean {
   }
 }
 
-let debugMode = readDebugMode();
-
-if (typeof window !== "undefined") {
-  window.addEventListener("popstate", () => {
-    debugMode = readDebugMode();
-  });
-}
+const EMPTY: readonly SseLogEntry[] = [];
 
 /** Push one event into the session's ring buffer. No-op when debug is off. */
 export function pushSseEvent(sessionId: string, event: StreamEvent): void {
-  if (!debugMode) return;
+  if (!isDebugMode()) return;
   const log = getOrCreate(sessionId);
   const entry: SseLogEntry = { index: log.nextIndex++, ts: Date.now(), event };
   // Always produce a new array reference so useSyncExternalStore's Object.is
@@ -85,7 +79,7 @@ export function subscribeSseLog(sessionId: string, cb: () => void): () => void {
   return () => log.listeners.delete(cb);
 }
 
-/** Snapshot of entries for a session (empty array when none). */
+/** Snapshot of entries for a session (stable empty array when none). */
 export function snapshotSseLog(sessionId: string): readonly SseLogEntry[] {
-  return logs.get(sessionId)?.entries ?? [];
+  return logs.get(sessionId)?.entries ?? EMPTY;
 }
