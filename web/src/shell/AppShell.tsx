@@ -89,6 +89,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
+import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -1442,6 +1443,21 @@ export function AppShell() {
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
                 </main>
+
+                {/* Debug-mode execution-logs rail — desktop only, hidden when a
+              push panel is open (the panel itself becomes the focus). Only
+              rendered in debug mode so the column doesn't occupy space in
+              normal use. */}
+                {conversationId && debugMode && !panelOpen && !executionLogsOpen && (
+                  <div className="hidden md:flex md:flex-col md:w-48 md:shrink-0 md:border-l md:border-border md:overflow-y-auto md:p-2 md:gap-2">
+                    <SessionRail
+                      conversationId={conversationId}
+                      onExpandTerminals={openTerminalsPanel}
+                      onExpandExecutionLogs={openExecutionLogsPanel}
+                      suppressed={false}
+                    />
+                  </div>
+                )}
 
                 {/* Right workspace card — gated on conversationId (panels have
               no workspace to read without a session), default-open,
