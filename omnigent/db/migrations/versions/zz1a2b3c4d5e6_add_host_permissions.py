@@ -1,7 +1,7 @@
 """add host permissions
 
 Revision ID: zz1a2b3c4d5e6
-Revises: d1e2f3a4b5c6
+Revises: c4d5e6f7a8b9
 Create Date: 2026-07-07 00:00:00.000000
 
 Adds the ``host_permissions`` table: a junction table mapping
@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "zz1a2b3c4d5e6"
-down_revision: str | None = "b3c4d5e6f7a8"
+down_revision: str | None = "c4d5e6f7a8b9"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

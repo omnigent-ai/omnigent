@@ -1084,6 +1084,7 @@ def create_app(
                     permission_store=permission_store,
                     host_store=host_store,
                     host_registry=host_registry,
+                    host_permission_store=host_permission_store,
                     agent_cache=agent_cache,
                     runner_router=runner_router,
                     tunnel_registry=tunnel_registry,

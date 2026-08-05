@@ -120,6 +120,7 @@ class FireDeps:
     permission_store: Any | None
     host_store: Any | None
     host_registry: Any | None
+    host_permission_store: Any | None = None
     agent_cache: Any | None = None
     runner_router: Any | None = None
     tunnel_registry: Any | None = None
@@ -799,7 +800,11 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             _wait_for_runner_client,
         )
 
-        if deps.host_registry is None or deps.host_store is None:
+        if (
+            deps.host_registry is None
+            or deps.host_store is None
+            or deps.host_permission_store is None
+        ):
             raise RuntimeError("connected host registry/store is not configured")
 
         owner = task.user_id or RESERVED_USER_LOCAL
@@ -818,6 +823,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             host_registry=deps.host_registry,
             conversation_store=deps.conversation_store,
             permission_store=deps.permission_store,
+            host_permission_store=deps.host_permission_store,
         )
 
         attempt = await _launch_runner_on_host(

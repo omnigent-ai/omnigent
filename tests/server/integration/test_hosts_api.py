@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
-from omnigent.db.utils import now_epoch
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -1648,9 +1647,7 @@ async def test_manage_grantee_cannot_redelegate_manage(
             json={"level": "manage"},
             headers={"x-test-user": "alice@test.com"},
         )
-        assert resp.status_code == 403, (
-            "manage grantee must not be able to re-delegate manage"
-        )
+        assert resp.status_code == 403, "manage grantee must not be able to re-delegate manage"
 
         # The owner CAN grant ``manage``.
         resp = await client.put(

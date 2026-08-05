@@ -433,7 +433,12 @@ def register_core_routes(
         if launch_host_id is not None and resp.runner_id is None:
             host_registry = getattr(request.app.state, "host_registry", None)
             host_store_inst = getattr(request.app.state, "host_store", None)
-            if host_registry is not None and host_store_inst is not None:
+            host_permission_store = getattr(request.app.state, "host_permission_store", None)
+            if (
+                host_registry is not None
+                and host_store_inst is not None
+                and host_permission_store is not None
+            ):
                 from omnigent.host.frames import (
                     HostLaunchRunnerFrame,
                     encode_host_frame,
@@ -450,9 +455,7 @@ def register_core_routes(
                     host_registry=host_registry,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
-                    host_permission_store=getattr(
-                        request.app.state, "host_permission_store", None
-                    ),
+                    host_permission_store=host_permission_store,
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)

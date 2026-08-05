@@ -3049,7 +3049,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :returns: Count of conversations whose ``host_id`` matches.
         """
-        with self._session() as session:
+        with self._session("count_conversations_by_host") as session:
             return (
                 session.query(SqlConversationMetadata)
                 .filter(

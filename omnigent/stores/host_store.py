@@ -641,7 +641,7 @@ class HostStore:
 
         :returns: List of :class:`Host` entities for every owner.
         """
-        with self._session() as session:
+        with self._session("list_all_hosts") as session:
             rows = (
                 session.query(SqlHost)
                 .filter(SqlHost.workspace_id == current_workspace_id())
@@ -668,7 +668,7 @@ class HostStore:
             ``"alice@example.com"``.
         :returns: List of :class:`Host` entities the user may see.
         """
-        with self._session() as session:
+        with self._session("list_hosts_for_user") as session:
             granted_host_ids = select(SqlHostPermission.host_id).where(
                 SqlHostPermission.workspace_id == current_workspace_id(),
                 SqlHostPermission.user_id == user_id,
