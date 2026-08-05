@@ -30,6 +30,8 @@ variables:
     default: issue_classifications
   scores_table:
     default: issue_scores
+  latest_scores_view:
+    default: issue_scores_latest
   bot_state_table:
     default: issue_bot_state
   artifact_volume_name:

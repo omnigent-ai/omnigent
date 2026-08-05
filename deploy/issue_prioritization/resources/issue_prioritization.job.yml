@@ -28,6 +28,7 @@ resources:
               source-table: ${var.catalog}.${var.schema}.${var.source_table}
               classifications-table: ${var.catalog}.${var.schema}.${var.classifications_table}
               scores-table: ${var.catalog}.${var.schema}.${var.scores_table}
+              latest-scores-view: ${var.catalog}.${var.schema}.${var.latest_scores_view}
               bot-state-table: ${var.catalog}.${var.schema}.${var.bot_state_table}
               artifact-dir: /Volumes/${var.catalog}/${var.schema}/${var.artifact_volume_name}
               model-endpoint: ${var.model_endpoint}

@@ -36,6 +36,7 @@ The job reads open community issues from `github_issues_bronze`, persists LLM
 classifications in `issue_classifications`, appends the ranking to `issue_scores`,
 and writes ranking plus proposed label mutations to the managed
 `issue_priority_artifacts` volume. Dry-run never changes GitHub issues.
+`issue_scores_latest` always exposes the newest complete run for dashboard queries.
 
 Force a classifier refresh after prompt changes or for a backfill:
 

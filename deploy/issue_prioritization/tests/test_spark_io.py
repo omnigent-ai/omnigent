@@ -55,12 +55,16 @@ class FakeSpark:
         self.catalog = FakeCatalog()
         self.schemas = []
         self.frames = []
+        self.statements = []
 
     def createDataFrame(self, rows, schema):
         self.schemas.append(schema)
         frame = FakeFrame()
         self.frames.append(frame)
         return frame
+
+    def sql(self, statement):
+        self.statements.append(statement)
 
 
 def test_classification_schema_handles_empty_arrays() -> None:
@@ -83,7 +87,11 @@ def test_classification_schema_handles_empty_arrays() -> None:
 
 def test_score_sink_uses_schema_evolution() -> None:
     spark = FakeSpark()
-    sink = SparkScoreSink(spark, "main.team.scores")
+    sink = SparkScoreSink(
+        spark,
+        "main.team.scores",
+        "main.team.scores_latest",
+    )
     issue = Issue(1, "Title", "url", IssueType.BUG, Severity.S3)
     ranked = RankedIssue(
         rank=1,
@@ -104,6 +112,7 @@ def test_score_sink_uses_schema_evolution() -> None:
 
     assert spark.schemas[0].count("ARRAY<STRING>") == 5
     assert spark.frames[0].write.options == {"mergeSchema": "true"}
+    assert spark.statements[0].startswith("CREATE OR REPLACE VIEW main.team.scores_latest")
 
 
 def test_bot_state_schema_handles_empty_ownership() -> None:

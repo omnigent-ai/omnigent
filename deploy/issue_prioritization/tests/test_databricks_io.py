@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime
 
 from issue_prioritization.config import ScoringConfig
-from issue_prioritization.databricks_io import VolumeArtifactSink
+from issue_prioritization.databricks_io import VolumeArtifactSink, latest_scores_view_sql
 from issue_prioritization.mutations import BotState, MutationPlan, MutationTarget
 from issue_prioritization.pipeline import PipelineMode, PipelineRun
 
@@ -52,3 +52,13 @@ def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
     assert metadata["mode"] == "dry_run"
     assert metadata["adopt_legacy_bot_priorities"] is False
     assert metadata["legacy_priorities_adopted"] == 0
+
+
+def test_latest_scores_view_selects_one_complete_run() -> None:
+    statement = latest_scores_view_sql(
+        "main.team.issue_scores",
+        "main.team.issue_scores_latest",
+    )
+
+    assert statement.startswith("CREATE OR REPLACE VIEW main.team.issue_scores_latest")
+    assert "max_by(run_id, scored_at) FROM main.team.issue_scores" in statement

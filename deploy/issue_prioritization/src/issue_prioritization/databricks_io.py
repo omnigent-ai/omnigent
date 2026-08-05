@@ -97,9 +97,10 @@ class SparkClassificationRepository:
 
 
 class SparkScoreSink:
-    def __init__(self, spark: object, table: str) -> None:
+    def __init__(self, spark: object, table: str, latest_view: str) -> None:
         self.spark = spark
         self.table = _table(table)
+        self.latest_view = _table(latest_view)
 
     def write(self, run: PipelineRun) -> None:
         mutations = {plan.target.issue_number: plan for plan in run.mutations}
@@ -147,6 +148,7 @@ class SparkScoreSink:
                 .mode("append")
                 .saveAsTable(self.table)
             )
+            self.spark.sql(latest_scores_view_sql(self.table, self.latest_view))
 
 
 class VolumeArtifactSink:
@@ -253,3 +255,12 @@ def _table(value: str) -> str:
     if not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"expected catalog.schema.table, got {value!r}")
     return value
+
+
+def latest_scores_view_sql(scores_table: str, latest_view: str) -> str:
+    scores_table = _table(scores_table)
+    latest_view = _table(latest_view)
+    return f"""CREATE OR REPLACE VIEW {latest_view} AS
+    SELECT *
+    FROM {scores_table}
+    WHERE run_id = (SELECT max_by(run_id, scored_at) FROM {scores_table})"""

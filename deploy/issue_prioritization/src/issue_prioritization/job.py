@@ -49,6 +49,7 @@ def main() -> None:
     parser.add_argument("--source-table", required=True)
     parser.add_argument("--classifications-table", required=True)
     parser.add_argument("--scores-table", required=True)
+    parser.add_argument("--latest-scores-view", required=True)
     parser.add_argument("--bot-state-table", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--model-endpoint", default="")
@@ -124,7 +125,7 @@ def main() -> None:
         source=SparkIssueSource(spark, args.source_table),
         classifier=ai_query_classifier(spark, args.model_endpoint, areas),
         classifications=SparkClassificationRepository(spark, args.classifications_table),
-        scores=SparkScoreSink(spark, args.scores_table),
+        scores=SparkScoreSink(spark, args.scores_table, args.latest_scores_view),
         artifacts=VolumeArtifactSink(args.artifact_dir, config),
         engine=ScoreEngine(config, areas),
         maintainers=maintainers,
