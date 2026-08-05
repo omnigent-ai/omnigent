@@ -113,6 +113,12 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY,
+    _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+    _ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL_KEY,
+    _ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
+    _ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY,
+    _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _APPROVAL_TYPE,
     _CHILD_PREVIEW_LIMIT,
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
