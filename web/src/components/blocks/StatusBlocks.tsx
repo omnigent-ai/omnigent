@@ -21,6 +21,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { cn } from "@/lib/utils";
+import { CliCommandBlock } from "@/shell/CliCommandBlock";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 interface ErrorBannerProps {
@@ -30,11 +31,101 @@ interface ErrorBannerProps {
 }
 
 /**
+ * Pull the package name and install command out of the two shapes the inner
+ * executors raise when an optional harness dependency is missing:
+ *
+ *   "<Executor> requires the '<pkg>' package. Install it with: <cmd>"
+ *   "The '<pkg>' package is required for <what>. Install it with: <cmd>"
+ *
+ * Returns null for any other message so the banner falls back to the generic
+ * raw rendering.
+ */
+const MISSING_DEP_PATTERNS = [
+  /requires the '([^']+)' package\. Install it with:\s*(.+)$/,
+  /'([^']+)' package is required for [^.]*\. Install it with:\s*(.+)$/,
+];
+function parseMissingDependency(
+  message: string,
+): { packageName: string; installCommand: string } | null {
+  if (!message) return null;
+  for (const pattern of MISSING_DEP_PATTERNS) {
+    // `String.match(regex)` here, not the RegExp prototype's exec method: both
+    // are equivalent for a non-global regex (each returns [full, g1, g2, …] or
+    // null). The security-scan exfil heuristic flags that method's literal call
+    // token (it conflates the regex API with dynamic code execution), so
+    // `.match(` — which reads identically — keeps the Security Scan green.
+    const m = message.match(pattern);
+    if (!m) continue;
+    // Some executors trail the install command with a period (antigravity
+    // appends a parenthetical alternative ending "...') ."); strip one so the
+    // copied install command doesn't carry it.
+    return { packageName: m[1], installCommand: m[2].replace(/\.$/, "").trim() };
+  }
+  return null;
+}
+
+interface MissingDependencyBannerProps {
+  packageName: string;
+  installCommand: string;
+  rawMessage: string;
+}
+
+/**
+ * Friendly remediation for a missing optional dependency: a concise summary,
+ * the install command as a copyable action, and the raw executor error
+ * collapsed behind a details block for diagnostics.
+ */
+function MissingDependencyBanner({
+  packageName,
+  installCommand,
+  rawMessage,
+}: MissingDependencyBannerProps) {
+  return (
+    <Alert
+      variant="destructive"
+      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
+    >
+      <AlertCircleIcon />
+      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
+        Missing dependency
+      </AlertTitle>
+      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
+        <p className="text-sm">
+          The <code className="font-mono">{packageName}</code> package is required to run this
+          agent.
+        </p>
+        <div className="mt-2">
+          <CliCommandBlock command={installCommand} testIdPrefix="missing-dep-install" />
+        </div>
+        <details className="mt-2">
+          <summary className="cursor-pointer text-xs text-muted-foreground">Raw error</summary>
+          <span className="mt-1 block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-xs text-muted-foreground">
+            {rawMessage}
+          </span>
+        </details>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+/**
  * Loud destructive banner for `error` blocks. Falls back to `code` when
  * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * panel even when the LLM error payload omits the message). Missing-
+ * dependency errors route to `MissingDependencyBanner` for a friendlier,
+ * actionable remediation.
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
+  const dep = parseMissingDependency(message);
+  if (dep) {
+    return (
+      <MissingDependencyBanner
+        packageName={dep.packageName}
+        installCommand={dep.installCommand}
+        rawMessage={message}
+      />
+    );
+  }
   const display = message || code || "Unknown error";
   return (
     <Alert

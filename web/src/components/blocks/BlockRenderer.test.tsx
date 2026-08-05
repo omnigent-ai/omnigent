@@ -154,6 +154,87 @@ describe("BlockRenderer dispatch", () => {
     );
   });
 
+  it("renders a missing-dependency error as a friendly banner with a copyable install command", () => {
+    const message =
+      "AntigravityExecutor requires the 'google-antigravity' package. " +
+      "Install it with: pip install google-antigravity (or " +
+      "pip install 'omnigent[antigravity]').";
+    const items: RenderItem[] = [
+      { kind: "error", itemId: null, source: "execution", code: "executor_error", message },
+    ];
+
+    const { container } = render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    // Friendly summary instead of the raw RuntimeError dump.
+    expect(screen.getByText("Missing dependency")).toBeDefined();
+    const pkg = container.querySelector("code.font-mono");
+    expect(pkg?.textContent).toBe("google-antigravity");
+    // The install command renders as a copyable action (CliCommandBlock),
+    // not as raw error text — the antigravity message's trailing period is
+    // stripped so the copied command is clean.
+    const command = screen.getByTestId("missing-dep-install-command");
+    expect(command.textContent).toBe(
+      "pip install google-antigravity (or pip install 'omnigent[antigravity]')",
+    );
+    expect(screen.getByTestId("missing-dep-install-copy")).toBeDefined();
+    // The raw executor error stays available for diagnostics, collapsed.
+    expect(screen.getByText("Raw error")).toBeDefined();
+    // The generic "Error · source · code" heading is NOT shown for these.
+    expect(screen.queryByText(/Error · execution/)).toBeNull();
+  });
+
+  it("renders the friendly banner for the '<pkg> is required for' message shape too", () => {
+    // The openai-agents / databricks / open-responses executors phrase the
+    // same missing-dependency failure the other way round, so the parser
+    // matches both orderings.
+    const message =
+      "The 'openai' package is required for OpenAIAgentsSDKExecutor. " +
+      "Install it with: pip install openai";
+    const items: RenderItem[] = [
+      { kind: "error", itemId: null, source: "execution", code: "executor_error", message },
+    ];
+
+    const { container } = render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    expect(screen.getByText("Missing dependency")).toBeDefined();
+    expect(container.querySelector("code.font-mono")?.textContent).toBe("openai");
+    expect(screen.getByTestId("missing-dep-install-command").textContent).toBe(
+      "pip install openai",
+    );
+    expect(screen.queryByText(/Error · execution/)).toBeNull();
+  });
+
+  it("does not treat an unrelated error as a missing dependency", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "llm",
+        code: "llm_auth_failed",
+        message: "Authentication failed: invalid API key.",
+      },
+    ];
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    // Generic raw banner still handles non-dependency errors unchanged.
+    expect(screen.getByText(/Authentication failed/)).toBeDefined();
+    expect(screen.queryByText("Missing dependency")).toBeNull();
+    expect(screen.queryByTestId("missing-dep-install-command")).toBeNull();
+  });
+
+  it("falls back to the error code when the message is empty", () => {
+    // Guards the fallback path adjacent to the missing-dep early-return: an
+    // error block with no message must NOT route to the missing-dep banner
+    // (no message means no shape to match) and must render the code in the
+    // body instead of a blank panel.
+    const items: RenderItem[] = [
+      { kind: "error", itemId: null, source: "execution", code: "executor_error", message: "" },
+    ];
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    expect(screen.getByText("executor_error")).toBeDefined();
+    expect(screen.queryByText("Missing dependency")).toBeNull();
+    expect(screen.queryByTestId("missing-dep-install-command")).toBeNull();
+  });
+
   it("treats a trailing reasoning item as streaming when sessionStatus is running", () => {
     const items: RenderItem[] = [
       { kind: "reasoning", itemId: null, text: "thinking", duration: undefined },
