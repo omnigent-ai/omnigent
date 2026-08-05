@@ -7154,6 +7154,61 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("staggers a background conversation's reconnect but never the visible one", async () => {
+    // Every stream is recycled by the ingress at ~5 minutes, so streams opened
+    // together drop together. Without a stagger, a tab holding N conversations
+    // fires N reconnects — each with a snapshot + items fetch — in one burst.
+    seedSession("conv_fg", []);
+    seedSession("conv_bg", []);
+    const opens: string[] = [];
+    const sinks = new Map<string, StreamSink[]>();
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const match = /\/v1\/sessions\/([^/?]+)\/stream/.exec(url);
+      if (match) {
+        const id = match[1]!;
+        opens.push(id);
+        const sink = pushableStream();
+        sinks.set(id, [...(sinks.get(id) ?? []), sink]);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    // conv_bg is bound first, then conv_fg becomes the visible one.
+    const bg = bindConversationForTest("conv_bg");
+    const bgController = new AbortController();
+    const bgLoop = startStreamPump("conv_bg", bgController, bg.set, bg.get);
+    await vi.advanceTimersByTimeAsync(1);
+    const fg = bindConversationForTest("conv_fg");
+    const fgController = new AbortController();
+    const fgLoop = startStreamPump("conv_fg", fgController, fg.set, fg.get);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(opens).toEqual(["conv_bg", "conv_fg"]);
+
+    // Both drop at the same instant, as the ingress deadline would do.
+    sinks.get("conv_bg")![0]!.error();
+    sinks.get("conv_fg")![0]!.error();
+    await vi.advanceTimersByTimeAsync(1);
+
+    // The visible conversation reconnects immediately; the background one waits.
+    expect(opens.slice(2)).toEqual(["conv_fg"]);
+
+    // Past the jitter ceiling, the background conversation has reconnected too.
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(opens.slice(2).sort()).toEqual(["conv_bg", "conv_fg"]);
+
+    releaseConversation("conv_bg");
+    releaseConversation("conv_fg");
+    bgController.abort();
+    fgController.abort();
+    for (const list of sinks.values()) {
+      for (const sink of list.slice(1)) sink.close();
+    }
+    await drainAsync(2);
+    await Promise.all([bgLoop, fgLoop]);
+  });
+
   it("recomputes the idle flag on every reconnect, so a backgrounded tab reports idle", async () => {
     // The `idle` query param on the stream GET is the whole presence uplink, so
     // the flag has to be recomputed at each (re)connect rather than reused from

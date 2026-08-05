@@ -2645,6 +2645,11 @@ async function bindStream(
       // live blocks the pump already inserted) so the ApprovalCard
       // appears at the bottom of the chat — same position the live
       // stream would have given it.
+      // A cold bind prepends the snapshot to whatever the pump already pushed:
+      // the entry has no window of its own yet. (The cache-window merge
+      // branches that used to live here served the transcript LRU's revisit
+      // path, which no longer exists — a revisit finds a live entry and never
+      // re-binds.)
       const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
@@ -3339,6 +3344,14 @@ export async function startStreamPump(
       if (failedOpens > 0) {
         await abortableDelay(nextReconnectDelay(failedOpens), controller.signal);
         if (controller.signal.aborted || isConversationDisposed(id)) break;
+      } else if (hasConnected && conversationRegistry.getActive()?.id !== id) {
+        // Stagger a BACKGROUND conversation's reconnect. The ingress caps every
+        // stream at ~5 minutes, and streams opened together recycle together, so
+        // without this a tab holding N conversations fires N reconnects — each
+        // with a snapshot + items fetch — in one burst. The conversation on
+        // screen is never delayed.
+        await abortableDelay(backgroundReconnectJitter(), controller.signal);
+        if (controller.signal.aborted || isConversationDisposed(id)) break;
       }
 
       // Per-attempt controller: a presence idle flip recycles just this
@@ -3444,6 +3457,16 @@ export async function startStreamPump(
     }
   }
   /* eslint-enable no-await-in-loop */
+}
+
+// Spread background reconnects over a few seconds so N conversations recycling
+// at the same ingress deadline don't fire N snapshot fetches at once. Small
+// enough that a backgrounded conversation is still current well before the user
+// could switch to it.
+const BACKGROUND_RECONNECT_JITTER_MAX_MS = 3_000;
+
+function backgroundReconnectJitter(): number {
+  return Math.random() * BACKGROUND_RECONNECT_JITTER_MAX_MS;
 }
 
 /**
