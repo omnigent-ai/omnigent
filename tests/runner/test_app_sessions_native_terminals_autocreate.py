@@ -2707,3 +2707,153 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+
+
+# ── What a plain claude-native launch must NOT carry ─────────────────
+#
+# A session created without Smart Routing has to launch byte-for-byte like a
+# pre-Smart-Routing one: no spawn-routing endpoint, so no loopback server, no
+# bearer token on disk, and no ``Task`` PreToolUse hook paying a hook
+# subprocess plus a round trip on every spawn.
+#
+# Accepted consequence: the class is stamped at create, so flipping the gear's
+# Subagent-routing toggle on for a plain session is inert until recreate.
+
+
+async def _run_auto_create_claude_terminal_for_routing_class(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    routed: bool,
+) -> Any:
+    """Drive the claude-native launch and return the captured terminal spec."""
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "auth:\n  type: databricks\n  profile: test-profile\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    # ``opus`` resolves to the newer generation, so the launch model
+    # (opus-4-7) has no spelling of its own — exactly the case the pin was
+    # added for, and the case that overwrites the workspace's picker row.
+    ucode = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "workspace-picker-row",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Workspace pick",
+        },
+        api_key_helper="printf %s sk-sentinel-do-not-use",
+        model="databricks-claude-opus-4-7",
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native._ucode_config_for_profile",
+        lambda profile, *, refresh_models=True: ucode,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    snapshot: dict[str, Any] = {"labels": {}}
+    if routed:
+        snapshot["cost_control_mode_override"] = "on"
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
+    )
+    try:
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+        )
+    finally:
+        from omnigent.runner import subagent_routing, turn_routing
+
+        subagent_routing.shutdown_session_router(session_id)
+        turn_routing.shutdown_session_turn_router(session_id)
+        await fake_client.aclose()
+    return captured["spec"]
+
+
+def _claude_pretooluse_matchers(spec: Any) -> list[str | None]:
+    settings = _load_claude_invocation_settings(spec.args)
+    return [entry.get("matcher") for entry in settings["hooks"].get("PreToolUse", [])]
+
+
+def _claude_hook_commands(spec: Any) -> list[str]:
+    settings = _load_claude_invocation_settings(spec.args)
+    return [
+        hook.get("command", "")
+        for entries in settings["hooks"].values()
+        for entry in entries
+        for hook in entry.get("hooks", [])
+    ]
+
+
+async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f601",
+        routed=False,
+    )
+
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER not in _claude_pretooluse_matchers(
+        spec
+    )
+    assert all("claude_router_hook" not in command for command in _claude_hook_commands(spec))
+
+
+async def test_a_routed_claude_native_launch_keeps_the_spawn_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f602",
+        routed=True,
+    )
+
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))

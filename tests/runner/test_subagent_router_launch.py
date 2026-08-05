@@ -38,29 +38,46 @@ def _cleanup_routers() -> Any:  # type: ignore[explicit-any]
         subagent_routing.shutdown_session_router(session_id)
 
 
-@pytest.mark.parametrize("auto_harness", [True, False])
-async def test_claude_native_launch_installs_the_router_either_way(
-    tmp_path: Path, auto_harness: bool
+@pytest.mark.parametrize("routing_class", [_PINNED, _AUTO])
+async def test_a_routed_claude_native_launch_installs_the_router(
+    tmp_path: Path, routing_class: SessionRoutingClass
 ) -> None:
+    """Claude routes spawns whether or not the harness is auto-picked."""
     advertised, router = _start_subagent_router_for_native_session(
         "conv_native_launch",
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
-        auto_harness=auto_harness,
+        routing_enabled=routing_class.routing_enabled,
+        auto_harness=routing_class.auto_harness,
     )
-    # No session flag consulted on the Claude family: the Task hook is
-    # installed either way and the server decides per spawn, so the gear's
-    # subagent-routing toggle keeps working mid-session.
     assert advertised == tmp_path
     assert router is not None
     assert read_router_endpoint(tmp_path) is not None
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_a_plain_native_launch_gets_no_router(tmp_path: Path, harness: str) -> None:
+    """A plain session pays none of routing's cost.
+
+    No loopback server, no bearer token on disk, and (because the hooks are
+    pointed at the advertisement that is never written) no ``Task`` /
+    ``spawn_agent`` PreToolUse hook stalling every spawn on a verdict the
+    server would never route anyway.
+    """
+    assert _start_subagent_router_for_native_session(
+        "conv_native_launch",
+        bridge_dir=tmp_path,
+        harness=harness,
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=False,
+        auto_harness=False,
+    ) == (None, None)
+    assert read_router_endpoint(tmp_path) is None
+
+
 @pytest.mark.parametrize("harness", ["codex-native", "codex"])
-async def test_a_plain_or_pinned_codex_session_gets_no_router(
-    tmp_path: Path, harness: str
-) -> None:
+async def test_a_pinned_codex_session_gets_no_router(tmp_path: Path, harness: str) -> None:
     """The advertisement is what makes a codex home diverge from a plain one.
 
     Its presence turns on the generated ``hooks.json`` (a ``spawn_agent``
@@ -73,6 +90,7 @@ async def test_a_plain_or_pinned_codex_session_gets_no_router(
         bridge_dir=tmp_path,
         harness=harness,
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=True,
         auto_harness=False,
     ) == (None, None)
     assert read_router_endpoint(tmp_path) is None
@@ -84,6 +102,7 @@ async def test_an_auto_harness_codex_session_gets_the_router(tmp_path: Path) -> 
         bridge_dir=tmp_path,
         harness="codex-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=True,
         auto_harness=True,
     )
 
@@ -98,6 +117,7 @@ async def test_native_launch_skips_without_a_server_client(tmp_path: Path) -> No
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=None,
+        routing_enabled=True,
         auto_harness=True,
     ) == (None, None)
 
@@ -110,6 +130,7 @@ async def test_stale_handle_shutdown_leaves_a_relaunched_router_alive(tmp_path: 
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=True,
         auto_harness=True,
     )
     assert first is not None
@@ -120,6 +141,7 @@ async def test_stale_handle_shutdown_leaves_a_relaunched_router_alive(tmp_path: 
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=True,
         auto_harness=True,
     )
     assert second is not None and second is not first
@@ -141,6 +163,7 @@ async def test_unscoped_shutdown_still_tears_down_the_live_router(tmp_path: Path
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_enabled=True,
         auto_harness=True,
     )
     assert router is not None
@@ -149,8 +172,8 @@ async def test_unscoped_shutdown_still_tears_down_the_live_router(tmp_path: Path
     assert session_id not in subagent_routing._session_routers
 
 
-@pytest.mark.parametrize("routing_class", [_PLAIN, _PINNED, _AUTO])
-async def test_claude_sdk_launch_installs_the_router_for_every_session_class(
+@pytest.mark.parametrize("routing_class", [_PINNED, _AUTO])
+async def test_a_routed_claude_sdk_launch_installs_the_router(
     routing_class: SessionRoutingClass,
 ) -> None:
     await _ensure_session_subagent_router(
@@ -161,6 +184,18 @@ async def test_claude_sdk_launch_installs_the_router_for_every_session_class(
     )
     env = subagent_routing.session_router_env("conv_sdk_launch", "claude-sdk")
     assert env["OMNIGENT_SUBAGENT_ROUTER_SESSION_ID"] == "conv_sdk_launch"
+
+
+async def test_a_plain_claude_sdk_launch_gets_no_router() -> None:
+    """No router means no env, so the executor registers no ``Task`` hook."""
+    await _ensure_session_subagent_router(
+        "conv_sdk_launch",
+        "claude-sdk",
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=_PLAIN,
+    )
+    assert "conv_sdk_launch" not in subagent_routing._session_routers
+    assert subagent_routing.session_router_env("conv_sdk_launch", "claude-sdk") == {}
 
 
 @pytest.mark.parametrize("routing_class", [_PLAIN, _PINNED])
@@ -325,6 +360,7 @@ async def test_sdk_launch_survives_an_unusable_router_root(
         "conv_sdk_launch",
         "claude-sdk",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=_AUTO,
     )
     assert subagent_routing.session_router_env("conv_sdk_launch", "claude-sdk") == {}
 
@@ -336,6 +372,7 @@ async def test_sdk_launch_skips_harnesses_without_spawn_hooks(harness: str) -> N
         "conv_sdk_launch",
         harness,
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=_AUTO,
     )
     assert "conv_sdk_launch" not in subagent_routing._session_routers
 
@@ -345,6 +382,7 @@ async def test_sdk_launch_skips_native_harnesses() -> None:
         "conv_sdk_launch",
         "claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=_AUTO,
     )
     assert subagent_routing.session_router_env("conv_sdk_launch", "claude-native") == {}
 

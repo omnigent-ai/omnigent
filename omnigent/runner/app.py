@@ -8822,11 +8822,11 @@ async def _ensure_session_subagent_router(
     bridge directory and start the router from their launch paths, where
     the harness's hooks are also pointed at it.
 
-    On the Claude family it is started for every session regardless of its
-    routing state — the server gates each spawn on the session's
-    (mid-session togglable) subagent-routing setting. On the codex family
-    the advertisement is what turns generated hooks and the routed-spawn
-    tool pre-approvals on, so it is limited to auto-harness sessions.
+    Started for Smart Routing sessions only: a plain session must not carry
+    the loopback server, its on-disk bearer token, or an in-process hook on
+    every ``Task`` for a verdict the server never routes. On the codex
+    family the advertisement is also what turns generated hooks and the
+    routed-spawn tool pre-approvals on, so there it takes auto-harness.
 
     Never raises: ``ensure_session_router_quietly`` owns the bridge-dir
     resolution too, so a hostile or pre-existing ``$TMPDIR`` root cannot
@@ -8849,7 +8849,7 @@ async def _ensure_session_subagent_router(
         session_id,
         server_client=server_client,
         harness=harness,
-        auto_harness=resolved.auto_harness,
+        routing_class=resolved,
     )
 
 

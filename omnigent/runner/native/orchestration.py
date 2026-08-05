@@ -505,6 +505,7 @@ def _start_subagent_router_for_native_session(
     bridge_dir: Path,
     harness: str,
     server_client: httpx.AsyncClient | None,
+    routing_enabled: bool,
     auto_harness: bool,
 ) -> _NativeRouterLaunch:
     """Start the subagent-routing endpoint for a native session.
@@ -513,12 +514,11 @@ def _start_subagent_router_for_native_session(
     launch, so the endpoint has to be live (and advertised in the bridge
     dir the hooks read) before the CLI starts.
 
-    On the Claude family this is installed for every session, routed or
-    not: the server re-reads the session's subagent-routing setting on
-    each spawn, so a session that starts unrouted can still be toggled on
-    mid-flight. On the codex family the advertisement additionally turns
-    on a generated ``hooks.json`` and the routed-spawn tool pre-approvals,
-    so it is installed for auto-harness sessions only — see
+    Installed for Smart Routing sessions only, on both families: a plain
+    session launches like a plain one, with no loopback server, no bearer
+    token on disk and no spawn hook on its argv. On the codex family the
+    advertisement additionally turns on a generated ``hooks.json`` and the
+    routed-spawn tool pre-approvals, so there it takes auto-harness — see
     ``ensure_session_router_quietly``.
 
     :param session_id: Session/conversation identifier.
@@ -526,19 +526,28 @@ def _start_subagent_router_for_native_session(
     :param harness: Harness the router is being installed for; logged on
         failure.
     :param server_client: Runner→server client the relay forwards on.
-    :param auto_harness: Whether Smart Routing owns this session's harness.
-        Gates the codex family only.
+    :param routing_enabled: Whether the session launched with Smart Routing
+        on. Stamped at create, so a plain session stays plain even if the
+        gear's subagent-routing toggle is flipped mid-session.
+    :param auto_harness: Whether Smart Routing also owns this session's
+        harness. Additionally required on the codex family.
     :returns: The advertisement directory to point hooks at (``None`` when
         the endpoint could not start) paired with the router handle.
     """
-    from omnigent.runner.subagent_routing import ensure_session_router_quietly
+    from omnigent.runner.subagent_routing import (
+        SessionRoutingClass,
+        ensure_session_router_quietly,
+    )
 
     router = ensure_session_router_quietly(
         session_id,
         bridge_dir=bridge_dir,
         server_client=server_client,
         harness=harness,
-        auto_harness=auto_harness,
+        routing_class=SessionRoutingClass(
+            routing_enabled=routing_enabled,
+            auto_harness=auto_harness,
+        ),
     )
     return _NativeRouterLaunch(bridge_dir if router is not None else None, router)
 
@@ -3963,6 +3972,7 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         harness="codex-native",
         server_client=server_client,
+        routing_enabled=launch_config.routing_enabled,
         auto_harness=launch_config.auto_harness,
     )
     if _codex_router_dir is not None:
@@ -6305,15 +6315,18 @@ async def _auto_create_claude_terminal(
     # via ``--plugin-dir`` — the CLI mirror of the SDK plugin wiring.
     # ``api_key_helper`` (ucode) registers Claude's gateway token command.
     # Gate natively spawned subagents (the Task/Agent tool): start the loopback
-    # endpoint in the bridge dir the PreToolUse hook already discovers. Always
-    # installed on the Claude family — the server decides per spawn whether to
-    # route, so the gear's toggle keeps working mid-session.
+    # endpoint in the bridge dir the PreToolUse hook already discovers. Smart
+    # Routing sessions only — a plain session would otherwise carry a loopback
+    # server, a bearer token on disk and a hook subprocess on every spawn for a
+    # verdict the server never routes. Claude routes spawns whether or not the
+    # harness is auto-picked, so ``auto_harness`` is not required here.
     subagent_router_dir, _subagent_router = _start_subagent_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
         harness="claude-native",
         server_client=server_client,
-        auto_harness=True,
+        routing_enabled=launch_metadata.routing_enabled,
+        auto_harness=launch_metadata.auto_harness,
     )
     # First-message model routing. Advertised in the same bridge dir the
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its

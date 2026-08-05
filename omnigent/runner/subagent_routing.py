@@ -1299,7 +1299,7 @@ def ensure_session_router_quietly(
     harness: str | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     caps: Any = None,
-    auto_harness: bool = True,
+    routing_class: SessionRoutingClass = PLAIN_SESSION,
 ) -> SubagentRouter | None:
     """Start the session's router, or return ``None`` instead of failing.
 
@@ -1322,14 +1322,18 @@ def ensure_session_router_quietly(
         loop.
     :param caps: Accepted and ignored; kept so launch sites can pass the
         ``RuntimeCaps`` they already hold.
-    :param auto_harness: Whether this session let Smart Routing pick its
-        harness. Only consulted on the codex family, where the endpoint's
-        advertisement is also what turns the generated ``spawn_agent``
-        hook, the extra tool pre-approvals and the merged ``hooks.json``
-        on — costs a plain or pinned codex session must not pay. The
-        Claude family ignores it: its ``Task`` hook is registered by the
-        bridge either way and the server still gates each spawn, so
-        subagent routing stays togglable mid-session there.
+    :param routing_class: The session's Smart Routing class, which decides
+        whether it gets an endpoint at all. A **plain** session gets none
+        on either family: the loopback server, its bearer token on disk and
+        the per-spawn hook round trip are Smart Routing's costs to pay, not
+        a plain session's. A **routed** claude session gets one — claude
+        routes spawns whether or not the harness is also auto-picked. The
+        codex family additionally needs :attr:`~SessionRoutingClass.
+        auto_harness`, because there the advertisement is also what turns
+        the generated ``spawn_agent`` hook, the extra tool pre-approvals
+        and the merged ``hooks.json`` on. Stamped at create, so flipping
+        the gear's subagent-routing toggle on for a plain session stays
+        inert until it is recreated.
     :returns: The running router handle, or ``None`` when it could not
         start.
     """
@@ -1338,7 +1342,9 @@ def ensure_session_router_quietly(
         return None
     if harness not in _CLAUDE_HOOK_HARNESSES and harness not in _CODEX_HOOK_HARNESSES:
         return None
-    if harness in _CODEX_HOOK_HARNESSES and not auto_harness:
+    if not routing_class.routing_enabled:
+        return None
+    if harness in _CODEX_HOOK_HARNESSES and not routing_class.auto_harness:
         return None
     try:
         return ensure_session_router(
