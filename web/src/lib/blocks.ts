@@ -40,6 +40,11 @@ export interface BlockContext {
   responseId: string;
   itemId: string | null;
   createdBy?: string;
+  /** Server-side creation time (unix epoch seconds), when the item came
+   *  from history hydration. A DIFFERENT clock from `timestamp` (page-
+   *  relative `performance.now()` seconds, live streaming only) — never
+   *  mix the two; each is only compared against itself. */
+  createdAtS?: number;
 }
 
 /** Per-message-item content blocks. Both user input and assistant output. */
@@ -488,3 +493,10 @@ export type AnyBlock =
   | ElicitationBlock
   | PolicyDeniedBlock
   | ResponseEndBlock;
+
+/**
+ * Item-id prefix marking a provisional, in-flight assistant-text block —
+ * a live-streaming preview that lives in `blocks` until its authoritative
+ * `text_done` replaces it. Never a real server item id.
+ */
+export const LIVE_ITEM_PREFIX = "live:";

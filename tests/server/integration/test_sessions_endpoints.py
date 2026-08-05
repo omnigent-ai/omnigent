@@ -2711,6 +2711,9 @@ async def test_list_session_items_returns_items(
     assert len(items) >= 1
     user_msgs = [i for i in items if i.get("type") == "message" and i.get("role") == "user"]
     assert len(user_msgs) >= 1
+    # Every item carries its server-side creation stamp (drives the web
+    # UI's completed-turn "Worked for" duration).
+    assert all(isinstance(i.get("created_at"), int) and i["created_at"] > 0 for i in items)
 
 
 async def test_list_session_items_pagination(

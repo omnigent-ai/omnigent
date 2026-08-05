@@ -2,28 +2,44 @@
 // `item.kind`. Compaction renders as a standalone `Bubble` in
 // `ChatPage`, not as an inline render item — no case for it here.
 //
-// Tool-call collapsing: within a contiguous run of tool / native_tool
-// items, tools fold into a single summary line describing what's
-// hidden ("Read 2 files", rendered by `ToolGroupSummary`). While the
-// run is the live activity — the session is running and the run is
-// the last thing in the transcript — the trailing `STREAMING_TAIL`
-// tools stay visible as individual rows so the user can watch recent
-// steps; once the agent emits anything after the run (or the session
-// goes idle), the whole run folds into the one expandable line, like
-// the terminal's collapsed past turns. Still-in-progress spinners and
-// durable routing/fan-out cards never fold regardless of position.
+// Two levels of collapsing keep a turn readable:
+//
+// 1. Tool-run folding: within a contiguous run of tool / native_tool
+//    items, tools fold into a single summary line describing what's
+//    hidden ("Read 2 files", rendered by `ToolGroupSummary`). While
+//    the run is the live activity, the trailing `STREAMING_TAIL`
+//    tools stay visible as individual rows so the user can watch
+//    recent steps. Still-in-progress spinners and durable
+//    routing/fan-out cards never fold regardless of position.
+//
+// 2. Turn folding: once the turn settles (`turnLifecycle` leaves
+//    "streaming"), the whole process trace — interstitial narration,
+//    tool folds, reasoning — collapses behind one muted "Worked for
+//    Xs" row (`TurnWorkedFold`), leaving only the trailing final
+//    answer visible. This mirrors the Codex desktop treatment: the
+//    demarcation makes "where do I start reading" obvious instead of
+//    a wall of uniform prose. Resolved approval cards fold with the
+//    trace in document order; pending elicitations and persistent
+//    routing/dispatch cards stay visible outside the fold; a turn
+//    with no trailing answer (interrupted / failed / tool-only step
+//    bubbles) keeps its trace expanded.
 
 import type { ReactNode } from "react";
-import { useMemo } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
+import { ChevronRightIcon } from "lucide-react";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
+import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
@@ -291,10 +307,70 @@ export function FilePathAwareMessageResponse({
 
 const STREAMING_TAIL = 3;
 
+// How long fold eligibility must hold before the "Worked for" fold
+// appears on a live bubble. Long enough to absorb transient settled
+// reads (a step-wise turn's between-step idle, a stray idle before its
+// revive), short enough to feel immediate at a real turn end.
+const FOLD_SETTLE_DEBOUNCE_MS = 500;
+
+// A trace whose newest item is at most this old counts as "just
+// active": a page load over it may have landed inside a step-wise
+// turn's between-step gap, where the snapshot reads settled although
+// the turn continues. The last bubble's fold then waits
+// `FOLD_RECENT_MOUNT_DEBOUNCE_MS` instead of appearing instantly, so
+// the next step's running edge can cancel it — no fold flash. Genuinely
+// old history still mounts folded with no delay.
+const RECENT_ACTIVITY_WINDOW_S = 15;
+const FOLD_RECENT_MOUNT_DEBOUNCE_MS = 3_000;
+
+// How long a user-initiated fold expand parks the scroller's scroll
+// anchoring. Covers the 200ms `turn-fold-expand` height animation (see
+// index.css) with slack — anchoring would otherwise pin the answer
+// below the fold and glide the growing trace off the top.
+const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
+
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
   canApprove?: boolean;
+  /**
+   * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
+   * `"streaming"` keeps the process trace expanded; any settled state
+   * folds it behind the "Worked for Xs" row. When omitted, liveness
+   * falls back to `sessionStatus` (running/waiting ⇒ live).
+   */
+  turnLifecycle?: ActiveResponse["state"];
+  /** Wall-clock seconds the turn worked (`Bubble.workedForS`). */
+  workedForS?: number;
+  /**
+   * The turn continues in a later assistant bubble (`Bubble.continued`)
+   * — it yielded mid-task (e.g. awaiting sub-agents), so the answer
+   * lands elsewhere. Such a bubble folds its whole trace despite having
+   * no trailing answer of its own.
+   */
+  continued?: boolean;
+  /**
+   * This bubble is the LAST assistant bubble in the transcript. While
+   * the session is running, the last bubble never folds even when its
+   * lifecycle reads settled: on a mid-turn (re)connect the client can
+   * miss the edge that names the turn, misreading the live turn as
+   * "completed" — folding it then made the trace collapse and reopen
+   * as its tail alternated between text and tools (the codex flicker).
+   * The fold forms when the session's own terminal status edge lands,
+   * which is the natural moment anyway.
+   */
+  isLastAssistant?: boolean;
+  /**
+   * The session has a pending elicitation (approval/question card
+   * awaiting the user). The turn is parked, not over — a reload while
+   * parked can read BOTH the lifecycle and the session status as
+   * settled (a step-wise turn's snapshot names the STEP id, not the
+   * items' thread id) — so the last bubble's fold stays suppressed
+   * until the card is answered.
+   */
+  hasPendingElicitation?: boolean;
+  /** Server epoch seconds of the turn's newest item (`Bubble.lastActivityAtS`). */
+  lastActivityAtS?: number;
 }
 
 type ToolRunFragment =
@@ -308,18 +384,125 @@ type ToolRunFragment =
       index: number;
     };
 
-export function BlockRenderer({ items, sessionStatus, canApprove = true }: BlockRendererProps) {
+export function BlockRenderer({
+  items,
+  sessionStatus,
+  canApprove = true,
+  turnLifecycle,
+  workedForS,
+  continued = false,
+  isLastAssistant = false,
+  hasPendingElicitation = false,
+  lastActivityAtS,
+}: BlockRendererProps) {
+  const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
+  const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
+
+  // Fold a turn that did work AND either answered here or continues in a
+  // later bubble: the trace collapses behind the "Worked for" row, exempt
+  // cards stay visible after it, and the answer (when this bubble carries
+  // one) renders last at full style. A turn that did no work, or that
+  // dead-ends with no answer anywhere, renders expanded — there is
+  // nothing to demarcate.
+  const { process, exempt, final, finalStart } = partitionTurn(items);
+  // A `continued` bubble additionally has to have RUN something. That is
+  // the shape the flag exists for (narration + tool calls, then a yield
+  // to await sub-agents), and it keeps a stray narration- or
+  // reasoning-only fragment of a split turn from folding into a lone
+  // "Worked" row with nothing behind it.
+  const foldEligible =
+    !isTurnLive &&
+    // The last assistant bubble of a RUNNING session — or one parked on
+    // a pending elicitation — is (or may be) the live turn even when its
+    // lifecycle reads settled: a mid-turn (re)connect can miss the edge
+    // that names the turn. Never fold it until the session settles AND
+    // the card is answered; the terminal status edge folds it.
+    !(isLastAssistant && (sessionStatus === "running" || hasPendingElicitation)) &&
+    !isProvisionalTrace(items) &&
+    process.length > 0 &&
+    (final.length > 0 || (continued && process.some(isToolItem)));
+
+  // Debounce fold APPEARANCE on a live bubble: transient settled reads —
+  // a step-wise turn's idle edge between steps, a stray bare idle before
+  // its revive — would otherwise fold and unfold the trace. Eligibility
+  // must hold for a beat before the fold shows; losing eligibility hides
+  // it immediately. A bubble MOUNTED eligible (settled history) folds
+  // with no delay — UNLESS it is the last bubble over a just-active
+  // trace, where the page may have loaded inside a step-wise turn's
+  // between-step gap: that mount waits the longer recent-mount debounce
+  // so the next step's running edge can cancel the fold instead of
+  // flashing it.
+  const mountedOverRecentActivity =
+    isLastAssistant &&
+    lastActivityAtS !== undefined &&
+    Date.now() / 1000 - lastActivityAtS < RECENT_ACTIVITY_WINDOW_S;
+  const [showFold, setShowFold] = useState(foldEligible && !mountedOverRecentActivity);
+  const debounceMsRef = useRef(
+    mountedOverRecentActivity ? FOLD_RECENT_MOUNT_DEBOUNCE_MS : FOLD_SETTLE_DEBOUNCE_MS,
+  );
+  useEffect(() => {
+    if (foldEligible === showFold) {
+      // Once the fold has shown (or the mount window resolved), later
+      // transitions use the ordinary settle debounce.
+      if (showFold) debounceMsRef.current = FOLD_SETTLE_DEBOUNCE_MS;
+      return undefined;
+    }
+    if (!foldEligible) {
+      debounceMsRef.current = FOLD_SETTLE_DEBOUNCE_MS;
+      setShowFold(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setShowFold(true), debounceMsRef.current);
+    return () => clearTimeout(timer);
+  }, [foldEligible, showFold]);
+
+  // Animate only when the fold APPEARS on an already-mounted bubble —
+  // the turn settled, or its continuation landed, while the user was
+  // looking. Mounting settled history shows it closed with no motion.
+  const mountedRef = useRef(false);
+  const foldShownRef = useRef(showFold);
+  const animateCollapse = showFold && mountedRef.current && !foldShownRef.current;
+  useEffect(() => {
+    mountedRef.current = true;
+    foldShownRef.current = showFold;
+  });
+
+  if (showFold) {
+    return (
+      <>
+        <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
+          {renderSequence(process, { liveEdge: false, canApprove })}
+        </TurnWorkedFold>
+        {exempt.map(({ item, index }) => renderItem(item, index, false, false, canApprove))}
+        {renderSequence(final, { liveEdge: false, canApprove, indexBase: finalStart })}
+      </>
+    );
+  }
+
+  return renderSequence(items, { liveEdge: isTurnLive, canApprove });
+}
+
+/**
+ * Render a flat item sequence with tool-run folding. `liveEdge` marks
+ * the sequence as the live activity: the trailing tool run keeps its
+ * visible `STREAMING_TAIL` and a trailing reasoning item shows the
+ * streaming shimmer. `indexBase` offsets positional fallback keys so a
+ * partitioned slice keys consistently with its position in the turn.
+ */
+function renderSequence(
+  items: RenderItem[],
+  { liveEdge, canApprove, indexBase = 0 }: TurnSequenceOptions,
+): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
-  const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
-  const streamingRunStart = isAgentActive ? findStreamingRunStart(items) : -1;
-  // Reasoning is "currently streaming" iff the agent is live AND this
+  const streamingRunStart = liveEdge ? findStreamingRunStart(items) : -1;
+  // Reasoning is "currently streaming" iff the turn is live AND this
   // reasoning is the very last item in the bubble. Mirrors the
   // `streamingRunStart` rule for tool runs: the trailing live edge stays
   // expanded; once anything else lands after it, it collapses.
   const lastIdx = items.length - 1;
   const reasoningStreamingIdx =
-    isAgentActive && lastIdx >= 0 && items[lastIdx]!.kind === "reasoning" ? lastIdx : -1;
+    liveEdge && lastIdx >= 0 && items[lastIdx]!.kind === "reasoning" ? lastIdx : -1;
 
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i]!;
@@ -346,14 +529,16 @@ export function BlockRenderer({ items, sessionStatus, canApprove = true }: Block
         // the terminal's step list; only the fold's expanded contents
         // are nested (inside `ToolGroupSummary`).
         rendered.push(
-          <div key={`tool-group-with-tail:${runStart}`} className="space-y-1">
+          <div key={`tool-group-with-tail:${indexBase + runStart}`} className="space-y-1">
             <ToolGroupSummary tools={group.tools} />
-            {tail.map((fragment, idx) => renderToolRunFragment(fragment, runStart, idx))}
+            {tail.map((fragment, idx) =>
+              renderToolRunFragment(fragment, indexBase + runStart, idx),
+            )}
           </div>,
         );
       } else {
         for (let idx = 0; idx < fragments.length; idx += 1) {
-          rendered.push(renderToolRunFragment(fragments[idx]!, runStart, idx));
+          rendered.push(renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx));
         }
       }
       previousRenderedItemWasText = false;
@@ -361,11 +546,247 @@ export function BlockRenderer({ items, sessionStatus, canApprove = true }: Block
     }
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
-    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText, canApprove));
+    rendered.push(
+      renderItem(item, indexBase + i, i === reasoningStreamingIdx, followsText, canApprove),
+    );
     previousRenderedItemWasText = item.kind === "text";
   }
 
   return rendered;
+}
+
+interface TurnSequenceOptions {
+  liveEdge: boolean;
+  canApprove: boolean;
+  indexBase?: number;
+}
+
+interface TurnPartition {
+  process: RenderItem[];
+  exempt: { item: RenderItem; index: number }[];
+  final: RenderItem[];
+  finalStart: number;
+}
+
+// Bookkeeping tools some harnesses append AFTER the turn's final
+// message (codex-native mirrors the turn's file diff as a trailing
+// `turn_diff` call). They must not stop the answer detection — they
+// fold into the process trace instead.
+const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff"]);
+
+/**
+ * Whether a trailing item is wrap-up rather than part of the answer.
+ *
+ * Reasoning counts: it is process by definition, never the answer, and
+ * codex opens a reasoning section as the turn ends — landing it after
+ * the final message, where it blocked the fold live (the item is
+ * transient, so a reload folded the same turn and the two views
+ * disagreed).
+ */
+function isTrailingWrapup(item: RenderItem): boolean {
+  if (item.kind === "reasoning") return true;
+  return item.kind === "tool" && TRAILING_WRAPUP_TOOLS.has(item.execution.name);
+}
+
+/**
+ * Split a settled turn into the foldable process trace, the always-
+ * visible exempt items, and the trailing final answer.
+ *
+ * `final` is the trailing run of text items — the turn's answer —
+ * looking past any trailing bookkeeping tools (`turn_diff`), which
+ * fold as process. Everything before the answer is process too —
+ * including resolved approval cards, which are part of the work's
+ * history and fold in document order — except items the user must
+ * keep seeing without an extra click: still-PENDING elicitations
+ * (normally floated out of the bubble by ChatPage, exempted here
+ * defensively so an actionable card can never be hidden), persistent
+ * routing/dispatch cards, and (defensively) tools still in progress.
+ * Errors, retries and policy denials DO fold — when the turn still
+ * produced an answer they're recovered noise, and a turn that ended
+ * on one has no trailing text so it never folds in the first place.
+ */
+function partitionTurn(items: RenderItem[]): TurnPartition {
+  let end = items.length;
+  const wrapup: RenderItem[] = [];
+  while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
+    wrapup.unshift(items[end - 1]!);
+    end -= 1;
+  }
+  let finalStart = end;
+  while (finalStart > 0 && items[finalStart - 1]!.kind === "text") finalStart -= 1;
+  const process: RenderItem[] = [];
+  const exempt: { item: RenderItem; index: number }[] = [];
+  for (let i = 0; i < finalStart; i += 1) {
+    const item = items[i]!;
+    if (isPendingElicitation(item) || isPersistentToolCard(item) || isInProgressTool(item)) {
+      exempt.push({ item, index: i });
+    } else {
+      process.push(item);
+    }
+  }
+  process.push(...wrapup);
+  return { process, exempt, final: items.slice(finalStart, end), finalStart };
+}
+
+function isPendingElicitation(item: RenderItem): boolean {
+  return item.kind === "elicitation" && item.status === "pending";
+}
+
+/**
+ * Whether a bubble is made ONLY of streaming artifacts: reasoning
+ * chunks (no item id until their item is finalized) and `live:` text
+ * previews (replaced in place when the authoritative item lands). Such
+ * a bubble is a fragment of the turn still arriving, not a finished
+ * turn — but its synthetic response id never matches `activeResponse`,
+ * so the walker labels it "completed" and it would otherwise fold.
+ *
+ * That is what made the fold flicker on codex: a reasoning burst plus a
+ * narration preview folded mid-turn, then the fold vanished when the
+ * preview merged into the real bubble. A genuine turn always carries at
+ * least one server-assigned item id.
+ */
+function isProvisionalTrace(items: RenderItem[]): boolean {
+  return items.every((item) => item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX));
+}
+
+/**
+ * Codex-style demarcation for a completed turn: the whole process
+ * trace (narration, tool folds, reasoning) collapses behind one muted
+ * "Worked for Xs" row with a hairline rule, so the final answer below
+ * is unambiguously where reading starts. Expanding replays the trace
+ * inline.
+ *
+ * `animateCollapse` marks the render where the fold appeared while the
+ * user was watching. The fold then MOUNTS OPEN — showing exactly the
+ * trace that was already on screen — and closes on the next frame, so
+ * the steps visibly fold into the summary row. Swapping straight to the
+ * collapsed row instead made a tall block vanish in one frame, which
+ * read as a partial page reload. Settled history mounts closed: there
+ * was never an expanded trace to animate away.
+ *
+ * The summary row grows in over the same beat rather than being
+ * inserted at full height, because inserting it jolted the bubble ~40px
+ * TALLER before the collapse started — read as two separate motions.
+ * Row expanding + trace shrinking nets a single monotonic shrink.
+ */
+function TurnWorkedFold({
+  workedForS,
+  animateCollapse,
+  children,
+}: {
+  workedForS?: number;
+  animateCollapse: boolean;
+  children: ReactNode;
+}) {
+  const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const [open, setOpen] = useState(animateCollapse);
+  useEffect(() => {
+    if (!animateCollapse) return;
+    const frame = requestAnimationFrame(() => setOpen(false));
+    return () => cancelAnimationFrame(frame);
+  }, [animateCollapse]);
+
+  // A USER-initiated expand (never the animateCollapse mount-close)
+  // opens INSTANTLY — no height animation — and snaps the fold row to
+  // the top of the scroller so the trace reads from its beginning. The
+  // animation is what defeated the snap: it opens at height 0, so at
+  // snap time the scroller has no room yet (the snap clamps at the old
+  // max-scroll), and the 200ms of growth then plays out against the
+  // stick-to-bottom pin (which rides the bottom on the last turn) or
+  // native scroll anchoring (which pins the answer below) — either way
+  // the row glides off the top and the click appears to do nothing.
+  // Instant height means the first layout already has the full trace:
+  // the snap lands, and there is no growth window left to fight over.
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const [userOpened, setUserOpened] = useState(false);
+  const scrollOnOpenRef = useRef(false);
+  const scrollLock = useContext(ConversationScrollLockContext);
+  const handleOpenChange = (next: boolean) => {
+    scrollOnOpenRef.current = next;
+    setUserOpened(next);
+    setOpen(next);
+  };
+  useLayoutEffect(() => {
+    if (!open || !scrollOnOpenRef.current) return;
+    scrollOnOpenRef.current = false;
+    const row = rowRef.current;
+    if (!row) return;
+    // Release StickToBottom's bottom-lock first (same recipe as
+    // JumpToTopButton): viewing the last turn the view is pinned, and
+    // the expand's resize otherwise fires the library's scrollToBottom
+    // (isAtBottom is still true from the pre-click view), overriding
+    // the snap and riding the bottom — the click appears to do nothing.
+    if (scrollLock) {
+      scrollLock.stopScroll();
+      scrollLock.state.isAtBottom = false;
+      scrollLock.state.escapedFromLock = true;
+    }
+    const scroller = nearestScrollContainer(row);
+    // Park native scroll anchoring across the expand commit. The
+    // restore deliberately outlives the effect (no cleanup): the timer
+    // must fire even if the fold re-renders or unmounts mid-hold.
+    if (scroller) {
+      scroller.style.overflowAnchor = "none";
+      window.setTimeout(() => {
+        scroller.style.overflowAnchor = "";
+      }, FOLD_EXPAND_ANCHOR_HOLD_MS);
+    }
+    row.scrollIntoView?.({ block: "start" });
+  }, [open, scrollLock]);
+
+  return (
+    // Named `group/turn-fold` so only this collapsible's own chevron
+    // rotates (inner tool cards carry unnamed `.group` rotations that a
+    // bare `group` class here would incorrectly trigger).
+    <Collapsible
+      key="turn-worked-fold"
+      open={open}
+      onOpenChange={handleOpenChange}
+      className="group/turn-fold not-prose w-full"
+      data-testid="turn-worked-fold"
+    >
+      <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
+        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
+          <span className="shrink-0">{label}</span>
+          <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
+          <span aria-hidden className="ml-1 flex-1 border-border border-t" />
+        </CollapsibleTrigger>
+      </div>
+      {/* Height animation lives in index.css (it needs Radix's measured
+          --radix-collapsible-content-height) and is disabled under
+          prefers-reduced-motion. */}
+      {/* No padding/border on the animated element: any chrome here is
+          height that appears before the collapse starts, i.e. the jolt
+          this animation exists to remove. Expanded spacing comes from
+          the row's hairline above and the message column's gap below. */}
+      <CollapsibleContent
+        className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
+      >
+        <div className="flex flex-col gap-2">{children}</div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+/** Nearest ancestor that actually scrolls vertically (overflow-y auto/scroll). */
+function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const overflowY = getComputedStyle(p).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll") return p;
+  }
+  return null;
+}
+
+/** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
+function formatWorkedFor(seconds: number): string {
+  const s = Math.max(1, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
 }
 
 /**
