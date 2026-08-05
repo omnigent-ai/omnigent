@@ -749,7 +749,7 @@ class HostStore:
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param sandbox_id: The provider-assigned sandbox id to persist.
         """
-        with self._session() as session:
+        with self._session("update_host_sandbox_id") as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
