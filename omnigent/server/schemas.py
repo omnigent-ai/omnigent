@@ -1431,7 +1431,7 @@ class SessionCreateMetadata(BaseModel):
     :param reasoning_effort: Optional per-session reasoning-effort
         hint. Accepted metadata values are ``"none"``,
         ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
-        ``"xhigh"``, and ``"max"``. Provider-specific support is
+        ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
         validated when a turn executes. ``None`` means use the agent
         default.
     :param host_id: Optional host to launch the runner on, e.g.
@@ -1641,8 +1641,8 @@ class SessionResponse(BaseModel):
         non-managed or non-resumable hosts.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
-        ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
-        ``"max"``. Provider-specific support is validated when a
+        ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, ``"max"``,
+        and ``"ultra"``. Provider-specific support is validated when a
         turn executes. ``None`` means use the agent default.
     :param items: Committed conversation items in chronological
         order. Empty for a freshly created session.
@@ -1905,8 +1905,8 @@ class UpdateSessionRequest(BaseModel):
         labels; keys not present are left untouched.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
-        ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
-        ``"max"``. Provider-specific support is validated when a
+        ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, ``"max"``,
+        and ``"ultra"``. Provider-specific support is validated when a
         turn executes. Clear aliases such as ``"default"`` remove
         the session override. ``None`` leaves unchanged.
     :param model_override: Per-session LLM model override, e.g.

@@ -11,6 +11,7 @@ Managed deployments can swap in a different implementation via
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from databricks.sdk.config import Config
 
 _logger = logging.getLogger(__name__)
+
+_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0)
 
 # Custom-method path (Google API convention) appended to the external
 # router's base URL, e.g. ``<base_url>/routes:select``.
@@ -45,6 +48,7 @@ class RoutingResult:
     model: str
     rationale: str
     harness: str | None = None
+    reasoning_effort: str | None = None
 
 
 class RoutingClient(Protocol):
@@ -54,6 +58,7 @@ class RoutingClient(Protocol):
         self,
         message: str,
         available_models: dict[str, list[str]],
+        model_efforts: dict[str, list[str]] | None = None,
     ) -> RoutingResult | None:
         """Pick the best model for a session's initial message.
 
@@ -63,6 +68,7 @@ class RoutingClient(Protocol):
             a one-entry dict; multi-agent fan-out passes one entry per
             harness.  Implementations that only need the flat model list can
             call :func:`_flatten_models` to get a deduped ordered sequence.
+        :param model_efforts: Optional model-id → supported-effort mapping.
         :returns: A :class:`RoutingResult`, or ``None`` to skip routing.
         """
         ...
@@ -184,6 +190,35 @@ async def fetch_runner_models(
     return {worker: [model.id for model in models] for worker, models in catalog.items()}
 
 
+async def fetch_codex_model_efforts(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> dict[str, list[str]] | None:
+    """Return reasoning efforts advertised by each Codex-native model."""
+    import httpx as _httpx
+
+    try:
+        for delay in (*_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S, None):
+            resp = await runner_client.get(
+                f"/v1/sessions/{session_id}/codex-model-options", timeout=5.0
+            )
+            if resp.status_code != 503 or delay is None:
+                break
+            await asyncio.sleep(delay)
+        resp.raise_for_status()
+        return {
+            model["id"]: [
+                option["reasoningEffort"]
+                for option in model.get("supportedReasoningEfforts", [])
+                if isinstance(option, dict) and isinstance(option.get("reasoningEffort"), str)
+            ]
+            for model in resp.json()["models"]
+            if isinstance(model, dict) and isinstance(model.get("id"), str)
+        } or None
+    except (_httpx.HTTPError, KeyError, TypeError, ValueError):
+        return None
+
+
 def _flatten_models(available_models: dict[str, list[str]]) -> list[str]:
     """Return a deduped, ordered flat model list from a harness → models map.
 
@@ -238,16 +273,27 @@ with the model chosen:
   "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); \
 selected [cheapest/mid-range/most capable] model [model-id]."
 
+Choose a listed reasoning effort for the selected model, or null when none are listed.
+
 Return **strict JSON only**:
-{{"harness": "<harness-id>", "model": "<model-id>", "rationale": "<sentence>"}}
+{{"harness": "<harness-id>", "model": "<model-id>", "reasoning_effort": null,
+"rationale": "<sentence>"}}
 """
 
 
-def _build_rubric(available_models: dict[str, list[str]]) -> str:
+def _build_rubric(
+    available_models: dict[str, list[str]],
+    model_efforts: dict[str, list[str]] | None = None,
+) -> str:
     """Format the judge prompt with the harness → models structure."""
     sections: list[str] = []
     for harness, models in available_models.items():
-        model_lines = "\n".join(f"    - {m}" for m in models)
+        model_lines = "\n".join(
+            f"    - {model} (efforts: {', '.join(model_efforts[model])})"
+            if model_efforts and model_efforts.get(model)
+            else f"    - {model}"
+            for model in models
+        )
         sections.append(f"  harness: {harness}\n{model_lines}")
     return _JUDGE_SYSTEM_TEMPLATE.format(
         harness_menu="\n".join(sections),
@@ -262,9 +308,10 @@ _VERDICT_SCHEMA: dict[str, object] = {
     "properties": {
         "harness": {"type": "string"},
         "model": {"type": "string"},
+        "reasoning_effort": {"type": ["string", "null"]},
         "rationale": {"type": "string"},
     },
-    "required": ["harness", "model", "rationale"],
+    "required": ["harness", "model", "reasoning_effort", "rationale"],
     "additionalProperties": False,
 }
 
@@ -279,9 +326,10 @@ class LLMRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        model_efforts: dict[str, list[str]] | None = None,
     ) -> RoutingResult | None:
         flat = _flatten_models(available_models)
-        rubric = _build_rubric(available_models)
+        rubric = _build_rubric(available_models, model_efforts)
         _logger.info("LLMRoutingClient: available_models=%s", dict(available_models))
         try:
             response = await self._llm.create(
@@ -346,7 +394,10 @@ class LLMRoutingClient:
                 None,
             )
 
-        return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
+        reasoning_effort = verdict.get("reasoning_effort")
+        if reasoning_effort not in (model_efforts or {}).get(model, []):
+            reasoning_effort = None
+        return RoutingResult(model, str(rationale), chosen_harness, reasoning_effort)
 
 
 def _bearer_auth(token: str) -> httpx.Auth:
@@ -502,7 +553,9 @@ class ExternalRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        model_efforts: dict[str, list[str]] | None = None,
     ) -> RoutingResult | None:
+        del model_efforts
         import httpx
         from google.protobuf import json_format
 
@@ -800,13 +853,17 @@ async def route_session_harness(
     return (
         chosen_harness,
         result.model,
-        {"model": result.model, "rationale": result.rationale},
+        {
+            "model": result.model,
+            "reasoning_effort": result.reasoning_effort,
+            "rationale": result.rationale,
+        },
         None,
     )
 
 
 async def route_turn(
-    _harness: str | None,
+    harness: str | None,
     user_message: str,
     *,
     session_id: str | None = None,
@@ -831,14 +888,20 @@ async def route_turn(
     # for brain-turn routing we only want the models this session's own
     # harness can run, not the sub-agents' model lists.
     available: dict[str, list[str]] | None = None
+    model_efforts: dict[str, list[str]] | None = None
     if session_id and runner_client is not None:
         catalog = await fetch_runner_models(session_id, runner_client)
         if catalog and "self" in catalog:
             available = {"self": catalog["self"]}
+        if harness == "codex-native":
+            model_efforts = await fetch_codex_model_efforts(session_id, runner_client)
+            if model_efforts:
+                available = {"self": list(model_efforts)}
     if not available:
         return None, None
 
-    result = await _caps.routing_client.route(user_message, available)
+    args = (user_message, available, model_efforts) if model_efforts else (user_message, available)
+    result = await _caps.routing_client.route(*args)
     if result is None:
         return None, None
 
@@ -847,4 +910,8 @@ async def route_turn(
         result.model,
         result.rationale,
     )
-    return result.model, {"model": result.model, "rationale": result.rationale}
+    return result.model, {
+        "model": result.model,
+        "reasoning_effort": result.reasoning_effort,
+        "rationale": result.rationale,
+    }

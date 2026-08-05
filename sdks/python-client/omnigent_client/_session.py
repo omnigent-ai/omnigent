@@ -27,7 +27,9 @@ if TYPE_CHECKING:
 
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "incomplete", "cancelled"})
-_VALID_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+_VALID_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 
 
 class Session:

@@ -8,6 +8,7 @@ imported by the router in ``sessions.py``."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 import time
@@ -4098,6 +4099,9 @@ async def _forward_event_to_runner(
     # before the routing card, matching the per-turn routing path).
     _auto_card_model: str | None = None
     _auto_card_verdict: dict[str, Any] | None = None
+    _auto_model: str | None = None
+    _auto_verdict: dict[str, Any] | None = None
+    _auto_model_applied = False
     if conv.harness_override == "auto" and body.type == "message":
         from omnigent.server.smart_routing import route_session_harness
 
@@ -4124,6 +4128,10 @@ async def _forward_event_to_runner(
                 if _auto_model is not None and effective_runner_override is None:
                     _conv_updates["model_override"] = _auto_model
                     effective_runner_override = _auto_model
+                    _auto_model_applied = True
+                    _auto_effort = (_auto_verdict or {}).get("reasoning_effort")
+                    _conv_updates["reasoning_effort"] = _auto_effort
+                    _conv_updates["_unset_reasoning_effort"] = _auto_effort is None
                 _updated = await asyncio.to_thread(
                     conversation_store.update_conversation,
                     session_id,
@@ -4131,6 +4139,15 @@ async def _forward_event_to_runner(
                 )
                 if _updated is not None:
                     conv = _updated
+                if _auto_model_applied:
+                    session_stream.publish(
+                        session_id,
+                        {
+                            "type": "session.reasoning_effort",
+                            "conversation_id": session_id,
+                            "reasoning_effort": (_auto_verdict or {}).get("reasoning_effort"),
+                        },
+                    )
             except (OSError, ValueError):
                 _logger.warning(
                     "auto-harness: failed to persist resolved harness for session=%s",
@@ -4203,6 +4220,9 @@ async def _forward_event_to_runner(
                     _child_updates: dict[str, Any] = {}
                     if _routed_model is not None:
                         _child_updates["model_override"] = _routed_model
+                        _routed_effort = (_verdict or {}).get("reasoning_effort")
+                        _child_updates["reasoning_effort"] = _routed_effort
+                        _child_updates["_unset_reasoning_effort"] = _routed_effort is None
                     if _routed_harness is not None:
                         _child_updates["harness_override"] = _routed_harness
                     if _child_updates:
@@ -4210,6 +4230,15 @@ async def _forward_event_to_runner(
                             conversation_store.update_conversation,
                             session_id,
                             **_child_updates,
+                        )
+                    if _routed_model is not None:
+                        session_stream.publish(
+                            session_id,
+                            {
+                                "type": "session.reasoning_effort",
+                                "conversation_id": session_id,
+                                "reasoning_effort": (_verdict or {}).get("reasoning_effort"),
+                            },
                         )
                 except (OSError, ValueError):
                     _logger.warning(
@@ -4230,6 +4259,7 @@ async def _forward_event_to_runner(
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
+                    _routed_effort = (_verdict or {}).get("reasoning_effort")
                     # Persist as the session's model_override so all
                     # subsequent turns use this model automatically.
                     try:
@@ -4237,6 +4267,16 @@ async def _forward_event_to_runner(
                             conversation_store.update_conversation,
                             session_id,
                             model_override=_routed_model,
+                            reasoning_effort=_routed_effort,
+                            _unset_reasoning_effort=_routed_effort is None,
+                        )
+                        session_stream.publish(
+                            session_id,
+                            {
+                                "type": "session.reasoning_effort",
+                                "conversation_id": session_id,
+                                "reasoning_effort": _routed_effort,
+                            },
                         )
                     except (OSError, ValueError):
                         _logger.warning(
@@ -4248,6 +4288,14 @@ async def _forward_event_to_runner(
     # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
+    if _routed_model is not None:
+        effort = (_verdict or {}).get("reasoning_effort")
+    elif _auto_model_applied:
+        effort = (_auto_verdict or {}).get("reasoning_effort")
+    else:
+        effort = conv.reasoning_effort
+    if effort is not None:
+        runner_body["reasoning"] = {"effort": effort}
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
     # _routed_harness is non-None when the child routing path resolved one
@@ -4496,17 +4544,34 @@ async def _dispatch_session_event_to_runner_impl(
                     runner_client=_native_runner_client,
                 )
                 if _native_routed_model is not None:
+                    _native_routed_effort = (_native_verdict or {}).get("reasoning_effort")
                     try:
                         await asyncio.to_thread(
                             conversation_store.update_conversation,
                             session_id,
                             model_override=_native_routed_model,
+                            reasoning_effort=_native_routed_effort,
+                            _unset_reasoning_effort=_native_routed_effort is None,
+                        )
+                        session_stream.publish(
+                            session_id,
+                            {
+                                "type": "session.reasoning_effort",
+                                "conversation_id": session_id,
+                                "reasoning_effort": _native_routed_effort,
+                            },
                         )
                     except (OSError, ValueError):
                         _logger.warning(
                             "smart_routing: persist failed for native session=%s",
                             session_id,
                             exc_info=True,
+                        )
+                    with contextlib.suppress(httpx.HTTPError):
+                        await runner_client.post(
+                            f"/v1/sessions/{session_id}/events",
+                            json={"type": "effort_change", "effort": _native_routed_effort},
+                            timeout=5.0,
                         )
         # ────────────────────────────────────────────────────────────
         # Forward the message, carrying any routed model in-band. The

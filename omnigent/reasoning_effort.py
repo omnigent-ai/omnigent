@@ -23,6 +23,7 @@ OPENAI_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"}
 ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_EFFORTS = ANTHROPIC_EFFORTS
 CODEX_EFFORTS = OPENAI_EFFORTS
+CODEX_NATIVE_EFFORTS = OPENAI_EFFORTS | {"max", "ultra"}
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
 ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
@@ -34,7 +35,7 @@ COPILOT_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 def format_supported(values: Iterable[str]) -> str:
     """Return a stable comma-separated supported-values string."""
-    order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    order = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
     values_set = set(values)
     return ", ".join(value for value in order if value in values_set)
 
