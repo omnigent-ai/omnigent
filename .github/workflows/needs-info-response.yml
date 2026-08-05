@@ -49,6 +49,12 @@ jobs:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
+      - name: Warn when the omnigent-ci App is unconfigured
+        # The feature no-ops without the App (see above). Surface it so a dormant
+        # setup is distinguishable from a broken one.
+        if: steps.app-token.outputs.token == ''
+        run: echo "::notice::omnigent-ci App not configured; needs-info re-triage is dormant (label left in place)."
+
       - name: Remove needs-info label
         # Skip when the App isn't configured: removing with GITHUB_TOKEN would
         # not re-trigger re-triage, so the label would just silently vanish.
@@ -59,5 +65,14 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          echo "Author responded on #$ISSUE_NUMBER; removing needs-info to re-triage."
-          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-info
+          # Re-check the live labels before removing: the job gate reads the
+          # (possibly stale) event payload, and `gh --remove-label` errors on a
+          # label that is already gone. This keeps the step idempotent under a
+          # race (e.g. two quick comments, or a concurrent removal).
+          if gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels \
+               --jq '.labels[].name' | grep -qx needs-info; then
+            echo "Author responded on #$ISSUE_NUMBER; removing needs-info to re-triage."
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-info
+          else
+            echo "needs-info already cleared on #$ISSUE_NUMBER; nothing to do."
+          fi

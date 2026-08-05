@@ -403,7 +403,7 @@ jobs:
           # All GitHub mutations are built in Python with proper escaping
           # — no eval, no shell interpolation of model output.
           python3 <<'PYEOF'
-          import json, pathlib, sys, shlex
+          import json, os, pathlib, sys, shlex
 
           raw = pathlib.Path("/tmp/triage_output.txt").read_text()
 
@@ -478,16 +478,22 @@ jobs:
                   labels_add.append("help wanted")
 
               # Duplicate — only accept if the issue number is in our
-              # pre-fetched candidate list (prevents hallucinated refs).
+              # pre-fetched candidate list (prevents hallucinated refs). Only on
+              # the initial open: on re-triage we neither re-label nor re-comment
+              # (the duplicate call was already made at open time), so the label
+              # and its explanatory comment stay consistent.
               dup = result.get("duplicate_of")
               candidates = json.loads(
                   pathlib.Path("/tmp/duplicates.json").read_text()
               )
               candidate_numbers = {d["number"] for d in candidates}
-              if dup and isinstance(dup, int) and dup in candidate_numbers:
+              if (
+                  dup and isinstance(dup, int) and dup in candidate_numbers
+                  and os.environ.get("EVENT_ACTION") == "opened"
+              ):
                   labels_add.append("duplicate")
               else:
-                  dup = None  # discard hallucinated duplicate
+                  dup = None  # discard hallucinated / re-triage duplicate
 
               if "needs-triage" in existing_labels:
                   labels_remove.append("needs-triage")
@@ -522,7 +528,6 @@ jobs:
           pathlib.Path("/tmp/triage_result.json").write_text(json.dumps(output))
 
           # Build a shell script with properly escaped arguments — no eval.
-          import os
           issue = os.environ["ISSUE_NUMBER"]
           repo = os.environ["REPO"]
           cmds = []
