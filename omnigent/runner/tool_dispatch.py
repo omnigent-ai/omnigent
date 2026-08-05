@@ -2100,7 +2100,7 @@ async def _execute_subagent_tool(
 
 async def _peer_send_allowed(
     *,
-    target_snapshot: dict[str, Any],
+    target_snapshot: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> bool:

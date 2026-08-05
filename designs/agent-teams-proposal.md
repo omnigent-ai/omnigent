@@ -150,11 +150,14 @@ queueing if contention proves common.)
 - **`spawn_bounds`** already counts `dispatch_tools` per turn
   (`examples/polly/config.yaml:335`). Peer sends go through `sys_session_send`,
   so they are counted with no change — a teammate cannot fan out past the cap.
-- **New `team_bounds` policy (optional)** — caps peer sends per turn and the
-  number of distinct peers a session may message over the run, so a team cannot
-  grow unbounded through transitive peer contact. Lives beside the existing
-  policies in `omnigent/policies/builtins/orchestration.py` (re-exported under
-  the legacy `omnigent.inner.nessie.policies` handler path).
+- **New `team_bounds` policy (opt-in, off by default)** — caps peer sends per
+  turn and the number of distinct peers a session may message over the run, for
+  teams that want to bound transitive peer contact. Nothing applies it
+  automatically and the shipped `examples/team_demo` does not wire it: peer
+  messaging is unrestricted by default, since authorization already keeps a send
+  inside the team's spawn tree. Lives beside the existing policies in
+  `omnigent/policies/builtins/orchestration.py` (re-exported under the legacy
+  `omnigent.inner.nessie.policies` handler path).
 - **Blast radius** is unchanged; each member keeps its own `os_env` / sandbox.
 
 ## What is reused vs new
@@ -193,7 +196,10 @@ queueing if contention proves common.)
    the awaiter? MVP routes to the awaiter only; the lead can `sys_session_list` /
    `sys_session_get_history` to inspect. A mirrored notice to the lead is cheap to
    add if wanted.
-3. **`team_bounds` defaults** — reasonable caps for team size / peer-send depth?
+3. ~~**`team_bounds` defaults** — reasonable caps for team size / peer-send
+   depth?~~ **Resolved: no default cap.** Peer messaging is unbounded unless an
+   operator opts into `team_bounds`; a team's value is members talking freely,
+   and authorization already confines sends to the team's spawn tree.
 4. **Server-side enforcement** — the child-only check is runner-side today; do we
    also want the team-root check mirrored on the server create/event routes for
    defense in depth?

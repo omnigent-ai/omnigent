@@ -17,15 +17,17 @@ For a normal child send the two are identical. For an **agent-team peer send**
 — teammate B messages teammate C, whose structural parent is the lead A — B
 awaits the result even though C's parent stays A. The write is authorized by
 `_peer_send_allowed` (shared spawn-tree root + `team: true` on *both*
-endpoints), routed by `awaiter_session_id`, and bounded by the `team_bounds`
-policy.
+endpoints) and routed by `awaiter_session_id`. Message *volume* is deliberately
+unbounded: authorization already confines a peer send to the team's own spawn
+tree, and members are meant to talk freely. The optional `team_bounds` policy
+exists for teams that do want a cap; nothing applies it by default.
 
 ### What is already covered (do not rebuild)
 
 | Layer | Assertion | Location |
 | --- | --- | --- |
 | Registry routing | awaiter = sender for peer, = parent for child; inbox delivery; by-awaiter wake grouping | `tests/runner/test_subagent_awaiter_routing.py` |
-| Policy bound | per-turn + distinct-peer caps; named `(agent,title)` sends ignored | `tests/inner/nessie/test_policies.py::test_team_bounds_*` |
+| Policy bound | counting logic for the per-turn + distinct-peer caps, and that named `(agent,title)` sends are ignored — in isolation, holding ONE evaluator. Neither cap binds on the server-side `tools/call` path (see §2) | `tests/inner/nessie/test_policies.py::test_team_bounds_*` |
 | Authorization (unit) | root + dual-opt-in AND | `omnigent/runner/tool_dispatch.py` `_peer_send_allowed` |
 
 ### The gap this experiment fills
@@ -33,7 +35,7 @@ policy.
 Nothing exercises the **whole chain** through a live server + runner:
 
 ```
-alice: sys_session_send(session_id=<bob>) 
+alice: sys_session_send(session_id=<bob>)
   → _peer_send_allowed HTTP lookups (both snapshots, root + team flags)
   → register_subagent_work(awaiter=alice)   [not the lead]
   → bob runs a real turn
@@ -121,15 +123,24 @@ useful for anyone reasoning about the peer path.
    sub-config, and toggling the top-level flag is what governs the whole tree.
    S3 flips the top-level flag to prove the refusal.
 
-2. **`team_bounds`' per-turn cap cannot trip in the deterministic server-side
+2. **Neither `team_bounds` cap can trip in the deterministic server-side
    path.** `_evaluate_tool_call_policy` builds a fresh policy engine per
-   `tools/call` (`_build_policy_engine_from_spec`), so the stateful per-turn
-   counter resets each call. This is the same documented limitation the polly
-   CUJ notes for `spawn_bounds` (`scenario_fanout_dispatch`). The cumulative
-   distinct-peer bound and the per-turn wave bound must be verified against a
-   live runner; the unit test
-   (`tests/inner/nessie/test_policies.py::test_team_bounds_*`) already covers the
-   counting logic in isolation.
+   `tools/call` (`_build_policy_engine_from_spec`), so BOTH pieces of evaluator
+   state reset each call: the per-turn counter and the cumulative distinct-peer
+   set. Every send is judged as if it were the first, so a wave of any size is
+   allowed. This is the same documented limitation the polly CUJ notes for
+   `spawn_bounds` (`scenario_fanout_dispatch`), and it is a property of the
+   evaluation path, not of this feature.
+
+   Both bounds must therefore be verified against a live runner, where one
+   evaluator survives the turn. The unit tests
+   (`tests/inner/nessie/test_policies.py::test_team_bounds_*`) cover the
+   counting logic in isolation by holding a single evaluator;
+   `test_team_bounds_state_is_per_evaluator_instance` pins the contrast so those
+   tests are not misread as proof of an enforced server-side bound. Until a
+   live-runner check exists, treat the caps as advisory on this path: the
+   authorization gate still confines peer sends to the team, so the exposure is
+   runaway fan-out cost, not a reachability escape.
 
 3. **Guardrails for a peer sender live on the top-level spec, not the sender's
    sub-config.** Same root cause as §1: policy evaluation loads the spec bound to

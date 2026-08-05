@@ -81,8 +81,11 @@ os_env:
   sandbox:
     type: none
 
-# Bound the team fan-out. team_bounds caps peer sends per turn and distinct
-# peers per session; spawn_bounds caps child dispatches per turn.
+# Bound child dispatches per turn. Peer messaging between teammates is
+# deliberately left unbounded here — the authorization gate already confines a
+# peer send to the team's own spawn tree, and a team's whole point is that
+# members talk freely. Add the `team_bounds` policy if you want to cap peer
+# sends per turn or distinct peers per session.
 guardrails:
   policies:
     blast_radius:
@@ -98,13 +101,6 @@ guardrails:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
           max_dispatches_per_turn: 4
-    team_bounds:
-      type: function
-      function:
-        path: omnigent.inner.nessie.policies.team_bounds
-        arguments:
-          max_peer_sends_per_turn: 3
-          max_team_peers: 5
 
 tools:
   agents:

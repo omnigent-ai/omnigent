@@ -195,9 +195,16 @@ def _rewrite_team_bundle(
     if peer_send_cap is not None:
         cfg_path = dst / "config.yaml"
         spec = yaml.safe_load(cfg_path.read_text())
-        spec["guardrails"]["policies"]["team_bounds"]["function"]["arguments"][
-            "max_peer_sends_per_turn"
-        ] = peer_send_cap
+        # The example ships without a peer-send bound (a team messages freely),
+        # so S4 adds the policy itself rather than editing an existing block.
+        policies = spec.setdefault("guardrails", {}).setdefault("policies", {})
+        policies["team_bounds"] = {
+            "type": "function",
+            "function": {
+                "path": "omnigent.inner.nessie.policies.team_bounds",
+                "arguments": {"max_peer_sends_per_turn": peer_send_cap},
+            },
+        }
         cfg_path.write_text(yaml.safe_dump(spec, sort_keys=False))
     return dst
 

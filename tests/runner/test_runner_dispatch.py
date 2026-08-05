@@ -4148,6 +4148,281 @@ async def test_peer_send_denied_when_team_not_opted_in(
 
 
 @pytest.mark.asyncio
+async def test_peer_send_denied_when_caller_team_not_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peer send is refused when the CALLER's team flag is off.
+
+    Authorization is an AND over both endpoints. The target-side half is
+    covered above; this pins the caller-side half, so a session that never
+    opted in cannot message a teammate that did.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[int] = []
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(runner_app, "register_subagent_work", lambda **k: None)
+
+    handler = _peer_send_handler(
+        target_parent="conv_lead",
+        target_root="conv_lead",
+        target_team=True,
+        caller_root="conv_lead",
+        caller_team=False,
+        event_posts=event_posts,
+    )
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_peer", "args": "take a look"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    payload = json.loads(output)
+    assert payload["error"] == "session_out_of_tree"
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_peer_send_denied_when_target_has_no_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peer send is refused when the target carries no spawn-tree root.
+
+    ``root_conversation_id`` is ``None`` only for rows predating that column.
+    Such a target cannot be proven to share the caller's tree, so the gate
+    must fail closed rather than fall back to a looser comparison.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[int] = []
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(runner_app, "register_subagent_work", lambda **k: None)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_peer":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_peer",
+                    "title": "reviewer:auth",
+                    "parent_session_id": "conv_lead",
+                    "root_conversation_id": None,
+                    "team": True,
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions/conv_peer/events":
+            event_posts.append(1)
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_peer", "args": "take a look"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    payload = json.loads(output)
+    assert payload["error"] == "session_out_of_tree"
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_peer_send_fails_closed_when_caller_lookup_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed caller-snapshot lookup denies the peer send.
+
+    The gate needs the caller's own root and team flag to authorize. If that
+    read fails (server error, transport failure) it must deny rather than
+    assume membership.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[int] = []
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(runner_app, "register_subagent_work", lambda **k: None)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_peer":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_peer",
+                    "title": "reviewer:auth",
+                    "parent_session_id": "conv_lead",
+                    "root_conversation_id": "conv_lead",
+                    "team": True,
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        # The caller's own snapshot is unavailable.
+        if request.method == "GET" and path == "/v1/sessions/conv_caller":
+            return httpx.Response(500, json={"error": "boom"})
+        if request.method == "POST" and path == "/v1/sessions/conv_peer/events":
+            event_posts.append(1)
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_peer", "args": "take a look"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    payload = json.loads(output)
+    assert payload["error"] == "session_out_of_tree"
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_peer_send_between_roots_of_same_tree_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two top-level sessions are separate trees and cannot peer-message.
+
+    A top-level session roots its own tree, so its ``root_conversation_id``
+    equals its own id (asserted at the store layer in
+    ``tests/stores/test_conversation_store.py``). Two such sessions therefore
+    never share a root, and the ``or conversation_id`` fallback in the gate
+    cannot make them match. This pins that: peer messaging stays inside one
+    spawn tree even when both parties opt into ``team``.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[int] = []
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(runner_app, "register_subagent_work", lambda **k: None)
+
+    # Both sessions are roots: each one's root id is its own id.
+    handler = _peer_send_handler(
+        target_parent="",
+        target_root="conv_peer",
+        target_team=True,
+        caller_root="conv_caller",
+        caller_team=True,
+        event_posts=event_posts,
+    )
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_peer", "args": "take a look"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    payload = json.loads(output)
+    assert payload["error"] == "session_out_of_tree"
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_peer_send_keeps_sse_fanout_on_structural_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peer send leaves SSE fan-out pointing at the target's real parent.
+
+    Completion routing moves to the sender, but the target's live deltas must
+    keep rendering in its owner's UI panel. If ``register_child_session`` were
+    re-pointed at the sender the lead's panel would go dark mid-turn.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[int] = []
+    sse_parents: list[str | None] = []
+    work_parents: list[str | None] = []
+
+    def _record_child(child_session_id: str, **kwargs: Any) -> None:
+        sse_parents.append(kwargs.get("parent_session_id"))
+
+    def _record_work(**kwargs: Any) -> Any:
+        work_parents.append(kwargs.get("parent_session_id"))
+        return SimpleNamespace(work_id="w", status="launching")
+
+    monkeypatch.setattr(runner_app, "register_child_session", _record_child)
+    monkeypatch.setattr(runner_app, "register_subagent_work", _record_work)
+    monkeypatch.setattr(tool_dispatch, "_publish_child_launching_update", lambda *a, **k: None)
+
+    handler = _peer_send_handler(
+        target_parent="conv_lead",
+        target_root="conv_lead",
+        target_team=True,
+        caller_root="conv_lead",
+        caller_team=True,
+        event_posts=event_posts,
+    )
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_peer", "args": "take a look"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert event_posts == [1]
+    # The lead stays the structural parent for both the SSE fan-out and the
+    # work registration; only the awaiter moves to the sender.
+    assert sse_parents == ["conv_lead"]
+    assert work_parents == ["conv_lead"]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_completion_drains_from_parent_inbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

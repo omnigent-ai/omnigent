@@ -1206,8 +1206,9 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     Remove sub-agent work associated with a deleted session.
 
-    A deleted session can be either the child work handle itself or
-    the parent that owns several child handles. Both indexes are
+    A deleted session can be the child work handle itself, the awaiter
+    that owns several handles, or — for an agent-team peer send — the
+    structural parent of a handle some teammate awaits. All three are
     cleaned so runner-local state cannot outlive the session tree.
 
     :param session_id: Session id being deleted, e.g.
@@ -1220,6 +1221,13 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
     _subagent_work_by_parent.pop(session_id, None)
+    # A peer send groups work under the awaiter, so entries whose structural
+    # parent is the deleted session are not reachable via the loop above.
+    for child_id, entry in list(_subagent_work_by_child.items()):
+        if entry.parent_session_id != session_id:
+            continue
+        unregister_subagent_work(child_id)
+        _drained_delivered_subagent_children.discard(child_id)
 
 
 def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:

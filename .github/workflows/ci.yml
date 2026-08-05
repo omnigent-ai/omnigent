@@ -238,6 +238,30 @@ jobs:
           retention-days: 14
           include-hidden-files: true  # the per-shard .coverage.<group> dotfile
 
+  team-p2p-cuj:
+    name: Team p2p CUJ
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version-file: ".python-version"
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --extra all --extra dev
+      # The driver stands a mock LLM up in front of a real server + runner, so
+      # it needs no provider credentials — strip any so a leaked key can't make
+      # a scenario reach a live endpoint.
+      - name: Run team peer-messaging CUJ
+        run: |
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
+            uv run python tests/e2e/team_p2p_cuj.py
+
   stores-postgres:
     name: Pytest (stores-postgres)
     needs: gate

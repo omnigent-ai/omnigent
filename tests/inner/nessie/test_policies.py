@@ -376,6 +376,35 @@ def test_team_bounds_caps_distinct_peers_cumulatively() -> None:
     assert _result(evaluate(_tool_call("sys_session_send", session_id="d", args="hi"))) == "DENY"
 
 
+def test_team_bounds_state_is_per_evaluator_instance() -> None:
+    """
+    Both team bounds live in per-evaluator state, so a caller that rebuilds the
+    evaluator per event gets no bound at all.
+
+    This is a REAL limitation of the deterministic server-side tool_call path,
+    not a quirk of the tests above: ``_evaluate_tool_call_policy`` calls
+    ``_build_policy_engine_from_spec`` per request, so each ``tools/call``
+    evaluates against a fresh counter and an empty peer set. The bounds only
+    bind where one evaluator survives a whole turn (the live runner). The
+    other ``team_bounds`` tests deliberately hold a single evaluator, which is
+    why the caps fire there — this test pins the contrast so nobody reads
+    those as proof of an enforced server-side wave bound.
+
+    ``spawn_bounds`` has the same limitation (see the polly CUJ notes); it is
+    documented in ``designs/team-p2p-parity-experiment.md``.
+    """
+    # A single evaluator bounds the wave: the 3rd send is refused.
+    shared = team_bounds(max_peer_sends_per_turn=2, max_team_peers=2)
+    calls = [_tool_call("sys_session_send", session_id=f"p{i}", args="hi") for i in range(4)]
+    assert [_result(shared(call)) for call in calls] == ["ALLOW", "ALLOW", "DENY", "DENY"]
+
+    # Rebuilt per event, nothing is ever refused — neither cap can accumulate.
+    per_call = [
+        _result(team_bounds(max_peer_sends_per_turn=2, max_team_peers=2)(call)) for call in calls
+    ]
+    assert per_call == ["ALLOW", "ALLOW", "ALLOW", "ALLOW"]
+
+
 @pytest.mark.parametrize(
     "child_args,expected",
     [
