@@ -292,6 +292,8 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_harness_override,
     _validated_harness_override_executor_type,
+    _validated_spec_smart_routing_harness,
+    _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
 )
@@ -3474,7 +3476,10 @@ async def _ensure_native_terminal_ready(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
         )
     if resp.status_code < 400:
-        return _NativeTerminalEnsureOutcome(error=None)
+        return _NativeTerminalEnsureOutcome(
+            error=None,
+            policy_notice=_policy_notice_from_ensure_response(resp),
+        )
     _logger.warning(
         "%s terminal ensure failed definitively for session=%s status=%s body=%s",
         display_name,
@@ -4770,6 +4775,14 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
             )
             return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+        if ensure_outcome.policy_notice is not None:
+            # Terminal is up but policy enforcement is off (fail-open). Post
+            # a durable, non-fatal banner; the user message still forwards.
+            await _persist_native_policy_notice(
+                session_id,
+                conversation_store,
+                ensure_outcome.policy_notice,
+            )
         # Record the optimistic bubble before forwarding so it's known
         # server-side immediately (replayed into the snapshot). Roll it
         # back on any failure/cancellation so a message the TUI never

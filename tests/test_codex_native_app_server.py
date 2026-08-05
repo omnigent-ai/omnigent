@@ -140,6 +140,7 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     assert process.terminated is True
     _model_discovery_cache.clear()
 
+
 # Every framework-approved Omnigent tool gets its own approval table, so a
 # routed spawn's sys_session_create never raises an interactive prompt.
 _EXPECTED_FRAMEWORK_TOOL_APPROVALS = {

@@ -808,6 +808,7 @@ async def test_recovery_ignores_another_session_sharing_the_bridge_dir(
     )
     assert read_pending_replay(tmp_path) is not None
 
+
 # ── claude-native: settle probe + the runner-side actuator ──────────────
 
 

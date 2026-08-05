@@ -7,7 +7,6 @@ import re
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
 

@@ -59,6 +59,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -69,7 +70,9 @@ from omnigent.server.routes._sessions.helpers import (
     _build_evaluation_context,
     _claude_native_remember_host,
     _client_supplied_hook_elicitation_id,
+    _emit_server_routing_decision,
     _forward_session_change_to_runner,
+    _get_runner_client,
     _native_ask_gate_lock,
     _publish_policy_denied,
     _structured_ask_user_question,
@@ -77,6 +80,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
+    _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
 )
 from omnigent.server.schemas import (

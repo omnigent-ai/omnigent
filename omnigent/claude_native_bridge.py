@@ -1525,7 +1525,7 @@ def build_hook_settings(
     return settings
 
 
-def _claude_route_turn_hook(bridge_dir: Path, python: str) -> dict[str, Any]:
+def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
     """
     Build the ``UserPromptSubmit`` entry for first-message model routing.
 

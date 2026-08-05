@@ -1903,10 +1903,13 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
     const first = buildBubbles(f1 as AnyBlock[], null, cache);
     const f2 = [...f1, { type: "text_chunk", ctx: ctx({ responseId: "resp_2" }), text: "o" }];
     const second = buildBubbles(f2 as AnyBlock[], null, cache);
-    expect(kinds(second)).toEqual(["routing_decision", "assistant", "assistant", "assistant"]);
+    // One assistant bubble per turn: the echo, the finished item and the
+    // streaming text all sit in the same turn, so they group together.
+    expect(kinds(second)).toEqual(["routing_decision", "assistant"]);
     expect(second).toEqual(buildBubbles(f2 as AnyBlock[], null));
+    // The chip is still the SAME object — a full rebuild would have minted a
+    // new one, so the cache resumed rather than restarting past the chip.
     expect(second[0]).toBe(first[0]);
-    expect(second[1]).toBe(first[1]);
   });
 });
 

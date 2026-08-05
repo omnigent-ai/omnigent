@@ -11,6 +11,7 @@ import re
 import shlex
 import socket
 import sys
+import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -1255,7 +1256,7 @@ def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None
     }
 
 
-def _codex_route_turn_hook(bridge_dir: Path, python_executable: str | None) -> dict[str, Any]:
+def _codex_route_turn_hook(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
     """
     Build the ``UserPromptSubmit`` entry for first-message model routing.
 

@@ -642,6 +642,7 @@ async def test_a_non_auto_opt_in_value_is_rejected(client: httpx.AsyncClient) ->
     assert created.status_code == 400, created.text
     assert "smart_routing_harness" in created.text
 
+
 # ── Create-time subagent-routing stamp ──────────────────────────────────────
 #
 # The spawn gate is two-state: only an explicit ``"on"`` routes. A session that

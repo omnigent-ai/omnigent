@@ -140,6 +140,7 @@ from omnigent.server.routes._sessions.helpers import (
     _title_content_from_item,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
+    _validated_subagent_routing_override,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,

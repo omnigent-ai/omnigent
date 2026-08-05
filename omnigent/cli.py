@@ -79,7 +79,7 @@ if TYPE_CHECKING:
 
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
-    from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
+    from omnigent.server.smart_routing import LLMRoutingClient
     from omnigent.smart_routing_cli import RoutingDecision
     from omnigent.spec.types import LLMConfig
     from omnigent.update_check import _InstalledWheelInfo

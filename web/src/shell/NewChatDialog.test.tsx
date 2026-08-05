@@ -145,6 +145,25 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
+/** Stable per-harness model-catalog results (identity matters: effects key on them). */
+const CLAUDE_MODEL_OPTIONS_RESULT = {
+  data: [
+    { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
+    { id: "sonnet", model: "system.ai.claude-sonnet-4-6[1m]", displayName: "Sonnet 4.6" },
+    { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
+  ],
+  isLoading: false,
+  isError: false,
+};
+const CODEX_MODEL_OPTIONS_RESULT = {
+  data: [
+    { id: "databricks-gpt-5-5", displayName: "GPT-5.5", isDefault: true },
+    { id: "databricks-gpt-5-6", displayName: "GPT-5.6" },
+  ],
+  isLoading: false,
+  isError: false,
+};
+
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
@@ -658,25 +677,9 @@ function setupLandingMocks() {
   mockHosts([host("online")]);
   useHostModelOptionsMock.mockImplementation(
     (_hostId, harness) =>
-      ({
-        data:
-          harness === "codex-native"
-            ? [
-                { id: "databricks-gpt-5-5", displayName: "GPT-5.5", isDefault: true },
-                { id: "databricks-gpt-5-6", displayName: "GPT-5.6" },
-              ]
-            : [
-                { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
-                {
-                  id: "sonnet",
-                  model: "system.ai.claude-sonnet-4-6[1m]",
-                  displayName: "Sonnet 4.6",
-                },
-                { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
-              ],
-        isLoading: false,
-        isError: false,
-      }) as unknown as ReturnType<typeof useHostModelOptions>,
+      (harness === "codex-native"
+        ? CODEX_MODEL_OPTIONS_RESULT
+        : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
   );
   mockAgents([
     {
@@ -3134,7 +3137,7 @@ describe("NewChatLandingScreen smart routing", () => {
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
     ["Claude Code", "a1", false, null, "Default"],
-    ["Codex", "a2", true, "Smart Routing", "Default"],
+    ["Codex", "a2", true, "Smart Routing", "Default (databricks-gpt-5-5)"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
     (_label, agentId, flag, routingOption, siblingOption) => {
@@ -3150,11 +3153,10 @@ describe("NewChatLandingScreen smart routing", () => {
     },
   );
 
-  // No Model row at all: Codex has nothing else to offer with the flag off,
-  // and a non-routable harness has nothing to offer even with it on. Either
-  // way that harness's own knob row is untouched.
+  // No Model row at all: a non-routable harness has nothing to offer even with
+  // the flag on, and its own knob row is untouched. (Codex always has a row —
+  // the host resolves its launch catalog — see the dropdown cases above.)
   it.each([
-    ["Codex with the flag off", "a2", false, null, "new-chat-landing-config-approval"],
     [
       "a non-routable harness with the flag on",
       "a_cursor",
@@ -3193,18 +3195,18 @@ describe("NewChatLandingScreen smart routing", () => {
       mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
       renderLanding({ smart_routing_enabled: true });
       openAgentConfig(agentId);
-      if (!offered && agentId === "a2") {
-        // Codex's Model row is only ever there for Smart Routing.
-        expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-        expect(screen.getByTestId("new-chat-landing-config-approval")).toBeTruthy();
-        return;
-      }
       openSelect("new-chat-landing-config-model");
       if (offered) {
         expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
       } else {
+        // The row stays — it still names the harness's own models — but the
+        // routing sentinel is gone.
         expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
-        expect(screen.getByRole("option", { name: "Opus 4.8" })).toBeTruthy();
+        expect(
+          screen.getByRole("option", {
+            name: agentId === "a2" ? "databricks-gpt-5-6" : "Opus 4.8",
+          }),
+        ).toBeTruthy();
       }
     },
   );

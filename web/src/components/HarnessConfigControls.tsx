@@ -43,6 +43,9 @@ export interface RoutingModelOption {
  *   is visual-only, so pass it here to name the control for AT).
  * @param models Harness models, listed after "Default". Empty when the harness
  *   resolves its own catalog and only the two sentinels are expressible.
+ * @param defaultLabel Label for the "no explicit model" row. Defaults to
+ *   "Default"; pass the resolved form (e.g. `Default (gpt-5.5)`) where the
+ *   catalog names which model that is.
  * @param activeModelId Model marked `data-active` in the list, when any.
  * @param contentClassName Extra classes for the dropdown popup.
  * @param children Rendered below the model list, e.g. a loading/empty note.
@@ -54,6 +57,7 @@ export function RoutingModelSelect({
   testId,
   ariaLabel = "Model",
   models,
+  defaultLabel = "Default",
   activeModelId,
   contentClassName,
   children,
@@ -64,6 +68,7 @@ export function RoutingModelSelect({
   testId: string;
   ariaLabel?: string;
   models?: readonly RoutingModelOption[];
+  defaultLabel?: string;
   activeModelId?: string | null;
   contentClassName?: string;
   children?: ReactNode;
@@ -77,7 +82,7 @@ export function RoutingModelSelect({
         {offerSmartRouting && (
           <SelectItem value={MODEL_SELECT_SMART}>{SMART_ROUTING_LABEL}</SelectItem>
         )}
-        <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+        <SelectItem value={MODEL_SELECT_DEFAULT}>{defaultLabel}</SelectItem>
         {(models ?? []).map((m) => (
           <SelectItem
             key={m.id}

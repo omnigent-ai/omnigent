@@ -57,7 +57,9 @@ def test_router_hook_registered_when_router_dir_set(tmp_path: Path) -> None:
     assert "omnigent.inner.hook_scripts.claude_router_hook" in hook["command"]
     assert f"--bridge-dir {bridge_dir}" in hook["command"]
     assert f"--router-dir {bridge_dir}" in hook["command"]
-    assert hook["timeout"] == 30
+    # Must exceed the hook script's own 30s request timeout, so the script's
+    # fail-open branch runs before Claude kills the hook.
+    assert hook["timeout"] == 40
 
 
 def test_router_hook_coexists_with_policy_hooks(tmp_path: Path) -> None:

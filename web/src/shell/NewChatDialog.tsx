@@ -1604,6 +1604,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
+                  defaultLabel={defaultModelLabel(codexModelOptions, displayModelId)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                 >
                   {modelsLoading && (

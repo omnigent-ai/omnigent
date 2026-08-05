@@ -168,6 +168,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
+    SUBAGENT_ROUTING_OVERRIDE_VALUES,
     _logger,
     _managed_launch_tasks,
     _model_options_cache,
@@ -4831,9 +4832,37 @@ class _NativeTerminalEnsureOutcome:
         create the terminal (fails the turn with a durable banner), or
         ``None`` when the terminal is ready / the failure was not
         definitive.
+    :param policy_notice: Human-readable reason that tool-call policy
+        enforcement is NOT active for this session (fail-open — codex too
+        old or the hook could not be trusted), or ``None`` when
+        enforcement is active. Non-fatal: surfaced once as a durable
+        banner, never blocks the turn.
     """
 
     error: ErrorData | None
+    policy_notice: str | None = None
+
+
+def _policy_notice_from_ensure_response(resp: httpx.Response) -> str | None:
+    """
+    Extract a non-fatal policy-disabled notice from a 2xx ensure response.
+
+    The runner attaches ``policy_hook_disabled_reason`` (once) to its
+    terminal-ensure success body when the session degraded to no policy
+    enforcement. A malformed / non-JSON body is treated as "no notice"
+    rather than failing the (successful) readiness probe.
+
+    :param resp: The runner's 2xx ensure response.
+    :returns: The reason string, or ``None`` when absent / unparseable.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    reason = body.get("policy_hook_disabled_reason")
+    return reason if isinstance(reason, str) and reason.strip() else None
 
 
 def _publish_error_event(session_id: str, error: ErrorData) -> None:
@@ -4851,6 +4880,53 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
         error=RetryErrorDetail(code=error.code, message=error.message),
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+async def _persist_native_policy_notice(
+    session_id: str,
+    conversation_store: ConversationStore,
+    reason: str,
+) -> None:
+    """
+    Persist + publish a non-fatal "policy not enforced" banner.
+
+    The runner reports (once, via the terminal-ensure success response)
+    that a native codex session started but tool-call policy enforcement
+    is inactive (fail-open: codex too old, or the policy hook could not be
+    trusted). This records a durable ``type="error"`` banner so the web UI
+    shows the degraded-security state across refresh/reconnect, and
+    mirrors it as a live ``response.error`` event. Unlike
+    :func:`_persist_native_terminal_failure` it does NOT consume the user
+    message or mark the turn failed — the terminal is up and the message
+    still forwards; this is an advisory notice only.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conversation_store: Store used for the durable append.
+    :param reason: Human-readable cause from the runner, e.g. ``"Codex CLI
+        0.128.0 is older than 0.129.0; upgrade codex to enforce tool-call
+        policies."``.
+    :returns: None.
+    """
+    error = ErrorData(
+        source="execution",
+        code=_NATIVE_POLICY_NOT_ENFORCED_CODE,
+        message=f"Tool-call policy enforcement is not active for this session: {reason}",
+    )
+    persisted = await _relay_persist_error_once(
+        conversation_store,
+        session_id,
+        NewConversationItem(
+            type="error",
+            response_id=generate_task_id(),
+            data=error,
+        ),
+    )
+    # Mirror to live clients only when newly persisted (the runner's
+    # one-shot flag already prevents re-surfacing; this dedups a same-turn
+    # retry against an already-recorded notice).
+    if persisted == "persisted":
+        _publish_error_event(session_id, error)
 
 
 def _extract_claude_native_runner_failure(resp: httpx.Response) -> str | None:
@@ -8884,9 +8960,11 @@ __all__ = [
     "_persist_external_model_options",
     "_persist_external_reasoning_effort_change",
     "_persist_external_subagent_start",
+    "_persist_native_policy_notice",
     "_persist_policy_deny_sentinel",
     "_persist_session_status_error_labels",
     "_persist_stored_session_bundle",
+    "_policy_notice_from_ensure_response",
     "_poll_request_disconnect",
     "_presentation_labels_for_agent",
     "_presentation_labels_for_agent_impl",

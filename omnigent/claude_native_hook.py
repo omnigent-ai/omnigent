@@ -1261,9 +1261,9 @@ def _write_turn_routing_marker(path: Path) -> bool:
 def _route_turn_post(
     url: str,
     token: str,
-    body: dict[str, Any],
+    body: dict[str, object],
     timeout: float,
-) -> dict[str, Any] | None:
+) -> dict[str, object] | None:
     """
     POST one JSON body to the loopback ``route-turn`` endpoint.
 
