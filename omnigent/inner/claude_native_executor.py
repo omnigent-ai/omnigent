@@ -8,7 +8,7 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from omnigent.claude_model_vocabulary import claude_model_command_arg
+from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
@@ -16,6 +16,7 @@ from omnigent.claude_native_bridge import (
     inject_slash_command,
     inject_user_message,
     read_active_session_id,
+    read_claude_status_model,
     read_launch_model,
     read_model_env,
 )
@@ -258,9 +259,15 @@ class ClaudeNativeExecutor(Executor):
 
         Only switches when routing named a model AND it differs from the
         model the pane is already on. The baseline is tracked per turn in
-        ``_applied_model``, seeded lazily from the spawn ``launch_model``
-        so turn 1's routed pick is compared against what Claude actually
-        booted with — not blindly re-issued.
+        ``_applied_model``, seeded lazily so turn 1's routed pick is compared
+        against what the pane is actually on — not blindly re-issued.
+
+        The LIVE model (the statusLine capture) is the seed, falling back to
+        the launch model. ``launch_model`` alone was wrong for a routed first
+        message: the turn router blocks the prompt, switches the pane itself
+        and then replays the prompt with the same override, so a baseline
+        frozen at bridge-prepare time still named the pre-switch model and the
+        replay typed a second, redundant ``/model``.
 
         :param wanted_model: The turn's routed model, or ``None`` when the
             turn carries no override (routing off / already-pinned session).
@@ -269,12 +276,17 @@ class ClaudeNativeExecutor(Executor):
         if not wanted_model:
             return False
         if self._applied_model is None:
-            # First turn: compare against the spawn model. read_launch_model
-            # is best-effort (None when no ucode profile was active); an
-            # unknown baseline means we switch to be safe — a redundant
-            # ``/model`` to the current model is a harmless no-op.
-            self._applied_model = read_launch_model(self._bridge_dir)
-        return wanted_model != self._applied_model
+            # Both reads are best-effort (no statusLine capture yet, no ucode
+            # profile); an unknown baseline means we switch to be safe — a
+            # redundant ``/model`` to the current model is a harmless no-op.
+            self._applied_model = read_claude_status_model(self._bridge_dir) or read_launch_model(
+                self._bridge_dir
+            )
+        if self._applied_model is None:
+            return True
+        # The statusLine reports a display spelling ("Sonnet 5") where routing
+        # names a catalog id, so compare normalized.
+        return normalized_model_id(wanted_model) != normalized_model_id(self._applied_model)
 
 
 def _bridge_dir_from_env() -> Path:

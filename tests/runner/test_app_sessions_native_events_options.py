@@ -1859,6 +1859,13 @@ async def test_events_model_change_on_native_session_types_slash_command(
         captured.append((bridge_dir, command, timeout_s, confirm_hint))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    # The pane's own picker vocabulary: this id occupies the custom slot, so
+    # ``/model`` takes it exactly rather than stepping down to ``opus``.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -1927,6 +1934,70 @@ async def test_events_model_change_on_native_session_types_slash_command(
     assert queued_events == [], (
         f"model_change must not publish session events; got {queued_events!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A model outside the pane's ``/model`` vocabulary fails loud, typing nothing.
+
+    Typing a bare catalog id the picker has no row for leaves the pane on its
+    old model while the handler reports success, so the session's recorded
+    model diverges from the one it is running.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+
+    def _fake_inject(bridge_dir: Any, **kwargs: Any) -> None:
+        """Record any injection so the assertion can prove none happened."""
+        captured.append((bridge_dir, kwargs))
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    # Every alias is pinned to something else, so the routed id maps to nothing
+    # ``/model`` accepts.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "57c7c1acc5eeec3978c5e62043da51a5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/57c7c1acc5eeec3978c5e62043da51a5/events",
+            json={"type": "model_change", "model": "databricks-claude-opus-4-8"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unsupported"
+    assert captured == []
 
 
 @pytest.mark.asyncio

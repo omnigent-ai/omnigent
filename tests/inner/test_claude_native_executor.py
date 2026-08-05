@@ -1162,3 +1162,65 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
     assert slash_calls == [], f"No /model expected when already on that model; got {slash_calls}."
     assert msg_calls == ["hello"]
     assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_a_routed_first_message_switches_the_model_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The replay of a routed first message must not re-issue ``/model``.
+
+    First-message routing blocks the prompt, types the switch itself, then
+    replays the prompt with the same ``model_override``. Seeding the baseline
+    from ``launch_model`` (written once at bridge prepare) made the replay
+    compare against the PRE-switch model and type a second, redundant
+    ``/model`` — visible in the transcript ahead of the very first turn.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    slash_calls: list[str] = []
+    msg_calls: list[str] = []
+
+    def fake_inject_slash_command(bridge_dir_arg: Path, *, command: str, **kwargs: object) -> None:
+        del bridge_dir_arg, kwargs
+        slash_calls.append(command)
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        msg_calls.append(content)
+
+    # The launch model is stale — the turn router already moved the pane, and
+    # only the statusLine capture knows it.
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_launch_model",
+        lambda _bridge: "databricks-claude-sonnet-5",
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_claude_status_model",
+        lambda _bridge: "claude-opus-4-8",
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-opus-4-8"),
+        )
+    ]
+
+    assert slash_calls == [], (
+        f"The router already switched the pane; the replay must type nothing. Got {slash_calls}."
+    )
+    assert msg_calls == ["hello"]
+    assert events == [TurnComplete(response=None)]

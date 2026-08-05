@@ -109,6 +109,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
@@ -137,6 +138,7 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_from_cache,
     _set_read_state,
+    _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
@@ -1808,12 +1810,19 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 {"type": "effort_change", "effort": updated.reasoning_effort},
+                # Same TUI injection budget as the model change below: the
+                # ``/effort`` confirm dialog can render seconds after the
+                # command.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
         if live_forward and (model_override is not None or clear_model):
-            await _forward_session_change_to_runner(
+            _model_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {"type": "model_change", "model": updated.model_override},
+                # The runner answers this by typing ``/model`` into the pane and
+                # confirming the dialog, which outlasts the default budget.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -1821,7 +1830,15 @@ def register_core_routes(
             # polly/debby also carry) — see _persist_model_change_note for the
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
-            if not _is_native_terminal_session(updated):
+            if _is_native_terminal_session(updated):
+                # The injection is the only thing that moves a native pane's
+                # model, so a dropped forward must not pass as applied.
+                _surface_model_change_forward_failure(
+                    session_id,
+                    updated.model_override,
+                    _model_forward,
+                )
+            else:
                 await _persist_model_change_note(
                     session_id,
                     updated.model_override,

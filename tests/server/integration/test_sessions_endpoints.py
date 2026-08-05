@@ -6459,6 +6459,54 @@ async def test_patch_model_override_skips_note_for_native_session(
     assert _model_change_notes(published) == []
 
 
+async def test_patch_model_override_surfaces_a_dropped_native_forward(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native pane the model change never reached must say so.
+
+    The PATCH persists ``model_override`` and forwards it to the runner, which
+    types ``/model`` into the terminal — the only thing that moves a native
+    pane's model. The forward's result was discarded, so a dropped one left the
+    row and the picker claiming a model the pane was never switched to, with
+    nothing on screen to say the switch had not happened.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    async def _no_runner(*_args: Any, **_kwargs: Any) -> None:
+        """No runner is bound, so nothing typed the slash command."""
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _no_runner,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"model_override": "opus"},
+    )
+    assert patch.status_code == 200, patch.text
+    errors = [
+        event
+        for _sid, event in published
+        if event.get("type") == "response.error"
+        and event.get("error", {}).get("code") == "model_change_not_applied"
+    ]
+    assert len(errors) == 1, f"Expected one visible failure notice; got {published!r}"
+    assert "opus" in errors[0]["error"]["message"]
+
+
 async def test_patch_model_override_records_note_for_terminal_view_sdk_session(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

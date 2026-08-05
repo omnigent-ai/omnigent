@@ -4051,6 +4051,7 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
+        from omnigent.claude_model_vocabulary import claude_model_command_arg
         from omnigent.claude_native import (
             resolve_claude_native_model_selection,
         )
@@ -4058,6 +4059,7 @@ def create_runner_app(
             SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             inject_slash_command,
+            read_model_env,
         )
 
         if model is None or not model.strip():
@@ -4072,7 +4074,31 @@ def create_runner_app(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        command = f"/model {resolved_model}"
+        # ``/model`` takes only this session's own picker vocabulary — its
+        # family aliases and its one custom slot. Typing a bare catalog id
+        # outside it leaves the pane on its old model while this handler
+        # reports success, so fail loud instead. Same translation the routed
+        # turn path and the executor apply.
+        env = read_model_env(bridge_dir) or None
+        model_arg = claude_model_command_arg(resolved_model, env)
+        if model_arg is None:
+            _logger.warning(
+                "claude-native model change: %r has no spelling session=%s accepts (pins=%s)",
+                resolved_model,
+                conv_id,
+                sorted(env or ()),
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_unsupported",
+                    "detail": (
+                        f"This Claude terminal cannot switch to {resolved_model}: "
+                        "its /model picker has no spelling for that model."
+                    ),
+                },
+            )
+        command = f"/model {model_arg}"
         try:
             # Accepted trade-off: ``/model <id>`` also saves the pick as the
             # person's global default in ``~/.claude/settings.json``. Driving
