@@ -6220,14 +6220,12 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
     """
     The real forwarder mirror drives a live server and crosses the SSE wire.
 
-    Every other test in this feature mocks its neighbour, so a broken seam
-    between them passes all of them — the missing event type in the route's
-    payload-validation passthrough did exactly that, 400ing every POST while
-    each layer's own tests stayed green. This drives
-    ``_forward_permission_mode_from_pane`` (not a hand-rolled POST) against
-    the real route, and asserts the published event survives validation
-    against ``ServerStreamEvent`` at the SSE boundary and lifts into the typed
-    frontend shape the store reduces.
+    Covers the seams that per-layer tests miss by mocking their neighbour: an
+    event type absent from the route's payload-validation passthrough 400s
+    every POST, and one absent from ``ServerStreamEvent`` fails at the SSE
+    boundary — both invisible to the forwarder, which logs post failures at
+    debug level. Drives ``_forward_permission_mode_from_pane`` itself rather
+    than a hand-rolled POST, so the mirror's own logic is on the path.
     """
     from omnigent import claude_native_forwarder as fwd
     from tests.server.helpers import start_session_stream_collector
