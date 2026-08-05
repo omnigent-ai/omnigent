@@ -1156,13 +1156,16 @@ export function ChatPage() {
   // the CLI instructions instead so users learn the right entry point.
   if (!urlConvId) return <NewChatLandingScreen />;
 
-  // Pick the reconnect dialog's state from liveness. The dialog only
-  // opens for the two unreachable variants; `host_offline` carries
-  // ownership (a non-owner can't reach the host machine). Any other
-  // liveness defaults to `local_stranded` — harmless since the dialog
-  // stays closed unless an unreachable interaction opened it.
-  const reconnectState = liveness.kind === "host_offline" ? "host_offline" : "local_stranded";
-  const reconnectIsOwner = liveness.kind === "host_offline" ? liveness.isOwner : true;
+  // Pick the reconnect dialog's state from the session's host binding, not
+  // from liveness: the dialog opens both from an unreachable send AND from the
+  // composer's host badge, which offers reconnect whenever the host tunnel is
+  // down — including states liveness still calls reachable (a runner that
+  // outlived its host). A host-bound session always reconnects via
+  // `omnigent host`; only an unbound one relaunches locally. Ownership gates
+  // the host command — a non-owner can't reach that machine.
+  const hostBound = !!(activeSession?.hostId ?? activeConv?.host_id);
+  const reconnectState = hostBound ? "host_offline" : "local_stranded";
+  const reconnectIsOwner = isOwnerLevel(permissionLevel);
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
@@ -1882,7 +1885,6 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
-        hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
@@ -2759,14 +2761,13 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
-    // A `host_offline` session moves the reconnect affordance up into the
-    // composer's host badge (ComposerStatusLine), where the host is already
-    // named — so render nothing here whenever that composer is on screen
-    // (sub-agent sessions included; their badge carries it just like a normal
-    // session's). The composer is hidden only in the terminal-first *terminal*
-    // view (the PTY owns the surface); there the banner still carries the
-    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
-    // no badge).
+    // A host-bound session carries the reconnect affordance in the composer's
+    // host badge (ComposerStatusLine), which names the host that dropped — so
+    // render nothing here whenever that composer is on screen (sub-agent
+    // sessions included; their badge carries it just like a normal session's).
+    // The composer is hidden only in the terminal-first *terminal* view (the
+    // PTY owns the surface); there the banner still carries the affordance.
+    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
       return null;
@@ -3512,13 +3513,10 @@ interface ComposerProps {
    */
   unreachable?: boolean;
   /**
-   * The session is host-bound to an offline, non-resumable host
-   * (`host_offline`): the composer's host badge turns into a clickable
-   * "Host is offline — click to reconnect" affordance (see HostBadge's
-   * `onReconnect`), replacing the separate banner below the composer.
+   * Open the reconnect help dialog. Always wired to the status line's host
+   * badge, which turns itself into a clickable reconnect affordance whenever
+   * its bound host is offline and reconnectable.
    */
-  hostOffline?: boolean;
-  /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
   onShowReconnectHelp?: () => void;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
@@ -3740,10 +3738,9 @@ function ComposerStatusLine({
   goal: Goal | null;
   isSubAgentSession: boolean;
   /**
-   * When set (`host_offline` liveness), the host badge becomes a clickable
-   * "Host is offline — click to reconnect" affordance. Also forces the tray
-   * to render even when it would otherwise be empty, so the prompt is always
-   * visible for an unreachable host.
+   * Opens the reconnect help dialog, handed to the host badge — which turns
+   * itself into a clickable reconnect affordance when its bound host is
+   * offline and reconnectable.
    */
   onHostReconnect?: () => void;
 }) {
@@ -3773,19 +3770,14 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  // The offline-host reconnect affordance lives in the host badge, so the tray
-  // must render even when every other slot is empty (an unreachable session
-  // often has no branch/ring yet). Gated by `showHost`: only host-bound
-  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
-  // never host-bound — a stranded child is `local_stranded`, which keeps its
-  // banner elsewhere.
-  const showReconnect = showHost && !!onHostReconnect;
   // A host-bound session shows the badge, so the tray must render for it even
   // with no branch/ring yet — otherwise the host + context footer vanishes for
   // sessions with no worktree branch (e.g. codex) until the ring populates.
+  // This also keeps the offline host's reconnect affordance on screen, since
+  // the badge is where it lives and an unreachable session often has no
+  // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showReconnect && !showHostBadge)
-    return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
 
   return (
     <div
@@ -3940,7 +3932,6 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
-  hostOffline = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
   subAgentLabel = null,
@@ -5167,7 +5158,7 @@ export function Composer({
       <ComposerStatusLine
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
-        onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
+        onHostReconnect={onShowReconnectHelp}
       />
     </form>
   );
