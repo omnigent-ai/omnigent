@@ -747,12 +747,64 @@ let queryClient: QueryClient | null = null;
 const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
 let pendingSeq = 0;
 let queueSeq = 0;
-// Tail of the send chain. Each `send` waits on the previous send's network
-// work before issuing its own POST, so rapid-fire messages reach the server
-// in submission order. Concurrent `fetch` POSTs have no ordering guarantee,
-// which otherwise lets the server accept messages out of order. Module-level
-// (one active chat at a time); the chain only ever resolves, never rejects.
-let sendChain: Promise<void> = Promise.resolve();
+// Tail of each conversation's send chain, keyed by conversation id. A `send`
+// waits on the previous send TO THE SAME CONVERSATION before issuing its POST,
+// so rapid-fire messages reach the server in submission order (concurrent
+// `fetch` POSTs have no ordering guarantee). Per conversation, not global:
+// ordering is only meaningful within a session, and a shared chain lets a
+// stalled send to one conversation delay an unrelated one. Chains only ever
+// resolve, never reject.
+const sendChains = new Map<string | symbol, Promise<void>>();
+
+// Sends with no conversation id yet (brand-new chat) serialize together: the
+// session is created inside the chained work, so they can't key by id. A
+// non-string key can never collide with a conversation id.
+const NEW_SESSION_SEND_CHAIN_KEY = Symbol("new-session");
+
+/**
+ * Take a slot in a conversation's send chain.
+ *
+ * :param conversationId: Conversation to serialize against, or ``null`` for a
+ *     send whose session doesn't exist yet (a brand-new chat). Null callers
+ *     share one chain, which is what orders the create-then-post race.
+ * :returns: ``priorSend`` to await before issuing network work, ``rekey`` to
+ *     call once a new chat's real session id is known, and ``releaseSend`` to
+ *     call after the work settles (in a ``finally``).
+ */
+function enterSendChain(conversationId: string | null): {
+  priorSend: Promise<void>;
+  rekey: (resolvedConversationId: string) => void;
+  releaseSend: () => void;
+} {
+  let key: string | symbol = conversationId ?? NEW_SESSION_SEND_CHAIN_KEY;
+  const priorSend = sendChains.get(key) ?? Promise.resolve();
+  let releaseSend: () => void = () => {};
+  const slot = new Promise<void>((resolve) => {
+    releaseSend = resolve;
+  });
+  sendChains.set(key, slot);
+  return {
+    priorSend,
+    rekey: (resolvedConversationId) => {
+      // A brand-new chat's id exists only after `createSession`, and
+      // `ensureBoundSession` publishes it to the store BEFORE this send's POST.
+      // A send issued in that window pins the real id, so it would look up an
+      // empty chain and overtake us. Move our slot onto the real id so it
+      // chains behind this POST instead.
+      if (key === resolvedConversationId) return;
+      if (sendChains.get(key) === slot) sendChains.delete(key);
+      key = resolvedConversationId;
+      sendChains.set(key, slot);
+    },
+    releaseSend: () => {
+      // Drop the entry when we're the tail, so the map can't grow without
+      // bound across a long session's conversations.
+      if (sendChains.get(key) === slot) sendChains.delete(key);
+      releaseSend();
+    },
+  };
+}
+
 let flashTimer: ReturnType<typeof setTimeout> | null = null;
 const workspaceInvalidationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -863,9 +915,9 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
-  // Reset the POST-ordering chain so a prior run's unresolved send can't block
+  // Reset the POST-ordering chains so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
-  sendChain = Promise.resolve();
+  sendChains.clear();
   queryClient = client;
 }
 
@@ -1168,18 +1220,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
-      // Join the SAME send chain the foreground path uses. A queued message can
-      // hand off from the foreground flush (send() → sendChain) to here the
-      // moment the user navigates away, and the two POST paths would otherwise
-      // race — a background postEvent could overtake a foreground send() still
-      // awaiting its chain slot, delivering out of FIFO order. Taking a slot
-      // here (await priorSend before the upload/post, release in finally)
-      // serializes every POST across both paths through one ordering primitive.
-      const priorSend = sendChain;
-      let releaseSend: () => void = () => {};
-      sendChain = new Promise<void>((resolve) => {
-        releaseSend = resolve;
-      });
+      // Join the SAME send chain the foreground path uses for this
+      // conversation. A queued message can hand off from the foreground flush
+      // (send() → its chain) to here the moment the user navigates away, and
+      // the two POST paths would otherwise race — a background postEvent could
+      // overtake a foreground send() still awaiting its chain slot, delivering
+      // out of FIFO order. Taking a slot here (await priorSend before the
+      // upload/post, release in finally) serializes every POST to this
+      // conversation across both paths through one ordering primitive.
+      const { priorSend, releaseSend } = enterSendChain(conversationId);
       // Upload any attachments, then post the message referencing their
       // server-assigned file_ids — the same two-phase sequence send() runs
       // (no combined endpoint exists: /resources/files stores the blob and
@@ -1283,15 +1332,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // target afterward would leak the message into the now-active session.
     const submitConversationId = get().conversationId;
 
-    // Take our place in the send chain: wait for the prior send's network
-    // work, then hand off to the next via `releaseSend` in the finally
-    // below. This serializes POSTs in submission order without delaying the
-    // optimistic bubble rendered above. `priorSend` only ever resolves.
-    const priorSend = sendChain;
-    let releaseSend: () => void = () => {};
-    sendChain = new Promise<void>((resolve) => {
-      releaseSend = resolve;
-    });
+    // Take our place in THIS conversation's send chain: wait for its prior
+    // send's network work, then hand off to the next via `releaseSend` in the
+    // finally below. This serializes POSTs in submission order without delaying
+    // the optimistic bubble rendered above. `priorSend` only ever resolves.
+    const { priorSend, rekey, releaseSend } = enterSendChain(submitConversationId);
 
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
@@ -1301,6 +1346,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await priorSend;
       const sessionId = await ensureBoundSession(agentId, set, get, opts, submitConversationId);
       postedSessionId = sessionId;
+      // A new chat's session now exists: move our chain slot onto its real id
+      // so a follow-up send queues behind this POST.
+      rekey(sessionId);
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -1471,11 +1519,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = get().conversationId;
 
-    const priorSend = sendChain;
-    let releaseSend: () => void = () => {};
-    sendChain = new Promise<void>((resolve) => {
-      releaseSend = resolve;
-    });
+    const { priorSend, rekey, releaseSend } = enterSendChain(submitConversationId);
 
     // The session this command actually posts to, once resolved.
     let postedSessionId: string | null = null;
@@ -1484,6 +1528,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await priorSend;
       const sessionId = await ensureBoundSession(agentId, set, get, opts, submitConversationId);
       postedSessionId = sessionId;
+      // See `send`: rekey a new chat's slot onto its real session id.
+      rekey(sessionId);
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.

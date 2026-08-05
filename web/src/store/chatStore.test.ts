@@ -9340,12 +9340,71 @@ describe("chatStore — background cross-session flush", () => {
     });
   });
 
-  it("serializes a background flush behind an in-flight foreground send (FIFO across paths)", async () => {
-    // The navigate-away race: a foreground send() for the active conversation is
-    // still in flight (its /events POST held open) when the background flush
-    // fires for another conversation. Both POSTs must go through the one send
-    // chain, so the background POST cannot overtake the foreground one — it
-    // waits until the foreground POST resolves.
+  it("serializes a background flush behind an in-flight foreground send to the SAME conversation", async () => {
+    // The navigate-away race: a send() for conv_a is still in flight (its
+    // /events POST held open) when the user switches away and conv_a's
+    // remaining queue hands off to the background flush. Both POST paths take a
+    // slot on conv_a's send chain, so the background POST cannot overtake the
+    // foreground one — messages reach the runner in submission order.
+    seedConversationsCache([conv("conv_a", "idle"), conv("conv_other", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_a",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+    });
+
+    // Hold conv_a's first POST open and record delivery order.
+    const delivered: string[] = [];
+    let releaseForeground: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_a/events" && init?.method === "POST") {
+        const body = JSON.parse((init as RequestInit).body as string);
+        const text = (body.data?.content ?? []).find(
+          (b: { type: string }) => b.type === "input_text",
+        )?.text;
+        delivered.push(text);
+        if (text === "fg-msg") {
+          return new Promise<Response>((resolve) => {
+            releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
+          });
+        }
+        return mockResponse({ queued: true, item_id: "ci_bg" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    // Foreground send() takes conv_a's first chain slot; its POST is held open.
+    const fg = useChatStore.getState().send("fg-msg", "agent_xyz");
+    await tick();
+    expect(delivered).toEqual(["fg-msg"]);
+
+    // User navigates away; conv_a's queued follow-up now drains via the
+    // background path. It must NOT overtake the in-flight foreground POST.
+    useChatStore.setState({
+      conversationId: "conv_other",
+      queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_a" }],
+    });
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["fg-msg"]);
+
+    // Release the foreground POST → the background POST is free to deliver.
+    releaseForeground();
+    await fg;
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["fg-msg", "bg-msg"]);
+  });
+
+  it("does not block a background flush behind a send to a DIFFERENT conversation", async () => {
+    // Ordering is only meaningful within one conversation: the runner appends
+    // per session. A stalled send to the conversation being viewed must not
+    // delay an unrelated conversation's queued message — that was a
+    // head-of-line block from serializing every POST through one global chain.
     seedConversationsCache([conv("conv_active", "idle"), conv("conv_bg", "idle")]);
     useChatStore.setState({
       conversationId: "conv_active",
@@ -9356,17 +9415,13 @@ describe("chatStore — background cross-session flush", () => {
       queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_bg" }],
     });
 
-    // Hold conv_active's foreground POST open; conv_bg's background POST resolves
-    // immediately. Records delivery order across both endpoints.
     const delivered: string[] = [];
-    let releaseForeground: () => void = () => {};
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === "/v1/sessions/conv_active/events" && init?.method === "POST") {
         delivered.push("foreground");
-        return new Promise<Response>((resolve) => {
-          releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
-        });
+        // Never resolves: conv_active's POST stays in flight for the whole test.
+        return new Promise<Response>(() => {});
       }
       if (url === "/v1/sessions/conv_bg/events" && init?.method === "POST") {
         delivered.push("background");
@@ -9375,21 +9430,12 @@ describe("chatStore — background cross-session flush", () => {
       return defaultFetchHandler(input, init);
     });
 
-    // Foreground send() takes the first chain slot and its POST is held open.
-    const fg = useChatStore.getState().send("fg-msg", "agent_xyz");
+    void useChatStore.getState().send("fg-msg", "agent_xyz");
     await tick();
     expect(delivered).toEqual(["foreground"]);
 
-    // Background flush fires while the foreground POST is still in flight. It
-    // must NOT deliver yet — it's queued behind the foreground POST on the chain.
+    // conv_bg delivers while conv_active's POST is still hanging.
     useChatStore.getState().flushBackgroundQueues();
-    await tick();
-    await tick();
-    expect(delivered).toEqual(["foreground"]);
-
-    // Release the foreground POST → the background POST is now free to deliver.
-    releaseForeground();
-    await fg;
     await tick();
     await tick();
     expect(delivered).toEqual(["foreground", "background"]);
