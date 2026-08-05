@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import subprocess
 import threading
@@ -927,27 +928,44 @@ class _FakeTunnel:
         raise ConnectionError("test disconnect")
 
 
-class _ReadinessChangingTunnel(_FakeTunnel):
-    """Trigger one idle refresh before disconnecting the fake tunnel."""
+class _RecordingWS:
+    """Fake tunnel that records frames the readiness loop sends.
+
+    The readiness loop (:meth:`HostProcess._harness_readiness_loop`) only ever
+    calls ``send``; ``first_send`` lets a test await the first update frame
+    deterministically instead of sleeping for a fixed interval.
+    """
 
     def __init__(self) -> None:
-        """Initialize the frame log and receive counter."""
-        super().__init__()
-        self.recv_count = 0
+        """Initialize the frame log and first-send signal."""
+        self.sent: list[str] = []
+        self.first_send = asyncio.Event()
 
-    async def recv(self) -> str:
-        """Simulate one idle interval followed by a disconnect."""
-        self.recv_count += 1
-        if self.recv_count == 1:
-            await asyncio.Future()
-        raise ConnectionError("test disconnect")
+    async def send(self, data: str) -> None:
+        """Record an outbound frame and signal the first send.
+
+        :param data: Encoded frame text.
+        """
+        self.sent.append(data)
+        self.first_send.set()
+
+
+async def _cancel(task: asyncio.Task[None]) -> None:
+    """Cancel *task* and await its unwinding, swallowing the cancellation."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 async def test_live_host_refreshes_harness_readiness_without_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A setup completed after connect must replace the advertised readiness."""
-    readiness = iter(({"pi": False}, {"pi": True}))
+    """A setup completed after connect pushes a replacement readiness frame.
+
+    The refresh now runs in :meth:`HostProcess._harness_readiness_loop`, off the
+    receive loop, so a slow probe can never stall the tunnel keepalive.
+    """
+    readiness = iter(({"pi": True},))
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -961,25 +979,26 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
         0.01,
     )
     host = _make_host_process()
-    tunnel = _ReadinessChangingTunnel()
+    ws = _RecordingWS()
 
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"pi": False}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
 
-    assert len(tunnel.sent) == 2
-    hello = decode_host_frame(tunnel.sent[0])
-    refresh = decode_host_frame(tunnel.sent[1])
-    assert isinstance(hello, HostHelloFrame)
-    assert hello.configured_harnesses == {"pi": False}
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
     assert isinstance(refresh, HostHarnessReadinessFrame)
     assert refresh.configured_harnesses == {"pi": True}
+    _cleanup_host(host)
 
 
 async def test_live_host_full_refresh_detects_auth_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The full-refresh fallback catches readiness changes beyond binary installs."""
-    readiness = iter(({"codex": "needs-auth"}, {"codex": True}))
+    readiness = iter(({"codex": True},))
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -989,38 +1008,52 @@ async def test_live_host_full_refresh_detects_auth_completion(
         0.01,
     )
     host = _make_host_process()
-    tunnel = _ReadinessChangingTunnel()
+    ws = _RecordingWS()
 
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
 
-    assert len(tunnel.sent) == 2
-    refresh = decode_host_frame(tunnel.sent[1])
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
     assert isinstance(refresh, HostHarnessReadinessFrame)
     assert refresh.configured_harnesses == {"codex": True}
+    _cleanup_host(host)
 
 
 async def test_live_host_does_not_repeat_unchanged_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A periodic full refresh sends nothing when the readiness map is unchanged."""
-    readiness = iter(({"codex": "needs-auth"}, {"codex": "needs-auth"}))
-    monkeypatch.setattr(
-        "omnigent.host.connect.configured_harness_map",
-        lambda: next(readiness),
-    )
+    calls = {"n": 0}
+
+    def _unchanged_map() -> dict[str, str]:
+        calls["n"] += 1
+        return {"codex": "needs-auth"}
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
     )
     host = _make_host_process()
-    tunnel = _ReadinessChangingTunnel()
+    ws = _RecordingWS()
 
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    try:
+        # Let at least two full refreshes recompute-and-compare before stopping.
+        for _ in range(400):
+            if calls["n"] >= 2:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        await _cancel(task)
 
-    assert len(tunnel.sent) == 1
-    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+    assert calls["n"] >= 2
+    assert ws.sent == []
+    _cleanup_host(host)
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(

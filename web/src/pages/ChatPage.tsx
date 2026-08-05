@@ -894,6 +894,7 @@ export function ChatPage() {
     runnerOnline,
     backgroundTaskCount,
   });
+
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
   // bound — so it identifies the source (for the picker's prefill) but is
@@ -1157,13 +1158,16 @@ export function ChatPage() {
   // the CLI instructions instead so users learn the right entry point.
   if (!urlConvId) return <NewChatLandingScreen />;
 
-  // Pick the reconnect dialog's state from liveness. The dialog only
-  // opens for the two unreachable variants; `host_offline` carries
-  // ownership (a non-owner can't reach the host machine). Any other
-  // liveness defaults to `local_stranded` — harmless since the dialog
-  // stays closed unless an unreachable interaction opened it.
-  const reconnectState = liveness.kind === "host_offline" ? "host_offline" : "local_stranded";
-  const reconnectIsOwner = liveness.kind === "host_offline" ? liveness.isOwner : true;
+  // Pick the reconnect dialog's state from the session's host binding, not
+  // from liveness: the dialog opens both from an unreachable send AND from the
+  // composer's host badge, which offers reconnect whenever the host tunnel is
+  // down — including states liveness still calls reachable (a runner that
+  // outlived its host). A host-bound session always reconnects via
+  // `omnigent host`; only an unbound one relaunches locally. Ownership gates
+  // the host command — a non-owner can't reach that machine.
+  const hostBound = !!(activeSession?.hostId ?? activeConv?.host_id);
+  const reconnectState = hostBound ? "host_offline" : "local_stranded";
+  const reconnectIsOwner = isOwnerLevel(permissionLevel);
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
@@ -1686,8 +1690,7 @@ function MainAgentSurface({
   // tool runs, and reasoning gaps — including after a reload that hydrates
   // `running` before any bubbles exist locally. Only a trailing compaction
   // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingStatus = shouldShowWorkingIndicator(showsWorking, bubbles);
-  const showWorkingIndicator = showWorkingStatus;
+  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
   if (showTerminal && conversationId) {
     return (
@@ -1714,20 +1717,32 @@ function MainAgentSurface({
     <>
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
-      <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
+      <div
+        ref={setConversationEl}
+        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+      >
         {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
-              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
-              the message column so the ticks don't butt against the text; the
-              rail is hidden on mobile, so the extra left padding is md-only. */}
+          {/* Override ConversationContent's default spacing so the thread keeps
+              16px side gutters and consecutive agent turns read as one thread.
+              The left inset grows *continuously* as the conversation area
+              narrows: the centered column slides left with the area until its
+              edge nears the left-edge TurnRail, then the inset ramps up to hold
+              a minimum gap from the ticks — capped at 1.5rem so it stops moving
+              rather than stepping. Keyed on the area's width via cqi (the
+              @container/chat context on the wrapper), not the viewport, so
+              opening the sidebar — which narrows the area — feeds it too. The
+              ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
+              48rem column's auto-margins shrink past the clearance. md+ only:
+              the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
           {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
             scrollClassName="[overflow-anchor:none]"
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
+              "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
+              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1771,6 +1786,7 @@ function MainAgentSurface({
                     bubble={bubble}
                     canApprove={canApprove}
                     isLastAssistant={bubbleIndex === lastAssistantIndex}
+                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
                   />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
@@ -1807,7 +1823,7 @@ function MainAgentSurface({
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingStatus && <RunnerStartingIndicator variant="row" />}
+                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
@@ -1826,7 +1842,7 @@ function MainAgentSurface({
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingStatus} suppress={subAgentLabel != null} />
+          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
           <UserMessageNavConnected
             goPrev={nav.goPrev}
             goNext={nav.goNext}
@@ -1899,7 +1915,6 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
-        hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
@@ -2014,9 +2029,9 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           (scrolled up) or collapsed (at the bottom, where the inline shimmer
           owns the visuals). */}
       {show && <span className="sr-only">Working…</span>}
-      {/* Mirror the conversation content column (mx-auto + px-6 + width) so the
+      {/* Mirror the conversation content column (mx-auto + px-4 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
-      <div className={cn("mx-auto w-full px-6", CHAT_COLUMN_WIDTH)}>
+      <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
         {show && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
           // its flat bottom edge merges into the chat box. aria-hidden: the
@@ -2776,14 +2791,13 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
-    // A `host_offline` session moves the reconnect affordance up into the
-    // composer's host badge (ComposerStatusLine), where the host is already
-    // named — so render nothing here whenever that composer is on screen
-    // (sub-agent sessions included; their badge carries it just like a normal
-    // session's). The composer is hidden only in the terminal-first *terminal*
-    // view (the PTY owns the surface); there the banner still carries the
-    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
-    // no badge).
+    // A host-bound session carries the reconnect affordance in the composer's
+    // host badge (ComposerStatusLine), which names the host that dropped — so
+    // render nothing here whenever that composer is on screen (sub-agent
+    // sessions included; their badge carries it just like a normal session's).
+    // The composer is hidden only in the terminal-first *terminal* view (the
+    // PTY owns the surface); there the banner still carries the affordance.
+    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
       return null;
@@ -3123,10 +3137,12 @@ export const BubbleView = memo(
     bubble,
     canApprove = true,
     isLastAssistant = false,
+    showsWorking = false,
   }: {
     bubble: Bubble;
     canApprove?: boolean;
     isLastAssistant?: boolean;
+    showsWorking?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
@@ -3144,12 +3160,18 @@ export const BubbleView = memo(
       );
     }
     return (
-      <AssistantBubble bubble={bubble} canApprove={canApprove} isLastAssistant={isLastAssistant} />
+      <AssistantBubble
+        bubble={bubble}
+        canApprove={canApprove}
+        isLastAssistant={isLastAssistant}
+        showsWorking={showsWorking}
+      />
     );
   },
   (prev, next) =>
     prev.canApprove === next.canApprove &&
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
+    (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -3242,7 +3264,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
-      className="max-w-3xl"
+      className="max-w-[640px]"
     >
       {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
           immediately left of the right-aligned bubble (the bubble's own
@@ -3370,10 +3392,12 @@ function AssistantBubble({
   bubble,
   canApprove,
   isLastAssistant = false,
+  showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   canApprove: boolean;
   isLastAssistant?: boolean;
+  showsWorking?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
@@ -3422,6 +3446,7 @@ function AssistantBubble({
             isLastAssistant={isLastAssistant}
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
+            showsWorking={showsWorking}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -3434,7 +3459,7 @@ function AssistantBubble({
           </p>
         )}
         {markdownText && (
-          <MessageActions className="mt-1 opacity-40 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
@@ -3556,13 +3581,10 @@ interface ComposerProps {
    */
   unreachable?: boolean;
   /**
-   * The session is host-bound to an offline, non-resumable host
-   * (`host_offline`): the composer's host badge turns into a clickable
-   * "Host is offline — click to reconnect" affordance (see HostBadge's
-   * `onReconnect`), replacing the separate banner below the composer.
+   * Open the reconnect help dialog. Always wired to the status line's host
+   * badge, which turns itself into a clickable reconnect affordance whenever
+   * its bound host is offline and reconnectable.
    */
-  hostOffline?: boolean;
-  /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
   onShowReconnectHelp?: () => void;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
@@ -3784,10 +3806,9 @@ function ComposerStatusLine({
   goal: Goal | null;
   isSubAgentSession: boolean;
   /**
-   * When set (`host_offline` liveness), the host badge becomes a clickable
-   * "Host is offline — click to reconnect" affordance. Also forces the tray
-   * to render even when it would otherwise be empty, so the prompt is always
-   * visible for an unreachable host.
+   * Opens the reconnect help dialog, handed to the host badge — which turns
+   * itself into a clickable reconnect affordance when its bound host is
+   * offline and reconnectable.
    */
   onHostReconnect?: () => void;
 }) {
@@ -3817,19 +3838,14 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  // The offline-host reconnect affordance lives in the host badge, so the tray
-  // must render even when every other slot is empty (an unreachable session
-  // often has no branch/ring yet). Gated by `showHost`: only host-bound
-  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
-  // never host-bound — a stranded child is `local_stranded`, which keeps its
-  // banner elsewhere.
-  const showReconnect = showHost && !!onHostReconnect;
   // A host-bound session shows the badge, so the tray must render for it even
   // with no branch/ring yet — otherwise the host + context footer vanishes for
   // sessions with no worktree branch (e.g. codex) until the ring populates.
+  // This also keeps the offline host's reconnect affordance on screen, since
+  // the badge is where it lives and an unreachable session often has no
+  // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showReconnect && !showHostBadge)
-    return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
 
   return (
     <div
@@ -3984,7 +4000,6 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
-  hostOffline = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
   subAgentLabel = null,
@@ -5062,7 +5077,7 @@ export function Composer({
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
             >
-              <PaperclipIcon className="size-4" />
+              <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
             </Button>
             <ComposerMicButton
@@ -5152,30 +5167,32 @@ export function Composer({
                 backendLabel="Codex"
               />
             )}
-            <ComposerModelEffortLabel
-              showModels={showModels}
-              showEffort={showEffort}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              harnessLabel={harnessLabel}
-            />
-            <ComposerConfigGear
-              harnessLabel={harnessLabel}
-              showModels={showModels}
-              showEffort={showEffort}
-              effortLevels={effortLevels}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              // Config changes persist server-side and apply on the next
-              // wake/turn (the runner forward is best-effort), so the gear
-              // stays live wherever a message could be sent — including
-              // asleep/starting/unknown. Only read-only viewers and sessions
-              // no message can wake (unreachable) get an inert gear.
-              disabled={isReadOnly || unreachable}
-              openNonce={pickerOpenNonce}
-            />
+            <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
+              <ComposerModelEffortLabel
+                showModels={showModels}
+                showEffort={showEffort}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                harnessLabel={harnessLabel}
+              />
+              <ComposerConfigGear
+                harnessLabel={harnessLabel}
+                showModels={showModels}
+                showEffort={showEffort}
+                effortLevels={effortLevels}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                // Config changes persist server-side and apply on the next
+                // wake/turn (the runner forward is best-effort), so the gear
+                // stays live wherever a message could be sent — including
+                // asleep/starting/unknown. Only read-only viewers and sessions
+                // no message can wake (unreachable) get an inert gear.
+                disabled={isReadOnly || unreachable}
+                openNonce={pickerOpenNonce}
+              />
+            </div>
             <Button
               type="submit"
               size="icon"
@@ -5185,8 +5202,9 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 shrink-0 rounded-full md:size-8",
-                !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
+                "size-9 shrink-0 rounded-lg md:size-8",
+                !showInterruptButton &&
+                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
               )}
               // Interrupt stays live during a pending elicitation —
               // cancelling the turn is the other legitimate way out.
@@ -5201,7 +5219,7 @@ export function Composer({
               {showInterruptButton ? (
                 <SquareIcon className="size-4 fill-current" />
               ) : (
-                <ArrowUpIcon className="size-4" />
+                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
               )}
               <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
             </Button>
@@ -5211,7 +5229,7 @@ export function Composer({
       <ComposerStatusLine
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
-        onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
+        onHostReconnect={onShowReconnectHelp}
       />
     </form>
   );
@@ -5883,8 +5901,12 @@ function ComposerConfigGear({
               // read-only config summary) still shows, but block the click and
               // dim it. A native `disabled` button swallows pointer events, so
               // the tooltip would never fire.
+              // The ::before hairline is this gear's divider from the
+              // model/effort label in the composer's split pill. It's drawn
+              // here rather than as a sibling node because the label renders
+              // nothing for some sessions — `first:` then drops the divider.
               className={cn(
-                "size-9 shrink-0 text-muted-foreground hover:text-foreground md:size-8",
+                "size-9 shrink-0 text-muted-foreground before:absolute before:top-1/2 before:left-0 before:h-4 before:w-px before:-translate-y-1/2 before:bg-border hover:text-foreground first:before:hidden md:size-8",
                 disabled && "cursor-default opacity-50 hover:text-muted-foreground",
               )}
               aria-disabled={disabled}
@@ -5895,7 +5917,7 @@ function ComposerConfigGear({
               data-testid="composer-config-gear"
               aria-label="Configure session"
             >
-              <SettingsIcon className="size-4" />
+              <SettingsIcon className="size-4" data-icon-size="16" />
             </Button>
           </TooltipTrigger>
           {summary.length > 0 && (
@@ -5906,7 +5928,8 @@ function ComposerConfigGear({
             >
               {summary.map((row) => (
                 <span key={row.label} className="text-muted-foreground">
-                  {row.label}: <span className="text-popover-foreground">{row.value}</span>
+                  {row.label}:{" "}
+                  <span className="text-background dark:text-popover-foreground">{row.value}</span>
                 </span>
               ))}
             </TooltipContent>
@@ -6025,23 +6048,35 @@ function useResolvedComposerModel(
   // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
   // so like cursor/kiro/opencode the live model is the session override, never
   // the cross-session sticky ``selectedModel``.
+  // The sticky is this session's model only when the session itself advertises
+  // it. `switchTo` clears the session-scoped fields but deliberately keeps
+  // `selectedModel`, so until the incoming snapshot lands the catalog is empty
+  // and the sticky still holds the OUTGOING session's pick — surfacing it paints
+  // e.g. a Codex gpt-5.5 on a Claude session for the whole bind round trip.
+  // Gating on the session's own catalog mirrors the compatibility rule bindStream
+  // applies a moment later, so the label never advertises a model this session
+  // would reject. Post-bind this is a no-op: the store only ever leaves a
+  // catalog-compatible sticky (or the override) in `selectedModel`.
+  const sessionStickyModel =
+    findNativeModelOption(codexModelOptions, selectedModel) !== null ? selectedModel : null;
   const pickerSelectedModel =
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "pi"
       ? sessionModelOverride
-      : (sessionModelOverride ?? selectedModel);
+      : (sessionModelOverride ?? sessionStickyModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
   // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
-  // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
-  // there the sticky IS the applied model.
+  // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
+  // there it IS the applied model — but only once this session's catalog vouches
+  // for it (see `sessionStickyModel`).
   const nonNativeModel =
     modelPickerKind === null
       ? (sessionModelOverride ?? llmModel)
-      : (sessionModelOverride ?? selectedModel ?? llmModel);
+      : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
@@ -6108,7 +6143,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">Smart Routing</span>
       </span>
@@ -6132,7 +6167,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{harnessLabel}</span>
       </span>
@@ -6142,7 +6177,7 @@ function ComposerModelEffortLabel({
   return (
     <span
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+      className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
     >
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}

@@ -113,6 +113,37 @@ def test_kimi_only_upstream_binary_satisfies_readiness(
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
+def test_cli_probe_timeout_defaults_lenient_but_readiness_passes_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The readiness caller can shorten the probe subprocess timeout.
+
+    A wedged harness CLI must not stall the throttled readiness refresh for the
+    lenient default (30s); readiness passes ``READINESS_CLI_PROBE_TIMEOUT_S`` so
+    the ``auth status`` probe fails fast. Direct callers (setup / launch) keep
+    the 30s default.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    recorded: list[float | None] = []
+
+    def _record_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded.append(kwargs.get("timeout"))  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _record_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert recorded[-1] == 30.0
+
+    assert (
+        hi.harness_cli_logged_in(ANTHROPIC_FAMILY, timeout=hi.READINESS_CLI_PROBE_TIMEOUT_S)
+        is True
+    )
+    assert recorded[-1] == hi.READINESS_CLI_PROBE_TIMEOUT_S == 10.0
+
+
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
     """Cursor ships via a curl installer (no npm package) and authenticates
     through its own CLI login, so it carries an ``install_hint`` + status JSON

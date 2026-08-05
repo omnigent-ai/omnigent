@@ -2420,7 +2420,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
                             SqlProject.workspace_id == current_workspace_id(),
-                            SqlProject.owner_user_id == owned_by,
+                            SqlProject.user_id == owned_by,
                             SqlProject.name == project,
                         )
                     )

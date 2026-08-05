@@ -129,7 +129,7 @@ _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
 
-def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, object] | None:
+def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[str, object] | None:
     """Map a ``thread/tokenUsage/updated`` payload's ``last`` breakdown
     onto the wire shape that :class:`TurnComplete` consumes.
 
@@ -1623,7 +1623,7 @@ class _CodexAppServerSession:
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        model: str,
+        model: str | None,
         cwd: str,
         sandbox: str,
         reasoning_effort: str | None = None,
@@ -2204,7 +2204,7 @@ class _CodexAppServerSession:
 @dataclass
 class _CodexSessionState:
     app_session: _CodexAppServerSession | None = None
-    signature: tuple[str, str, str, str] | None = None
+    signature: tuple[str | None, str, str, str] | None = None
 
 
 class _AppSessionFactory(Protocol):
@@ -2350,6 +2350,7 @@ class CodexExecutor(Executor):
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
+        self._model_provider_override = model_provider_override
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host = gateway_host.rstrip("/") if gateway_host else None
@@ -2552,7 +2553,7 @@ class CodexExecutor(Executor):
         self,
         state: _CodexSessionState,
         *,
-        signature: tuple[str, str, str, str],
+        signature: tuple[str | None, str, str, str],
         effective_cwd: str,
     ) -> _CodexAppServerSession:
         if state.signature == signature and state.app_session is not None:
@@ -2585,8 +2586,15 @@ class CodexExecutor(Executor):
         state = self._session_states.setdefault(session_key, _CodexSessionState())
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
+        # On the cli-config path (model_provider_override set) the codex binary
+        # owns its own model list via its config.toml — omnigent does not pass a
+        # model override to thread/create, letting the binary use its configured
+        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
+        # binary to call UC and get a validation error.
         model = cfg.model or self._model_override
-        if model is None:
+        if self._model_provider_override is not None:
+            model = None
+        elif model is None:
             provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
             resolution = await run_sync_on_thread(
                 model_catalog.resolve_catalog_model,

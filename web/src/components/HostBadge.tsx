@@ -1,5 +1,3 @@
-import { MonitorOff as MonitorOffIcon } from "lucide-react";
-
 import { useHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
@@ -57,6 +55,8 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
   unknown: "status unknown",
 };
 
+const RECONNECT_WORD = "offline — click to reconnect";
+
 /**
  * Host indicator for the open conversation, rendered in the composer's
  * status-line tray, immediately left of the worktree branch
@@ -65,11 +65,17 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
  * Shows the friendly host name (or sandbox-provider label) plus a status
  * circle: green online, red offline, neutral while liveness is still unknown.
  *
- * When `onReconnect` is set the session is unreachable because its host is
- * offline (`host_offline` liveness): the badge becomes a clickable "Host is
- * offline — click to reconnect" affordance in the same slot, replacing the
- * passive name + dot. This is what moves the reconnect prompt up beside the
- * host instead of a separate banner below the composer.
+ * The name + dot is the ONLY shape this badge takes — a disconnected host
+ * keeps its name so the user always reads which machine dropped. When the
+ * host tunnel is down and reconnecting is possible, the same name + red dot
+ * becomes a button that opens the reconnect instructions (`onReconnect`).
+ * A dormant resumable managed host is excluded: its "offline" is idle
+ * dormancy the next message wakes, not a disconnect to act on.
+ *
+ * @param sessionId - The open conversation whose host to show.
+ * @param onReconnect - Opens the reconnect help dialog. Wired by the caller
+ *   for every host-bound session; the badge itself decides when a host is
+ *   actually reconnectable.
  */
 export function HostBadge({
   sessionId,
@@ -99,40 +105,50 @@ export function HostBadge({
   const badge = resolveHostBadge({ hostId, host, online });
   if (!badge) return null;
 
-  if (onReconnect) {
-    return (
-      <button
-        type="button"
-        data-testid="host-badge"
-        onClick={onReconnect}
-        className="flex min-w-0 items-center gap-1.5 text-xs text-destructive underline-offset-2 hover:underline"
-        title="Host is offline — click to reconnect"
-      >
-        <span aria-hidden className="size-2 shrink-0 rounded-full bg-destructive" />
-        <MonitorOffIcon className="size-3.5 shrink-0" aria-hidden />
-        <span className="truncate">Host is offline — click to reconnect</span>
-      </button>
-    );
-  }
-
-  return (
-    <div
-      data-testid="host-badge"
-      className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
-      title={`Host ${badge.label}, ${STATUS_WORD[badge.status]}`}
-    >
+  // A resumable managed host that reports offline is idle-stopped, not
+  // disconnected — the next message resumes it, and `omnigent host` (what the
+  // reconnect dialog hands out) is the wrong instruction for it.
+  const reconnectable = badge.status === "offline" && !session?.hostResumable && !!onReconnect;
+  const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
+  // The dot is decorative (aria-hidden), so the status would otherwise be
+  // conveyed by color alone. Restate it in sr-only text — read together with
+  // the visible label, a screen reader announces "<host>, <status>". `title`
+  // carries the same text for mouse hover.
+  const content = (
+    <>
       <span
         aria-hidden
         className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[badge.status])}
       />
       <span className="truncate">{badge.label}</span>
-      {/* The dot is decorative (aria-hidden), so the status would otherwise be
-          conveyed by color alone. Restate it in sr-only text — read together
-          with the visible label, a screen reader announces "<host>, <status>".
-          `title` carries the same text for mouse hover. No aria-label: on a
-          non-interactive div it's announced unreliably and would only
-          duplicate this text where it is honored. */}
-      <span className="sr-only">, {STATUS_WORD[badge.status]}</span>
+      <span className="sr-only">, {statusWord}</span>
+    </>
+  );
+  const title = `Host ${badge.label}, ${statusWord}`;
+
+  if (reconnectable) {
+    return (
+      <button
+        type="button"
+        data-testid="host-badge"
+        onClick={onReconnect}
+        className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        title={title}
+      >
+        {content}
+      </button>
+    );
+  }
+
+  return (
+    // No aria-label: on a non-interactive div it's announced unreliably and
+    // would only duplicate the sr-only text where it is honored.
+    <div
+      data-testid="host-badge"
+      className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
+      title={title}
+    >
+      {content}
     </div>
   );
 }

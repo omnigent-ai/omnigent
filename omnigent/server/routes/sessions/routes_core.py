@@ -633,7 +633,7 @@ def register_core_routes(
             # First-class first so its id wins when a name exists in both.
             by_name: dict[str, SessionProjectSummary] = {}
             if project_store is not None:
-                for proj in project_store.list(owner_user_id=user_id):
+                for proj in project_store.list(user_id=user_id):
                     by_name[proj.name] = SessionProjectSummary(id=proj.id, name=proj.name)
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in conversation_store.list_projects(owned_by=user_id):
@@ -1893,7 +1893,7 @@ def register_core_routes(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, owner_user_id=user_id
+                    project_store.get, target_project_id, user_id=user_id
                 )
                 if owned is None:
                     raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
@@ -2092,9 +2092,7 @@ def register_core_routes(
         # unfiled (a foreign project id would show in no folder view).
         fork_project_id = None
         if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(
-                project_store.get, source.project_id, owner_user_id=user_id
-            )
+            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
             if owned is not None:
                 fork_project_id = source.project_id
 

@@ -388,12 +388,17 @@ def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ig
 
 
 def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
-    """Deep-replace any whole-string inline base64 data URI with a compact
+    """Deep-replace inline base64 attachment payloads with a compact
     ``[attachment: …]`` marker, recursing through dict/list values. The fallback
     path for values that reach ``json.dumps`` (nested dicts, non-block content)
-    so a resolver-produced base64 payload does not survive serialization. Only
-    whole-string data-URI values are redacted — not data URIs used as dict keys,
-    tuple members, or substrings embedded mid-text (the runner never emits
+    so a resolver-produced base64 payload does not survive serialization.
+
+    Two shapes are redacted: a whole-string ``data:*;base64,...`` URI (the
+    resolver form under ``image_url`` / ``file_data``), and an Anthropic content
+    block ``{"type": "image"|"document", "source": {"type": "base64", ...}}``
+    (what the ``Read`` tool returns for an image file, carried in a
+    ``function_call_output``). Neither is redacted when it appears as a dict
+    key, tuple member, or substring embedded mid-text (the runner never emits
     those)."""
     if isinstance(value, str):
         parsed = _parse_replay_data_uri(value)
@@ -403,6 +408,20 @@ def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
     if isinstance(value, list):
         return [_redact_inline_base64(item) for item in value]
     if isinstance(value, dict):
+        source = value.get("source")
+        if (
+            value.get("type") in ("image", "document")
+            and isinstance(source, dict)
+            and source.get("type") == "base64"
+        ):
+            media_type = source.get("media_type") or "application/octet-stream"
+            data = source.get("data")
+            payload_chars = len(data) if isinstance(data, str) else 0
+            kind = "image" if value.get("type") == "image" else "attachment"
+            return {
+                "type": "text",
+                "text": f"[{kind}: {media_type}, {payload_chars} base64 chars]",
+            }
         return {key: _redact_inline_base64(item) for key, item in value.items()}
     return value
 

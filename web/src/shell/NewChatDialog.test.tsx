@@ -730,13 +730,16 @@ function selectAgent(agentId: string): void {
 }
 
 /**
- * Select an agent whose harness is unconfigured on the host. Such agents fold
- * into the picker's "More" submenu (they aren't listed inline), so we open the
- * picker, drill into "More", then commit the row.
+ * Select a harness that may live under the picker's "More" submenu. Fully
+ * supported harnesses list inline even when they need setup; everything else
+ * folds into "More". Drills in only when the row isn't already inline, so
+ * callers don't have to track which side of the split their fixture lands on.
  */
 function selectUnconfiguredAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+  }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
@@ -900,50 +903,130 @@ describe("NewChatLandingScreen", () => {
     ]);
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    const cursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
-    const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
-    const kiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
+    // Only the fully supported harnesses lead, in rank order, ahead of the
+    // Agents group.
+    const claude = screen.getByTestId("new-chat-landing-agent-a_claude");
+    const codex = screen.getByTestId("new-chat-landing-agent-a_codex");
     const polly = screen.getByTestId("new-chat-landing-agent-a_polly");
-    expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(claude.compareDocumentPosition(codex) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(codex.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Every other harness folds into "More", even though all are configured
+    // here — support level, not host readiness, decides the split.
+    for (const id of ["a_cursor", "a_pi", "a_kiro"]) {
+      expect(screen.queryByTestId(`new-chat-landing-agent-${id}`)).toBeNull();
+    }
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const morePi = screen.getByTestId("new-chat-landing-agent-a_pi");
+    const moreCursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
+    const moreKiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
+    // "More" keeps the same rank ordering: Cursor (30) → Pi (40) → Kiro (50).
+    expect(
+      moreCursor.compareDocumentPosition(morePi) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      morePi.compareDocumentPosition(moreKiro) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
-  // The default agents are claude-native (a1) and codex-native (a2); the host
-  // below reports codex-native as unconfigured on this machine.
+  it("pins a not-fully-supported harness inline once it is the selected pick", () => {
+    // Pi isn't fully supported, so a fresh picker never leads with it — but
+    // selecting it must pin it inline so the active pick is never buried.
+    mockAgents([
+      {
+        id: "a_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    selectUnconfiguredAgent("a_pi");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    // Now selected → inline, no drill-down needed.
+    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+  });
+
+  // claude-native (a1, fully supported) plus cursor-native (a_cursor, not) so
+  // the preference has a "More" row to act on: the host below reports
+  // cursor-native as unconfigured on this machine.
   function mockHostWithHarnessReadiness() {
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
+        description: null,
+        harness: "cursor-native",
+        skills: [],
+      },
+    ]);
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "cursor-native": false },
+      } as Host,
+    ]);
+  }
+
+  it("keeps unconfigured harnesses in the 'More' submenu by default (opt-in preference off)", () => {
+    // With the preference untouched the picker keeps offering harnesses that
+    // aren't set up on the host: they stay in "More" (badged, not hidden), so
+    // users can still discover and configure them.
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
+  });
+
+  it("hides harnesses unconfigured on the selected host when the preference is on", () => {
+    // Preference on → cursor-native (unconfigured on host_1) drops out of the
+    // picker entirely, taking the now-empty "More" trigger with it, while
+    // claude-native (configured, fully supported) stays inline.
+    writeHideUnconfiguredHarnesses(true);
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
+  });
+
+  it("leads with fully supported harnesses even when they need setup on the host", () => {
+    // Support level outranks readiness for the primary list: an unconfigured
+    // Codex still leads (badged), rather than being demoted to "More".
     mockHosts([
       {
         ...host("online"),
         configured_harnesses: { "claude-native": true, "codex-native": false },
       } as Host,
     ]);
-  }
-
-  it("folds unconfigured harnesses into the 'More' submenu by default (opt-in preference off)", () => {
-    // With the preference untouched the picker keeps offering harnesses that
-    // aren't set up on the host — configured ones (a1) list inline, and the
-    // "needs setup" ones (a2) fold into the "More" submenu (badged, not
-    // hidden), so users can still discover and configure them.
-    mockHostWithHarnessReadiness();
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    // a2 is unconfigured → not inline; it lives behind "More".
-    expect(screen.queryByTestId("new-chat-landing-agent-a2")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
-  });
-
-  it("hides harnesses unconfigured on the selected host when the preference is on", () => {
-    // Preference on → codex-native (reported unconfigured on host_1) drops out
-    // of the picker while claude-native (configured) stays.
-    writeHideUnconfiguredHarnesses(true);
-    mockHostWithHarnessReadiness();
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-agent-a2")).toBeNull();
+    // Nothing left to group → no "More" trigger at all.
+    expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
   });
 
   // Polly is a bundle agent whose brain harness (claude-sdk) is overridable, so
@@ -1000,6 +1083,90 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-cursor")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-harness-pi")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-harness-copilot")).toBeNull();
+  });
+
+  // Harnesses the user has actually launched are promoted out of "More" into
+  // the primary list, so a regular Pi / Cursor user gets theirs one click away.
+  function mockClaudeAndPi() {
+    mockAgents([
+      {
+        id: "a_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+    ]);
+  }
+
+  it("promotes a previously-launched harness into the primary list", () => {
+    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["pi-native"]));
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    // Pi isn't fully supported, but the user has launched it → inline, and with
+    // nothing left to group the "More" trigger disappears entirely.
+    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
+  });
+
+  it("leaves an unused harness under 'More'", () => {
+    // Control for the test above: same fixture, empty recents → Pi stays behind
+    // "More", proving the promotion comes from the stored list.
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+  });
+
+  it("matches a stored reversed harness alias against its canonical spec", () => {
+    // Older entries (and the server's reversed spelling) store "native-pi";
+    // it must still promote the canonical pi-native row.
+    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["native-pi"]));
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+  });
+
+  it("ignores a malformed recent-harnesses entry", () => {
+    // A corrupted value must not crash the picker — it falls back to the
+    // support-level split.
+    localStorage.setItem("omnigent:recent-harnesses", "{not json");
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a_claude")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
+  });
+
+  it("keeps the hide-unconfigured preference ahead of a recent harness", () => {
+    // Recency promotes within what can launch here; it must not resurrect a
+    // harness the host can't run, which is the whole point of the preference.
+    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["pi-native"]));
+    writeHideUnconfiguredHarnesses(true);
+    mockClaudeAndPi();
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "pi-native": false },
+      } as Host,
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a_claude")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {
@@ -2859,20 +3026,32 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
   });
 
-  it("drills into the More page for needs-setup harnesses", () => {
-    // codex-native reported unconfigured on host_1 → folded into "More".
-    mockHosts([
+  it("drills into the More page for harnesses outside the supported set", () => {
+    // cursor-native isn't fully supported → folded into "More" (Claude Code and
+    // Codex lead inline), so touch gets a drill-in page with a Back row.
+    mockAgents([
       {
-        ...host("online"),
-        configured_harnesses: { "claude-native": true, "codex-native": false },
-      } as Host,
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
+        description: null,
+        harness: "cursor-native",
+        skills: [],
+      },
     ]);
     renderLanding();
     openPicker();
-    // a2 (Codex, unconfigured) isn't inline; drill into "More" to reach it.
-    expect(screen.queryByTestId("new-chat-landing-agent-a2")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
     fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
   });

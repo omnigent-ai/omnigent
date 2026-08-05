@@ -108,9 +108,9 @@
   --color-tray: var(--tray);
   --color-foreground: var(--foreground);
   --color-background: var(--background);
-  --radius-sm: calc(var(--radius) * 0.6);
-  --radius-md: calc(var(--radius) * 0.8);
-  --radius-lg: var(--radius);
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
   --radius-xl: calc(var(--radius) * 1.4);
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
@@ -118,12 +118,13 @@
 }
 
 @theme {
-  /* App-default interface/body text. Keep this non-inline so the desktop
-   * typography mapping can override the token at runtime. */
+  /* App-default interface/body text. Keep this non-inline so runtime
+   * typography mappings can override the token. */
   --text-ui: 1rem;
-  --text-ui--line-height: 1.5;
+  --text-ui--line-height: 1.4;
   /* Slightly larger hierarchy/caption step than Tailwind's default. */
   --text-sm: 0.9rem;
+  --text-sm--line-height: 1.4;
 }
 
 /* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
@@ -132,11 +133,10 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
-  /* User-controlled desktop UI font size (see Appearance settings /
+  /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
-   * runtime on documentElement. It feeds typography tokens only; layout and
-   * icon geometry remain on the fixed 16px desktop rem grid. */
-  --desktop-ui-font-size: 16px;
+   * runtime on documentElement. It feeds typography tokens only. */
+  --desktop-ui-font-size: 13px;
   --icon-size-default: 14px;
   --icon-container-default: 16px;
 
@@ -290,10 +290,6 @@
   --sidebar-accent-foreground: #04355d;
   --sidebar-border: #e4e4e7;
   --sidebar-ring: #2272b4;
-  /* Faint dot-grid tint on the light-mode sidebar canvas (see the
-     * html:not(.dark) .conversations-sidebar rule). Tunable. */
-  --sidebar-dot-color: #8e537333;
-  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 3%, transparent);
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
 }
@@ -370,8 +366,18 @@
   --sidebar-border: oklch(0.28 0.005 240);
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
   --tooltip-bg: #2a2440;
-  /* White dot-grid tint for the dark sidebar (see .dark .conversations-sidebar). */
-  --sidebar-dot-color: rgba(255, 255, 255, 0.12);
+}
+
+/* Omnigent-only active sidebar treatment. Other palettes retain their neutral
+ * inherited sidebar-active tokens. */
+:root:not(.dark):not([data-theme]) {
+  --sidebar-active: rgba(240, 1, 150, 0.1);
+  --sidebar-active-foreground: #651249;
+}
+
+.dark:not([data-theme]) {
+  --sidebar-active: rgba(240, 1, 150, 0.15);
+  --sidebar-active-foreground: #f472b6;
 }
 
 /* Main-sidebar item labels use the same text-ui semantic step as Appearance
@@ -380,6 +386,12 @@
 .sidebar-compact-text {
   font-size: var(--text-ui);
   line-height: var(--text-ui--line-height);
+}
+
+/* Home-sidebar rows use a fixed 20px line box so their shared 4px block padding
+ * produces a natural 28px row without scaling layout geometry. */
+.sidebar-row {
+  line-height: 20px;
 }
 
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
@@ -400,6 +412,11 @@
   padding: 1px;
 }
 
+/* Compact icon-only buttons use the full 16px glyph inside that box. */
+.button-standard-icons[data-size="icon-xs"] svg:not([data-icon-size]) {
+  padding: 0;
+}
+
 /* App-shell canvas — the transparent <main> shows it through. Light: flat
  * white. Dark: purple-tinted near-black, two faint radial blooms over a 145°
  * gradient (from the agentic-ux-2026 mock). The rails paint their own layers
@@ -415,37 +432,33 @@
     linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b);
 }
 
-/* Left sidebar canvas — a 20px dot-grid (--sidebar-dot-color, themed) over a
- * themed base. Light: the near-white brand gradient + a pink corner glow,
- * lifted by an inset edge shadow. Dark: transparent base (the canvas shows) +
- * a purple bottom wash + the diagonal white sheen. */
-html:not(.dark) .conversations-sidebar {
-  background:
-    radial-gradient(var(--sidebar-dot-color) 0.6px, transparent 0.8px) 0 0 / 20px 20px,
-    radial-gradient(104% 74% at 112% 108%, rgba(248, 177, 215, 0.16), transparent 66%),
-    linear-gradient(
-      45deg,
-      rgb(253, 250, 250),
-      rgb(253, 249, 251) 8%,
-      rgb(253, 249, 251) 17%,
-      rgb(253, 249, 252) 25%,
-      rgb(254, 248, 253) 33%,
-      rgb(254, 248, 252) 42%,
-      rgb(254, 251, 252) 50%,
-      rgb(254, 251, 251) 58%,
-      rgb(254, 251, 251) 67%,
-      rgb(254, 251, 251) 75%,
-      rgb(254, 251, 251) 83%,
-      rgb(254, 251, 251) 92%,
-      rgb(254, 253, 253)
-    );
-  box-shadow: rgba(0, 0, 0, 0.05) -12px 0 24px -14px inset;
+/* Omnigent's sidebar canvas. The default palette carries no data-theme
+ * attribute, so these brand gradients cannot leak into alternate palettes. */
+:root:not(.dark):not([data-theme]) .conversations-sidebar {
+  background: #fffefe;
+  background: -webkit-linear-gradient(to right, #fffefe, #fcf6fa);
+  background: linear-gradient(to right, #fffefe, #fcf6fa);
 }
-.dark .conversations-sidebar {
+.dark:not([data-theme]) .conversations-sidebar {
   background:
-    radial-gradient(var(--sidebar-dot-color) 0.6px, transparent 0.8px) 0 0 / 20px 20px,
     linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)),
     linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%);
+}
+
+/* Alternate palettes own their sidebar color through the palette token. */
+:root:not(.dark)[data-theme] .conversations-sidebar,
+.dark[data-theme] .conversations-sidebar {
+  background: var(--sidebar);
+}
+
+/* Edge treatment is mode-specific but palette-independent. */
+html:not(.dark) .conversations-sidebar {
+  border-right: none;
+  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+}
+.dark .conversations-sidebar {
+  border-right: 1px solid rgb(255 255 255 / 2%);
+  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
 }
 
 /* Below md the sidebar is a full-screen overlay ON TOP of the chat, so it has
@@ -455,8 +468,10 @@ html:not(.dark) .conversations-sidebar {
  * desktop. Above md the sidebar pushes content aside instead of covering it,
  * so it keeps its translucent canvas there. */
 @media (width < 48rem) {
-  html:not(.dark) .conversations-sidebar,
-  .dark .conversations-sidebar {
+  :root:not(.dark):not([data-theme]) .conversations-sidebar,
+  :root:not(.dark)[data-theme] .conversations-sidebar,
+  .dark:not([data-theme]) .conversations-sidebar,
+  .dark[data-theme] .conversations-sidebar {
     background-color: var(--card-solid);
   }
 }
@@ -863,15 +878,19 @@ html:not(.dark) .conversations-sidebar {
  * the discrete Appearance value without affecting mobile. */
 @media (width >= 48rem) {
   :root {
-    --text-xs: calc(var(--desktop-ui-font-size) * 0.75);
-    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+    /* The step factors below are Tailwind's rem ratios against a 16px base, so
+     * they need the preference on that scale. Multiplying the raw 13px shrinks
+     * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
+    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
+    --text-xs: calc(var(--ui-ramp-anchor) * 0.75);
+    --text-sm: calc(var(--ui-ramp-anchor) * 0.9);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);
-    --text-lg: calc(var(--desktop-ui-font-size) * 1.125);
-    --text-xl: calc(var(--desktop-ui-font-size) * 1.25);
-    --text-2xl: calc(var(--desktop-ui-font-size) * 1.5);
-    --text-3xl: calc(var(--desktop-ui-font-size) * 2);
-    --text-3xl--line-height: calc(var(--desktop-ui-font-size) * 2.25);
+    --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
+    --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
+    --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
+    --text-3xl: calc(var(--ui-ramp-anchor) * 2);
+    --text-3xl--line-height: calc(var(--ui-ramp-anchor) * 2.25);
   }
 
   body {
@@ -879,25 +898,27 @@ html:not(.dark) .conversations-sidebar {
   }
 }
 
-/* Mobile typography bump.
- *
- * Push the root font-size from the browser default (16px) to 18px below
- * Tailwind's `md` breakpoint. Tailwind v4 sizes typography AND spacing in
- * `rem`, so the whole UI scales up ~12.5% uniformly — easier to read at
- * arm's length and slightly more forgiving touch targets. Desktop is
- * controlled independently by the Appearance setting.
- *
- * Note that `rem` in `@media` queries always refers to the user-agent's
- * default (16px) per the CSS spec — so `48rem` here is the same 768px
- * Tailwind uses for `md:*` utilities, regardless of our root override. */
+/* Mobile-specific sidebar geometry. The root remains at the global 16px so
+ * rem-based typography and controls keep the same scale across viewports. */
 @media (width < 48rem) {
-  html {
-    font-size: 1.125em;
+  /* Mobile uses its own base size while preserving the desktop hierarchy. */
+  :root {
+    --mobile-ui-font-size: 14px;
+    --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
+    --text-ui: var(--mobile-ui-font-size);
   }
-  /* Mobile typography remains independent of the desktop Appearance setting. */
-  .sidebar-compact-text {
-    font-size: 0.8125rem;
-    line-height: 1.125rem;
+
+  /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
+  .conversations-sidebar {
+    --sidebar-icon-size-mobile: 16px;
+  }
+
+  .conversations-sidebar svg,
+  .conversations-sidebar .ui-icon,
+  .conversations-sidebar .button-standard-icons svg {
+    width: var(--sidebar-icon-size-mobile);
+    height: var(--sidebar-icon-size-mobile);
+    padding: 0;
   }
 }
 

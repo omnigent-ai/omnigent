@@ -31,6 +31,7 @@ import {
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
+  ListFilterIcon,
   LaptopIcon,
   Loader2Icon,
   MailIcon,
@@ -92,6 +93,9 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -122,7 +126,6 @@ import {
 } from "@/hooks/useConversations";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { relativeTime } from "@/lib/relativeTime";
@@ -168,24 +171,21 @@ import {
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
+import { SIDEBAR_ROW } from "./sidebarStyles";
 
-// Positioning for a row's trailing session-state badge. On desktop the badge
-// fades out on hover/focus so the pin + kebab controls can take its place; on
-// mobile it sits left of the always-visible controls (right-[4.5rem]).
+// Positioning for a row's trailing session-state badge. On desktop it shares
+// the controls' right-1 edge and fades on hover so the pin + kebab take its
+// place; on mobile it sits left of the always-visible controls.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-2 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
-// Highlight applied to a drop target while a draggable session hovers it: a
-// subtle background tint — no border, no shadow. Keyed on --primary like the
-// row-selection highlight in this file, at /5 (half the original /10) so it's a
-// gentler gray in light mode (a gentler glow in dark mode) and reads as "active
-// area" without the heavy fill. Pair with `transition-colors` so it eases in.
-const SIDEBAR_HOVER_HIGHLIGHT =
-  "hover:bg-[var(--sidebar-hover)] hover:text-[var(--sidebar-active-foreground)]";
+// Match the Settings sidebar's ghost-button hover treatment across every home
+// sidebar row.
+const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
 // Active highlight also wins on hover so active items don't lose their
 // background and flash when the mouse enters them.
 const SIDEBAR_ACTIVE_HIGHLIGHT =
-  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)]";
+  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 // Maps a first-class project id → its name, provided once at the list level so
@@ -218,12 +218,27 @@ function SidebarRowDataProvider({
 }
 
 /**
- * Which session tab the sidebar is showing. ``"mine"`` is the viewer's own
- * sessions (the Pinned / Projects / Chats structure); ``"shared"`` is the flat
- * list of sessions others have shared with the viewer. The split mirrors
- * :func:`isOwnedByViewer`.
+ * Which slice of sessions the sidebar shows. ``"mine"``/``"shared"`` split by
+ * ownership (see :func:`isOwnedByViewer`); ``"archived"`` is the only slice
+ * that includes archived sessions.
  */
-type SidebarTab = "mine" | "shared";
+type SidebarTab = "all" | "mine" | "shared" | "archived";
+
+const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
+  { value: "all", label: "All sessions" },
+  { value: "mine", label: "My sessions" },
+  { value: "shared", label: "Shared sessions" },
+  { value: "archived", label: "Archived sessions" },
+];
+
+// Shown in place of the list when a filter matches nothing. Named per filter so
+// the empty state says which slice is empty, not just "No sessions".
+const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
+  all: "No active sessions",
+  mine: "No sessions of your own",
+  shared: "No sessions shared with you",
+  archived: "No archived sessions",
+};
 
 // Bulk-selection targets either the flat "Sessions" list or the sessions
 // nested inside project folders; the active scope decides which rows show
@@ -430,15 +445,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // (from the Sessions header or the Projects header kebab, respectively).
   const [selectionScope, setSelectionScope] = useState<SelectionScope>("sessions");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  // Which session tab is shown. "mine" (default) keeps the full Pinned /
-  // Projects / Chats structure; "shared" is a flat list of sessions others
-  // shared with the viewer.
-  const [activeTab, setActiveTab] = useState<SidebarTab>("mine");
-  // The "Shared with me" tab only makes sense when sessions can be shared with
-  // other people at all — i.e. a multi-user server. A loopback-only local
-  // server has just the one user (mirrors the disabled Share affordance; see
-  // `isCurrentServerLocal` and AppShell's `shareDisabled`), so hide the tabs
-  // and always show the viewer's own sessions there.
+  // Active filter from the Sessions heading's menu.
+  const [activeTab, setActiveTab] = useState<SidebarTab>("all");
+  // A loopback-only server has one user, so "Shared" is meaningless there —
+  // the filter menu drops that option. Mirrors AppShell's `shareDisabled`.
   const multiUser = !isCurrentServerLocal();
 
   const lastSelectedIdRef = useRef<string | null>(null);
@@ -546,7 +556,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // for the settings section nav (see settingsNav.tsx) — entering settings
   // shouldn't replace the whole sidebar.
   const { inSettings } = useSettingsRoute();
-  // Remember the pre-settings location so "Back to Omnigent" returns to the
+  // Remember the pre-settings location so the Back row returns to the
   // conversation the user was viewing, not the home page. Tracked here since
   // the sidebar stays mounted across the transition into settings.
   useTrackSettingsReturn();
@@ -684,10 +694,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
       />
       {inSettings ? (
-        <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
+        <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
         <>
-          <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between px-4">
+          <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between pr-3 pl-5">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -715,7 +725,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon-xs"
                     aria-label="Search"
                     onClick={() => onOpenSearch?.()}
-                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                    className="size-6 text-muted-foreground hover:text-foreground"
                     data-testid="sidebar-search-button"
                   >
                     <SearchIcon className="ui-icon" />
@@ -730,7 +740,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     variant="ghost"
                     size="icon-xs"
                     aria-label="Settings"
-                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                    className="size-6 text-muted-foreground hover:text-foreground"
                   >
                     {/* No onNavClick: on mobile, entering Settings keeps the
                     drawer open and swaps it to the section list. */}
@@ -749,7 +759,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon-xs"
                     aria-label="Close sidebar"
                     onClick={onClose}
-                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                    className="size-6 text-muted-foreground hover:text-foreground"
                   >
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
@@ -764,7 +774,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+          <div className="flex flex-col gap-0 px-3 pt-2 pb-0" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -777,7 +787,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // headers and project folders. border-0 drops the Button base's
                 // transparent 1px border so the icon lands exactly on that
                 // column, flush with the Inbox row and folder rows.
-                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -794,7 +805,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onNavClick(e);
                 }}
               >
-                <SquarePenIcon className="ui-icon text-muted-foreground" />
+                <SquarePenIcon
+                  className={cn(
+                    "ui-icon",
+                    isNewChatPage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
                 New session
               </Link>
             </Button>
@@ -805,7 +823,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // Same shared nav-row construct as "New session" / "Inbox" so
                 // the active-pill, hover, insets, icon column, and text weight
                 // all match post-refactor.
-                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -813,7 +832,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="scheduled-tasks-nav"
             >
               <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon className="ui-icon text-muted-foreground" />
+                <ClockIcon
+                  className={cn(
+                    "ui-icon",
+                    isTasksPage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
                 Automations
               </Link>
             </Button>
@@ -821,14 +847,22 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               asChild
               variant="ghost"
               className={cn(
-                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
               data-testid="inbox-button"
             >
               <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon className="ui-icon text-muted-foreground" />
+                <InboxIcon
+                  className={cn(
+                    "ui-icon",
+                    isInboxPage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
                 Inbox
                 {inboxCount > 0 && (
                   <span
@@ -846,50 +880,20 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </Button>
           </div>
 
-          {/* Session-scope tabs: split the viewer's own sessions ("My
-          sessions") from ones shared with them ("Shared with me"). Sits above
-          the scrolling list (non-scrolling) so it stays put while the list
-          scrolls. Stays visible during selection mode so the viewer can still
-          switch scopes while bulk-selecting. */}
-          {multiUser && (
-            <div className="px-2 pb-2">
-              <Tabs
-                value={activeTab}
-                onValueChange={(v) => switchTab(v as SidebarTab)}
-                className="w-full"
-              >
-                <TabsList className="w-full">
-                  <TabsTrigger
-                    value="mine"
-                    data-testid="sidebar-tab-mine"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
-                  >
-                    <span className="min-w-0 truncate">My sessions</span>
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="shared"
-                    data-testid="sidebar-tab-shared"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
-                  >
-                    <span className="min-w-0 truncate">Shared with me</span>
-                  </TabsTrigger>
-                </TabsList>
-              </Tabs>
-            </div>
-          )}
-
           <nav
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="relative flex-1 overflow-y-auto px-3 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
               scrollContainerRef={scrollContainerRef}
               onRowClick={onNavClick}
               searchQuery=""
-              activeTab={multiUser ? activeTab : "mine"}
+              activeTab={activeTab}
+              onActiveTabChange={switchTab}
+              multiUser={multiUser}
               pinnedConversationIds={pinnedConversationIds}
               pinnedConversations={pinnedConversations}
               onTogglePinned={togglePinnedConversation}
@@ -1123,6 +1127,9 @@ interface ConversationListProps {
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
   activeTab: SidebarTab;
+  onActiveTabChange: (tab: SidebarTab) => void;
+  /** Multi-user server; gates the "Shared" filter option. */
+  multiUser: boolean;
   pinnedConversationIds: string[];
   // The server-authoritative pinned sessions, so a pinned session that sits
   // outside the loaded pagination window still renders in the Pinned section.
@@ -1188,6 +1195,8 @@ function ConversationList({
   onRowClick,
   searchQuery,
   activeTab,
+  onActiveTabChange,
+  multiUser,
   pinnedConversationIds,
   pinnedConversations,
   onTogglePinned,
@@ -1278,14 +1287,16 @@ function ConversationList({
     // also present in the paginated list, and merging both would render it twice.
     const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
-    // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
-    // "shared" is the ones others shared with them. The Pinned / Projects /
-    // Sessions structure is then built from that slice, so both tabs reuse the
-    // same section layout with different conversations.
+    // The filter picks the slice; the Pinned / Projects / Sessions structure is
+    // then built from it, so every filter reuses the same layout.
     const tabScoped =
-      activeTab === "shared"
-        ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
-        : notArchived.filter((c) => isOwnedByViewer(c, viewerId));
+      activeTab === "archived"
+        ? allWithPinned.filter((c) => c.archived === true)
+        : activeTab === "shared"
+          ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
+          : activeTab === "mine"
+            ? notArchived.filter((c) => isOwnedByViewer(c, viewerId))
+            : notArchived;
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -1297,14 +1308,12 @@ function ConversationList({
     const pinned = orderByPinnedTimestamp(tabScoped.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
-    // Projects are a "My sessions"-only tool (filing into a project is
-    // owner-only), so the Shared tab renders no folders. On "mine" each folder
-    // holds its non-pinned, non-archived sessions; a pinned member is excluded
-    // (it lives under Pinned), so pinning a project's last session leaves the
-    // folder showing "No sessions".
+    // Filing is owner-only, so Shared renders no folders; Archived is flat too
+    // (archived outranks project membership). Elsewhere each folder holds its
+    // non-pinned sessions — pinning a project's last one leaves it empty.
     const filedIds = new Set<string>();
     const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
-      activeTab === "shared"
+      activeTab === "shared" || activeTab === "archived"
         ? []
         : projects.map(({ id, name }) => {
             // Dual-read membership: a session belongs to this folder if it has
@@ -1327,18 +1336,13 @@ function ConversationList({
     // unloaded page. We render it as a folder with a "No sessions" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
-    // Sessions: the remainder of the tab's slice — not pinned, not filed.
+    // Sessions: the remainder — not pinned, not filed.
     const sessions = sortByUpdatedAtDesc(
       tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
       frozenKeys,
     );
-    const archived = sortByUpdatedAtDesc(
-      allWithPinned.filter((c) => c.archived === true),
-      activeOverride,
-      frozenKeys,
-    );
-    return { pinned, sessions, archived, projectGroups };
+    return { pinned, sessions, projectGroups };
   }, [
     allConversations,
     pinnedConversations,
@@ -1419,14 +1423,7 @@ function ConversationList({
   // user has expanded — persisted across reloads. A project shows its rows only
   // while its name is in this set.
   const [expandedProjects, setExpandedProjects] = useState<string[]>(readExpandedProjectSections);
-  // True only while the open set was produced by "Expand all" and hasn't been
-  // touched since. This — not "do all folders happen to be open" — is what gates
-  // the revert affordance, so a user who opens every folder by hand (forced with
-  // a single project) never sees a "Revert to last state" button backed by an
-  // empty snapshot that would destructively collapse everything.
-  const [expandedViaButton, setExpandedViaButton] = useState(false);
   const toggleProjectExpanded = useCallback((projectName: string) => {
-    setExpandedViaButton(false);
     setExpandedProjects((prev) => {
       const next = prev.includes(projectName)
         ? prev.filter((n) => n !== projectName)
@@ -1441,7 +1438,6 @@ function ConversationList({
   const expandProject = useCallback((projectName: string) => {
     setExpandedProjects((prev) => {
       if (prev.includes(projectName)) return prev;
-      setExpandedViaButton(false);
       const next = [...prev, projectName];
       writeExpandedProjectSections(next);
       return next;
@@ -1519,31 +1515,18 @@ function ConversationList({
     [activeDrag, moveToProject, expandProject, onTogglePinned],
   );
 
-  // "Expand all" opens every project folder at once and remembers the set that
-  // was open beforehand, so a follow-up "Revert to last state" restores exactly
-  // what was open (not collapse-everything). The snapshot is session-only — not
-  // persisted.
-  const [revertSnapshot, setRevertSnapshot] = useState<string[]>([]);
   const expandAllProjects = useCallback((allNames: string[]) => {
-    setExpandedProjects((prev) => {
-      setRevertSnapshot(prev);
-      setExpandedViaButton(true);
+    setExpandedProjects(() => {
       writeExpandedProjectSections(allNames);
       return allNames;
     });
   }, []);
-  // "Revert to last state" restores the set that was open before "Expand all".
-  // When there's no real last state — folders were opened by hand, not via the
-  // button (expandedViaButton is false, so any leftover snapshot is stale) — it
-  // collapses everything instead.
-  const revertProjects = useCallback(() => {
+  const collapseAllProjects = useCallback(() => {
     setExpandedProjects(() => {
-      const target = expandedViaButton ? revertSnapshot : [];
-      setExpandedViaButton(false);
-      writeExpandedProjectSections(target);
-      return target;
+      writeExpandedProjectSections([]);
+      return [];
     });
-  }, [expandedViaButton, revertSnapshot]);
+  }, []);
 
   // Sessions each expanded ProjectFolder has actually rendered, keyed by
   // project name. A folder paginates independently of the global window, so its
@@ -1693,7 +1676,7 @@ function ConversationList({
   if (conversationsQuery.isError) {
     const err = conversationsQuery.error;
     return (
-      <p className="px-2 py-1 text-destructive text-xs">
+      <p className="px-2 py-1 text-destructive text-ui">
         Failed to load: {err instanceof Error ? err.message : String(err)}
       </p>
     );
@@ -1734,7 +1717,7 @@ function ConversationList({
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
-            className="flex flex-col gap-4 pr-1"
+            className="flex flex-col gap-4"
             data-testid="sidebar-conversation-list"
             // Freeze the sort order while the pointer is over the list so rows
             // never move under the cursor. The frozen-keys map is cleared by the
@@ -1750,11 +1733,11 @@ function ConversationList({
             {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
               <UngroupDropZone />
             )}
-            {totalVisible === 0 ? (
+            {totalVisible === 0 && searchQuery ? (
               <>
-                <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+                <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
                 {/* The list is one paginated stream ordered by updated_at across
-              owned + shared sessions, so the current tab can be empty on the
+              owned + shared sessions, so the current filter can be empty on the
               loaded window while its sessions live on a later page. Keep the
               sentinel mounted so pagination continues instead of stranding the
               user on a false "empty" state. */}
@@ -1820,7 +1803,7 @@ function ConversationList({
                             (group) => group.conversations.length > 0,
                           )}
                           onExpandAll={expandAllProjects}
-                          onRevert={revertProjects}
+                          onCollapseAll={collapseAllProjects}
                           onProjectCreated={expandProject}
                           onEnterSelectionMode={() => onEnterSelectionMode("projects")}
                         />
@@ -1859,7 +1842,10 @@ function ConversationList({
                       )}
                   </SectionGroup>
                 )}
-                {sections.sessions.length > 0 && (
+                {/* Always rendered, even with no rows: the header carries the
+                    filter menu, so hiding it on an empty slice would strand the
+                    viewer with no way to pick another filter. */}
+                {
                   // Drop a session here to send it to the flat "Chats" list — where
                   // unfiled, unpinned sessions live. Active while dragging a filed
                   // session (removes it from its project) or a pinned one (unpins
@@ -1872,6 +1858,7 @@ function ConversationList({
                     <ConversationSection
                       title="Sessions"
                       conversations={sections.sessions}
+                      emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
@@ -1892,33 +1879,44 @@ function ConversationList({
                         ) : undefined
                       }
                       headerAction={
-                        !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
-                        ) : undefined
+                        // The filter stays reachable while bulk-selecting;
+                        // switching scope just exits selection. Only the
+                        // "select" entry point hides, being already active.
+                        <div className="flex items-center gap-0.5">
+                          {!selectionMode && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="Select sessions"
+                                  data-testid="toggle-selection-mode"
+                                  className="text-muted-foreground"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onEnterSelectionMode("sessions");
+                                  }}
+                                >
+                                  <ListChecksIcon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Select sessions</TooltipContent>
+                            </Tooltip>
+                          )}
+                          <SessionFilterMenu
+                            value={activeTab}
+                            onChange={onActiveTabChange}
+                            multiUser={multiUser}
+                          />
+                        </div>
                       }
                     />
                   </ChatsDropZone>
-                )}
-                {/* Both tabs render this same Pinned / Projects / Sessions tree;
-              `sections` is scoped to the active tab's conversations (owned vs.
-              shared), and Projects is empty on the Shared tab. */}
+                }
+                {/* Every filter renders this same Pinned / Projects / Sessions
+              tree; `sections` is scoped to the active filter's conversations,
+              and Projects is empty for Shared and Archived. */}
                 {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
                 {/* Infinite-scroll sentinel for the global list. Pagination extends
@@ -2080,10 +2078,11 @@ function SectionHeader({
         onClick={onToggleCollapsed}
         className={
           icon
-            ? `${cn(
-                "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
+            ? cn(
+                SIDEBAR_ROW,
+                "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
-              )} sidebar-compact-text text-foreground`
+              )
             : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
       >
@@ -2140,13 +2139,67 @@ function SectionHeader({
   );
 }
 
+// Scope filter on the Sessions heading. A radio group: the options are
+// mutually exclusive slices of one list.
+function SessionFilterMenu({
+  value,
+  onChange,
+  multiUser,
+}: {
+  value: SidebarTab;
+  onChange: (value: SidebarTab) => void;
+  multiUser: boolean;
+}) {
+  const filters = multiUser
+    ? SIDEBAR_FILTERS
+    : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
+  return (
+    <DropdownMenu>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Filter sessions"
+              data-testid="session-filter"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <ListFilterIcon className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Filter sessions</TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-xs">
+        <DropdownMenuLabel className="text-muted-foreground text-xs">Display</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={value}
+          onValueChange={(next) => onChange(next as SidebarTab)}
+        >
+          {filters.map((filter) => (
+            <DropdownMenuRadioItem
+              key={filter.value}
+              value={filter.value}
+              data-testid={`session-filter-${filter.value}`}
+            >
+              {filter.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function ProjectHeaderActions({
   projectNames,
   collapsed,
   expandedProjects,
   hasProjectSessions,
   onExpandAll,
-  onRevert,
+  onCollapseAll,
   onProjectCreated,
   onEnterSelectionMode,
 }: {
@@ -2157,13 +2210,14 @@ function ProjectHeaderActions({
       it isn't offered when there's nothing under any folder to select. */
   hasProjectSessions: boolean;
   onExpandAll: (projectNames: string[]) => void;
-  onRevert: () => void;
+  onCollapseAll: () => void;
   onProjectCreated: (projectName: string) => void;
   onEnterSelectionMode: () => void;
 }) {
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
     projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
+  const anyExpanded = projectNames.some((name) => expandedProjects.includes(name));
   // The kebab only carries the expand/collapse and "Select sessions" items; with
   // neither applicable (e.g. no projects yet) it would open empty, so hide it.
   const showMenu = showExpandControls || hasProjectSessions;
@@ -2180,27 +2234,30 @@ function ProjectHeaderActions({
               size="icon-xs"
               aria-label="Project list actions"
               data-testid="project-list-actions"
+              className="text-muted-foreground"
               onClick={(event) => event.stopPropagation()}
             >
               <MoreHorizontalIcon className="size-3.5" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
-            {showExpandControls &&
-              (allExpanded ? (
-                <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
-                  <Minimize2Icon className="size-3.5" />
-                  Collapse to previous
-                </DropdownMenuItem>
-              ) : (
-                <DropdownMenuItem
-                  data-testid="expand-all-projects"
-                  onSelect={() => onExpandAll(projectNames)}
-                >
-                  <Maximize2Icon className="size-3.5" />
-                  Expand all
-                </DropdownMenuItem>
-              ))}
+          <DropdownMenuContent align="end" className="min-w-40">
+            {/* Gated independently: each hides only when it would be a no-op, so
+                a mixed set offers both. */}
+            {showExpandControls && !allExpanded && (
+              <DropdownMenuItem
+                data-testid="expand-all-projects"
+                onSelect={() => onExpandAll(projectNames)}
+              >
+                <Maximize2Icon className="size-3.5" />
+                Expand all
+              </DropdownMenuItem>
+            )}
+            {showExpandControls && anyExpanded && (
+              <DropdownMenuItem data-testid="collapse-all-projects" onSelect={onCollapseAll}>
+                <Minimize2Icon className="size-3.5" />
+                Collapse all
+              </DropdownMenuItem>
+            )}
             {hasProjectSessions && (
               <DropdownMenuItem
                 data-testid="projects-select-sessions"
@@ -2337,7 +2394,7 @@ function ConversationSection({
             onToggleCollapsed={onToggleCollapsed}
           />
           {headerAction && (
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100">
+            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
               {headerAction}
             </div>
           )}
@@ -2347,13 +2404,17 @@ function ConversationSection({
       {!isCollapsed && (
         <>
           {conversations.length === 0 && emptyMessage ? (
-            // Expanded but empty (e.g. a project with no loaded chats).
+            // Expanded but empty — a project with no loaded chats (indented, in a
+            // dashed well) or a top-level list whose filter matched nothing.
             <p
-              className={cn(
+              className={
                 indentRows
-                  ? "mt-1 mr-2 ml-8 flex min-h-9 items-center justify-center rounded-xl border border-dashed border-border px-3 py-2 text-center text-ui text-muted-foreground"
-                  : "px-2 py-1 text-xs text-muted-foreground",
-              )}
+                  ? cn(
+                      SIDEBAR_ROW,
+                      "mt-1 mr-2 ml-8 flex items-center justify-center border border-dashed border-border text-center text-ui text-muted-foreground",
+                    )
+                  : "px-2 py-1 text-ui text-muted-foreground"
+              }
             >
               {emptyMessage}
             </p>
@@ -2647,7 +2708,7 @@ function ConversationMenuItems({
               <FolderInputIcon className="size-3.5" />
               {currentProject ? "Move session" : "Add to project"}
             </C.SubTrigger>
-            <C.SubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
+            <C.SubContent className="min-w-56">
               {/* A native submenu flyout — no separate popover layer, so no
                   open/dismiss race with the parent menu. */}
               <ProjectPickerMenu
@@ -3161,7 +3222,8 @@ function ConversationRow({
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
       className={cn(
-        "sidebar-compact-text relative flex h-8 flex-col justify-center rounded-[var(--radius-otto-sm)] py-1 pl-2 text-left text-foreground transition-colors",
+        SIDEBAR_ROW,
+        "relative flex flex-col justify-center text-left text-foreground transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -3353,7 +3415,7 @@ function ConversationRow({
                 // that display and collapse the centering, leaving the glyph
                 // pinned to the top-left of the button — so keep the flex
                 // display when revealing it.
-                "transition-opacity",
+                "text-muted-foreground transition-opacity",
                 "hidden md:inline-flex",
                 "md:opacity-0 md:group-hover:opacity-100",
                 "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
@@ -3365,7 +3427,11 @@ function ConversationRow({
                 onTogglePinned(conversation.id);
               }}
             >
-              {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+              {isPinned ? (
+                <PinOffIcon className="size-3.5" data-icon-size="14" />
+              ) : (
+                <PinIcon className="size-3.5" data-icon-size="14" />
+              )}
             </Button>
           )}
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
@@ -3381,7 +3447,7 @@ function ConversationRow({
                 // keeping it surfaced while the menu is open so the trigger
                 // doesn't vanish under the cursor.
                 className={cn(
-                  "transition-opacity",
+                  "text-muted-foreground transition-opacity",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}
@@ -3391,13 +3457,10 @@ function ConversationRow({
                   e.stopPropagation();
                 }}
               >
-                <MoreHorizontalIcon className="size-3.5" />
+                <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
               </Button>
             </DropdownMenuTrigger>
-            {/* text-xs on every menu item (incl. the submenu trigger): a smaller,
-                denser kebab that reads closer to the row text. Scoped here so the
-                shared dropdown-menu component is untouched. */}
-            <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitem]]:text-xs">
+            <DropdownMenuContent align="end" className="min-w-44">
               <ConversationMenuItems
                 components={dropdownBundle}
                 setMenuOpen={setMenuOpen}
@@ -3626,11 +3689,10 @@ function DeletingRow({
     );
   }
   return (
-    // Match the interactive row's box metrics (h-7, font-size, radius) so the
-    // swap only changes color/opacity — otherwise the row visibly grows and
-    // shifts the list while a delete is in flight.
+    // Match the interactive row's responsive metrics so the swap only changes
+    // color/opacity rather than shifting the list.
     <div
-      className="sidebar-compact-text flex h-7 w-full items-center gap-1.5 rounded-[var(--radius-otto-sm)] px-2 text-muted-foreground opacity-70"
+      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
       data-testid="conversation-deleting"
       aria-live="polite"
     >
@@ -3653,7 +3715,7 @@ function DeletingRow({
 function ArchivingRow({ label }: { label: string }) {
   return (
     <div
-      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui text-muted-foreground opacity-70"
+      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
       data-testid="conversation-archiving"
       aria-live="polite"
     >
@@ -3701,7 +3763,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="max-md:hidden"
+            className="text-muted-foreground max-md:hidden"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -3712,7 +3774,7 @@ function ProjectFolderActions({
                 onNavigate(e);
               }}
             >
-              <SquarePenIcon className="size-3.5" />
+              <SquarePenIcon className="size-3.5" data-icon-size="14" />
             </Link>
           </Button>
         </TooltipTrigger>
@@ -3760,13 +3822,14 @@ function ProjectFolderMenu({
             size="icon-xs"
             aria-label={`Project actions for ${projectName}`}
             data-testid="project-actions"
+            className="text-muted-foreground"
             // Sits on the folder header; keep its click off the collapse toggle.
             onClick={(e) => e.stopPropagation()}
           >
-            <MoreHorizontalIcon className="size-3.5" />
+            <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+        <DropdownMenuContent align="end" className="min-w-40">
           {/* New session — mobile-only (md:hidden); desktop uses the
               hover-revealed pencil on the folder header. */}
           <DropdownMenuItem asChild className="md:hidden" data-testid="project-new-session-menu">
@@ -4050,11 +4113,9 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }
 
   return (
-    // Match the interactive row's box metrics (h-7, sidebar-compact-text) so
-    // entering edit mode doesn't grow the row or bump the font size. pl-1 + the
-    // input's px-1 line the text up with the row's px-2 title; the size-6
-    // buttons sit inside the 28px row height.
-    <div className="sidebar-compact-text flex h-7 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1">
+    // Match the interactive row's responsive box metrics so entering edit mode
+    // doesn't shift the list. pl-1 + the input's px-1 align with row titles.
+    <div className="sidebar-compact-text flex h-8 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1 md:h-7">
       <input
         ref={inputRef}
         type="text"
@@ -4206,7 +4267,7 @@ function BulkActionBar({
   return (
     <>
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-background p-1.5">
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

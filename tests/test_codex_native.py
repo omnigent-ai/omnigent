@@ -81,7 +81,7 @@ def _point_codex_auth_check_at(
         # on the auth-path decision.
         monkeypatch.setattr(
             "omnigent.onboarding.harness_install.harness_cli_installed",
-            lambda _key: True,
+            lambda _key, **_kw: True,
         )
 
 
