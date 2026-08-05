@@ -86,8 +86,7 @@ def _ranking_dataset() -> dict[str, object]:
             "  CONCAT_WS(', ', mutation_blocked) AS mutation_blocked,\n",
             "  url\n",
             "FROM main.team_eng_omnigent.issue_scores_latest\n",
-            "ORDER BY rank\n",
-            "LIMIT 200 ",
+            "ORDER BY rank ",
         ],
     }
 
@@ -150,7 +149,7 @@ def _ranking_widget(y: int) -> dict[str, object]:
                     "title": "Issue Priority Ranking",
                     "showDescription": True,
                     "description": (
-                        "Top 200 issues from the latest complete scoring run. Proposed labels "
+                        "All issues from the latest complete scoring run. Proposed labels "
                         "remain a dry-run until GitHub writes are explicitly enabled."
                     ),
                 },

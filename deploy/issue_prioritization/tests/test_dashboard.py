@@ -31,6 +31,7 @@ def test_dashboard_patch_adds_ranking_after_existing_layout() -> None:
 
     dataset = next(item for item in patched["datasets"] if item["name"] == DATASET_NAME)
     assert "issue_scores_latest" in "".join(dataset["queryLines"])
+    assert "LIMIT" not in "".join(dataset["queryLines"])
     assert dataset["queryLines"][-1].endswith(" ")
 
     widget = patched["pages"][0]["layout"][-1]
