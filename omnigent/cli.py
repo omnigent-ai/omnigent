@@ -7514,13 +7514,12 @@ def _host_http_json(
 
     from omnigent.chat import _remote_headers
 
-    if base_url not in _host_http_headers_cache:
-        with _host_http_headers_lock:
-            if base_url not in _host_http_headers_cache:
-                _host_http_headers_cache[base_url] = _remote_headers(server_url=base_url)
-    headers = _host_http_headers_cache[base_url]
-
     try:
+        if base_url not in _host_http_headers_cache:
+            with _host_http_headers_lock:
+                if base_url not in _host_http_headers_cache:
+                    _host_http_headers_cache[base_url] = _remote_headers(server_url=base_url)
+        headers = _host_http_headers_cache[base_url]
         with httpx.Client(
             base_url=base_url,
             headers=headers,
