@@ -658,6 +658,7 @@ async def test_a_non_auto_opt_in_value_is_rejected(client: httpx.AsyncClient) ->
 # to re-derive routing from this session's (or its parent's) state later.
 
 _WRAPPER = "__wrapper__"
+_CODEX_WRAPPER = "__codex_wrapper__"
 _BUNDLE = "__bundle__"
 
 
@@ -692,6 +693,31 @@ _BUNDLE = "__bundle__"
             "fixed-harness-cost-control-on",
             {
                 "agent_id": _WRAPPER,
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+            },
+            None,
+            "on",
+        ),
+        # A session pinned to codex has no spawn-routing machinery — that needs
+        # the auto-harness launch's generated hooks and pre-approvals — so the
+        # switch is left unset rather than reading "on" with nothing behind it.
+        (
+            "pinned-codex-cost-control-on",
+            {
+                "agent_id": _CODEX_WRAPPER,
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+            },
+            None,
+            None,
+        ),
+        # Auto-harness may land on codex, and there the machinery IS installed.
+        (
+            "codex-wrapper-auto",
+            {
+                "agent_id": _CODEX_WRAPPER,
+                "harness_override": "auto",
                 "cost_control_mode_override": "on",
                 "smart_routing_message": ROUTING_MESSAGE,
             },
@@ -740,7 +766,11 @@ async def test_create_stamps_subagent_routing_for_routed_sessions(
 ) -> None:
     wrappers = await _native_wrappers(client, db_uri)
     bundle = await create_test_agent(client, name=f"stamp-{case}")
-    agent_ids = {_WRAPPER: wrappers["claude-native"], _BUNDLE: str(bundle["id"])}
+    agent_ids = {
+        _WRAPPER: wrappers["claude-native"],
+        _CODEX_WRAPPER: wrappers["codex-native"],
+        _BUNDLE: str(bundle["id"]),
+    }
     payload = {**body, "agent_id": agent_ids[body["agent_id"]]}
 
     if parent_cost_control is not None or case.startswith("child-of"):

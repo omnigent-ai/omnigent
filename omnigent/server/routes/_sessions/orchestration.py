@@ -6934,12 +6934,31 @@ async def _create_session_from_existing_agent(
     # Only "on" is written: unset already means Default, so stamping "off" on
     # every ordinary create would grow the overrides blob and cost a write for
     # no change in behavior. An explicit caller value always wins.
-    if subagent_routing_override is None and (
-        cost_control_mode_override == "on"
-        or _native_smart_routing
-        or (
-            _parent_for_routing is not None
-            and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
+    #
+    # Not stamped for a session pinned to a codex-family harness: spawn routing
+    # there needs the generated ``hooks.json`` and tool pre-approvals that only
+    # an auto-harness launch installs, so the switch would read "on" while
+    # nothing consumed it. The gear hides the control on those sessions to
+    # match — subagent routing is fixed at launch for pinned codex.
+    _pinned_codex_create = (
+        not (_native_smart_routing or _force_auto_for_child or _spec_auto_brain)
+        and body.harness_override != "auto"
+    )
+    if _pinned_codex_create:
+        _resolved_create_harness = await asyncio.to_thread(
+            _create_resolved_harness, agent, body.harness_override, agent_cache
+        )
+        _pinned_codex_create = harness_family(_resolved_create_harness) == "gpt"
+    if (
+        subagent_routing_override is None
+        and not _pinned_codex_create
+        and (
+            cost_control_mode_override == "on"
+            or _native_smart_routing
+            or (
+                _parent_for_routing is not None
+                and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
+            )
         )
     ):
         subagent_routing_override = "on"

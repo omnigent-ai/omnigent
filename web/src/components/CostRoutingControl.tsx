@@ -18,40 +18,63 @@ export function isCostRoutingSession(
 }
 
 /**
- * Harnesses whose sub-agent spawns go through the native-subagent router:
- * Claude Code and Codex in both flavours, plus the ``"auto"`` sentinel a
- * fully-auto session carries until its first message resolves a real harness.
+ * Native harnesses whose sub-agent spawns go through the native-subagent
+ * router, and whose spawn-routing apparatus is installed for any Smart
+ * Routing session. Codex is absent on purpose — see
+ * {@link isSubagentRoutingSession}.
  */
-const SUBAGENT_ROUTING_HARNESSES: ReadonlySet<string> = new Set([
-  "claude-native",
-  "claude-sdk",
-  "codex",
-  "codex-native",
-  "auto",
-]);
+const CLAUDE_SUBAGENT_ROUTING_HARNESSES: ReadonlySet<string> = new Set(["claude-native"]);
+
+/** Session label recording that Smart Routing owns this session's harness. */
+export const AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness";
+
+/** Whether Smart Routing owns this session's harness (so its spawns may cross families). */
+function isAutoHarnessSession(
+  session: Pick<Session, "harness" | "labels"> | null | undefined,
+): boolean {
+  return session?.labels?.[AUTO_HARNESS_LABEL_KEY] === "1" || session?.harness === "auto";
+}
 
 /**
  * Whether a session can control the routing of the sub-agents it spawns.
  *
- * Wider than {@link isCostRoutingSession}, in two ways. Native-terminal Claude /
- * Codex sessions qualify: the native CLI bakes its OWN model at launch, but the
- * sub-agents it spawns are routed per spawn through the native-subagent hook, so
- * the knob is meaningful there — hence the harness gate. And every other
- * top-level agent session qualifies regardless of harness: an SDK/bundle agent
- * (Polly, Debby, …) spawns its children through the session-create path, which
- * routes off the parent's switch whatever harness the parent runs.
+ * Wider than {@link isCostRoutingSession} for non-native sessions: an
+ * SDK/bundle agent (Polly, Debby, …) spawns its children through the
+ * session-create path, which re-reads this switch per spawn whatever harness
+ * the parent runs, so the knob works there regardless of routing state.
+ *
+ * Narrower for a native terminal, where the whole spawn-routing apparatus is
+ * installed at launch and cannot be turned on afterwards:
+ *
+ * - an auto-harness session always has it;
+ * - a Claude-family session has it whenever it launched on Smart Routing;
+ * - a session pinned to Codex never has it (the generated ``hooks.json`` and
+ *   the routed-spawn tool pre-approvals only come with an auto-harness
+ *   launch), and neither does a plain session of any family.
+ *
+ * Those last two would present "Smart Routing" as choosable while nothing
+ * consumed the choice, so the row is hidden instead. Subagent routing is
+ * launch-time-fixed for pinned Codex.
  *
  * Callers must also check ``ServerInfo.smart_routing_enabled`` — this
  * predicate only checks the session shape.
  */
 export function isSubagentRoutingSession(
-  session: Pick<Session, "agentName" | "parentSessionId" | "harness" | "labels"> | null | undefined,
+  session:
+    | Pick<
+        Session,
+        "agentName" | "parentSessionId" | "harness" | "labels" | "costControlModeOverride"
+      >
+    | null
+    | undefined,
 ): boolean {
   if (!isCostRoutingSession(session)) return false;
-  if (isNativeTerminalSession(session)) {
-    return SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "");
-  }
-  return true;
+  if (!isNativeTerminalSession(session)) return true;
+  if (isAutoHarnessSession(session)) return true;
+  return (
+    CLAUDE_SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "") &&
+    session?.costControlModeOverride === "on"
+  );
 }
 
 // The tier-defining token of Claude model ids ("databricks-claude-haiku-4-5" → "haiku").

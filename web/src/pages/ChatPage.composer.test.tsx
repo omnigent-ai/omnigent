@@ -48,7 +48,8 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, shouldQueueSend } from "./ChatPage";
+import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
+import type { Session } from "@/lib/types";
 import type { QueuedMessage } from "@/store/chatStore";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -2082,6 +2083,39 @@ describe("Composer config gear — subagent routing", () => {
     await openNativeModal({ subagentRoutingEligible: false });
     expect(row()).toBeNull();
   });
+
+  // Only the smart-routing flag matters to `isSubagentRoutingEligible`.
+  const smartRoutingInfo = { smart_routing_enabled: true } as unknown as Parameters<
+    typeof isSubagentRoutingEligible
+  >[0];
+
+  it.each([
+    ["routed claude-native", "claude-native", "on", {}, true],
+    [
+      "auto-harness codex-native",
+      "codex-native",
+      null,
+      { "omnigent.routing.auto_harness": "1" },
+      true,
+    ],
+    ["pinned codex-native", "codex-native", "on", {}, false],
+    ["plain claude-native", "claude-native", null, {}, false],
+  ] as const)(
+    "row visibility follows the session's routing class: %s",
+    async (_case, harness, costControlModeOverride, extraLabels, visible) => {
+      const session = {
+        agentName: "coder",
+        parentSessionId: null,
+        harness,
+        costControlModeOverride,
+        labels: { "omnigent.wrapper": "claude-code", ...extraLabels },
+      } as unknown as Session;
+      await openNativeModal({
+        subagentRoutingEligible: isSubagentRoutingEligible(smartRoutingInfo, session),
+      });
+      expect(row() === null).toBe(!visible);
+    },
+  );
 
   it("renders the gear for a native session whose only knob is subagent routing", () => {
     renderWithTooltips(

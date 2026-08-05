@@ -1418,6 +1418,9 @@ describe("routing eligibility gates", () => {
     parentSessionId: null,
     harness: "claude-native",
     labels: { "omnigent.wrapper": "claude-code" },
+    // Routed: a native session's spawn-routing apparatus is installed at
+    // launch, so only a Smart Routing one carries the switch.
+    costControlModeOverride: "on",
   } as unknown as Session;
 
   it.each([true, false] as const)("cost routing follows the server flag (%s)", (flag) => {
@@ -1443,6 +1446,27 @@ describe("routing eligibility gates", () => {
     // harness allowlist doesn't apply.
     const piSession = { ...sdkSession, harness: "pi" } as unknown as Session;
     expect(isSubagentRoutingEligible(info(true), piSession)).toBe(true);
+  });
+
+  it("a pinned codex session has no subagent-routing switch to offer", () => {
+    // Spawn routing on codex needs the generated hooks and pre-approvals that
+    // only an auto-harness launch installs, so the row would be inert.
+    const codex = {
+      ...nativeSession,
+      harness: "codex-native",
+      labels: { "omnigent.wrapper": "codex-cli" },
+    } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), codex)).toBe(false);
+    const autoCodex = {
+      ...codex,
+      labels: { ...codex.labels, "omnigent.routing.auto_harness": "1" },
+    } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), autoCodex)).toBe(true);
+  });
+
+  it("a plain native session has no subagent-routing switch to offer", () => {
+    const plain = { ...nativeSession, costControlModeOverride: null } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), plain)).toBe(false);
   });
 
   it("both gates are off for a sub-agent (child) session even with the flag on", () => {

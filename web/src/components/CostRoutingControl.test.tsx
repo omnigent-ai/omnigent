@@ -1,6 +1,7 @@
 import { cleanup } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  AUTO_HARNESS_LABEL_KEY,
   isCostRoutingSession,
   isSubagentRoutingSession,
   shortModelName,
@@ -33,9 +34,44 @@ describe("isCostRoutingSession", () => {
 describe("isSubagentRoutingSession", () => {
   const top = { agentName: "claude-native-ui", parentSessionId: null };
 
-  it("matches Claude Code and Codex in both flavours, plus the auto sentinel", () => {
-    for (const harness of ["claude-native", "claude-sdk", "codex", "codex-native", "auto"]) {
-      expect(isSubagentRoutingSession({ ...top, harness })).toBe(true);
+  it("matches a routed Claude session and any auto-harness session", () => {
+    expect(
+      isSubagentRoutingSession({
+        ...top,
+        harness: "claude-native",
+        costControlModeOverride: "on",
+      }),
+    ).toBe(true);
+    // Auto-harness may land on either family, and both install the apparatus.
+    expect(isSubagentRoutingSession({ ...top, harness: "auto" })).toBe(true);
+    for (const harness of ["claude-native", "codex-native"]) {
+      expect(
+        isSubagentRoutingSession({
+          ...top,
+          harness,
+          labels: { [AUTO_HARNESS_LABEL_KEY]: "1" },
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("rejects a session whose spawn routing is fixed off at launch", () => {
+    // Pinned codex: spawn routing there needs the generated hooks and the
+    // routed-spawn pre-approvals, which only an auto-harness launch installs.
+    expect(
+      isSubagentRoutingSession({
+        ...top,
+        harness: "codex-native",
+        costControlModeOverride: "on",
+      }),
+    ).toBe(false);
+    // A plain native session of either family: the apparatus is stamped at
+    // create, so flipping the switch afterwards would change nothing.
+    for (const harness of ["claude-native", "codex-native"]) {
+      expect(isSubagentRoutingSession({ ...top, harness })).toBe(false);
+      expect(isSubagentRoutingSession({ ...top, harness, costControlModeOverride: "off" })).toBe(
+        false,
+      );
     }
   });
 
@@ -68,6 +104,7 @@ describe("isSubagentRoutingSession", () => {
         agentName: "claude-native-ui",
         parentSessionId: "conv_parent987",
         harness: "claude-native",
+        costControlModeOverride: "on",
       }),
     ).toBe(false);
   });
