@@ -190,6 +190,23 @@ def catalog_models_for_harness(
     return None
 
 
+def failure_detail(exc: BaseException) -> str:
+    """Describe *exc* for a routing decline the user reads.
+
+    ``str(exc)`` is empty for the exceptions routing hits most — httpx's
+    timeouts carry no message — which rendered as a dangling "router request
+    failed: " with the cause missing. The class name is the cause in that case:
+    ``ReadTimeout`` says what happened, and a timeout is exactly what a
+    fail-open budget produces.
+
+    :param exc: The exception a routing call raised.
+    :returns: A non-empty description, e.g. ``"ReadTimeout"`` or
+        ``"[Errno 61] Connection refused"``.
+    """
+    text = str(exc).strip()
+    return text or type(exc).__name__
+
+
 # ── RoutingClient protocol ──────────────────────────────────────────────────
 
 
@@ -504,7 +521,7 @@ class LLMRoutingClient:
             verdict = json.loads(text)
         except Exception as exc:  # noqa: BLE001  # fail-open
             _logger.warning("LLMRoutingClient: judge call failed", exc_info=True)
-            self.last_error = f"routing judge call failed: {exc}"
+            self.last_error = f"routing judge call failed: {failure_detail(exc)}"
             return None
 
         model = verdict.get("model")
@@ -1727,9 +1744,12 @@ class ExternalRoutingClient:
                     auth=auth if auth is not None else httpx.USE_CLIENT_DEFAULT,
                 )
         except httpx.HTTPError as exc:
-            # Transport-level failure (connect/timeout/DNS): no response body.
-            _logger.warning("ExternalRoutingClient: routes:select request failed: %s", exc)
-            self.last_error = f"router request failed: {exc}"
+            # Transport-level failure (connect/timeout/DNS): no response body,
+            # and httpx's timeouts carry no message — name the class instead.
+            _logger.warning(
+                "ExternalRoutingClient: routes:select request failed: %s", failure_detail(exc)
+            )
+            self.last_error = f"router request failed: {failure_detail(exc)}"
             return None
         if resp.status_code >= 400:
             # Log the response body — the gateway puts the actual reason there
@@ -1987,7 +2007,7 @@ async def route_session_harness(
         result = await router.client.route(user_message, harness_models)
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
-        return None, None, None, f"Routing call failed: {exc}"
+        return None, None, None, f"Routing call failed: {failure_detail(exc)}"
 
     if result is None:
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
@@ -2237,5 +2257,5 @@ async def route_turn_or_decline(
         model, verdict = await route_turn(harness, user_message, **kwargs)
     except Exception as exc:  # a routing outage must never drop a turn
         _logger.exception("smart_routing: route_turn failed; the turn runs unrouted")
-        return None, None, f"Routing call failed: {exc}"
+        return None, None, f"Routing call failed: {failure_detail(exc)}"
     return model, verdict, None

@@ -3134,6 +3134,35 @@ async def test_external_router_declines_when_the_transport_never_connects() -> N
 
 
 @pytest.mark.asyncio
+async def test_external_router_names_a_timeout_that_carries_no_message() -> None:
+    """A messageless failure still names its cause on the decision card.
+
+    httpx's timeouts stringify to ``""``, so the chip read "Routing unavailable
+    (router request failed: )" — a dangling colon with the reason missing,
+    exactly on the fail-open path a 5s budget makes the common one.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+    assert client.last_error == "router request failed: ReadTimeout"
+
+
+def test_failure_detail_prefers_the_message_and_falls_back_to_the_class() -> None:
+    from omnigent.server.smart_routing import failure_detail
+
+    assert failure_detail(ValueError("no route options")) == "no route options"
+    # Whitespace is no reason either, and every httpx timeout arrives blank.
+    assert failure_detail(TimeoutError("  ")) == "TimeoutError"
+
+
+@pytest.mark.asyncio
 async def test_external_router_passes_its_budget_to_the_transport() -> None:
     """
     The 5s budget reaches ``httpx``, rather than only being documented.

@@ -744,6 +744,24 @@ async def test_router_failure_allows_the_spawn_unchanged(
     assert reason_fragment in decision.rationale
 
 
+async def test_a_swallowed_router_exception_still_names_its_cause() -> None:
+    """A client that raises past its own reporting leaves the cause on the chip.
+
+    ``last_error`` is unset when ``route`` raises before it can record one, and
+    the decline then said only "router returned no verdict" while the real
+    cause (a timeout, which stringifies empty) lived in the server log alone.
+    """
+    import httpx
+
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(error=httpx.ReadTimeout("")),
+        routing_settings=RoutingSettings(),
+    )
+    decision = await resolve_subagent_route("conv_1", _request(), caps=caps)
+    assert decision.action == "allow"
+    assert "router call failed: ReadTimeout" in decision.rationale
+
+
 async def test_identical_spawns_are_each_routed() -> None:
     """Decisions are not cached: a decision_id is an identity, not a key."""
     client = FakeRoutingClient(

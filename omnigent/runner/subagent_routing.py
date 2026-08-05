@@ -749,15 +749,24 @@ async def _decide(
     # words it. Fail-open still preserves the ask — a router outage returns an
     # allow with no model, the hook leaves ``tool_input`` untouched, and the
     # spawn runs on exactly the model it named.
+    raised: str | None = None
     try:
         result = await client.route(task, candidates)
-    except Exception:  # noqa: BLE001 — router outages are a normal path here
+    except Exception as exc:  # noqa: BLE001 — router outages are a normal path here
         _logger.warning(
             "route-subagent: router call failed for session=%s", session_id, exc_info=True
         )
         result = None
+        # A client that raises past its own error reporting leaves
+        # ``last_error`` unset; without this the chip said only "no verdict"
+        # and the cause lived in the server log alone.
+        from omnigent.server.smart_routing import failure_detail
+
+        raised = f"router call failed: {failure_detail(exc)}"
     if result is None or not getattr(result, "model", None):
-        detail = _opt_str(getattr(client, "last_error", None)) or "router returned no verdict"
+        detail = (
+            _opt_str(getattr(client, "last_error", None)) or raised or "router returned no verdict"
+        )
         return _unavailable_decision(detail)
 
     return replace(_decision_from_result(req, result, candidates), router_source=router.source)
