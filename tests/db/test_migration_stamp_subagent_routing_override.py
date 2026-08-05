@@ -205,3 +205,110 @@ def test_downgrade_leaves_the_backfilled_values_in_place(tmp_path: Path) -> None
         assert _overrides(engine) == after_upgrade
     finally:
         engine.dispose()
+
+
+def test_upgrade_leaves_unparseable_and_non_dict_blobs_alone(tmp_path: Path) -> None:
+    """
+    Add #36: a blob the migration cannot read is skipped, not fatal.
+
+    ``session_overrides`` is written by the store, so in practice it is always a
+    JSON object — but a hand-edited row, a truncated write, or a schema from a
+    much older build is enough to make one unreadable, and a migration that
+    raises on one row leaves the whole deployment un-upgradable.
+    """
+    uri = f"sqlite:///{tmp_path / 'stamp-junk.db'}"
+    engine = _new_engine(uri)
+    try:
+        _migrate(engine, uri, _BEFORE)
+        _insert(
+            engine,
+            [
+                # Not JSON at all.
+                {"id": _uuid("garbage"), "session_overrides": "{not json"},
+                # Valid JSON, wrong shape: a list, a bare string, a JSON null.
+                {"id": _uuid("list"), "session_overrides": "[]"},
+                {"id": _uuid("string"), "session_overrides": '"on"'},
+                {"id": _uuid("json-null"), "session_overrides": "null"},
+                # Empty string, which is neither absent nor parseable.
+                {"id": _uuid("empty"), "session_overrides": ""},
+                # A routed row alongside them, so the migration is proven to have
+                # done its job rather than bailed out at the first bad row.
+                {"id": _uuid("routed"), "session_overrides": _ROUTED},
+            ],
+        )
+
+        _migrate(engine, uri, _AFTER)
+
+        stored = _overrides(engine)
+        assert stored[_uuid("routed")] == _ROUTED_STAMPED
+        for tag, unchanged in (
+            ("garbage", "{not json"),
+            ("list", "[]"),
+            ("string", '"on"'),
+            ("json-null", "null"),
+            ("empty", ""),
+        ):
+            assert stored[_uuid(tag)] == unchanged, tag
+    finally:
+        engine.dispose()
+
+
+def test_upgrade_handles_an_already_stamped_row_and_a_dangling_parent(tmp_path: Path) -> None:
+    """
+    Add #36, the other edges: an existing stamp and a parent that is not there.
+
+    A row stamped by the create path before the migration ran must not be
+    rewritten (the blob is fixed-width and a needless write costs space for no
+    change), and a child whose parent row is missing has nothing to inherit — the
+    old tri-state rule resolved that to "not routed", so the new stamp is absent.
+    """
+    uri = f"sqlite:///{tmp_path / 'stamp-edges.db'}"
+    engine = _new_engine(uri)
+    try:
+        _migrate(engine, uri, _BEFORE)
+        _insert(
+            engine,
+            [
+                {"id": _uuid("already-on"), "session_overrides": _ROUTED_STAMPED},
+                {
+                    "id": _uuid("orphan"),
+                    "parent_conversation_id": _uuid("gone"),
+                    "session_overrides": json.dumps(
+                        {"harness_override": "auto"}, separators=(",", ":")
+                    ),
+                },
+            ],
+        )
+
+        _migrate(engine, uri, _AFTER)
+
+        assert _overrides(engine) == {
+            _uuid("already-on"): _ROUTED_STAMPED,
+            _uuid("orphan"): json.dumps({"harness_override": "auto"}, separators=(",", ":")),
+        }
+    finally:
+        engine.dispose()
+
+
+def test_re_running_the_upgrade_changes_nothing(tmp_path: Path) -> None:
+    """
+    Add #37: the backfill is idempotent.
+
+    A stamped row is indistinguishable from a row the user set by hand, so a
+    second pass has to be a no-op — otherwise a re-run (a retried deploy, a
+    downgrade-then-upgrade cycle) would overwrite a deliberate ``"off"``.
+    """
+    uri = f"sqlite:///{tmp_path / 'stamp-twice.db'}"
+    engine = _new_engine(uri)
+    try:
+        _migrate(engine, uri, _BEFORE)
+        _seed(engine)
+        _migrate(engine, uri, _AFTER)
+        once = _overrides(engine)
+
+        _migrate(engine, uri, _BEFORE, down=True)
+        _migrate(engine, uri, _AFTER)
+
+        assert _overrides(engine) == once
+    finally:
+        engine.dispose()

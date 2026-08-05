@@ -1053,3 +1053,176 @@ async def test_replay_skips_the_switch_when_the_pane_is_already_there(
     )
 
     assert len(client.posts) == 1
+
+
+# ── Timeout ladder ──────────────────────────────────────────────────
+#
+# Each hop's budget must exceed the hop it waits on, or the inner fail-open can
+# never run: the outer layer kills the inner one first and the user is left with
+# a wedged pane instead of an unrouted turn. These are relations, not values —
+# a future retune stays green as long as it keeps the ordering.
+
+
+def test_the_timeout_ladder_is_strictly_decreasing_inwards() -> None:
+    """Add #25: the hook's budget > the relay's > the server hop's."""
+    from omnigent.runner.turn_routing import (
+        HARNESS_HOOK_TIMEOUT_S,
+        HOOK_REQUEST_TIMEOUT_S,
+        RELAY_TIMEOUT_S,
+        SERVER_HOP_TIMEOUT_S,
+        SETTINGS_UPDATE_TIMEOUT_S,
+    )
+
+    # Hop 1 registers on the harness and must cover the hook script's whole
+    # life: the verdict round trip plus (codex only) the settings update.
+    assert HARNESS_HOOK_TIMEOUT_S > HOOK_REQUEST_TIMEOUT_S + SETTINGS_UPDATE_TIMEOUT_S
+    # Hop 2a waits on hop 3, which waits on hop 4.
+    assert HOOK_REQUEST_TIMEOUT_S > RELAY_TIMEOUT_S > SERVER_HOP_TIMEOUT_S
+
+
+def test_the_router_clients_own_timeout_sits_inside_the_hook_budget() -> None:
+    """
+    Add #26: the router's HTTP timeout is the innermost wait, not the outermost.
+
+    ``ExternalRoutingClient`` is called from inside the server hop, so its own
+    per-call timeout has to be the tightest number in the stack. If it were
+    larger than the hook's budget, a slow router would degrade to "harness killed
+    the hook" (prompt at risk) instead of "routing unavailable" (turn runs).
+    """
+    import inspect
+
+    from omnigent.runner.turn_routing import HOOK_REQUEST_TIMEOUT_S
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    default = (
+        inspect.signature(ExternalRoutingClient.__init__).parameters["request_timeout"].default
+    )
+    assert isinstance(default, int | float)
+    assert 0 < default < HOOK_REQUEST_TIMEOUT_S
+
+
+# ── Route-once under load, and the manual-pin gap ───────────────────
+
+
+async def test_two_concurrent_first_prompts_are_not_serialised_by_a_lock() -> None:
+    """
+    Add #27: pins the known concurrency gap — there is no per-session lock.
+
+    ``resolve_turn_route`` reads the gate off the conversation row, and the row
+    only carries a decision label once the first call has finished persisting.
+    Two prompts submitted inside one routing round trip therefore both pass the
+    gate. That is recorded as a low residual (registry row 92 / breakage X13),
+    not fixed: the pin write is idempotent, both calls land the same arm, and a
+    lock here would have to span the runner and the server.
+
+    This test exists so the gap stays *deliberate*. If a lock is added, it fails
+    and the residual can be closed instead of quietly drifting.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+    rec = _Recorder()
+
+    async def _slow_route(harness: str | None, prompt: str) -> tuple[str | None, dict[str, Any]]:
+        started.set()
+        await release.wait()
+        return await rec.route(harness, prompt)
+
+    conv = _FakeConv()
+    first = asyncio.create_task(
+        resolve_turn_route(
+            "conv_1",
+            _request(),
+            conv=conv,
+            route_turn=_slow_route,
+            pin=rec.pin,
+            persist=rec.persist,
+        )
+    )
+    await started.wait()
+    second = asyncio.create_task(
+        resolve_turn_route(
+            "conv_1",
+            _request(turn_id="turn_2", prompt="and another thing"),
+            conv=conv,
+            route_turn=_slow_route,
+            pin=rec.pin,
+            persist=rec.persist,
+        )
+    )
+    release.set()
+    decisions = await asyncio.gather(first, second)
+
+    # Both route: no lock, and the row the gate reads was not updated in between.
+    assert [d.action for d in decisions] == ["route", "route"]
+    # But they agree on the arm, so the pane is never asked for two models, and
+    # the pin write is the same value twice.
+    assert {d.model for d in decisions} == {ROUTED_MODEL}
+    assert rec.pinned == [ROUTED_MODEL, ROUTED_MODEL]
+
+
+async def test_a_second_prompt_after_the_decision_lands_declines() -> None:
+    """Add #27, the half that IS closed: serialised prompts route exactly once."""
+    rec = _Recorder()
+    conv = _FakeConv()
+    first = await resolve_turn_route(
+        "conv_1", _request(), conv=conv, route_turn=rec.route, pin=rec.pin, persist=rec.persist
+    )
+    assert first.action == "route"
+    # What the server writes once the decision is persisted.
+    conv.labels.update(_routed_labels())
+
+    second = await resolve_turn_route(
+        "conv_1",
+        _request(turn_id="turn_2"),
+        conv=conv,
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert second.action == "allow"
+    assert second.terminal is True
+    assert len(rec.routed) == 1
+
+
+async def test_a_manually_pinned_session_with_routing_on_is_still_hook_routed_once() -> None:
+    """
+    Add #28: pins the row-91 gap, deliberately unfixed.
+
+    The composer gate declines a manually pinned session (its gate is
+    ``effective_runner_override is None``), but this hook cannot use that check:
+    the codex forwarder mirrors ``config.toml``'s launch model into
+    ``model_override`` about a second into the first turn, so a present
+    ``model_override`` cannot tell a user's pin from the mirror (row 89 — across
+    8 live sessions the mirror won the race in 6, so a presence gate would have
+    wrongly declined routing 6 times out of 8).
+
+    So a bare session the user pinned, with Smart Routing left on, gets routed
+    once by the hook. Closing it needs pin provenance the mirror destroys.
+    Asserted here so it is a recorded decision rather than an accident.
+    """
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(),
+        # A real user pin: a model set, and NO routing-decision label.
+        conv=_FakeConv(model_override="databricks-gpt-5-6-sol"),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+
+    assert decision.action == "route"
+    assert decision.model == ROUTED_MODEL
+    assert len(rec.routed) == 1
+    # And exactly once: the decision label it writes is what closes the gate, so
+    # the pin is overridden one time and never again.
+    second = await resolve_turn_route(
+        "conv_1",
+        _request(turn_id="turn_2"),
+        conv=_FakeConv(model_override=ROUTED_MODEL, labels=_routed_labels()),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert second.action == "allow"
+    assert len(rec.routed) == 1

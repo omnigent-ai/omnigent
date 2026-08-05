@@ -355,30 +355,39 @@ async def test_a_long_context_suffix_is_the_same_arm() -> None:
     assert decision_record(req, decision).attempted_override is None
 
 
-async def test_a_matching_ask_on_an_allow_is_honored_too() -> None:
-    """The router keeping the parent model still answers the ask."""
-    client = FakeRoutingClient(RoutingResult(model=PARENT_MODEL, rationale="parent model fits"))
-    req = _request(requested_model=PARENT_MODEL)
-    decision = await resolve_subagent_route("conv_1", req, caps=FakeCaps(routing_client=client))
-    assert decision.action == "allow"
-    assert decision.rationale == (
-        f"parent model fits Spawn requested {PARENT_MODEL}; honored — "
-        "the router picked the same arm."
-    )
-    assert decision_record(req, decision).attempted_override is None
+@pytest.mark.parametrize(
+    ("picked", "harness", "cross_harness", "expected_action", "rationale_head"),
+    [
+        # The router keeping the parent model still answers the ask.
+        (PARENT_MODEL, None, False, "allow", "parent model fits"),
+        # A cross-harness pick the spawn asked for is still the ask, honored.
+        (GPT_MODEL, "codex", True, "redirect", "narrow change"),
+    ],
+    ids=["allow", "redirect"],
+)
+async def test_a_matching_ask_is_honored_on_every_action(
+    picked: str,
+    harness: str | None,
+    cross_harness: bool,
+    expected_action: str,
+    rationale_head: str,
+) -> None:
+    """Honoring is about agreement, not about the verdict's shape.
 
-
-async def test_a_matching_ask_on_a_redirect_is_honored_too() -> None:
-    """A cross-harness pick the spawn asked for is still the ask, honored."""
+    ``rewrite`` is covered by the strict-adherence matrix above; these are the
+    two other actions a matching ask can ride, and both must read the same.
+    """
     client = FakeRoutingClient(
-        RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
+        RoutingResult(model=picked, rationale=rationale_head, harness=harness)
     )
-    req = _request(requested_model=GPT_MODEL)
+    req = _request(requested_model=picked)
     decision = await resolve_subagent_route(
-        "conv_1", req, caps=FakeCaps(routing_client=client), cross_harness=True
+        "conv_1", req, caps=FakeCaps(routing_client=client), cross_harness=cross_harness
     )
-    assert decision.action == "redirect"
-    assert "honored — the router picked the same arm" in decision.rationale
+    assert decision.action == expected_action
+    assert decision.rationale == (
+        f"{rationale_head} Spawn requested {picked}; honored — the router picked the same arm."
+    )
     assert decision_record(req, decision).attempted_override is None
 
 
@@ -955,6 +964,13 @@ async def test_loopback_endpoint_allows_when_the_resolver_errors(tmp_path: Path)
 
 
 # ── Enablement gate + session router lifecycle (P7) ─────────────────
+#
+# Two gates, deliberately named apart. ``routing_enabled`` is the TURN gate: it
+# decides whether a session's own turns are routed, and a child reads its
+# parent's cost-control mode because the server routes children of a routed
+# parent. ``subagent_routing_enabled`` is the SPAWN gate: two-state, stamped at
+# create, and it reads one explicit switch. The turn-gate tests below used to be
+# named ``test_routing_enabled_*``, which read as the spawn gate.
 
 
 @pytest.mark.parametrize(
@@ -963,11 +979,12 @@ async def test_loopback_endpoint_allows_when_the_resolver_errors(tmp_path: Path)
         ("on", None, True),
         ("off", None, False),
         (None, None, False),
-        # An unset session inherits the parent's mode.
+        # An unset session reads its parent's mode — the turn gate, not the
+        # spawn gate, which is two-state and never re-derives from a parent.
         (None, "on", True),
     ],
 )
-def test_routing_enabled_reads_the_session_toggle(
+def test_turn_routing_enabled_reads_the_session_toggle(
     mode: str | None, parent_mode: str | None, expected: bool
 ) -> None:
     assert routing_enabled(mode, parent_cost_control_mode=parent_mode) is expected
@@ -981,7 +998,7 @@ def test_routing_enabled_reads_the_session_toggle(
         (object(), True),
     ],
 )
-def test_routing_enabled_requires_a_client_when_caps_are_given(
+def test_turn_routing_enabled_requires_a_client_when_caps_are_given(
     routing_client: object | None, expected: bool
 ) -> None:
     assert routing_enabled("on", caps=FakeCaps(routing_client=routing_client)) is expected
