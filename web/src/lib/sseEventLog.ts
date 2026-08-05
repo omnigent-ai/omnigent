@@ -37,13 +37,23 @@ function getOrCreate(sessionId: string): SessionLog {
 }
 
 // Cache the debug flag so pushSseEvent is a single boolean check per call.
+// Reads both ?debug=1 (URL) and localStorage "debug"="1".
 // Updated on popstate so SPA navigation that adds/removes ?debug=1 is picked up.
-let debugMode =
-  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debug") === "1";
+function readDebugMode(): boolean {
+  if (typeof window === "undefined") return false;
+  if (new URLSearchParams(window.location.search).get("debug") === "1") return true;
+  try {
+    return localStorage.getItem("debug") === "1";
+  } catch {
+    return false;
+  }
+}
+
+let debugMode = readDebugMode();
 
 if (typeof window !== "undefined") {
   window.addEventListener("popstate", () => {
-    debugMode = new URLSearchParams(window.location.search).get("debug") === "1";
+    debugMode = readDebugMode();
   });
 }
 
