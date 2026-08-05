@@ -7,6 +7,7 @@ import pytest
 from omnigent import claude_native, codex_native_app_server, gateway_inference
 from omnigent.claude_native import ClaudeNativeUcodeConfig
 from omnigent.codex_native_app_server import NativeCodexLaunch, native_codex_launch_base_url
+from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.gateway_inference import (
     CLAUDE_GATEWAY_HARNESSES,
     CODEX_GATEWAY_HARNESSES,
@@ -261,3 +262,47 @@ def test_not_gateway_backed_names_only_the_explicit_false_arms() -> None:
     # Unknown keeps every option: an older host must not silently lose routing.
     assert not_gateway_backed(None, arms) == []
     assert not_gateway_backed({"claude-native": True}, arms) == []
+
+
+@pytest.mark.parametrize(
+    "gateway_url",
+    [
+        # Canonical dedicated-subdomain gateway, and the staging variant.
+        "https://wkspc.ai-gateway.cloud.databricks.com/codex/v1",
+        "https://wkspc.ai-gateway.staging.cloud.databricks.com/codex/v1",
+        # Azure / GCP parent domains.
+        "https://wkspc.ai-gateway.azuredatabricks.net/codex/v1",
+        "https://wkspc.ai-gateway.gcp.databricks.com/codex/v1",
+        # Workspace-hosted shape: no ai-gateway label, but the path prefix.
+        "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+    ],
+)
+def test_gateway_url_accepts_databricks_owned_hosts(gateway_url: str) -> None:
+    assert is_databricks_ai_gateway_url(gateway_url) is True
+
+
+@pytest.mark.parametrize(
+    "gateway_url",
+    [
+        # The trusted domain appears mid-host; .evil.test really owns it.
+        "https://x.ai-gateway.cloud.databricks.com.evil.test/codex/v1",
+        # Label-boundary look-alikes: a string-suffix test on the bare parent
+        # domain (no leading dot) would accept both of these.
+        "https://evilcloud.databricks.com/ai-gateway/codex/v1",
+        "https://ai-gateway.notazuredatabricks.net/codex/v1",
+        # The parent domain itself is not a workspace subdomain.
+        "https://cloud.databricks.com/ai-gateway/codex/v1",
+        # Trusted host, but neither gateway shape (no label, no path prefix).
+        "https://wkspc.cloud.databricks.com/codex/v1",
+        # ai-gateway only as part of a label.
+        "https://my-ai-gateway-proxy.cloud.databricks.com/codex/v1",
+        # Right host, plaintext http — the bearer must never go over http.
+        "http://wkspc.ai-gateway.cloud.databricks.com/codex/v1",
+        # Both markers in the path of a foreign host.
+        "https://evil.test/databricks/ai-gateway/codex/v1",
+        "not-a-url",
+        "",
+    ],
+)
+def test_gateway_url_rejects_lookalike_hosts(gateway_url: str) -> None:
+    assert is_databricks_ai_gateway_url(gateway_url) is False
