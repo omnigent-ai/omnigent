@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
@@ -266,3 +268,77 @@ def test_dry_run_previews_safe_legacy_priority_regrade() -> None:
     assert run.legacy_priorities_adopted == 1
     assert set(run.mutations[0].labels_add) == {"P1-high", "comp:db", "severity:S1"}
     assert run.mutations[0].labels_remove == ("P2-medium",)
+
+
+def test_pipeline_publishes_scores_only_after_artifacts_complete() -> None:
+    issue = _bronze(1)
+    classification = Classification(
+        issue_number=1,
+        issue_type=IssueType.BUG,
+        severity=Severity.S1,
+        area_keys=("db",),
+        component_labels=("comp:db",),
+        reasoning="No workaround",
+        content_hash=issue.content().content_hash,
+    )
+    area = Area("db", "comp:db", Decimal("1.2"))
+    catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
+    events = []
+
+    class OrderedSink(CaptureSink):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def write(self, run):
+            events.append(self.name)
+            super().write(run)
+
+    pipeline = IssuePrioritizationPipeline(
+        source=FakeSource([issue]),
+        classifier=FakeClassifier(classification),
+        classifications=FakeClassifications({1: classification}),
+        scores=OrderedSink("scores"),
+        artifacts=OrderedSink("artifacts"),
+        engine=ScoreEngine(ScoringConfig.default(), catalog),
+        maintainers=set(),
+    )
+
+    pipeline.run("run-publish-order")
+
+    assert events == ["artifacts", "scores"]
+
+
+def test_pipeline_does_not_publish_scores_when_artifacts_fail() -> None:
+    issue = _bronze(1)
+    classification = Classification(
+        issue_number=1,
+        issue_type=IssueType.BUG,
+        severity=Severity.S1,
+        area_keys=("db",),
+        component_labels=("comp:db",),
+        reasoning="No workaround",
+        content_hash=issue.content().content_hash,
+    )
+    area = Area("db", "comp:db", Decimal("1.2"))
+    catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
+    scores = CaptureSink()
+
+    class FailingArtifacts:
+        def write(self, run):
+            raise RuntimeError("volume unavailable")
+
+    pipeline = IssuePrioritizationPipeline(
+        source=FakeSource([issue]),
+        classifier=FakeClassifier(classification),
+        classifications=FakeClassifications({1: classification}),
+        scores=scores,
+        artifacts=FailingArtifacts(),
+        engine=ScoreEngine(ScoringConfig.default(), catalog),
+        maintainers=set(),
+    )
+
+    with pytest.raises(RuntimeError, match="volume unavailable"):
+        pipeline.run("run-artifact-failure")
+
+    assert scores.runs == []

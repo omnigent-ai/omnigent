@@ -52,6 +52,7 @@ def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
     assert metadata["mode"] == "dry_run"
     assert metadata["adopt_legacy_bot_priorities"] is False
     assert metadata["legacy_priorities_adopted"] == 0
+    assert not (tmp_path / "preview" / ".run.json.tmp").exists()
 
 
 def test_latest_scores_view_selects_one_complete_run() -> None:

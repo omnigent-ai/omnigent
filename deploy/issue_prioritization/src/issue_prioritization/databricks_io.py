@@ -171,7 +171,6 @@ class VolumeArtifactSink:
             "scored_at": run.scored_at.isoformat(),
             "classifications_updated": run.classifications_updated,
         }
-        (destination / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
         mutations = [
             {
                 "issue_number": plan.target.issue_number,
@@ -192,6 +191,9 @@ class VolumeArtifactSink:
             for plan in run.mutations
         ]
         (destination / "mutations.json").write_text(json.dumps(mutations, indent=2) + "\n")
+        pending_metadata = destination / ".run.json.tmp"
+        pending_metadata.write_text(json.dumps(metadata, indent=2) + "\n")
+        pending_metadata.replace(destination / "run.json")
 
 
 class SparkBotStateRepository:

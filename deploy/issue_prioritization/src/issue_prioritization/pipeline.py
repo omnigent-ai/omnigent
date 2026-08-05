@@ -146,8 +146,8 @@ class IssuePrioritizationPipeline:
             adopt_legacy_bot_priorities=adopt_legacy_bot_priorities,
             legacy_priorities_adopted=len(set(bot_states) - set(persisted_bot_states)),
         )
-        self.scores.write(run)
         self.artifacts.write(run)
+        self.scores.write(run)
         if mode == PipelineMode.APPLY:
             if self.mutation_sink is None:
                 raise RuntimeError("apply mode requires a mutation sink")
