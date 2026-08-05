@@ -81,15 +81,18 @@ SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-subagent"
 
 #: Seconds the runner's loopback relay waits for a verdict. Hop 3 of the
 #: timeout budget in the module docstring.
-RELAY_TIMEOUT_S = 7.0
+RELAY_TIMEOUT_S = 14.0
 
 #: Seconds the runner waits on the server relay route. Hop 4, inside which
-#: the routing call itself runs on ``ROUTING_REQUEST_TIMEOUT_S`` (5s).
-SERVER_HOP_TIMEOUT_S = 6.0
+#: the whole server-side route runs — candidate preparation and then the
+#: routing call (``ROUTING_REQUEST_TIMEOUT_S``), not the call alone.
+SERVER_HOP_TIMEOUT_S = 13.0
 
 #: Hop 2 of the budget, restated for the docstring cross-reference. The hook
-#: script owns the value; it cannot import this module (stdlib-only).
-HOOK_REQUEST_TIMEOUT_S = 8.0
+#: script owns the value; it cannot import this module (stdlib-only). Sized
+#: like the first-message hook: it must outlast a healthy route, preparation
+#: included, or a verdict that arrived is thrown away.
+HOOK_REQUEST_TIMEOUT_S = 15.0
 
 #: Conversation label carrying the routing decision behind a session's
 #: ``model_override``, so the child-sessions API can join the two without

@@ -52,13 +52,18 @@ ROUTES_SELECT_PATH = "routes:select"
 #:
 #: Sized from the observed round trip: healthy ``routes:select`` answers land
 #: in ~1.4–3s, and the slowest sample on record (~6.7s) was a gateway 500, not
-#: a verdict. Five seconds therefore covers the healthy case with headroom
-#: while capping the hazard paths — a first-message hook and a subagent spawn
-#: gate — at a blink instead of the 30–45s a wedged server used to cost.
+#: a verdict. Nine seconds covers the healthy case with wide headroom while
+#: still capping the hazard paths — a first-message hook and a subagent spawn
+#: gate — well under the 30–45s a wedged server used to cost.
+#:
+#: This budget covers the CALL only. The hops above it must also absorb the
+#: candidate/catalog preparation that runs before it (~3s measured on a first
+#: message), which is why each of them sits several seconds higher rather than
+#: one second above this value.
 #:
 #: One attempt, no retry: on an interactive path a second try only doubles the
 #: stall, and falling open onto the harness's own model is the better answer.
-ROUTING_REQUEST_TIMEOUT_S = 5.0
+ROUTING_REQUEST_TIMEOUT_S = 9.0
 
 # ── Model lists per harness family ──────────────────────────────────────────
 #

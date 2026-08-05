@@ -136,14 +136,19 @@ ROUTE_PATH_TEMPLATE = "/v1/sessions/{session_id}/route-turn"
 SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-turn"
 
 #: Hop 1: the timeout registered on the harness's hook entry. Covers the
-#: hook script's whole life (hop 2a + hop 2b) with one second to spare, so
-#: the harness only steps in when the script itself wedged.
-HARNESS_HOOK_TIMEOUT_S = 15
+#: hook script's whole life (hop 2a + hop 2b) plus its cold start, so the
+#: harness only steps in when the script itself wedged. Stays below Claude
+#: Code's own 30s ``UserPromptSubmit`` default — the harness must not be the
+#: layer that gives up first.
+HARNESS_HOOK_TIMEOUT_S = 22
 
-#: Hop 2a: the hook script's HTTP budget for the routing verdict. The
-#: user-visible cost of a wedged router — the prompt sits in the pane until
-#: this expires — so it stays in single digits.
-HOOK_REQUEST_TIMEOUT_S = 8.0
+#: Hop 2a: the hook script's HTTP budget for the routing verdict. This is
+#: the user-visible cost of a wedged router — the prompt sits in the pane
+#: until it expires — but it must also outlast a HEALTHY route, which is
+#: the whole server-side path: candidate/catalog preparation (~3s measured)
+#: before the ``routes:select`` call, then the call itself. A tighter budget
+#: loses the race with a router that answered, wasting the attempt.
+HOOK_REQUEST_TIMEOUT_S = 15.0
 
 #: Hop 2b: the codex hook's ``thread/settings/update`` budget, after the
 #: verdict. Claude's hook applies nothing, so it has no hop 2b. A local
@@ -151,11 +156,12 @@ HOOK_REQUEST_TIMEOUT_S = 8.0
 SETTINGS_UPDATE_TIMEOUT_S = 5.0
 
 #: Hop 3: seconds the runner's loopback relay waits for a verdict.
-RELAY_TIMEOUT_S = 7.0
+RELAY_TIMEOUT_S = 14.0
 
-#: Hop 4: seconds the runner waits on the server relay route. The routing
-#: call itself (``ROUTING_REQUEST_TIMEOUT_S``, 5s) runs inside this.
-SERVER_HOP_TIMEOUT_S = 6.0
+#: Hop 4: seconds the runner waits on the server relay route. The whole
+#: server-side route runs inside this — catalog preparation and then the
+#: routing call (``ROUTING_REQUEST_TIMEOUT_S``), not the call alone.
+SERVER_HOP_TIMEOUT_S = 13.0
 
 #: Seconds the replay waits for the hook to confirm it blocked the prompt
 #: (:data:`MARKER_FILE`). Timing out means the hook fell open, so the

@@ -1137,16 +1137,18 @@ def test_the_router_clients_own_timeout_sits_inside_the_hook_budget() -> None:
     assert 0 < default < HOOK_REQUEST_TIMEOUT_S
 
 
-def test_every_routing_budget_stays_in_single_digits() -> None:
+def test_every_routing_budget_stays_inside_the_owners_ceiling() -> None:
     """
-    The owner's ruling: a fail-open that takes 30s is blocking in practice.
+    Both halves of the owner's ruling, which pull against each other.
 
-    The relation tests above only pin the ORDERING, which a 45s ladder
-    satisfies just as well as a 15s one. This pins the magnitude: the two
-    hazard paths — a first-message hook holding a typed prompt and a spawn gate
-    holding an agent's tool call — must give up within seconds, so every
-    request budget on them is a single digit and the harness-registered kill is
-    well inside a quarter of a minute.
+    A fail-open that takes 30s is blocking in practice, so the hazard paths — a
+    first-message hook holding a typed prompt and a spawn gate holding an
+    agent's tool call — must give up well inside half a minute. But a budget
+    tight enough to lose the race with a HEALTHY route is worse than a slow
+    one: the verdict arrives and is thrown away, wasting the attempt and
+    duplicating the prompt. A healthy first message costs catalog preparation
+    (~3s measured) plus the routing call (~1.6s), so every hook budget must
+    clear that comfortably while staying at or under the 15s ceiling.
     """
     from omnigent.inner.hook_scripts.subagent_router import (
         HOOK_TIMEOUT_S as SPAWN_HOOK_TIMEOUT_S,
@@ -1157,9 +1159,11 @@ def test_every_routing_budget_stays_in_single_digits() -> None:
     from omnigent.runner import subagent_routing, turn_routing
     from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S
 
-    # The routing call itself, the innermost wait on every path.
-    assert ROUTING_REQUEST_TIMEOUT_S <= 8.0
-    # Each hook's own HTTP budget — what the user actually waits out.
+    # The routing call itself, the innermost wait on every path. It must leave
+    # room under the hops above it for the preparation that precedes it.
+    assert ROUTING_REQUEST_TIMEOUT_S <= 10.0
+    # Each hook's own HTTP budget — what the user actually waits out. The floor
+    # is what a healthy route costs end to end; the ceiling is the owner's 15s.
     for budget in (
         turn_routing.HOOK_REQUEST_TIMEOUT_S,
         turn_routing.RELAY_TIMEOUT_S,
@@ -1170,11 +1174,24 @@ def test_every_routing_budget_stays_in_single_digits() -> None:
         subagent_routing.SERVER_HOP_TIMEOUT_S,
         SPAWN_REQUEST_TIMEOUT_S,
     ):
-        assert 0 < budget < 10.0, budget
+        assert 0 < budget <= 15.0, budget
+    # The two hook budgets carry a typed prompt and a spawn tool call, so they
+    # are the ones that must outlast preparation-plus-call, not just the call.
+    _HEALTHY_ROUTE_S = 3.2 + 1.6
+    for budget in (
+        turn_routing.HOOK_REQUEST_TIMEOUT_S,
+        subagent_routing.HOOK_REQUEST_TIMEOUT_S,
+        SPAWN_REQUEST_TIMEOUT_S,
+    ):
+        assert budget > _HEALTHY_ROUTE_S * 2, budget
     # The outermost hop is the harness's own kill, which only needs enough
     # headroom for the hook script to reach its fail-open branch.
-    assert turn_routing.HARNESS_HOOK_TIMEOUT_S <= 15
-    assert SPAWN_HOOK_TIMEOUT_S <= 15
+    # Claude Code's own UserPromptSubmit default is 30s; the harness must not
+    # be the layer that gives up first, so both kills stay under it.
+    assert turn_routing.HARNESS_HOOK_TIMEOUT_S < 30
+    assert SPAWN_HOOK_TIMEOUT_S < 30
+    assert turn_routing.HARNESS_HOOK_TIMEOUT_S > turn_routing.HOOK_REQUEST_TIMEOUT_S
+    assert SPAWN_HOOK_TIMEOUT_S > SPAWN_REQUEST_TIMEOUT_S
 
 
 def test_the_subagent_ladder_is_strictly_decreasing_inwards() -> None:
@@ -1232,7 +1249,7 @@ def test_the_builtin_judge_shares_the_external_routers_budget() -> None:
     # covers the fallback chain and any pre-request token refresh.
     assert "timeout=ROUTING_REQUEST_TIMEOUT_S" in source
     assert "asyncio.wait_for" in source
-    assert ROUTING_REQUEST_TIMEOUT_S <= 8.0
+    assert ROUTING_REQUEST_TIMEOUT_S <= 10.0
 
 
 # ── Route-once under load, and the manual-pin gap ───────────────────
