@@ -3459,7 +3459,7 @@ function AssistantBubble({
           </p>
         )}
         {markdownText && (
-          <MessageActions className="mt-1 opacity-40 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
