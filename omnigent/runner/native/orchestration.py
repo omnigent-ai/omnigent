@@ -3929,11 +3929,13 @@ async def _auto_create_codex_terminal(
     # the same "a denied spawn is an approved re-route" framing. Routed through
     # ``developer_instructions`` (whose sidecar base keeps a resume reversible),
     # never by editing config.toml here.
-    routed_spawn_note: str | None = None
+    # Passed only for auto-harness sessions so a pinned or plain codex launch
+    # keeps main's kwargs exactly.
+    routed_spawn_extras: dict[str, str] = {}
     if launch_config.auto_harness:
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
-        routed_spawn_note = smart_routing_spawn_note("codex-native")
+        routed_spawn_extras["developer_instructions"] = smart_routing_spawn_note("codex-native")
     app_server = build_codex_native_server(
         socket_path=socket_path,
         codex_home=codex_home,
@@ -3949,7 +3951,7 @@ async def _auto_create_codex_terminal(
         # This TUI runs detached for the web UI, so trust the runner-selected
         # workspace in the session-private config instead of blocking forever.
         trust_project=True,
-        developer_instructions=routed_spawn_note,
+        **routed_spawn_extras,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and

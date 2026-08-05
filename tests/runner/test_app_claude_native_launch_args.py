@@ -328,6 +328,25 @@ def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
     assert config.api_key_helper
 
 
+@pytest.fixture
+def bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """
+    Yield a bridge dir the claude-native bridge accepts.
+
+    ``augment_claude_args`` validates the bridge dir against the real
+    ``$TMPDIR/omnigent-<uid>/claude-native`` root, so a raw ``tmp_path`` is
+    rejected. Point the bridge root and its trusted parent at the test's temp
+    dir the way ``tests/test_claude_native_bridge.py`` does.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp directory.
+    :returns: Bridge dir under the patched bridge root.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+    return tmp_path
+
+
 def _augmented(bridge_dir: Path, *, auto_harness: bool) -> list[str]:
     """Run the runner's own claude-native argv composition for one session shape."""
     from omnigent.claude_native_bridge import augment_claude_args
@@ -343,7 +362,7 @@ def _augmented(bridge_dir: Path, *, auto_harness: bool) -> list[str]:
 
 
 def test_auto_harness_launch_names_the_routed_spawn_tool_and_preapproves_it(
-    tmp_path: Path,
+    bridge_dir: Path,
 ) -> None:
     """An auto-harness Claude launch carries the note AND the tool allowlist.
 
@@ -352,7 +371,7 @@ def test_auto_harness_launch_names_the_routed_spawn_tool_and_preapproves_it(
     schema is deferred behind tool search), and Claude Code's don't-ask mode
     denied the Omnigent MCP call outright (no ``--allowedTools``).
     """
-    args = _augmented(tmp_path, auto_harness=True)
+    args = _augmented(bridge_dir, auto_harness=True)
 
     note = args[args.index("--append-system-prompt") + 1]
     assert "mcp__omnigent__sys_session_create" in note
@@ -367,7 +386,7 @@ def test_auto_harness_launch_names_the_routed_spawn_tool_and_preapproves_it(
     assert set(_ROUTED_SPAWN_ALLOWED_TOOLS) <= set(allowed)
 
 
-def test_pinned_harness_launch_argv_is_unchanged(tmp_path: Path) -> None:
+def test_pinned_harness_launch_argv_is_unchanged(bridge_dir: Path) -> None:
     """A pinned session's argv must stay byte-identical to the pre-change one.
 
     The routed-spawn note and the tool allowlist are additions for auto-harness
@@ -378,11 +397,11 @@ def test_pinned_harness_launch_argv_is_unchanged(tmp_path: Path) -> None:
 
     baseline = augment_claude_args(
         ("--model", "databricks-claude-sonnet-5"),
-        bridge_dir=tmp_path,
+        bridge_dir=bridge_dir,
         python_executable="/venv/bin/python",
     )
 
-    assert _augmented(tmp_path, auto_harness=False) == baseline
+    assert _augmented(bridge_dir, auto_harness=False) == baseline
     assert "--append-system-prompt" not in baseline
     assert "--allowedTools" not in baseline
 
