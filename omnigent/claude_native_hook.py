@@ -10,9 +10,11 @@ import secrets
 import sys
 import time
 from collections.abc import Callable
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
+from pathlib import Path
 
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -28,7 +30,6 @@ from omnigent.claude_native_bridge import (
     url_component,
     write_active_session_id,
 )
-from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
@@ -128,17 +129,33 @@ def _env_float(name: str, default: float) -> float:
 # down server can no longer re-POST for a day. Overridable for operators who
 # want more slack against a flaky upstream.
 _PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
+
+
 # httpx errors that mean the request never reached a live server (no response
 # was ever begun). These are unambiguous hard failures — the server is down /
 # unreachable, not holding a poll. Everything else under ``httpx.HTTPError``
 # that is not a 4xx/5xx status (RemoteProtocolError, ReadError, ReadTimeout, …)
 # means the connection was established and then severed mid-poll.
-_NEVER_CONNECTED_ERRORS = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.PoolTimeout,
-    httpx.ProxyError,
-)
+def _never_connected_errors() -> tuple[type[Exception], ...]:
+    """
+    Return the httpx errors meaning the request never reached a live server.
+
+    Built on demand so importing this module does not pull httpx: the hook runs
+    as a fresh subprocess per event, and only the rotation and permission paths
+    make HTTP calls of their own.
+
+    :returns: Exception classes denoting a connection that was never established.
+    """
+    import httpx
+
+    return (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.PoolTimeout,
+        httpx.ProxyError,
+    )
+
+
 # An established connection that drops in under this many seconds is treated as
 # a flapping/crash-looping server (a hard failure), NOT a genuinely-parked poll
 # a proxy severed. Comfortably below any real idle-proxy timeout (typically
@@ -350,6 +367,8 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     :returns: New Omnigent session id, e.g. ``"conv_new"``, or ``None`` when
         rotation could not be completed from the hook.
     """
+    import httpx
+
     old_session_id = read_active_session_id(bridge_dir)
     if not old_session_id:
         return None
@@ -396,6 +415,8 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     :returns: New Omnigent session id, e.g. ``"conv_fork"``, or ``None``
         when rotation could not be completed from the hook.
     """
+    import httpx
+
     old_session_id = read_active_session_id(bridge_dir)
     if not old_session_id:
         return None
@@ -448,6 +469,9 @@ def _create_clear_replacement_session(
         new-session binding, or terminal transfer.
     :raises RuntimeError: If Omnigent returns malformed session data.
     """
+
+    from omnigent.entities.session_resources import terminal_resource_id
+
     old_resp = client.get(f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}")
     old_resp.raise_for_status()
     old = old_resp.json()
@@ -541,7 +565,10 @@ def _create_fork_replacement_session(
         new-session binding, or terminal transfer.
     :raises RuntimeError: If Omnigent returns malformed session data.
     """
+
     old_resp = client.get(f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}")
+    from omnigent.entities.session_resources import terminal_resource_id
+
     old_resp.raise_for_status()
     old = old_resp.json()
     if not isinstance(old, dict):
@@ -646,7 +673,7 @@ def _post_hook_with_reattach(
     Failure classification:
 
     * **Hard failure → count toward the cap.** A 5xx, or a connection that
-      never established (:data:`_NEVER_CONNECTED_ERRORS`), or an established
+      never established (:func:`_never_connected_errors`), or an established
       connection that dropped in under :data:`_PERMISSION_HELD_POLL_FLOOR_S`
       (a flapping/crash-looping server). This is the spin.
     * **Held-poll sever → reset the counter.** An established connection that
@@ -694,6 +721,8 @@ def _post_hook_with_reattach(
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
+    import httpx
+
     body = {
         **payload,
         "_omnigent_elicitation_id": f"elicit_claude_{secrets.token_hex(16)}",
@@ -749,7 +778,7 @@ def _post_hook_with_reattach(
             # Classify by HOW it failed, not by elapsed time (a proxy severs a
             # legitimately-held poll in seconds-to-minutes, so wall-clock can't
             # tell it from a down server — #1782 Polly review).
-            never_connected = isinstance(exc, _NEVER_CONNECTED_ERRORS)
+            never_connected = isinstance(exc, _never_connected_errors())
             held_s = time.monotonic() - attempt_started
             # Hard failure iff the server was never reached, OR an established
             # connection dropped so fast it's a flap rather than a parked poll.

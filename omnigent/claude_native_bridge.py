@@ -59,14 +59,13 @@ from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.inner.os_env import OSEnvironment
     from omnigent.llms.context_window import ModelPricing
+    from omnigent.tools.base import Tool
 
 from omnigent.inner.bundle_skills import claude_native_skill_args
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
-from omnigent.tools.base import Tool, ToolContext
-from omnigent.tools.builtins.os_env import build_os_env_tools
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
@@ -3975,6 +3974,8 @@ def _call_mcp_tool(
         active tool relay.
     :returns: MCP tool-call result.
     """
+    from omnigent.tools.base import ToolContext
+
     if not isinstance(params, dict):
         return _mcp_error("tool call params must be an object")
     name = params.get("name")
@@ -4138,6 +4139,9 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     :returns: ``(tools, close_tools)`` where ``close_tools``
         releases any helper processes.
     """
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.tools.builtins.os_env import build_os_env_tools
+
     workspace_raw = config.get("workspace")
     workspace = Path(workspace_raw) if isinstance(workspace_raw, str) and workspace_raw else None
     os_env: OSEnvironment | None = None

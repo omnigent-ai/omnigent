@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
+import threading
 from pathlib import Path
 
 import httpx
@@ -546,3 +548,76 @@ def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_i
         "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
     )
     assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}
+
+
+class _MalformedProxy:
+    """A proxy that answers with a broken status line."""
+
+    def __init__(self) -> None:
+        """:returns: None."""
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(4)
+        self.port = self._sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                conn.sendall(b"not-a-status-line\r\n\r\n")
+
+    def close(self) -> None:
+        """:returns: None."""
+        self._sock.close()
+
+
+def test_pre_tool_use_fails_closed_when_proxy_reply_is_malformed(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A proxy speaking garbage must still produce a deny at the entrypoint.
+
+    Transport-neutral contract test: it drives the hook end to end over a real
+    socket with no transport stub, so whichever HTTP client the hook uses must
+    turn a protocol-level failure into a deny rather than letting the exception
+    escape. An escape means the hook exits with no output at all -- a silent
+    fail OPEN on the only TOOL_CALL enforcement point native harnesses have.
+    """
+    proxy = _MalformedProxy()
+    write_policy_hook_config(
+        bridge_dir, ap_server_url="https://policy.example", ap_auth_headers={}
+    )
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{proxy.port}")
+    try:
+        exit_code = _run_hook(
+            bridge_dir,
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf /"},
+            },
+            monkeypatch,
+        )
+    finally:
+        proxy.close()
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
+    assert result["hookSpecificOutput"]["permissionDecisionReason"]
