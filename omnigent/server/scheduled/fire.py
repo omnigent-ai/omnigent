@@ -50,7 +50,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
@@ -800,11 +800,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             _wait_for_runner_client,
         )
 
-        if (
-            deps.host_registry is None
-            or deps.host_store is None
-            or deps.host_permission_store is None
-        ):
+        if deps.host_registry is None or deps.host_store is None:
             raise RuntimeError("connected host registry/store is not configured")
 
         owner = task.user_id or RESERVED_USER_LOCAL
@@ -823,7 +819,8 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             host_registry=deps.host_registry,
             conversation_store=deps.conversation_store,
             permission_store=deps.permission_store,
-            host_permission_store=deps.host_permission_store,
+            # App wiring requires this store whenever host support is enabled.
+            host_permission_store=cast(Any, deps.host_permission_store),
         )
 
         attempt = await _launch_runner_on_host(
