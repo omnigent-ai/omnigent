@@ -1113,7 +1113,7 @@ def create_app(
         the app builds its own.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli_auth import open_server_client
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -1160,22 +1160,20 @@ def create_app(
     if auth_token_factory is None:
         auth_token_factory = _make_auth_token_factory()
     binding_token = _runner_tunnel_binding_token_from_env()
-    server_client = httpx.AsyncClient(
-        base_url=server_url,
+    server_client = open_server_client(
+        server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
         # Announce the runner as a first-party non-browser client via the
         # sentinel Origin. The server's require_trusted_origin CSRF guard on
         # the multipart routes (POST /v1/sessions bundle create, file upload
         # — both reached from tool_dispatch over this client) requires a
         # trusted Origin; the runner sends none otherwise, so the sentinel is
-        # what lets sys_session_create / sys_upload_file through.
-        #
-        # The workspace-routing header (empty unless a ?o= selector was
-        # recorded for this server) routes these callbacks to the workspace.
+        # what lets sys_session_create / sys_upload_file through. The factory
+        # folds the routing/slice-key headers in on top; we pass only the
+        # runner's tunnel-binding token (when present) alongside the Origin.
         headers={
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
             **({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token is not None else {}),
-            **databricks_request_headers(server_url),
         },
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
@@ -1186,6 +1184,7 @@ def create_app(
         # httpx walks the redirect chain inside the auth loop and
         # hands the auth flow only the terminal HTML login page,
         # defeating the retry. See ``_is_login_redirect_or_unauthorized``.
+        follow_redirects=False,
     )
 
     mcp_manager = RunnerMcpManager(
