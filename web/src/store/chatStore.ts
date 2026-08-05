@@ -4789,13 +4789,23 @@ export function handleSessionEvent(event: StreamEvent): void {
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
+          // The head's wire position describes the head's message. In a
+          // SHARED session this branch also catches another viewer's
+          // consumed event — it names a server pending id we don't hold,
+          // which is indistinguishable from our own POST not having
+          // returned its id yet — and slotting their message into our
+          // reserved position would lift it above blocks that preceded
+          // it. When the event names an author who isn't us, append (the
+          // behaviour before wire positions existed) instead.
+          const author = event.createdBy;
+          const isForeign = author !== undefined && author !== getCurrentAuthorId();
           return commitUserBlockInPlace(
             s.blocks,
             s.pendingUserMessages.slice(1),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
             committedUserBlock(event.itemId, content, head.tempId, event.createdBy ?? head.author),
-            head.anchorIndex,
+            isForeign ? undefined : head.anchorIndex,
           );
         }
 

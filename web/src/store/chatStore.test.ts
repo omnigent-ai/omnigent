@@ -4636,6 +4636,79 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("appends another viewer's message instead of using our reserved position", () => {
+      // Shared session: a collaborator's consumed event names a server
+      // pending id we don't hold, which is indistinguishable from our own
+      // POST not having returned its id yet — so it lands in the FIFO-head
+      // branch. Committing THEIR message at OUR wire position would lift
+      // it above blocks that preceded it, so a foreign author appends.
+      vi.mocked(getCurrentAuthorId).mockReturnValue("alice@example.com");
+      const prior = textBlock("resp_prev", "msg_prev", "earlier reply");
+      const during = textBlock("resp_new", "msg_reply", "streaming");
+      useChatStore.setState({
+        blocks: [prior, during],
+        pendingUserMessages: [
+          {
+            tempId: "pend_1",
+            content: [{ type: "input_text", text: "mine" }],
+            anchorIndex: 1,
+            author: "alice@example.com",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_bob",
+        itemType: "message",
+        clearedPendingId: "pending_srv_9",
+        createdBy: "bob@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from bob" }] },
+      });
+
+      // Appended, NOT spliced at index 1 above `msg_reply`.
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_prev",
+        "msg_reply",
+        "msg_bob",
+      ]);
+    });
+
+    it("still uses our wire position when the event carries our own author", () => {
+      // Same branch, our own message: `createdBy` matching the viewer (or
+      // absent entirely) means the FIFO head really is this message, so
+      // the reserved position applies.
+      vi.mocked(getCurrentAuthorId).mockReturnValue("alice@example.com");
+      const prior = textBlock("resp_prev", "msg_prev", "earlier reply");
+      const during = textBlock("resp_new", "msg_reply", "streaming");
+      useChatStore.setState({
+        blocks: [prior, during],
+        pendingUserMessages: [
+          {
+            tempId: "pend_1",
+            content: [{ type: "input_text", text: "mine" }],
+            anchorIndex: 1,
+            author: "alice@example.com",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_mine",
+        itemType: "message",
+        clearedPendingId: "pending_srv_9",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "mine" }] },
+      });
+
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_prev",
+        "msg_mine",
+        "msg_reply",
+      ]);
+    });
+
     it("clears the optimistic bubble when the block already committed", () => {
       // Issue #3983: a snapshot merge or the native transcript relay can
       // commit the block before the consumed event lands. Only one
