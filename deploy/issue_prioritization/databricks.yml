@@ -42,7 +42,7 @@ variables:
   github_repo:
     default: omnigent-ai/omnigent
   github_secret_scope:
-    description: Secret scope containing the GitHub token used only in apply mode.
+    description: Secret scope for legacy ownership reads and apply-mode writes.
     default: ""
   github_token_secret_key:
     default: github-token

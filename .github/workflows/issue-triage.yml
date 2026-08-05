@@ -19,8 +19,8 @@ name: Issue Triage
 #
 # What the bot does:
 #   1. Removes `needs-triage`, adds `triaged`
-#   2. Classifies component — one `comp:*` label
-#   3. Assigns priority — P0-critical / P1-high / P2-medium / P3-low
+#   2. Classifies component — one `comp:*` label until Databricks owns scoring
+#   3. Assigns priority until Databricks owns scoring
 #   4. Routes to contributors — `good-first-issue` or `help-wanted`
 #   5. Flags incomplete issues — `needs-info` (replaces priority label)
 #   6. Detects duplicates — `duplicate` label + ONE comment
@@ -395,6 +395,7 @@ jobs:
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_PRIORITIZATION_V2_ENABLED: ${{ vars.ISSUE_PRIORITIZATION_V2_ENABLED }}
         run: |
           set -euo pipefail
 
@@ -438,6 +439,9 @@ jobs:
           # (gh issue edit --remove-label errors on missing labels).
           issue_data = json.loads(pathlib.Path("/tmp/issue.json").read_text())
           existing_labels = {l["name"] for l in issue_data.get("labels", [])}
+          v2_owns_scoring = (
+              os.environ.get("ISSUE_PRIORITIZATION_V2_ENABLED", "").lower() == "true"
+          )
 
           labels_add = []
           labels_remove = []
@@ -463,14 +467,14 @@ jobs:
 
               # Components (array)
               components = result.get("components", [])
-              if isinstance(components, list):
+              if not v2_owns_scoring and isinstance(components, list):
                   for c in components:
                       if c in ALLOWED_COMPONENTS:
                           labels_add.append(c)
 
               # Priority
               p = result.get("priority")
-              if p and p in ALLOWED_PRIORITIES:
+              if not v2_owns_scoring and p and p in ALLOWED_PRIORITIES:
                   labels_add.append(p)
 
               # Contributor routing
@@ -521,7 +525,11 @@ jobs:
               "components": valid_components,
               "ranked_owners": ranked_owners,
               "duplicate_of": dup if isinstance(dup, int) else None,
-              "priority": result.get("priority") if result.get("priority") in ALLOWED_PRIORITIES else None,
+              "priority": (
+                  result.get("priority")
+                  if not v2_owns_scoring and result.get("priority") in ALLOWED_PRIORITIES
+                  else None
+              ),
               "needs_info": bool(result.get("needs_info")),
               "reasoning": result.get("reasoning", ""),
           }
@@ -559,6 +567,8 @@ jobs:
           # Print summary for the workflow log.
           print(f"Labels to add: {labels_add}")
           print(f"Labels to remove: {labels_remove}")
+          if v2_owns_scoring:
+              print("Databricks v2 owns priority and component labels")
           if output["duplicate_of"]:
               print(f"Duplicate of: #{output['duplicate_of']}")
           print(f"Reasoning: {output['reasoning']}")

@@ -83,6 +83,10 @@ Keep the write variable false until a dry-run's `ranking.*` and
 `mutations.json` artifacts have been reviewed. Apply mode also creates any
 missing labels declared in `.github/issue-prioritization-labels.json`.
 
+At rollout, set the repository variable `ISSUE_PRIORITIZATION_V2_ENABLED=true`
+at the same time as enabling this job. That stops the legacy issue-triage action
+from writing priority or component labels, so Databricks is the only owner.
+
 ## Tests
 
 ```bash
