@@ -126,6 +126,15 @@ describe("useAutoGrowTextarea", () => {
     expect(ta.style.height).toBe("40px");
   });
 
+  it("reports no growth while the element has no layout", () => {
+    // Mid route swap scrollHeight reads 0 and the height is left alone. The
+    // growth has to be published anyway: a caller offsetting its layout by the
+    // last value would otherwise hold that offset until the next measure.
+    const growth: number[] = [];
+    render(<Harness value="two rows" onGrowth={(px) => growth.push(px)} />);
+    expect(growth).toEqual([0]);
+  });
+
   it("reports how far past one row the box has grown", () => {
     // The in-session composer subtracts this from its own top margin, keeping
     // the extra rows out of the flex column so the transcript's scroll

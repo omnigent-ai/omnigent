@@ -28,7 +28,12 @@ function measureTextarea(
   if (pinned) wrapper.style.height = `${wrapperHeight}px`;
   try {
     ta.style.height = "auto";
-    if (ta.scrollHeight === 0) return;
+    if (ta.scrollHeight === 0) {
+      // Not laid out, so there's no growth to report either — say so rather
+      // than leave a stale offset applied across a route swap.
+      onGrowth?.(0);
+      return;
+    }
     const cs = getComputedStyle(ta);
     const lineHeight = parseFloat(cs.lineHeight);
     const paddingTop = parseFloat(cs.paddingTop);
@@ -36,8 +41,8 @@ function measureTextarea(
     const maxHeight = lineHeight * maxRows + paddingTop + paddingBottom;
     const height = Math.min(ta.scrollHeight, maxHeight);
     ta.style.height = height + "px";
-    // Resting height is a single row, or the CSS floor where the composer sets
-    // one (the landing composer's `min-h`).
+    // Resting height is a single row — or a CSS floor, for a composer that
+    // sets one, so its empty height doesn't read as growth.
     const resting = Math.max(
       lineHeight + paddingTop + paddingBottom,
       parseFloat(cs.minHeight) || 0,
