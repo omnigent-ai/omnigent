@@ -92,7 +92,11 @@ async function run(
             err.status = 404;
             throw err;
           }
-          return { data: kind === "pr" ? { pull_request: {} } : {} };
+          // "issue" (open), "closed", "draft", or "pr".
+          if (kind === "pr") return { data: { pull_request: {}, state: "open" } };
+          if (kind === "closed") return { data: { state: "closed" } };
+          if (kind === "draft") return { data: { state: "open", draft: true } };
+          return { data: { state: "open" } };
         },
       },
     },
@@ -232,6 +236,14 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
   assert.deepStrictEqual(refs("this fixes the thing generally"), [], "prose does not count");
   assert.deepStrictEqual(refs(""), [], "empty body");
   assert.deepStrictEqual(refs(undefined), [], "missing body");
+  // Quoted and fenced text is shown, not asserted.
+  assert.deepStrictEqual(refs("> Part of #123"), [], "blockquote excluded");
+  assert.deepStrictEqual(refs("  > - `Part of #123` example"), [], "indented blockquote excluded");
+  assert.deepStrictEqual(refs("```\nPart of #123\n```"), [], "fenced block excluded");
+  assert.deepStrictEqual(refs("~~~\nRefs #123\n~~~"), [], "tilde fence excluded");
+  assert.deepStrictEqual(refs("> quoted #9\n\nPart of #7"), [7], "keeps the asserted one");
+  // An unterminated fence swallows the rest, which is the safe direction.
+  assert.deepStrictEqual(refs("```\nPart of #5"), [], "unterminated fence excluded");
 }
 
 // ---- end-to-end behaviour ----
@@ -278,14 +290,45 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
     assert.strictEqual(commented.length, 0, `${kw} must satisfy the rule`);
   }
 
-  // ...but only when it resolves to an issue. "Refs #4147" pointing at another PR
-  // is not a tracking record, and three real backlog PRs do exactly this.
-  {
+  // ...but only when it resolves to an OPEN, non-draft issue.
+  for (const [kind, why] of [
+    ["pr", "a reference to a PR does not count"],
+    ["closed", "a closed issue is not tracked work"],
+    ["draft", "a draft issue is not agreed work yet"],
+  ]) {
     const { commented } = await run([pr({ number: 51, body: "Refs #88" })], {
       env: ENFORCE,
-      issues: { 88: "pr" },
+      issues: { 88: kind },
     });
-    assert.strictEqual(commented.length, 1, "a reference to a PR does not count");
+    assert.strictEqual(commented.length, 1, why);
+  }
+
+  // Quoted or fenced text is shown, not asserted. A PR that documents the bot's
+  // own comment must not satisfy its own rule -- this fired on a real PR.
+  {
+    const quoted = "See the wording:\n\n> - `Part of #77` if this is one step towards it.\n";
+    const { commented } = await run([pr({ number: 54, body: quoted })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 1, "a blockquoted example does not count");
+  }
+  {
+    const fenced = "Example:\n\n```\nPart of #77\n```\n";
+    const { commented } = await run([pr({ number: 55, body: fenced })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 1, "a fenced example does not count");
+  }
+  // A real reference alongside a quoted one still counts.
+  {
+    const both = "> quoting `Part of #99` here\n\nPart of #77\n";
+    const { commented } = await run([pr({ number: 56, body: both })], {
+      env: ENFORCE,
+      issues: { 77: "issue", 99: "issue" },
+    });
+    assert.strictEqual(commented.length, 0, "an asserted reference still counts");
   }
 
   // A bare mention is a cross-reference, not a claim about this PR.

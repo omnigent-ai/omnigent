@@ -92,11 +92,8 @@ async function referencesIssue({ github, core, owner, repo, pr }) {
     return false;
   }
   for (const candidate of issueLink.trackingReferences(pr.body)) {
-    try {
-      const { data } = await github.rest.issues.get({ owner, repo, issue_number: candidate });
-      if (!data.pull_request) return true;
-    } catch {
-      // A number that does not resolve proves nothing; try the next.
+    if (await issueLink.resolvesToOpenIssue({ github, core, owner, repo, number: candidate })) {
+      return true;
     }
   }
   return false;

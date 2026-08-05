@@ -79,7 +79,11 @@ async function run(
             err.status = 404;
             throw err;
           }
-          return { data: kind === "pr" ? { pull_request: {} } : {} };
+          // "issue" (open), "closed", "draft", or "pr".
+          if (kind === "pr") return { data: { pull_request: {}, state: "open" } };
+          if (kind === "closed") return { data: { state: "closed" } };
+          if (kind === "draft") return { data: { state: "open", draft: true } };
+          return { data: { state: "open" } };
         },
       },
     },
@@ -119,14 +123,28 @@ const verdictOf = (rows, n) => (rows.find((r) => r[0] === `#${n}`) || [])[1];
     assert.strictEqual(labeled.length, 1, "Part of #N clears the bar");
   }
 
-  // A reference to another PR is not a tracking record.
-  {
+  // A reference must resolve to an OPEN, non-draft issue. Shares the resolver
+  // with the nudge, so the two cannot disagree about what counts.
+  for (const [kind, why] of [
+    ["pr", "a PR is not a tracking record"],
+    ["closed", "a closed issue is not tracked work"],
+    ["draft", "a draft issue is not agreed work yet"],
+  ]) {
     const { labeled, rows } = await run([pr({ number: 12, body: "Refs #88" })], {
-      issues: { 88: "pr" },
+      issues: { 88: kind },
       env: ENFORCE,
     });
-    assert.strictEqual(labeled.length, 0);
+    assert.strictEqual(labeled.length, 0, why);
     assert.strictEqual(verdictOf(rows, 12), "below bar");
+  }
+
+  // A quoted example must not clear the bar either.
+  {
+    const { labeled } = await run(
+      [pr({ number: 121, body: "> - `Part of #77` if this is one step towards it." })],
+      { issues: { 77: "issue" }, env: ENFORCE }
+    );
+    assert.strictEqual(labeled.length, 0, "a blockquoted example does not clear the bar");
   }
 
   // No reference at all: below the bar.

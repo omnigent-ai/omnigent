@@ -62,14 +62,46 @@ const DECLARED_TRACKED_TYPE = /- \[[xX]\]\s*(?:Bug fix|Feature|UI \/ frontend ch
 const TRACKING_REFERENCE =
   /\b(?:part of|related to|towards?|refs?|references?|see(?:\s+also)?)\b[:\s]*(?:https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/(\d+)|(?:[\w.-]+\/[\w.-]+)?#(\d+))/gi;
 
+// Strips text that is being shown rather than asserted: fenced code blocks and
+// blockquoted lines. Without this, a PR that quotes documentation containing
+// "Part of #123" satisfies its own rule, which happened on the first live run.
+function assertedText(body) {
+  return (body ?? "")
+    .replace(/```[\s\S]*?(?:```|$)/g, "")
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, "")
+    .split("\n")
+    .filter((line) => !/^\s*>/.test(line))
+    .join("\n");
+}
+
 // Issue numbers a body claims to be working towards, deduped and in order.
 function trackingReferences(body) {
   const seen = [];
-  for (const m of (body ?? "").matchAll(TRACKING_REFERENCE)) {
+  for (const m of assertedText(body).matchAll(TRACKING_REFERENCE)) {
     const n = Number(m[1] ?? m[2]);
     if (n && !seen.includes(n)) seen.push(n);
   }
   return seen;
+}
+
+// Resolve one reference: is it an OPEN, non-draft issue in this repo?
+//
+// Shared so the nudge and the ready-for-review gate cannot drift on what counts.
+//   - a pull request is not a tracking record
+//   - a closed issue is not tracked work
+//   - a draft issue is not agreed work yet
+// Returns false when the number cannot be resolved: unverifiable is not evidence.
+async function resolvesToOpenIssue({ github, core, owner, repo, number }) {
+  try {
+    const { data } = await github.rest.issues.get({ owner, repo, issue_number: number });
+    if (data.pull_request) return false;
+    if (data.state !== "open") return false;
+    if (data.draft) return false;
+    return true;
+  } catch (err) {
+    core?.warning?.(`Could not resolve #${number}: ${err.message}`);
+    return false;
+  }
 }
 
 const QUERY = `
@@ -237,23 +269,13 @@ module.exports = async ({ context, github, core }) => {
       }
 
       // No closing link, but the body may still name the issue it works towards.
-      // Each candidate is resolved, because "Refs #4147" often points at another
-      // PR, and a PR is not the tracking record this rule is asking for.
+      // Each candidate is resolved: "Refs #4147" often points at another PR, and a
+      // closed or draft issue is not tracked work.
       let tracked = null;
       for (const candidate of trackingReferences(pr.body)) {
-        try {
-          const { data } = await github.rest.issues.get({
-            owner,
-            repo,
-            issue_number: candidate,
-          });
-          if (!data.pull_request) {
-            tracked = candidate;
-            break;
-          }
-        } catch (err) {
-          // A number that doesn't resolve proves nothing either way; try the next.
-          core.warning(`Could not resolve #${candidate} from #${pr.number}: ${err.message}`);
+        if (await resolvesToOpenIssue({ github, core, owner, repo, number: candidate })) {
+          tracked = candidate;
+          break;
         }
       }
       if (tracked) {
@@ -333,5 +355,7 @@ module.exports = async ({ context, github, core }) => {
 // Exported for the offline unit test.
 module.exports.exemptReason = exemptReason;
 module.exports.trackingReferences = trackingReferences;
+module.exports.assertedText = assertedText;
+module.exports.resolvesToOpenIssue = resolvesToOpenIssue;
 module.exports.MARKER = MARKER;
 module.exports.EFFECTIVE_FROM = EFFECTIVE_FROM;
