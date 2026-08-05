@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -141,6 +142,25 @@ class GitHubAPI:
 
     def list_commits(self, pull_number: int) -> list[dict[str, Any]]:
         return self.paginated(f"/repos/{self.repo}/pulls/{pull_number}/commits?per_page=100")
+
+    def has_write_access(self, login: str) -> bool:
+        """True when the user can push to the repo, i.e. is a maintainer here.
+
+        Checked via the collaborator permission API rather than the event's
+        `author_association`, which reads CONTRIBUTOR for a maintainer whose org
+        membership is private.
+        """
+        try:
+            data, _ = self.request(
+                "GET", f"/repos/{self.repo}/collaborators/{urllib.parse.quote(login)}/permission"
+            )
+        except urllib.error.HTTPError as error:
+            # 403/404 = not a collaborator, or we cannot see. Fail closed: no
+            # label, so a stranger's comment never moves the PR's state.
+            if error.code in (403, 404):
+                return False
+            raise
+        return (data or {}).get("permission") in {"admin", "write", "maintain"}
 
     def add_label(self, issue_number: int, label: str) -> None:
         self.request(
@@ -290,6 +310,84 @@ def clear_review_label_on_waiting(payload: dict[str, Any], api: GitHubAPI) -> bo
     return removed
 
 
+# A comment whose first non-space token is a slash command (`/review`, `/reopen`,
+# `/merge`, ...). These drive automation rather than ask the author for anything,
+# so they must not flip a PR back to waiting-on-author.
+SLASH_COMMAND = re.compile(r"^[ \t]*/[a-z][\w-]*", re.I)
+
+
+def is_slash_command(body: str | None) -> bool:
+    return bool(SLASH_COMMAND.match(body or ""))
+
+
+def apply_waiting_on_maintainer_activity(
+    event_name: str, payload: dict[str, Any], api: GitHubAPI
+) -> bool:
+    """Put a PR back in the author's court when a maintainer engages with it.
+
+    Any non-approving review, review-thread comment, or PR comment from someone
+    with write access means the author has something to act on -- not just a
+    formal "request changes". Deliberately excluded: approvals (nothing is owed),
+    slash commands (they drive automation), bots, and the author themselves.
+    """
+    if event_name == "issue_comment":
+        if "pull_request" not in payload.get("issue", {}):
+            return False
+        pull_number = payload["issue"]["number"]
+        comment = payload.get("comment") or {}
+        actor = (comment.get("user") or {}).get("login")
+        if is_slash_command(comment.get("body")):
+            print(f"#{pull_number}: slash command, not a request to the author.")
+            return False
+        reason = "a maintainer commented"
+    elif event_name == "pull_request_review_comment":
+        if not payload.get("pull_request"):
+            return False
+        pull_number = payload["pull_request"]["number"]
+        comment = payload.get("comment") or {}
+        actor = (comment.get("user") or {}).get("login")
+        if is_slash_command(comment.get("body")):
+            return False
+        reason = "a maintainer left a review comment"
+    elif event_name == "pull_request_review":
+        if not payload.get("pull_request"):
+            return False
+        pull_number = payload["pull_request"]["number"]
+        review = payload.get("review") or {}
+        actor = (review.get("user") or {}).get("login")
+        # An approval asks nothing of the author; it means the PR is ready.
+        if (review.get("state") or "").lower() == "approved":
+            print(f"#{pull_number}: approving review, leaving the label alone.")
+            return False
+        if is_slash_command(review.get("body")):
+            return False
+        reason = "a maintainer reviewed"
+    else:
+        return False
+
+    if not actor or actor.endswith("[bot]"):
+        return False
+
+    pull = api.get_pull(pull_number)
+    if pull.get("state") != "open":
+        return False
+    author = (pull.get("user") or {}).get("login", "")
+    if actor.lower() == author.lower():
+        return False
+    if LABEL in label_names(pull):
+        return False
+    if not api.has_write_access(actor):
+        print(f"#{pull_number}: @{actor} has no write access; not a maintainer signal.")
+        return False
+
+    api.add_label(pull_number, LABEL)
+    print(f"Added {LABEL} to #{pull_number}: {reason} (@{actor})")
+    if REVIEW_LABEL in label_names(pull):
+        if api.remove_label(pull_number, REVIEW_LABEL):
+            print(f"Removed {REVIEW_LABEL} from #{pull_number}: now {LABEL}")
+    return True
+
+
 def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitHubAPI) -> bool:
     pull_number: int | None = None
     actor: str | None = None
@@ -390,7 +488,11 @@ def run(
         close_stale_waiting_prs(api, now=now)
         return
 
-    clear_on_author_activity(event_name, payload, api)
+    # Author activity wins: the same event cannot be both, and clearing the label
+    # is the cheaper check (it exits immediately unless the label is set).
+    if clear_on_author_activity(event_name, payload, api):
+        return
+    apply_waiting_on_maintainer_activity(event_name, payload, api)
 
 
 def load_event_payload() -> dict[str, Any]:

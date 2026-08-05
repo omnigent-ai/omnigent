@@ -64,7 +64,9 @@ class FakeAPI:
         review_comments: dict[int, list[dict[str, Any]]] | None = None,
         reviews: dict[int, list[dict[str, Any]]] | None = None,
         commits: dict[int, list[dict[str, Any]]] | None = None,
+        writers: list[str] | None = None,
     ):
+        self.writers = writers if writers is not None else ["maintainer1"]
         self.pull = pull or pr()
         self.issues = issues or []
         self.timeline_by_issue = timeline_by_issue or {}
@@ -102,6 +104,9 @@ class FakeAPI:
 
     def list_commits(self, pull_number: int) -> list[dict[str, Any]]:
         return self.commits.get(pull_number, [])
+
+    def has_write_access(self, login: str) -> bool:
+        return login.lower() in {m.lower() for m in self.writers}
 
     def add_label(self, issue_number: int, label: str) -> None:
         self.added.append((issue_number, label))
@@ -367,6 +372,152 @@ class WaitingForReviewTest(unittest.TestCase):
         self.assertEqual(api.closed, [], "an author reply cancels the close")
         self.assertEqual(api.added, [(30, waiting_on_author.REVIEW_LABEL)])
         self.assertEqual(api.review_requests, [(30, ["maintainer1"])])
+
+
+class AutoWaitingOnAuthorTest(unittest.TestCase):
+    """A maintainer engaging with a PR puts it back in the author's court."""
+
+    def dispatch(self, event: str, payload: dict[str, Any], **kw: Any) -> FakeAPI:
+        api = FakeAPI(**kw)
+        waiting_on_author.run(event, payload, api, waiting_on_author.CANONICAL_REPO)
+        return api
+
+    def comment(self, body: str, actor: str = "maintainer1") -> dict[str, Any]:
+        return {
+            "issue": {"number": 12, "pull_request": {}},
+            "comment": {"user": {"login": actor}, "body": body},
+        }
+
+    def test_maintainer_comment_applies_the_label(self) -> None:
+        api = self.dispatch(
+            "issue_comment", self.comment("could you rebase this?"), pull=pr(labels=[])
+        )
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_slash_command_does_not_apply_the_label(self) -> None:
+        # /review, /reopen, /merge drive automation; they ask the author nothing.
+        for body in ("/review", "  /review", "/reopen", "/merge\nplease"):
+            api = self.dispatch("issue_comment", self.comment(body), pull=pr(labels=[]))
+            self.assertEqual(api.added, [], f"{body!r} must not label")
+
+    def test_slash_command_mid_comment_still_counts_as_prose(self) -> None:
+        api = self.dispatch(
+            "issue_comment", self.comment("nice work, I'll run /review now"), pull=pr(labels=[])
+        )
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_non_maintainer_comment_is_ignored(self) -> None:
+        api = self.dispatch(
+            "issue_comment", self.comment("bump?", actor="stranger"), pull=pr(labels=[])
+        )
+        self.assertEqual(api.added, [])
+
+    def test_bot_comment_is_ignored(self) -> None:
+        api = self.dispatch(
+            "issue_comment",
+            self.comment("CI failed", actor="github-actions[bot]"),
+            pull=pr(labels=[]),
+            writers=["github-actions[bot]"],
+        )
+        self.assertEqual(api.added, [])
+
+    def test_author_comment_does_not_self_label(self) -> None:
+        # The author is also a maintainer on their own PR: still not a request.
+        api = self.dispatch(
+            "issue_comment",
+            self.comment("ready for another look", actor="alice"),
+            pull=pr(author="alice", labels=[]),
+            writers=["alice"],
+        )
+        self.assertEqual(api.added, [])
+
+    def test_approving_review_leaves_the_label_alone(self) -> None:
+        api = self.dispatch(
+            "pull_request_review",
+            {
+                "pull_request": {"number": 12},
+                "review": {"user": {"login": "maintainer1"}, "state": "approved", "body": "lgtm"},
+            },
+            pull=pr(labels=[]),
+        )
+        self.assertEqual(api.added, [])
+
+    def test_commenting_review_applies_the_label(self) -> None:
+        api = self.dispatch(
+            "pull_request_review",
+            {
+                "pull_request": {"number": 12},
+                "review": {
+                    "user": {"login": "maintainer1"},
+                    "state": "commented",
+                    "body": "a few thoughts",
+                },
+            },
+            pull=pr(labels=[]),
+        )
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_changes_requested_applies_the_label(self) -> None:
+        api = self.dispatch(
+            "pull_request_review",
+            {
+                "pull_request": {"number": 12},
+                "review": {
+                    "user": {"login": "maintainer1"},
+                    "state": "changes_requested",
+                    "body": "please fix",
+                },
+            },
+            pull=pr(labels=[]),
+        )
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_review_thread_comment_applies_the_label(self) -> None:
+        api = self.dispatch(
+            "pull_request_review_comment",
+            {
+                "pull_request": {"number": 12},
+                "comment": {"user": {"login": "maintainer1"}, "body": "this line?"},
+            },
+            pull=pr(labels=[]),
+        )
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_applying_clears_waiting_for_review(self) -> None:
+        api = self.dispatch(
+            "issue_comment",
+            self.comment("one more thing"),
+            pull=pr(labels=[waiting_on_author.REVIEW_LABEL]),
+        )
+        self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+        self.assertEqual(api.removed, [(12, waiting_on_author.REVIEW_LABEL)])
+
+    def test_already_waiting_is_a_no_op(self) -> None:
+        api = self.dispatch(
+            "issue_comment",
+            self.comment("still waiting"),
+            pull=pr(labels=[waiting_on_author.LABEL]),
+        )
+        self.assertEqual(api.added, [], "no duplicate label")
+
+    def test_closed_pr_is_left_alone(self) -> None:
+        api = self.dispatch(
+            "issue_comment", self.comment("for the record"), pull=pr(labels=[], state="closed")
+        )
+        self.assertEqual(api.added, [])
+
+    def test_author_reply_still_clears_and_hands_off(self) -> None:
+        # The two directions must not fight: author activity wins.
+        api = self.dispatch(
+            "issue_comment",
+            {
+                "issue": {"number": 12, "pull_request": {}},
+                "comment": {"user": {"login": "alice"}, "body": "fixed"},
+            },
+            pull=pr(author="alice", labels=[waiting_on_author.LABEL], assignees=["maintainer1"]),
+        )
+        self.assertEqual(api.removed, [(12, waiting_on_author.LABEL)])
+        self.assertEqual(api.added, [(12, waiting_on_author.REVIEW_LABEL)])
 
 
 if __name__ == "__main__":
