@@ -29,7 +29,11 @@ jobs:
     permissions:
       # Job-level permissions REPLACE the workflow-level block, so restate read.
       contents: read
-      issues: write # post the notice
+      # Commenting on a PR needs BOTH: the endpoint is /issues/{n}/comments, but
+      # GitHub gates it on `pull-requests` when the target is a pull request.
+      # `issues: write` alone returns "Resource not accessible by integration".
+      issues: write
+      pull-requests: write
     steps:
       # Trusted default branch, .github only (the script). Never PR head.
       - name: Check out .github
