@@ -7,6 +7,7 @@ import {
   WRAPPER_LABEL_KEY,
   isFullySupportedNativeCodingAgent,
   isNativeTerminalSession,
+  isRecentHarness,
   nativeCodingAgentForHarness,
   nativeWrapperLabelsForAgent,
 } from "./nativeCodingAgents";
@@ -161,5 +162,28 @@ describe("isFullySupportedNativeCodingAgent", () => {
   it("is false for non-native agents and null", () => {
     expect(isFullySupportedNativeCodingAgent({ name: "polly", harness: "claude-sdk" })).toBe(false);
     expect(isFullySupportedNativeCodingAgent(null)).toBe(false);
+  });
+});
+
+describe("isRecentHarness", () => {
+  const pi = { name: "pi-native-ui", harness: "pi-native" };
+
+  it("matches a stored canonical harness id", () => {
+    expect(isRecentHarness(pi, ["pi-native"])).toBe(true);
+  });
+
+  it("folds a stored reversed alias to the canonical spec", () => {
+    expect(isRecentHarness(pi, ["native-pi"])).toBe(true);
+  });
+
+  it("is false for a harness that isn't in the list", () => {
+    expect(isRecentHarness(pi, ["cursor-native"])).toBe(false);
+    expect(isRecentHarness(pi, [])).toBe(false);
+  });
+
+  it("is false for non-native agents, null, and unknown stored ids", () => {
+    expect(isRecentHarness({ name: "polly", harness: "claude-sdk" }, ["claude-sdk"])).toBe(false);
+    expect(isRecentHarness(null, ["pi-native"])).toBe(false);
+    expect(isRecentHarness(pi, ["not-a-harness"])).toBe(false);
   });
 });

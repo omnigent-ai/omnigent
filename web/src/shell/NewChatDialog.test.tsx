@@ -1085,6 +1085,90 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-copilot")).toBeNull();
   });
 
+  // Harnesses the user has actually launched are promoted out of "More" into
+  // the primary list, so a regular Pi / Cursor user gets theirs one click away.
+  function mockClaudeAndPi() {
+    mockAgents([
+      {
+        id: "a_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+    ]);
+  }
+
+  it("promotes a previously-launched harness into the primary list", () => {
+    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["pi-native"]));
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    // Pi isn't fully supported, but the user has launched it → inline, and with
+    // nothing left to group the "More" trigger disappears entirely.
+    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
+  });
+
+  it("leaves an unused harness under 'More'", () => {
+    // Control for the test above: same fixture, empty recents → Pi stays behind
+    // "More", proving the promotion comes from the stored list.
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+  });
+
+  it("matches a stored reversed harness alias against its canonical spec", () => {
+    // Older entries (and the server's reversed spelling) store "native-pi";
+    // it must still promote the canonical pi-native row.
+    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["native-pi"]));
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+  });
+
+  it("ignores a malformed recent-harnesses entry", () => {
+    // A corrupted value must not crash the picker — it falls back to the
+    // support-level split.
+    localStorage.setItem("omnigent:recent-harnesses", "{not json");
+    mockClaudeAndPi();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a_claude")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
+  });
+
+  it("keeps the hide-unconfigured preference ahead of a recent harness", () => {
+    // Recency promotes within what can launch here; it must not resurrect a
+    // harness the host can't run, which is the whole point of the preference.
+    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["pi-native"]));
+    writeHideUnconfiguredHarnesses(true);
+    mockClaudeAndPi();
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "pi-native": false },
+      } as Host,
+    ]);
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a_claude")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
+  });
+
   it("seeds the working directory from the host's most-recent path", async () => {
     renderLanding();
     // host_1's recent ("/Users/corey/repo") seeds the field; the chip shows

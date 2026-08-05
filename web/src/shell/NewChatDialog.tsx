@@ -118,6 +118,7 @@ import { cn } from "@/lib/utils";
 import {
   isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
+  isRecentHarness,
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
@@ -137,6 +138,7 @@ import {
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -961,22 +963,26 @@ export function AgentHarnessPicker({
   // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
   // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Split harnesses by support level: only the fully supported ones lead the
-  // primary list, and every other harness folds into "More" whether or not it
-  // is configured here. The selected harness always stays inline.
+  const { recentHarnesses } = useRecentHarnesses();
+  // Split harnesses by support level: the fully supported ones lead the primary
+  // list, and every other harness folds into "More" whether or not it is
+  // configured here. Also promoted out of "More": the selected harness (never
+  // bury the active pick) and any the user has launched before, so a regular
+  // Pi / Cursor user gets theirs one click away instead of one hover.
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     const more: AvailableAgent[] = [];
     for (const a of harnessEntries) {
       const selected = a.id === effectiveAgentId;
       // The preference hides harnesses that can't launch here — it outranks
-      // support level, but never buries the active pick.
+      // both support level and recency, but never buries the active pick.
       if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(a.harness, host)) continue;
-      if (selected || isFullySupportedNativeCodingAgent(a)) ready.push(a);
-      else more.push(a);
+      if (selected || isFullySupportedNativeCodingAgent(a) || isRecentHarness(a, recentHarnesses)) {
+        ready.push(a);
+      } else more.push(a);
     }
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId]);
+  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, recentHarnesses]);
 
   // Split the agents group: built-in bundle agents (Polly / Debby) stay inline
   // in the main list; user-registered custom agents fold into a "Custom agents"
@@ -2016,6 +2022,7 @@ export function NewChatLandingScreen() {
   }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
+  const { addRecentHarness } = useRecentHarnesses();
 
   const allHosts = hosts ?? [];
   const onlineHosts = allHosts.filter((h) => h.status === "online");
@@ -3061,6 +3068,10 @@ export function NewChatLandingScreen() {
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
+      // Remember the launched harness so the picker promotes it out of "More"
+      // next time. Recorded only on a successful create, so a harness the user
+      // merely browsed past never earns a primary slot.
+      if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
       // Fire-and-forget: don't block navigation on the sidebar list refresh.
       // The background refetch (or the WS session_added push) backfills the
       // new session's row within ~1s of landing in the chat; the chat itself

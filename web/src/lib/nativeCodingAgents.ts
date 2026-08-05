@@ -234,6 +234,20 @@ export function isFullySupportedNativeCodingAgent(
   return nativeCodingAgentForAvailableAgent(agent)?.fullySupported === true;
 }
 
+/**
+ * Whether ``agent``'s harness is one of ``recentHarnesses``. Compares resolved
+ * specs rather than raw strings so a stored reversed alias (``native-pi``) still
+ * matches the canonical spelling (``pi-native``).
+ */
+export function isRecentHarness(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+  recentHarnesses: readonly string[],
+): boolean {
+  const spec = nativeCodingAgentForAvailableAgent(agent);
+  if (spec === undefined) return false;
+  return recentHarnesses.some((h) => nativeCodingAgentForHarness(h)?.key === spec.key);
+}
+
 export function isNativeWrapper(wrapper: string | null | undefined): boolean {
   return nativeCodingAgentForWrapper(wrapper) !== undefined;
 }
