@@ -339,6 +339,7 @@ class WaitingForReviewTest(unittest.TestCase):
                 super().__init__("token", "omnigent-ai/omnigent")
 
             def request(self, method: str, path: str, body: dict[str, Any] | None = None):
+                assert method == "POST"
                 reviewers = (body or {}).get("reviewers", [])
                 posted.append(reviewers)
                 if reviewers == ["gone"]:
