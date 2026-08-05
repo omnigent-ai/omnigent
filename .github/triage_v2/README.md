@@ -8,7 +8,7 @@ pure and reusable; Databricks and GitHub adapters are layered on top.
 Prepare normalized issue JSON, then run:
 
 ```bash
-uv run --project deploy/issue_prioritization issue-priority \
+uv run --project .github/triage_v2 issue-priority \
   --input issues.json \
   --areas .github/areas.json \
   --output-dir /tmp/issue-priority-preview
@@ -70,7 +70,7 @@ Prepare an idempotent local dashboard draft after a complete scoring run:
 ```bash
 databricks api get /api/2.0/lakeview/dashboards/<dashboard-id> \
   --profile <profile> > /tmp/issue-dashboard.json
-uv run --project deploy/issue_prioritization issue-priority-dashboard-draft \
+uv run --project .github/triage_v2 issue-priority-dashboard-draft \
   --input /tmp/issue-dashboard.json \
   --output /tmp/issue-dashboard-draft.json
 ```
@@ -106,5 +106,5 @@ from writing priority or component labels, so Databricks is the only owner.
 ## Tests
 
 ```bash
-uv run --project deploy/issue_prioritization pytest deploy/issue_prioritization/tests
+uv run --project .github/triage_v2 pytest .github/triage_v2/tests
 ```

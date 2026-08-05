@@ -3469,7 +3469,7 @@ requires-dist = [
 [[package]]
 name = "omnigent-issue-prioritization"
 version = "0.1.0"
-source = { editable = "deploy/issue_prioritization" }
+source = { editable = ".github/triage_v2" }
 
 [package.dev-dependencies]
 dev = [

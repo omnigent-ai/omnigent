@@ -32,9 +32,9 @@ resources:
               bot-state-table: ${var.catalog}.${var.schema}.${var.bot_state_table}
               artifact-dir: /Volumes/${var.catalog}/${var.schema}/${var.artifact_volume_name}
               model-endpoint: ${var.model_endpoint}
-              areas-path: ${workspace.file_path}/.github/areas.json
-              maintainers-path: ${workspace.file_path}/.github/MAINTAINER
-              label-manifest-path: ${workspace.file_path}/.github/issue-prioritization-labels.json
+              areas-path: ${workspace.file_path}/areas.json
+              maintainers-path: ${workspace.file_path}/MAINTAINER
+              label-manifest-path: ${workspace.file_path}/issue-prioritization-labels.json
               github-repo: ${var.github_repo}
               github-secret-scope: ${var.github_secret_scope}
               github-token-secret-key: ${var.github_token_secret_key}
