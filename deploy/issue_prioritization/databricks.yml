@@ -7,11 +7,9 @@ include:
 sync:
   paths:
     - .
-    - ../../.github
-  include:
-    - .github/areas.json
-    - .github/MAINTAINER
-    - .github/issue-prioritization-labels.json
+    - ../../.github/areas.json
+    - ../../.github/MAINTAINER
+    - ../../.github/issue-prioritization-labels.json
 
 artifacts:
   default:
