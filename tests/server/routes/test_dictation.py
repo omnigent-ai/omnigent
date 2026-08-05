@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from typing import Any
 
 import httpx
 import pytest
@@ -56,7 +57,7 @@ class _PermissionStore:
         return self.admin
 
 
-def _fake_app(**router_kwargs: object) -> FastAPI:
+def _fake_app(**router_kwargs: Any) -> FastAPI:
     """Bare app carrying only the dictation router with a fake engine."""
     app = FastAPI()
     router_kwargs.setdefault("engine_provider", FakeDictationEngine)
