@@ -146,13 +146,13 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
 # test: a comprehension over ``_FRAMEWORK_APPROVED_TOOLS`` passes no matter what
 # is added to it, so it can never catch the approval surface growing.
 #
-# A plain (and a pinned Smart Routing) codex session pre-approves exactly the
-# one tool the framework calls unprompted on any session. An auto-harness
-# session, whose spawns the router may move onto the Claude family, additionally
-# pre-approves the four that carry out that redirect — nobody is watching for an
-# approval prompt in the middle of one.
+# A plain codex session pre-approves exactly the one tool the framework calls
+# unprompted on any session. Any Smart Routing session — pinned harness or auto
+# — additionally pre-approves the four its routed spawns run on: discover the
+# agent, start the routed child, deliver the task, collect the result. Nobody is
+# watching for an approval prompt in the middle of a spawn.
 _PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
-_AUTO_HARNESS_TOOL_APPROVALS = {
+_ROUTED_TOOL_APPROVALS = {
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_session_create": {"approval_mode": "approve"},
     "sys_agent_list": {"approval_mode": "approve"},
@@ -163,10 +163,10 @@ _AUTO_HARNESS_TOOL_APPROVALS = {
 
 def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
     assert set(framework_approved_tools(routed_spawns=False)) == set(_PLAIN_TOOL_APPROVALS)
-    assert set(framework_approved_tools(routed_spawns=True)) == set(_AUTO_HARNESS_TOOL_APPROVALS)
+    assert set(framework_approved_tools(routed_spawns=True)) == set(_ROUTED_TOOL_APPROVALS)
     # The base set is a subset of the routed one, so a routed session never
     # loses an approval a plain session has.
-    assert set(_FRAMEWORK_APPROVED_TOOLS) <= set(_AUTO_HARNESS_TOOL_APPROVALS)
+    assert set(_FRAMEWORK_APPROVED_TOOLS) <= set(_ROUTED_TOOL_APPROVALS)
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
@@ -672,15 +672,24 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
     }
 
 
-# ── The three codex-native session classes ──────────────────────────
+# ── The codex-native session classes ────────────────────────────────
 #
 # Everything below is a per-class snapshot of the private CODEX_HOME a
 # codex-native session boots on. A plain session must be indistinguishable from
 # a pre-Smart-Routing one: codex's bundled model catalog (no ``codex debug
 # models`` probe), no ``spawn_agent`` routing gate in hooks.json, and only the
-# one framework tool approval. A pinned Smart Routing session adds the extended
-# catalog. Only an auto-harness session adds the spawn gate and the redirect
-# toolkit's approvals.
+# one framework tool approval.
+#
+# Every Smart Routing session — pinned harness or auto — adds the extended
+# catalog, the spawn gate and the routed-spawn approvals, because on this arm
+# the spawn tools are neither gated nor pre-approved without them and the spawn
+# simply stalls on a prompt nobody is watching. The home is therefore the same
+# shape for pinned and auto; what separates them is the cross-family framing in
+# ``developer_instructions``, which the launch site adds for auto-harness only
+# (``test_routed_spawn_note_appends_then_restores_the_user_base``).
+#
+# The catalog-only shape is still reachable: on a codex too old for the spawn
+# gate the advertisement is dropped, and the session degrades to it.
 
 
 def _stub_model_catalog_probe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -768,25 +777,16 @@ async def test_a_plain_codex_native_session_looks_like_a_plain_codex_session(
     assert _SPAWN_MATCHER not in _hook_matchers(codex_home, "PreToolUse")
 
 
-async def test_a_pinned_smart_routing_codex_native_session_gains_only_the_catalog(
+async def test_a_smart_routing_codex_native_session_gains_the_spawn_apparatus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent.inner.codex_executor import CODEX_EXTENDED_CATALOG_ENV_VAR
+    """Pinned and auto-harness alike: the routed spawn has to be able to run.
 
-    codex_home, probes = await _start_codex_home(
-        tmp_path, monkeypatch, env={CODEX_EXTENDED_CATALOG_ENV_VAR: "1"}
-    )
-
-    assert probes == ["/bin/codex"]
-    assert (codex_home / "model_catalog.json").is_file()
-    assert "model_catalog_json" in (codex_home / "config.toml").read_text(encoding="utf-8")
-    assert _mcp_tool_approvals(codex_home) == _PLAIN_TOOL_APPROVALS
-    assert _SPAWN_MATCHER not in _hook_matchers(codex_home, "PreToolUse")
-
-
-async def test_an_auto_harness_codex_native_session_gains_everything(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+    The pinned class used to be withheld the advertisement, which took the
+    ``spawn_agent`` gate AND the four routed-spawn approvals with it — so a
+    pinned Smart Routing session's spawns did not merely go unrouted, they
+    stalled on an approval prompt nobody was watching.
+    """
     from omnigent.inner.codex_executor import (
         CODEX_EXTENDED_CATALOG_ENV_VAR,
         CODEX_ROUTER_DIR_ENV_VAR,
@@ -807,9 +807,45 @@ async def test_an_auto_harness_codex_native_session_gains_everything(
 
     assert probes == ["/bin/codex"]
     assert (codex_home / "model_catalog.json").is_file()
-    assert _mcp_tool_approvals(codex_home) == _AUTO_HARNESS_TOOL_APPROVALS
+    assert "model_catalog_json" in (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert _mcp_tool_approvals(codex_home) == _ROUTED_TOOL_APPROVALS
     # Omnigent's policy hook stays first, then the spawn gate, then user hooks.
     assert _hook_matchers(codex_home, "PreToolUse") == [None, _SPAWN_MATCHER, None]
+
+
+async def test_an_old_codex_degrades_a_routed_session_to_catalog_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Below the spawn gate's CLI floor the session launches, unrouted.
+
+    The advertisement is dropped, so everything keyed off it falls back to the
+    plain shape — no gate, no routed-spawn approvals — while the extended
+    catalog (keyed off its own env var) stays. The gear still offers the
+    subagent-routing row; the choice simply no-ops until codex is upgraded.
+    """
+    from omnigent.inner.codex_executor import (
+        CODEX_EXTENDED_CATALOG_ENV_VAR,
+        CODEX_ROUTER_DIR_ENV_VAR,
+        CODEX_ROUTER_SESSION_ID_ENV_VAR,
+    )
+
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    _set_codex_version(monkeypatch, (0, 144, 9))
+    codex_home, probes = await _start_codex_home(
+        tmp_path,
+        monkeypatch,
+        env={
+            CODEX_EXTENDED_CATALOG_ENV_VAR: "1",
+            CODEX_ROUTER_DIR_ENV_VAR: str(router_dir),
+            CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+        },
+    )
+
+    assert probes == ["/bin/codex"]
+    assert (codex_home / "model_catalog.json").is_file()
+    assert _mcp_tool_approvals(codex_home) == _PLAIN_TOOL_APPROVALS
+    assert _SPAWN_MATCHER not in _hook_matchers(codex_home, "PreToolUse")
 
 
 async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(

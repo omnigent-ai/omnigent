@@ -20,10 +20,11 @@ export function isCostRoutingSession(
 /**
  * Native harnesses whose sub-agent spawns go through the native-subagent
  * router, and whose spawn-routing apparatus is installed for any Smart
- * Routing session. Codex is absent on purpose — see
- * {@link isSubagentRoutingSession}.
+ * Routing session — both families, since a pinned codex launch installs the
+ * generated `hooks.json` spawn gate and the routed-spawn tool pre-approvals
+ * too. See {@link isSubagentRoutingSession}.
  */
-const CLAUDE_SUBAGENT_ROUTING_HARNESSES: ReadonlySet<string> = new Set(["claude-native"]);
+const SUBAGENT_ROUTING_HARNESSES: ReadonlySet<string> = new Set(["claude-native", "codex-native"]);
 
 /** Session label recording that Smart Routing owns this session's harness. */
 export const AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness";
@@ -47,16 +48,20 @@ function isAutoHarnessSession(
  * installed at launch and cannot be turned on afterwards:
  *
  * - an auto-harness session always has it;
- * - a Claude-family session has it whenever it launched on Smart Routing;
- * - a native session pinned to Codex never has it (the generated ``hooks.json``
- *   and the routed-spawn tool pre-approvals only come with an auto-harness
- *   launch), and neither does a plain session of any family. A codex-brained
- *   SDK/bundle agent is not this case — it took the non-native branch above,
- *   and the server stamps it to match.
+ * - a Claude- OR Codex-family session has it whenever it launched on Smart
+ *   Routing, pinned harness included: the launch starts the spawn-routing
+ *   endpoint either way, and on codex that advertisement is what turns on the
+ *   generated ``hooks.json`` gate and the routed-spawn tool pre-approvals;
+ * - a plain native session of either family never has it.
  *
- * Those last two would present "Smart Routing" as choosable while nothing
- * consumed the choice, so the row is hidden instead. Subagent routing is
- * launch-time-fixed for pinned Codex.
+ * That last case would present "Smart Routing" as choosable while nothing
+ * consumed the choice, so the row is hidden instead. What separates pinned
+ * from auto-harness is not whether spawns route but where they may land —
+ * pinned stays in its own family — which is not a knob, so it does not change
+ * the row's visibility.
+ *
+ * Mirrors the server's create-time stamp exactly (see the
+ * ``subagent_routing_override`` block in ``_create_session_from_existing_agent``).
  *
  * Callers must also check ``ServerInfo.smart_routing_enabled`` — this
  * predicate only checks the session shape.
@@ -74,7 +79,7 @@ export function isSubagentRoutingSession(
   if (!isNativeTerminalSession(session)) return true;
   if (isAutoHarnessSession(session)) return true;
   return (
-    CLAUDE_SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "") &&
+    SUBAGENT_ROUTING_HARNESSES.has(session?.harness ?? "") &&
     session?.costControlModeOverride === "on"
   );
 }

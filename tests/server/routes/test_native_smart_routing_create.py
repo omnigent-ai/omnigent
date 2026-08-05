@@ -700,9 +700,11 @@ _CODEX_BUNDLE = "__codex_bundle__"
             None,
             "on",
         ),
-        # A session pinned to codex has no spawn-routing machinery — that needs
-        # the auto-harness launch's generated hooks and pre-approvals — so the
-        # switch is left unset rather than reading "on" with nothing behind it.
+        # A session pinned to codex is stamped too: its launch installs the
+        # same generated ``hooks.json`` spawn gate and routed-spawn tool
+        # pre-approvals the claude arm gets, so the switch has a consumer.
+        # Suppressing it here is what left the owner's pinned-codex session
+        # unable to spawn at all.
         (
             "pinned-codex-cost-control-on",
             {
@@ -711,14 +713,11 @@ _CODEX_BUNDLE = "__codex_bundle__"
                 "smart_routing_message": ROUTING_MESSAGE,
             },
             None,
-            None,
+            "on",
         ),
-        # ... but only for a NATIVE codex terminal. A bundle/SDK agent whose
-        # brain is codex is codex-family too, and it spawns through the
-        # session-create path, which re-reads this switch per spawn — so the
-        # stamp is what gives its children default routing. Suppressing on
-        # family alone dropped that, and disagreed with the gear (which offers
-        # the row on every non-native session).
+        # A bundle/SDK agent whose brain is codex is codex-family too, and it
+        # spawns through the session-create path, which re-reads this switch per
+        # spawn — so the stamp is what gives its children default routing.
         (
             "codex-brain-bundle-cost-control-on",
             {
@@ -749,6 +748,15 @@ _CODEX_BUNDLE = "__codex_bundle__"
             None,
         ),
         ("cost-control-omitted", {"agent_id": _WRAPPER}, None, None),
+        # Plain native, either family: nothing routes, so nothing reads the
+        # switch — and the gear hides the row to match.
+        (
+            "plain-codex-cost-control-off",
+            {"agent_id": _CODEX_WRAPPER, "cost_control_mode_override": "off"},
+            None,
+            None,
+        ),
+        ("plain-codex-cost-control-omitted", {"agent_id": _CODEX_WRAPPER}, None, None),
         # A child carries its own stamp copied from the parent at create; the
         # gate never re-reads the parent.
         ("child-of-routed-parent", {"agent_id": _BUNDLE}, "on", "on"),

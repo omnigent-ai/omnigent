@@ -309,7 +309,13 @@ def test_app_server_keeps_symlinked_hooks_when_routing_off(
     assert hooks.is_symlink
 
 
-# ── The three codex session classes ─────────────────────────────────
+# ── The three codex session classes (SDK arm) ───────────────────────
+#
+# The wrapped app-server harness, not the native terminal: its spawns go
+# through the session-create path, which routes off the stamped switch with no
+# in-harness gate, so this arm still takes auto-harness before it is armed.
+# (The native arm arms a pinned Smart Routing session too — see
+# ``tests/test_codex_native_app_server.py``.)
 #
 # A plain codex session must look exactly like a pre-Smart-Routing one: no
 # ``codex debug models`` probe replacing its model catalog, no generated

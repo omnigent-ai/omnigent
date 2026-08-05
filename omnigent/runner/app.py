@@ -8851,9 +8851,10 @@ async def _ensure_session_subagent_router(
 
     Started for Smart Routing sessions only: a plain session must not carry
     the loopback server, its on-disk bearer token, or an in-process hook on
-    every ``Task`` for a verdict the server never routes. On the codex
-    family the advertisement is also what turns generated hooks and the
-    routed-spawn tool pre-approvals on, so there it takes auto-harness.
+    every ``Task`` for a verdict the server never routes. On the codex SDK
+    arm the advertisement also turns generated hooks and the routed-spawn
+    tool pre-approvals on, and those spawns already route through
+    session-create, so there it takes auto-harness.
 
     Never raises: ``ensure_session_router_quietly`` owns the bridge-dir
     resolution too, so a hostile or pre-existing ``$TMPDIR`` root cannot

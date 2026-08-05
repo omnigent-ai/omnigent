@@ -34,14 +34,15 @@ describe("isCostRoutingSession", () => {
 describe("isSubagentRoutingSession", () => {
   const top = { agentName: "claude-native-ui", parentSessionId: null };
 
-  it("matches a routed Claude session and any auto-harness session", () => {
-    expect(
-      isSubagentRoutingSession({
-        ...top,
-        harness: "claude-native",
-        costControlModeOverride: "on",
-      }),
-    ).toBe(true);
+  it("matches a Smart Routing session of either family, pinned or auto", () => {
+    // Pinned Smart Routing on either family: the launch starts the
+    // spawn-routing endpoint, and on codex that advertisement is what turns on
+    // the generated hooks.json gate and the routed-spawn pre-approvals.
+    for (const harness of ["claude-native", "codex-native"]) {
+      expect(isSubagentRoutingSession({ ...top, harness, costControlModeOverride: "on" })).toBe(
+        true,
+      );
+    }
     // Auto-harness may land on either family, and both install the apparatus.
     expect(isSubagentRoutingSession({ ...top, harness: "auto" })).toBe(true);
     for (const harness of ["claude-native", "codex-native"]) {
@@ -55,18 +56,9 @@ describe("isSubagentRoutingSession", () => {
     }
   });
 
-  it("rejects a session whose spawn routing is fixed off at launch", () => {
-    // Pinned codex: spawn routing there needs the generated hooks and the
-    // routed-spawn pre-approvals, which only an auto-harness launch installs.
-    expect(
-      isSubagentRoutingSession({
-        ...top,
-        harness: "codex-native",
-        costControlModeOverride: "on",
-      }),
-    ).toBe(false);
-    // A plain native session of either family: the apparatus is stamped at
-    // create, so flipping the switch afterwards would change nothing.
+  it("rejects a plain native session, where nothing would read the switch", () => {
+    // No Smart Routing at create means no endpoint, no spawn gate and no
+    // pre-approvals, so flipping the switch afterwards would change nothing.
     for (const harness of ["claude-native", "codex-native"]) {
       expect(isSubagentRoutingSession({ ...top, harness })).toBe(false);
       expect(isSubagentRoutingSession({ ...top, harness, costControlModeOverride: "off" })).toBe(
@@ -79,8 +71,8 @@ describe("isSubagentRoutingSession", () => {
     // An SDK/bundle agent spawns children through the session-create path, which
     // routes off this switch regardless of the harness the parent runs.
     expect(isSubagentRoutingSession({ ...top, harness: "pi" })).toBe(true);
-    // Codex-family but not native: the server stamps these too. Keying the
-    // suppression on family alone hid the stamp while this row still showed.
+    // Codex-family but not native, and unrouted: its children still route off
+    // this switch, because they are created rather than spawned in-harness.
     expect(isSubagentRoutingSession({ ...top, harness: "codex" })).toBe(true);
     expect(isSubagentRoutingSession({ ...top, harness: "openai-agents" })).toBe(true);
     expect(isSubagentRoutingSession({ ...top, harness: "not-a-real-harness" })).toBe(true);

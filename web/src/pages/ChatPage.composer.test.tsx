@@ -2098,8 +2098,9 @@ describe("Composer config gear — subagent routing", () => {
       { "omnigent.routing.auto_harness": "1" },
       true,
     ],
-    ["pinned codex-native", "codex-native", "on", {}, false],
+    ["pinned codex-native", "codex-native", "on", {}, true],
     ["plain claude-native", "claude-native", null, {}, false],
+    ["plain codex-native", "codex-native", null, {}, false],
   ] as const)(
     "row visibility follows the session's routing class: %s",
     async (_case, harness, costControlModeOverride, extraLabels, visible) => {

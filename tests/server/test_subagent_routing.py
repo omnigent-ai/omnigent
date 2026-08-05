@@ -538,6 +538,46 @@ async def test_in_family_session_only_offers_its_own_harness() -> None:
     assert decision.action == "deny"
 
 
+async def test_a_pinned_codex_spawn_can_never_land_a_claude_arm() -> None:
+    """Pinned codex routes spawns now, but only within its own family.
+
+    The routing endpoint is installed for a pinned Smart Routing codex session
+    so its spawns can run at all; cross-family placement stays an auto-harness
+    privilege. Without the restriction a codex session would start handing its
+    subagents to Claude Code.
+    """
+    client = FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-native")
+    )
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native"),
+        caps=FakeCaps(routing_client=client),
+        cross_harness=False,
+    )
+    assert set(client.calls[0][1]) == {"codex-native"}
+    assert CLAUDE_MODEL not in client.calls[0][1]["codex-native"]
+    assert decision.action == "deny"
+    assert decision.harness != "claude-native"
+
+
+async def test_an_auto_harness_codex_spawn_may_land_a_claude_arm() -> None:
+    """The same pick, on the one class allowed to cross families."""
+    client = FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-native")
+    )
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native"),
+        caps=FakeCaps(routing_client=client),
+        cross_harness=True,
+    )
+    assert set(client.calls[0][1]) == {"codex-native", "claude-native"}
+    assert decision.action == "redirect"
+    assert decision.model == CLAUDE_MODEL
+    assert decision.harness == "claude-native"
+
+
 async def test_pick_outside_candidate_set_denies() -> None:
     client = FakeRoutingClient(
         RoutingResult(model="databricks-kimi-k2", rationale="unavailable", harness="claude-sdk")

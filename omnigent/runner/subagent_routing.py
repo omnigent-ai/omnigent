@@ -122,6 +122,14 @@ _RELAYED_CAP = 500
 # other harness gets no router env vars at all.
 _CLAUDE_HOOK_HARNESSES = frozenset({"claude-sdk", "claude_sdk", "claude-native"})
 _CODEX_HOOK_HARNESSES = frozenset({"codex", "codex-native"})
+# Codex harnesses that route in-harness spawns for a *pinned* Smart Routing
+# session too, not only an auto-harness one. Just the native terminal: it is
+# the only codex surface whose spawns never reach the session-create path, so
+# without the endpoint its spawn tools are neither gated nor pre-approved and
+# a Smart Routing session cannot spawn at all. An SDK/bundle agent on the
+# codex app-server spawns through session-create, which already routes off the
+# stamped switch, so the in-harness gate would only add a round trip.
+_PINNED_CODEX_HOOK_HARNESSES = frozenset({"codex-native"})
 
 # Cross-harness counterpart used to offer the router a second family, and
 # to name the redirect target when it picks from that family.
@@ -198,9 +206,11 @@ class SessionRoutingClass:
     spawn-routing hooks, no extra tool pre-approvals. A **pinned**
     Smart Routing session (``routing_enabled`` only) adds the extended
     model catalog, because a routed turn can land on an arm codex's
-    bundled catalog has no entry for. An **auto-harness** session (both)
-    additionally gets the spawn-routing gate and the pre-approvals the
-    cross-harness redirect needs.
+    bundled catalog has no entry for, plus — on a native terminal — the
+    spawn-routing gate and the tool pre-approvals its routed spawns need
+    to run at all. An **auto-harness** session (both) additionally lets
+    those spawns cross into the counterpart harness family; a pinned one
+    routes within its own.
 
     :param routing_enabled: The session launched with Smart Routing as its
         model.
@@ -1339,14 +1349,16 @@ def ensure_session_router_quietly(
         whether it gets an endpoint at all. A **plain** session gets none
         on either family: the loopback server, its bearer token on disk and
         the per-spawn hook round trip are Smart Routing's costs to pay, not
-        a plain session's. A **routed** claude session gets one — claude
-        routes spawns whether or not the harness is also auto-picked. The
-        codex family additionally needs :attr:`~SessionRoutingClass.
-        auto_harness`, because there the advertisement is also what turns
-        the generated ``spawn_agent`` hook, the extra tool pre-approvals
-        and the merged ``hooks.json`` on. Stamped at create, so flipping
-        the gear's subagent-routing toggle on for a plain session stays
-        inert until it is recreated.
+        a plain session's. Every **routed** session on a native terminal
+        gets one, pinned or auto-harness — on codex the advertisement is
+        also what turns the generated ``spawn_agent`` hook, the extra tool
+        pre-approvals and the merged ``hooks.json`` on, and without those a
+        pinned Smart Routing session could not spawn at all. The codex
+        *SDK* arm still needs :attr:`~SessionRoutingClass.auto_harness`:
+        its spawns go through the session-create path, which routes off the
+        stamped switch without any in-harness gate. Stamped at create, so
+        flipping the gear's subagent-routing toggle on for a plain session
+        stays inert until it is recreated.
     :returns: The running router handle, or ``None`` when it could not
         start.
     """
@@ -1357,7 +1369,11 @@ def ensure_session_router_quietly(
         return None
     if not routing_class.routing_enabled:
         return None
-    if harness in _CODEX_HOOK_HARNESSES and not routing_class.auto_harness:
+    if (
+        harness in _CODEX_HOOK_HARNESSES
+        and harness not in _PINNED_CODEX_HOOK_HARNESSES
+        and not routing_class.auto_harness
+    ):
         return None
     try:
         return ensure_session_router(

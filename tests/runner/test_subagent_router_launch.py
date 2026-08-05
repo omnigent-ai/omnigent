@@ -38,15 +38,22 @@ def _cleanup_routers() -> Any:  # type: ignore[explicit-any]
         subagent_routing.shutdown_session_router(session_id)
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
 @pytest.mark.parametrize("routing_class", [_PINNED, _AUTO])
-async def test_a_routed_claude_native_launch_installs_the_router(
-    tmp_path: Path, routing_class: SessionRoutingClass
+async def test_a_routed_native_launch_installs_the_router(
+    tmp_path: Path, harness: str, routing_class: SessionRoutingClass
 ) -> None:
-    """Claude routes spawns whether or not the harness is auto-picked."""
+    """Either family routes spawns whether or not the harness is auto-picked.
+
+    On codex the advertisement is also what turns on the generated
+    ``hooks.json`` spawn gate and the routed-spawn tool pre-approvals, so
+    withholding it from a pinned Smart Routing session left that session unable
+    to spawn at all — not merely unrouted.
+    """
     advertised, router = _start_subagent_router_for_native_session(
         "conv_native_launch",
         bridge_dir=tmp_path,
-        harness="claude-native",
+        harness=harness,
         server_client=_DeadClient(),  # type: ignore[arg-type]
         routing_enabled=routing_class.routing_enabled,
         auto_harness=routing_class.auto_harness,
@@ -76,39 +83,23 @@ async def test_a_plain_native_launch_gets_no_router(tmp_path: Path, harness: str
     assert read_router_endpoint(tmp_path) is None
 
 
-@pytest.mark.parametrize("harness", ["codex-native", "codex"])
-async def test_a_pinned_codex_session_gets_no_router(tmp_path: Path, harness: str) -> None:
-    """The advertisement is what makes a codex home diverge from a plain one.
+async def test_a_pinned_codex_sdk_session_gets_no_router(tmp_path: Path) -> None:
+    """The SDK codex arm keeps the auto-harness requirement.
 
-    Its presence turns on the generated ``hooks.json`` (a ``spawn_agent``
-    PreToolUse gate that stalls ~30 s on a wedged server before failing
-    open) and the routed-spawn tool pre-approvals. A session that never
-    routes a spawn must pay none of it.
+    Its spawns go through the session-create path, which already routes off the
+    stamped switch, so an in-harness ``spawn_agent`` gate would only add a
+    round trip — and with it the generated ``hooks.json`` that stops the user's
+    own hooks file from being symlinked through.
     """
     assert _start_subagent_router_for_native_session(
         "conv_native_launch",
         bridge_dir=tmp_path,
-        harness=harness,
+        harness="codex",
         server_client=_DeadClient(),  # type: ignore[arg-type]
         routing_enabled=True,
         auto_harness=False,
     ) == (None, None)
     assert read_router_endpoint(tmp_path) is None
-
-
-async def test_an_auto_harness_codex_session_gets_the_router(tmp_path: Path) -> None:
-    advertised, router = _start_subagent_router_for_native_session(
-        "conv_native_launch",
-        bridge_dir=tmp_path,
-        harness="codex-native",
-        server_client=_DeadClient(),  # type: ignore[arg-type]
-        routing_enabled=True,
-        auto_harness=True,
-    )
-
-    assert advertised == tmp_path
-    assert router is not None
-    assert read_router_endpoint(tmp_path) is not None
 
 
 async def test_native_launch_skips_without_a_server_client(tmp_path: Path) -> None:

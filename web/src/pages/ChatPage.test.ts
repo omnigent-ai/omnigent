@@ -1448,20 +1448,24 @@ describe("routing eligibility gates", () => {
     expect(isSubagentRoutingEligible(info(true), piSession)).toBe(true);
   });
 
-  it("a pinned codex session has no subagent-routing switch to offer", () => {
-    // Spawn routing on codex needs the generated hooks and pre-approvals that
-    // only an auto-harness launch installs, so the row would be inert.
+  it("a pinned codex Smart Routing session offers the subagent-routing switch", () => {
+    // Its launch installs the generated hooks.json spawn gate and the
+    // routed-spawn pre-approvals, same as the claude arm; what it does not get
+    // is cross-family picks, which is not a knob.
     const codex = {
       ...nativeSession,
       harness: "codex-native",
       labels: { "omnigent.wrapper": "codex-cli" },
     } as unknown as Session;
-    expect(isSubagentRoutingEligible(info(true), codex)).toBe(false);
+    expect(isSubagentRoutingEligible(info(true), codex)).toBe(true);
     const autoCodex = {
       ...codex,
       labels: { ...codex.labels, "omnigent.routing.auto_harness": "1" },
     } as unknown as Session;
     expect(isSubagentRoutingEligible(info(true), autoCodex)).toBe(true);
+    // Plain codex is the one class that never reads the switch.
+    const plainCodex = { ...codex, costControlModeOverride: null } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), plainCodex)).toBe(false);
   });
 
   it("a plain native session has no subagent-routing switch to offer", () => {

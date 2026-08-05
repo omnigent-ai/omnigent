@@ -412,14 +412,15 @@ class _CodexNativeLaunchConfig:
         auto-harness mode (``omnigent.routing.auto_harness`` label or a
         ``harness_override`` of ``"auto"``), so the router may re-route its
         spawns onto the Claude family. Only then are the routed-spawn developer
-        instructions installed, the spawn-routing endpoint started, and the
-        redirect tools pre-approved — a pinned or plain codex session gets none
-        of it.
+        instructions installed, which is the only cross-family framing — a
+        pinned session's spawns stay on codex.
     :param routing_enabled: ``True`` when the session launched with Smart
         Routing on (pinned or auto-harness). Gates the first-message
         turn-routing endpoint, whose advertisement in turn gates the
-        ``UserPromptSubmit`` routing hook, and the extended model catalog a
-        routed turn may need.
+        ``UserPromptSubmit`` routing hook; the extended model catalog a routed
+        turn may need; and the spawn-routing endpoint, whose advertisement
+        gates the generated ``spawn_agent`` hook and the routed-spawn tool
+        pre-approvals a routed spawn cannot run without.
     """
 
     workspace: Path
@@ -518,8 +519,10 @@ def _start_subagent_router_for_native_session(
     session launches like a plain one, with no loopback server, no bearer
     token on disk and no spawn hook on its argv. On the codex family the
     advertisement additionally turns on a generated ``hooks.json`` and the
-    routed-spawn tool pre-approvals, so there it takes auto-harness — see
-    ``ensure_session_router_quietly``.
+    routed-spawn tool pre-approvals — which is why a pinned Smart Routing
+    codex session needs it too: without them its spawn tools are neither
+    gated nor pre-approved, so the spawn stalls on an approval prompt
+    nobody is watching. See ``ensure_session_router_quietly``.
 
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Session bridge directory the hooks discover.
@@ -527,10 +530,12 @@ def _start_subagent_router_for_native_session(
         failure.
     :param server_client: Runner→server client the relay forwards on.
     :param routing_enabled: Whether the session launched with Smart Routing
-        on. Stamped at create, so a plain session stays plain even if the
-        gear's subagent-routing toggle is flipped mid-session.
+        on. The gate on both families. Stamped at create, so a plain
+        session stays plain even if the gear's subagent-routing toggle is
+        flipped mid-session.
     :param auto_harness: Whether Smart Routing also owns this session's
-        harness. Additionally required on the codex family.
+        harness, so its spawns may cross families. Not required for the
+        endpoint; it decides what the router may offer.
     :returns: The advertisement directory to point hooks at (``None`` when
         the endpoint could not start) paired with the router handle.
     """
@@ -3964,9 +3969,10 @@ async def _auto_create_codex_terminal(
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
-    # the server decides per spawn whether to route. Auto-harness only — the
-    # advertisement is also what makes this session's codex-home diverge from a
-    # plain one (generated hooks.json, routed-spawn tool pre-approvals).
+    # the server decides per spawn whether to route. Any Smart Routing session,
+    # pinned or auto — the advertisement is also what makes this session's
+    # codex-home diverge from a plain one (generated hooks.json, routed-spawn
+    # tool pre-approvals), and a pinned session cannot spawn without them.
     _codex_router_dir, _codex_router = _start_subagent_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
