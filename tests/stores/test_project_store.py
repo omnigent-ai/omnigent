@@ -151,10 +151,10 @@ def test_same_name_allowed_across_owners(store: SqlAlchemyProjectStore) -> None:
 
 
 def test_duplicate_name_rejected_for_null_owner(store: SqlAlchemyProjectStore) -> None:
-    """Single-user mode (NULL owner) still enforces name uniqueness.
+    """Single-user mode (NULL owner) enforces name uniqueness in the store.
 
-    The DB UNIQUE index can't do this (SQL treats NULLs as distinct), so the
-    store's ``_name_taken`` check is the sole guard for NULL owners.
+    ``_name_taken`` is the sole guard for every owner, NULL included — no unique
+    index backs it.
     """
     store.create(_uid("p1"), "Solo", None)
     with pytest.raises(OmnigentError) as exc:
@@ -162,29 +162,32 @@ def test_duplicate_name_rejected_for_null_owner(store: SqlAlchemyProjectStore) -
     assert exc.value.code == ErrorCode.ALREADY_EXISTS
 
 
-def test_duplicate_name_rejected_at_db_layer_for_named_owner(
+def test_duplicate_name_lands_when_precheck_is_bypassed(
     store: SqlAlchemyProjectStore,
 ) -> None:
-    """The UNIQUE index enforces per-owner uniqueness even if the store's
-    ``_name_taken`` pre-check is bypassed — the DB is the race backstop.
+    """A duplicate name is accepted once ``_name_taken`` is bypassed.
+
+    No unique index covers (workspace_id, user_id, name), so the pre-check is
+    the only guard and a concurrent create racing past it lands. Pins that
+    accepted cost: both rows exist, each addressable by its own id.
 
     Monkeypatching ``_name_taken`` to always-miss simulates two concurrent
-    creates both passing the check; the second must still fail via the index's
-    ``IntegrityError``, mapped to ``ALREADY_EXISTS``.
+    creates both passing the check.
     """
     store.create(_uid("p1"), "Dup", "alice@example.com")
     store._name_taken = lambda *a, **k: False  # type: ignore[method-assign]
-    with pytest.raises(OmnigentError) as exc:
-        store.create(_uid("p2"), "Dup", "alice@example.com")
-    assert exc.value.code == ErrorCode.ALREADY_EXISTS
+    store.create(_uid("p2"), "Dup", "alice@example.com")
+
+    assert [p.name for p in store.list(user_id="alice@example.com")] == ["Dup", "Dup"]
+    assert store.get(_uid("p1"), user_id="alice@example.com") is not None
+    assert store.get(_uid("p2"), user_id="alice@example.com") is not None
 
 
-def test_non_name_integrity_error_is_not_masked(store: SqlAlchemyProjectStore) -> None:
-    """An integrity failure that isn't the name index re-raises untranslated.
+def test_primary_key_collision_is_not_masked(store: SqlAlchemyProjectStore) -> None:
+    """Reusing an id surfaces as ``IntegrityError``, not ``ALREADY_EXISTS``.
 
-    Reusing an existing id hits the primary-key constraint, not
-    ``ix_projects_name``; that must surface as ``IntegrityError`` rather than a
-    misleading ``ALREADY_EXISTS`` name collision.
+    The PK is the only remaining constraint on this table, and the store must
+    not dress its violation up as a name collision.
     """
     store.create(_uid("p1"), "Original", "alice@example.com")
     store._name_taken = lambda *a, **k: False  # type: ignore[method-assign]

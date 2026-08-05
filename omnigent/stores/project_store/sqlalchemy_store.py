@@ -6,7 +6,6 @@ import json
 from typing import Any
 
 from sqlalchemy import asc, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlProject, current_workspace_id
@@ -66,20 +65,6 @@ def _decode_config(raw: str | None) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {}
 
 
-def _is_name_conflict(exc: IntegrityError) -> bool:
-    """Return whether ``exc`` is the per-owner name-UNIQUE index violation.
-
-    Only that constraint should translate to ``ALREADY_EXISTS`` — any other
-    integrity failure (unexpected PK collision, NOT NULL, etc.) must surface
-    as itself rather than a misleading "already exists". Drivers name the hit
-    constraint differently: Postgres reports the index name (``ix_projects_name``)
-    while SQLite lists the columns (``...user_id, projects.name``). Match either
-    signature, keyed on the ``name`` column that is unique to this index.
-    """
-    message = str(exc.orig)
-    return "ix_projects_name" in message or "projects.name" in message
-
-
 def _to_entity(row: SqlProject) -> Project:
     """
     Convert a :class:`SqlProject` ORM row to a :class:`Project`.
@@ -133,9 +118,10 @@ class SqlAlchemyProjectStore(ProjectStore):
     ) -> bool:
         """Return whether ``user_id`` already has a project named ``name``.
 
-        Enforces per-owner name uniqueness in the store because a DB unique
-        index cannot: ``user_id`` is NULL in single-user mode and SQL treats
-        NULLs as distinct, so null-owner rows would never collide.
+        The sole enforcement point for per-owner name uniqueness: there is no
+        unique index behind it (see ``SqlProject.__table_args__``). Being a
+        check-then-write, it cannot close the concurrency window — two
+        simultaneous creates or renames to the same name can both land.
 
         :param session: The active SQLAlchemy session.
         :param user_id: The owner scope.
@@ -161,13 +147,10 @@ class SqlAlchemyProjectStore(ProjectStore):
     ) -> Project:
         """Insert a new, empty project.
 
-        Name uniqueness has two layers: the ``_name_taken`` pre-check gives a
-        friendly error (and is the only guard for NULL owners, which SQL treats
-        as distinct), while the ``ix_projects_name`` UNIQUE index enforces it at
-        the DB layer for non-NULL owners — catching a concurrent create that
-        slips past the check. That index violation surfaces as ``IntegrityError``
-        and maps to the same ``ALREADY_EXISTS``; any other integrity failure is
-        re-raised untranslated.
+        Rejects a name the owner already uses via the ``_name_taken`` pre-check.
+        That check is the only guard — no unique index backs it — so a
+        concurrent create of the same name can slip through; see
+        ``SqlProject.__table_args__`` for why that is acceptable.
         """
         with self._session("insert_project") as session:
             if self._name_taken(session, user_id=user_id, name=name, exclude_id=None):
@@ -184,15 +167,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 config=_encode_config(config),
             )
             session.add(row)
-            try:
-                session.flush()
-            except IntegrityError as exc:
-                if not _is_name_conflict(exc):
-                    raise
-                raise OmnigentError(
-                    f"A project named {name!r} already exists",
-                    code=ErrorCode.ALREADY_EXISTS,
-                ) from exc
+            session.flush()
             return _to_entity(row)
 
     def get(self, project_id: str, *, user_id: str | None) -> Project | None:
@@ -228,6 +203,10 @@ class SqlAlchemyProjectStore(ProjectStore):
         ``None`` leaves a field unchanged. Returns ``None`` if the project does
         not exist or is not owned by ``user_id``. A ``config`` of ``{}`` clears
         the stored defaults (distinct from ``None`` = leave unchanged).
+
+        A rename re-checks ``_name_taken``, which — as on ``create`` — is the
+        only uniqueness guard, so concurrent renames to the same name can both
+        land.
         """
         with self._session("update_project") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
@@ -249,17 +228,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                     changed = True
             if changed:
                 row.updated_at = now_epoch()
-            try:
-                session.flush()
-            except IntegrityError as exc:
-                # A concurrent rename raced past _name_taken and hit the UNIQUE
-                # index (non-NULL owners); anything else is a real error.
-                if not _is_name_conflict(exc):
-                    raise
-                raise OmnigentError(
-                    f"A project named {name!r} already exists",
-                    code=ErrorCode.ALREADY_EXISTS,
-                ) from exc
+            session.flush()
             return _to_entity(row)
 
     def delete(self, project_id: str, *, user_id: str | None) -> bool:

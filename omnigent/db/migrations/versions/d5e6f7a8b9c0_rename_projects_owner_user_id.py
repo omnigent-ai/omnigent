@@ -1,4 +1,4 @@
-"""Rename ``projects.owner_user_id`` to ``user_id``
+"""Rename ``projects.owner_user_id`` to ``user_id``; drop the name UNIQUE index
 
 Revision ID: d5e6f7a8b9c0
 Revises: c4d5e6f7a8b9
@@ -12,14 +12,30 @@ still diverging. This brings it in line with ``session_permissions.user_id``,
 ``account_tokens.user_id``, ``device_grants.user_id``, ``hosts.user_id``, and
 ``scheduled_tasks.user_id``.
 
-Type is unchanged (``VARCHAR(128)``, nullable). Both indexes covering the
-column are recreated: ``ix_projects_owner_user_id`` → ``ix_projects_user_id``
-(matching the ``ix_scheduled_tasks_user_id`` precedent) and ``ix_projects_name``
-keeps its name, since it is named for the ``name`` column that makes it unique —
-``_is_name_conflict`` in the project store matches on that index name.
+Type is unchanged (``VARCHAR(128)``, nullable). ``ix_projects_owner_user_id``
+becomes ``ix_projects_user_id``, matching the ``ix_scheduled_tasks_user_id``
+precedent.
 
-The rename is not wire-visible: ``owner_user_id`` was never part of the
-``ProjectObject`` response, so no client contract changes.
+``ix_projects_name`` — UNIQUE over (workspace_id, owner, name) — is **dropped,
+not renamed**. It backed only the store's two ``_name_taken`` probes, which now
+stand alone as the sole uniqueness check:
+
+- It never held for single-user mode, where the owner column is NULL and SQL
+  treats NULLs as distinct, so that deployment has always allowed duplicates.
+- ``name`` is mutable (``update`` renames it), so a unique key over it is
+  maintained on every rename.
+- The ``?project=<name>`` member join tolerates duplicate names by
+  construction: it unions first-class members with ``omni_project``
+  label-projects matched on the same string, so name-collision merging is
+  already its defined behaviour.
+
+The cost is that two concurrent creates or renames to the same name can both
+land. ``ix_projects_user_id`` still covers both probes via its
+(workspace_id, user_id) prefix, then filters ``name`` over the owner's handful
+of rows.
+
+Neither change is wire-visible: the owner column was never part of the
+``ProjectObject`` response, and dropping an index changes no response shape.
 
 Dialect strategy
 ----------------
@@ -28,10 +44,10 @@ Dialect strategy
 - **PostgreSQL / MySQL**: native ``ALTER TABLE ... RENAME COLUMN``
   (``recreate="auto"``), no copy.
 
-As in b3c1a2d4e5f6, the dependent indexes are dropped before the rename and
-recreated after: a single batch that both renames a column and drops an index
-referencing it trips Alembic's batch reflection, which maps the reflected index
-onto the not-yet-renamed column.
+As in b3c1a2d4e5f6, the dependent indexes are dropped before the rename: a
+single batch that both renames a column and drops an index referencing it trips
+Alembic's batch reflection, which maps the reflected index onto the
+not-yet-renamed column.
 """
 
 from __future__ import annotations
@@ -53,9 +69,10 @@ def _is_sqlite() -> bool:
 
 
 def upgrade() -> None:
-    """Rename ``projects.owner_user_id`` → ``user_id``."""
+    """Rename the owner column and drop ``ix_projects_name``."""
     recreate: Literal["always", "auto"] = "always" if _is_sqlite() else "auto"
 
+    # Dropped for good, not recreated below — see the module docstring.
     op.drop_index("ix_projects_name", table_name="projects")
     op.drop_index("ix_projects_owner_user_id", table_name="projects")
     with op.batch_alter_table("projects", recreate=recreate) as batch_op:
@@ -70,19 +87,17 @@ def upgrade() -> None:
         "projects",
         ["workspace_id", "user_id", "created_at", "id"],
     )
-    op.create_index(
-        "ix_projects_name",
-        "projects",
-        ["workspace_id", "user_id", "name"],
-        unique=True,
-    )
 
 
 def downgrade() -> None:
-    """Restore the ``owner_user_id`` column name."""
+    """Restore the ``owner_user_id`` column name and the UNIQUE name index.
+
+    Recreating ``ix_projects_name`` can fail if duplicate names accumulated
+    while the constraint was absent — deliberately, so the downgrade surfaces
+    the conflict rather than silently discarding a row.
+    """
     recreate: Literal["always", "auto"] = "always" if _is_sqlite() else "auto"
 
-    op.drop_index("ix_projects_name", table_name="projects")
     op.drop_index("ix_projects_user_id", table_name="projects")
     with op.batch_alter_table("projects", recreate=recreate) as batch_op:
         batch_op.alter_column(
