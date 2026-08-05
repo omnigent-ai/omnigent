@@ -52,10 +52,10 @@ export function pushSseEvent(sessionId: string, event: StreamEvent): void {
   if (!debugMode) return;
   const log = getOrCreate(sessionId);
   const entry: SseLogEntry = { index: log.nextIndex++, ts: Date.now(), event };
-  if (log.entries.length >= MAX_EVENTS) {
-    log.entries.shift();
-  }
-  log.entries.push(entry);
+  // Always produce a new array reference so useSyncExternalStore's Object.is
+  // check detects the change and triggers a re-render.
+  const prev = log.entries.length >= MAX_EVENTS ? log.entries.slice(1) : log.entries;
+  log.entries = [...prev, entry];
   for (const l of log.listeners) l();
 }
 
