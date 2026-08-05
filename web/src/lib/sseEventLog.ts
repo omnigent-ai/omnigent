@@ -36,8 +36,16 @@ function getOrCreate(sessionId: string): SessionLog {
   return log;
 }
 
+function isDebugMode(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("debug") === "1"
+  );
+}
+
 /** Push one event into the session's ring buffer. No-op when debug is off. */
 export function pushSseEvent(sessionId: string, event: StreamEvent): void {
+  if (!isDebugMode()) return;
   const log = getOrCreate(sessionId);
   const entry: SseLogEntry = { index: log.nextIndex++, ts: Date.now(), event };
   if (log.entries.length >= MAX_EVENTS) {
