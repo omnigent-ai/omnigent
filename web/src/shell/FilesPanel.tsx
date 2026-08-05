@@ -139,7 +139,7 @@ function SortSelector({
         <button
           type="button"
           aria-label={`Sort: ${active.label}`}
-          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-xs hover:bg-muted hover:text-foreground"
+          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-sm hover:bg-muted hover:text-foreground"
         >
           <span>Sort:</span>
           <active.Icon className="size-3.5" />
@@ -179,7 +179,7 @@ function FileScopeSwitch({
   const changedSelected = flatView;
   const allSelected = !flatView;
   const pill =
-    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-[13px] font-medium leading-5 transition-colors";
+    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-ui font-medium leading-5 transition-colors";
   const activePill = "bg-muted text-foreground";
   const idlePill = "text-muted-foreground hover:text-foreground";
   return (
@@ -196,7 +196,7 @@ function FileScopeSwitch({
         <ListIcon className="size-3.5 shrink-0" />
         Changed
         {count > 0 && (
-          <span className="shrink-0 font-normal text-[11px] text-muted-foreground tabular-nums">
+          <span className="shrink-0 font-normal text-sm text-muted-foreground tabular-nums">
             {count}
           </span>
         )}
@@ -239,7 +239,7 @@ function SearchFilterInput({
       </span>
       <input
         aria-label={label}
-        className="w-full rounded border border-border bg-transparent px-2 py-1 font-mono text-xs outline-none placeholder:text-muted-foreground focus:border-ring"
+        className="w-full rounded border border-border bg-transparent px-2 py-1 font-mono text-sm outline-none placeholder:text-muted-foreground focus:border-ring"
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         type="text"
@@ -438,7 +438,7 @@ export function FilesPanel({
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
               <input
                 aria-label="Search changed files"
-                className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                 onChange={(event) => setChangedSearch(event.target.value)}
                 placeholder="Search"
                 type="search"
@@ -458,7 +458,7 @@ export function FilesPanel({
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
                 <input
                   aria-label="Search all files"
-                  className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                  className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                   onChange={(event) => setTreeSearch(event.target.value)}
                   placeholder="Search"
                   type="search"
@@ -565,7 +565,7 @@ function WorkingDirLabel({ dir }: { dir: string }) {
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="inline-block max-w-full truncate font-mono text-[11px] text-muted-foreground cursor-default">
+            <span className="inline-block max-w-full truncate font-mono text-sm text-muted-foreground cursor-default">
               {dirBasename(dir)}
             </span>
           </TooltipTrigger>

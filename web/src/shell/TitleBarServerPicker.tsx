@@ -83,7 +83,7 @@ export function TitleBarServerPicker({
       <DropdownMenu>
         <DropdownMenuTrigger
           className={cn(
-            "pointer-events-auto flex max-w-72 items-center gap-1 rounded-md px-2 text-xs",
+            "pointer-events-auto flex max-w-72 items-center gap-1 rounded-md px-2 text-sm",
             "my-1 text-muted-foreground hover:bg-foreground/5 hover:text-foreground",
             "data-[state=open]:bg-foreground/5 data-[state=open]:text-foreground",
           )}

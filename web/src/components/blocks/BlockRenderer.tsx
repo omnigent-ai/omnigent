@@ -232,7 +232,7 @@ function PlainTextFallback({ text }: { text: string }) {
   const truncated = text.length > MAX_PLAINTEXT_DISPLAY_LENGTH;
   const shown = truncated ? text.slice(0, MAX_PLAINTEXT_DISPLAY_LENGTH) : text;
   return (
-    <div className="whitespace-pre-wrap break-all font-mono text-xs">
+    <div className="whitespace-pre-wrap break-all font-mono text-sm">
       {shown}
       {truncated && (
         <span className="text-muted-foreground">
@@ -763,7 +763,7 @@ function TurnWorkedFold({
       data-testid="turn-worked-fold"
     >
       <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
+        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
           <span className="shrink-0">{label}</span>
           <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
           <span aria-hidden className="ml-1 flex-1 border-border border-t" />

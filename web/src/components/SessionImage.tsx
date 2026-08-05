@@ -72,7 +72,7 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
         role="img"
         aria-label={alt}
         className={cn(
-          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-xs text-muted-foreground",
+          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
           className,
         )}
       >

@@ -340,7 +340,7 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
       )}
       <span className="flex min-w-0 flex-col">
         <span className="flex items-center gap-2">
-          <span className="truncate text-xs">{host.name}</span>
+          <span className="truncate text-sm">{host.name}</span>
           <span
             className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
           >
@@ -374,14 +374,14 @@ export function ConnectHostInstructions({
   const databricksFeatures = info !== "loading" && info.databricks_features;
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
-      {label && <p className="text-xs text-muted-foreground">{label}</p>}
+      {label && <p className="text-sm text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
         <Tabs defaultValue="local">
           <TabsList className="w-full">
-            <TabsTrigger value="local" className="text-xs">
+            <TabsTrigger value="local" className="text-sm">
               Local machine
             </TabsTrigger>
-            <TabsTrigger value="lakebox" className="text-xs">
+            <TabsTrigger value="lakebox" className="text-sm">
               Databricks Lakebox
             </TabsTrigger>
           </TabsList>
@@ -637,7 +637,7 @@ function HarnessSetupNotice({
     <p
       // pl-2 lines the icon up with the chips tray directly above (which has
       // pl-2), so the notice reads as part of the composer, not indented left.
-      className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
+      className="flex items-center gap-2 pl-2 text-sm text-amber-600 dark:text-amber-500"
       data-testid="new-chat-landing-harness-warning"
     >
       <TriangleAlertIcon className="size-3.5 shrink-0" />
@@ -647,11 +647,11 @@ function HarnessSetupNotice({
             {agentName} isn&apos;t ready on {hostName}.
           </span>
           {/* Compact bordered chip — small enough to sit on the sentence's line
-              (h-5, text-xs), so it reads as part of the notice. */}
+              (h-5, text-sm), so it reads as part of the notice. */}
           <button
             type="button"
             data-testid="new-chat-landing-harness-setup"
-            className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-xs font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
+            className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-sm font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
             onClick={onSetup}
           >
             Set up {agentName}
@@ -804,9 +804,7 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * doesn't claim roving focus for it — mirrors the in-session picker). */
 function PickerSectionHeader({ children }: { children: ReactNode }) {
   return (
-    <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
-      {children}
-    </div>
+    <div className="px-2 pt-1.5 pb-0.5 text-sm font-medium text-muted-foreground">{children}</div>
   );
 }
 
@@ -920,7 +918,7 @@ export function AgentHarnessPicker({
     const inner = (
       <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
         <span className="truncate">{agent.display_name}</span>
-        {blurb && <span className="truncate text-[11px] text-muted-foreground/70">{blurb}</span>}
+        {blurb && <span className="truncate text-sm text-muted-foreground/70">{blurb}</span>}
       </div>
     );
     return withTooltip ? <AgentRowTooltip agent={agent}>{inner}</AgentRowTooltip> : inner;
@@ -930,7 +928,7 @@ export function AgentHarnessPicker({
     harnessUnconfiguredOnHost(agent.harness, host) ? (
       <Badge
         variant="outline"
-        className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+        className="ml-auto self-center border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
         data-testid={`new-chat-landing-agent-warning-${agent.id}`}
       >
         {harnessWarningBadgeText(
@@ -950,7 +948,7 @@ export function AgentHarnessPicker({
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={active ? "true" : undefined}
         onSelect={() => onSelectAgent(agent)}
-        className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+        className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
       >
         {renderRowInner(agent, true)}
         {renderBadge(agent)}
@@ -1007,7 +1005,7 @@ export function AgentHarnessPicker({
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
-      className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+      className="gap-2 rounded-sm px-2 py-1.5 text-ui text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
       Create custom agent
@@ -1025,11 +1023,11 @@ export function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-pending"
           data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
           onSelect={onSelectPending}
-          className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+          className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
-            <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
+            <span className="truncate text-sm text-muted-foreground/70">Custom</span>
           </div>
         </DropdownMenuItem>
       )}
@@ -1086,7 +1084,7 @@ export function AgentHarnessPicker({
           )}
         >
           <span
-            className={cn("max-w-[12rem] truncate text-xs text-foreground", triggerLabelClassName)}
+            className={cn("max-w-[12rem] truncate text-sm text-foreground", triggerLabelClassName)}
           >
             {hasAgents ? agentLabel : "No agents"}
           </span>
@@ -1117,7 +1115,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-13 font-medium"
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">More</span>
@@ -1134,7 +1132,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-13 font-medium"
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">Custom agents</span>
@@ -1160,7 +1158,7 @@ export function AgentHarnessPicker({
                         e.preventDefault();
                         setMobilePage("more");
                       }}
-                      className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                      className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                     >
                       <span className="flex-1">More</span>
                       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1170,7 +1168,7 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                        className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
@@ -1199,7 +1197,7 @@ export function AgentHarnessPicker({
                     e.preventDefault();
                     setMobilePage("custom");
                   }}
-                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                 >
                   <span className="flex-1">Custom agents</span>
                   <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1209,7 +1207,7 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center gap-2 rounded-sm px-2 py-1.5 text-13"
+                    className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
@@ -1458,12 +1456,12 @@ function HarnessConfigModal({
                       </SelectItem>
                     ))}
                     {claudeModelsLoading && (
-                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
                         Loading models…
                       </div>
                     )}
                     {!claudeModelsLoading && claudeModelOptions.length === 0 && (
-                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
                         Models unavailable
                       </div>
                     )}
@@ -1537,10 +1535,10 @@ function HarnessConfigModal({
                     </SelectItem>
                   ))}
                   {modelsLoading && (
-                    <div className="px-2.5 py-1 text-xs text-muted-foreground">Loading models…</div>
+                    <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
                   )}
                   {!modelsLoading && modelOptions.length === 0 && (
-                    <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                    <div className="px-2.5 py-1 text-sm text-muted-foreground">
                       Models unavailable
                     </div>
                   )}
@@ -1580,7 +1578,7 @@ function HarnessConfigModal({
                 <div
                   role="alert"
                   data-testid="new-chat-landing-bypass-sandbox-banner"
-                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
+                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium leading-relaxed text-destructive"
                 >
                   <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
                   <span>
@@ -1626,7 +1624,7 @@ function HarnessConfigModal({
                         {harnessUnconfiguredOnHost(id, host) && (
                           <Badge
                             variant="outline"
-                            className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+                            className="border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                             data-testid={`new-chat-landing-harness-warning-${id}`}
                           >
                             {harnessWarningBadgeText(
@@ -3154,7 +3152,7 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderIcon className="size-4 shrink-0" />
@@ -3390,7 +3388,7 @@ export function NewChatLandingScreen() {
                 {mentionedItems.map((item, i) => (
                   <span
                     key={mentionItemPath(item)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
                     {item.isDir ? (
                       <FolderIcon className="size-3 shrink-0" />
@@ -3419,7 +3417,7 @@ export function NewChatLandingScreen() {
                 {files.map((file, i) => (
                   <span
                     key={attachmentKey(file)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
                     {file.type.startsWith("image/") ? (
                       <ImageIcon className="size-3 shrink-0" />
@@ -3633,7 +3631,7 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     {isCloudHost ? (
@@ -3660,23 +3658,23 @@ export function NewChatLandingScreen() {
                           onSelect={selectSandbox}
                           data-testid="new-chat-landing-sandbox-option"
                           data-active={sandboxSelected ? "true" : undefined}
-                          className="text-xs data-[active=true]:bg-accent/60"
+                          className="text-sm data-[active=true]:bg-accent/60"
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-xs">{sandboxLabel}</span>
+                            <span className="text-sm">{sandboxLabel}</span>
                           </span>
                         </DropdownMenuItem>
                       ) : (
                         <DropdownMenuItem
                           aria-disabled="true"
                           onSelect={(e) => e.preventDefault()}
-                          className="flex items-center justify-between px-2 py-1.5 text-xs text-muted-foreground opacity-60"
+                          className="flex items-center justify-between px-2 py-1.5 text-sm text-muted-foreground opacity-60"
                           data-testid="new-chat-landing-sandbox-option-disabled"
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-xs">New Sandbox</span>
+                            <span className="text-sm">New Sandbox</span>
                           </span>
                           <Tooltip>
                             <TooltipTrigger asChild>
@@ -3702,7 +3700,7 @@ export function NewChatLandingScreen() {
                     </>
                   )}
                   {allHosts.length === 0 && !showConnectThisMachine && (
-                    <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                    <div className="px-2 py-1.5 text-sm text-muted-foreground">
                       No hosts connected yet.
                     </div>
                   )}
@@ -3712,7 +3710,7 @@ export function NewChatLandingScreen() {
                       onSelect={() => selectHost(host.host_id)}
                       data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
-                      className="text-xs data-[active=true]:bg-accent/60"
+                      className="text-sm data-[active=true]:bg-accent/60"
                     >
                       <HostOption
                         host={host}
@@ -3733,7 +3731,7 @@ export function NewChatLandingScreen() {
                           }}
                           disabled={connectingThisMachine}
                           data-testid="new-chat-landing-run-on-this-machine"
-                          className="text-xs"
+                          className="text-sm"
                         >
                           <HostOption
                             host={host}
@@ -3747,7 +3745,7 @@ export function NewChatLandingScreen() {
                       );
                     }
                     return (
-                      <DropdownMenuItem key={host.host_id} disabled className="text-xs">
+                      <DropdownMenuItem key={host.host_id} disabled className="text-sm">
                         <HostOption
                           host={host}
                           subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
@@ -3764,10 +3762,10 @@ export function NewChatLandingScreen() {
                       }}
                       disabled={connectingThisMachine}
                       data-testid="new-chat-landing-run-on-this-machine"
-                      className="gap-2 text-xs"
+                      className="gap-2 text-sm"
                     >
                       <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <span className="text-xs">
+                      <span className="text-sm">
                         {connectingThisMachine ? "Connecting this machine…" : "Run on this machine"}
                       </span>
                     </DropdownMenuItem>
@@ -3779,7 +3777,7 @@ export function NewChatLandingScreen() {
                   <DropdownMenuItem
                     onSelect={() => setConnectOpen(true)}
                     data-testid="new-chat-landing-connect-host"
-                    className="gap-2 text-xs text-muted-foreground"
+                    className="gap-2 text-sm text-muted-foreground"
                   >
                     <PlusIcon className="size-3.5" />
                     Connect new host
@@ -3797,7 +3795,7 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
@@ -3814,7 +3812,7 @@ export function NewChatLandingScreen() {
                       <div className="flex items-center gap-1.5">
                         <label
                           htmlFor="landing-repo-url"
-                          className="text-xs font-medium text-foreground"
+                          className="text-sm font-medium text-foreground"
                         >
                           Repository (optional)
                         </label>
@@ -3841,7 +3839,7 @@ export function NewChatLandingScreen() {
                         value={sandboxRepoUrl}
                         onChange={(e) => setSandboxRepoUrl(e.target.value)}
                         placeholder="https://github.com/org/repo"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-repo-input"
                       />
                       <input
@@ -3850,10 +3848,10 @@ export function NewChatLandingScreen() {
                         onChange={(e) => setSandboxRepoBranch(e.target.value)}
                         placeholder="Branch (defaults to the repo's default)"
                         aria-label="Repository branch"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                         data-testid="new-chat-landing-repo-branch-input"
                       />
-                      <p className="text-xs text-muted-foreground">
+                      <p className="text-sm text-muted-foreground">
                         Cloned into the sandbox as the session's working directory. Leave blank to
                         start in an empty workspace.
                       </p>
@@ -3894,7 +3892,7 @@ export function NewChatLandingScreen() {
                         }
                       />
                     ) : (
-                      <p className="p-3 text-xs text-muted-foreground">Select a host first.</p>
+                      <p className="p-3 text-sm text-muted-foreground">Select a host first.</p>
                     )}
                   </PopoverContent>
                 </Popover>
@@ -3907,7 +3905,7 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
@@ -3930,14 +3928,14 @@ export function NewChatLandingScreen() {
                     <div className="flex flex-col gap-2">
                       <label
                         htmlFor="landing-branch-name"
-                        className="text-xs font-medium text-foreground"
+                        className="text-sm font-medium text-foreground"
                       >
                         Git worktree branch (optional)
                       </label>
                       {/* Help text sits above the field. The warning for a picked
                         existing worktree stays below the input (contextual to the
                         selection). */}
-                      <p className="text-xs text-muted-foreground">
+                      <p className="text-sm text-muted-foreground">
                         New branch name, or pick an existing worktree. Leave blank to start directly
                         in the working directory.
                       </p>
@@ -3970,7 +3968,7 @@ export function NewChatLandingScreen() {
                           name="omnigent-worktree-branch"
                           // pr-9 leaves room for the generate button overlaid at
                           // the right edge.
-                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-xs outline-none transition-colors focus-visible:border-ring"
+                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-sm outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-branch-input"
                         />
                         {/* Fill a unique branch name for a throwaway worktree.
@@ -3998,7 +3996,7 @@ export function NewChatLandingScreen() {
                             className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
-                            <span className="px-2 pt-1 pb-0.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+                            <span className="px-2 pt-1 pb-0.5 text-sm font-medium tracking-wide text-muted-foreground uppercase">
                               Existing worktrees
                             </span>
                             <ul className="flex flex-col gap-0.5">
@@ -4019,7 +4017,7 @@ export function NewChatLandingScreen() {
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
                                       }}
-                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent ${
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-accent ${
                                         selected ? "bg-accent" : ""
                                       }`}
                                       data-testid="new-chat-landing-worktree-option"
@@ -4054,13 +4052,13 @@ export function NewChatLandingScreen() {
                           onChange={(e) => setBaseBranch(e.target.value)}
                           placeholder="Base branch (defaults to current)"
                           aria-label="Base branch"
-                          className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                          className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-base-branch-input"
                         />
                       )}
                       {startInExistingWorktree && (
                         <p
-                          className="text-xs text-amber-600 dark:text-amber-500"
+                          className="text-sm text-amber-600 dark:text-amber-500"
                           data-testid="new-chat-landing-existing-worktree-warning"
                         >
                           Starts in existing worktree, edit the name to create a new one.
@@ -4111,7 +4109,7 @@ export function NewChatLandingScreen() {
           {supportsApprovalMode && bypassSandbox && (
             <p
               role="alert"
-              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive"
+              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium text-destructive"
               data-testid="new-chat-landing-bypass-sandbox-active-banner"
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
@@ -4123,7 +4121,7 @@ export function NewChatLandingScreen() {
           )}
 
           {createError && (
-            <p className="text-xs text-destructive" data-testid="new-chat-landing-error">
+            <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
           )}

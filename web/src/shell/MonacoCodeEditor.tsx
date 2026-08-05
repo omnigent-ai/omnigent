@@ -488,7 +488,7 @@ function MonacoCodeEditorInner({
       {canEdit &&
         isDirty &&
         (hasExternalUpdate ? (
-          <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground shrink-0">
+          <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground shrink-0">
             <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
             <span className="flex-1">
               This file was modified externally while you were editing.
@@ -509,7 +509,7 @@ function MonacoCodeEditorInner({
             </button>
           </div>
         ) : (
-          <div className="flex items-center gap-1.5 border-b border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground shrink-0">
+          <div className="flex items-center gap-1.5 border-b border-border bg-muted/50 px-4 py-1.5 text-sm text-muted-foreground shrink-0">
             <MessageSquareOffIcon className="size-3.5 shrink-0" />
             Save your changes to enable commenting on selections.
           </div>

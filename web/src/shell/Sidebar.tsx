@@ -957,7 +957,7 @@ function InfiniteScrollSentinel({
         if (hasMore) fetchMore();
       }}
       className={cn(
-        "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-xs hover:bg-muted disabled:pointer-events-none disabled:opacity-50",
+        "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-sm hover:bg-muted disabled:pointer-events-none disabled:opacity-50",
         indent && "pl-5",
       )}
     >
@@ -1104,7 +1104,7 @@ function ProjectFolder({
         }
         footer={
           loadingFirstPage ? (
-            <p className="px-2 py-1 pl-5 text-muted-foreground text-xs">Loading…</p>
+            <p className="px-2 py-1 pl-5 text-muted-foreground text-sm">Loading…</p>
           ) : (
             <InfiniteScrollSentinel
               hasMore={query.hasNextPage}
@@ -1671,7 +1671,7 @@ function ConversationList({
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
 
   if (conversationsQuery.isLoading) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
   }
   if (conversationsQuery.isError) {
     const err = conversationsQuery.error;
@@ -1836,7 +1836,7 @@ function ConversationList({
                     ))}
                     {sections.projectGroups.length === 0 &&
                       !effectiveCollapsedSections.includes("Projects") && (
-                        <p className="px-3 py-1.5 text-xs text-muted-foreground">
+                        <p className="px-3 py-1.5 text-sm text-muted-foreground">
                           No projects yet. Create one to group your sessions.
                         </p>
                       )}
@@ -2013,7 +2013,7 @@ function UngroupDropZone() {
       ref={setNodeRef}
       data-testid="sidebar-ungroup-drop-zone"
       className={cn(
-        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-xs transition-colors",
+        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-sm transition-colors",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >
@@ -2172,8 +2172,8 @@ function SessionFilterMenu({
         </TooltipTrigger>
         <TooltipContent side="bottom">Filter sessions</TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-xs">
-        <DropdownMenuLabel className="text-muted-foreground text-xs">Display</DropdownMenuLabel>
+      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-sm">
+        <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={value}
           onValueChange={(next) => onChange(next as SidebarTab)}
@@ -2847,7 +2847,7 @@ function SessionTooltipContent({
       </p>
       <p
         data-testid="session-tooltip-location"
-        className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+        className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
       >
         <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
         <span className="truncate">{locationLabel}</span>
@@ -2855,7 +2855,7 @@ function SessionTooltipContent({
       {conversation.git_branch && (
         <p
           data-testid="session-tooltip-branch"
-          className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
         >
           <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">{conversation.git_branch}</span>
@@ -3327,7 +3327,7 @@ function ConversationRow({
             <ContextMenuTrigger asChild>
               <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
             </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
               <ConversationMenuItems
                 components={contextBundle}
                 setMenuOpen={() => {}}
@@ -3344,7 +3344,7 @@ function ConversationRow({
       ) : isMobile ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+          <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
             <ConversationMenuItems
               components={contextBundle}
               setMenuOpen={() => {}}
@@ -3360,7 +3360,7 @@ function ConversationRow({
                 <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
               </div>
             </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
               <ConversationMenuItems
                 components={contextBundle}
                 setMenuOpen={() => {}}
@@ -3499,7 +3499,7 @@ function ConversationRow({
           </DialogHeader>
           {gitBranch !== null && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-              <p className="text-xs text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Optionally clean up the git worktree. These actions are{" "}
                 <span className="font-semibold text-destructive">irreversible</span>.
               </p>
@@ -3514,7 +3514,7 @@ function ConversationRow({
                 <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
                 <span className="min-w-0">
                   Delete local branch{" "}
-                  <code className="break-all rounded bg-muted px-1 py-0.5 text-xs">
+                  <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
                     {gitBranch}
                   </code>
                 </span>
@@ -3623,14 +3623,14 @@ function PinnedProjectFlyoutContent({
           clamp to 3 wrapped lines to keep the card tidy — full text stays in
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
-      <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+      <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
         <FolderIcon className="size-3.5 shrink-0" />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (
         <p
           data-testid="pinned-project-flyout-branch"
-          className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
         >
           <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">{gitBranch}</span>
@@ -3700,7 +3700,7 @@ function DeletingRow({
       <span className="min-w-0 flex-1 truncate" title={label}>
         {label}
       </span>
-      <span className="shrink-0 text-xs">Deleting…</span>
+      <span className="shrink-0 text-sm">Deleting…</span>
     </div>
   );
 }
@@ -3723,7 +3723,7 @@ function ArchivingRow({ label }: { label: string }) {
       <span className="min-w-0 flex-1 truncate" title={label}>
         {label}
       </span>
-      <span className="shrink-0 text-xs">Archiving…</span>
+      <span className="shrink-0 text-sm">Archiving…</span>
     </div>
   );
 }
@@ -4025,7 +4025,7 @@ function ProjectPickerMenu({
       <div className="flex items-center gap-2 border-b px-2 py-1.5">
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
-          className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           placeholder="Search projects"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
@@ -4042,7 +4042,7 @@ function ProjectPickerMenu({
           </C.Item>
         ))}
         {filtered.length === 0 && (
-          <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
+          <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
         )}
       </div>
       {currentProject && (
@@ -4360,7 +4360,7 @@ function BulkActionBar({
         </div>
 
         {(bulkArchive.isError || bulkDelete.isError) && (
-          <p className="text-xs text-destructive" role="alert">
+          <p className="text-sm text-destructive" role="alert">
             Some actions failed. Retry or dismiss.
           </p>
         )}
@@ -4375,7 +4375,7 @@ function BulkActionBar({
               be undone.
             </DialogDescription>
           </DialogHeader>
-          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground">
+          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-muted-foreground">
             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
             Branches are not cleaned up. Use single-session delete for branch surgery.
           </p>

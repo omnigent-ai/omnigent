@@ -283,7 +283,7 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     expect(screen.getByText("No active sessions")).toHaveClass("text-ui");
-    expect(screen.getByText("No active sessions")).not.toHaveClass("text-xs");
+    expect(screen.getByText("No active sessions")).not.toHaveClass("text-sm");
   });
 
   it("uses the interface text token for session-list errors", () => {
@@ -297,7 +297,7 @@ describe("Sidebar session list", () => {
 
     const error = screen.getByText("Failed to load: boom");
     expect(error).toHaveClass("text-ui");
-    expect(error).not.toHaveClass("text-xs");
+    expect(error).not.toHaveClass("text-sm");
   });
 
   it("keeps the session list scrollable without visible scrollbar chrome", () => {

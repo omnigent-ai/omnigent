@@ -199,7 +199,8 @@ describe("project folder header icon/chevron", () => {
       "text-center",
       "text-ui",
     );
-    expect(empty).not.toHaveClass("min-h-9", "text-xs");
+    // Body tier, not the smaller caption step.
+    expect(empty).not.toHaveClass("min-h-9", "text-sm");
   });
 
   it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {
@@ -209,7 +210,7 @@ describe("project folder header icon/chevron", () => {
 
     // The parent section label uses the settings-scaled subtitle tier.
     expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-sm", "font-normal");
-    expect(header).not.toHaveClass("font-medium", "text-caption", "uppercase");
+    expect(header).not.toHaveClass("font-medium", "uppercase");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
 
