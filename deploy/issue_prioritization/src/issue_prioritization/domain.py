@@ -36,7 +36,7 @@ class Issue:
     area_keys: tuple[str, ...] = ()
     component_labels: tuple[str, ...] = ()
     duplicate_count: int = 0
-    reaction_count: int = 0
+    upvote_count: int = 0
     current_priority: Priority | None = None
     needs_info: bool = False
     is_ready: bool = False
@@ -54,7 +54,7 @@ class Issue:
             area_keys=_string_tuple(value.get("area_keys", ())),
             component_labels=_string_tuple(value.get("component_labels", ())),
             duplicate_count=max(0, int(value.get("duplicate_count", 0))),
-            reaction_count=max(0, int(value.get("reaction_count", 0))),
+            upvote_count=max(0, int(value.get("upvote_count", 0))),
             current_priority=Priority(str(current_priority)) if current_priority else None,
             needs_info=bool(value.get("needs_info", False)),
             is_ready=bool(value.get("is_ready", False)),

@@ -18,7 +18,7 @@ class BronzeIssue:
     author: str
     labels: tuple[str, ...]
     created_at: datetime
-    reaction_count: int
+    upvote_count: int
     duplicate_count: int
 
     @classmethod
@@ -31,7 +31,7 @@ class BronzeIssue:
             author=str(_first(value, "author_login", "user_login", "author", default="")),
             labels=_labels(_first(value, "labels", "label_names", default=())),
             created_at=_timestamp(_first(value, "created_at")),
-            reaction_count=_reaction_count(value),
+            upvote_count=_upvote_count(value),
             duplicate_count=max(0, int(_first(value, "duplicate_count", default=0) or 0)),
         )
 
@@ -54,7 +54,7 @@ class BronzeIssue:
             area_keys=classification.area_keys,
             component_labels=classification.component_labels,
             duplicate_count=self.duplicate_count,
-            reaction_count=self.reaction_count,
+            upvote_count=self.upvote_count,
             current_priority=_current_priority(self.labels),
             needs_info="needs-info" in self.labels,
             age_days=max(0, (now - self.created_at).days),
@@ -96,8 +96,13 @@ def _timestamp(value: object) -> datetime:
     return parsed.replace(tzinfo=parsed.tzinfo or UTC)
 
 
-def _reaction_count(value: Mapping[str, object]) -> int:
-    direct = _first(value, "reaction_count", "reactions_total_count")
+def _upvote_count(value: Mapping[str, object]) -> int:
+    direct = _first(
+        value,
+        "upvote_count",
+        "thumbs_up_count",
+        "reactions_plus_one_count",
+    )
     if direct is not None:
         return max(0, int(direct))
     reactions = value.get("reactions")
@@ -107,7 +112,7 @@ def _reaction_count(value: Mapping[str, object]) -> int:
         except json.JSONDecodeError:
             return 0
     if isinstance(reactions, Mapping):
-        return max(0, int(reactions.get("total_count", 0)))
+        return max(0, int(reactions.get("+1", 0)))
     return 0
 
 

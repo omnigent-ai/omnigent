@@ -85,7 +85,7 @@ def _row(item: RankedIssue) -> dict[str, object]:
         "area_keys": list(issue.area_keys),
         "component_labels": list(issue.component_labels),
         "duplicate_count": issue.duplicate_count,
-        "reaction_count": issue.reaction_count,
+        "upvote_count": issue.upvote_count,
         "breakdown": [
             {
                 "name": step.name,

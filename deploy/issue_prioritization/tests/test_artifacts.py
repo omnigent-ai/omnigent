@@ -24,6 +24,8 @@ def test_dry_run_artifacts_are_complete_and_deterministic(tmp_path) -> None:
             severity=Severity.S1,
             area_keys=("db",),
             current_priority=Priority.P2,
+            upvote_count=3,
+            duplicate_count=2,
         ),
         Issue(
             number=1,
@@ -49,6 +51,9 @@ def test_dry_run_artifacts_are_complete_and_deterministic(tmp_path) -> None:
     summary = json.loads((first / "summary.json").read_text())
     assert summary["issue_count"] == 2
     assert summary["priority_changes"] == 2
+    ranking = json.loads((first / "ranking.json").read_text())
+    assert ranking[0]["upvote_count"] == 3
+    assert ranking[0]["duplicate_count"] == 2
 
 
 def test_cli_writes_review_artifacts_without_network(tmp_path) -> None:

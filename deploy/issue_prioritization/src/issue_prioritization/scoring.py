@@ -47,10 +47,10 @@ class DemandModule:
     name: str = "demand"
 
     def apply(self, issue: Issue, score: Decimal) -> ScoreStep:
-        cap = int(self.config.decimal("reaction_cap"))
-        reactions = min(issue.reaction_count, cap)
+        cap = int(self.config.decimal("upvote_cap"))
+        upvotes = min(issue.upvote_count, cap)
         points = (
-            self.config.decimal("max_points") * Decimal(reactions) / Decimal(cap)
+            self.config.decimal("max_points") * Decimal(upvotes) / Decimal(cap)
             if cap
             else Decimal(0)
         )

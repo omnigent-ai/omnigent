@@ -75,7 +75,7 @@ def _bronze(number, author="community"):
         author=author,
         labels=("Bug", "P2-medium"),
         created_at=datetime(2026, 8, 1, tzinfo=UTC),
-        reaction_count=0,
+        upvote_count=0,
         duplicate_count=0,
     )
 

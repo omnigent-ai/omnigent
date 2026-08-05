@@ -21,7 +21,8 @@ _SCORE_SCHEMA = """run_id STRING, mode STRING, regrade BOOLEAN,
 adopt_legacy_bot_priorities BOOLEAN, legacy_priorities_adopted BIGINT,
 scored_at TIMESTAMP, rank BIGINT, previous_rank BIGINT, rank_delta BIGINT,
 issue_number BIGINT, title STRING, url STRING, issue_type STRING, severity STRING,
-score DOUBLE, current_priority STRING, proposed_priority STRING,
+score DOUBLE, upvote_count BIGINT, duplicate_count BIGINT,
+current_priority STRING, proposed_priority STRING,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, breakdown_json STRING,
 labels_add ARRAY<STRING>, labels_remove ARRAY<STRING>, mutation_blocked ARRAY<STRING>"""
 _BOT_STATE_SCHEMA = """issue_number BIGINT, priority STRING, severity STRING,
@@ -126,6 +127,8 @@ class SparkScoreSink:
                     "issue_type": issue.issue_type.value,
                     "severity": issue.severity.value,
                     "score": float(result.score),
+                    "upvote_count": issue.upvote_count,
+                    "duplicate_count": issue.duplicate_count,
                     "current_priority": issue.current_priority.value
                     if issue.current_priority
                     else None,

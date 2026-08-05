@@ -53,7 +53,12 @@ def test_low_weight_s1_bug_falls_to_p2() -> None:
 
 
 def test_duplicate_reach_is_capped() -> None:
-    result = ScoreEngine(ScoringConfig.default(), _catalog()).score(
+    default = ScoringConfig.default()
+    modules = dict(default.modules)
+    modules["duplicates"] = ModuleConfig(True, modules["duplicates"].values)
+    enabled = replace(default, modules=modules)
+
+    result = ScoreEngine(enabled, _catalog()).score(
         _issue(severity=Severity.S2, duplicate_count=100)
     )
 
@@ -78,7 +83,6 @@ def test_optional_modules_are_disabled_by_default() -> None:
     assert [step.name for step in result.steps] == [
         "severity",
         "component",
-        "duplicates",
         "demand",
     ]
 
@@ -99,8 +103,8 @@ def test_optional_modules_can_be_enabled_independently() -> None:
 def test_demand_is_linear_and_type_independent() -> None:
     engine = ScoreEngine(ScoringConfig.default(), _catalog())
 
-    bug = engine.score(_issue(reaction_count=6))
-    feature = engine.score(_issue(issue_type=IssueType.ENHANCEMENT, reaction_count=6))
+    bug = engine.score(_issue(upvote_count=6))
+    feature = engine.score(_issue(issue_type=IssueType.ENHANCEMENT, upvote_count=6))
 
     assert bug.score == Decimal("91.50")
     assert feature.score == bug.score
@@ -112,7 +116,7 @@ def test_demand_is_capped() -> None:
             issue_type=IssueType.ENHANCEMENT,
             severity=Severity.S2,
             area_keys=("harness-kimi",),
-            reaction_count=1000,
+            upvote_count=1000,
         )
     )
 

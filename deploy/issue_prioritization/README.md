@@ -20,7 +20,9 @@ GitHub write path.
 
 All weights and enabled modules live in
 `src/issue_prioritization/default_scoring.json`. Readiness and age are present
-but disabled by default.
+but disabled by default. Duplicate reach is also disabled until the upstream
+triage pipeline exposes confirmed duplicate links as structured data. Community
+demand counts GitHub `+1` reactions only, not all reaction types.
 
 ## Databricks dry-run
 

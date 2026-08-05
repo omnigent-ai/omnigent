@@ -111,6 +111,8 @@ def test_score_sink_uses_schema_evolution() -> None:
     sink.write(run)
 
     assert spark.schemas[0].count("ARRAY<STRING>") == 5
+    assert "upvote_count BIGINT" in spark.schemas[0]
+    assert "duplicate_count BIGINT" in spark.schemas[0]
     assert spark.frames[0].write.options == {"mergeSchema": "true"}
     assert spark.statements[0].startswith("CREATE OR REPLACE VIEW main.team.scores_latest")
 

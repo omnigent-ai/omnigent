@@ -24,13 +24,13 @@
       "default_weight": 1.0
     },
     "duplicates": {
-      "enabled": true,
+      "enabled": false,
       "increment": 0.15,
       "max_bonus": 0.5
     },
     "demand": {
       "enabled": true,
-      "reaction_cap": 12,
+      "upvote_cap": 12,
       "max_points": 15
     },
     "readiness": {
