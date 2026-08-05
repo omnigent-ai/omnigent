@@ -619,7 +619,7 @@ def test_host_http_json_handles_remote_headers_oserror() -> None:
     converted to a graceful _HostHttpResult(status_code=0) like any other
     transport failure.
     """
-    from omnigent.cli import _host_http_json, _host_http_headers_cache
+    from omnigent.cli import _host_http_headers_cache, _host_http_json
 
     # Clear cache so the resolution path is exercised.
     url = "https://oserror-test.example.com"
