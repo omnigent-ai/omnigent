@@ -262,16 +262,20 @@ RUN npm install -g --no-audit --no-fund \
 
 # Optional additional npm-installable harness CLIs (e.g. opencode-ai, a qwen
 # package) for a downstream deployment that wants a harness beyond the
-# pre-baked set above, without forking this Dockerfile or waiting on a broader
-# policy for what ships by default (see the discussion on #1575 — the current
-# set grew one harness at a time with no shared inclusion policy yet, so we're
-# not expanding it further here). Off by default: does not change the shipped
-# CLI set. Space-separate multiple specs and pin versions the same way the
-# default set is unpinned/pinned above — e.g.:
+# pre-baked set above, without forking this Dockerfile. The pre-baked set has
+# grown one harness at a time with no shared policy yet for what ships by
+# default, so this sidesteps that question entirely rather than expanding it.
+# Off by default: does not change the shipped CLI set. Space-separate multiple
+# specs and pin versions the same way the default set is unpinned/pinned
+# above — e.g.:
 #   --build-arg EXTRA_HARNESS_CLIS="opencode-ai@1.17.11"
 # Mirrors the OMNIGENT_EXTRAS pattern used for optional Python extras above.
+# `set -f` disables pathname expansion for the unquoted expansion below, so a
+# spec containing a shell glob character (*, ?, []) is passed to npm literally
+# instead of being matched against files in the build context.
 ARG EXTRA_HARNESS_CLIS=
 RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
+        set -f; \
         npm install -g --no-audit --no-fund ${EXTRA_HARNESS_CLIS} \
         && npm cache clean --force; \
     fi
