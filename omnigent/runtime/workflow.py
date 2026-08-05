@@ -800,30 +800,37 @@ def _apply_provider_to_openai_agents(env: dict[str, str], family: FamilyConfig) 
         )
 
 
-def _optional_provider_family(entry: ProviderEntry, family_name: str) -> FamilyConfig | None:
-    """Return a provider family, or ``None`` if absent *or* its key env var is unset.
+def _optional_provider_family(
+    entry: ProviderEntry, family_name: str
+) -> tuple[FamilyConfig | None, OmnigentError | None]:
+    """Attempt to resolve a provider family, returning success or failure info.
 
     For the ``pi`` harness, which carries a single credential but probes
     both families: a family whose ``$VAR`` is unresolved is treated as
     unavailable rather than fatal, so e.g. a user who only exported
     ``ANTHROPIC_API_KEY`` can still run pi on the anthropic family.
 
-    The only :class:`OmnigentError` raised at family-access time comes from
-    the deferred ``$VAR`` expansion (structural validation already happened
-    at parse time), so catching it here narrowly means "this family's
-    credential is not configured". A ``keychain:`` ref raises ``ValueError``
-    (deferred — see :func:`resolve_secret`); that propagates so the user
-    sees the clear "not yet supported" message rather than a silent skip.
+    All credential resolution failures (unresolved ``env:`` var, missing
+    keychain secret) raise :class:`OmnigentError` at family-access time
+    (structural validation already happened at parse time). They are caught
+    here so the other family can be tried; the error is returned to the
+    caller so it can be surfaced when no family succeeds.
+
+    Returns a two-tuple ``(family, error)`` so the caller can include the
+    original resolution error in its failure message, naming the missing
+    variable instead of emitting a generic "no family resolves" message.
 
     :param entry: The resolved provider entry.
     :param family_name: Family key, e.g. ``"openai"`` or ``"anthropic"``.
-    :returns: The :class:`FamilyConfig`, or ``None`` when the family is
-        absent or its credential env var is unset.
+    :returns: ``(FamilyConfig, None)`` when the family resolved, or
+        ``(None, OmnigentError)`` when resolution failed, or ``(None, None)``
+        when the family is simply not configured.
     """
     try:
-        return entry.family(family_name)
-    except OmnigentError:
-        return None
+        family = entry.family(family_name)
+        return family, None
+    except OmnigentError as exc:
+        return None, exc
 
 
 def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
@@ -837,25 +844,35 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
 
     A family whose credential env var is unset is skipped (not fatal) so a
     user who exported only one vendor's key can still run pi on that family.
-    If neither family resolves, this fails loud.
+    If neither family resolves, this fails loud, including the original
+    credential resolution error(s) so the user knows which env var to set.
 
     :param env: Mutable spawn-env dict, modified in place.
     :param entry: The resolved provider entry (at least one inline family).
     :raises OmnigentError: If no configured family's credentials resolve,
         or no model can be resolved for the chosen family.
     """
-    anthropic = _optional_provider_family(entry, ANTHROPIC_FAMILY)
-    openai = _optional_provider_family(entry, OPENAI_FAMILY)
+    anthropic, anthropic_err = _optional_provider_family(entry, ANTHROPIC_FAMILY)
+    openai, openai_err = _optional_provider_family(entry, OPENAI_FAMILY)
     base_urls: dict[str, str] = {}
     if anthropic is not None:
         base_urls[_PI_FAMILY_KEY[ANTHROPIC_FAMILY]] = anthropic.base_url
     if openai is not None:
         base_urls[_PI_FAMILY_KEY[OPENAI_FAMILY]] = openai.base_url
     if not base_urls:
+        # At least one family was configured (the provider passed parse-time
+        # validation) but its credential could not be resolved. Surface the
+        # original error(s) so the user knows which env var to set, rather
+        # than a generic "set the api_key env var" message that omits the name.
+        cred_errors = [str(err) for err in (anthropic_err, openai_err) if err is not None]
+        detail = (
+            f" ({'; '.join(cred_errors)})"
+            if cred_errors
+            else " — set the api_key env var for its 'anthropic' or 'openai' family in your shell"
+        )
         raise OmnigentError(
             f"pi harness: provider {entry.name!r} configures no family whose "
-            "credentials resolve — set the api_key env var for its 'anthropic' or "
-            "'openai' family in your shell, then retry.",
+            f"credentials resolve{detail}, then retry.",
             code=ErrorCode.INVALID_INPUT,
         )
     # pi carries a single credential: anthropic's when present, else openai's.
@@ -870,6 +887,8 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     assert auth_source is not None  # base_urls non-empty ⇒ one family resolved
     env[_HARNESS_GATEWAY_FLAG["pi"]] = "true"
     env["HARNESS_PI_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
+    if openai is not None and openai.wire_api is not None:
+        env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] = openai.wire_api
     env["HARNESS_PI_GATEWAY_HOST"] = _origin_of(next(iter(base_urls.values())))
     env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] = _provider_auth_command(auth_source)
     # Model precedence: spec model > provider ``models.default`` > catalog
@@ -1495,6 +1514,57 @@ def _build_goose_spawn_env(
     return env
 
 
+def _build_acp_cli_spawn_env(
+    spec: AgentSpec,
+    *,
+    harness: str,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
+
+    Rows in :data:`omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES` all run the
+    shared ``omnigent/inner/acp_harness.py`` wrap; this maps a row + spec to
+    the ``HARNESS_ACP_*`` vars it reads. Like goose/acp, a vendor ACP CLI owns
+    its own auth and model, so no provider/gateway credential and no model var
+    is wired. The binary resolves via the ``OMNIGENT_<NAME>_PATH`` env
+    override, then the config ``harness.<name>.command`` path, then PATH plus
+    the common global install dirs.
+
+    :param spec: The agent spec.
+    :param harness: The catalog row key, e.g. ``"grok"``.
+    :param workdir: Accepted for signature parity with the other builders; the
+        ACP wrap consumes no bundle dir.
+    :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harness_startup_config import (
+        config_harness_path_override,
+        resolve_harness_path,
+    )
+
+    row = ACP_CLI_HARNESSES[harness]
+    executable = (
+        resolve_harness_path(harness)
+        or config_harness_path_override(harness, load_config())
+        or resolve_cli_binary(row.binary)
+        or row.binary
+    )
+    env = {
+        "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
+        "HARNESS_ACP_NAME": row.label,
+    }
+    # Session workspace (selected working folder). ``None`` lets the wrap fall
+    # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
+    if cwd is not None:
+        env["HARNESS_ACP_CWD"] = str(cwd)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    return env
+
+
 def _build_acp_spawn_env(
     spec: AgentSpec,
     *,
@@ -1535,7 +1605,7 @@ def _build_acp_spawn_env(
     )
 
     has_embedded = isinstance(cfg, dict) and "acp_agent" in cfg
-    embedded = cfg.get("acp_agent") if has_embedded else None
+    embedded = cfg.get("acp_agent") if isinstance(cfg, dict) else None
     agent: AcpAgentEntry | None = None
     if has_embedded:
         if not isinstance(embedded, dict):
@@ -1546,10 +1616,14 @@ def _build_acp_spawn_env(
             isinstance(name, str) and name.strip() and isinstance(command, str) and command.strip()
         ):
             raise ValueError("executor acp_agent requires non-empty string name and command")
+        omnigent_mcp = embedded.get("omnigent_mcp", True)
+        if not isinstance(omnigent_mcp, bool):
+            raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
             command=command.strip(),
+            omnigent_mcp=omnigent_mcp,
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
@@ -1563,6 +1637,7 @@ def _build_acp_spawn_env(
         env["HARNESS_ACP_SESSION_ID_MODE"] = agent.session_id_mode
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
+        env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
 
         model = _resolve_spec_model(spec)
         if model is not None and not model.startswith(("databricks-", "databricks/")):

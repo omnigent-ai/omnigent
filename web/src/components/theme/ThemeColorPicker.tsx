@@ -110,7 +110,7 @@ export function ThemeColorPicker({
 
   return (
     <div className="flex items-center justify-between gap-4 border-b border-border/70 py-3 last:border-b-0">
-      <span className="text-sm font-medium">{label}</span>
+      <span className="text-ui font-medium">{label}</span>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button

@@ -1,3 +1,9 @@
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -7,7 +13,7 @@ import { useChatStore } from "@/store/chatStore";
 // mentions); these status-line tests don't exercise it, so stub the hook to
 // avoid wrapping every render in a QueryClientProvider.
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
@@ -26,19 +32,19 @@ const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(()
   useSessionHostOnlineMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: (id: string | null | undefined) => useSessionMock(id),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: (opts: unknown) => useHostsMock(opts),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -313,20 +319,30 @@ describe("Composer status line (branch + context ring)", () => {
   });
 
   it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
-    // host_offline surfaces the reconnect affordance in the host badge (in
-    // place of the old banner below the composer): the tray shows even with
-    // no branch/ring, and clicking the badge opens the reconnect help.
+    // An offline host surfaces the reconnect affordance in the host badge (in
+    // place of the old banner below the composer) while keeping the host name:
+    // the tray shows even with no branch/ring, and clicking opens the help.
     bindHost("mac-laptop");
     useSessionHostOnlineMock.mockReturnValue(false);
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
     const onShowReconnectHelp = vi.fn();
-    renderComposer({ hostOffline: true, onShowReconnectHelp });
+    renderComposer({ onShowReconnectHelp });
 
     expect(statusLine()).not.toBeNull();
     const badge = screen.getByTestId("host-badge");
     expect(badge.tagName).toBe("BUTTON");
-    expect(badge).toHaveTextContent(/Host is offline/);
+    expect(badge).toHaveTextContent("mac-laptop");
     badge.click();
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the tray hidden for a session with no host and nothing else to show", () => {
+    // onShowReconnectHelp is now passed for every session, so it must not
+    // resurrect an empty tray on a session with no host badge to hang it on.
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer({ onShowReconnectHelp: vi.fn() });
+
+    expect(statusLine()).toBeNull();
   });
 
   it("hides the host badge on a sub-agent session", () => {

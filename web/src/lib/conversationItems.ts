@@ -19,6 +19,9 @@ export interface BaseItem {
   type: string;
   response_id: string;
   status: string;
+  /** Server-side creation time (unix epoch seconds). Drives the
+   *  completed-turn "Worked for" duration for reloaded history. */
+  created_at?: number;
 }
 
 export interface MessageItem extends BaseItem {
@@ -64,8 +67,8 @@ export interface ErrorItem extends BaseItem {
 export interface ReasoningItem extends BaseItem {
   type: "reasoning";
   model: string;
-  summary: Array<{ type: string; text: string }>;
-  content?: Array<{ type: string; text: string }>;
+  summary: { type: string; text: string }[];
+  content?: { type: string; text: string }[];
 }
 
 /** The provider-native tool item types the runtime persists today. */

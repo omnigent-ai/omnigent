@@ -1,66 +1,48 @@
 # Model Hardcoding Plan
 
-## Current Curated Inventory
+## Current Inventory
 
-The current baseline lives in `dev/lint/hardcoded_model_allowlist.txt`. It is
-count-based by `path` and `model-id`, so unrelated line movement does not break
-the hook while net-new pins still fail.
-
-The remaining pins fall into a few buckets:
-
-- **CI automation:** `.github/actions/*`, `.github/scripts/ci/*`, and
-  `.github/workflows/*` pin Databricks gateway models for review bots, release
-  helpers, image generation, and integration stress jobs.
-- **Harness defaults:** native/executor launch paths such as
-  `omnigent/pi_native_credentials.py`, `omnigent/opencode_native_provider.py`,
-  `omnigent/inner/*_executor.py`, and `omnigent/codex_native_app_server.py`
-  still carry fallback model ids.
-- **Static pickers/catalogs:** `omnigent/model_catalog.py` and
-  `omnigent/cursor_native.py` encode static model choices for CLIs that do not
-  expose a directly reusable live listing API.
-- **Policy and sizing logic:** `omnigent/llms/context_window.py`,
-  `omnigent/policies/builtins/routing.py`, and `omnigent/tools/builtins/spawn.py`
-  mention concrete models when mapping windows, routing examples, or dispatch
-  examples.
-- **Examples/onboarding:** `examples/kimi_hello.yaml` and onboarding provider
-  prompts include concrete defaults to make first-run setup work.
+Production model selection uses explicit operator configuration, provider or
+CLI discovery, and normalized catalog metadata. The count-based hardcode
+baseline is gone. The only source-controlled model aliases are the unavoidable
+Claude and Codex records in `omnigent/model_fallbacks.py`; each carries an owner,
+provenance, and the discovery gap that prevents a live listing.
 
 ## Prevention
 
-- `dev/lint/lint_no_hardcoded_models.py` scans non-test Python/config/shell
-  files for concrete model ids in model-selection contexts.
-- When a supported file or the baseline changes, `.pre-commit-config.yaml` runs
-  the hook across the full tracked lint surface so both new pins and stale
-  allowlist counts fail.
-- New hardcoded ids fail unless the allowlist count is intentionally updated,
-  while removing a pin requires lowering or deleting its baseline entry.
+- `dev/lint/lint_no_hardcoded_models.py` scans every tracked non-test
+  Python/config/shell file for concrete model ids.
+- When a supported file changes, `.pre-commit-config.yaml` runs the hook across
+  the full tracked lint surface so any non-owned hardcode fails.
+- Unavoidable static aliases pass only when Python AST analysis proves they are
+  confined to complete `StaticModelFallback` records in
+  `omnigent/model_fallbacks.py`, including non-empty owner, provenance, and
+  discovery-gap metadata.
+- There is no count-based escape hatch. New production aliases must either come
+  from configuration/discovery or satisfy the central owned-fallback contract.
 
 ### Scope and exclusions
 
-The hook scans Python, YAML, JSON, TOML, and shell files under `omnigent`,
-`scripts`, `examples`, `.github`, and `dev/lint`. Python uses AST context;
-config and shell files use model-looking lines while ignoring comment-only
-lines.
+The hook scans tracked Python, YAML, JSON, TOML, and shell files across the
+repository. Python AST analysis checks every non-docstring string literal;
+config and shell files check every non-comment line. Tests, Markdown/prose,
+TypeScript/JavaScript, generated OpenAPI, and vendor/build trees are excluded.
 
-Tests, Markdown/prose, top-level files, `web` TypeScript/JavaScript, and
-generated/vendor trees are intentionally outside the initial lint surface.
-Tests need concrete ids as fixtures, while prose and frontend sources need
-syntax-aware handling before they can be added without excessive false
-positives.
+Concrete model ids in runtime help, logs, and errors are production literals
+and therefore fail lint. Use provider-neutral wording or synthetic identifier
+shapes there; docstrings may retain concrete examples when they materially
+improve API documentation.
 
-This is a heuristic ratchet, not a parser-level guarantee. Python detection is
-limited to model-named assignments, keyword arguments, and dictionary keys; a
-model id in an unrelated positional argument or bare collection can escape the
-check. Config and shell detection requires the model context and id on the same
-line, so multiline/block-scalar values are also outside the initial coverage.
-These gaps should be closed with syntax-aware scanners rather than broader
-regexes that would make prose false-positive.
+This remains a model-id regex ratchet rather than a parser-level guarantee for
+every provider naming scheme. Extend the regex and add a focused test when a
+new complete-id shape appears; do not broaden structural exceptions beyond
+complete owned fallback records.
 
 The hook intentionally scans the full tracked surface when a supported file
-changes. That bounded cost is what lets it enforce exact global baseline counts
-instead of only checking additions in changed files. Like the existing Ruff
-hooks, local pre-commit execution assumes the repository `.venv` has been
-prepared with `just ensure`; CI is the enforcement backstop.
+changes. That bounded cost is what lets it enforce global absence instead of
+only checking additions in changed files. Like the existing Ruff hooks, local
+pre-commit execution assumes the repository `.venv` has been prepared with
+`just ensure`; CI is the enforcement backstop.
 
 ## Migration Plan
 
@@ -77,11 +59,11 @@ prepared with `just ensure`; CI is the enforcement backstop.
 4. **Centralize static fallback catalogs.** Keep unavoidable static CLI catalogs
    behind one module with provenance, TTL/refresh notes, and a smaller lint
    exception surface.
-5. **Ratchet the baseline down.** Each migration removes the corresponding
-   `dev/lint/hardcoded_model_allowlist.txt` entry; the lint rejects both count
-   increases and stale allowances.
-6. **Document escape hatches.** If a temporary pin is unavoidable, require a
-   short rationale near the call site and the smallest allowlist count.
+5. **Delete the baseline.** With production call sites migrated, reject every
+   non-owned model literal instead of maintaining path/count exceptions.
+6. **Constrain the escape hatch.** Unavoidable static aliases must live in the
+   central fallback registry with literal ownership, provenance, and discovery
+   gap metadata.
 
 ## Resolver Contract
 
@@ -159,6 +141,22 @@ An explicit Anthropic `[1m]` marker remains self-describing metadata, and an
 uncatalogued/offline model keeps the conservative 128K fallback rather than a
 release-specific guess.
 
+## Pi Wire Routing
+
+Pi gateway configuration consumes the same normalized Unity Catalog model
+service metadata. Databricks GPT models use the Responses or Chat surface the
+catalog advertises, while generic OpenAI-compatible providers honor their
+configured wire. If Databricks discovery is unavailable, an unknown GPT uses
+Responses rather than a release-specific completions allowlist.
+
+## Pi Picker Migration
+
+Inner Pi sessions populate their model registry from live Unity Catalog model
+services instead of a release-specific Databricks list. MLflow metadata adds
+context and output limits when available. If discovery is unavailable, the
+resolved run model is still registered so launch does not depend on picker
+enumeration; no stale alternatives are offered.
+
 ## Kiro Picker Migration
 
 The Kiro Web picker now runs `kiro-cli chat --list-models --format json` on the
@@ -166,6 +164,23 @@ bound runner and forwards the CLI's model ids, default, descriptions, context
 windows, and credit rates. The server caches the runner response through the
 same asynchronous picker path as Codex, so provider changes no longer require an
 Omnigent source update and snapshots do not block on the CLI process.
+
+## CI Model Configuration
+
+Credentialed automation reads model roles from repository variables instead of
+pinning provider releases in workflow source:
+
+- `OMNIGENT_CI_ANTHROPIC_MODEL`
+- `OMNIGENT_CI_FAST_ANTHROPIC_MODEL`
+- `OMNIGENT_CI_OPENAI_MODEL`
+- `OMNIGENT_CI_E2E_JUDGE_MODEL`
+- `OMNIGENT_CI_E2E_MODEL_POOL_GPT`
+- `OMNIGENT_CI_IMAGE_MODEL`
+
+Operators can update those values as provider catalogs change without a code
+release. Workflows deliberately do not carry source-controlled model defaults;
+missing required variables fail or take their existing fail-open path.
+
 ## Ad-hoc CLI Defaults
 
 Minimal agent YAMLs that declare neither a harness nor a model now resolve the
@@ -185,6 +200,33 @@ prefilling a source-controlled model pin.
 The same policy supplies the final runtime fallback for key, gateway, and local
 providers. Explicit agent and provider defaults still win; without either,
 runtime discovery fails with configuration guidance when no catalog is available.
+
+## Persistent Catalog Resilience
+
+The shared MLflow catalog boundary persists one validated last-known-good file
+per provider in the platform user-cache directory. A cache is fresh for one
+hour; if live retrieval fails, a validated entry remains usable for up to seven
+days and logs its source and age. Atomic replacement prevents concurrent
+processes from exposing partial JSON.
+
+Cache files record their own schema version, the upstream catalog schema,
+source URL, and fetch time. Corrupt, incompatible, wrong-source, or over-age
+entries are ignored. `OMNIGENT_DISABLE_CATALOG_LOOKUP=1` bypasses in-memory,
+disk, and network lookup so tests cannot inherit developer-machine state.
+
+## Configuration Help Text
+
+Setup prompts, routing policy schemas, and spawn-tool descriptions explain the
+expected provider-configured model value without embedding release-specific ids.
+Runtime help may use synthetic examples to show identifier shape; concrete
+release ids belong in tests or provider-owned documentation.
+
+## Static Fallback Ownership
+
+The remaining Claude and Codex aliases live only in
+`omnigent/model_fallbacks.py`. Each fallback records its adapter owner, catalog
+provenance, and the discovery gap that prevents a live listing. `sys_list_models`
+surfaces those fields whenever it returns an unverified static catalog.
 
 ## Kimi Example Default
 

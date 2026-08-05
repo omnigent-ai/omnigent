@@ -46,12 +46,15 @@ import sys
 import threading
 import time
 from types import FrameType
+from typing import cast
 
 import uvicorn
 from fastapi import FastAPI
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.inner import _proc
+from omnigent.process_logging import env_truthy
+from omnigent.runner._zygote import ZYGOTE_HARNESS_FORKED_ENV_VAR
 
 # uvicorn log level for harness subprocesses. ``"warning"`` keeps
 # the per-process noise low (AP and the harness wrap both emit
@@ -235,6 +238,14 @@ def _start_parent_watchdog(parent_pid: int) -> threading.Thread:
         join it).
     """
 
+    # A zygote-forked harness has the zygote — not its runner (``parent_pid``)
+    # — as OS parent, so ``os.getppid()`` never equals ``parent_pid`` and the
+    # reparent check would fire instantly. Rely solely on the explicit pid probe
+    # in that case, exactly as Windows already does.
+    trust_getppid = not IS_WINDOWS and not env_truthy(
+        os.environ.get(ZYGOTE_HARNESS_FORKED_ENV_VAR)
+    )
+
     def _watch() -> None:
         while True:
             time.sleep(_PARENT_POLL_INTERVAL_S)
@@ -243,7 +254,7 @@ def _start_parent_watchdog(parent_pid: int) -> threading.Thread:
             # os.getppid() is unreliable (the venv launcher breaks the parent
             # link), so it would falsely report the parent gone the instant
             # the watchdog starts; rely solely on the explicit liveness probe.
-            if not IS_WINDOWS and os.getppid() != parent_pid:
+            if trust_getppid and os.getppid() != parent_pid:
                 _request_shutdown_with_hard_exit("parent process exit")
                 return
             # Secondary probe for the window before POSIX reparenting is
@@ -345,6 +356,37 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _create_uvicorn_config(
+    app: FastAPI,
+    socket_path: str | None,
+    bind: str | None,
+) -> uvicorn.Config:
+    """Build the Uvicorn config for the allocated runner endpoint.
+
+    Uses a Unix socket on POSIX or loopback TCP on Windows, keeps
+    per-process logging quiet, and bounds graceful connection draining.
+    """
+    # Uvicorn accepts fractional seconds despite its integer annotation.
+    graceful_timeout = cast("int", _GRACEFUL_SHUTDOWN_TIMEOUT_S)
+    if socket_path:
+        return uvicorn.Config(
+            app,
+            uds=socket_path,
+            log_level=_UVICORN_LOG_LEVEL,
+            timeout_graceful_shutdown=graceful_timeout,
+        )
+    if bind:
+        host, _, port = bind.rpartition(":")
+        return uvicorn.Config(
+            app,
+            host=host,
+            port=int(port),
+            log_level=_UVICORN_LOG_LEVEL,
+            timeout_graceful_shutdown=graceful_timeout,
+        )
+    sys.exit("runner: exactly one of --socket or --bind is required")
+
+
 def main(argv: list[str] | None = None) -> None:
     """
     Runner entrypoint.
@@ -366,26 +408,14 @@ def main(argv: list[str] | None = None) -> None:
 
     app = _load_harness_app(args.harness, args.module, args.conversation_id)
     if args.parent_pid is not None:
-        _set_pdeathsig()
+        # Skip PR_SET_PDEATHSIG for a zygote-forked harness: it binds death to
+        # the OS parent (the zygote), not the runner, so it would fire only when
+        # the zygote dies. The watchdog's explicit runner-pid probe is the
+        # correct death signal there.
+        if not env_truthy(os.environ.get(ZYGOTE_HARNESS_FORKED_ENV_VAR)):
+            _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
-    # Bind the endpoint Omnigent allocated for this conversation: a Unix socket
-    # path (``--socket``, POSIX) or a TCP loopback host:port (``--bind``,
-    # Windows). ``log_level`` keeps per-process noise low — see
-    # ``_UVICORN_LOG_LEVEL``. ``timeout_graceful_shutdown`` bounds how long
-    # uvicorn waits for active connections after SIGTERM before force-exiting.
-    if args.socket:
-        bind_kwargs: dict[str, object] = {"uds": args.socket}
-    elif args.bind:
-        host, _, port = args.bind.rpartition(":")
-        bind_kwargs = {"host": host, "port": int(port)}
-    else:
-        sys.exit("runner: exactly one of --socket or --bind is required")
-    config = uvicorn.Config(
-        app,
-        log_level=_UVICORN_LOG_LEVEL,
-        timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-        **bind_kwargs,
-    )
+    config = _create_uvicorn_config(app, args.socket, args.bind)
     _HardExitServer(config).run()
 
 

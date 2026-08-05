@@ -303,16 +303,28 @@ describe("quick pin/unpin hover button", () => {
   });
 
   it("sizes the Projects group-header controls to the same compact icon", () => {
-    // The "New project" / "Expand all" controls share the right-edge column
-    // with the folder + session kebabs, so they use the same compact `icon-xs`
+    // The "New project" button and the list-actions kebab (expand-all /
+    // select-sessions live inside it) share the right-edge column with the
+    // folder + session kebabs, so they use the same compact `icon-xs`
     // (size-6), not the larger `icon-sm` (size-7).
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     expect(screen.getByTestId("new-project")).toHaveClass("size-6");
     expect(screen.getByTestId("new-project")).not.toHaveClass("size-7");
-    expect(screen.getByTestId("expand-all-projects")).toHaveClass("size-6");
-    expect(screen.getByTestId("expand-all-projects")).not.toHaveClass("size-7");
+    expect(screen.getByTestId("project-list-actions")).toHaveClass("size-6");
+    expect(screen.getByTestId("project-list-actions")).not.toHaveClass("size-7");
+  });
+
+  it("hides the Projects list-actions kebab when there are no projects", () => {
+    // With no projects, the kebab has nothing to offer (no expand/collapse, no
+    // sessions to select) and would open empty — so it's hidden entirely,
+    // leaving just the "New project" button.
+    mocks.projects = [];
+    renderSidebar();
+
+    expect(screen.queryByTestId("project-list-actions")).toBeNull();
+    expect(screen.getByTestId("new-project")).toBeInTheDocument();
   });
 
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
@@ -556,11 +568,10 @@ describe("pinned row project flyout", () => {
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     const flyoutTitle = within(flyout).getByText("My Session");
     expect(flyoutTitle).toBeInTheDocument();
-    // The flyout title is sized to match the sidebar row name
-    // (`sidebar-compact-text`, 13px at the default), not the larger `text-sm`.
-    // Both scale with the UI font-size setting via the rem-based root.
+    // The flyout title matches sidebar row names through the shared compact
+    // class, which resolves to the same text-ui step as Appearance content.
     expect(flyoutTitle).toHaveClass("sidebar-compact-text");
-    expect(flyoutTitle).not.toHaveClass("text-sm");
+    expect(flyoutTitle).not.toHaveClass("text-ui");
     expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );

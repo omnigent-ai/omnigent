@@ -221,13 +221,12 @@ export function shouldEchoSynchronously(byteLength: number, msSinceLastInput: nu
  * synchronous ``writeSync`` method that the public types don't expose
  * (see {@link TerminalSession.writeOutput}).
  */
-// eslint-disable-next-line no-underscore-dangle
-type TerminalCore = {
+interface TerminalCore {
   _core?: {
     writeSync?: (data: Uint8Array, maxSubsequentCalls?: number) => void;
     coreMouseService?: { activeEncoding?: string };
   };
-};
+}
 
 /**
  * Load the WebGL renderer onto *term*, returning the addon or ``null``
@@ -312,13 +311,13 @@ export const WHEEL_REPORTS_MAX_PER_EVENT = 50;
  * does not expose the encoding, so the session feature-detects it from
  * xterm's core mouse service (see ``TerminalSession.sgrMouseEncodingActive``).
  */
-export type WheelMouseState = {
+export interface WheelMouseState {
   mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any";
   sgrEncoding: boolean;
-};
+}
 
 /** Screen geometry needed to place and scale a wheel report. */
-export type WheelScreenMetrics = {
+export interface WheelScreenMetrics {
   /** Viewport coordinates of the character grid's top-left corner. */
   left: number;
   top: number;
@@ -327,7 +326,7 @@ export type WheelScreenMetrics = {
   cellHeight: number;
   cols: number;
   rows: number;
-};
+}
 
 /**
  * Build SGR mouse-wheel reports for *lines* scroll steps at cell

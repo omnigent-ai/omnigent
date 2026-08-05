@@ -1781,6 +1781,11 @@
             "title": "External Session Id",
             "type": "string"
           },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
           "items": {
             "items": {
               "$ref": "#/components/schemas/ImportItemInput"
@@ -5256,6 +5261,18 @@
             "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
             "title": "Total Cost Usd"
           },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch timestamp of the last persisted session activity. Advances when conversation items are appended and on session metadata edits (rename, agent switch, archive); a mid-stall rename therefore resets the clock, so an orchestrator treating this as a pure item-append heartbeat should account for that. Can be compared across snapshots independently of lifecycle status.",
+            "title": "Updated At"
+          },
           "usage_by_model": {
             "anyOf": [
               {
@@ -7747,7 +7764,7 @@
     },
     "/v1/imports": {
       "post": {
-        "description": "Import one normalized transcript, rejecting duplicate sources.",
+        "description": "Import one normalized transcript, optionally replacing its prior import.",
         "operationId": "import_session_v1_imports_post",
         "requestBody": {
           "content": {
@@ -8813,7 +8830,7 @@
         ]
       },
       "patch": {
-        "description": "Update a session's mutable fields. When `runner_id` is\nprovided, this is the mutable affinity primitive for the Alpha\nrunner-state pivot: create-bind, resume-bind, and recover-bind\nall send the currently registered runner id, and the server\natomically replaces `conversations.runner_id` with that\nvalue using last-write-wins semantics. Title, labels, and\nreasoning-effort updates remain supported for existing\nsessions clients.\n\n**Parameters**\n\n- `body` \u2014 The validated `UpdateSessionRequest`.\n\n**Returns:** The updated `SessionResponse` snapshot.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 if the runner is not registered; 404 if no session exists.",
+        "description": "Update a session's mutable fields. When `runner_id` is\nprovided, this is the mutable affinity primitive for the Alpha\nrunner-state pivot: create-bind, resume-bind, and recover-bind\nall send the currently registered runner id, and the server\natomically replaces `conversations.runner_id` with that\nvalue using last-write-wins semantics. Title, labels, and\nreasoning-effort updates remain supported for existing\nsessions clients.\n\n**Parameters**\n\n- `body` \u2014 The validated `UpdateSessionRequest`.\n\n**Returns:** The updated `SessionResponse` snapshot, with `items` always empty \u2014 PATCH callers use only scalar fields, and transcripts are served by `GET /sessions/{id}/items`.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 if the runner is not registered; 404 if no session exists.",
         "operationId": "update_session_v1_sessions__session_id__patch",
         "parameters": [
           {

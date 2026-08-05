@@ -13,7 +13,8 @@ module at most once.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeAlias, cast
 
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -21,8 +22,11 @@ from omnigent.harness_plugins import (
     native_provider_for_key,
 )
 
+# Provider hooks intentionally have unrelated sync and async signatures.
+_NativeHook: TypeAlias = Callable[..., Any]  # type: ignore[explicit-any]
 
-def resolve(import_path: str) -> Any:
+
+def resolve(import_path: str) -> object:
     """Resolve a ``module:attr`` / ``module.attr`` path to its object.
 
     Thin wrapper over :func:`omnigent.harness_plugins.load_object`. Deliberately
@@ -35,7 +39,7 @@ def resolve(import_path: str) -> Any:
     return load_object(import_path)
 
 
-def resolve_hook(provider: NativeHarnessProvider, hook: str) -> Any | None:
+def resolve_hook(provider: NativeHarnessProvider, hook: str) -> _NativeHook | None:
     """Resolve one named hook on a provider, or ``None`` if it is unset.
 
     ``hook`` is a field name on :class:`NativeHarnessProvider` (e.g.
@@ -46,10 +50,13 @@ def resolve_hook(provider: NativeHarnessProvider, hook: str) -> Any | None:
     import_path = getattr(provider, hook)
     if import_path is None:
         return None
-    return resolve(import_path)
+    resolved = resolve(import_path)
+    if not callable(resolved):
+        raise TypeError(f"native provider hook {import_path!r} is not callable")
+    return cast(_NativeHook, resolved)
 
 
-def resolve_hook_for_key(key: str, hook: str) -> Any | None:
+def resolve_hook_for_key(key: str, hook: str) -> _NativeHook | None:
     """Resolve a hook by native-agent ``key``, or ``None`` if unknown/unset."""
     provider = native_provider_for_key(key)
     if provider is None:

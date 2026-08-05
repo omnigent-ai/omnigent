@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -229,6 +228,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cloud": {"endpoint": "https://boxlite.example.com:8100"},
+                "disk_size_gb": 100,
             },
         }
     )
@@ -243,6 +243,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
     assert fake.endpoint == "https://boxlite.example.com:8100"
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.disk_size_gb == 100
 
 
 def test_parse_boxlite_without_section_defaults_local(
@@ -261,6 +262,7 @@ def test_parse_boxlite_without_section_defaults_local(
     assert fake.endpoint is None
     assert fake.image is None
     assert fake.env is None
+    assert fake.disk_size_gb is None
 
 
 def test_parse_boxlite_local_customization_reaches_launcher(
@@ -1689,13 +1691,13 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
     assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
 
 
-async def test_launch_without_host_config_supports_legacy_start_host_signature(
+async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_host_signature(
     db_uri: str,
 ) -> None:
     """
     A deployment-injected launcher whose ``start_host`` override predates the
-    ``host_config`` parameter keeps launching when no host_config is set —
-    the kwarg is omitted entirely rather than passed as ``None``.
+    optional ``host_config`` and ``on_stage`` parameters keeps launching and
+    resuming when neither value is set.
     """
     host_store = HostStore(db_uri)
 
@@ -1720,7 +1722,6 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
             repo_url: str | None = None,
             repo_branch: str | None = None,
             repo_name: str | None = None,
-            on_stage: Callable[[str], None] | None = None,
         ) -> str:
             return super().start_host(
                 sandbox_id,
@@ -1731,17 +1732,17 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
                 repo_url=repo_url,
                 repo_branch=repo_branch,
                 repo_name=repo_name,
-                on_stage=on_stage,
             )
 
-    fake = _LegacySignatureLauncher(on_host_start=_register)
+    fake = _LegacySignatureLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
 
-    result = await launch_managed_host(
-        config=_injected_config(fake), owner=_OWNER, host_store=host_store
-    )
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(result.host_id)
+    await resume_managed_host(result.host_id, host_store, config)
 
-    [start] = fake.host_starts
-    assert result.host_id == start.host_id
+    assert [start.host_id for start in fake.host_starts] == [result.host_id, result.host_id]
+    assert fake.resumed == ["sb-fake-1"]
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
@@ -2304,6 +2305,35 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, first_token) is None
     resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, second_token)
     assert resolved is not None and resolved.host_id == first.host_id
+
+
+async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
+    """A wake reports launch-pipeline stages through ``on_stage``.
+
+    Parity with the fresh-launch path (``_arm_and_start_host``): base
+    ``start_host`` emits ``"starting"`` before it execs the host, so a wake
+    with an observer must surface at least that stage rather than leaving the
+    caller on a single frozen ``"provisioning"`` band for the whole resume.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+
+    stages: list[str] = []
+    await resume_managed_host(first.host_id, host_store, config, on_stage=stages.append)
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert "starting" in stages
 
 
 async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> None:

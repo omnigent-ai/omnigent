@@ -15,9 +15,6 @@ from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
-from omnigent.policies.types import (
-    PolicyAction,
-)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -58,18 +55,35 @@ from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_re
 from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _EVALUATE_HOOK_ELICITATION_ID_RE,
+    _TURN_ACTOR_LABEL,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _allow_all_edits_eligible,
+    _allow_remember_eligible,
+    _build_actor,
+    _build_evaluation_context,
+    _claude_native_remember_host,
+    _client_supplied_hook_elicitation_id,
+    _forward_session_change_to_runner,
+    _native_ask_gate_lock,
+    _publish_policy_denied,
+    _structured_ask_user_question,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _hold_native_ask_gate,
+    _publish_and_wait_for_harness_elicitation,
+    _spawn_native_blocked_notice_forward,
+)
 from omnigent.server.schemas import (
     ElicitationRequestParams,
 )
 from omnigent.spec.types import (
     Phase,
+    PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -776,7 +790,9 @@ def register_hooks_routes(
                 # an ALLOW (or now-hard DENY) collapses the ASK and falls through
                 # without a second prompt. Held across the human wait by design;
                 # a declined ASK records nothing, so siblings legitimately re-ask.
-                async with _native_ask_gate_lock(session_id, result.deciding_policy):
+                deciding_policy = result.deciding_policy
+                assert deciding_policy is not None
+                async with _native_ask_gate_lock(session_id, deciding_policy):
                     engine = _build_engine()
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
@@ -807,15 +823,15 @@ def register_hooks_routes(
                                 get_server_runner_router(),
                                 {"type": "interrupt"},
                             )
-                            verdict_body = {
+                            decline_body = {
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",
                             }
                             return Response(
-                                content=json.dumps(verdict_body),
+                                content=json.dumps(decline_body),
                                 media_type="application/json",
                             )
-                        verdict_body: dict[str, Any] = (
+                        approval_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
                             if approved
                             else {
@@ -824,7 +840,7 @@ def register_hooks_routes(
                             }
                         )
                         return Response(
-                            content=json.dumps(verdict_body),
+                            content=json.dumps(approval_body),
                             media_type="application/json",
                         )
                 # Re-evaluation collapsed the ASK (a sibling's approval recorded

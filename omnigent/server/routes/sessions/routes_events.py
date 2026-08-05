@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -24,6 +24,9 @@ from omnigent.entities.conversation import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+)
+from omnigent.host.frames import (
+    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
@@ -71,13 +74,116 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _ALLOWED_EVENT_TYPES,
+    _APPROVAL_TYPE,
+    _COMPACT_TYPE,
+    _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+    _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
+    _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+    _EXTERNAL_COMPACTION_STATUS_TYPE,
+    _EXTERNAL_COMPACTION_STATUS_VALUES,
+    _EXTERNAL_CONVERSATION_ITEM_TYPE,
+    _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+    _EXTERNAL_MCP_STARTUP_STATUS_VALUES,
+    _EXTERNAL_MCP_STARTUP_TYPE,
+    _EXTERNAL_MODEL_CHANGE_TYPE,
+    _EXTERNAL_MODEL_OPTIONS_TYPE,
+    _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+    _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+    _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+    _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+    _EXTERNAL_SESSION_STATUS_TYPE,
+    _EXTERNAL_SESSION_STATUS_VALUES,
+    _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+    _EXTERNAL_SESSION_TODOS_TYPE,
+    _EXTERNAL_SESSION_USAGE_TYPE,
+    _EXTERNAL_SUBAGENT_START_TYPE,
+    _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+    _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+    _INTERRUPT_TYPE,
+    _MCP_ELICITATION_TYPE,
+    _SLASH_COMMAND_TYPE,
+    _SNAPSHOT_RUNNER_TIMEOUT_S,
+    _STOP_SESSION_TYPE,
+    _intentional_stop_sessions,
+    _interrupt_fenced_sessions,
+    _logger,
+    _pushed_model_options_cache,
+    _session_mcp_startup_cache,
+    _session_sandbox_status_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    SessionLiveness,
+    _apply_pending_policy_ask_writes,
+    _await_settled_managed_launch,
+    _build_actor,
+    _build_skill_slash_command_policy_body,
+    _dispatch_skill_slash_command_to_runner,
+    _evaluate_output_policy,
+    _forward_session_change_to_runner,
+    _get_runner_client,
+    _get_runner_client_for_resource_access,
+    _handle_external_session_todos,
+    _is_codex_native_subagent,
+    _launch_runner_on_host,
+    _persist_external_assistant_message,
+    _persist_external_codex_approval_mode_change,
+    _persist_external_codex_collaboration_mode_change,
+    _persist_external_model_change,
+    _persist_external_model_options,
+    _persist_external_reasoning_effort_change,
+    _persist_external_subagent_start,
+    _persist_policy_deny_sentinel,
+    _persist_session_status_error_labels,
+    _prune_session_read_state,
+    _publish_compaction_completed,
+    _publish_compaction_failed,
+    _publish_compaction_in_progress,
+    _publish_elicitation_request_to_ancestors,
+    _publish_external_output_reasoning_delta,
+    _publish_external_output_text_delta,
+    _publish_external_tool_output_delta,
+    _publish_input_deny_terminal,
+    _publish_interrupted,
+    _publish_mcp_startup,
+    _publish_policy_deny,
+    _publish_session_superseded,
+    _publish_status,
+    _remove_session_worktree_best_effort,
+    _require_external_status_forward,
+    _run_compact_locked,
+    _signal_harness_elicitation_resolved_by_id,
+    _stop_session_host_runner,
+    _stop_session_via_runner,
+    _stream_live_events,
+    _subagent_delivery_status,
+    _wait_for_runner_client,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _best_effort_stop,
+    _child_session_summaries_from_conversations,
+    _dispatch_session_event_to_runner,
+    _enrich_idle_status_with_subagent_output,
+    _ensure_runner_relay_ready,
+    _ensure_runner_session_initialized,
+    _evaluate_input_policy,
+    _evaluate_tool_call_policy,
+    _heal_subagent_runner_binding_via_parent,
+    _is_native_terminal_session,
+    _maybe_relaunch_managed_sandbox,
+    _maybe_wake_stale_resumable_managed_sandbox,
+    _persist_external_codex_subagent_start,
+    _persist_external_conversation_item,
+    _persist_external_session_usage,
+    _persist_host_launch_failure_turn,
+    _persist_native_terminal_failure,
+    _resolve_elicitation,
+    _wait_for_host_bound_runner_client,
+)
 from omnigent.server.schemas import (
     ConversationDeleted,
     ElicitationRequestEvent,
@@ -740,7 +846,7 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
             status = body.data.get("status")
-            if status not in _EXTERNAL_SESSION_STATUS_VALUES:
+            if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
                 raise OmnigentError(
                     f"external_session_status requires data.status in "
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
@@ -880,6 +986,7 @@ def register_events_routes(
                 if not (
                     isinstance(server_name, str)
                     and server_name
+                    and isinstance(record_status, str)
                     and record_status in _EXTERNAL_MCP_STARTUP_STATUS_VALUES
                 ):
                     raise OmnigentError(
@@ -890,7 +997,10 @@ def register_events_routes(
                     )
                 record_error = record.get("error")
                 mcp_servers[server_name] = McpServerStartup(
-                    status=record_status,
+                    status=cast(
+                        Literal["starting", "ready", "failed", "cancelled"],
+                        record_status,
+                    ),
                     error=record_error if isinstance(record_error, str) and record_error else None,
                 )
             _publish_mcp_startup(session_id, mcp_servers)
@@ -1076,7 +1186,10 @@ def register_events_routes(
                 _runner_needs_session_init = _is_native_terminal_session(conv)
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
-            _grace_host_reg = getattr(request.app.state, "host_registry", None)
+            _grace_host_reg = cast(
+                HostRegistry | None,
+                getattr(request.app.state, "host_registry", None),
+            )
             _grace_host_conn = (
                 _grace_host_reg.get(conv.host_id) if _grace_host_reg is not None else None
             )
@@ -1103,7 +1216,7 @@ def register_events_routes(
                     conv.runner_id,
                     session_id,
                 )
-                if _grace_host_conn is not None:
+                if _grace_host_reg is not None and _grace_host_conn is not None:
                     runner_client = await _wait_for_host_bound_runner_client(
                         session_id,
                         runner_router,
@@ -1160,6 +1273,31 @@ def register_events_routes(
                             body,
                             conversation_store,
                             launch_attempt.error,
+                            runner_router,
+                            created_by=created_by,
+                        )
+                        return {"queued": True, "item_id": item_id}
+                    if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
+                        # The host refused: the workspace directory no longer
+                        # exists (e.g. the worktree was deleted). Consume the
+                        # message and persist an actionable error banner so the
+                        # user knows to start a new session with a valid
+                        # workspace — instead of timing out into a generic
+                        # RUNNER_UNAVAILABLE.
+                        item_id = await _persist_native_terminal_failure(
+                            session_id,
+                            conv,
+                            body,
+                            conversation_store,
+                            ErrorData(
+                                source="execution",
+                                code="runner_failed_to_start",
+                                message=(
+                                    launch_attempt.error
+                                    or "The session workspace no longer exists on the host. "
+                                    "Start a new session with a valid workspace."
+                                ),
+                            ),
                             runner_router,
                             created_by=created_by,
                         )
@@ -1270,12 +1408,22 @@ def register_events_routes(
             # forwarded into a TUI whose forwarder isn't attached, the
             # round-trip never mirrors back, and the optimistic bubble
             # sticks with no reply (host-restart bug).
+            #
+            # suppress_recovery_turn=True: the server already persisted the
+            # message to DB before calling session-init, so the runner's
+            # history load would see the pending message and start a
+            # recovery turn.  The subsequent forward would then arrive to
+            # an active turn, be buffered, and be processed a second time
+            # once the recovery turn finishes.  Telling the runner to skip
+            # recovery-turn detection here ensures the server's forward is
+            # the sole trigger for the turn.
             native_terminal_ready = await _ensure_runner_session_initialized(
                 session_id,
                 conv,
                 runner_client,
                 conversation_store,
                 initializer=getattr(request.app.state, "runner_session_initializer", None),
+                suppress_recovery_turn=True,
             )
         await _ensure_runner_relay_ready(
             session_id,

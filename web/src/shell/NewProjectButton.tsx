@@ -66,7 +66,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
           </DialogHeader>
           <input
             autoFocus
-            className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none"
+            className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
             placeholder="Project name…"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -78,7 +78,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             }}
           />
           {createProject.isError && (
-            <p className="text-sm text-destructive" role="alert">
+            <p className="text-ui text-destructive" role="alert">
               {(createProject.error as Error).message}
             </p>
           )}

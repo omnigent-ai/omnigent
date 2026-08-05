@@ -31,10 +31,9 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
-
-_CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
 
 # Marker file the cwd-resolution tests ask Codex to read back. It is placed
 # only in the session's intended cwd (worktree / picked workspace) and never
@@ -114,10 +113,10 @@ def _codex_native_agent_id(client: httpx.Client) -> str:
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             return str(agent["id"])
     raise AssertionError(
-        f"{_CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
+        f"{CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
         "(expected from _ensure_default_agents at startup)"
     )
 
@@ -504,16 +503,16 @@ def test_codex_native_builtin_registered_at_startup(
     """
     The server auto-registers ``codex-native-ui`` as a built-in agent.
 
-    ``_ensure_default_codex_agent`` runs during lifespan startup and
+    ``_ensure_default_native_agents`` runs during lifespan startup and
     inserts the agent into the store. ``GET /v1/agents`` must list it
     so the Web UI new-session picker can offer Codex alongside Claude.
     """
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     agent_names = {a["name"] for a in resp.json()["data"]}
-    assert _CODEX_NATIVE_AGENT_NAME in agent_names, (
-        f"Expected {_CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
-        f"{agent_names}. _ensure_default_codex_agent did not run or "
+    assert CODEX_NATIVE_AGENT_NAME in agent_names, (
+        f"Expected {CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
+        f"{agent_names}. _ensure_default_native_agents did not run or "
         f"used a different name."
     )
 
@@ -529,7 +528,7 @@ def test_codex_native_builtin_session_can_be_created(
     resp.raise_for_status()
     agent_id = None
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             agent_id = agent["id"]
             break
     assert agent_id is not None

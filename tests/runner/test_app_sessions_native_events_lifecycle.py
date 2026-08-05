@@ -13,6 +13,8 @@ import pytest
 from omnigent import (
     claude_native_bridge,
     codex_native_bridge,
+    cursor_native,
+    cursor_native_bridge,
     kiro_native,
     kiro_native_bridge,
 )
@@ -323,6 +325,104 @@ async def test_kiro_native_model_options_failure_is_retryable(
 
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "kiro_native_model_options_failed"
+
+
+@pytest.mark.asyncio
+async def test_cursor_native_model_options_use_cli_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conv_id = "c7e721bf0e124d2fb5bc1bc36772864e"
+    expected = [
+        {
+            "id": "provider-latest",
+            "displayName": "Provider Latest",
+            "isDefault": True,
+            "isCurrent": False,
+        }
+    ]
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", lambda: expected)
+    injected: list[tuple[str, str | None]] = []
+
+    def _inject_model(
+        _bridge_dir: Path,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
+        del timeout_s
+        injected.append((model, expected_display_name))
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _inject_model)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.get(f"/v1/sessions/{conv_id}/cursor-model-options")
+        event_response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "provider-latest"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"models": expected}
+    assert event_response.status_code == 204
+    assert injected == [("provider-latest", "Provider Latest")]
+
+
+@pytest.mark.asyncio
+async def test_cursor_native_model_options_failure_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery failures return 503 so the server leaves its cache cold."""
+    conv_id = "d29b45fd569245b2bc0dd79694e73886"
+
+    def _fail_discovery() -> list[dict[str, object]]:
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", _fail_discovery)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.get(f"/v1/sessions/{conv_id}/cursor-model-options")
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "cursor_native_model_options_failed"
 
 
 @pytest.mark.asyncio
@@ -2267,11 +2367,12 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
         callbacks["on_exit"] = on_exit
         callbacks["replace"] = replace
 
@@ -2408,11 +2509,12 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -2601,11 +2703,12 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]

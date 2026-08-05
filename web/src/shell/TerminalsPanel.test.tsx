@@ -1,7 +1,15 @@
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import { TerminalsPanel } from "./TerminalsPanel";
+
+// Monotonic per-mount id. A fresh `data-instance` means React remounted
+// the TerminalView (new xterm + WebSocket) rather than reusing it — the
+// signal the stale-scrollback regression test needs.
+let terminalMountSeq = 0;
 
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
@@ -12,20 +20,28 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     sessionId: string;
     terminalId: string;
     readOnly?: boolean;
-  }) => (
-    <div
-      data-testid="terminal-view"
-      data-session-id={sessionId}
-      data-terminal-id={terminalId}
-      data-read-only={String(readOnly ?? false)}
-    />
-  ),
+  }) => {
+    // Assign once per mount (useRef(arg) evaluates arg every render but keeps
+    // the first value), so the id is stable across re-renders and only changes
+    // on a remount.
+    const instance = useRef<number | null>(null);
+    if (instance.current === null) instance.current = ++terminalMountSeq;
+    return (
+      <div
+        data-testid="terminal-view"
+        data-session-id={sessionId}
+        data-terminal-id={terminalId}
+        data-read-only={String(readOnly ?? false)}
+        data-instance={String(instance.current)}
+      />
+    );
+  },
 }));
 
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals etc.) — only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(),
 }));
 
@@ -164,6 +180,42 @@ describe("TerminalsPanel navigation", () => {
     // A non-owner sees the shell but cannot type — the shared PTY runs
     // as the owner, so keystrokes can't be attributed per-user.
     expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-read-only", "true");
+  });
+
+  it("remounts the terminal when switching sessions with the same terminal id", () => {
+    // Two sessions of the same shape share a terminal id (e.g. every
+    // native session's agent pane). The panel stays mounted across a
+    // session switch, so keying the xterm wrapper on the id alone would
+    // reuse the mount and keep the previous session's scrollback until
+    // the new WS repaints. The wrapper key is scoped to the session id.
+    const terminals = [makeTerminal("terminal_claude_main", "claude", "main")];
+    const { rerender } = renderPanel({
+      initialTerminalKey: "terminal:terminal_claude_main",
+      terminals,
+    });
+    act(() => {
+      vi.advanceTimersByTime(180);
+    });
+    const first = screen.getByTestId("terminal-view").getAttribute("data-instance");
+
+    rerender(
+      <TerminalsPanel
+        open
+        conversationId="conv_other"
+        initialTerminalKey="terminal:terminal_claude_main"
+        readOnly={false}
+        onClose={vi.fn()}
+      />,
+    );
+    act(() => {
+      vi.advanceTimersByTime(180);
+    });
+
+    const view = screen.getByTestId("terminal-view");
+    expect(view).toHaveAttribute("data-session-id", "conv_other");
+    // A new instance id proves a clean remount, not a reused mount with
+    // stale scrollback.
+    expect(view.getAttribute("data-instance")).not.toBe(first);
   });
 
   it("defers mounting TerminalView until the panel is expanded", () => {

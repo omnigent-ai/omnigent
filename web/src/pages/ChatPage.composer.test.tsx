@@ -1,3 +1,9 @@
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +13,7 @@ import { useChatStore } from "@/store/chatStore";
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
@@ -18,19 +24,19 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: () => ({ data: [] }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: () => undefined,
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -901,6 +907,35 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("gpt-5.5");
     // The real effort still renders — proving the label is present and only
     // the leaked model was suppressed.
+    expect(label()).toHaveTextContent("High");
+  });
+
+  it("does not leak the cross-session sticky model on a native session before its catalog lands", () => {
+    // The Codex→Claude switch repro: `switchTo` clears the session-scoped model
+    // fields but keeps the sticky, so mid-switch a claude-native session has an
+    // empty catalog and the `gpt-5.5` the outgoing Codex session left behind.
+    // The label must wait for a model this session vouches for rather than
+    // paint the previous session's pick for the whole bind round trip.
+    useChatStore.setState({
+      selectedModel: "gpt-5.5", // outgoing Codex session's pick — must not surface
+      sessionModelOverride: null,
+      selectedEffort: "high",
+      llmModel: null,
+      codexModelOptions: [], // cleared by `switchTo`, refilled when the snapshot lands
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    expect(label()).not.toHaveTextContent("gpt-5.5");
+    // The real effort still renders — only the leaked model was suppressed.
     expect(label()).toHaveTextContent("High");
   });
 });

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,13 +19,124 @@ except ImportError:  # pragma: no cover - Python < 3.11
 from omnigent.codex_native_app_server import (
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
+    _build_native_codex_app_server_argv,
     _codex_policy_hooks_settings,
+    _hooks_list_diagnostics,
+    _model_discovery_cache,
+    _our_policy_hooks_from_list,
     _sync_codex_developer_instructions,
     build_codex_native_server,
+    discover_codex_model_options,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
-from omnigent.inner.codex_executor import _populate_codex_home_config
+from omnigent.inner.codex_executor import (
+    _populate_codex_home_config,
+    _provider_codex_config_overrides,
+)
+
+
+async def test_discover_codex_model_options_strips_secrets_and_stops_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-launch discovery uses an empty home, no credentials, and clean teardown."""
+    from omnigent import codex_native_app_server
+
+    captured_env: dict[str, str] = {}
+
+    class _FakeProcess:
+        pid = None
+        returncode: int | None = None
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.returncode = 0 if self.returncode is None else self.returncode
+            return self.returncode
+
+    process = _FakeProcess()
+
+    async def _fake_start(
+        *,
+        codex_path: str,
+        listen_url: str,
+        env: dict[str, str],
+        cwd: Path,
+    ) -> _FakeProcess:
+        assert codex_path == "/test/codex"
+        assert listen_url.startswith("ws://127.0.0.1:")
+        assert cwd.is_dir()
+        assert Path(env["CODEX_HOME"]).is_dir()
+        captured_env.update(env)
+        return process
+
+    async def _fake_wait(process: _FakeProcess, port: int) -> None:
+        assert process is not None
+        assert port > 0
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            assert ws_url.startswith("ws://127.0.0.1:")
+            assert client_name == "omnigent-codex-model-discovery"
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            params: dict[str, object],
+        ) -> dict[str, object]:
+            assert method == "model/list"
+            assert params == {"includeHidden": False}
+            return {
+                "result": {
+                    "data": [
+                        {
+                            "id": "coding-model",
+                            "model": "coding-model",
+                            "isDefault": True,
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            }
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_clean_codex_env",
+        lambda: {
+            "PATH": "/bin",
+            "OPENAI_API_KEY": "openai-secret",
+            "OPENAI_BASE_URL": "https://example.invalid/v1",
+            "DATABRICKS_BEARER": "databricks-secret",
+            "DATABRICKS_CODEX_TOKEN": "databricks-secret",
+        },
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_start_codex_model_discovery_process",
+        _fake_start,
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+    _model_discovery_cache.clear()
+
+    options = await discover_codex_model_options(codex_path="/test/codex")
+
+    assert options == [{"id": "coding-model", "model": "coding-model", "isDefault": True}]
+    assert captured_env == {"PATH": "/bin", "CODEX_HOME": captured_env["CODEX_HOME"]}
+    assert process.terminated is True
+    _model_discovery_cache.clear()
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
@@ -133,6 +245,17 @@ def _hook(key: str, command: str, trust: str, current_hash: str = "sha256:h") ->
         "trustStatus": trust,
         "currentHash": current_hash,
     }
+
+
+def test_hooks_list_empty_result_does_not_fall_back_to_envelope() -> None:
+    """A valid empty result remains authoritative over envelope metadata."""
+    listed = {
+        "result": {},
+        "data": [{"cwd": _CWD, "hooks": [_hook("k1", _OUR_COMMAND, "trusted")]}],
+    }
+
+    assert _our_policy_hooks_from_list(listed, _CWD) == []
+    assert "returned no hooks" in _hooks_list_diagnostics(listed, _CWD)
 
 
 @dataclass
@@ -501,6 +624,8 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
 
     rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert rendered.startswith("[mcp_servers.omnigent]\n")
+    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+    assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
     parsed = tomllib.loads(rendered)
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
@@ -516,6 +641,92 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "sys_session_rename": {"approval_mode": "approve"},
         },
     }
+
+
+async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native app-server and remote TUI argv contain no provider secret."""
+    from omnigent import codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_providers = { existing = { name = "Existing", '
+        'base_url = "https://existing.invalid/v1", wire_api = "responses" } }\n',
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
+    server.config_overrides = [
+        *_provider_codex_config_overrides(
+            model="test-model",
+            base_url="https://provider.invalid/v1",
+            auth_command="credential-helper --token sk-sentinel-do-not-use",
+            wire_api="responses",
+        ),
+        'approval_policy="never"',
+        'sandbox_mode="danger-full-access"',
+    ]
+    await server.start()
+    await server.close()
+
+    app_server_argv = _build_native_codex_app_server_argv(
+        tagged_argv0="codex session-tag",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=server.config_overrides,
+    )
+    remote_argv = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=tuple(server.config_overrides),
+    )
+    assert all("sk-sentinel-do-not-use" not in arg for arg in app_server_argv)
+    assert all("sk-sentinel-do-not-use" not in arg for arg in remote_argv)
+    assert 'model_provider="omnigent_provider"' in app_server_argv
+    assert 'model_provider="omnigent_provider"' in remote_argv
+    assert 'approval_policy="never"' in app_server_argv
+    assert 'sandbox_mode="danger-full-access"' in app_server_argv
+
+    config_path = codex_home / "config.toml"
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    provider = config["model_providers"]["omnigent_provider"]
+    assert config["model_providers"]["existing"]["name"] == "Existing"
+    assert provider["base_url"] == "https://provider.invalid/v1"
+    assert provider["auth"]["args"] == [
+        "-c",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ]
+    assert provider["wire_api"] == "responses"
+    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
+    """Remote TUI construction fails closed on provider table overrides."""
+    from omnigent import codex_native_app_server
+
+    provider_override = _provider_codex_config_overrides(
+        model=None,
+        base_url="https://provider.invalid/v1",
+        auth_command="printf %s sk-sentinel-do-not-use",
+        wire_api="responses",
+    )[-1]
+
+    with pytest.raises(ValueError, match="must be materialized"):
+        codex_native_app_server.build_codex_remote_args(
+            codex_args=(),
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+            config_overrides=(provider_override,),
+        )
 
 
 async def test_untrusted_hook_is_trusted_via_batchwrite() -> None:

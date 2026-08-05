@@ -11,6 +11,8 @@
  * mocked, returning a real FileContentResponse-shaped object.
  */
 
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
@@ -24,7 +26,7 @@ import {
 import type { FileContentResponse } from "@/hooks/useFileContent";
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useFileContent")>();
+  const actual = await importOriginal<typeof UseFileContentModule>();
   // Keep the real fileContentToBlob (the decode logic under test); only the
   // network call is faked.
   return { ...actual, fetchFileContent: vi.fn() };

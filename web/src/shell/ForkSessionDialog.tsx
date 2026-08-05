@@ -504,6 +504,11 @@ export function ForkSessionForm({
       }
       // Fire-and-forget: the sidebar refresh must not gate navigation.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // The fork inherits the source's project, and each folder renders its
+      // own ["project-sessions", <name>] list. The WS fallback can't converge
+      // it either: it skips the active session, and the navigate below makes
+      // the fork active.
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       onClose();
       navigate(`/c/${fork.id}`);
     } catch (e) {

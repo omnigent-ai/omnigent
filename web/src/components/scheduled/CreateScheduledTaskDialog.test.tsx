@@ -6,6 +6,9 @@
 // The agent/host hooks and the create mutation are mocked; WorkspacePicker is
 // stubbed (its filesystem browsing is out of scope here).
 
+import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
+import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -114,7 +117,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
 // nativeAgentHasCapability(claude-native, "permissionMode") must be true so the
 // model/effort knobs map onto the payload; polly (claude-sdk) has no knobs.
 vi.mock("@/lib/nativeCodingAgents", async (orig) => {
-  const actual = await orig<typeof import("@/lib/nativeCodingAgents")>();
+  const actual = await orig<typeof NativeCodingAgentsModule>();
   return {
     ...actual,
     isNativeCodingAgent: (a: AvailableAgent) => a?.name === "claude-native-ui",
@@ -170,7 +173,7 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
   return render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
 }
 
-function scheduledTask(overrides: Partial<import("@/lib/scheduledTasksApi").ScheduledTask> = {}) {
+function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask> = {}) {
   return {
     id: "st_1",
     name: "Morning brief",
@@ -191,7 +194,7 @@ function scheduledTask(overrides: Partial<import("@/lib/scheduledTasksApi").Sche
     lastRunConversationId: null,
     nextRunAt: null,
     ...overrides,
-  } satisfies import("@/lib/scheduledTasksApi").ScheduledTask;
+  } satisfies ScheduledTasksApiModule.ScheduledTask;
 }
 
 describe("agent picker readiness (needs-setup badges)", () => {
@@ -430,7 +433,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     const timeField = screen.getByTestId("schedule-time");
     expect(timeField.tagName).toBe("INPUT");
     expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
-    expect(timeField).toHaveClass("text-sm");
+    expect(timeField).toHaveClass("text-ui");
     expect(screen.getByTestId("schedule-time-picker-trigger")).toBeInTheDocument();
   });
 
@@ -584,10 +587,10 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(timeField).toHaveValue("05:07 PM");
   });
 
-  it("uses text-sm for dialog text fields that wrap shared primitives", () => {
+  it("uses text-ui for dialog text fields that wrap shared primitives", () => {
     renderDialog();
-    expect(screen.getByTestId("task-name-input")).toHaveClass("text-sm");
-    expect(screen.getByTestId("task-prompt-input")).toHaveClass("text-sm");
+    expect(screen.getByTestId("task-name-input")).toHaveClass("text-ui");
+    expect(screen.getByTestId("task-prompt-input")).toHaveClass("text-ui");
   });
 
   it("blocks submit while the typed time is invalid", async () => {
@@ -605,7 +608,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
     const minuteField = screen.getByTestId("schedule-minute");
     expect(minuteField.tagName).toBe("INPUT");
-    expect(minuteField).toHaveClass("text-sm");
+    expect(minuteField).toHaveClass("text-ui");
     expect(minuteField).toHaveAttribute("placeholder", "0");
     expect(screen.queryByTestId("schedule-time-picker-trigger")).toBeNull();
     fireEvent.change(minuteField, { target: { value: "7" } });

@@ -38,11 +38,13 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias
 
 from omnigent._platform import stable_user_id
 
 _logger = logging.getLogger(__name__)
+
+_ConfigObject: TypeAlias = dict[str, object]
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_HERMES_NATIVE_BRIDGE_DIR"
@@ -278,7 +280,7 @@ _USER_CONFIG_KEYS = frozenset(
 _HERMES_HOME_SUBDIR = "hermes_home"
 
 
-def _load_user_hermes_config() -> dict:
+def _load_user_hermes_config() -> _ConfigObject:
     """Load inference-relevant keys from the user's ``~/.hermes/config.yaml``."""
     user_config = Path.home() / ".hermes" / "config.yaml"
     if not user_config.is_file():
@@ -352,11 +354,14 @@ def write_policy_hook_config(
 
     # Merge user config so model/provider/auth settings carry over.
     user_cfg = _load_user_hermes_config()
-    config: dict = {**user_cfg}
+    config: _ConfigObject = {**user_cfg}
 
     config["hooks_auto_accept"] = True
+    existing_hooks = config.get("hooks")
+    if not isinstance(existing_hooks, dict):
+        existing_hooks = {}
     config["hooks"] = {
-        **config.get("hooks", {}),
+        **existing_hooks,
         "pre_tool_call": [
             {
                 "command": str(wrapper),
@@ -367,8 +372,11 @@ def write_policy_hook_config(
 
     # Register the Omnigent MCP stdio server so Hermes can call
     # Omnigent builtin tools (sys_session_*, sys_agent_*, load_skill, etc.).
+    existing_mcp_servers = config.get("mcp_servers")
+    if not isinstance(existing_mcp_servers, dict):
+        existing_mcp_servers = {}
     config["mcp_servers"] = {
-        **config.get("mcp_servers", {}),
+        **existing_mcp_servers,
         "omnigent": {
             "command": sys.executable,
             "args": [
@@ -515,7 +523,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Hermes terminal."""
     _ensure_dir(bridge_dir)
-    payload: dict[str, Any] = {
+    payload: _ConfigObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),

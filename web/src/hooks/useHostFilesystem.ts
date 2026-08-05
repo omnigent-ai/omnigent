@@ -208,7 +208,7 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
   }
   // Host offline / timed out (502/504) or another server failure —
   // surface its detail so the user sees why the check failed.
-  let detail: string | null = null;
+  let detail: string | null;
   try {
     const body = (await res.json()) as { detail?: string };
     detail = typeof body.detail === "string" && body.detail !== "" ? body.detail : null;
