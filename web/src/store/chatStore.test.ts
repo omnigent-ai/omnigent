@@ -59,6 +59,8 @@ import {
   startStreamPump,
   useChatStore,
   type FrameScheduler,
+  bindConversationForTest,
+  releaseConversation,
 } from "./chatStore";
 import { useTerminalActivityStore } from "./terminalActivity";
 
@@ -375,10 +377,6 @@ beforeEach(() => {
     blocks: [],
     pendingUserMessages: [],
     queuedMessages: [],
-    // Reset the per-conversation stash too, or a stash entry left by one
-    // navigation test leaks into the next (the entry survives switchTo by
-    // design — that's the whole point — so beforeEach must clear it).
-    pendingByConversation: {},
     activeResponse: null,
     status: "idle",
     sessionStatus: "idle",
@@ -456,6 +454,64 @@ describe("chatStore — switchTo", () => {
     expect(user.content).toEqual([{ type: "input_text", text: "hello" }]);
     expect(state.loadingConversation).toBe(false);
     expect(state.conversationLoadError).toBeNull();
+  });
+
+  it("keeps a backgrounded conversation live, so returning to it needs no refetch", async () => {
+    // The feature: switching away no longer tears the stream down, so switching
+    // back neither re-opens a stream nor re-fetches the snapshot. This is what
+    // the transcript LRU used to approximate (paint stale, then revalidate).
+    seedSession("conv_a", [userMessage("resp_a", "in a")]);
+    seedSession("conv_b", [userMessage("resp_b", "in b")]);
+
+    await useChatStore.getState().switchTo("conv_a");
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+
+    await useChatStore.getState().switchTo("conv_b");
+    const callsAfterB = fetchMock.mock.calls.length;
+
+    await useChatStore.getState().switchTo("conv_a");
+    // Painted from the live entry: conv_a's transcript is right there.
+    expect(useChatStore.getState().conversationId).toBe("conv_a");
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+    // And nothing was fetched to get it.
+    expect(fetchMock.mock.calls.length).toBe(callsAfterB);
+  });
+
+  it("does not abort a conversation's stream when switching away", async () => {
+    // Hold conv_a's stream open so the pump doesn't exit and clear its
+    // controller (the default mock closes immediately, which reads as a
+    // server-side close).
+    const sink = pushableStream();
+    seedSession("conv_a", []);
+    seedSession("conv_b", []);
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_a/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_a");
+    const aController = useChatStore.getState().abortController;
+    expect(aController).not.toBeNull();
+
+    await useChatStore.getState().switchTo("conv_b");
+    // conv_a keeps pumping in the background — that is the whole point.
+    expect(aController!.signal.aborted).toBe(false);
+
+    sink.close();
+  });
+
+  it("keeps each conversation's transcript separate across switches", async () => {
+    seedSession("conv_a", [userMessage("resp_a", "in a")]);
+    seedSession("conv_b", [userMessage("resp_b", "in b"), assistantMessage("resp_b", "reply b")]);
+
+    await useChatStore.getState().switchTo("conv_a");
+    await useChatStore.getState().switchTo("conv_b");
+    expect(useChatStore.getState().blocks).toHaveLength(2);
+    await useChatStore.getState().switchTo("conv_a");
+    expect(useChatStore.getState().blocks).toHaveLength(1);
   });
 
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {
@@ -545,434 +601,6 @@ describe("chatStore — switchTo", () => {
         content: [{ type: "input_image", file_id: "file_xyz", filename: "a.png" }],
       },
     ]);
-  });
-
-  it("restores an un-acked optimistic bubble from the per-conversation stash on navigate-back", async () => {
-    // The first-message bug: a native web message's optimistic bubble lives
-    // only in client memory until the server records it — the transcript
-    // round-trip lags (esp. on a cold-starting runner), so for a window
-    // BOTH the items and pending_inputs in the snapshot are empty. If the
-    // user navigates away in that window, switchTo wipes the bubble; the
-    // navigate-back snapshot is still empty, so without the stash the chat
-    // shows nothing until the round-trip's session.input.consumed lands.
-    seedSession("conv_native", []); // pre-record: nothing server-side yet
-    seedSession("conv_other", []);
-
-    // Land on the native session, then model send()'s optimistic push.
-    await useChatStore.getState().switchTo("conv_native");
-    useChatStore.setState({
-      pendingUserMessages: [{ tempId: "pend_1", content: [{ type: "input_text", text: "hello" }] }],
-    });
-
-    // Navigate away (stashes conv_native's bubble) and back.
-    await useChatStore.getState().switchTo("conv_other");
-    await useChatStore.getState().switchTo("conv_native");
-
-    // Restored from the stash despite the empty snapshot. If the stash
-    // logic is reverted, switchTo's reset leaves this [] — the exact
-    // disappeared-first-message bug.
-    expect(useChatStore.getState().pendingUserMessages).toEqual([
-      { tempId: "pend_1", content: [{ type: "input_text", text: "hello" }] },
-    ]);
-  });
-
-  it("drops the stashed bubble on navigate-back when its message persisted while away", async () => {
-    // If the round-trip completes while the user is on another session, the
-    // navigate-back snapshot already carries the committed item. The
-    // restored stash bubble must be deduped against it (by text/endsWith),
-    // or the message double-renders (committed item + trailing bubble).
-    seedSession("conv_other", []);
-
-    await useChatStore.getState().switchTo("conv_native");
-    useChatStore.setState({
-      pendingUserMessages: [{ tempId: "pend_1", content: [{ type: "input_text", text: "hello" }] }],
-    });
-    await useChatStore.getState().switchTo("conv_other");
-
-    // While away, the message round-tripped into durable history.
-    seedSession("conv_native", [userMessage("resp1", "hello")]);
-    await useChatStore.getState().switchTo("conv_native");
-
-    // Stash bubble deduped away; the committed item is the only copy. If
-    // the dedup didn't apply to restored bubbles, pendingUserMessages would
-    // still hold the stale entry (a visible duplicate).
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-    const userBlocks = useChatStore.getState().blocks.filter((b) => b.type === "user_message");
-    expect(userBlocks).toHaveLength(1); // committed "hello" renders exactly once
-  });
-
-  it("keeps the stashed bubble when its text matches an OLDER message already in history", async () => {
-    // Resumed/disconnected-session regression (the offline-host report): the
-    // conversation already has a committed "hello". The user sends another
-    // "hello" whose optimistic bubble isn't recorded server-side yet (the
-    // runner is relaunching, so the POST is still in flight), then navigates
-    // away and back. The navigate-back dedup must NOT treat the PRE-EXISTING
-    // committed "hello" as the persisted copy of the new bubble — only a copy
-    // NEW since the bubble was stashed counts. Without the baseline the bubble
-    // vanishes until its own copy finally commits ("disappears then reappears").
-    seedSession("conv_native", [userMessage("resp_old", "hello")]);
-    seedSession("conv_other", []);
-
-    await useChatStore.getState().switchTo("conv_native");
-    // The snapshot's committed "hello" is in blocks now — it forms the dedup
-    // baseline captured when we navigate away. Add the new optimistic bubble.
-    useChatStore.setState((s) => ({
-      pendingUserMessages: [
-        ...s.pendingUserMessages,
-        { tempId: "pend_1", content: [{ type: "input_text", text: "hello" }] },
-      ],
-    }));
-
-    // Away and back — the snapshot still has ONLY the older committed "hello".
-    await useChatStore.getState().switchTo("conv_other");
-    await useChatStore.getState().switchTo("conv_native");
-
-    // Bubble survives: the older committed copy was already in the baseline,
-    // so it isn't mistaken for the new message persisting. Revert the
-    // baseline logic and this is [] — the disappeared-message bug.
-    expect(useChatStore.getState().pendingUserMessages).toEqual([
-      { tempId: "pend_1", content: [{ type: "input_text", text: "hello" }] },
-    ]);
-    const userBlocks = useChatStore.getState().blocks.filter((b) => b.type === "user_message");
-    expect(userBlocks).toHaveLength(1); // the old committed "hello", bubble separate
-  });
-
-  it("still drops the stashed bubble when a NEW committed copy appears beside an older match", async () => {
-    // The baseline must not over-protect: if history already had a "hello"
-    // AND the user's new "hello" round-trips into history while away, the
-    // snapshot now holds TWO — one more than the baseline — so the stash
-    // bubble IS the persisted one and must be deduped away (no duplicate).
-    seedSession("conv_native", [userMessage("resp_old", "hello")]);
-    seedSession("conv_other", []);
-
-    await useChatStore.getState().switchTo("conv_native");
-    useChatStore.setState((s) => ({
-      pendingUserMessages: [
-        ...s.pendingUserMessages,
-        { tempId: "pend_1", content: [{ type: "input_text", text: "hello" }] },
-      ],
-    }));
-    await useChatStore.getState().switchTo("conv_other");
-
-    // While away, the new "hello" committed — history now has two copies.
-    seedSession("conv_native", [
-      userMessage("resp_old", "hello"),
-      userMessage("resp_new", "hello"),
-    ]);
-    await useChatStore.getState().switchTo("conv_native");
-
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-    const userBlocks = useChatStore.getState().blocks.filter((b) => b.type === "user_message");
-    expect(userBlocks).toHaveLength(2); // both committed copies, no trailing bubble
-  });
-
-  it("replays all pending_inputs on navigate-back, deduping a restored in-flight twin by content", async () => {
-    // Navigate-back re-seeds from the snapshot's pending_inputs — the
-    // server is the source of truth for every queued message it knows
-    // about, the viewer's own and collaborators' alike (no viewer
-    // identity needed). A restored in-flight bubble whose record landed
-    // server-side while its POST response was still in transit is
-    // dropped in favor of its content-identical server twin: the server
-    // entry carries the durable pending_id, so the eventual consumed
-    // event clears it BY ID. The own message is image-only here because
-    // that's the case only content equality can correlate — the
-    // text-based dedupe has nothing to match, and keeping both copies
-    // would double-render and strand one of them (the stuck-pending-
-    // bubble bug).
-    seedSession("conv_other", []);
-
-    await useChatStore.getState().switchTo("conv_native");
-    useChatStore.setState({
-      pendingUserMessages: [
-        {
-          tempId: "pend_1",
-          content: [{ type: "input_image", file_id: "file_xyz", filename: "a.png" }],
-        },
-      ],
-    });
-    await useChatStore.getState().switchTo("conv_other");
-
-    // While away (still pre-persist): the server holds the viewer's own
-    // entry (recorded by the in-flight POST) and a collaborator's.
-    seedSession("conv_native", []);
-    seedPendingInputs("conv_native", [
-      {
-        pending_id: "pending_mine",
-        content: [{ type: "input_image", file_id: "file_xyz", filename: "a.png" }],
-        created_by: "alice@databricks.com",
-      },
-      {
-        pending_id: "pending_bob",
-        content: [{ type: "input_text", text: "from bob" }],
-        created_by: "bob@databricks.com",
-      },
-    ]);
-    await useChatStore.getState().switchTo("conv_native");
-
-    const pending = useChatStore.getState().pendingUserMessages;
-    // Both server entries, nothing else. If the restored twin weren't
-    // deduped, the image bubble would appear twice (length 3); if
-    // pending_inputs replay were dropped, "from bob" would be missing.
-    expect(pending).toEqual([
-      {
-        tempId: "pending_mine",
-        content: [{ type: "input_image", file_id: "file_xyz", filename: "a.png" }],
-        author: "alice@databricks.com",
-      },
-      {
-        tempId: "pending_bob",
-        content: [{ type: "input_text", text: "from bob" }],
-        author: "bob@databricks.com",
-      },
-    ]);
-  });
-
-  it("drops a settled send's bubble on navigate-back once the server has resolved it (stuck-bubble regression)", async () => {
-    // The reported strand, replayed end-to-end through the real client
-    // paths:
-    //   1. send an image-only message from the composer (real upload +
-    //      POST /events; send() promotes the "pending:" placeholder to
-    //      the uploaded file id and stamps `posted` when the POST
-    //      settles);
-    //   2. confirm the live SSE stream is connected and pumping;
-    //   3. navigate away — switchTo aborts the SSE transport, so the
-    //      session.input.consumed event the transcript round-trip
-    //      publishes while away is fired into a dead socket and lost
-    //      (the live stream has no replay). The abort IS the missed
-    //      event: no bytes can arrive on a severed transport, so the
-    //      test deliberately delivers nothing after this point.
-    //   4. while away, the round-trip commits the message server-side
-    //      and drains its pending_inputs entry;
-    //   5. navigate back — the snapshot shows the committed item and
-    //      nothing pending.
-    // The send settled, so the server snapshot is authoritative and the
-    // bubble must NOT come back. Before the fix the stash restored it at
-    // step 5 and nothing could ever clear it — image-only content
-    // defeats the text dedupe, native sessions skip the idle-clear, and
-    // the consumed event was long gone — leaving a permanent pending
-    // bubble that "rotated" on every later send.
-    const sink = pushableStream();
-    let nativeStreamOpens = 0;
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      // First bind gets the controllable live stream (so the test can
-      // prove it was connected before the drop); the navigate-back
-      // rebind gets a plain empty stream.
-      if (url === "/v1/sessions/conv_native/stream") {
-        nativeStreamOpens += 1;
-        return nativeStreamOpens === 1
-          ? mockResponse(null, { bodyStream: sink.stream })
-          : streamResponse();
-      }
-      // Real upload target for the image attachment.
-      if (url === "/v1/sessions/conv_native/resources/files" && init?.method === "POST") {
-        return mockResponse({
-          id: "file_real",
-          name: "a.png",
-          metadata: { filename: "a.png", bytes: 3, created_at: 0 },
-        });
-      }
-      // Native wrapper: the message round-trips through the TUI, not
-      // persisted at POST time — the precondition for the bug.
-      if (url.split("?")[0] === "/v1/sessions/conv_native" && (init?.method ?? "GET") === "GET") {
-        return mockResponse({
-          id: "conv_native",
-          agent_id: "agent_xyz",
-          status: "idle",
-          created_at: 0,
-          items: sessionSnapshots.get("conv_native") ?? [],
-          pending_inputs: sessionPendingInputs.get("conv_native") ?? [],
-          labels: { "omnigent.wrapper": "claude-code-native-ui" },
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
-    seedSession("conv_native", []);
-    seedSession("conv_other", []);
-
-    await useChatStore.getState().switchTo("conv_native");
-    expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
-
-    // 1. Real image-only send: upload → POST /events → settle.
-    const image = new File([new Uint8Array([137, 80, 78])], "a.png", { type: "image/png" });
-    await useChatStore.getState().send("", "agent_xyz", [image]);
-
-    // The bubble carries the REAL uploaded file id (send promoted the
-    // "pending:a.png" placeholder) and the settled flag — proving the
-    // full upload + POST path ran, not a hand-injected bubble. If
-    // file_id were still "pending:a.png", the upload promotion broke;
-    // if posted were undefined, the settle stamp broke and navigation
-    // would wrongly stash this bubble.
-    const sent = useChatStore.getState().pendingUserMessages;
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.content).toEqual([
-      { type: "input_image", file_id: "file_real", filename: "a.png" },
-    ]);
-    expect(sent[0]!.posted).toBe(true);
-
-    // 2. Prove the live stream is connected and pumping BEFORE the
-    // drop, so the missed event below is a real loss on a real
-    // connection, not an artifact of a stream that never attached.
-    sink.push(
-      sse("session.status", {
-        type: "session.status",
-        conversation_id: "conv_native",
-        status: "running",
-      }),
-    );
-    await tick();
-    expect(useChatStore.getState().sessionStatus).toBe("running");
-
-    // 3. Navigate away. The abort severs the transport — the consumed
-    // event published during the gap can never reach this client.
-    await useChatStore.getState().switchTo("conv_other");
-
-    // 4. While away: the transcript round-trip committed the message
-    // (file blocks merged into the durable item) and drained
-    // pending_inputs — the snapshot now shows the committed item and
-    // nothing pending.
-    seedSession("conv_native", [
-      {
-        id: "msg_img_user",
-        response_id: "resp_img",
-        type: "message",
-        role: "user",
-        status: "completed",
-        content: [
-          { type: "input_image", file_id: "file_real", filename: "a.png" },
-          { type: "input_text", text: "[Attached: a.png]" },
-        ],
-      },
-    ]);
-
-    // 5. Navigate back: no pending bubble survives — the committed item
-    // is the only copy. If switchTo still stashed settled sends, this
-    // would hold the stranded image bubble forever.
-    await useChatStore.getState().switchTo("conv_native");
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-    const userBlocks = useChatStore.getState().blocks.filter((b) => b.type === "user_message");
-    expect(userBlocks).toHaveLength(1); // the committed copy renders exactly once
-
-    // Unpark the first bind's pump so it unwinds cleanly.
-    sink.close();
-  });
-
-  it("first-message regression: an in-flight send survives navigation; a settled one defers to the server", async () => {
-    // End-to-end lifecycle of the navigation-survival policy, driving the
-    // REAL send() path (not a setState-injected bubble).
-    //
-    // Phase 1: a brand-new native session's first POST is held
-    // open while the host cold-starts the runner — the server hasn't
-    // reached pending_inputs.record() yet, so for that whole window the
-    // snapshot has neither a committed item NOR a pending_inputs entry
-    // (confirmed in the logz trace: items=0, pending_inputs=0). The mock
-    // /events POST never resolves to model that. Navigating away and back
-    // must restore the bubble from the client stash — the server cannot
-    // replay a message it has never been told about.
-    //
-    // Phase 2 (stuck-bubble fix): once the POST settles, the server owns
-    // the message, so navigation defers to the snapshot. Here the
-    // snapshot shows nothing pending (the entry was resolved while
-    // away), so the bubble must NOT come back — if it did, nothing
-    // could ever clear it (the consumed event is gone and native
-    // sessions skip the idle-clear): the permanent stuck bubble.
-    let releaseEventsPost: (() => void) | null = null;
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      // Cold-starting runner: the /events POST is held open until the
-      // test releases it. record() only runs server-side after that.
-      if (url.match(/\/v1\/sessions\/[^/]+\/events$/) && init?.method === "POST") {
-        return new Promise<Response>((resolve) => {
-          releaseEventsPost = () => resolve(mockResponse({ queued: true }));
-        }) as unknown as Response;
-      }
-      // Native wrapper: message round-trips through the TUI, not
-      // persisted at POST time (the precondition for both phases).
-      if (url.split("?")[0] === "/v1/sessions/conv_native" && (init?.method ?? "GET") === "GET") {
-        return mockResponse({
-          id: "conv_native",
-          agent_id: "agent_xyz",
-          status: "idle",
-          created_at: 0,
-          items: sessionSnapshots.get("conv_native") ?? [],
-          pending_inputs: sessionPendingInputs.get("conv_native") ?? [],
-          labels: { "omnigent.wrapper": "claude-code-native-ui" },
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
-    seedSession("conv_native", []);
-    seedSession("conv_other", []);
-
-    // Bind the native session, then send the first message through the
-    // real path. Not awaited — the POST is deliberately in flight.
-    await useChatStore.getState().switchTo("conv_native");
-    const sendDone = useChatStore.getState().send("hello", "agent_xyz");
-    await tick(); // let send() reach the held-open POST
-
-    expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
-    const sent = useChatStore.getState().pendingUserMessages;
-    expect(sent).toHaveLength(1); // optimistic bubble is showing
-    expect(sent[0]!.content).toEqual([{ type: "input_text", text: "hello" }]);
-    const sentTempId = sent[0]!.tempId; // client-only id; the server has no copy yet
-
-    // Phase 1: navigate away (POST still in flight) and back.
-    await useChatStore.getState().switchTo("conv_other");
-    await useChatStore.getState().switchTo("conv_native");
-
-    // The SAME optimistic bubble is restored from the stash — proving it
-    // came from client memory, not a re-fetch (the snapshot is empty). The
-    // stable tempId rules out any other source. Without the stash this is
-    // [] and the assertion fails: the disappeared-first-message bug.
-    const after = useChatStore.getState().pendingUserMessages;
-    expect(after).toHaveLength(1);
-    expect(after[0]!.tempId).toBe(sentTempId);
-    expect(after[0]!.content).toEqual([{ type: "input_text", text: "hello" }]);
-
-    // Phase 2: the POST settles (runner came up, server recorded +
-    // forwarded the message). The live bubble keeps rendering, but it is
-    // now server-owned for navigation purposes.
-    releaseEventsPost!();
-    await sendDone;
-    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1); // still on screen
-
-    // Navigate away and back again. The snapshot has no pending_inputs
-    // entry (resolved while away) and no committed item yet — the
-    // server says nothing is pending, and the server wins. If switchTo
-    // still stashed settled sends, the bubble would come back here as a
-    // permanently-stuck pending message.
-    await useChatStore.getState().switchTo("conv_other");
-    await useChatStore.getState().switchTo("conv_native");
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-  });
-
-  it("drops a settled slash-command echo on navigate-back (nothing can ever reconcile it)", async () => {
-    // The optimistic /skill echo follows the same navigation-survival
-    // policy as a message send: once its POST settles the server has
-    // persisted the visible receipt, so navigation defers to the
-    // snapshot. The echo is the most strand-prone bubble if wrongly
-    // stashed — its receipt is a SlashCommandBlock, not a user message,
-    // so the navigate-back text dedupe can never match it, and no
-    // session.input.consumed ever fires for a slash command.
-    seedSession("conv_native", []);
-    seedSession("conv_other", []);
-
-    await useChatStore.getState().switchTo("conv_native");
-    await useChatStore.getState().sendSlashCommand("compact", "", "agent_xyz");
-
-    // Echo is showing (with the typed command text) while we wait for
-    // the slash_command receipt event.
-    const echo = useChatStore.getState().pendingUserMessages;
-    expect(echo).toHaveLength(1);
-    expect(echo[0]!.content).toEqual([{ type: "input_text", text: "/compact" }]);
-
-    // Navigate away and back: the settled echo is not restored (the
-    // persisted receipt in the snapshot is the durable copy). If
-    // sendSlashCommand skipped the posted stamp, the stash would
-    // resurrect the echo here as a bubble nothing can clear.
-    await useChatStore.getState().switchTo("conv_other");
-    await useChatStore.getState().switchTo("conv_native");
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
   // The session.status handler keys off isNativeTerminalSession to decide
@@ -1241,7 +869,12 @@ describe("chatStore — switchTo", () => {
     expect(state.hasMoreHistory).toBe(true);
   });
 
-  it("drops a stale loadMoreHistory page that resolves after navigating away and back", async () => {
+  it("applies a scroll-up page that resolves after navigating away and back", async () => {
+    // This used to be "drops a stale page": navigating away destroyed the window
+    // and re-hydrated it on return, so an in-flight cursor-relative page was
+    // relative to a window that no longer existed. The conversation now keeps its
+    // window across navigation, so the page is still valid when it lands and must
+    // be applied rather than discarded.
     const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
     const itemsA = Array.from({ length: total }, (_, idx) =>
       userMessage(`a_${idx.toString().padStart(4, "0")}`, `a ${idx}`),
@@ -1253,40 +886,33 @@ describe("chatStore — switchTo", () => {
     const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
     expect(windowIds).toHaveLength(INITIAL_WINDOW_ITEMS);
 
-    // Defer ONLY the first scroll-up page (the `after=` cursor fetch);
-    // binds use cursorless initial-window fetches and stay live.
-    let releaseStalePage: (() => void) | null = null;
+    // Hold the scroll-up page open across the navigation round trip.
+    let releasePage: (() => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/conv_a\/items\?.*after=/.test(url) && releaseStalePage === null) {
+      if (/\/v1\/sessions\/conv_a\/items\?.*after=/.test(url) && releasePage === null) {
         return new Promise<Response>((resolve) => {
-          releaseStalePage = () => resolve(defaultFetchHandler(input, init));
+          releasePage = () => resolve(defaultFetchHandler(input, init));
         });
       }
       return defaultFetchHandler(input, init);
     });
 
-    const stale = useChatStore.getState().loadMoreHistory();
+    const inFlight = useChatStore.getState().loadMoreHistory();
     await useChatStore.getState().switchTo("conv_b");
-    await useChatStore.getState().switchTo("conv_a"); // fresh window for A
-    releaseStalePage!();
-    await stale;
+    await useChatStore.getState().switchTo("conv_a");
+    releasePage!();
+    await inFlight;
 
     const state = useChatStore.getState();
-    // The stale page is cursor-relative to the PRE-navigation window; the
-    // round trip passed the conversation-id guard, so only the generation
-    // check stops it from prepending below the fresh hydration merge.
-    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(windowIds);
-    expect(state.oldestItemId).toBe(itemsA.at(-INITIAL_WINDOW_ITEMS)!.id);
-    expect(state.hasMoreHistory).toBe(true);
-    expect(state.loadingMoreHistory).toBe(false);
-
-    // The window is healthy: a fresh scroll-up still pages correctly.
-    await useChatStore.getState().loadMoreHistory();
-    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+    // Prepended onto the window it was fetched against, which is still current.
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([
       ...itemsA.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
+    expect(state.oldestItemId).toBe(itemsA[0]!.id);
+    expect(state.hasMoreHistory).toBe(false);
+    expect(state.loadingMoreHistory).toBe(false);
   });
 
   it("loadMoreHistory dedupes a page overlapping blocks kept across a rebind", async () => {
@@ -1423,7 +1049,10 @@ describe("chatStore — switchTo", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("aborts the in-flight stream's controller when switching conversations", async () => {
+  it("aborts a conversation's stream when it is released, not when switched away", async () => {
+    // Switch-away used to abort (see "does not abort a conversation's stream
+    // when switching away"). Release — conversation deleted, or evicted from the
+    // registry — is what tears the stream down now.
     const controller = new AbortController();
     useChatStore.setState({
       conversationId: "conv_abc",
@@ -1432,11 +1061,11 @@ describe("chatStore — switchTo", () => {
     seedSession("conv_def");
 
     await useChatStore.getState().switchTo("conv_def");
-
-    expect(controller.signal.aborted).toBe(true);
-    // The NEW bind creates a fresh controller; that one stays for the
-    // lifetime of the new session's stream.
+    expect(controller.signal.aborted).toBe(false);
     expect(useChatStore.getState().conversationId).toBe("conv_def");
+
+    releaseConversation("conv_abc");
+    expect(controller.signal.aborted).toBe(true);
   });
 
   it("switching to null clears state without opening a stream", async () => {
@@ -3179,12 +2808,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         pendingUserMessages: [
           { tempId: "pend_clear", content: [{ type: "input_text", text: "/clear" }] },
         ],
-        pendingByConversation: {
-          conv_old: {
-            messages: [{ tempId: "pend_clear", content: [{ type: "input_text", text: "/clear" }] }],
-            committedTexts: [],
-          },
-        },
       });
       handleSessionEvent({
         type: "session_superseded",
@@ -3195,9 +2818,8 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const state = useChatStore.getState();
       // The `/clear` never gets a session.input.consumed on conv_old (the
       // runner rotated away), so its bubble must be dropped here rather than
-      // spinning forever — both the live list and the navigate-back stash.
+      // spinning forever.
       expect(state.pendingUserMessages).toEqual([]);
-      expect(state.pendingByConversation.conv_old).toBeUndefined();
     });
 
     it("ignores a superseded frame from a switched-away conversation", () => {
@@ -6747,19 +6369,17 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     expect(order).toEqual(["A", "B", "C"]);
   });
 
-  it("drops a pending frame's buffered blocks when the session switches mid-stream", async () => {
-    useChatStore.setState({ conversationId: "conv_old", blocks: [] });
+  it("lands a pending frame on its OWN conversation, never the visible one", async () => {
+    // A buffered frame that fires after the user switches away must not paint
+    // onto the newly-visible conversation. That used to be enforced by flush()
+    // bailing on a conversationId mismatch — and it dropped the blocks. Now the
+    // buffer belongs to conv_old's entry, so the blocks are kept AND the visible
+    // conversation is untouched.
+    const { set: setOld, get: getOld } = bindConversationForTest("conv_old");
     const sink = pushableStream();
     const controller = new AbortController();
     const manual = manualScheduler();
-    void pumpStreamEvents(
-      "conv_old",
-      sink.stream,
-      controller,
-      setState,
-      getState,
-      manual.scheduler,
-    );
+    void pumpStreamEvents("conv_old", sink.stream, controller, setOld, getOld, manual.scheduler);
 
     sink.push(sse("response.created", { id: "resp_old", status: "in_progress", output: [] }));
     sink.push(delta("A")); // first content → sync flush onto conv_old
@@ -6768,16 +6388,15 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     await tick();
     expect(manual.pending()).toBe(true);
 
-    // switchTo binds another session: conversationId changes + the old
-    // controller aborts. The new session starts empty.
-    controller.abort();
-    useChatStore.setState({ conversationId: "conv_new", blocks: [] });
+    // The user navigates to another conversation. conv_old keeps its stream.
+    bindConversationForTest("conv_new");
 
-    // Firing the stale frame must NOT land conv_old's buffered B/C onto
-    // conv_new — flush() early-returns on the conversationId mismatch.
     manual.fire();
     expect(useChatStore.getState().conversationId).toBe("conv_new");
+    // conv_new is untouched...
     expect(useChatStore.getState().blocks).toEqual([]);
+    // ...and conv_old kept its own buffered output rather than discarding it.
+    expect(getOld().blocks.length).toBeGreaterThan(0);
   });
 });
 
@@ -6862,22 +6481,52 @@ describe("chatStore — pumpStreamEvents end reasons", () => {
     expect(st.activeResponse).toEqual({ responseId: "resp_k", state: "streaming", error: null });
   });
 
-  it("returns 'switched' when the conversation changes mid-stream", async () => {
-    useChatStore.setState({ conversationId: "conv_sw_a", blocks: [] });
+  it("keeps pumping when the user switches to another conversation", async () => {
+    // Switching away used to end the pump ("switched"), because one shared
+    // `blocks` array meant a background pump would corrupt the visible
+    // transcript. Each conversation now owns its state, so backgrounding is not
+    // a reason to stop — it is the entire feature. Only disposal ends the pump.
+    const { set: setA, get: getA } = bindConversationForTest("conv_sw_a");
     const sink = pushableStream();
     const done = pumpStreamEvents(
       "conv_sw_a",
       sink.stream,
       new AbortController(),
-      setState,
-      getState,
+      setA,
+      getA,
       immediate,
     );
     sink.push(sse("response.created", { id: "resp_sw", status: "in_progress", output: [] }));
     await tick();
-    useChatStore.setState({ conversationId: "conv_sw_b" });
-    // A 34-char + trailing-space delta flushes a chunk, so the next
-    // for-await iteration runs the conversation-id guard and bails.
+    bindConversationForTest("conv_sw_b");
+    // A 34-char + trailing-space delta flushes a chunk, so the next for-await
+    // iteration runs the pump's liveness guard — which conv_sw_a still passes.
+    sink.push(sse("response.output_text.delta", { delta: `${"z".repeat(34)} ` }));
+    await tick();
+    // Still running: the delta landed on conv_sw_a, not on the visible one.
+    expect(getA().blocks.length).toBeGreaterThan(0);
+    expect(useChatStore.getState().blocks).toEqual([]);
+    sink.push("data: [DONE]\n\n");
+    sink.close();
+    expect(await done).toBe("server_closed");
+  });
+
+  it("returns 'switched' once its conversation is evicted", async () => {
+    // The end reason survives for the case it now describes: the entry is gone
+    // (evicted or deleted), so there is nowhere to write and nothing to reopen.
+    const { set: setA, get: getA } = bindConversationForTest("conv_sw_gone");
+    const sink = pushableStream();
+    const done = pumpStreamEvents(
+      "conv_sw_gone",
+      sink.stream,
+      new AbortController(),
+      setA,
+      getA,
+      immediate,
+    );
+    sink.push(sse("response.created", { id: "resp_sw", status: "in_progress", output: [] }));
+    await tick();
+    releaseConversation("conv_sw_gone");
     sink.push(sse("response.output_text.delta", { delta: `${"z".repeat(34)} ` }));
     expect(await done).toBe("switched");
   });
@@ -7250,12 +6899,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("drops a stale reconcile/re-hydrate after a switch-away-and-back mid-backfill", async () => {
+  it("keeps reconciling a conversation the user navigated away from", async () => {
+    // This used to assert the opposite: switch-away destroyed the window, so a
+    // reconcile still in flight was stale and had to be discarded. A background
+    // conversation now keeps its window AND must keep reconciling — the ingress
+    // recycles every stream ~every 5 minutes, and the server keeps no replay
+    // buffer, so skipping the repair would leave it silently missing events.
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("spre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
     seedSession("conv_stale", preGap);
     seedSession("conv_other", []);
-    // Route /stream opens to sinks AND hold reconcile's first backfill page.
     const sinks: StreamSink[] = [];
     let releaseBackfill: (() => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -7273,66 +6926,48 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       return defaultFetchHandler(input, init);
     });
     const controller = new AbortController();
-    useChatStore.setState({
-      conversationId: "conv_stale",
+    const { set: setStale, get: getStale } = bindConversationForTest("conv_stale", {
       abortController: controller,
       blocks: itemsToBlocks(windowItems),
       hasMoreHistory: true,
       oldestItemId: windowItems[0]!.id,
     });
 
-    const loop = startStreamPump("conv_stale", controller, setState, getState);
+    const loop = startStreamPump("conv_stale", controller, setStale, getStale);
     await drainAsync();
     expect(sinks).toHaveLength(1);
 
-    // 100 gap items: if the stale backfill resumed, it would outrun the
-    // page cap and fall through to the window re-hydrate.
+    // A drop mid-turn: the reconnect reconciles, and parks on its first
+    // deferred backfill page.
     const gap = Array.from({ length: 100 }, (_, i) => gapUser("sgap", i));
     seedSessionItems("conv_stale", [...preGap, ...gap]);
     sinks[0]!.error();
     await drainAsync();
-    // Sync gate: reconcile is parked on its first deferred backfill page.
     expect(releaseBackfill).not.toBeNull();
 
-    // The user leaves and comes back: the revisit hydrates a FRESH window
-    // (the newest INITIAL_WINDOW_ITEMS, i.e. every gap item) and then
-    // scrolls one page up.
-    const away = useChatStore.getState().switchTo("conv_other");
+    // The user leaves while that reconcile is still in flight.
+    await useChatStore.getState().switchTo("conv_other");
     await drainAsync(5);
-    await away;
-    const back = useChatStore.getState().switchTo("conv_stale");
-    await drainAsync(5);
-    await back;
-    await useChatStore.getState().loadMoreHistory();
-    const fresh = useChatStore.getState();
-    expect(fresh.blocks.map((b) => b.ctx.itemId)).toEqual(
-      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
-    );
 
-    // The stale page resolves: the conversation id matches again, so only
-    // the generation guard separates it from the new window.
+    // It resolves against the backgrounded conversation, which is still live.
     releaseBackfill!();
     await drainAsync();
 
-    const state = useChatStore.getState();
-    // The stale flow must write nothing — pre-fix it ran on to the
-    // re-hydrate fallback, which rewound the scroll-up cursor to the
-    // window top and bumped the generation (voiding future legit pages).
-    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
-    );
-    expect(state.oldestItemId).toBe(preGap.at(-SESSION_HISTORY_PAGE_SIZE)!.id);
-    expect(state.historyGeneration).toBe(fresh.historyGeneration);
+    // The visible conversation is untouched...
+    expect(useChatStore.getState().conversationId).toBe("conv_other");
+    expect(useChatStore.getState().blocks).toEqual([]);
+    // ...and conv_stale picked up the items it missed during the gap, so
+    // returning to it shows a current transcript rather than one frozen at the
+    // moment the stream dropped. The 100-item gap exceeds the backfill cap, so
+    // the window is replaced wholesale rather than extended — what matters is
+    // that it now ends at the newest item, not at the pre-gap tail.
+    const staleIds = getStale().blocks.map((b) => b.ctx.itemId);
+    expect(staleIds.at(-1)).toBe(gap.at(-1)!.id);
+    expect(staleIds).not.toContain(windowItems.at(-1)!.id);
 
-    // The new window still pages older from where it left off: pre-fix the
-    // rewound cursor re-fetched the already-rendered page (all dupes) and
-    // the transcript would not have grown.
-    await useChatStore.getState().loadMoreHistory();
-    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      [...preGap, ...gap].map((item) => item.id),
-    );
-
-    // Unpark the orphaned pump so the awaited loop can exit.
+    // Release the conversation so the reconnect loop stops: a live entry keeps
+    // reconnecting by design, which is exactly what this test asserts.
+    releaseConversation("conv_stale");
     sinks[1]!.error();
     await drainAsync(2);
     await loop;
