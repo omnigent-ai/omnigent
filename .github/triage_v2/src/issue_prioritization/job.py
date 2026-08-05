@@ -44,7 +44,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=list(PipelineMode), default=PipelineMode.DRY_RUN)
     parser.add_argument("--regrade", default="false")
-    parser.add_argument("--adopt-legacy-bot-priorities", default="false")
+    parser.add_argument(
+        "--adopt-legacy-bot-priorities",
+        "--adopt_legacy_bot_priorities",
+        default="false",
+    )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--source-table", required=True)
     parser.add_argument("--classifications-table", required=True)

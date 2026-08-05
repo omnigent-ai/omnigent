@@ -41,9 +41,9 @@ resources:
               legacy-priority-bot-logins: ${var.legacy_priority_bot_logins}
               allow-github-writes: ${var.allow_github_writes}
           environment_key: default
-          libraries:
-            - whl: ../dist/*.whl
       environments:
         - environment_key: default
           spec:
-            client: "4"
+            environment_version: "4"
+            dependencies:
+              - ../dist/*.whl
