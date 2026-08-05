@@ -21,6 +21,7 @@ Key assertions:
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -1140,10 +1141,16 @@ class TestStreamProjection:
 
     def _pair(self, name: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Map a stream fixture and return its (function_call, output) item data."""
-        events = map_step_to_events(_load(name), conversation_id=_CID)
+        return self._pair_step(_load(name), label=name)
+
+    def _pair_step(
+        self, step: dict[str, Any], *, label: str = "step"
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Map one step dict and return its (function_call, output) item data."""
+        events = map_step_to_events(step, conversation_id=_CID)
         kinds = [event.data.get("item_type") for event in events]
         assert kinds == ["function_call", "function_call_output"], (
-            f"{name} mapped to {kinds}, expected an invocation followed by its output"
+            f"{label} mapped to {kinds}, expected an invocation followed by its output"
         )
         call = events[0].data["item_data"]
         output = events[1].data["item_data"]
@@ -1170,6 +1177,30 @@ class TestStreamProjection:
         call, output = self._pair("stream_view_file_done")
         assert call["name"] == "view_file"
         assert call["call_id"] == output["call_id"]
+
+    def test_a_suffixed_sibling_does_not_shadow_the_exact_argument(self) -> None:
+        """
+        An argument whose name matches a body key EXACTLY wins over a prefix hit.
+
+        Streamed steps carry no ``argumentsJson``, so arguments are recovered by
+        matching ``metadata.argumentsOrder`` against the typed body — by prefix,
+        because agy suffixes some of them (``AbsolutePath`` → ``absolutePathUri``).
+        A prefix scan alone returns whichever sibling comes first in the body, so
+        a body carrying both spellings could surface the wrong value.
+        """
+        step = copy.deepcopy(_load("stream_view_file_done"))
+        step["metadata"]["argumentsOrder"] = ["AbsolutePath"]
+        # The suffixed sibling is FIRST, so a prefix-only scan reaches it first.
+        step["viewFile"] = {
+            "absolutePathUriPreview": "file:///wrong.json",
+            "absolutePath": "file:///right.json",
+        }
+
+        call, _ = self._pair_step(step)
+        assert "right.json" in str(call["arguments"]), (
+            f"the exact argument must win over a suffixed sibling; got {call['arguments']}"
+        )
+        assert "wrong.json" not in str(call["arguments"])
 
     def test_generic_step_uses_the_agy_tool_name(self) -> None:
         """GENERIC steps keep ``toolCall`` in the stream; prefer that real name."""

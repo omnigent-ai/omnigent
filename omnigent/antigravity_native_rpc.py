@@ -298,6 +298,11 @@ def _pid_listen_ports(pid: int) -> list[int]:
     discovery needs no external binary. ``lsof`` remains a fallback for hosts
     where psutil cannot read the process (``AccessDenied``) but lsof can.
 
+    ``net_connections`` is the psutil 6.0 spelling (5.9 called it
+    ``connections``), which is why the dependency floor is ``>=6``: on 5.9 this
+    would raise ``AttributeError`` — neither ``psutil.Error`` nor ``OSError``,
+    so it would escape the fallback below instead of degrading to ``lsof``.
+
     Both blind — a restricted ``/proc`` where agy's listener is held in a
     backend the agy process does not own as an fd — yields ``[]``, which callers
     already treat as "cannot attribute" and handle without guessing a port.

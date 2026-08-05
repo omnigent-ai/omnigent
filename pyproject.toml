@@ -47,8 +47,11 @@ dependencies = [
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
-    # lifecycle (omnigent/host/local_server.py).
-    "psutil>=5.9,<8",
+    # lifecycle (omnigent/host/local_server.py). Floor is 6.0: agy's connect-RPC
+    # port discovery calls ``Process.net_connections()``, which 5.9 spells
+    # ``connections()`` — an AttributeError there, not a psutil.Error, so it
+    # would escape the fallback rather than degrade to lsof.
+    "psutil>=6,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
     # Pure-Python implementation; available on all platforms.

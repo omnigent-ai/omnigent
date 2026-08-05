@@ -492,8 +492,13 @@ def _arguments_from_body(step: dict[str, object], body: dict[str, object]) -> di
     ``metadata.argumentsOrder`` names the arguments the model passed
     (``["CommandLine", "Cwd", …]``) while the body holds their executed values
     under lowerCamelCase — sometimes suffixed (``AbsolutePath`` →
-    ``absolutePathUri``), hence the prefix match. Matching on that list is what
+    ``absolutePathUri``), hence the prefix fallback. Matching on that list is what
     keeps result fields (``combinedOutput``, ``results``) out of the arguments.
+
+    An exact match is tried first: a prefix scan alone returns whichever body key
+    happens to come first, so a body carrying both an argument and a suffixed
+    sibling of it (``absolutePath`` beside ``absolutePathUri``) would surface
+    whichever agy serialized first rather than the one that was asked for.
 
     :param step: The tool step (read for ``metadata.argumentsOrder``).
     :param body: The step's typed body.
@@ -509,7 +514,7 @@ def _arguments_from_body(step: dict[str, object], body: dict[str, object]) -> di
         if not isinstance(name, str) or name in _TOOL_ARG_DISPLAY_KEYS:
             continue
         wanted = name.lower()
-        match = next(
+        match = body_keys.get(wanted) or next(
             (key for lowered, key in body_keys.items() if lowered.startswith(wanted)), None
         )
         if match is not None:
@@ -603,8 +608,9 @@ def output_text_delta_event(
         not exceed the last one it accepted, so a constant value silences every
         delta after the first — the message then keeps a truncated buffer, never
         sees its ``final`` chunk, and is replayed to every later subscriber as a
-        cut-off duplicate. The reader passes the byte offset of the text already
-        forwarded, which is monotonic by construction.
+        cut-off duplicate. The reader passes a per-step chunk count, which only
+        ever grows; the forwarded byte offset does NOT qualify, because a
+        shorter post-moderation rewrite moves it backwards.
     :returns: One ``external_output_text_delta`` event.
     """
     return OutboundEvent(

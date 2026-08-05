@@ -1693,6 +1693,61 @@ async def test_stream_done_closes_the_live_block_with_a_final_delta(
 
 
 @pytest.mark.asyncio
+async def test_a_shrinking_rewrite_mid_stream_still_closes_the_live_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A rewrite that SHRINKS the answer still delivers the closing delta.
+
+    agy can replace a growing ``modifiedResponse`` with a shorter, non-prefix
+    rewrite. The reader emits no delta for it (there is no new suffix) but does
+    re-anchor its tracker to the new text, so an index derived from the forwarded
+    byte count MOVES BACKWARDS — and the server drops any chunk whose index does
+    not exceed the last accepted one. The closing ``final`` chunk was therefore
+    discarded and the block never closed. Indices are a per-step chunk count for
+    exactly this reason: growth cannot make a counter go backwards.
+
+    Scoped to what the producer controls. The server ALSO retires only on text
+    byte-equal to the commit, and deltas already published cannot be unsent, so a
+    shrink still leaves a stale preview — that half needs a reset signal in
+    ``inflight_text`` and is not fixable from here.
+    """
+    rewritten = "Redacted."
+    frames = [
+        _frame([_generating_planner("The answer is ")]),
+        _frame([_generating_planner("The answer is quite long ")]),
+        # Moderation replaces the answer: shorter, and not a prefix of it.
+        _frame([_generating_planner(rewritten)]),
+        _frame([_done_planner(rewritten)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    deltas = sink.deltas()
+    indices = [cast(int, d["index"]) for d in deltas]
+    assert indices == sorted(set(indices)), (
+        f"indices must strictly increase across a rewrite, got {indices}"
+    )
+    # The closer is what marks the block retirable, so it must survive the
+    # server's index check rather than being silently dropped.
+    finals = [d for d in deltas if d.get("final") is True]
+    assert len(finals) == 1, f"expected exactly one final delta, got {len(finals)}"
+    assert deltas[-1] is finals[0], "the final delta must be the last one sent"
+    assert cast(int, finals[0]["index"]) > max(
+        cast(int, d["index"]) for d in deltas if d.get("final") is not True
+    ), "the closing chunk must outrank every chunk before it or the server drops it"
+
+
+@pytest.mark.asyncio
 async def test_multi_chunk_answer_leaves_nothing_in_flight_on_the_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4581,12 +4636,135 @@ async def test_a_quiet_child_agy_still_reports_running_is_not_closed(
             timeout=_MIRROR_HANG_GUARD_S,
         )
 
-    # The veto is the point: the timer fired and agy's status overruled it, more
-    # than once, and the mirror was still alive to see the child finish.
-    assert idle_checks >= 2, f"the quiescence timer should have fired twice; got {idle_checks}"
+    # The veto is the point: the timer fired, agy's status overruled it, and the
+    # mirror was still alive to see the child finish.
+    assert idle_checks >= 1, f"the quiescence timer should have fired; got {idle_checks}"
     assert polls > _QUIET_POLLS_BEFORE_FINISHING, "the mirror gave up before the child finished"
     assert sink.statuses() == ["running", "idle"], (
         f"the child closed on its own step, not the timer; got {sink.statuses()}"
+    )
+
+
+async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A child agy never calls idle is re-checked ever less often, not every window.
+
+    agy answering "still running" can only veto the close, so the window is a
+    repeating re-check rather than a one-shot grace period. Left flat it would
+    re-ask at the same cadence for the life of the session; doubling keeps a
+    long-lived quiet child cheap while a stalled one is still caught.
+    """
+    polls = 0
+    idle_checks = 0
+
+    def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
+        nonlocal polls
+        polls += 1
+        return [_load("user_input")]  # turn open, never another step
+
+    def _still_running(_port: int) -> dict[str, Any]:
+        nonlocal idle_checks
+        idle_checks += 1
+        return {"trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    monkeypatch.setattr(reader, "_SUBAGENT_QUIESCENT_POLLS", 2)
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _still_running)
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, _captured = _subagent_client()
+    async with client:
+        mirror = asyncio.create_task(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            )
+        )
+        deadline = 0
+        while polls < 30 and deadline < 10_000:
+            deadline += 1
+            await asyncio.sleep(0)
+        mirror.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await mirror
+
+    assert polls >= 30, f"the mirror should have kept polling a vetoed child; got {polls}"
+    # Windows of 2, 4, 8, 16 reach poll 30 in four checks; a flat window would
+    # have asked ~15 times by now.
+    assert idle_checks <= 5, (
+        f"the re-check should back off, not repeat every window; got {idle_checks} "
+        f"checks over {polls} polls"
+    )
+    assert sink.statuses() == ["running"], (
+        f"a child agy still calls running must not be closed; got {sink.statuses()}"
+    )
+
+
+async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A nested sub-agent's mirror is reachable at teardown, not orphaned.
+
+    A child's steps run the same ``_process_committed_step`` path as the
+    parent's, so a nested ``INVOKE_SUBAGENT`` registers a grandchild mirror into
+    the CHILD's tracker. The reader's drain only walks the parent's, so without
+    the child cleaning up its own, a depth-2 mirror holds no reachable reference
+    and keeps polling a cascade whose agy is going away.
+    """
+    grandchild_polls = 0
+
+    def _steps(_port: int, cascade: str) -> list[dict[str, Any]]:
+        if cascade == "grand-ccc":
+            nonlocal grandchild_polls
+            grandchild_polls += 1
+            return [_load("user_input")]  # never closes: polls until cancelled
+        return [
+            _load("user_input"),
+            _invoke_subagent_step(results=[{"conversationId": "grand-ccc"}]),
+            _done_planner("Child done.", step_index=9),
+        ]
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    # agy reports the grandchild still working, so nothing but cancellation can
+    # end its mirror — the quiescence backstop must not be what stops it here.
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {"grand-ccc": {"status": "CASCADE_RUN_STATUS_RUNNING"}}
+        },
+    )
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, captured = _subagent_client(child_ids=["conv_grandchild"])
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+        assert _registrations(captured), "the nested sub-agent should have been registered"
+        settled = grandchild_polls
+        # A live mirror polls in a tight loop (its delay is collapsed), so a real
+        # pause is what makes an orphan visible; a cancelled one cannot advance.
+        await asyncio.sleep(0.05)
+
+    assert grandchild_polls == settled, (
+        f"the grandchild mirror kept polling after its parent ended "
+        f"({settled} → {grandchild_polls} polls)"
     )
 
 

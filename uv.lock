@@ -3126,7 +3126,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.5" },
     { name = "prompt-toolkit", specifier = ">=3.0,<4" },
     { name = "protobuf", specifier = ">=6,<7" },
-    { name = "psutil", specifier = ">=5.9,<8" },
+    { name = "psutil", specifier = ">=6,<8" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'databricks'", specifier = ">=3.1,<4" },
     { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8,<3" },

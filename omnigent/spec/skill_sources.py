@@ -412,9 +412,15 @@ def _agy_skill_dirs(ctx: SkillSourceContext) -> list[tuple[Path, str | None]]:
     ``agy plugin list``) and the ``skills/`` tree stays on disk. The manifest is
     therefore NOT a usable enabled-signal; the manifest file's name is.
 
-    :param ctx: Session discovery context. ``home`` is the real user home: agy
-        runs under a bridge-owned ``--gemini_dir`` whose plugins are linked back
-        to the real tree, so the real home is the truthful source either way.
+    :param ctx: Session discovery context. ``home`` is the real user home, which
+        is truthful for every source above even though agy runs under a
+        bridge-owned ``--gemini_dir``: the plugin, Global and Shared trees are
+        linked back to the real home by ``_seed_isolated_agy_plugins`` /
+        ``_seed_isolated_agy_skills``; the workspace tree is not under the Gemini
+        dir at all; and agy recreates its builtins in whatever Gemini dir it is
+        launched with. Anything listed here therefore resolves in-session — a
+        menu entry agy could not expand would just fail, since a native session
+        sends ``/name`` to the CLI as plaintext.
     :returns: ``(directory, namespace)`` pairs; ``namespace`` is ``None`` for
         every source except plugins.
     """
