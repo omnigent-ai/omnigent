@@ -403,7 +403,8 @@ describe("Sidebar session list", () => {
       "justify-start",
       "gap-2",
       "px-2",
-      "py-1",
+      "py-1.5",
+      "md:py-1",
     );
     expect(inbox).toHaveClass("hover:bg-muted", "hover:text-foreground", "dark:hover:bg-muted/50");
     expect(inbox.className).not.toContain("sidebar-hover");

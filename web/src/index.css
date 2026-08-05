@@ -121,9 +121,10 @@
   /* App-default interface/body text. Keep this non-inline so runtime
    * typography mappings can override the token. */
   --text-ui: 1rem;
-  --text-ui--line-height: 1.5;
+  --text-ui--line-height: 1.4;
   /* Slightly larger hierarchy/caption step than Tailwind's default. */
   --text-sm: 0.9rem;
+  --text-sm--line-height: 1.4;
 }
 
 /* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —

@@ -3655,7 +3655,7 @@ function DeletingRow({
     );
   }
   return (
-    // Match the interactive row's shared 28px metrics so the swap only changes
+    // Match the interactive row's responsive metrics so the swap only changes
     // color/opacity rather than shifting the list.
     <div
       className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
@@ -4079,11 +4079,9 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }
 
   return (
-    // Match the interactive row's box metrics (h-7, sidebar-compact-text) so
-    // entering edit mode doesn't grow the row or bump the font size. pl-1 + the
-    // input's px-1 line the text up with the row's px-2 title; the size-6
-    // buttons sit inside the 28px row height.
-    <div className="sidebar-compact-text flex h-7 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1">
+    // Match the interactive row's responsive box metrics so entering edit mode
+    // doesn't shift the list. pl-1 + the input's px-1 align with row titles.
+    <div className="sidebar-compact-text flex h-8 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1 md:h-7">
       <input
         ref={inputRef}
         type="text"

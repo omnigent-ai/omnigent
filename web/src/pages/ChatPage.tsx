@@ -1707,15 +1707,14 @@ function MainAgentSurface({
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
-              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
-              the message column so the ticks don't butt against the text; the
-              rail is hidden on mobile, so the extra left padding is md-only. */}
+          {/* Override ConversationContent's default spacing so the thread keeps
+              16px side gutters at every viewport and consecutive agent turns
+              read as one thread. */}
           {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
             scrollClassName="[overflow-anchor:none]"
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
+              "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1997,9 +1996,9 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           (scrolled up) or collapsed (at the bottom, where the inline shimmer
           owns the visuals). */}
       {show && <span className="sr-only">Working…</span>}
-      {/* Mirror the conversation content column (mx-auto + px-6 + width) so the
+      {/* Mirror the conversation content column (mx-auto + px-4 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
-      <div className={cn("mx-auto w-full px-6", CHAT_COLUMN_WIDTH)}>
+      <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
         {show && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
           // its flat bottom edge merges into the chat box. aria-hidden: the
@@ -3212,7 +3211,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
-      className="max-w-3xl"
+      className="max-w-[640px]"
     >
       {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
           immediately left of the right-aligned bubble (the bubble's own

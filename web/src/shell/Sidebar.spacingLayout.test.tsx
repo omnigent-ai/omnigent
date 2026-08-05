@@ -4,10 +4,11 @@
 //     section: 12px side gutters, 8px above it (to the Omnigent header), and no
 //     bottom padding of its own; the 16px gap below comes from the scrolling list.
 //   - The scrolling project/session list uses the same 12px side gutters.
-//   - Nav rows use a natural 28px height: 20px line box + 4px block padding.
+//   - Rows use 6px mobile and 4px desktop block padding; desktop retains its
+//     natural 28px height.
 //   - Section headers (Pinned / Projects / Sessions) carry 8px bottom padding.
-//   - Session rows share that natural 28px container and sit flush (no
-//     inter-row gap).
+//   - Session rows share those responsive metrics and sit flush (no inter-row
+//     gap).
 //   - Project folder rows also sit flush (no inter-row gap).
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -158,7 +159,8 @@ describe("sidebar vertical spacing", () => {
       "min-h-0",
       "gap-2",
       "px-2",
-      "py-1",
+      "py-1.5",
+      "md:py-1",
       "rounded-[var(--radius-otto-button)]",
     );
     expect(newChat).not.toHaveClass("h-8");
@@ -180,7 +182,8 @@ describe("sidebar vertical spacing", () => {
       "min-h-0",
       "gap-2",
       "px-2",
-      "py-1",
+      "py-1.5",
+      "md:py-1",
       "rounded-[var(--radius-otto-button)]",
     );
     expect(row).not.toHaveClass("h-8");
