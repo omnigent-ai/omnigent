@@ -1637,6 +1637,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
 
     const entry = conversationRegistry.acquire(conversationId);
+    if (!wasLive) {
+      // Cold entry: nothing is hydrated yet, so the page must show the
+      // hydrating placeholder rather than mount the composer against empty
+      // state. Without this the composer resolves its model label from the
+      // sticky cross-session pick (session-scoped fields are still null) and
+      // paints the PREVIOUS conversation's model until the snapshot lands.
+      // A live entry deliberately skips this — painting it instantly, with no
+      // placeholder, is the whole point of keeping streams open.
+      entry.setState({ loadingConversation: true });
+    }
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();

@@ -1068,6 +1068,44 @@ describe("chatStore — switchTo", () => {
     expect(controller.signal.aborted).toBe(true);
   });
 
+  it("shows the hydrating placeholder while a COLD conversation binds", async () => {
+    // `loadingConversation` unmounts the chat surface during hydration. It has
+    // to be set for a cold entry: the composer would otherwise mount against
+    // empty session-scoped state (`llmModel` / `sessionModelOverride` null) and
+    // resolve its model label from the sticky cross-session pick — painting the
+    // PREVIOUS conversation's model until the snapshot lands.
+    const seen: boolean[] = [];
+    const unsubscribe = useChatStore.subscribe((s) => seen.push(s.loadingConversation));
+    // Hold every request so the hydrating window stays open to observe.
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    void useChatStore.getState().switchTo("conv_cold_hydrate");
+    await tick();
+    unsubscribe();
+
+    expect(seen).toContain(true);
+    expect(useChatStore.getState().loadingConversation).toBe(true);
+  });
+
+  it("does NOT show the placeholder when returning to a live conversation", async () => {
+    // The converse, and the whole point of keeping streams open: a revisit
+    // repaints the entry's own settled state, so flashing a spinner over an
+    // already-current transcript would undo the snappiness this buys.
+    seedSession("conv_warm", [userMessage("resp_w", "already here")]);
+    await useChatStore.getState().switchTo("conv_warm");
+    seedSession("conv_elsewhere", []);
+    await useChatStore.getState().switchTo("conv_elsewhere");
+
+    const seen: boolean[] = [];
+    const unsubscribe = useChatStore.subscribe((s) => seen.push(s.loadingConversation));
+    await useChatStore.getState().switchTo("conv_warm");
+    unsubscribe();
+
+    expect(seen).not.toContain(true);
+    expect(useChatStore.getState().loadingConversation).toBe(false);
+    // And it painted from the live entry, not from a refetch.
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
   it("switching to null clears state without opening a stream", async () => {
     const block: AnyBlock = {
       type: "user_message",
