@@ -72,7 +72,7 @@ def decisions(
     """Return this session's ``routing_decision`` items, oldest first.
 
     The session snapshot is the public read path for the decision rows the
-    chips and cards render from (``designs/CUJ_MASTER.md`` recipe R1 reads the
+    chips and cards render from (the same rows the UI
     same rows straight out of ``chat.db``).
 
     :param client: HTTP client pointed at the routing server.

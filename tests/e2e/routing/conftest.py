@@ -119,7 +119,7 @@ def _provider_block() -> dict[str, Any]:
     Smart Routing's apply layer can only rewrite a launch's model when the
     launch resolves through the Databricks AI Gateway, so the host has to see a
     databricks provider. The routing worktree's isolated dev config is the
-    canonical source (``designs/CUJ_MASTER.md`` §1.3).
+    canonical source (three canonical prompt classes: trivial, delegate-shaped, crosscutting).
 
     :returns: The ``providers`` mapping.
     :raises pytest.skip.Exception: When no provider config can be found.

@@ -2056,13 +2056,13 @@ def test_parse_routing_settings(
                     "other": {"kind": "key"},
                     "ws": {
                         "kind": "databricks",
-                        "profile": "eng-ml-inference",
+                        "profile": "test-routing-profile",
                         "default": True,
                     },
                 }
             },
             None,
-            "eng-ml-inference",
+            "test-routing-profile",
         ),
         # No providers in the server config: the global block is consulted.
         (
