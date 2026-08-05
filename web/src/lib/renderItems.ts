@@ -282,7 +282,7 @@ export function buildBubbles(
   // chip and the turn chip that repeats it verbatim are one verdict however far
   // apart they landed, and whether the pair is still visible decides whether the
   // cached prefix may be reused at all.
-  const superseded = supersededCreateRoutingChips(blocks);
+  const superseded = supersededRoutingChips(blocks);
   if (cache === undefined) {
     return markContinuedTurns(
       walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map(), superseded)
@@ -901,6 +901,79 @@ function deferredRoutingChips(
 }
 
 /**
+ * Every routing chip that renders nothing because a later one stands for it.
+ *
+ * Two independent repeats, both resolved over the whole transcript: a
+ * create-time pick the first turn repeats, and an in-harness spawn gate whose
+ * resulting child session repeats it.
+ *
+ * :returns: block indexes of the chips that render nothing.
+ */
+function supersededRoutingChips(blocks: AnyBlock[]): Set<number> {
+  const superseded = supersededCreateRoutingChips(blocks);
+  for (const index of supersededSpawnGateRoutingChips(blocks)) superseded.add(index);
+  return superseded;
+}
+
+/**
+ * Spawn-gate `native_subagent` chips the resulting `child_session` chip repeats.
+ *
+ * One spawn produces two decisions: the in-harness gate sizes the task, and
+ * then the child session it created routes its own first message. To the user
+ * that is one decision about one spawn, so it renders as one chip — the
+ * `child_session` row, which is strictly more informative: it names the
+ * spawned agent (the gate row has no agent, so it labels itself "Session")
+ * and the arm the child actually runs, with the gate's own pick still shown as
+ * the row's `raw_model` when a tier substitution moved it.
+ *
+ * Three cases deliberately stay two chips:
+ *
+ * - a deny→honor pair (an unapplied gate verdict, then an applied one) — the
+ *   failed attempt is the point;
+ * - two different spawns, which never share both a rationale and an arm;
+ * - a pair whose verdicts genuinely differ, which is not a repeat at all.
+ *
+ * :returns: block indexes of the gate chips that render nothing.
+ */
+function supersededSpawnGateRoutingChips(blocks: AnyBlock[]): Set<number> {
+  const superseded = new Set<number>();
+  for (let j = 0; j < blocks.length; j += 1) {
+    const chip = blocks[j]!;
+    if (chip.type !== "routing_decision" || chip.routing?.scope !== "native_subagent") continue;
+    const later = nextRoutingDecision(blocks, j);
+    if (later === null || later.routing?.scope !== "child_session") continue;
+    if (sameSpawnVerdict(chip, later)) superseded.add(j);
+  }
+  return superseded;
+}
+
+/**
+ * Whether a gate chip and the child-session chip after it decide one spawn.
+ *
+ * The two rows carry no shared spawn id — different decision ids, no agent name
+ * on the gate row, and minutes can pass between them — so the pairing key is
+ * the verdict itself: the same non-empty rationale (the router scored the same
+ * task text twice) AND the child running the arm the gate picked (its
+ * `raw_model`, when the workspace served a different model of that tier, else
+ * its `model`). Both must hold, so two same-arm spawns of different tasks, or
+ * two different verdicts about one task, still render separately.
+ */
+function sameSpawnVerdict(gate: RoutingDecisionBlock, child: RoutingDecisionBlock): boolean {
+  if (!gate.applied || !child.applied) return false;
+  if (gate.rationale.length === 0 || gate.rationale !== child.rationale) return false;
+  return bareModelId(gate.model) === bareModelId(child.routing?.rawModel ?? child.model);
+}
+
+/**
+ * A model id without its catalog prefix, for comparing two spellings of one arm
+ * (`"databricks-claude-opus-4-8"` and the router's own `"claude-opus-4-8"`).
+ */
+function bareModelId(model: string): string {
+  const lower = model.toLowerCase();
+  return lower.startsWith("databricks-") ? lower.slice("databricks-".length) : lower;
+}
+
+/**
  * Create-time `session` chips whose verdict the first turn repeats verbatim.
  *
  * A create with Smart Routing records the pick as a `session`-scope chip, then
@@ -915,8 +988,10 @@ function deferredRoutingChips(
  * Scanned over the whole transcript rather than from the walk's resume point,
  * and paired by decision ORDER rather than adjacency: neither what rendered in
  * between nor which turn group the two landed in changes whether they are the
- * same verdict twice. A `native_subagent` / `child_session` decision is never
- * the supersessor — a deny-then-honor spawn pair is two real decisions.
+ * same verdict twice. A spawn decision (`native_subagent` / `child_session`) is
+ * never the supersessor here — a deny-then-honor spawn pair is two real
+ * decisions; the one spawn repeat that does collapse has its own rule in
+ * `supersededSpawnGateRoutingChips`.
  *
  * :returns: block indexes of the chips that render nothing.
  */

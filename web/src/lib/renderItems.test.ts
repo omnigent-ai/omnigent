@@ -11,7 +11,11 @@ import { BlockStream } from "./blockStream";
 import type { ConversationItem } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { itemsToBlocks } from "./itemsToBlocks";
-import { routingDecisionBlock, routingDecisionItem } from "./__fixtures__/routingDecision";
+import {
+  type RoutingDecisionWire,
+  routingDecisionBlock,
+  routingDecisionItem,
+} from "./__fixtures__/routingDecision";
 import {
   type Bubble,
   type RenderItem,
@@ -1853,6 +1857,179 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
           "rd_spawn_honor",
         ]);
       }
+    });
+  });
+
+  describe("spawn-gate chip the child session repeats", () => {
+    // One spawn, two decisions: the in-harness gate sizes the task, then the
+    // child session it created routes its own first message. The rows below are
+    // the ones a live auto-harness codex session actually persisted.
+    const ESCALATE =
+      "Routed to claude-opus-4-8 because [not_crosscutting AND prompt_short AND " +
+      "low_ambiguity] all hold -> escalate up to claude-opus-4-8.";
+    const TRIVIAL =
+      "Routed to gpt-5-6-luna because trivial task (prompt<300, no errors/refs, " +
+      "llm easy) -> cheapest arm gpt-5-6-luna; never escalate.";
+
+    function gateItem(overrides: RoutingDecisionWire = {}): ConversationItem {
+      return routingDecisionItem({
+        id: "rd_gate",
+        response_id: "routing_gate",
+        model: "databricks-claude-opus-4-8",
+        rationale: ESCALATE,
+        harness: "claude-native",
+        scope: "native_subagent",
+        decision_id: "48fc9aad-a5a8-4902-ab90-ce85d8d9db1b",
+        ...overrides,
+      });
+    }
+
+    function childItem(overrides: RoutingDecisionWire = {}): ConversationItem {
+      return routingDecisionItem({
+        id: "rd_child",
+        response_id: "routing_child",
+        // The gate's own arm is not servable here, so the child ran the best
+        // model of that tier and the pick is preserved as ``raw_model``.
+        model: "databricks-claude-opus-5",
+        raw_model: "claude-opus-4-8",
+        rationale: ESCALATE,
+        agent: "claude-native-ui",
+        harness: "auto",
+        scope: "child_session",
+        decision_id: "5106aef9-595b-46a7-a99e-5a3a65d5b8ac",
+        ...overrides,
+      });
+    }
+
+    it("static reload: one chip per spawn, and the child row is the one kept", () => {
+      // Every decision the live session recorded, in order: its create-time
+      // pick, the first turn's repeat of it, one trivial spawn, then the
+      // escalated spawn's gate verdict and the child session it produced.
+      const items: ConversationItem[] = [
+        routingDecisionItem({
+          id: "rd_create",
+          response_id: "routing_create",
+          model: "databricks-gpt-5-6-sol",
+          rationale:
+            "Routed to gpt-5-6-sol because [not_crosscutting AND prompt_short AND " +
+            "low_ambiguity] not all hold -> default gpt-5-6-sol.",
+          harness: "codex-native",
+          scope: "session",
+        }),
+        routingDecisionItem({
+          id: "rd_turn",
+          response_id: "routing_turn",
+          model: "databricks-gpt-5-6-sol",
+          rationale:
+            "Routed to gpt-5-6-sol because [not_crosscutting AND prompt_short] " +
+            "not all hold -> default gpt-5-6-sol.",
+          harness: "codex-native",
+          scope: "turn",
+        }),
+        {
+          id: "u1",
+          type: "message",
+          role: "user",
+          response_id: "resp_1",
+          status: "completed",
+          content: [{ type: "input_text", text: "spawn subagents to do the work" }],
+        } as unknown as ConversationItem,
+        routingDecisionItem({
+          id: "rd_gate_trivial",
+          response_id: "routing_gate_trivial",
+          model: "databricks-gpt-5-6-luna",
+          rationale: TRIVIAL,
+          harness: "codex-native",
+          scope: "native_subagent",
+        }),
+        gateItem(),
+        childItem(),
+      ];
+      const bubbles = buildBubbles(itemsToBlocks(items), null);
+      // Three spawns' worth of decisions collapse to one chip each: the turn
+      // chip (standing for the create), the trivial spawn, and the escalated
+      // spawn — represented by its child row, not its gate row.
+      expect(chipIds(bubbles)).toEqual(["rd_turn", "rd_gate_trivial", "rd_child"]);
+      const kept = bubbles.find(
+        (b) => b.kind === "routing_decision" && b.itemId === "rd_child",
+      ) as Extract<Bubble, { kind: "routing_decision" }>;
+      // The surviving row names the spawned agent and the arm that ran, with
+      // the gate's pick still visible as the router's raw verdict.
+      expect(kept.agent).toBe("claude-native-ui");
+      expect(kept.model).toBe("databricks-claude-opus-5");
+      expect(kept.routing?.rawModel).toBe("claude-opus-4-8");
+    });
+
+    it("collapses the pair across anything that renders in between", () => {
+      const blocks = itemsToBlocks([gateItem(), childItem()]);
+      expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_child"]);
+      const spread = itemsToBlocks([
+        gateItem(),
+        {
+          id: "a0",
+          type: "message",
+          role: "assistant",
+          response_id: "resp_0",
+          status: "completed",
+          content: [{ type: "output_text", text: "Delegated." }],
+        } as unknown as ConversationItem,
+        childItem(),
+      ]);
+      expect(chipIds(buildBubbles(spread, null))).toEqual(["rd_child"]);
+    });
+
+    it("keeps a deny-then-honor spawn pair as two chips", () => {
+      // The gate refused to route (a router outage), and the child then
+      // routed — the owner needs to see the attempt that failed.
+      const blocks = itemsToBlocks([
+        gateItem({ model: "unavailable", applied: false, rationale: ESCALATE }),
+        childItem(),
+      ]);
+      expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_gate", "rd_child"]);
+    });
+
+    it("keeps two independent spawns as two chips", () => {
+      // Two in-harness spawns, then one child session: the trivial gate row
+      // belongs to a different spawn than the child row, so only the pair that
+      // shares a verdict collapses.
+      const blocks = itemsToBlocks([
+        routingDecisionItem({
+          id: "rd_gate_trivial",
+          response_id: "routing_gate_trivial",
+          model: "databricks-gpt-5-6-luna",
+          rationale: TRIVIAL,
+          harness: "codex-native",
+          scope: "native_subagent",
+        }),
+        gateItem(),
+        childItem(),
+      ]);
+      expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_gate_trivial", "rd_child"]);
+    });
+
+    it("keeps a pair whose verdicts genuinely differ as two chips", () => {
+      // Same spawn shape, different outcomes: a child that ran another arm, and
+      // a child whose decision was about another task, are both real news.
+      const differing: RoutingDecisionWire[] = [
+        { model: "databricks-claude-sonnet-5", raw_model: "claude-sonnet-5" },
+        { rationale: TRIVIAL },
+      ];
+      for (const override of differing) {
+        const blocks = itemsToBlocks([gateItem(), childItem(override)]);
+        expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_gate", "rd_child"]);
+      }
+    });
+
+    it("stays stable frame by frame as the pair streams in", () => {
+      // The gate chip is finalized into the cached prefix before the child row
+      // exists, so the drop can only land by re-walking it.
+      const streamed = itemsToBlocks([gateItem(), childItem()]);
+      const cache = createBubbleCache();
+      for (let n = 1; n <= streamed.length; n += 1) {
+        const frame = streamed.slice(0, n);
+        expect(buildBubbles(frame, null, cache)).toEqual(buildBubbles(frame, null));
+      }
+      expect(chipIds(cache.bubbles)).toEqual(["rd_child"]);
     });
   });
 
