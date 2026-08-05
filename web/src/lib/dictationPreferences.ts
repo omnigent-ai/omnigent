@@ -31,8 +31,10 @@ export function normalizeDictationLanguage(value: unknown): string | null {
 }
 
 function normalizeDeviceId(value: unknown): string | null {
-  if (typeof value !== "string" || !value || value.length > MAX_DEVICE_ID_LENGTH) return null;
-  return value;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "default" || trimmed.length > MAX_DEVICE_ID_LENGTH) return null;
+  return trimmed;
 }
 
 function normalizeDictationPreferences(value: DictationPreferences): DictationPreferences {

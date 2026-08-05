@@ -131,12 +131,12 @@ def create_dictation_router(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
             )
-        if auth_provider is not None and auth_provider.get_user_id(request) is None:
+        user_id = auth_provider.get_user_id(request) if auth_provider is not None else None
+        if auth_provider is not None and user_id is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
             )
         if permission_store is not None:
-            user_id = auth_provider.get_user_id(request) if auth_provider is not None else None
             if user_id is None:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,

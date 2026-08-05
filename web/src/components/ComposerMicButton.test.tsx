@@ -222,6 +222,21 @@ describe("ComposerMicButton", () => {
     }
   });
 
+  it("cancels Web Speech when clicked again during startup", () => {
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
+
+    fireEvent.click(button);
+
+    expect(stopSpy).toHaveBeenCalledOnce();
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("status")).toHaveTextContent("Dictation cancelled");
+
+    act(() => handlers.start?.({}));
+    expect(button).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("captures a separate owned stream for the Web Speech meter", async () => {
     const meter = installMeterAudio();
     const owned = mediaStream();

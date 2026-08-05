@@ -66,6 +66,28 @@ describe("dictationPreferences", () => {
     });
   });
 
+  it("normalizes stored microphone device ids", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        path: "server",
+        browserLanguage: "en-US",
+        microphoneDeviceId: "  mic-2  ",
+      }),
+    );
+    expect(readDictationPreferences().microphoneDeviceId).toBe("mic-2");
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        path: "server",
+        browserLanguage: "en-US",
+        microphoneDeviceId: " default ",
+      }),
+    );
+    expect(readDictationPreferences().microphoneDeviceId).toBeNull();
+  });
+
   it("does not throw when storage is unavailable", () => {
     const getItem = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new DOMException("blocked", "SecurityError");

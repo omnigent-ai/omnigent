@@ -67,7 +67,9 @@ def create_worker_app(
 ) -> FastAPI:
     """Build the authenticated worker app with asynchronous warmup."""
     resolve_engine = engine_provider or get_engine
-    token = shared_token if shared_token is not None else os.environ.get(WORKER_TOKEN_ENV, "")
+    token = (
+        shared_token if shared_token is not None else os.environ.get(WORKER_TOKEN_ENV, "")
+    ).strip()
     readiness = _Readiness()
 
     async def warmup() -> None:

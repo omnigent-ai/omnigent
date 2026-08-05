@@ -575,10 +575,23 @@ export const ComposerMicButton = ({
       if (serverAvailable) void toggleServer();
       return;
     }
-    // Guard against rapid clicks landing before start/end event fires.
-    if (transitionRef.current) return;
     const recognition = recognitionRef.current;
     if (!recognition) return;
+    // A second click can cancel a recognizer stuck before its start event.
+    if (transitionRef.current) {
+      if (phaseRef.current === "starting" && webTakeActiveRef.current) {
+        webTakeActiveRef.current = false;
+        transitionRef.current = false;
+        setPhase("idle");
+        setCompletionStatus("Dictation cancelled");
+        try {
+          recognition.stop();
+        } catch {
+          // The recognizer may not have entered a stoppable state yet.
+        }
+      }
+      return;
+    }
     transitionRef.current = true;
     try {
       if (phaseRef.current === "listening") {

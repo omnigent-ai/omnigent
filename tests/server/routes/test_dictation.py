@@ -38,8 +38,12 @@ class _NoIdentityAuthProvider:
 
 
 class _IdentityAuthProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def get_user_id(self, request: object) -> str:
         del request
+        self.calls += 1
         return "test-user"
 
 
@@ -278,13 +282,15 @@ def test_status_requires_auth_and_sanitizes_remote_url(monkeypatch: pytest.Monke
 
 
 def test_status_requires_admin_in_multi_user_mode() -> None:
+    auth_provider = _IdentityAuthProvider()
     with TestClient(
         _fake_app(
-            auth_provider=_IdentityAuthProvider(),
+            auth_provider=auth_provider,
             permission_store=_PermissionStore(admin=False),
         )
     ) as tc:
         assert tc.get("/v1/dictation/status").status_code == 403
+        assert auth_provider.calls == 1
 
     with TestClient(
         _fake_app(
