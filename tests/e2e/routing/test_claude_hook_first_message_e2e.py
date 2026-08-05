@@ -17,11 +17,11 @@ What is scored:
   it blocks the prompt, the model is switched while nothing is running, and the
   runner replays the captured prompt. The block notice must appear **once** —
   twice means the replay itself was routed again.
-* **The picker, not the arg form.** ``/model <id>`` prints "saved as your default
-  for new sessions" and rewrites the ``model`` key in the developer's own
-  ``~/.claude/settings.json``. The apply layer must use bare ``/model`` and the
-  picker's session-only key, so the pane says "for this session only" and the
-  settings file's digest is unchanged.
+* **The switch actually lands.** The apply layer types ``/model <id>``, so the
+  pane must report the switch before the replay runs. Claude Code answers that
+  form by also rewriting the ``model`` key in the developer's own
+  ``~/.claude/settings.json`` — an accepted trade-off — so everything *else* in
+  that file must be unchanged.
 * **One decision, one turn.** A leaked replay shows up as two user messages for
   one thing typed.
 * **The second prompt fast-skips.** Turn 2 must issue **zero** routing calls —
@@ -41,7 +41,7 @@ from omnigent.runner.turn_routing import MARKER_FILE
 from tests.e2e.routing._helpers import (
     capture_pane,
     claude_bridge_dir,
-    claude_settings_digest,
+    claude_settings_apart_from_the_model,
     decisions,
     same_arm,
     settle,
@@ -69,9 +69,8 @@ pytestmark = [pytest.mark.smart_routing, pytest.mark.timeout(900)]
 #: The hook's own block notice, printed into the pane before the replay.
 _BLOCK_NOTICE = "Smart Routing selected"
 
-#: What the picker prints on a session-scoped pick. Never "saved as your
-#: default", which is what the argument form prints.
-_SESSION_ONLY_HINT = "for this session only"
+#: What Claude Code prints once ``/model <id>`` has been applied.
+_MODEL_APPLIED_HINT = "Set model to"
 
 #: Text claude's TUI shows once its input box is mounted. Typing before this is
 #: the dropped-first-message race: claude flushes pending input on boot.
@@ -113,7 +112,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
 ) -> None:
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_digest()
+    settings_before = claude_settings_apart_from_the_model()
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
 
     # A BARE routed create: Smart Routing on, no prompt, so nothing is routed
@@ -159,8 +158,8 @@ def test_claude_routes_the_first_typed_message_exactly_once(
         f"the hook routed to {raw_pick!r}, expected the {expected.model!r} arm"
     )
 
-    # The apply layer must have gone through the picker's session-only path.
-    wait_for_pane_text(socket_path, target, _SESSION_ONLY_HINT, timeout=_ROUTE_TIMEOUT_S)
+    # The apply layer must have typed ``/model <id>`` and had it take effect.
+    wait_for_pane_text(socket_path, target, _MODEL_APPLIED_HINT, timeout=_ROUTE_TIMEOUT_S)
 
     # The local fast-skip marker is written before the block.
     wait_for_bridge_file(bridge_dir, MARKER_FILE, timeout=_ROUTE_TIMEOUT_S)
@@ -192,7 +191,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
         "turn 2's prompt reached the router; the fast skip must be free"
     )
 
-    assert claude_settings_digest() == settings_before, (
-        "~/.claude/settings.json changed — the model switch must go through the "
-        "picker's session-only key, never `/model <id>`"
+    assert claude_settings_apart_from_the_model() == settings_before, (
+        "~/.claude/settings.json changed beyond its `model` key — `/model <id>` "
+        "may move Claude Code's own default, nothing else"
     )

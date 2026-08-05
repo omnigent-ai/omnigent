@@ -51,8 +51,8 @@ ALIAS_MODEL_ENV_VARS: dict[str, str] = {
 CUSTOM_MODEL_OPTION_ENV_VAR = "ANTHROPIC_CUSTOM_MODEL_OPTION"
 
 #: Display name Claude Code labels the custom slot's ``/model`` picker row
-#: with. That row shows this name instead of the slot's id, so driving the
-#: picker onto it needs the name as an accepted row spelling.
+#: with, e.g. ``"Sonnet 5"``. Cosmetic — the slot's id is what ``/model``
+#: takes — so it is not part of the vocabulary below.
 CUSTOM_MODEL_OPTION_NAME_ENV_VAR = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
 
 #: Launch-env keys that define this session's model vocabulary.

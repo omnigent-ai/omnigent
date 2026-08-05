@@ -32,7 +32,7 @@ import pytest
 from omnigent.server.smart_routing import models_in_family
 from tests.e2e.routing._helpers import (
     arm_in,
-    claude_settings_digest,
+    claude_settings_apart_from_the_model,
     decisions,
     same_arm,
     session_snapshot,
@@ -74,7 +74,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
 ) -> None:
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_digest()
+    settings_before = claude_settings_apart_from_the_model()
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
 
     # ── 1. The routed create ────────────────────────────────────────────────
@@ -168,8 +168,8 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
         "the spawn's task text never reached the router"
     )
 
-    # ── 4. Isolation: the user's global Claude settings are untouched ────────
-    assert claude_settings_digest() == settings_before, (
-        "~/.claude/settings.json changed — routing must confine its hook wiring "
-        "to the session's bridge dir"
+    # ── 4. Isolation: only Claude Code's own `model` key may have moved ──────
+    assert claude_settings_apart_from_the_model() == settings_before, (
+        "~/.claude/settings.json changed beyond its `model` key — routing must "
+        "confine its hook wiring to the session's bridge dir"
     )

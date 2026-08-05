@@ -6051,8 +6051,11 @@ def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
     assert record.background_task_count == 0
 
 
-# ── /model picker (session-scoped model switching) ──────────────────────
+# ── /model switching + pane readiness ───────────────────────────────────
 
+#: Claude Code's interactive ``/model`` picker. Omnigent never drives it —
+#: it types ``/model <id>`` — but a picker the person opened by hand covers
+#: the input box, so the readiness gate has to recognise it.
 _MODEL_PICKER_PANE = """\
   Select model
   Switch between Claude models. Your pick becomes the default for new sessions.
@@ -6065,7 +6068,7 @@ _MODEL_PICKER_PANE = """\
 """
 
 _IDLE_PANE = """\
-  ⎿  Set model to Sonnet 5 for this session only
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
 ──────────────────────────────
 ❯
 ──────────────────────────────
@@ -6117,158 +6120,42 @@ def _fake_tmux(
     return sends
 
 
-def test_parse_model_picker_rows_reads_labels_and_the_cursor() -> None:
-    rows = claude_native_bridge._parse_model_picker_rows(_MODEL_PICKER_PANE)
-
-    assert rows == [
-        (1, False, "Default (recommended)"),
-        (2, False, "databricks-claude-opus-4-8"),
-        # The live model's check glyph is not part of its label.
-        (3, True, "databricks-claude-sonnet-5"),
-        (4, False, "Haiku"),
-    ]
-
-
-def test_parse_model_picker_rows_is_empty_off_the_picker() -> None:
-    assert claude_native_bridge._parse_model_picker_rows(_IDLE_PANE) == []
-
-
-@pytest.mark.parametrize(
-    ("targets", "expected_label"),
-    [
-        # A pinned alias labels the row with the exact catalog id.
-        (("databricks-claude-sonnet-5", "sonnet"), "databricks-claude-sonnet-5"),
-        (("databricks-claude-opus-4-8", "opus"), "databricks-claude-opus-4-8"),
-        # An unpinned family shows Claude Code's own display name, so the
-        # alias has to reach it.
-        (("databricks-claude-haiku-4-5", "haiku"), "Haiku"),
-    ],
-)
-def test_model_picker_row_matches_ids_and_aliases(
-    targets: tuple[str, ...],
-    expected_label: str,
-) -> None:
-    rows = claude_native_bridge._parse_model_picker_rows(_MODEL_PICKER_PANE)
-    hits = [row for row in rows if claude_native_bridge._model_picker_row_matches(row, targets)]
-
-    assert [row[2] for row in hits] == [expected_label]
-
-
-def test_model_picker_row_matches_nothing_for_an_absent_family() -> None:
-    rows = claude_native_bridge._parse_model_picker_rows(_MODEL_PICKER_PANE)
-
-    assert not [
-        row
-        for row in rows
-        if claude_native_bridge._model_picker_row_matches(
-            row, ("databricks-claude-fable-5", "fable")
-        )
-    ]
-
-
-def test_inject_model_selection_walks_to_the_row_and_presses_session_only(
+def test_a_model_switch_types_the_argument_form_and_confirms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    The switch is the picker's session-only key, never ``/model <id>``.
+    A model switch is ``/model <id>`` plus the confirm Enter.
 
-    ``/model <id>`` prints "saved as your default for new sessions" and
-    rewrites the ``model`` key in the user's own ``~/.claude/settings.json``,
-    so a routed turn would change the default model of their unrelated
-    Claude sessions. Digits are equally forbidden: in this picker a digit
-    confirms the row AS THE DEFAULT.
-    """
-    bridge_dir = _picker_bridge_dir(tmp_path)
-    # Cursor starts on row 3; the target is row 2, so one ``Up`` then ``s``.
-    moved = _MODEL_PICKER_PANE.replace(
-        "  ❯ 3. databricks-claude-sonnet-5", "    3. databricks-claude-sonnet-5"
-    ).replace("    2. databricks-claude-opus-4-8", "  ❯ 2. databricks-claude-opus-4-8")
-    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE, moved, _IDLE_PANE])
-
-    claude_native_bridge.inject_model_selection(
-        bridge_dir, targets=("databricks-claude-opus-4-8", "opus")
-    )
-
-    keys = [args[-1] for args in sends]
-    assert keys == ["C-u", "/model", "Enter", "Up", "s"]
-    # The argument form would have typed the id into the prompt.
-    assert not any("/model " in key for key in keys)
-    assert not any(key.isdigit() for key in keys)
-    # ``s`` must go through literally, not as a tmux key name.
-    assert sends[-1] == ["send-keys", "-l", "-t", "claude:0.0", "s"]
-
-
-def test_inject_model_selection_skips_the_walk_when_already_on_the_row(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE, _IDLE_PANE])
-
-    claude_native_bridge.inject_model_selection(
-        bridge_dir, targets=("databricks-claude-sonnet-5", "sonnet")
-    )
-
-    assert [args[-1] for args in sends] == ["C-u", "/model", "Enter", "s"]
-
-
-def test_inject_model_selection_dismisses_the_picker_when_no_row_matches(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    An unreachable model leaves the pane usable, and the caller fails open.
-
-    Leaving the picker open would wedge the next injection: the readiness
-    gate never sees an input box, and the user's prompt is lost.
-    """
-    bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
-
-    with pytest.raises(RuntimeError, match="no row for"):
-        claude_native_bridge.inject_model_selection(bridge_dir, targets=("gpt-5.6-luna",))
-
-    assert [args[-1] for args in sends] == ["C-u", "/model", "Enter", "Escape"]
-
-
-def test_inject_model_selection_raises_when_the_picker_never_opens(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bridge_dir = _picker_bridge_dir(tmp_path)
-    _fake_tmux(monkeypatch, [_IDLE_PANE])
-    monkeypatch.setattr(claude_native_bridge, "_MODEL_PICKER_OPEN_TIMEOUT_S", 0.0)
-
-    with pytest.raises(RuntimeError, match="did not open the /model picker"):
-        claude_native_bridge.inject_model_selection(bridge_dir, targets=("sonnet",))
-
-
-def test_inject_model_selection_confirms_the_switch_model_dialog(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A "Switch model?" dialog is accepted whenever it renders.
-
-    It only appears on a session with cached history, and it took ~1.9s to
-    render there — far past any fixed sleep — so it is polled for. A dropped
-    Enter leaves the dialog open and the next injection times out.
+    Accepted trade-off: the argument form also saves the pick as the person's
+    global default for new sessions. The interactive picker avoided that write
+    but needed ~35s of screen-scraping automation to drive.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
-    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE, dialog, _IDLE_PANE])
+    sends = _fake_tmux(monkeypatch, [dialog, _IDLE_PANE])
 
-    claude_native_bridge.inject_model_selection(
-        bridge_dir, targets=("databricks-claude-sonnet-5", "sonnet")
+    claude_native_bridge.inject_slash_command(
+        bridge_dir,
+        command="/model databricks-claude-sonnet-5",
+        auto_confirm=True,
     )
 
-    assert [args[-1] for args in sends] == ["C-u", "/model", "Enter", "s", "Enter"]
-
-
-def test_inject_model_selection_rejects_empty_targets(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="at least one target"):
-        claude_native_bridge.inject_model_selection(tmp_path / "bridge", targets=())
+    assert [args[-1] for args in sends] == [
+        "C-u",
+        "/model databricks-claude-sonnet-5",
+        "Enter",
+        # The "Switch model?" confirmation, once it actually rendered.
+        "Enter",
+    ]
+    # The id must go through literally, not as a tmux key name.
+    assert sends[1] == [
+        "send-keys",
+        "-l",
+        "-t",
+        "claude:0.0",
+        "/model databricks-claude-sonnet-5",
+    ]
 
 
 def test_confirm_tui_dialog_polls_instead_of_sleeping_a_fixed_interval(
@@ -6307,10 +6194,11 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     The claude-native "an injection may land now" signal, which doubles as the
     settle signal for the routing replay.
 
-    An open ``/model`` picker or ``Switch model?`` dialog swallows typed text,
-    so a mounted input box with neither on top of it is what readiness means.
-    A blocked ``UserPromptSubmit`` starts no turn either, so there is no turn
-    id to wait out — this is what says the replay may land.
+    A ``/model`` picker the person opened, or a ``Switch model?`` dialog,
+    swallows typed text — so a mounted input box with neither on top of it is
+    what readiness means. A blocked ``UserPromptSubmit`` starts no turn
+    either, so there is no turn id to wait out; this is what says the replay
+    may land.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     frames = {"pane": _IDLE_PANE}
@@ -6331,38 +6219,3 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
 
 def test_claude_pane_ready_is_false_without_an_advertised_pane(tmp_path: Path) -> None:
     assert claude_native_bridge.claude_pane_ready(tmp_path / "nope") is False
-
-
-def test_pick_model_picker_row_prefers_an_exact_id_over_an_alias_sibling() -> None:
-    """
-    Two generations of one family both answer to the alias — ids win.
-
-    Speaking the alias would move the pane onto whichever generation the
-    alias resolves to, while the recorded decision named the other one.
-    """
-    rows = claude_native_bridge._parse_model_picker_rows(
-        "    1. Default (recommended)         Use the default model\n"
-        "    2. databricks-claude-opus-5      Custom Opus model\n"
-        "  ❯ 3. databricks-claude-opus-4-8    Opus model\n"
-    )
-
-    picked = claude_native_bridge._pick_model_picker_row(
-        rows, ("databricks-claude-opus-4-8", "opus")
-    )
-
-    assert picked is not None
-    assert picked[2] == "databricks-claude-opus-4-8"
-
-
-def test_pick_model_picker_row_falls_back_to_the_alias_display_name() -> None:
-    rows = claude_native_bridge._parse_model_picker_rows(
-        "    1. Default (recommended)   Use the default model\n"
-        "  ❯ 2. Haiku                   Haiku 4.5 · Fastest for quick answers\n"
-    )
-
-    picked = claude_native_bridge._pick_model_picker_row(
-        rows, ("databricks-claude-haiku-4-5", "haiku")
-    )
-
-    assert picked is not None
-    assert picked[2] == "Haiku"

@@ -464,19 +464,29 @@ def rollout_turn_contexts(session_id: str) -> list[dict[str, Any]]:
 # ── Isolation guards ────────────────────────────────────────────────────────
 
 
-def claude_settings_digest() -> str | None:
-    """Return the md5 of the developer's ``~/.claude/settings.json``.
+def claude_settings_apart_from_the_model() -> str | None:
+    """Return the developer's ``~/.claude/settings.json`` minus its ``model`` key.
 
-    Routing must never write into the user's global Claude settings — the hook
-    registration lives in the per-session bridge dir. Compared before and
-    after each claude CUJ.
+    Routing writes nothing into the user's global Claude settings — hook
+    registration lives in the per-session bridge dir. Claude Code's own
+    response to ``/model <id>`` does rewrite the file's ``model`` key, which
+    is the accepted trade-off for the switch, so that one key is excluded and
+    everything else is compared before and after each claude CUJ.
 
-    :returns: The hex digest, or ``None`` when the file does not exist.
+    :returns: A canonical rendering of the remaining settings, or ``None``
+        when the file does not exist.
     """
     path = Path.home() / ".claude" / "settings.json"
     if not path.exists():
         return None
-    return hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # Unreadable is still comparable — hash the bytes.
+        return hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()
+    if isinstance(payload, dict):
+        payload = {key: value for key, value in payload.items() if key != "model"}
+    return json.dumps(payload, sort_keys=True)
 
 
 def grep_log(path: Path, needles: Sequence[str]) -> list[str]:

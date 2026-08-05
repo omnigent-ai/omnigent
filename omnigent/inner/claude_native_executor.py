@@ -12,7 +12,7 @@ from omnigent.claude_model_vocabulary import claude_model_command_arg
 from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
-    inject_model_selection,
+    inject_slash_command,
     inject_user_message,
     read_active_session_id,
     read_launch_model,
@@ -169,17 +169,16 @@ class ClaudeNativeExecutor(Executor):
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
                     if wanted_model_arg is not None:
-                        # The picker's "this session only" pick, never
-                        # ``/model <id>``: the argument form saves the pick as
-                        # the user's global default for new sessions, so every
-                        # routed turn would rewrite the default model of their
-                        # unrelated Claude sessions. Runs to completion before
-                        # the message inject below (same lock), so the switch
-                        # can't race the message.
+                        # Accepted trade-off: ``/model <id>`` also saves the
+                        # pick as the person's global default for new Claude
+                        # sessions. Runs to completion before the message
+                        # inject below (same lock), so its confirm Enter can't
+                        # race the message.
                         await asyncio.to_thread(
-                            inject_model_selection,
+                            inject_slash_command,
                             self._bridge_dir,
-                            targets=self._model_selection_targets(wanted_model, wanted_model_arg),
+                            command=f"/model {wanted_model_arg}",
+                            auto_confirm=True,
                         )
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
@@ -250,28 +249,6 @@ class ClaudeNativeExecutor(Executor):
             wanted_model,
         )
         return wanted_arg
-
-    @staticmethod
-    def _model_selection_targets(
-        wanted_model: str | None, wanted_model_arg: str
-    ) -> tuple[str, ...]:
-        """
-        Row spellings the ``/model`` picker may label the wanted model with.
-
-        The picker labels a row with the exact catalog id when this session's
-        launch env pinned one there, and with Claude Code's own family display
-        name otherwise — so both the routed id and the vocabulary argument are
-        offered, most precise first.
-
-        :param wanted_model: The routed model id, e.g.
-            ``"databricks-claude-sonnet-5"``, or ``None``.
-        :param wanted_model_arg: The vocabulary spelling
-            :func:`claude_model_command_arg` returned, e.g. ``"sonnet"``.
-        :returns: Ordered, deduplicated spellings for
-            :func:`omnigent.claude_native_bridge.inject_model_selection`.
-        """
-        candidates = (wanted_model, wanted_model_arg)
-        return tuple(dict.fromkeys(value for value in candidates if value))
 
     def _should_switch_model(self, wanted_model: str | None) -> bool:
         """

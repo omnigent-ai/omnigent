@@ -885,15 +885,15 @@ async def test_replay_switches_the_claude_pane_before_delivering(
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
-    switched: list[tuple[Path, tuple[str, ...]]] = []
+    switched: list[tuple[Path, str, bool]] = []
     client = _FakeServerClient()
 
-    def _inject(bridge_dir: Path, *, targets: tuple[str, ...]) -> None:
+    def _inject(bridge_dir: Path, *, command: str, auto_confirm: bool = False) -> None:
         assert not client.posts, "the pane must be switched before the prompt lands"
-        switched.append((bridge_dir, tuple(targets)))
+        switched.append((bridge_dir, command, auto_confirm))
 
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_model_selection", _inject, raising=False
+        "omnigent.claude_native_bridge.inject_slash_command", _inject, raising=False
     )
     monkeypatch.setattr(
         "omnigent.claude_native_bridge.read_model_env",
@@ -911,7 +911,9 @@ async def test_replay_switches_the_claude_pane_before_delivering(
         idle=lambda _turn: True,
     )
 
-    assert switched == [(tmp_path, ("databricks-claude-sonnet-5", "sonnet"))]
+    # The vocabulary spelling, not the catalog id: ``/model`` rejects a bare
+    # gateway id and silently keeps the old model.
+    assert switched == [(tmp_path, "/model sonnet", True)]
     assert len(client.posts) == 1
 
 
@@ -925,13 +927,11 @@ async def test_replay_still_delivers_when_the_claude_switch_fails(
     _mark(tmp_path)
     client = _FakeServerClient()
 
-    def _boom(_bridge_dir: Path, *, targets: tuple[str, ...]) -> None:
-        del targets
-        raise RuntimeError("picker never opened")
+    def _boom(_bridge_dir: Path, *, command: str, auto_confirm: bool = False) -> None:
+        del command, auto_confirm
+        raise RuntimeError("tmux target is not advertised")
 
-    monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_model_selection", _boom, raising=False
-    )
+    monkeypatch.setattr("omnigent.claude_native_bridge.inject_slash_command", _boom, raising=False)
     monkeypatch.setattr(
         "omnigent.claude_native_bridge.read_model_env",
         lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
@@ -958,15 +958,15 @@ async def test_replay_skips_the_switch_for_an_unspeakable_model(
     """
     A model this pane has no ``/model`` spelling for is left alone.
 
-    Typing a value the picker does not list would either wedge the picker or
-    silently keep the old model while claiming the routed one.
+    Typing a value the CLI will not take leaves the pane on its old model
+    while the recorded decision claims the routed one.
     """
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_model_selection",
+        "omnigent.claude_native_bridge.inject_slash_command",
         lambda *a, **k: pytest.fail("must not touch the pane"),
         raising=False,
     )
@@ -999,7 +999,7 @@ async def test_replay_leaves_the_model_alone_for_codex(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_model_selection",
+        "omnigent.claude_native_bridge.inject_slash_command",
         lambda *a, **k: pytest.fail("codex must not drive the claude pane"),
         raising=False,
     )
@@ -1060,7 +1060,7 @@ async def test_replay_skips_the_switch_when_the_pane_is_already_there(
         lambda _dir: "databricks-claude-sonnet-5",
     )
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.inject_model_selection",
+        "omnigent.claude_native_bridge.inject_slash_command",
         lambda *a, **k: pytest.fail("no switch when the pane is already on it"),
         raising=False,
     )

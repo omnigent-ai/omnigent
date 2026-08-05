@@ -34,7 +34,7 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 from tests.e2e.routing._helpers import (
     arm_in,
     claude_bridge_dir,
-    claude_settings_digest,
+    claude_settings_apart_from_the_model,
     decisions,
     same_arm,
     session_snapshot,
@@ -97,7 +97,7 @@ def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
     require_tmux()
     # The auto route chooses between both families, so both must be backed.
     routing_arms("claude-native", "codex-native")  # type: ignore[operator]
-    settings_before = claude_settings_digest()
+    settings_before = claude_settings_apart_from_the_model()
     workspace = trusted_workspace(tmp_path, "auto_ws")
 
     # A contained, code-referencing task: on the ``both`` menu the recipe
@@ -198,7 +198,7 @@ def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
             f"Claude one (model_override={child.get('model_override')!r})"
         )
 
-    assert claude_settings_digest() == settings_before, (
-        "~/.claude/settings.json changed — routing must confine its hook wiring "
-        "to the session's bridge dir"
+    assert claude_settings_apart_from_the_model() == settings_before, (
+        "~/.claude/settings.json changed beyond its `model` key — routing must "
+        "confine its hook wiring to the session's bridge dir"
     )

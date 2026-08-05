@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -52,11 +52,7 @@ from typing import TYPE_CHECKING, cast
 from urllib import error, request
 
 from omnigent._platform import stable_user_id
-from omnigent.claude_model_vocabulary import (
-    CLAUDE_MODEL_ALIASES,
-    MODEL_VOCABULARY_ENV_VARS,
-    normalized_model_id,
-)
+from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
@@ -139,12 +135,6 @@ _CLAUDE_PROMPT_GLYPH = "❯"
 # followed by a numbered choice, which the chat input never renders. Used to
 # exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
 _SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
-# One numbered row of a TUI list, with or without the selection cursor:
-# ``  ❯ 3. databricks-claude-sonnet-5 ✔  Custom Sonnet model``. Used to read
-# the ``/model`` picker's rows and which one is current.
-_MODEL_PICKER_ROW_RE = re.compile(
-    rf"^\s*(?P<cursor>{_CLAUDE_PROMPT_GLYPH})?\s*(?P<ordinal>\d+)\.\s+(?P<label>\S.*)$"
-)
 # Box-drawing glyphs Claude Code's input-box frame is made of. A line of
 # these below ``❯`` marks the live input box (see ``_is_box_rule``),
 # distinguishing it from a bare prompt echoed into scrollback.
@@ -181,23 +171,11 @@ _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
-# Footer the ``/model`` picker renders while it is open. Its ``s`` binding is
-# the whole reason the picker is driven instead of ``/model <id>``: the arg
-# form saves the pick as the user's GLOBAL default for new sessions, this one
-# does not. Presence of this text is the picker's readiness signal.
-_MODEL_PICKER_SESSION_ONLY_HINT = "use this session only"
-# Key the picker binds to "use this session only".
-_MODEL_PICKER_SESSION_ONLY_KEY = "s"
-# Line the picker prints on a session-scoped pick. Never "saved as your
-# default", which is what the arg form prints.
-_MODEL_PICKER_APPLIED_HINT = "for this session only"
-# Seconds to wait for the picker to render after ``/model`` is submitted.
-_MODEL_PICKER_OPEN_TIMEOUT_S = 15.0
-# Seconds to wait for the picker to close after the session-only key.
-_MODEL_PICKER_APPLY_TIMEOUT_S = 15.0
-# Most rows the picker can hold. Bounds the cursor walk so a row that never
-# becomes current (a mis-parsed pane) cannot loop forever.
-_MODEL_PICKER_MAX_ROWS = 24
+# Footer Claude Code's interactive ``/model`` picker renders while it is open.
+# Omnigent never drives that picker — it switches with ``/model <id>`` — but a
+# picker the person opened by hand covers the input box, so an injection would
+# be lost; the readiness gate treats it as "not ready".
+_MODEL_PICKER_OPEN_HINT = "use this session only"
 # Title of the confirmation dialog Claude Code pops when switching models
 # invalidates the prompt cache. It only appears on a session with history,
 # and it took ~1.9s to render on a warm session, so it is polled for rather
@@ -3104,249 +3082,6 @@ def _confirm_tui_dialog(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
-def inject_model_selection(
-    bridge_dir: Path,
-    *,
-    targets: Sequence[str],
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
-) -> None:
-    """
-    Switch the pane's model **for this session only**, via the picker.
-
-    Not ``/model <id>``: that form prints "Set model to X and saved as your
-    default for new sessions" and rewrites the ``model`` key in the user's
-    own ``~/.claude/settings.json``, so every routed turn would silently
-    change the default model of the person's unrelated Claude sessions. The
-    picker (``/model`` with no argument) binds
-    :data:`_MODEL_PICKER_SESSION_ONLY_KEY` to "use this session only", which
-    applies the switch to the live session and writes nothing.
-
-    Driven entirely by polling ``capture-pane``: submit ``/model``, wait for
-    the picker, walk the cursor onto the row naming one of *targets* with
-    ``Up``/``Down``, then press the session-only key. Digit keys are never
-    sent — in this picker a digit confirms the row **as the default**, which
-    is the exact write this function exists to avoid.
-
-    :param bridge_dir: Bridge directory path, e.g.
-        ``/tmp/omnigent/claude-native/<digest>``.
-    :param targets: Accepted spellings of the wanted model, most precise
-        first, e.g. ``("databricks-claude-sonnet-5", "sonnet")``. A row
-        matches when its label is any of them (catalog prefixes and the
-        ``[1m]`` suffix ignored), or when a family alias among them names
-        the row's family.
-    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
-    :returns: None once the picker has applied the pick.
-    :raises ValueError: If *targets* is empty.
-    :raises RuntimeError: If the tmux target is not advertised in time, if
-        the picker never renders, if no row matches *targets*, if the
-        cursor cannot be walked onto that row, or if the picker never
-        closes. The picker is dismissed with ``Escape`` before raising so
-        the pane is left usable, and callers treat a raise as "leave the
-        model alone".
-    """
-    if not targets:
-        raise ValueError("inject_model_selection needs at least one target spelling")
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
-    # ``C-u`` clears a draft the user is mid-typing so ``/model`` is not
-    # appended to their text. Unlike Escape it does not interrupt a turn.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "/model")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    pane = _wait_for_model_picker(socket_path, tmux_target)
-    try:
-        _walk_model_picker_cursor(socket_path, tmux_target, pane=pane, targets=targets)
-    except RuntimeError:
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
-        raise
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _MODEL_PICKER_SESSION_ONLY_KEY)
-    _wait_for_model_picker_applied(socket_path, tmux_target)
-
-
-def _wait_for_model_picker(socket_path: str, tmux_target: str) -> str:
-    """
-    Poll until the ``/model`` picker is on screen, and return that frame.
-
-    :param socket_path: Absolute path to the tmux socket.
-    :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :returns: The captured pane text showing the open picker.
-    :raises RuntimeError: If the picker never renders in
-        :data:`_MODEL_PICKER_OPEN_TIMEOUT_S`.
-    """
-    deadline = time.monotonic() + _MODEL_PICKER_OPEN_TIMEOUT_S
-    last = ""
-    while True:
-        pane = _capture_pane(socket_path, tmux_target)
-        if pane.strip():
-            last = pane
-        if _MODEL_PICKER_SESSION_ONLY_HINT in pane and _parse_model_picker_rows(pane):
-            return pane
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                "Claude Code did not open the /model picker within "
-                f"{_MODEL_PICKER_OPEN_TIMEOUT_S}s; the model was not switched."
-                + _format_terminal_failure_tail(last)
-            )
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-
-
-def _wait_for_model_picker_applied(socket_path: str, tmux_target: str) -> None:
-    """
-    Poll until the picker has closed after the session-only key.
-
-    Also accepts the "Switch model?" dialog on the way: switching a session
-    that already has history invalidates its prompt cache, and Claude Code
-    asks before doing that.
-
-    :param socket_path: Absolute path to the tmux socket.
-    :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :returns: None once the picker is gone.
-    :raises RuntimeError: If the picker is still open after
-        :data:`_MODEL_PICKER_APPLY_TIMEOUT_S`.
-    """
-    deadline = time.monotonic() + _MODEL_PICKER_APPLY_TIMEOUT_S
-    last = ""
-    while True:
-        pane = _capture_pane(socket_path, tmux_target)
-        if pane.strip():
-            last = pane
-        if _SWITCH_MODEL_DIALOG_HINT in pane:
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-        elif _MODEL_PICKER_SESSION_ONLY_HINT not in pane:
-            return
-        if time.monotonic() >= deadline:
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
-            raise RuntimeError(
-                "Claude Code's /model picker did not close within "
-                f"{_MODEL_PICKER_APPLY_TIMEOUT_S}s; the model may not have switched."
-                + _format_terminal_failure_tail(last)
-            )
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-
-
-def _walk_model_picker_cursor(
-    socket_path: str,
-    tmux_target: str,
-    *,
-    pane: str,
-    targets: Sequence[str],
-) -> None:
-    """
-    Move the picker's cursor onto the row matching *targets*.
-
-    One arrow key per iteration, re-reading the pane each time, so the walk
-    is verified rather than counted blind.
-
-    :param socket_path: Absolute path to the tmux socket.
-    :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param pane: The frame showing the open picker.
-    :param targets: Accepted spellings of the wanted model.
-    :returns: None once the wanted row carries the cursor.
-    :raises RuntimeError: If no row matches, or the cursor never lands.
-    """
-    for _ in range(_MODEL_PICKER_MAX_ROWS):
-        rows = _parse_model_picker_rows(pane)
-        wanted = _pick_model_picker_row(rows, targets)
-        if wanted is None:
-            raise RuntimeError(
-                "Claude Code's /model picker has no row for "
-                f"{list(targets)}; the model was not switched. Rows: "
-                f"{[row[2] for row in rows]}"
-            )
-        current = next((row for row in rows if row[1]), None)
-        if current is not None and current[0] == wanted[0]:
-            return
-        key = "Down" if current is None or wanted[0] > current[0] else "Up"
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(socket_path, tmux_target)
-    raise RuntimeError(
-        f"Could not move Claude Code's /model picker onto {list(targets)} in "
-        f"{_MODEL_PICKER_MAX_ROWS} steps; the model was not switched."
-    )
-
-
-def _parse_model_picker_rows(pane: str) -> list[tuple[int, bool, str]]:
-    """
-    Parse the ``/model`` picker's numbered rows out of a pane capture.
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``(ordinal, is_selected, label)`` per row in screen order,
-        where ``label`` is the row's model column with its trailing
-        description stripped, e.g.
-        ``[(1, False, "Default (recommended)"), (2, True, "Haiku")]``.
-        Empty when the pane shows no picker.
-    """
-    rows: list[tuple[int, bool, str]] = []
-    for line in pane.splitlines():
-        match = _MODEL_PICKER_ROW_RE.match(line)
-        if match is None:
-            continue
-        selected = _CLAUDE_PROMPT_GLYPH in (match.group("cursor") or "")
-        # The row is two columns separated by run-in whitespace; the second
-        # is prose ("Custom Sonnet model", "Fastest for quick answers"). The
-        # live model's row also carries a check glyph.
-        label = re.split(r"\s{2,}", match.group("label").strip())[0]
-        label = label.rstrip("✔✓ ").strip()
-        rows.append((int(match.group("ordinal")), selected, label))
-    return rows
-
-
-def _pick_model_picker_row(
-    rows: Sequence[tuple[int, bool, str]],
-    targets: Sequence[str],
-) -> tuple[int, bool, str] | None:
-    """
-    Choose the picker row the wanted model is on.
-
-    Exact id matches are resolved across ALL rows before any alias match is
-    considered. A workspace serving two generations of one family renders a
-    row per generation, and both answer to the same alias — so an alias that
-    happened to be scanned first would move the pane onto a model nobody
-    routed to while the record claimed the routed one.
-
-    :param rows: Parsed picker rows, in screen order.
-    :param targets: Accepted spellings, most precise first.
-    :returns: The wanted row, or ``None`` when no row names the model.
-    """
-    ids = [target for target in targets if normalized_model_id(target) not in CLAUDE_MODEL_ALIASES]
-    for candidates in (ids, targets):
-        for row in rows:
-            if _model_picker_row_matches(row, candidates):
-                return row
-    return None
-
-
-def _model_picker_row_matches(row: tuple[int, bool, str], targets: Sequence[str]) -> bool:
-    """
-    Report whether a picker row names one of *targets*.
-
-    Rows are labelled with whatever the launch env pinned: the exact
-    catalog id when an alias is pinned to one, otherwise Claude Code's own
-    display name for the family (``"Haiku"``, ``"Sonnet 5"``). So an id
-    target is compared id-wise and an alias target also matches a row whose
-    family it names.
-
-    :param row: One ``(ordinal, is_selected, label)`` row.
-    :param targets: Accepted spellings, e.g. ``("databricks-claude-sonnet-5",
-        "sonnet")``.
-    :returns: ``True`` when the row is the wanted model.
-    """
-    label = row[2].strip()
-    if not label:
-        return False
-    normalized_label = normalized_model_id(label)
-    for target in targets:
-        if not target.strip():
-            continue
-        if normalized_label == normalized_model_id(target):
-            return True
-        alias = target.strip().lower()
-        if alias in CLAUDE_MODEL_ALIASES and normalized_label.split()[0] == alias:
-            return True
-    return False
-
-
 def display_cost_approval_popup(
     bridge_dir: Path,
     *,
@@ -3530,7 +3265,7 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
 
     "Usable" means the TUI is back at a mounted chat input with no ``/model``
     picker or confirmation dialog on top of it — the state an injection needs
-    to land, and the settle signal after a picker-driven model switch.
+    to land, and the settle signal after a model switch.
 
     It is also the claude-native answer to "has the blocked prompt cleared?"
     for first-message routing: a blocked ``UserPromptSubmit`` starts no turn
@@ -3550,7 +3285,7 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return False
     pane = _capture_pane(socket_path, tmux_target)
-    if _MODEL_PICKER_SESSION_ONLY_HINT in pane or _SWITCH_MODEL_DIALOG_HINT in pane:
+    if _MODEL_PICKER_OPEN_HINT in pane or _SWITCH_MODEL_DIALOG_HINT in pane:
         return False
     return _claude_prompt_rendered(pane)
 

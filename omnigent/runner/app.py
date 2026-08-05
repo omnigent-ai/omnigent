@@ -311,90 +311,6 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     return "Request failed on the runner; see runner logs for details."
 
 
-def _claude_native_model_picker_targets(
-    model: str,
-    model_env: Mapping[str, str],
-) -> tuple[str, ...]:
-    """
-    Row spellings Claude Code's ``/model`` picker may label *model* with.
-
-    The web picker sends a tier id, not a catalog id, so every spelling the
-    tier's row could carry has to be offered — a bare ``"opus"`` reaches no
-    row on a workspace whose opus row is labelled
-    ``databricks-claude-opus-4-8``:
-
-    - the family alias's pinned catalog id, which labels that row outright;
-    - the resolved selection and its vocabulary spelling;
-    - the custom slot's display name, because that row shows the name (e.g.
-      ``"Opus 5"``) rather than the id the slot holds.
-
-    :param model: The selection resolved by
-        :func:`resolve_claude_native_model_selection`, e.g. ``"opus"`` or
-        ``"databricks-claude-opus-5"``.
-    :param model_env: The session's model vocabulary — the launch env's alias
-        pins, custom slot, and custom slot name.
-    :returns: Ordered, deduplicated spellings for
-        :func:`omnigent.claude_native_bridge.inject_model_selection`, most
-        precise first.
-    """
-    from omnigent.claude_model_vocabulary import (
-        CUSTOM_MODEL_OPTION_ENV_VAR,
-        CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
-        alias_pins,
-        claude_model_command_arg,
-        normalized_model_id,
-    )
-
-    custom_slot = model_env.get(CUSTOM_MODEL_OPTION_ENV_VAR, "").strip()
-    on_custom_slot = bool(custom_slot) and normalized_model_id(custom_slot) == normalized_model_id(
-        model
-    )
-    candidates = (
-        alias_pins(model_env).get(model.strip().lower()),
-        model,
-        claude_model_command_arg(model, model_env),
-        model_env.get(CUSTOM_MODEL_OPTION_NAME_ENV_VAR, "").strip() if on_custom_slot else None,
-    )
-    return tuple(dict.fromkeys(value for value in candidates if value))
-
-
-def _inject_claude_native_model_pick(
-    bridge_dir: Path,
-    model: str,
-    launch_env: Mapping[str, str],
-    timeout_s: float,
-) -> None:
-    """
-    Apply *model* to a live Claude Code pane via its ``/model`` picker.
-
-    Blocking; call from a worker thread. Resolves which rows the pane could
-    be labelling *model* with, then drives the picker's "this session only"
-    pick — never ``/model <id>``, whose argument form saves the pick as the
-    user's global default for new sessions.
-
-    The pane's own recorded vocabulary wins where both speak: it is what this
-    pane actually booted with, while *launch_env* is resolved fresh and
-    covers sessions whose bridge predates that record.
-
-    :param bridge_dir: Bridge directory of the target Claude session.
-    :param model: The resolved model selection, e.g. ``"opus"``.
-    :param launch_env: Model vocabulary from the session's resolved launch
-        config, filling gaps in the bridge record.
-    :param timeout_s: Seconds to wait for the pane to be advertised.
-    :returns: None once the picker has applied the pick.
-    :raises RuntimeError: If the pane is unreachable or the picker cannot be
-        driven onto *model*.
-    """
-    from omnigent.claude_native_bridge import inject_model_selection, read_model_env
-
-    model_env = {**launch_env, **read_model_env(bridge_dir)}
-    inject_model_selection(
-        bridge_dir,
-        targets=_claude_native_model_picker_targets(model, model_env),
-        timeout_s=timeout_s,
-    )
-
-
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
 SpecResolver: TypeAlias = Callable[[str, str | None], Awaitable[_SpecEntry | None]]
 _ResourceType: TypeAlias = Literal["environment", "terminal", "file"]
@@ -4098,7 +4014,10 @@ def create_runner_app(
         from omnigent.claude_native import (
             resolve_claude_native_model_selection,
         )
-        from omnigent.claude_native_bridge import bridge_dir_for_bridge_id
+        from omnigent.claude_native_bridge import (
+            bridge_dir_for_bridge_id,
+            inject_slash_command,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -4112,17 +4031,18 @@ def create_runner_app(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
+        command = f"/model {resolved_model}"
         try:
-            # The picker's "this session only" pick, never ``/model <id>``:
-            # the argument form saves the pick as the user's global default
-            # for new sessions, rewriting ~/.claude/settings.json for their
-            # unrelated Claude sessions.
+            # Accepted trade-off: ``/model <id>`` also saves the pick as the
+            # person's global default in ``~/.claude/settings.json``. Driving
+            # the interactive picker instead avoided that write but needed
+            # ~35s of fragile tmux automation, so the write stands.
             await asyncio.to_thread(
-                _inject_claude_native_model_pick,
+                inject_slash_command,
                 bridge_dir,
-                resolved_model,
-                dict(claude_config.env) if claude_config is not None else {},
-                1.0,
+                command=command,
+                timeout_s=1.0,
+                auto_confirm=True,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(

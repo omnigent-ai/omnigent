@@ -2592,7 +2592,7 @@ def test_route_turn_blocks_on_a_routed_verdict_without_touching_the_model(
     monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
     monkeypatch.setattr(
         claude_native_hook,
-        "inject_model_selection",
+        "inject_slash_command",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("the hook must not drive tmux")),
         raising=False,
     )
