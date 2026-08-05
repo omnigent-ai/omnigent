@@ -1802,20 +1802,21 @@ def main() -> None:
     from omnigent.cli_diagnostics import (
         log_cli_error_hint,
         log_cli_exception,
-        print_setup_hint,
+        print_stale_host_hint,
         setup_cli_logging,
     )
 
     setup_cli_logging(argv)
 
-    # ``omnigent setup`` IS the setup wizard — if it fails, telling the
-    # user to "run omnigent setup" would be circular. ``upgrade`` (and its
-    # ``update`` alias) is excluded too: its failures (unreachable index,
-    # dev checkout, install error) are never about a missing model
-    # credential, so the setup hint would only mislead. ``integration``
-    # likewise: its errors (package not installed, daemon not running) have
-    # nothing to do with model credentials.
-    suggest_setup = argv[0] not in {"setup", "update", "upgrade", "integration"}
+    # Do not recommend the off-switch when it is already running. Commands
+    # unrelated to runner startup are excluded to avoid a misleading hint.
+    suggest_stale_host_recovery = argv[0] not in {
+        "integration",
+        "setup",
+        "stop",
+        "update",
+        "upgrade",
+    }
 
     # Lightweight update notice: only on an interactive terminal and only
     # for user-facing commands. Reads a cached "latest PyPI version" and
@@ -1839,8 +1840,8 @@ def main() -> None:
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
-        if suggest_setup:
-            print_setup_hint()
+        if suggest_stale_host_recovery:
+            print_stale_host_hint()
         raise SystemExit(exc.exit_code) from exc
     except click.Abort as exc:
         # Ctrl+C / user cancel — no hint, the user knows what they did.
@@ -1852,8 +1853,8 @@ def main() -> None:
         # always-on CLI log has more context than this single crash — then
         # hand off to the friendly crash handler for the calm screen,
         # de-emphasized traceback, and the bug-filing prompt. We drop the
-        # `omnigent setup` hint here: genuine crashes are rarely auth issues,
-        # and "run setup" would contradict the crash screen's reassurance.
+        # stale-host hint here: genuine crashes are not runner startup failures,
+        # and recovery advice would contradict the crash screen's reassurance.
         # `handle_crash` renders the UX and we exit with code 1 (SystemExit
         # does NOT re-trigger sys.excepthook, so there's no double render).
         from omnigent.crash_handler import handle_crash
