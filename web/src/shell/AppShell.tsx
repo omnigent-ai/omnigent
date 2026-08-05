@@ -291,7 +291,11 @@ export function AppShell() {
   // terminal. The hook is react-query-backed and dedup'd with the rail.
   // reconcileWhilePending: self-heals if the live resource.created SSE was
   // missed (see UseTerminalsOptions for the why).
-  const { terminals, isLoading: terminalsLoading } = useTerminals(conversationId ?? null, {
+  const {
+    terminals,
+    isLoading: terminalsLoading,
+    error: terminalsError,
+  } = useTerminals(conversationId ?? null, {
     reconcileWhilePending: terminalPending,
   });
 
@@ -1145,17 +1149,19 @@ export function AppShell() {
   // Prune shell tabs whose terminal has gone away (closed by the agent, or the
   // runner went offline and emptied the list). Keeps the strip from pointing at
   // dead PTYs; the active selection falls back to the Shells list when its tab
-  // is dropped. Skip while the list is still loading so restored (persisted)
-  // tabs aren't wiped by the transient empty list before the PTYs are fetched.
+  // is dropped. Skip while the list is still loading OR the fetch errored so
+  // restored (persisted) tabs aren't wiped by a non-authoritative empty list —
+  // an errored read is `[]` too, and pruning against it would discard tabs
+  // whose PTYs we simply couldn't reach.
   useEffect(() => {
-    if (terminalsLoading) return;
+    if (terminalsLoading || terminalsError !== null) return;
     const valid = new Set(terminals.map((t) => terminalTabKey(t)));
     setOpenTerminals((prev) => {
       const next = prev.filter((k) => valid.has(k));
       return next.length === prev.length ? prev : next;
     });
     setSelectedTerminalKey((active) => (active !== null && !valid.has(active) ? null : active));
-  }, [terminals, terminalsLoading]);
+  }, [terminals, terminalsLoading, terminalsError]);
 
   function openExecutionLogsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer

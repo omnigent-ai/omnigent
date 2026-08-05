@@ -2044,6 +2044,35 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByTitle("terminal_bash_s1")).toBeNull();
     expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
   });
+
+  it("keeps restored shell tabs when the terminals fetch errors (non-authoritative empty list)", () => {
+    // An errored terminals fetch also yields terminals: [], but that empty list
+    // is not authoritative — we couldn't reach the PTYs, not "they're gone".
+    // Pruning against it would wipe the restored tab, so the prune effect is
+    // gated on error too. The tab must survive an errored read.
+    writeSessionWorkspaceState("conv_shellerr", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [],
+      isLoading: false,
+      error: new Error("terminals fetch failed: 503"),
+    });
+    mockConversations([{ id: "conv_shellerr", permission_level: null }]);
+
+    renderShell("/c/conv_shellerr");
+
+    // The restored tab survives the errored (non-authoritative) empty list —
+    // the strip keeps the tab (title falls back to the raw id until the
+    // terminal loads) instead of pruning it as if the PTY were gone.
+    expect(screen.getByTitle("terminal_bash_s1")).toBeInTheDocument();
+  });
 });
 
 describe("Embedded REPL terminal rail inventory", () => {
