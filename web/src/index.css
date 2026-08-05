@@ -118,8 +118,8 @@
 }
 
 @theme {
-  /* App-default interface/body text. Keep this non-inline so the desktop
-   * typography mapping can override the token at runtime. */
+  /* App-default interface/body text. Keep this non-inline so runtime
+   * typography mappings can override the token. */
   --text-ui: 1rem;
   --text-ui--line-height: 1.5;
   /* Slightly larger hierarchy/caption step than Tailwind's default. */
@@ -132,10 +132,9 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
-  /* User-controlled desktop UI font size (see Appearance settings /
+  /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
-   * runtime on documentElement. It feeds typography tokens only; layout and
-   * icon geometry remain on the fixed 16px desktop rem grid. */
+   * runtime on documentElement. It feeds typography tokens only. */
   --desktop-ui-font-size: 13px;
   --icon-size-default: 14px;
   --icon-container-default: 16px;
@@ -882,25 +881,27 @@ html:not(.dark) .conversations-sidebar {
   }
 }
 
-/* Mobile typography bump.
- *
- * Push the root font-size from the browser default (16px) to 18px below
- * Tailwind's `md` breakpoint. Tailwind v4 sizes typography AND spacing in
- * `rem`, so the whole UI scales up ~12.5% uniformly — easier to read at
- * arm's length and slightly more forgiving touch targets. Desktop is
- * controlled independently by the Appearance setting.
- *
- * Note that `rem` in `@media` queries always refers to the user-agent's
- * default (16px) per the CSS spec — so `48rem` here is the same 768px
- * Tailwind uses for `md:*` utilities, regardless of our root override. */
+/* Mobile-specific sidebar geometry. The root remains at the global 16px so
+ * rem-based typography and controls keep the same scale across viewports. */
 @media (width < 48rem) {
-  html {
-    font-size: 1.125em;
+  /* Mobile uses its own base size while preserving the desktop hierarchy. */
+  :root {
+    --mobile-ui-font-size: 14px;
+    --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
+    --text-ui: var(--mobile-ui-font-size);
   }
-  /* Mobile typography remains independent of the desktop Appearance setting. */
-  .sidebar-compact-text {
-    font-size: 0.8125rem;
-    line-height: 1.125rem;
+
+  /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
+  .conversations-sidebar {
+    --sidebar-icon-size-mobile: 16px;
+  }
+
+  .conversations-sidebar svg,
+  .conversations-sidebar .ui-icon,
+  .conversations-sidebar .button-standard-icons svg {
+    width: var(--sidebar-icon-size-mobile);
+    height: var(--sidebar-icon-size-mobile);
+    padding: 0;
   }
 }
 
