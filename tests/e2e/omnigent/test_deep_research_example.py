@@ -1,7 +1,7 @@
 """Structural test for the deep-research example bundle (examples/deep-research).
 
-deep-research is a single-agent web researcher whose tools come entirely from
-the hosted **Keenable MCP server** (``tools/mcp/keenable.yaml`` →
+deep-research is a single-agent web researcher whose web-research tools come
+from the hosted **Keenable MCP server** (``tools/mcp/keenable.yaml`` →
 ``search_web_pages`` + ``fetch_page_content``), auto-discovered by the spec
 parser with no ``tools:`` block. Pure spec-load — no LLM, no credentials, no
 live MCP endpoint — modeled on ``test_example_scribe.py``.
@@ -13,12 +13,11 @@ in ``_ALT_COVERED`` (same pattern as ``openai-coder``).
 
 What breaks if this fails:
 - the Keenable MCP server stops being discovered from ``tools/mcp/*.yaml`` (the
-  agent would load with no tools at all — its entire capability is that server),
+  agent would load without its search and fetch capabilities),
 - the ``deep-research`` skill is dropped or renamed,
 - the ``claude-sdk`` omnigent executor stops translating,
-- the ``os_env`` block disappears or its ``sandbox: none`` flips (the shipped
-  bundle must load on macOS too, and the agent is deliberately unsandboxed —
-  it only reads the web via MCP, runs no shell, touches no local files).
+- an ``os_env`` block is added, which would expose local file and shell tools
+  to an agent intended to research only through its web-search MCP server.
 """
 
 from __future__ import annotations
@@ -42,8 +41,8 @@ def deep_research_spec() -> AgentSpec:
 
 def test_deep_research_loads_with_keenable_mcp(deep_research_spec: AgentSpec) -> None:
     """
-    The bundle loads and its only tool source is the auto-discovered
-    Keenable MCP server (HTTP transport at the public endpoint).
+    The bundle loads and its only configured web-research source is the
+    auto-discovered Keenable MCP server (HTTP transport at the public endpoint).
 
     There is no ``tools:`` block — the whole point is that a
     ``tools/mcp/<name>.yaml`` server is discovered and its tools exposed. If
@@ -74,13 +73,6 @@ def test_deep_research_runs_on_claude_sdk(deep_research_spec: AgentSpec) -> None
     assert deep_research_spec.executor.model is None
 
 
-def test_deep_research_is_unsandboxed(deep_research_spec: AgentSpec) -> None:
-    """
-    The agent carries a ``caller_process`` os_env with ``sandbox: none`` — it
-    only reads the web via the MCP server, so it needs no sandbox, and shipping
-    ``sandbox: none`` keeps the bundle loadable on macOS.
-    """
-    assert deep_research_spec.os_env is not None
-    assert deep_research_spec.os_env.type == "caller_process"
-    assert deep_research_spec.os_env.sandbox is not None
-    assert deep_research_spec.os_env.sandbox.type == "none"
+def test_deep_research_has_no_os_environment(deep_research_spec: AgentSpec) -> None:
+    """The example does not opt into local file or shell tools."""
+    assert deep_research_spec.os_env is None

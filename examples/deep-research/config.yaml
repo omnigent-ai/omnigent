@@ -25,7 +25,7 @@ prompt: |
   thorough, accurate, and *cited* answer grounded in live web sources — not
   in your prior knowledge.
 
-  Your tools come from the Keenable MCP server (auto-loaded from
+  Your web-research tools come from the Keenable MCP server (auto-loaded from
   tools/mcp/keenable.yaml):
   - search_web_pages — find candidate sources. Describe the ideal page in
     natural language, not keywords. Use site / date filters to narrow.
@@ -49,14 +49,30 @@ prompt: |
   Act in the same turn you announce — don't end a turn having only said what
   you will search for; emit the search/fetch tool calls right away.
 
-# Unsandboxed: this agent only reads the web via the Keenable MCP server; it
-# runs no shell and touches no local files.
-os_env:
-  type: caller_process
-  cwd: .
-  sandbox:
-    type: none
-
 # No `tools:` block is required for MCP — servers under tools/mcp/*.yaml are
-# auto-discovered and their tools exposed to the agent. (Add `tools.builtins`
-# here only if you also want omnigent built-ins like web_fetch.)
+# auto-discovered and their tools exposed to the agent. Keenable is the active
+# zero-signup example. The alternatives below expose `web_search`, not
+# Keenable's search/fetch pair. To use one, remove tools/mcp/keenable.yaml,
+# uncomment exactly one provider, and adapt the prompt and skill to its tool
+# surface (including a page-reading tool if the workflow requires full text).
+#
+# tools:
+#   builtins:
+#     # OpenAI-native search (requires an OpenAI model/harness):
+#     # - web_search
+#
+#     # Google Programmable Search:
+#     # - name: web_search
+#     #   api_key: ${GOOGLE_SEARCH_API_KEY}
+#     #   engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
+#
+#     # Perplexity:
+#     # - name: web_search
+#     #   search_provider: perplexity
+#     #   api_key: ${PERPLEXITY_API_KEY}
+#
+#     # Nimble:
+#     # - name: web_search
+#     #   search_provider: nimble
+#     #   api_key: ${NIMBLE_API_KEY}
+#     #   search_depth: deep
