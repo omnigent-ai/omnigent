@@ -14,6 +14,9 @@ from email.message import Message
 from typing import Any
 
 LABEL = "waiting-on-author"
+# The other half of the cycle. `waiting-on-author` alone can only say "stalled";
+# this says "back in the reviewer's queue", which is what a maintainer filters on.
+REVIEW_LABEL = "waiting-for-review"
 WAITING_DAYS = 7
 CANONICAL_REPO = "omnigent-ai/omnigent"
 MAX_CLOSURES_PER_RUN = 30
@@ -131,6 +134,28 @@ class GitHubAPI:
     def list_commits(self, pull_number: int) -> list[dict[str, Any]]:
         return self.paginated(f"/repos/{self.repo}/pulls/{pull_number}/commits?per_page=100")
 
+    def add_label(self, issue_number: int, label: str) -> None:
+        self.request(
+            "POST", f"/repos/{self.repo}/issues/{issue_number}/labels", {"labels": [label]}
+        )
+
+    def request_review(self, pull_number: int, reviewers: list[str]) -> None:
+        # Best effort: a reviewer who lost repo access, or the PR author, is
+        # rejected with 422, and that must not fail the handoff.
+        if not reviewers:
+            return
+        try:
+            self.request(
+                "POST",
+                f"/repos/{self.repo}/pulls/{pull_number}/requested_reviewers",
+                {"reviewers": reviewers},
+            )
+        except urllib.error.HTTPError as error:
+            if error.code in (403, 422):
+                print(f"::warning::Could not re-request review on #{pull_number}: {error.code}")
+                return
+            raise
+
     def close_pull(self, pull_number: int) -> None:
         self.request("PATCH", f"/repos/{self.repo}/pulls/{pull_number}", {"state": "closed"})
 
@@ -156,6 +181,33 @@ def remove_waiting_label(api: GitHubAPI, issue_number: int, reason: str) -> bool
     else:
         print(f"#{issue_number} no longer has {LABEL}; nothing to remove.")
     return removed
+
+
+def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> None:
+    """Move a PR from the author's court back into the reviewer's.
+
+    The label is what maintainers filter on; the review request is what actually
+    surfaces the PR in their GitHub review queue. GitHub clears the request when a
+    review is submitted, so it has to be re-made here or the reply is invisible.
+    """
+    number = pull["number"]
+    labels = label_names(pull)
+    if REVIEW_LABEL not in labels:
+        api.add_label(number, REVIEW_LABEL)
+        print(f"Added {REVIEW_LABEL} to #{number}: {reason}")
+
+    author = (pull.get("user") or {}).get("login", "").lower()
+    # Assignees are the durable owner record; requested_reviewers empties out on
+    # every submitted review. Never re-request the author's own review.
+    owners = [
+        login
+        for login in (
+            (person or {}).get("login")
+            for person in (pull.get("assignees") or []) + (pull.get("requested_reviewers") or [])
+        )
+        if login and login.lower() != author
+    ]
+    api.request_review(number, sorted(set(owners)))
 
 
 def user_login(item: dict[str, Any]) -> str | None:
@@ -198,6 +250,24 @@ def author_activity_since_label(api: GitHubAPI, pull: dict[str, Any], since: str
     return None
 
 
+def clear_review_label_on_waiting(payload: dict[str, Any], api: GitHubAPI) -> bool:
+    """The two labels are mutually exclusive: applying one drops the other.
+
+    Fires when a maintainer (or the review-submitted path) sets waiting-on-author,
+    so a PR never advertises both states at once.
+    """
+    label = (payload.get("label") or {}).get("name")
+    pull = payload.get("pull_request") or {}
+    if label != LABEL or not pull:
+        return False
+    if REVIEW_LABEL not in label_names(pull):
+        return False
+    removed = api.remove_label(pull["number"], REVIEW_LABEL)
+    if removed:
+        print(f"Removed {REVIEW_LABEL} from #{pull['number']}: now {LABEL}")
+    return removed
+
+
 def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitHubAPI) -> bool:
     pull_number: int | None = None
     actor: str | None = None
@@ -205,6 +275,8 @@ def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitH
     author_activity = False
 
     if event_name in {"pull_request", "pull_request_target"} and payload.get("pull_request"):
+        if payload.get("action") == "labeled":
+            return clear_review_label_on_waiting(payload, api)
         if payload.get("action") != "synchronize":
             return False
         pull_number = payload["pull_request"]["number"]
@@ -237,7 +309,10 @@ def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitH
 
     if not author_activity:
         return False
-    return remove_waiting_label(api, pull_number, reason)
+    removed = remove_waiting_label(api, pull_number, reason)
+    if removed:
+        hand_off_to_reviewer(api, pull, reason)
+    return removed
 
 
 def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
@@ -261,7 +336,8 @@ def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
             pull = api.get_pull(issue["number"])
             reason = author_activity_since_label(api, pull, label_applied_at)
             if reason:
-                remove_waiting_label(api, issue["number"], reason)
+                if remove_waiting_label(api, issue["number"], reason):
+                    hand_off_to_reviewer(api, pull, reason)
                 continue
 
             if days_between(label_applied_at, now) < WAITING_DAYS:

@@ -17,7 +17,12 @@ SPEC.loader.exec_module(waiting_on_author)
 
 
 def pr(
-    number: int = 12, author: str = "alice", labels: list[str] | None = None, state: str = "open"
+    number: int = 12,
+    author: str = "alice",
+    labels: list[str] | None = None,
+    state: str = "open",
+    assignees: list[str] | None = None,
+    requested_reviewers: list[str] | None = None,
 ) -> dict[str, Any]:
     labels = [waiting_on_author.LABEL] if labels is None else labels
     return {
@@ -25,6 +30,8 @@ def pr(
         "state": state,
         "user": {"login": author},
         "labels": [{"name": label} for label in labels],
+        "assignees": [{"login": login} for login in (assignees or [])],
+        "requested_reviewers": [{"login": login} for login in (requested_reviewers or [])],
     }
 
 
@@ -66,6 +73,8 @@ class FakeAPI:
         self.removed: list[tuple[int, str]] = []
         self.closed: list[int] = []
         self.comments: list[tuple[int, str]] = []
+        self.added: list[tuple[int, str]] = []
+        self.review_requests: list[tuple[int, list[str]]] = []
 
     def get_pull(self, pull_number: int) -> dict[str, Any]:
         return self.pull | {"number": pull_number}
@@ -91,6 +100,12 @@ class FakeAPI:
 
     def list_commits(self, pull_number: int) -> list[dict[str, Any]]:
         return self.commits.get(pull_number, [])
+
+    def add_label(self, issue_number: int, label: str) -> None:
+        self.added.append((issue_number, label))
+
+    def request_review(self, pull_number: int, reviewers: list[str]) -> None:
+        self.review_requests.append((pull_number, reviewers))
 
     def close_pull(self, pull_number: int) -> None:
         self.closed.append(pull_number)
@@ -229,6 +244,101 @@ class WaitingOnAuthorTest(unittest.TestCase):
         api = FakeAPI(issues=issues, timeline_by_issue=timeline)
         waiting_on_author.close_stale_waiting_prs(api, now=datetime(2026, 7, 24, tzinfo=UTC))
         self.assertEqual(len(api.closed), waiting_on_author.MAX_CLOSURES_PER_RUN)
+
+
+class WaitingForReviewTest(unittest.TestCase):
+    def test_author_reply_hands_off_to_reviewer(self) -> None:
+        api = FakeAPI(pull=pr(author="alice", assignees=["maintainer1"]))
+        waiting_on_author.clear_on_author_activity(
+            "issue_comment",
+            {"issue": {"number": 12, "pull_request": {}}, "comment": {"user": {"login": "alice"}}},
+            api,
+        )
+        self.assertEqual(api.removed, [(12, waiting_on_author.LABEL)])
+        self.assertEqual(api.added, [(12, waiting_on_author.REVIEW_LABEL)])
+        # The re-request is what actually surfaces the PR in the reviewer's queue.
+        self.assertEqual(api.review_requests, [(12, ["maintainer1"])])
+
+    def test_handoff_never_requests_the_author(self) -> None:
+        api = FakeAPI(pull=pr(author="alice", assignees=["alice", "maintainer1"]))
+        waiting_on_author.clear_on_author_activity(
+            "pull_request_target",
+            {"action": "synchronize", "pull_request": {"number": 12}},
+            api,
+        )
+        self.assertEqual(api.review_requests, [(12, ["maintainer1"])])
+
+    def test_handoff_is_idempotent_on_the_label(self) -> None:
+        api = FakeAPI(
+            pull=pr(
+                author="alice",
+                labels=[waiting_on_author.LABEL, waiting_on_author.REVIEW_LABEL],
+                assignees=["maintainer1"],
+            )
+        )
+        waiting_on_author.clear_on_author_activity(
+            "pull_request_target",
+            {"action": "synchronize", "pull_request": {"number": 12}},
+            api,
+        )
+        self.assertEqual(api.added, [], "already labeled; no duplicate add")
+
+    def test_maintainer_comment_does_not_hand_off(self) -> None:
+        api = FakeAPI(pull=pr(author="alice", assignees=["maintainer1"]))
+        waiting_on_author.clear_on_author_activity(
+            "issue_comment",
+            {
+                "issue": {"number": 12, "pull_request": {}},
+                "comment": {"user": {"login": "maintainer1"}},
+            },
+            api,
+        )
+        self.assertEqual(api.added, [])
+        self.assertEqual(api.review_requests, [])
+
+    def test_labeling_waiting_on_author_clears_the_review_label(self) -> None:
+        api = FakeAPI()
+        handled = waiting_on_author.clear_on_author_activity(
+            "pull_request_target",
+            {
+                "action": "labeled",
+                "label": {"name": waiting_on_author.LABEL},
+                "pull_request": pr(
+                    labels=[waiting_on_author.LABEL, waiting_on_author.REVIEW_LABEL]
+                ),
+            },
+            api,
+        )
+        self.assertTrue(handled)
+        self.assertEqual(api.removed, [(12, waiting_on_author.REVIEW_LABEL)])
+
+    def test_labeling_something_else_is_ignored(self) -> None:
+        api = FakeAPI()
+        handled = waiting_on_author.clear_on_author_activity(
+            "pull_request_target",
+            {
+                "action": "labeled",
+                "label": {"name": "size/M"},
+                "pull_request": pr(labels=[waiting_on_author.REVIEW_LABEL]),
+            },
+            api,
+        )
+        self.assertFalse(handled)
+        self.assertEqual(api.removed, [])
+
+    def test_scheduled_sweep_hands_off_when_author_replied(self) -> None:
+        api = FakeAPI(
+            pull=pr(number=30, author="alice", assignees=["maintainer1"]),
+            issues=[issue(30)],
+            timeline_by_issue={30: [labeled_at("2026-07-01T00:00:00Z")]},
+            issue_comments={
+                30: [{"user": {"login": "alice"}, "created_at": "2026-07-02T00:00:00Z"}]
+            },
+        )
+        waiting_on_author.close_stale_waiting_prs(api, now=datetime(2026, 7, 20, tzinfo=UTC))
+        self.assertEqual(api.closed, [], "an author reply cancels the close")
+        self.assertEqual(api.added, [(30, waiting_on_author.REVIEW_LABEL)])
+        self.assertEqual(api.review_requests, [(30, ["maintainer1"])])
 
 
 if __name__ == "__main__":
