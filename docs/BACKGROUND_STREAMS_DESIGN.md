@@ -215,14 +215,18 @@ healthy connection, 401/403 permanent, bounded transient-404 retries, and
 onto the entry unchanged, since it is already threaded on `(set, get)`.
 
 **The catch: its loop conditions are `get().conversationId === id`.** There are 16
-such guards in the streaming path, and they currently mean two things at once —
-"is this conversation still loaded?" and "is it the one on screen?". Today those
-are the same question. Under this refactor they must split:
+such guards in the streaming path, and they currently conflate "is this
+conversation still loaded?" with "is it the one on screen?" — today the same
+question. The guards must become **liveness** checks (`entry.disposed`), which
+background entries pass.
 
-- **Liveness** (`entry.disposed`) — governs whether the pump keeps looping and
-  reconnecting. Background entries must pass this.
-- **Foreground** (`registry.activeId === id`) — governs only genuinely
-  view-scoped concerns.
+Foreground is deliberately NOT the counterpart concept. Having gone through all
+16: 14 are pure liveness, and about 12 of those stop being load-bearing at all
+once each entry owns its state. The `flush()` bail and the `"switched"` returns
+exist only because there is ONE shared `blocks` array, so a background pump would
+corrupt the visible transcript; writing into your own state is always correct, so
+they can be deleted rather than translated. `"switched"` itself means "stop,
+someone else owns the state now" — with per-entry state, nobody does.
 
 Getting this wrong is the single most likely way to ship a broken version of this
 feature: leave the guards as-is and every background pump exits on its first
@@ -230,24 +234,37 @@ reconnect check, silently degrading to today's behaviour with all the added
 complexity and none of the benefit. Worth an explicit test — *a background entry
 survives a simulated drop and applies post-reconnect events.*
 
-Almost every guard becomes liveness. The `flush()` bail at `:3701` and the
-`"switched"` returns at `:3745` / `:3922` are the ones to re-read individually,
-since they exist to stop a pump writing into a conversation the user has left —
+The guards to re-read individually are the `flush()` bail at `:3701` and the
+`"switched"` returns at `:3745` / `:3922`, which exist to stop a pump writing
+into a conversation the user has left —
 a concern that disappears once each pump owns its own state.
 
-Two knock-on effects of 30 streams reconnecting on a ~5-minute cycle:
+**Every reconnect must reconcile, background or not.** An earlier draft here
+proposed deferring `reconcileOnReconnect` for background entries to save
+requests. That is wrong, and the reason is worth recording.
 
-- **Reconcile cost.** Each reconnect runs `reconcileOnReconnect` — a
-  `getSessionSlim` plus at least one `fetchSessionItemsPage`, sometimes more via
-  `backfillItemsUntilCovered` (`chatStore.ts:3062`). At 30 entries that is ~60+
-  requests per 5 minutes for conversations nobody is looking at. Defer the
-  *reconcile* (not the reconnect) for background entries: reconnect and keep
-  pumping, mark the entry as needing reconciliation, and run it on `switchTo`.
-  One flag, no new lifecycle state.
-- **Thundering herd.** Thirty streams opened together will recycle together.
-  `nextReconnectDelay` already jitters, but it only applies to *failed* opens — a
-  healthy drop reconnects instantly by design. Add a small stagger for
-  non-active entries so 30 reconnects do not land in one burst.
+The ~5-minute drop is not a network failure — it is the ingress capping every
+HTTP/2 stream unconditionally, on a healthy connection. It is the steady state,
+~12 times an hour per stream, not an edge case. And the gap is real: the server
+keeps no replay buffer and adds no sequence number, so "events emitted while no
+subscriber is connected are dropped silently; reconnecting clients use the
+snapshot endpoint, not replay" (`session_stream.py:81`). Reconnect is fast
+(instant after a healthy connection) but not atomic, and a busy agent can emit
+into that window. The subscriber queue is also bounded at 1024 events and *drains
+itself* on overflow, pushing an `_OVERFLOW` marker — reachable by a throttled
+background tab.
+
+So reconciliation is **state integrity, not display preparation**. Deferring it
+would leave background entries silently wrong — exactly the "frozen transcript"
+failure this feature is supposed to eliminate, but harder to notice. The ~60
+requests per 5 minutes is the honest cost of 30 live streams. If that proves too
+expensive the levers are lowering `MAX_LIVE` or making the reconcile cheaper,
+never skipping it.
+
+Still worth doing: **stagger the reconnects.** Thirty streams opened together
+recycle together, and `nextReconnectDelay` only jitters *failed* opens — a healthy
+drop reconnects instantly by design. The stagger is purely herd control; it does
+not reduce total work.
 
 #### Why not just give the dev server HTTP/2?
 
@@ -381,18 +398,28 @@ Keep the *drop-recovery* half of `reconcileOnReconnect` — transport drops and 
 ~5-minute ingress recycle still happen, and background streams need the same
 recovery. Only the navigate-back variants go.
 
-## 5. Presence
+## 5. Presence — deliberately unchanged
 
-Opening a stream registers the user as a viewer, so background streams would
-light up presence circles for conversations nobody is looking at. No backend
-change is needed: `SessionViewer.idle` already exists and greys the avatar
-(`PresenceAvatars.tsx:42`). Compose the flag as
-`effectiveIdle = document.hidden || !isActive`, which is honest — the tab holds
-the conversation open but isn't looking at it.
+Opening a stream registers the user as a viewer, so with 30 live streams a user
+shows as an active viewer on every conversation they hold open. **Decision: leave
+this as-is, out of scope for this work.**
 
-This does mean the presence idle tracker moves into the registry, and a
-visibility flip must recycle every live stream rather than the single global
-attempt controller.
+It is a defensible reading — those conversations genuinely are open and
+live-updating in that tab — and the server already absorbs the churn: presence
+aggregates per user across connections (`all(connection.idle for ...)`,
+`presence.py:242`) and holds a leave-grace window, so ~5-minute stream recycles
+do not flicker avatars.
+
+The alternative considered was reporting idle for non-active conversations
+(`document.hidden || !isActive`), which the existing `SessionViewer.idle` flag and
+its greyed avatar (`PresenceAvatars.tsx:42`) would render for free. Rejected for
+now: it needs the entry to know whether it is on screen, which is the only
+remaining reason foreground would exist as a concept at all. Revisit if users find
+the viewer list misleading.
+
+One piece of presence work is already done, and was needed regardless of the above
+(a flip must recycle EVERY open stream, since the `idle` flag rides on each
+stream's GET): `presenceAttemptControllers` ✅ `9c44023a`.
 
 ## 6. Risks
 
@@ -471,10 +498,10 @@ so the existing 328 tests are the regression net; only phase 3 changes semantics
   6 checked which conversation the event was for. Also found that events which
   DO name a target need both checks — a session's stream can carry frames about
   another conversation — hence `applyToNamedConversation`.
-- **Phase 3** — raise `MAX_LIVE` to its real value (30 prod / 3 dev), split the
-  guards into liveness vs. foreground so background pumps keep reconnecting, and
-  delete `transcriptCache`, `pendingByConversation`, and the cache-bridge paths.
-  The feature lands here.
+- **Phase 3** — raise `MAX_LIVE` to its real value (30 prod / 3 dev), convert the
+  guards to liveness checks so background pumps keep reconnecting and
+  reconciling, and delete `transcriptCache`, `pendingByConversation`, and the
+  cache-bridge paths. The feature lands here. Presence is untouched (§ 5).
 - **Phase 4** *(optional)* — drop the mirror, migrate components to
   `useActiveConversation(selector)`.
 
@@ -488,11 +515,15 @@ A follow-on this unlocks: the sidebar could read live per-conversation state
    is forced by HTTP/1.1. Enabling `server.https` in the dev server (Vite 8 then
    serves HTTP/2) lets dev converge on 30 — worth doing soon after, so developers
    exercise production's eviction rate.
-2. Presence — is `idle` the right signal for a background stream, or should
-   background streams be excluded from presence entirely (a small backend change
-   to make viewer registration opt-out at stream open)?
-3. Whether to defer `reconcileOnReconnect` for background entries in phase 3 or
-   ship the simpler always-reconcile version first and measure the request load.
+2. Whether the reconnect stagger is worth adding up front or only if 30
+   simultaneous recycles actually show up as a burst in practice.
 
-*Settled: memory is unbounded by choice (§ Layer 2); the cap is a single
-`MAX_LIVE` with no detached tier; reconnect-on-drop is required per entry.*
+*Settled:*
+- *memory is unbounded by choice (§ Layer 2);*
+- *the cap is a single `MAX_LIVE`, no detached tier (§ Layer 2);*
+- *reconnect-on-drop is required per entry, and every reconnect reconciles —
+  background included, because the gap loses events (§ Layer 2);*
+- *presence is left as-is: holding a live stream shows you as an active viewer
+  (§ 5);*
+- *foreground is not a first-class concept — the guards become liveness, and most
+  disappear (§ Layer 2).*
