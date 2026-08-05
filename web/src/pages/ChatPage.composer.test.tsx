@@ -1035,6 +1035,68 @@ describe("Composer Codex Plan-mode control", () => {
   });
 });
 
+describe("Composer claude-native permission mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ claudePermissionMode: "" });
+  });
+
+  it("no longer renders a standalone picker beside the gear", () => {
+    // The mode lives inside the gear modal now, alongside model and effort —
+    // the composer row stays uncluttered.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "default" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+
+    expect(screen.queryByTestId("claude-permission-mode-select")).toBeNull();
+  });
+
+  it("shows the Permissions row inside the gear modal", async () => {
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    const row = screen.getByTestId("composer-config-permission-mode");
+    // Trigger shows the label only — the description belongs to the open list.
+    expect(row).toHaveTextContent("Auto");
+    expect(row).not.toHaveTextContent("classifier");
+  });
+
+  it("omits the Permissions row when the mode could not be determined", async () => {
+    // Claude only renders its mode footer in some pane states (a todo list
+    // displaces it), so an unknown mode must not be shown as a guess.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-permission-mode")).toBeNull();
+  });
+
+  it("keeps the gear reachable when the mode is the only config row", () => {
+    // The gear used to hide unless model/effort/routing applied; a Claude
+    // session whose only knob is the permission mode must still open it.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showClaudePermissionMode: true,
+          showModels: false,
+          showEffort: false,
+          costRoutingEligible: false,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
+  });
+});
+
 describe("slashCommandMatches", () => {
   it("matches the leaf segment after a namespace prefix", () => {
     expect(slashCommandMatches("/superpowers:using-superpowers", "using-superpowers")).toBe(true);

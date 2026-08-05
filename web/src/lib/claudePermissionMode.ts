@@ -66,11 +66,14 @@ export function claudePermissionModeLabel(mode: string | null | undefined): stri
 }
 
 /**
- * The permission mode a running claude-native session is in.
+ * The permission mode a running claude-native session is in, or `null` when
+ * it cannot be determined.
  *
- * Prefers the label the server stamps after a confirmed switch;
- * `terminal_launch_args` only records the launch mode. Falls back to that
- * flag, then to Claude's default.
+ * Prefers the label the server stamps after a confirmed switch, then the
+ * launch flag. Returns `null` rather than assuming Claude's default: a
+ * `permissions.defaultMode` in a settings file boots the session into a mode
+ * that never appears in `terminal_launch_args`, so guessing "Manual" would
+ * display a mode the session isn't in. Callers hide the picker on `null`.
  */
 export function claudePermissionModeFromSession(
   session:
@@ -80,11 +83,11 @@ export function claudePermissionModeFromSession(
       }
     | null
     | undefined,
-): string {
+): string | null {
   const labelled = session?.labels?.[CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY];
   if (typeof labelled === "string" && labelled) return labelled;
   const args = session?.terminalLaunchArgs ?? [];
   const flagIndex = args.indexOf("--permission-mode");
   if (flagIndex >= 0 && flagIndex + 1 < args.length) return args[flagIndex + 1];
-  return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
+  return null;
 }

@@ -16,7 +16,9 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -6107,6 +6109,173 @@ async def test_post_external_codex_collaboration_mode_change_rejects_unknown_mod
 
     assert resp.status_code == 400, resp.text
     assert "external_codex_collaboration_mode_change" in resp.text
+
+
+async def test_post_external_permission_mode_change_persists_label_and_publishes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane-observed claude-native mode lands on the label and the stream.
+
+    The forwarder posts this when the user pressed shift+tab inside the TUI.
+    The SSE event moves the live picker; the label is what a reconnecting
+    client restores from, so both must happen or the mode goes stale on reload.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "auto"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert [event["type"] for _, event in published] == ["session.permission_mode"]
+    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[0][1]["permission_mode"] == "auto"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+
+
+async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-posting the mode already on the label publishes nothing.
+
+    The forwarder dedupes per poll, but a restarted forwarder re-seeds from the
+    pane. Without this guard that would republish on every reconnect and reset
+    the picker's open dropdown for anyone watching the session.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    seed = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": "plan"}},
+    )
+    assert seed.status_code == 202, seed.text
+    published.clear()
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": "plan"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert published == []
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "bypassPermissions",  # real CLI mode, but not one shift+tab can reach
+        "turbo",  # not a mode at all
+        "",
+    ],
+)
+async def test_post_external_permission_mode_change_rejects_unsupported_modes(
+    client: httpx.AsyncClient,
+    mode: str,
+) -> None:
+    """
+    Only switchable modes become labels; anything else fails loud.
+
+    A footer misread into an unknown value would otherwise persist a mode the
+    PATCH path and the web picker can't represent, leaving the picker blank.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": mode},
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_permission_mode_change" in resp.text
+
+
+async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The real forwarder mirror drives a live server and crosses the SSE wire.
+
+    Every other test in this feature mocks its neighbour, so a broken seam
+    between them passes all of them — the missing event type in the route's
+    payload-validation passthrough did exactly that, 400ing every POST while
+    each layer's own tests stayed green. This drives
+    ``_forward_permission_mode_from_pane`` (not a hand-rolled POST) against
+    the real route, and asserts the published event survives validation
+    against ``ServerStreamEvent`` at the SSE boundary and lifts into the typed
+    frontend shape the store reduces.
+    """
+    from omnigent import claude_native_forwarder as fwd
+    from tests.server.helpers import start_session_stream_collector
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    pane_mode = "default"
+
+    def _fake_read(_bridge_dir: Any) -> str | None:
+        """Serve the pane footer the forwarder would capture via tmux."""
+        return pane_mode
+
+    dedupe = fwd._ForwardDedupeState()
+    collector = await start_session_stream_collector(session_id)
+    try:
+        with (
+            patch.object(fwd, "read_permission_mode", _fake_read),
+            patch.object(fwd, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0),
+        ):
+
+            async def _poll() -> None:
+                """Run one real permission-mode mirror pass against the server."""
+                await fwd._forward_permission_mode_from_pane(
+                    client=client,
+                    session_id=session_id,
+                    bridge_dir=Path("/tmp/omnigent/claude-native/e2e"),
+                    dedupe=dedupe,
+                )
+
+            # Launch mode seeds silently — nothing should hit the wire.
+            await _poll()
+            # The user presses shift+tab in the TUI.
+            pane_mode = "auto"
+            await _poll()
+
+        event = await collector.next_event()
+    finally:
+        collector.task.cancel()
+
+    # Crossed the SSE boundary in the shape the frontend parser expects.
+    assert event["type"] == "session.permission_mode"
+    assert event["conversation_id"] == session_id
+    assert event["permission_mode"] == "auto"
+    # And it is durable: a reloading client restores the mode from the label.
+    snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "auto"
 
 
 async def test_post_external_codex_approval_mode_change_persists_terminal_args(
