@@ -166,6 +166,28 @@ describe("buildAgentBundle", () => {
     expect(yaml).toContain("      GITHUB_TOKEN: ghp_test");
   });
 
+  it("serializes the Azure DevOps MCP preset", async () => {
+    const input: AgentBundleInput = {
+      name: "ado-agent",
+      harness: "claude-sdk",
+      model: "claude-sonnet-4-20250514",
+      mcpServers: [
+        {
+          name: "azure-devops",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "@azure-devops/mcp", "contoso", "--authentication", "azcli"],
+        },
+      ],
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).toContain("  azure-devops:");
+    expect(yaml).toContain("    command: npx");
+    expect(yaml).toContain('    args: [-y, "@azure-devops/mcp", contoso, --authentication, azcli]');
+    expect(yaml).not.toContain("ADO_MCP_AUTH_TOKEN");
+    expect(yaml).not.toContain("PERSONAL_ACCESS_TOKEN");
+  });
+
   it("includes inline MCP servers (http)", async () => {
     const input: AgentBundleInput = {
       name: "http-agent",
