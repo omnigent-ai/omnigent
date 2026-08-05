@@ -34,6 +34,16 @@ from omnigent.claude_native_bridge import (
     prepare_bridge_dir,
     read_permission_hook_config,
 )
+from omnigent.codex_native_bridge import (
+    CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    CodexNativeBridgeState,
+)
+from omnigent.codex_native_bridge import (
+    prepare_bridge_dir as prepare_codex_bridge_dir,
+)
+from omnigent.codex_native_bridge import (
+    write_bridge_state as write_codex_bridge_state,
+)
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
@@ -2581,6 +2591,255 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         # The rotation target's terminal arrives via transfer. Auto-create here
         # is the regression: it cold-starts a redundant agy that 400s the
         # rotation's external_session_id PATCH and loops the rotation.
+        assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
+
+
+@dataclass
+class _CodexAutoCreateScenario:
+    """
+    One case for the codex-native auto-create guard route test.
+
+    :param case_id: Pytest id, e.g. ``"new_rotation_target_skips"``.
+    :param bridge_state_session: ``session_id`` recorded in the shared
+        bridge state, e.g. ``"3bb59abc6e20b834cbb2269f28880895"``, or
+        ``None`` to leave the bridge unseeded (fresh session).
+    :param terminal_under: Session id that owns a live ``codex:main``
+        terminal in the registry, or ``None`` for no live terminal.
+    :param bridge_id_label: Value reported for the session's
+        :data:`CODEX_NATIVE_BRIDGE_ID_LABEL_KEY` label, e.g.
+        ``"bridge_shared"`` for a rotation target (shares the original's
+        bridge) or the session's own id for a fresh session.
+    :param expect_auto_create: Whether the guard should invoke
+        ``_auto_create_codex_terminal`` for the new session.
+    """
+
+    case_id: str
+    bridge_state_session: str | None
+    terminal_under: str | None
+    bridge_id_label: str
+    expect_auto_create: bool
+
+
+class _CodexSnapshotServerClient:
+    """
+    Server-client stub for the codex auto-create guard route test.
+
+    Answers the GETs the codex branch issues: the session snapshot
+    (non-``None`` so ``_codex_session_needs_runner_terminal`` reports the
+    session needs a terminal) and the labels lookup (returns the bridge-id
+    label so the transfer-inbound check resolves the shared bridge dir).
+    A real stub class — not ``MagicMock`` — so an unexpected call shape
+    fails loudly instead of silently returning a mock.
+    """
+
+    def __init__(self, bridge_id_label: str) -> None:
+        """
+        :param bridge_id_label: Bridge id to report on the session's
+            ``labels``, e.g. ``"bridge_shared"``.
+        """
+        self._bridge_id_label = bridge_id_label
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """
+        Return a canned snapshot or labels payload for *url*.
+
+        :param url: Request path, e.g. ``"/v1/sessions/<id>"`` or
+            ``"/v1/sessions/<id>/labels"``.
+        :returns: A response object exposing ``status_code`` and ``json()``
+            matching the subset the runner reads.
+        """
+        del kwargs
+        labels = {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: self._bridge_id_label}
+
+        class _Response:
+            """Minimal httpx-like response with the fields the runner reads."""
+
+            def __init__(self, payload: dict[str, Any]) -> None:
+                """:param payload: JSON body returned by ``json()``."""
+                self.status_code = 200
+                self._payload = payload
+
+            def json(self) -> dict[str, Any]:
+                """:returns: The canned JSON payload."""
+                return self._payload
+
+        if url.endswith("/labels"):
+            return _Response({"labels": labels})
+        return _Response({"id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d", "labels": labels})
+
+
+_CODEX_AUTO_CREATE_SCENARIOS = [
+    # Rotation target: the bridge's active session still owns the live codex
+    # terminal that is about to be transferred onto the new session.
+    _CodexAutoCreateScenario(
+        case_id="new_rotation_target_skips",
+        bridge_state_session="3bb59abc6e20b834cbb2269f28880895",
+        terminal_under="3bb59abc6e20b834cbb2269f28880895",
+        bridge_id_label="bridge_shared",
+        expect_auto_create=False,
+    ),
+    # Fresh host-spawned session: own bridge, no recorded state, no terminal —
+    # it must bootstrap its own Codex.
+    _CodexAutoCreateScenario(
+        case_id="fresh_session_creates",
+        bridge_state_session=None,
+        terminal_under=None,
+        bridge_id_label="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+        expect_auto_create=True,
+    ),
+    # The bridge's recorded session is the new session itself (e.g. a relaunch
+    # after the terminal died) — not a rotation, so auto-create proceeds.
+    _CodexAutoCreateScenario(
+        case_id="active_is_self_creates",
+        bridge_state_session="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+    # The bridge names a sibling but no live terminal exists under it —
+    # nothing to transfer in, so auto-create proceeds.
+    _CodexAutoCreateScenario(
+        case_id="dead_terminal_under_active_creates",
+        bridge_state_session="3bb59abc6e20b834cbb2269f28880895",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    _CODEX_AUTO_CREATE_SCENARIOS,
+    ids=[s.case_id for s in _CODEX_AUTO_CREATE_SCENARIOS],
+)
+async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
+    scenario: _CodexAutoCreateScenario,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The codex-native auto-create guard skips ``/new`` rotation targets.
+
+    A native Codex ``/new`` starts a fresh thread in the SAME terminal, and
+    the forwarder rotates Omnigent ownership onto a fresh session before
+    transferring that terminal onto it. The bind reaches the runner's
+    ``POST /v1/sessions`` before the transfer runs, so the new session
+    momentarily has no terminal. Auto-creating a second ``codex:main`` here
+    makes the rotation's transfer 409, so the terminal — and the tmux status
+    link it carries — stays owned by the superseded session while the web
+    session streams from the new one.
+
+    Drives the real route with the real guard. Each scenario seeds the shared
+    bridge state's ``session_id`` and the terminal registry, then asserts
+    whether ``_auto_create_codex_terminal`` ran. Reverting the guard turns the
+    ``new_rotation_target_skips`` case red. Mirrors the claude-native and
+    antigravity-native guard tests above.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_bridge._BRIDGE_ROOT",
+        tmp_path / "codex-native",
+    )
+
+    # Seed the shared bridge state so the guard reads the original
+    # (terminal-owning) session as the bridge's active session.
+    if scenario.bridge_state_session is not None:
+        seed_dir = prepare_codex_bridge_dir(scenario.bridge_id_label)
+        write_codex_bridge_state(
+            seed_dir,
+            CodexNativeBridgeState(
+                session_id=scenario.bridge_state_session,
+                socket_path="ws://127.0.0.1:9876",
+                thread_id="thread_old",
+                codex_home=str(tmp_path / "codex-home"),
+            ),
+        )
+
+    # Seed a live codex:main terminal under the original session so the guard's
+    # registry probe finds the terminal that would be transferred. Poking
+    # ``_by_conversation`` directly is the established registry-test idiom — a
+    # real TerminalInstance without launching tmux.
+    terminal_registry = TerminalRegistry()
+    if scenario.terminal_under is not None:
+        instance = TerminalInstance(
+            name="codex",
+            session_key="main",
+            socket_path=tmp_path / "codex.sock",
+            private_dir=tmp_path / "codex",
+            running=True,
+        )
+        terminal_registry._by_conversation[scenario.terminal_under] = {("codex", "main"): instance}
+
+    created: list[str] = []
+
+    async def _recording_auto_create(
+        session_id: str, resource_registry: Any, publish_event: Any, **_kwargs: Any
+    ) -> None:
+        """
+        Record the auto-create call instead of launching a real Codex.
+
+        :param session_id: Session id the guard chose to auto-create for.
+        :param resource_registry: Unused — the real launch path is stubbed.
+        :param publish_event: Unused — the real launch path is stubbed.
+        :param _kwargs: Absorbs keyword args added to the real function.
+        :returns: None.
+        """
+        del resource_registry, publish_event
+        created.append(session_id)
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _recording_auto_create,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the codex-native spec for any agent id.
+
+        :param agent_id: Requested agent id (unused — fixed spec).
+        :param session_id: Requested session id (unused — fixed spec).
+        :returns: The codex-native :class:`AgentSpec`.
+        """
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_CodexSnapshotServerClient(  # type: ignore[arg-type]
+            scenario.bridge_id_label
+        ),
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+    assert resp.status_code == 201, resp.text
+
+    if scenario.expect_auto_create:
+        # Fresh / no-live-sibling sessions must still bootstrap their own
+        # Codex — the guard only suppresses true rotation targets.
+        assert created == ["2d1b1a96e3e08f2cd43c0cc4b695ac5d"], (
+            f"Expected auto-create for {scenario.case_id}; got {created}"
+        )
+    else:
+        # The rotation target's terminal arrives via transfer. Auto-create here
+        # is the regression: it 409s the transfer, so the terminal and its tmux
+        # status link stay on the superseded session.
         assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
 
 

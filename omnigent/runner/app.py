@@ -98,6 +98,7 @@ from omnigent.runner.native import (
     _claude_native_terminal_arrives_via_transfer,
     _codex_ensure_response_with_policy_notice,
     _codex_native_model_from_spec,
+    _codex_native_terminal_arrives_via_transfer,
     _codex_session_needs_runner_terminal,
     _CodexNativeModelOptionsNotReady,
     _delete_native_bridge_dirs,
@@ -2819,6 +2820,20 @@ def create_runner_app(
 
                 async def _codex_pre_launch(has_terminal: bool) -> PreLaunchResult:
                     needs = await _codex_session_needs_runner_terminal(server_client, session_id)
+                    if not has_terminal:
+                        inbound = await _codex_native_terminal_arrives_via_transfer(
+                            server_client=server_client,
+                            session_id=session_id,
+                            resource_registry=resource_registry,
+                        )
+                        _logger.info(
+                            "Codex terminal transfer-inbound check: session=%s "
+                            "terminal_inbound=%s",
+                            session_id,
+                            inbound,
+                        )
+                        if inbound:
+                            return PreLaunchResult(skip=True)
                     if not needs and not has_terminal:
                         _logger.info(
                             "Skipping codex terminal auto-create for %s; session "
