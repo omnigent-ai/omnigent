@@ -524,7 +524,9 @@ def _authorize_runner_or_user_sync(
     auth on any runner failure (missing, blank, mismatched, or
     unauthorized token).
     """
-    token = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+    # An authenticated human request wins when both identities are present.
+    # The runner token still remains available to route-specific provenance checks.
+    token = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) if user_id is None else None
     if token:
         principal = authenticate_runner(token, conversation_id, conversation_store)
         if principal is not None and runner_allows(principal, conversation_id, action):

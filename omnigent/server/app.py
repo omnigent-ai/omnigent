@@ -1159,6 +1159,13 @@ def create_app(
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
+    if host_store is not None and host_permission_store is None:
+        from omnigent.stores.host_permission_store.sqlalchemy_store import (
+            SqlAlchemyHostPermissionStore,
+        )
+
+        host_permission_store = SqlAlchemyHostPermissionStore(str(host_store._engine.url))
+
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
