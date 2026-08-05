@@ -219,6 +219,11 @@ const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "re
  *     more when a deferred routing chip widened the region back to the chip
  *     (the pair, plus any bubble rendered between them). Reuse drops exactly
  *     this many bubbles before re-walking the region.
+ * :param supersededChips: block indexes the cached walk dropped as superseded
+ *     create-time chips. A chip is only KNOWN superseded once the turn that
+ *     repeats it arrives, which is usually after the chip's own bubble was
+ *     finalized into the prefix — so the set is remembered and compared, and a
+ *     disagreement over the prefix forces the one full rebuild that removes it.
  */
 export interface BubbleCache {
   blocks: AnyBlock[] | null;
@@ -227,6 +232,7 @@ export interface BubbleCache {
   bubbles: Bubble[];
   lastBubbleStart: number;
   lastBubbleCount: number;
+  supersededChips: ReadonlySet<number>;
 }
 
 const EMPTY_INTERRUPTED_RESPONSE_IDS: readonly string[] = [];
@@ -240,6 +246,7 @@ export function createBubbleCache(): BubbleCache {
     bubbles: [],
     lastBubbleStart: -1,
     lastBubbleCount: 1,
+    supersededChips: new Set<number>(),
   };
 }
 
@@ -271,9 +278,15 @@ export function buildBubbles(
   interruptedResponseIds: readonly string[] = EMPTY_INTERRUPTED_RESPONSE_IDS,
 ): Bubble[] {
   const interruptedResponses = new Set(interruptedResponseIds);
+  // Resolved over the whole transcript before any reuse decision: a create-time
+  // chip and the turn chip that repeats it verbatim are one verdict however far
+  // apart they landed, and whether the pair is still visible decides whether the
+  // cached prefix may be reused at all.
+  const superseded = supersededCreateRoutingChips(blocks);
   if (cache === undefined) {
     return markContinuedTurns(
-      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map()).bubbles,
+      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map(), superseded)
+        .bubbles,
       activeResponse,
     );
   }
@@ -289,7 +302,7 @@ export function buildBubbles(
 
   // Try the incremental path: reuse every finalized bubble (all but the
   // last) and rebuild only from where the last cached bubble started.
-  const reuse = reusablePrefix(blocks, activeResponse, interruptedResponses, cache);
+  const reuse = reusablePrefix(blocks, activeResponse, interruptedResponses, cache, superseded);
   if (reuse !== null) {
     const subIndexSeed = new Map<string, number>();
     for (const b of reuse.prefix) {
@@ -304,6 +317,7 @@ export function buildBubbles(
       reuse.startBlock,
       reuse.prefix,
       subIndexSeed,
+      superseded,
     );
     cache.blocks = blocks;
     cache.activeResponse = activeResponse;
@@ -311,17 +325,27 @@ export function buildBubbles(
     cache.bubbles = markContinuedTurns(rest.bubbles, activeResponse);
     cache.lastBubbleStart = rest.lastBubbleStart;
     cache.lastBubbleCount = rest.lastBubbleCount;
+    cache.supersededChips = superseded;
     return cache.bubbles;
   }
 
   // Cache miss (session switch, history prepend, in-place edit) — full rebuild.
-  const full = walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map());
+  const full = walkBubbles(
+    blocks,
+    activeResponse,
+    interruptedResponses,
+    0,
+    [],
+    new Map(),
+    superseded,
+  );
   cache.blocks = blocks;
   cache.activeResponse = activeResponse;
   cache.interruptedResponseIds = interruptedResponseIds;
   cache.bubbles = markContinuedTurns(full.bubbles, activeResponse);
   cache.lastBubbleStart = full.lastBubbleStart;
   cache.lastBubbleCount = full.lastBubbleCount;
+  cache.supersededChips = superseded;
   return cache.bubbles;
 }
 
@@ -452,6 +476,8 @@ function hasAssistantContinuation(bubbles: Bubble[], from: number): boolean {
  * assistant bubble matches the active response id), since that bubble's
  * rendered state could otherwise change without its blocks changing.
  *
+ * :param superseded: create-time chips the current transcript drops, compared
+ *     against the set the cached walk used.
  * :returns: ``{prefix, startBlock}`` when reuse is safe, else ``null``.
  */
 function reusablePrefix(
@@ -459,6 +485,7 @@ function reusablePrefix(
   activeResponse: ActiveResponse | null,
   interruptedResponses: ReadonlySet<string>,
   cache: BubbleCache,
+  superseded: ReadonlySet<number>,
 ): { prefix: Bubble[]; startBlock: number } | null {
   if (cache.blocks === null || cache.bubbles.length === 0 || cache.lastBubbleStart <= 0) {
     return null;
@@ -474,6 +501,11 @@ function reusablePrefix(
   // opened its own bubble in between. Rebuild in full so the arriving message
   // can still pick the chip up.
   if (chipPendingBeforeRegion(blocks, startBlock)) return null;
+  // The turn chip that supersedes a create-time one usually arrives long after
+  // that chip's bubble was finalized into the prefix, so the drop can only be
+  // applied by re-walking it. One rebuild on the frame the verdict flips; after
+  // it the sets agree again and reuse resumes.
+  if (supersededPrefixChanged(superseded, cache.supersededChips, startBlock)) return null;
   // The finalized prefix region must be byte-for-byte (reference-for-
   // reference) unchanged.
   for (let j = 0; j < startBlock; j += 1) {
@@ -514,6 +546,22 @@ function reusablePrefix(
     }
   }
   return { prefix, startBlock };
+}
+
+/**
+ * Whether the supersede verdict changed for any chip inside the reused prefix.
+ *
+ * Only the prefix matters: a chip at or after `startBlock` is re-walked anyway,
+ * so its verdict is applied fresh either way.
+ */
+function supersededPrefixChanged(
+  next: ReadonlySet<number>,
+  cached: ReadonlySet<number>,
+  startBlock: number,
+): boolean {
+  for (const j of next) if (j < startBlock && !cached.has(j)) return true;
+  for (const j of cached) if (j < startBlock && !next.has(j)) return true;
+  return false;
 }
 
 /**
@@ -558,6 +606,8 @@ function chipPendingBeforeRegion(blocks: AnyBlock[], startBlock: number): boolea
  *     final region produced — counted, not assumed: a chip deferred below its
  *     user message widens the region back to the chip, and anything rendering
  *     in between (claude-native's injected `/model` echo) is inside it too.
+ * :param superseded: whole-transcript block indexes of create-time chips the
+ *     first turn repeats verbatim; they render nothing and claim no message.
  */
 function walkBubbles(
   blocks: AnyBlock[],
@@ -566,6 +616,7 @@ function walkBubbles(
   startIndex: number,
   seedBubbles: Bubble[],
   subIndexByResp: Map<string, number>,
+  superseded: ReadonlySet<number>,
 ): { bubbles: Bubble[]; lastBubbleStart: number; lastBubbleCount: number } {
   const bubbles: Bubble[] = [...seedBubbles];
   // One cross-bubble result index per walk: the relay backdates a
@@ -582,9 +633,6 @@ function walkBubbles(
       crossBubbleResults.set(`${blk.ctx.responseId}:${blk.callId}`, blk);
     }
   }
-  // Create-time chips the first turn re-decides identically; dropped before
-  // pairing so they neither render nor claim the user message.
-  const superseded = supersededCreateRoutingChips(blocks, startIndex);
   // A session/turn chip reads as the verdict on the message that triggered it,
   // so it renders below that message. Persistence order varies by harness:
   // native paths write the decision first, others write it after.
@@ -864,22 +912,42 @@ function deferredRoutingChips(
  * route, recorded as an unapplied `"unavailable"` row) still renders: those two
  * chips say different things.
  *
- * :param startIndex: first block the walk will visit. Earlier chips were
- *     already resolved by the walk that placed the reused prefix.
+ * Scanned over the whole transcript rather than from the walk's resume point,
+ * and paired by decision ORDER rather than adjacency: neither what rendered in
+ * between nor which turn group the two landed in changes whether they are the
+ * same verdict twice. A `native_subagent` / `child_session` decision is never
+ * the supersessor — a deny-then-honor spawn pair is two real decisions.
+ *
  * :returns: block indexes of the chips that render nothing.
  */
-function supersededCreateRoutingChips(blocks: AnyBlock[], startIndex: number): Set<number> {
+function supersededCreateRoutingChips(blocks: AnyBlock[]): Set<number> {
   const superseded = new Set<number>();
-  for (let j = startIndex; j < blocks.length; j += 1) {
+  for (let j = 0; j < blocks.length; j += 1) {
     const chip = blocks[j]!;
     if (chip.type !== "routing_decision" || chip.routing?.scope !== "session") continue;
-    const next = adjacent(blocks, j, 1);
-    if (next === null) continue;
-    const later = blocks[next.index]!;
-    if (later.type !== "routing_decision" || later.routing?.scope !== "turn") continue;
+    const later = nextRoutingDecision(blocks, j);
+    if (later === null || later.routing?.scope !== "turn") continue;
     if (sameRoutingVerdict(chip, later)) superseded.add(j);
   }
   return superseded;
+}
+
+/**
+ * The next routing decision after `from`, whatever renders in between.
+ *
+ * Deliberately not `adjacent`: that only steps over blocks allowed to sit
+ * between a chip and the message it routes, so anything a session did while
+ * booting — narration, an earlier message, a whole finished response — read as
+ * "these two are unrelated" and both chips rendered. Whether one verdict was
+ * recorded twice is a question about their order, not their proximity, so this
+ * looks past every intervening block and past turn-group boundaries.
+ */
+function nextRoutingDecision(blocks: AnyBlock[], from: number): RoutingDecisionBlock | null {
+  for (let k = from + 1; k < blocks.length; k += 1) {
+    const b = blocks[k]!;
+    if (b.type === "routing_decision") return b;
+  }
+  return null;
 }
 
 /** Whether two routing chips advertise the same pick (model, harness, applied). */

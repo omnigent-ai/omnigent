@@ -1638,6 +1638,57 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
       expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_turn"]);
     });
 
+    // The pair is matched by decision ORDER, not proximity: a booting session
+    // writes whatever it writes between the two (the terminal it claimed, a
+    // rename), and an adjacency test read every one of those as "no pair".
+    it("pairs the two across anything that renders in between", () => {
+      const between: AnyBlock[] = [
+        doneBlock("a0", "resp_0", "Launched the terminal."),
+        userBlock("u0", "resp_0"),
+      ];
+      for (const filler of between) {
+        const blocks: AnyBlock[] = [
+          verdictChip("rd_create", "session"),
+          filler,
+          verdictChip("rd_turn", "turn"),
+          userBlock("u1", "resp_1"),
+        ];
+        expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_turn"]);
+      }
+    });
+
+    it("pairs the two across a turn-group boundary", () => {
+      // A full response lands between them, so the create chip and the turn
+      // chip belong to different turn groups.
+      const blocks: AnyBlock[] = [
+        verdictChip("rd_create", "session"),
+        startBlock("resp_0"),
+        doneBlock("a0", "resp_0", "Ready."),
+        endBlock("resp_0"),
+        verdictChip("rd_turn", "turn"),
+        userBlock("u1", "resp_1"),
+      ];
+      expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_turn"]);
+    });
+
+    it("drops the create chip once the turn chip arrives mid-stream", () => {
+      // The create chip is finalized into the cached prefix frames before the
+      // turn chip exists, so the drop can only land by re-walking it. Without
+      // that the owner saw both chips for the rest of the session.
+      expectFrameByFrameStable(
+        [
+          verdictChip("rd_create", "session"),
+          doneBlock("a0", "resp_0", "Launched the terminal."),
+          verdictChip("rd_turn", "turn"),
+          userBlock("u1", "resp_1"),
+          startBlock("resp_1"),
+          doneBlock("a1", "resp_1", "Done."),
+          endBlock("resp_1"),
+        ],
+        ["assistant", "user", "routing_decision", "assistant"],
+      );
+    });
+
     it("keeps both when the turn changes the model, harness, or applied flag", () => {
       const differing: Record<string, unknown>[] = [
         { model: "databricks-claude-sonnet-5" },
@@ -1733,6 +1784,75 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
       const bubbles = buildBubbles(itemsToBlocks(items), null);
       expect(kinds(bubbles)).toEqual(["user", "routing_decision", "routing_decision"]);
       expect(chipIds(bubbles)).toEqual(["rd_turn", "rd_spawn"]);
+    });
+
+    // The rows an auto-harness codex session actually persisted, in order:
+    // the create-time pick, the resource_event for the terminal it launched,
+    // the first turn's identical pick, then the user's message. One verdict,
+    // so one chip — the resource_event between them changes nothing.
+    it("static reload: a resource_event between the two does not split them", () => {
+      const luna = "databricks-gpt-5-6-luna";
+      const items: ConversationItem[] = [
+        routingDecisionItem({
+          id: "rd_create",
+          response_id: "routing_create",
+          model: luna,
+          rationale: "Routed to gpt-5-6-luna because [prompt_short] holds.",
+          harness: "codex-native",
+          scope: "session",
+        }),
+        {
+          id: "re_1",
+          type: "resource_event",
+          response_id: "resp_boot",
+          status: "completed",
+          action: "created",
+          resource_id: "term_1",
+          resource_type: "terminal",
+        } as unknown as ConversationItem,
+        routingDecisionItem({
+          id: "rd_turn",
+          response_id: "routing_turn",
+          model: luna,
+          rationale: "Routed to gpt-5-6-luna because [low_ambiguity] holds.",
+          harness: "codex-native",
+          scope: "turn",
+        }),
+        {
+          id: "u1",
+          type: "message",
+          role: "user",
+          response_id: "resp_1",
+          status: "completed",
+          content: [{ type: "input_text", text: "audit the routing" }],
+        } as unknown as ConversationItem,
+      ];
+      const bubbles = buildBubbles(itemsToBlocks(items), null);
+      expect(chipIds(bubbles)).toEqual(["rd_turn"]);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision"]);
+    });
+
+    it("keeps a spawn's deny-then-honor pair as two decisions", () => {
+      // Two real verdicts on one spawn, not one verdict recorded twice — and
+      // never the supersessor of a create-time chip either.
+      for (const scope of ["native_subagent", "child_session"] as const) {
+        const blocks: AnyBlock[] = [
+          verdictChip("rd_create", "session"),
+          verdictChip("rd_spawn_deny", "turn", {
+            routing: { scope, harness: "claude-native" },
+            applied: false,
+          }),
+          verdictChip("rd_spawn_honor", "turn", {
+            routing: { scope, harness: "claude-native" },
+          }),
+          userBlock("u1", "resp_1"),
+        ];
+        expect(chipIds(buildBubbles(blocks, null))).toEqual([
+          "rd_create",
+          "rd_spawn_deny",
+          "rd_spawn_honor",
+        ]);
+      }
     });
   });
 
