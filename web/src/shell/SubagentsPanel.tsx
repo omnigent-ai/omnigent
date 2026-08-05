@@ -15,37 +15,16 @@
 // click opens it in a new tab, matching the sidebar's behavior.
 
 import { lazy, Suspense, useState } from "react";
-import type { ComponentType, SVGProps } from "react";
 import {
-  BookOpenIcon,
-  BotIcon,
-  Code2Icon,
-  CompassIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CornerDownRightIcon,
-  FileTextIcon,
-  FlaskConicalIcon,
   ListIcon,
   NetworkIcon,
   PlusIcon,
-  ScanSearchIcon,
-  SearchIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
-import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
-import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
-import { CodexIcon } from "@/components/icons/CodexIcon";
-import { CursorIcon } from "@/components/icons/CursorIcon";
-import { GooseIcon } from "@/components/icons/GooseIcon";
-import { HermesIcon } from "@/components/icons/HermesIcon";
-import { KimiIcon } from "@/components/icons/KimiIcon";
-import { KiroIcon } from "@/components/icons/KiroIcon";
-import { NessieIcon } from "@/components/icons/NessieIcon";
-import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
-import { OttoIcon } from "@/components/icons/OttoIcon";
-import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -57,6 +36,7 @@ const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { AGENT_ICON_CLASS, iconForChildAgent, iconForSessionAgent } from "./subagentIcons";
 import {
   activityDotClassName,
   childStatus,
@@ -75,9 +55,6 @@ import { AddAgentDialog } from "./AddAgentDialog";
 const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
-// Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
-const PI_AGENT_NAME = "pi";
-type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
 
 /**
  * Build a rail-link search string from the current URL, dropping the
@@ -253,71 +230,6 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
 };
 
 /**
- * Map a sub-agent type label to a category icon so a mix of agents reads by
- * role at a glance (Claude Code spawns many same-type "Explore" agents — the
- * icon distinguishes roles; the preview line below distinguishes instances).
- * Category icons are monochrome — the row applies the muted color; the
- * fallback is the full-color Otto (starfish) mascot.
- *
- * @param tool - The agent type, e.g. ``"Explore"`` or ``"researcher"``;
- *   ``null`` when the child carries no type.
- * @returns An SVG icon component.
- */
-export function iconForAgentType(tool: string | null): AgentRowIcon {
-  const t = (tool ?? "").toLowerCase();
-  if (t.includes("explore")) return SearchIcon;
-  if (t.includes("research")) return BookOpenIcon;
-  if (t.includes("plan") || t.includes("architect")) return CompassIcon;
-  if (t.includes("review")) return ScanSearchIcon;
-  if (t.includes("test")) return FlaskConicalIcon;
-  if (t.includes("doc") || t.includes("writ")) return FileTextIcon;
-  if (
-    t.includes("code") ||
-    t.includes("eng") ||
-    t.includes("dev") ||
-    t.includes("front") ||
-    t.includes("back")
-  ) {
-    return Code2Icon;
-  }
-  return OttoIcon;
-}
-
-/**
- * Pick a brand glyph for coding child sessions when the summary carries
- * enough identity metadata. Native children identify via their wrapper
- * label (authoritative — a custom scaffold agent merely *named* "codex"
- * must not get the Codex logo). Pi children are scaffold sessions with
- * no wrapper label, so the exact agent name ``"pi"`` is the signal.
- *
- * Only full native sessions get the brand glyph. *Sub-agent* wrapper
- * children (``…-subagent``) deliberately fall through to the role icons
- * (and the Otto fallback) — a native session's sub-agents are all the
- * same brand, so repeating the logo down the tree says nothing, while
- * role icons distinguish what each one is doing.
- *
- * @param child - One child-session summary from the poll or stream.
- * @returns The Claude/Codex/pi glyph component, or ``null`` for generic agents.
- */
-function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
-  const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
-  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
-  if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
-  if (nativeAgent?.iconKind === "codex") return CodexIcon;
-  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
-  if (nativeAgent?.iconKind === "pi") return PiIcon;
-  if (nativeAgent?.iconKind === "cursor") return CursorIcon;
-  if (nativeAgent?.iconKind === "kiro") return KiroIcon;
-  if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
-  if (nativeAgent?.iconKind === "goose") return GooseIcon;
-  if (nativeAgent?.iconKind === "kimi") return KimiIcon;
-  if (nativeAgent?.iconKind === "hermes") return HermesIcon;
-  // Exact match — substring checks would false-match names like "pipeline".
-  if (child.tool === PI_AGENT_NAME) return PiIcon;
-  return null;
-}
-
-/**
  * Indicator + optional label shared by the main and child rows. The working
  * state reuses the sidebar's RunningDot in the same grey tone, so
  * "active" reads identically across the app; other states are a single
@@ -478,32 +390,6 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-/**
- * Resolve a session's brand icon from its native-wrapper ``iconKind``
- * (authoritative for native-terminal sessions) with a harness-substring
- * fallback for plain SDK sessions that carry no wrapper label — e.g.
- * ``omni --harness kimi``, whose ``harness: "kimi"`` would otherwise fall
- * through to the generic bot. Mirrors ``iconForAgent`` in ``AgentCard.tsx``.
- */
-function iconForWrapperOrHarness(
-  iconKind: string | undefined,
-  harness: string | null | undefined,
-  isNessie: boolean,
-): AgentRowIcon {
-  if (iconKind === "claude" || harness?.includes("claude")) return ClaudeIcon;
-  if (iconKind === "codex" || harness?.includes("codex")) return CodexIcon;
-  if (iconKind === "opencode" || harness?.includes("opencode")) return OpenCodeIcon;
-  if (iconKind === "cursor" || harness?.includes("cursor")) return CursorIcon;
-  if (iconKind === "kiro" || harness?.includes("kiro")) return KiroIcon;
-  if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
-  if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
-  if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
-  // Exact match — a substring check would false-match e.g. "openapi".
-  if (iconKind === "pi" || harness === "pi") return PiIcon;
-  if (isNessie) return NessieIcon;
-  return BotIcon;
-}
-
 function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
   const { session } = useSession(rootSessionId);
   const search = railLinkSearch(useLocation().search);
@@ -512,7 +398,11 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
-  const Icon = iconForWrapperOrHarness(nativeAgent?.iconKind, session?.harness, isNessie);
+  const Icon = iconForSessionAgent({
+    wrapper,
+    agentName: session?.agentName,
+    harness: session?.harness,
+  });
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
@@ -539,7 +429,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         )}
       >
         <div className="flex w-full items-center gap-1">
-          <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+          <Icon className={AGENT_ICON_CLASS} />
           <span className="shrink-0 truncate text-xs font-medium">{label}</span>
           <span className="flex-1" />
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
@@ -587,7 +477,7 @@ function SubagentRow({
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = railLinkSearch(useLocation().search);
-  const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
+  const Icon = iconForChildAgent(child);
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
@@ -646,7 +536,7 @@ function SubagentRow({
                 className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
               />
             )}
-            <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+            <Icon className={AGENT_ICON_CLASS} />
             <span className="shrink-0 truncate text-xs font-medium">{primary}</span>
             <span className="flex-1" />
             <StatusIndicator {...status} />

@@ -15,7 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
-import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
+import { iconForAgentType } from "./subagentIcons";
+import { SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the

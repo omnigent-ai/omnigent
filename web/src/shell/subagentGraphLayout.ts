@@ -1,20 +1,37 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
+import { WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { childStatus, type AgentActivity } from "./subagentStatus";
 
 export type { AgentActivity };
 
-export interface AgentNodeData {
+// Raw identity fields the node component resolves into a harness/role glyph.
+// Kept as plain strings so this module stays free of React and icon imports.
+export interface AgentIconFields {
+  /** ``omnigent.wrapper`` label, when the session carries one. */
+  wrapper: string | null;
+  /** Sub-agent type, e.g. ``"Explore"``; ``null`` on the root node. */
+  tool: string | null;
+  /** Agent name — resolves the root's nessie glyph. ``null`` on children. */
+  agentName: string | null;
+  /** Resolved harness, for SDK sessions carrying no wrapper label. */
+  harness: string | null;
+}
+
+export interface AgentNodeData extends AgentIconFields {
   label: string;
   activity: AgentActivity;
   statusLabel: string;
   sessionId: string;
   isActive: boolean;
   preview: string | null;
+  /** True for the root node, which resolves its glyph as a whole session
+   *  (brand → nessie → bot) rather than as a typed sub-agent. */
+  isRoot: boolean;
   [key: string]: unknown;
 }
 
-export interface TreeNode {
+export interface TreeNode extends AgentIconFields {
   id: string;
   label: string;
   activity: AgentActivity;
@@ -79,7 +96,7 @@ export function layoutTree(
   const nodes: LayoutNode[] = [];
   const edges: LayoutEdge[] = [];
 
-  function place(node: TreeNode, x: number, y: number) {
+  function place(node: TreeNode, x: number, y: number, isRoot: boolean) {
     nodes.push({
       id: node.id,
       type: "agent",
@@ -91,6 +108,11 @@ export function layoutTree(
         sessionId: node.id,
         isActive: node.id === activeId,
         preview: node.preview,
+        wrapper: node.wrapper,
+        tool: node.tool,
+        agentName: node.agentName,
+        harness: node.harness,
+        isRoot,
       },
     });
 
@@ -119,33 +141,44 @@ export function layoutTree(
         },
       });
 
-      place(child, childCenterX, childY);
+      place(child, childCenterX, childY, false);
       childX += childWidth + HORIZONTAL_GAP;
     }
   }
 
-  place(root, 0, 0);
+  place(root, 0, 0, true);
   return { nodes, edges };
 }
 
+/** The subtree root's own fields. Grouped rather than passed positionally —
+ *  the identity fields the node icons need would otherwise push this to ten
+ *  positional arguments. */
+export interface TreeRoot extends Partial<AgentIconFields> {
+  id: string;
+  label: string;
+  activity: AgentActivity;
+  statusLabel: string;
+  preview: string | null;
+}
+
 export function buildTree(
-  rootId: string,
-  rootLabel: string,
-  rootActivity: AgentActivity,
-  rootStatusLabel: string,
-  rootPreview: string | null,
+  root: TreeRoot,
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
   visited = new Set<string>(),
 ): TreeNode {
-  visited.add(rootId);
-  const children = childrenMap.get(rootId) ?? [];
+  visited.add(root.id);
+  const children = childrenMap.get(root.id) ?? [];
   return {
-    id: rootId,
-    label: rootLabel,
-    activity: rootActivity,
-    statusLabel: rootStatusLabel,
-    preview: rootPreview,
+    id: root.id,
+    label: root.label,
+    activity: root.activity,
+    statusLabel: root.statusLabel,
+    preview: root.preview,
+    wrapper: root.wrapper ?? null,
+    tool: root.tool ?? null,
+    agentName: root.agentName ?? null,
+    harness: root.harness ?? null,
     children:
       depth >= MAX_TREE_DEPTH
         ? []
@@ -155,11 +188,15 @@ export function buildTree(
               const status = childActivity(child);
               const label = child.session_name ?? child.title ?? child.tool ?? child.id;
               return buildTree(
-                child.id,
-                label,
-                status.activity,
-                status.label,
-                child.last_message_preview,
+                {
+                  id: child.id,
+                  label,
+                  activity: status.activity,
+                  statusLabel: status.label,
+                  preview: child.last_message_preview,
+                  wrapper: child.labels?.[WRAPPER_LABEL_KEY] ?? null,
+                  tool: child.tool,
+                },
                 childrenMap,
                 depth + 1,
                 visited,
@@ -169,22 +206,9 @@ export function buildTree(
 }
 
 export function buildGraphLayout(
-  rootId: string,
-  rootLabel: string,
-  rootActivity: AgentActivity,
-  rootStatusLabel: string,
-  rootPreview: string | null,
+  root: TreeRoot,
   childrenMap: Map<string, ChildSessionInfo[]>,
   activeId: string,
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
-  const tree = buildTree(
-    rootId,
-    rootLabel,
-    rootActivity,
-    rootStatusLabel,
-    rootPreview,
-    childrenMap,
-    0,
-  );
-  return layoutTree(tree, activeId);
+  return layoutTree(buildTree(root, childrenMap, 0), activeId);
 }
