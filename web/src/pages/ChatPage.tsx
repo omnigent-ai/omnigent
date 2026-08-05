@@ -5200,7 +5200,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 shrink-0 rounded-full md:size-8",
+                "size-9 shrink-0 rounded-lg md:size-8",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
@@ -5216,7 +5216,7 @@ export function Composer({
               {showInterruptButton ? (
                 <SquareIcon className="size-4 fill-current" />
               ) : (
-                <ArrowUpIcon className="size-4" />
+                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
               )}
               <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
             </Button>
