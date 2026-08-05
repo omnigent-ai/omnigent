@@ -41,6 +41,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
@@ -6935,11 +6936,17 @@ async def _create_session_from_existing_agent(
     # every ordinary create would grow the overrides blob and cost a write for
     # no change in behavior. An explicit caller value always wins.
     #
-    # Not stamped for a session pinned to a codex-family harness: spawn routing
-    # there needs the generated ``hooks.json`` and tool pre-approvals that only
-    # an auto-harness launch installs, so the switch would read "on" while
-    # nothing consumed it. The gear hides the control on those sessions to
+    # Not stamped for a NATIVE session pinned to a codex-family harness: spawn
+    # routing there needs the generated ``hooks.json`` and tool pre-approvals
+    # that only an auto-harness launch installs, so the switch would read "on"
+    # while nothing consumed it. The gear hides the control on those sessions to
     # match — subagent routing is fixed at launch for pinned codex.
+    #
+    # Nativeness is half the test: an SDK/bundle agent whose brain is
+    # codex/openai-agents is codex-family too, but it spawns its children
+    # through the session-create path, which re-reads this switch per spawn.
+    # Suppressing there would drop working child routing, and the gear (which
+    # offers the row on every non-native session) would disagree.
     _pinned_codex_create = (
         not (_native_smart_routing or _force_auto_for_child or _spec_auto_brain)
         and body.harness_override != "auto"
@@ -6948,7 +6955,9 @@ async def _create_session_from_existing_agent(
         _resolved_create_harness = await asyncio.to_thread(
             _create_resolved_harness, agent, body.harness_override, agent_cache
         )
-        _pinned_codex_create = harness_family(_resolved_create_harness) == "gpt"
+        _pinned_codex_create = is_native_harness(_resolved_create_harness) and (
+            harness_family(_resolved_create_harness) == "gpt"
+        )
     if (
         subagent_routing_override is None
         and not _pinned_codex_create

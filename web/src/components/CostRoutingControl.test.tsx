@@ -79,6 +79,9 @@ describe("isSubagentRoutingSession", () => {
     // An SDK/bundle agent spawns children through the session-create path, which
     // routes off this switch regardless of the harness the parent runs.
     expect(isSubagentRoutingSession({ ...top, harness: "pi" })).toBe(true);
+    // Codex-family but not native: the server stamps these too. Keying the
+    // suppression on family alone hid the stamp while this row still showed.
+    expect(isSubagentRoutingSession({ ...top, harness: "codex" })).toBe(true);
     expect(isSubagentRoutingSession({ ...top, harness: "openai-agents" })).toBe(true);
     expect(isSubagentRoutingSession({ ...top, harness: "not-a-real-harness" })).toBe(true);
     expect(isSubagentRoutingSession({ ...top, harness: null })).toBe(true);

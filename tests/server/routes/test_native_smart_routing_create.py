@@ -660,6 +660,7 @@ async def test_a_non_auto_opt_in_value_is_rejected(client: httpx.AsyncClient) ->
 _WRAPPER = "__wrapper__"
 _CODEX_WRAPPER = "__codex_wrapper__"
 _BUNDLE = "__bundle__"
+_CODEX_BUNDLE = "__codex_bundle__"
 
 
 @pytest.mark.parametrize(
@@ -711,6 +712,22 @@ _BUNDLE = "__bundle__"
             },
             None,
             None,
+        ),
+        # ... but only for a NATIVE codex terminal. A bundle/SDK agent whose
+        # brain is codex is codex-family too, and it spawns through the
+        # session-create path, which re-reads this switch per spawn — so the
+        # stamp is what gives its children default routing. Suppressing on
+        # family alone dropped that, and disagreed with the gear (which offers
+        # the row on every non-native session).
+        (
+            "codex-brain-bundle-cost-control-on",
+            {
+                "agent_id": _CODEX_BUNDLE,
+                "cost_control_mode_override": "on",
+                "smart_routing_message": ROUTING_MESSAGE,
+            },
+            None,
+            "on",
         ),
         # Auto-harness may land on codex, and there the machinery IS installed.
         (
@@ -766,10 +783,16 @@ async def test_create_stamps_subagent_routing_for_routed_sessions(
 ) -> None:
     wrappers = await _native_wrappers(client, db_uri)
     bundle = await create_test_agent(client, name=f"stamp-{case}")
+    codex_bundle = await create_test_agent(
+        client,
+        name=f"stamp-codex-{case}",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
     agent_ids = {
         _WRAPPER: wrappers["claude-native"],
         _CODEX_WRAPPER: wrappers["codex-native"],
         _BUNDLE: str(bundle["id"]),
+        _CODEX_BUNDLE: str(codex_bundle["id"]),
     }
     payload = {**body, "agent_id": agent_ids[body["agent_id"]]}
 

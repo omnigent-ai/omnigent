@@ -48,9 +48,11 @@ function isAutoHarnessSession(
  *
  * - an auto-harness session always has it;
  * - a Claude-family session has it whenever it launched on Smart Routing;
- * - a session pinned to Codex never has it (the generated ``hooks.json`` and
- *   the routed-spawn tool pre-approvals only come with an auto-harness
- *   launch), and neither does a plain session of any family.
+ * - a native session pinned to Codex never has it (the generated ``hooks.json``
+ *   and the routed-spawn tool pre-approvals only come with an auto-harness
+ *   launch), and neither does a plain session of any family. A codex-brained
+ *   SDK/bundle agent is not this case — it took the non-native branch above,
+ *   and the server stamps it to match.
  *
  * Those last two would present "Smart Routing" as choosable while nothing
  * consumed the choice, so the row is hidden instead. Subagent routing is
