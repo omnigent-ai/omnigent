@@ -3125,14 +3125,19 @@ def _confirm_unrecognised_dialog(
     bug: a warm session renders the dialog ~1.9s in, so the single Enter fired
     into nothing and the person's next message was typed into the modal.
 
+    The extra Enter only ever answers a dialog that appeared AFTER the settle,
+    so it cannot land on some unrelated menu that was already open (a live
+    permission prompt): one already showing takes the single blind Enter this
+    seam always sent, and the watch is skipped.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Seconds to keep watching after the blind Enter.
     :returns: ``True`` when a dialog was seen and confirmed.
     """
     time.sleep(_BLIND_CONFIRM_SETTLE_S)
-    # Already up: the blind Enter answers it, and there is nothing left to wait
-    # for — the poll below would just burn its whole budget on an idle pane.
+    # Already up: the blind Enter answers it, and nothing later may be Entered
+    # on — see the docstring. The poll would also burn its budget on an idle pane.
     already_showing = _pane_shows_dialog(_capture_pane(socket_path, tmux_target))
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if already_showing:

@@ -6322,6 +6322,21 @@ def test_a_late_unrecognised_dialog_is_still_confirmed(
     assert [args[-1] for args in sends] == ["Enter", "Enter"]
 
 
+def test_a_menu_already_open_at_the_settle_gets_only_the_blind_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The late-dialog Enter must not answer someone else's open menu.
+
+    A menu already on screen when the command was injected is not this
+    command's confirmation — it could be a live permission prompt. It takes the
+    single blind Enter this seam always sent, and nothing more.
+    """
+    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
+
+    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is True
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
 @pytest.mark.parametrize(
     ("pane", "expected"),
     [
