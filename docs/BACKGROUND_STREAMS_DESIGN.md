@@ -12,19 +12,25 @@ stream, wipes ~36 fields of state, and rebinds the new conversation.
 
 That teardown is the source of the felt latency. On return the client pays a
 stream reconnect plus a snapshot re-fetch, and anything the agent produced while
-away only arrives through that rebind. The `transcriptCache` LRU makes the switch
-*paint* instantly from committed blocks, but it is a static snapshot — it cannot
-make new messages arrive any sooner, which is exactly the complaint.
+away only arrives through that rebind.
+
+A `transcriptCache` LRU (#3932) tried to close this by painting committed blocks
+instantly on switch, and was **reverted** (#4124): the window appeared, then
+shifted under the reader as newer commits were gap-bridged onto it. That revert
+is the strongest argument for this design. A cache can only make the switch
+*paint* faster — it cannot make new messages arrive sooner, and painting a stale
+snapshot before revalidating is what made the contents move. Keeping the
+conversation live sidesteps both: there is nothing stale to paint and nothing to
+revalidate, because the transcript never stopped being current.
 
 The teardown is also the root of the store's most subtle code. Because state is
 destroyed on switch, we need a stash for in-flight optimistic bubbles
-(`pendingByConversation`), a `committedTexts` baseline so restoring a bubble
-doesn't dedupe against older history, and a cache gap-bridge
-(`backfillItemsUntilCovered`, `spliceUnseenAheadOfInFlight`) to reconcile a
-painted cache window against a newer snapshot. Roughly 450 lines of the hairiest
-code in the file exists to work around losing state. **Keeping conversations
-alive deletes that entire category of problem** — this refactor is net-negative
-complexity, not just a feature.
+(`pendingByConversation`) and a `committedTexts` baseline so restoring a bubble
+doesn't dedupe against older history. The reverted cache added a gap-bridge
+(`backfillItemsUntilCovered`, `spliceUnseenAheadOfInFlight`) on top of that.
+Roughly 450 lines of the hairiest code in the file exists to work around losing
+state. **Keeping conversations alive deletes that entire category of problem** —
+this refactor is net-negative complexity, not just a feature.
 
 Server-side there is no obstacle. Each open stream costs one bounded
 `asyncio.Queue` (1024 events), one registry entry, and a 15s heartbeat — about
@@ -378,8 +384,9 @@ effect no-ops.
 
 ## 4. What gets deleted
 
-- `transcriptCache` + `readTranscriptCache` / `writeTranscriptCache` /
-  `evictTranscriptCache` (`chatStore.ts:677-709`).
+- `evictTranscriptCache`'s call site, which becomes `releaseConversation` (the
+  `transcriptCache` LRU itself was already removed by the #4124 revert; this
+  work removes the need for any cache at all).
 - `pendingByConversation`, `StashedPending`, the `committedTexts` dedupe
   baseline, `removeFromPendingStash`, `committedUserTextsOf`, `contentKeyOf`, and
   the stash/restore block in `switchTo` (~`:1589-1630`). In-flight bubbles simply
@@ -460,8 +467,9 @@ stream's GET): `presenceAttemptControllers` ✅ `9c44023a`.
    paying to remove, and it makes the source of truth ambiguous for the next
    reader. Take the ~350 mechanical edits.
 5. **Memory.** Accepted as unbounded per the measurements above (mean 0.30 MB per
-   conversation, p90 0.4 MB). Today's transcript LRU already retains 10
-   conversations' committed blocks, so the delta is smaller than it first looks.
+   conversation, p90 0.4 MB). Since the #4124 revert main retains no transcripts
+   at all, so this is a genuine increase rather than a shift — still single-digit
+   MB for 30 typical conversations.
    Revisit only on evidence from heap profiling.
 
 ## 7. Phasing
@@ -500,7 +508,7 @@ so the existing 328 tests are the regression net; only phase 3 changes semantics
   another conversation — hence `applyToNamedConversation`.
 - **Phase 3** — raise `MAX_LIVE` to its real value (30 prod / 3 dev), convert the
   guards to liveness checks so background pumps keep reconnecting and
-  reconciling, and delete `transcriptCache`, `pendingByConversation`, and the
+  reconciling, and delete `pendingByConversation` and the remaining
   cache-bridge paths. The feature lands here. Presence is untouched (§ 5).
   ✅ `3fc0adb2` (registry) → `8617e6df` (feature) → `f2472cb7` (stagger +
   cache-merge cleanup)
