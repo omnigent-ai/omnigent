@@ -199,6 +199,12 @@ def test_chat_turn_rail_matches_baseline(
     expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
     expect(page.locator('[data-testid="composer-model-effort-label"]')).to_be_visible()
 
+    # Park the pointer clear of both the top hover band (which reveals the "Jump
+    # to top" pill) and the left rail (hovering a tick pops its preview box), so
+    # neither transient chrome leaks into the resting-state capture. Playwright's
+    # virtual mouse starts at (0,0), which is inside both zones.
+    page.mouse.move(512, 700)
+
     settle_for_snapshot(page)
 
     assert_snapshot(page)

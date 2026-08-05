@@ -238,6 +238,13 @@ def test_chat_conversation_matches_baseline(
         "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
     )
 
+    # Park the pointer out of the transcript's top hover band. Playwright's
+    # virtual mouse starts at (0,0), which sits inside the band that reveals the
+    # "Jump to top" pill; leaving it there lets a load-timing race (hasMoreHistory
+    # not yet settled / not-at-top) flash the pill into the capture. Moving it
+    # low pins `hovering` false so the pill stays hidden — the true resting state.
+    page.mouse.move(640, 700)
+
     # Settle web fonts + kill the blinking caret (both time-dependent).
     settle_for_snapshot(page)
 

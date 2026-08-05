@@ -1730,11 +1730,11 @@ function MainAgentSurface({
               The left inset grows *continuously* as the conversation area
               narrows: the centered column slides left with the area until its
               edge nears the left-edge TurnRail, then the inset ramps up to hold
-              a minimum gap from the ticks — capped at 3rem so it stops moving
+              a minimum gap from the ticks — capped at 1.5rem so it stops moving
               rather than stepping. Keyed on the area's width via cqi (the
               @container/chat context on the wrapper), not the viewport, so
               opening the sidebar — which narrows the area — feeds it too. The
-              ramp (1rem→3rem across a 54rem→50rem area) matches where the
+              ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
               48rem column's auto-margins shrink past the clearance. md+ only:
               the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
           {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
@@ -1742,7 +1742,7 @@ function MainAgentSurface({
             scrollClassName="[overflow-anchor:none]"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
-              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,3rem)]",
+              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
