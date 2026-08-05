@@ -122,7 +122,7 @@ def main() -> None:
         if line.split("#", 1)[0].strip()
     }
     pipeline = IssuePrioritizationPipeline(
-        source=SparkIssueSource(spark, args.source_table),
+        source=SparkIssueSource(spark, args.source_table, args.github_repo),
         classifier=ai_query_classifier(spark, args.model_endpoint, areas),
         classifications=SparkClassificationRepository(spark, args.classifications_table),
         scores=SparkScoreSink(spark, args.scores_table, args.latest_scores_view),

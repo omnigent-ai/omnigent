@@ -20,19 +20,22 @@ class BronzeIssue:
     created_at: datetime
     upvote_count: int
     duplicate_count: int
+    is_pull_request: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> BronzeIssue:
+        source = _with_raw_json(value)
         return cls(
-            number=int(_first(value, "number", "issue_number")),
-            title=str(_first(value, "title", default="")),
-            body=str(_first(value, "body", default="") or ""),
-            url=str(_first(value, "html_url", "url", default="")),
-            author=str(_first(value, "author_login", "user_login", "author", default="")),
-            labels=_labels(_first(value, "labels", "label_names", default=())),
-            created_at=_timestamp(_first(value, "created_at")),
-            upvote_count=_upvote_count(value),
-            duplicate_count=max(0, int(_first(value, "duplicate_count", default=0) or 0)),
+            number=int(_first(source, "number", "issue_number")),
+            title=str(_first(source, "title", default="")),
+            body=str(_first(source, "body", default="") or ""),
+            url=str(_first(source, "html_url", "url", default="")),
+            author=_author(source),
+            labels=_labels(_first(source, "labels", "label_names", default=())),
+            created_at=_timestamp(_first(source, "created_at")),
+            upvote_count=_upvote_count(source),
+            duplicate_count=max(0, int(_first(source, "duplicate_count", default=0) or 0)),
+            is_pull_request=bool(source.get("pull_request")),
         )
 
     def content(self) -> IssueContent:
@@ -66,6 +69,28 @@ def _first(value: Mapping[str, object], *names: str, default: object = None) -> 
         if name in value:
             return value[name]
     return default
+
+
+def _with_raw_json(value: Mapping[str, object]) -> dict[str, object]:
+    raw = value.get("raw_json")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = None
+    source = dict(raw) if isinstance(raw, Mapping) else {}
+    source.update({key: item for key, item in value.items() if item is not None})
+    return source
+
+
+def _author(value: Mapping[str, object]) -> str:
+    direct = _first(value, "author_login", "user_login", "author")
+    if direct is not None:
+        return str(direct)
+    user = value.get("user")
+    if isinstance(user, Mapping) and user.get("login"):
+        return str(user["login"])
+    return ""
 
 
 def _labels(value: object) -> tuple[str, ...]:

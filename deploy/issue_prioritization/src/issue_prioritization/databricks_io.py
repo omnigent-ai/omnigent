@@ -30,9 +30,10 @@ components ARRAY<STRING>"""
 
 
 class SparkIssueSource:
-    def __init__(self, spark: object, table: str) -> None:
+    def __init__(self, spark: object, table: str, repo: str) -> None:
         self.spark = spark
         self.table = _table(table)
+        self.repo = repo
 
     def load_open_issues(self) -> list[BronzeIssue]:
         frame = self.spark.table(self.table)
@@ -40,9 +41,11 @@ class SparkIssueSource:
         issues = []
         for row in rows:
             value = row.asDict(recursive=True)
-            if value.get("pull_request"):
+            if value.get("repo") != self.repo:
                 continue
-            issues.append(BronzeIssue.from_mapping(value))
+            issue = BronzeIssue.from_mapping(value)
+            if not issue.is_pull_request:
+                issues.append(issue)
         return issues
 
 
