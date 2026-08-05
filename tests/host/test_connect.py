@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -636,6 +637,9 @@ async def test_handle_launch_fails_for_bad_workspace() -> None:
     assert "does not exist" in (result.error or ""), (
         f"Error should mention path doesn't exist, got: {result.error!r}"
     )
+    assert result.error_code == "workspace_missing", (
+        f"Should carry workspace_missing error_code, got: {result.error_code!r}"
+    )
     assert result.runner_id is None
 
 
@@ -1185,7 +1189,7 @@ async def test_watch_runner_silent_on_intentional_stop(
     assert result.status == "launched", result.error
 
     runner_id = token_bound_runner_id("tok_stop")
-    stop_result = host._handle_stop(
+    stop_result = await host._handle_stop(
         HostStopRunnerFrame(request_id="req_stop_2", runner_id=runner_id)
     )
     assert stop_result.status == "stopped"
@@ -1312,7 +1316,7 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
-def test_handle_stop_terminates_process(tmp_path: Path) -> None:
+async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
     returns status='stopped'.
@@ -1332,7 +1336,7 @@ def test_handle_stop_terminates_process(tmp_path: Path) -> None:
         request_id="req_003",
         runner_id="runner_aaa",
     )
-    result = host._handle_stop(frame)
+    result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "stopped"
@@ -1342,7 +1346,7 @@ def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     assert "runner_aaa" not in host._runners
 
 
-def test_handle_stop_unknown_runner() -> None:
+async def test_handle_stop_unknown_runner() -> None:
     """
     Verify that _handle_stop returns status='failed' for an
     unknown runner_id.
@@ -1355,14 +1359,14 @@ def test_handle_stop_unknown_runner() -> None:
         request_id="req_004",
         runner_id="runner_nonexistent",
     )
-    result = host._handle_stop(frame)
+    result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
 
 
-def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
     """
     Verify ``_handle_runner_status`` reports ``alive`` for a tracked
     runner whose process is still running.
@@ -1380,7 +1384,7 @@ def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
         host._runners["runner_live"] = _RunnerHandle(
             proc=proc, log_path=tmp_path / "runner-live.log"
         )
-        result = host._handle_runner_status(
+        result = await host._handle_runner_status(
             HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
         )
         assert isinstance(result, HostRunnerStatusResultFrame)
@@ -1391,7 +1395,7 @@ def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
         proc.wait()
 
 
-def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+async def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
     """
     Verify ``_handle_runner_status`` reports ``dead`` for a tracked
     runner whose process has exited.
@@ -1408,14 +1412,14 @@ def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
     )
     proc.wait()  # ensure the process has exited before we query
     host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
-    result = host._handle_runner_status(
+    result = await host._handle_runner_status(
         HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
     )
     assert isinstance(result, HostRunnerStatusResultFrame)
     assert result.status == "dead"
 
 
-def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+async def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     """
     Verify ``_handle_runner_status`` reports ``unknown`` for a runner
     this host has no record of.
@@ -1426,7 +1430,7 @@ def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     grace. Both must read ``unknown`` so the server relaunches at once.
     """
     host = _make_host_process()
-    result = host._handle_runner_status(
+    result = await host._handle_runner_status(
         HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
     )
     assert isinstance(result, HostRunnerStatusResultFrame)
@@ -2130,6 +2134,44 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert env["MY_GATEWAY_URL"] == "https://llm.internal.example.com"
     # Anything unnamed stays behind the allowlist.
     assert "UNLISTED_SECRET" not in env
+
+
+def test_build_runner_env_passthrough_survives_remote_daemon_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_RUNNER_ENV_PASSTHROUGH forwards a named var through BOTH hops.
+
+    In ``--server`` mode the env crosses two strips: CLI→daemon
+    (``_build_host_daemon_env``) then daemon→runner (``_build_runner_env``). The
+    control var must survive the first hop or the second never sees the names it
+    lists. A named var travels via the ``DATABRICKS_`` prefix on the first hop and
+    the passthrough on the second, so it must reach the runner; an unnamed secret
+    must not.
+    """
+    from omnigent.cli import _build_host_daemon_env
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
+    monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
+    monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
+
+    server = "https://example.databricksapps.com"
+    daemon_env = _build_host_daemon_env(server_url=server)
+    # The first hop must keep the control var (regression guard for the remote no-op).
+    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server,
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    # The named var reaches the runner; an unnamed one does not.
+    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
+    assert "DATABRICKS_UNNAMED" not in runner_env
 
 
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:
@@ -3322,6 +3364,88 @@ async def test_connected_host_retries_login_redirects_indefinitely(
     assert spy.call_count == 6
 
 
+@pytest.mark.parametrize("status", [401, 403])
+async def test_connected_host_retries_auth_rejection_indefinitely(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """401/403 after a successful connect never turns fatal.
+
+    A host that already completed an upgrade proved its credentials and
+    authorization are valid. A later 401/403 is almost always a dropped
+    VPN whose corporate proxy answers the upgrade before it reaches the
+    server — killing the host would drop its live runners and force a
+    manual ``omnigent host`` restart once the VPN reconnects. It must keep
+    retrying past the fresh-host fatal threshold instead.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    rejection = _invalid_status(status)
+    # Accepted upgrade first (None), then several rejections (more than the
+    # fresh-host login-redirect fatal threshold of 3 to prove there is no
+    # cap), then a cancel to end the test.
+    spy = _ConnectSpy([None, rejection, rejection, rejection, rejection, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: if the post-connect rejections were still treated as
+    # fatal this would raise HostConnectError on the first one (call_count 2).
+    await host.run()
+
+    # 6 = accepted connect + 4 retried rejections + the ending cancel.
+    assert spy.call_count == 6
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_connected_host_auth_rejection_prints_notice_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+) -> None:
+    """The first auth rejection of an outage warns on stderr, exactly once.
+
+    ``_logger.warning`` goes to the CLI log file, so a foreground
+    ``omnigent host`` would sit silent while it retried a dropped VPN. The
+    terminal notice must name the cause and mention VPN/network, and must
+    print only once per outage (not on every retry) so it doesn't spam
+    stderr while connectivity is down.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    rejection = _invalid_status(status)
+    spy = _ConnectSpy([None, rejection, rejection, rejection, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # The cause reached the terminal, naming the transient network hint.
+    assert f"HTTP {status}" in err
+    assert "VPN" in err
+    # Printed once for the whole outage, not once per retry — three
+    # consecutive rejections must yield a single notice line.
+    assert err.count(f"HTTP {status}") == 1
+
+
+async def test_fresh_host_still_fails_loud_on_auth_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-connected host still fails loud on 401/403.
+
+    The connected-host retry keys on a prior successful upgrade. A host
+    that has NEVER connected and is rejected with 401/403 is genuinely
+    unauthenticated / unauthorized — it must still raise HostConnectError
+    on the first attempt (→ exit 1 with the fix printed), not loop.
+    """
+    spy = _ConnectSpy([_invalid_status(403)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError):
+        await host.run()
+
+    # Exactly one attempt → no silent retry for the fresh-host case.
+    assert spy.call_count == 1
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
@@ -3477,3 +3601,65 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
+    tmp_path: Path,
+) -> None:
+    """Cancelling a launch mid-spawn tears the runner down instead of leaking it.
+
+    ``_handle_launch`` registers the handle in ``_runners`` only after the spawn
+    thread returns, so a cancellation in that window used to leave a live runner
+    that was never watched, stopped, or reaped (and whose exit status the zygote
+    would retain forever). The spawn is shielded and the abandoned process is
+    terminated.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+    spawn_started = threading.Event()
+
+    def _slow_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a long-lived process, signalling once it exists.
+
+        :param args: Command args (ignored — a real sleep stands in).
+        :param kwargs: Popen kwargs (ignored).
+        :returns: A real subprocess handle.
+        """
+        proc = original_popen(
+            ["sleep", "60"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        spawned.append(proc)
+        spawn_started.set()
+        return proc
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cancel",
+        binding_token="tok_cancel",
+        workspace=str(workspace),
+    )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_slow_popen):
+        task = asyncio.create_task(host._handle_launch(frame))
+        # Cancel only once the spawn thread has actually created the process,
+        # so we exercise the real leak window rather than a pre-spawn cancel.
+        await asyncio.to_thread(spawn_started.wait, 10.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert spawned, "the spawn thread should have created a process"
+    # Never registered (that is the leak window) ...
+    assert not host._runners
+    # ... but also not left running: the shield's done-callback terminates it.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and spawned[0].poll() is None:
+        await asyncio.sleep(0.05)
+    assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"

@@ -70,7 +70,7 @@ export function SharingPage() {
 
   if (!isSingleUser && meIsAdmin === null) {
     return (
-      <div className="flex min-h-full items-center justify-center text-sm text-muted-foreground">
+      <div className="flex min-h-full items-center justify-center text-ui text-muted-foreground">
         Loading...
       </div>
     );
@@ -80,7 +80,7 @@ export function SharingPage() {
     return (
       <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Session sharing</h1>
-        <p className="text-sm text-muted-foreground">
+        <p className="text-ui text-muted-foreground">
           You don't have permission to manage session sharing.
         </p>
       </PageScroll>
@@ -109,7 +109,7 @@ export function SharingPage() {
       <div>
         <div className="mb-6">
           <h1 className="text-2xl font-semibold">Session sharing</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <p className="mt-1 text-ui text-muted-foreground">
             Control whether users on this server can share sessions with others. Applies server-wide
             and takes effect immediately. Changes affect only new shares — existing grants
             (including already-public sessions) keep working until revoked.
@@ -117,11 +117,11 @@ export function SharingPage() {
         </div>
 
         {isLoading || current === undefined ? (
-          <p className="text-sm text-muted-foreground">Loading…</p>
+          <p className="text-ui text-muted-foreground">Loading…</p>
         ) : (
           <>
             {!editable && (
-              <p className="mb-4 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+              <p className="mb-4 rounded-md border border-border bg-muted/40 px-3 py-2 text-ui text-muted-foreground">
                 The sharing mode is managed by this deployment and can't be changed here.
               </p>
             )}
@@ -151,7 +151,7 @@ export function SharingPage() {
                       className="mt-1 size-4 accent-primary"
                     />
                     <span className="flex-1">
-                      <span className="block text-sm font-medium">{tier.label}</span>
+                      <span className="block text-ui font-medium">{tier.label}</span>
                       <span className="mt-0.5 block text-xs text-muted-foreground">
                         {tier.description}
                       </span>
@@ -164,7 +164,7 @@ export function SharingPage() {
             {/* Public access — a separate switch from the tiers above. */}
             <div className="mt-6 flex items-center justify-between rounded-lg border px-4 py-3">
               <div className="pr-4">
-                <p className="text-sm font-medium">Public access</p>
+                <p className="text-ui font-medium">Public access</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   Allow sharing a session with anyone who has the link (public read access). When
                   off, the Share dialog's "Public access" toggle is hidden and new public grants are
@@ -183,7 +183,7 @@ export function SharingPage() {
                 aria-label="Public access"
               />
             </div>
-            {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+            {error && <p className="mt-3 text-ui text-destructive">{error}</p>}
           </>
         )}
       </div>

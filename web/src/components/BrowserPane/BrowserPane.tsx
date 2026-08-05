@@ -476,7 +476,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
            effects never measure an empty div. */
         <div ref={containerRef} className="min-h-0 min-w-0 flex-1" />
       ) : (
-        <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-sm">
+        <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
           Enter a URL above to get started — the agent will open pages here too.
         </div>
       )}

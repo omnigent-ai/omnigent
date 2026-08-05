@@ -406,6 +406,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
+  /** Copy text from the bundled setup page to the native clipboard. */
+  copyText: (text) => ipcRenderer.invoke("omnigent:copy-setup-text", text),
   /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.

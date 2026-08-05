@@ -13,10 +13,10 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
  * @returns The flyout's inner markup.
  */
 function AgentFlyoutBody({ agent }: { agent: AvailableAgent }) {
-  // text-sm matches the agent-name font size in the picker rows
-  // (DropdownMenuItem is text-sm), like Cursor's flyout.
+  // text-ui matches the agent-name font size in the picker rows
+  // (DropdownMenuItem is text-ui), like Cursor's flyout.
   return (
-    <div className="text-sm">
+    <div className="text-ui">
       <p className="font-semibold leading-snug">{agent.display_name}</p>
       <p className="mt-1 text-xs leading-snug text-muted-foreground">{agent.description}</p>
     </div>

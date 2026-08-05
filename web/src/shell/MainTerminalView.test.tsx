@@ -1,11 +1,17 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import { MainTerminalView } from "./MainTerminalView";
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
+
+// Monotonic per-mount id. A fresh value on `data-instance` means React
+// remounted the TerminalView (new xterm + WebSocket) rather than reusing
+// the existing one — the signal the stale-scrollback regression test needs.
+let terminalMountSeq = 0;
 
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
@@ -16,14 +22,22 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     sessionId: string;
     terminalId: string;
     readOnly?: boolean;
-  }) => (
-    <div
-      data-testid="terminal-view"
-      data-session-id={sessionId}
-      data-terminal-id={terminalId}
-      data-read-only={String(readOnly ?? false)}
-    />
-  ),
+  }) => {
+    // Assign once per mount (useRef(arg) evaluates arg every render but keeps
+    // the first value), so the id is stable across re-renders and only changes
+    // on a remount.
+    const instance = useRef<number | null>(null);
+    if (instance.current === null) instance.current = ++terminalMountSeq;
+    return (
+      <div
+        data-testid="terminal-view"
+        data-session-id={sessionId}
+        data-terminal-id={terminalId}
+        data-read-only={String(readOnly ?? false)}
+        data-instance={String(instance.current)}
+      />
+    );
+  },
 }));
 
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
@@ -84,19 +98,21 @@ function renderView({
   isNativeWrapper = false,
   initialTerminalKey = null,
   readOnly = false,
+  conversationId = "conv_sdk",
   setView,
 }: {
   terminals: TerminalInfo[];
   isNativeWrapper?: boolean;
   initialTerminalKey?: string | null;
   readOnly?: boolean;
+  conversationId?: string;
   setView?: (view: "chat" | "terminal") => void;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
   return render(
     <TerminalFirstContextProvider value={makeCtx(isNativeWrapper, setView)}>
       <MainTerminalView
-        conversationId="conv_sdk"
+        conversationId={conversationId}
         initialTerminalKey={initialTerminalKey}
         readOnly={readOnly}
       />
@@ -203,6 +219,38 @@ describe("MainTerminalView — native wrapper sessions", () => {
     expect(screen.queryByText("claude")).toBeNull();
     expect(screen.queryByText("bash")).toBeNull();
     expect(screen.queryByTestId("new-shell-button")).toBeNull();
+  });
+
+  it("remounts the terminal when switching between two same-vendor sessions", () => {
+    // Two claude-native sessions share the same agent-terminal id
+    // (`terminal_claude_main`). ChatPage stays mounted across a session
+    // switch and only feeds MainTerminalView a new conversationId, so the
+    // terminal must remount off the session — otherwise the pane keeps the
+    // previous session's scrollback until the new WS repaints.
+    const claudePane: TerminalInfo = {
+      id: "terminal_claude_main",
+      name: "claude",
+      session: "main",
+      running: true,
+    };
+    const { rerender } = renderView({
+      terminals: [claudePane],
+      isNativeWrapper: true,
+      conversationId: "conv_a",
+    });
+    const first = screen.getByTestId("terminal-view").getAttribute("data-instance");
+
+    rerender(
+      <TerminalFirstContextProvider value={makeCtx(true)}>
+        <MainTerminalView conversationId="conv_b" initialTerminalKey={null} readOnly={false} />
+      </TerminalFirstContextProvider>,
+    );
+
+    const view = screen.getByTestId("terminal-view");
+    expect(view).toHaveAttribute("data-session-id", "conv_b");
+    // A new instance id proves the mount was torn down and rebuilt for the
+    // new session rather than reused with stale scrollback.
+    expect(view.getAttribute("data-instance")).not.toBe(first);
   });
 
   it("renders a rail-opened shell chrome-free with the close X", () => {

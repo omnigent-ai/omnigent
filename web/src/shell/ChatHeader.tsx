@@ -247,13 +247,13 @@ export function ChatHeader({
               <BotIcon className="size-4 shrink-0 text-muted-foreground" />
               {boundAgent?.name ? (
                 <div className="flex min-w-0 flex-col leading-tight">
-                  <span className="truncate text-sm font-semibold text-foreground">
+                  <span className="truncate text-ui font-semibold text-foreground">
                     {boundAgent.name}
                   </span>
                   <span className="text-xs text-muted-foreground">Sub-agent</span>
                 </div>
               ) : (
-                <span className="text-sm font-semibold text-foreground">Sub-agent</span>
+                <span className="text-ui font-semibold text-foreground">Sub-agent</span>
               )}
             </div>
           </>
@@ -301,7 +301,7 @@ export function ChatHeader({
                   disabled={shareDisabled}
                   data-testid="mobile-share-session"
                   title={shareDisabledReason}
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <ShareIcon className="size-4" />
                   Share
@@ -311,7 +311,7 @@ export function ChatHeader({
                 <DropdownMenuItem
                   onSelect={onAgentInfo}
                   data-testid="mobile-agent-info"
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <InfoIcon className="size-4" />
                   Agent info
@@ -421,7 +421,7 @@ export function ChatHeader({
                 {showFilesPanel && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenFiles}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <FileIcon className="size-4" />
                     Files
@@ -439,7 +439,7 @@ export function ChatHeader({
                     main agent included. */}
                 <DropdownMenuItem
                   onSelect={mobileMenu.onOpenSubagents}
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <BotIcon className="size-4" />
                   Agents
@@ -464,7 +464,7 @@ export function ChatHeader({
                 {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenShells}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <TerminalIcon className="size-4" />
                     Shells
@@ -480,7 +480,7 @@ export function ChatHeader({
                 {mobileMenu.todosSupported && mobileMenu.todosTotal > 0 && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenTodos}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ListTodoIcon className="size-4" />
                     Tasks
@@ -492,7 +492,7 @@ export function ChatHeader({
                 {mobileMenu.debugMode && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenMainExecutionLog}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ListIcon className="size-4" />
                     Logs

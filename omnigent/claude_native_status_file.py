@@ -45,6 +45,13 @@ _STATUS_TO_RUNNER: dict[str, str] = {
     "busy": RUNNING,
     "waiting": RUNNING,
     "idle": IDLE,
+    # The turn ended but a background shell is still alive (Claude Code
+    # >= v2.1.197). The agent loop is idle, so this maps to ``idle`` — the
+    # Stop hook separately relabels its own ``idle`` to ``waiting`` with the
+    # shell tally, which is what keeps the spinner lit. Mapping ``shell`` to
+    # ``running`` would strand the composer on the "(queued)" placeholder,
+    # since the session never reads idle while a background shell runs.
+    "shell": IDLE,
     # Background-job literals, mapped defensively for robustness.
     "running": RUNNING,
     "completed": IDLE,

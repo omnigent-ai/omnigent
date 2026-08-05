@@ -179,7 +179,7 @@ export function PermissionsModal({
         {publicSharingEnabled && (
           <div className="flex items-center justify-between rounded-lg border px-3 py-2">
             <div>
-              <p className="text-sm font-medium">Public access</p>
+              <p className="text-ui font-medium">Public access</p>
               <p className="text-xs text-muted-foreground">Anyone can view this session</p>
             </div>
             <Switch
@@ -195,9 +195,9 @@ export function PermissionsModal({
             track's min-content and pushes every row past the dialog edge. */}
         <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
-            <p className="text-sm text-muted-foreground py-2">Loading…</p>
+            <p className="text-ui text-muted-foreground py-2">Loading…</p>
           ) : userGrants.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-2">No grants yet.</p>
+            <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (
             <>
               {/* Column headers */}
@@ -424,9 +424,9 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
         // Wider than the (narrow) field so suggested emails aren't truncated.
         <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
           {isLoading ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">Searching…</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">Searching…</div>
           ) : suggestions.length === 0 ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">No matches</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">No matches</div>
           ) : (
             <div ref={listRef} id={listId} role="listbox" className="max-h-72 overflow-y-auto">
               {suggestions.map((s, index) => (
@@ -441,7 +441,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                     commit(index);
                   }}
                   className={cn(
-                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm",
+                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-ui",
                     index === activeIndex && "bg-muted",
                   )}
                 >
@@ -611,11 +611,11 @@ function GrantRow({
       {/* Tail truncation keeps the local part — the distinguishing half when
           every grantee shares one company domain — and the title tooltip
           carries the full id. */}
-      <span className="flex-1 truncate text-sm" title={permission.user_id}>
+      <span className="flex-1 truncate text-ui" title={permission.user_id}>
         {permission.user_id}
       </span>
       {fixedLevel ? (
-        <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
+        <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
           {levelLabel}
         </span>
       ) : (

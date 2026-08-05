@@ -466,7 +466,7 @@ function OutputSection({ output }: { output: string }) {
 function ToolPendingOutput({ duration }: { duration: number | undefined }) {
   return (
     <div className="rounded-md border border-dashed bg-muted/30 p-3">
-      <div className="flex items-center gap-2 text-muted-foreground text-sm">
+      <div className="flex items-center gap-2 text-muted-foreground text-ui">
         <Loader2Icon className="size-4 animate-spin text-info" />
         <span>
           Waiting for output
@@ -490,7 +490,7 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
     message = "Tool did not return output before the response failed.";
   }
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-sm">
+    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-ui">
       {message}
     </div>
   );

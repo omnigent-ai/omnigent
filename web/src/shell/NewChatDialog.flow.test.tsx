@@ -177,9 +177,16 @@ function openWorktree(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
 }
 
-/** Open the picker and commit (select + close) an agent by clicking its row. */
+/**
+ * Open the picker and commit (select + close) an agent by clicking its row.
+ * Only the fully supported harnesses lead inline; the rest sit under "More", so
+ * drill in when the row isn't already listed.
+ */
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+  }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
@@ -756,6 +763,54 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(init.body as string);
     expect(body.labels?.["omnigent.wrapper"]).toBe("opencode-native-ui");
     expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("records the launched harness so the picker can promote it later", async () => {
+    // The picker promotes previously-launched harnesses out of "More"; this is
+    // the write half of that contract. OpenCode isn't fully supported, so
+    // without this record it would stay behind "More" forever.
+    setAgents([
+      agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" }),
+      agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_opencode" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(localStorage.getItem("omnigent:recent-harnesses")).toBeNull();
+
+    selectAgent("ag_opencode");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    // Stored under the canonical harness id, not the agent name or wrapper.
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:recent-harnesses") ?? "[]")).toEqual([
+        "opencode-native",
+      ]),
+    );
+  });
+
+  it("does not record a harness when the create fails", async () => {
+    // Only a successful launch earns a primary slot — a failed create must not
+    // promote the harness the user merely attempted.
+    setAgents([agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({ detail: "boom" }),
+      text: async () => "boom",
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    expect(localStorage.getItem("omnigent:recent-harnesses")).toBeNull();
   });
 
   it("omits terminal_launch_args when permission mode is left at default for claude-native", async () => {

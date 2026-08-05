@@ -68,8 +68,8 @@ function centered(message: string, tone: "muted" | "error" = "muted") {
     <div
       className={
         tone === "error"
-          ? "flex items-center justify-center p-8 text-destructive text-sm"
-          : "flex items-center justify-center p-8 text-muted-foreground text-sm"
+          ? "flex items-center justify-center p-8 text-destructive text-ui"
+          : "flex items-center justify-center p-8 text-muted-foreground text-ui"
       }
     >
       {message}

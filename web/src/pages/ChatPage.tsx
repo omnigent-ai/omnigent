@@ -93,6 +93,7 @@ import {
   buildBubbles,
   bubblesEqual,
   createBubbleCache,
+  liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -893,6 +894,7 @@ export function ChatPage() {
     runnerOnline,
     backgroundTaskCount,
   });
+
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
   // bound — so it identifies the source (for the picker's prefill) but is
@@ -1156,13 +1158,16 @@ export function ChatPage() {
   // the CLI instructions instead so users learn the right entry point.
   if (!urlConvId) return <NewChatLandingScreen />;
 
-  // Pick the reconnect dialog's state from liveness. The dialog only
-  // opens for the two unreachable variants; `host_offline` carries
-  // ownership (a non-owner can't reach the host machine). Any other
-  // liveness defaults to `local_stranded` — harmless since the dialog
-  // stays closed unless an unreachable interaction opened it.
-  const reconnectState = liveness.kind === "host_offline" ? "host_offline" : "local_stranded";
-  const reconnectIsOwner = liveness.kind === "host_offline" ? liveness.isOwner : true;
+  // Pick the reconnect dialog's state from the session's host binding, not
+  // from liveness: the dialog opens both from an unreachable send AND from the
+  // composer's host badge, which offers reconnect whenever the host tunnel is
+  // down — including states liveness still calls reachable (a runner that
+  // outlived its host). A host-bound session always reconnects via
+  // `omnigent host`; only an unbound one relaunches locally. Ownership gates
+  // the host command — a non-owner can't reach that machine.
+  const hostBound = !!(activeSession?.hostId ?? activeConv?.host_id);
+  const reconnectState = hostBound ? "host_offline" : "local_stranded";
+  const reconnectIsOwner = isOwnerLevel(permissionLevel);
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
@@ -1543,6 +1548,17 @@ function MainAgentSurface({
     () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
     [bubbles, pendingElicitations.length],
   );
+  // While the session runs, the last assistant bubble is (or may be) the
+  // live turn even if its lifecycle reads settled — BlockRenderer keeps
+  // its "Worked for" fold suppressed until a terminal status edge lands.
+  // Once a newer real user message follows it (optimistic pending bubbles
+  // included — they're merged into `bubbles` above), the running status
+  // belongs to that newer turn instead, so no bubble is possibly-live and
+  // no fold is suppressed (index -1).
+  const lastAssistantIndex = useMemo(
+    () => liveCandidateAssistantIndex(streamBubbles),
+    [streamBubbles],
+  );
 
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — guarded so the composer's
   // own unmodified ArrowUp/Down history-recall still works.
@@ -1674,8 +1690,7 @@ function MainAgentSurface({
   // tool runs, and reasoning gaps — including after a reload that hydrates
   // `running` before any bubbles exist locally. Only a trailing compaction
   // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingStatus = shouldShowWorkingIndicator(showsWorking, bubbles);
-  const showWorkingIndicator = showWorkingStatus;
+  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
   if (showTerminal && conversationId) {
     return (
@@ -1702,20 +1717,32 @@ function MainAgentSurface({
     <>
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
-      <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
+      <div
+        ref={setConversationEl}
+        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+      >
         {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
-              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
-              the message column so the ticks don't butt against the text; the
-              rail is hidden on mobile, so the extra left padding is md-only. */}
+          {/* Override ConversationContent's default spacing so the thread keeps
+              16px side gutters and consecutive agent turns read as one thread.
+              The left inset grows *continuously* as the conversation area
+              narrows: the centered column slides left with the area until its
+              edge nears the left-edge TurnRail, then the inset ramps up to hold
+              a minimum gap from the ticks — capped at 1.5rem so it stops moving
+              rather than stepping. Keyed on the area's width via cqi (the
+              @container/chat context on the wrapper), not the viewport, so
+              opening the sidebar — which narrows the area — feeds it too. The
+              ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
+              48rem column's auto-margins shrink past the clearance. md+ only:
+              the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
           {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
             scrollClassName="[overflow-anchor:none]"
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
+              "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
+              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1741,7 +1768,7 @@ function MainAgentSurface({
                     <h3 className="text-2xl font-medium tracking-[-0.02em]">
                       What should we work on?
                     </h3>
-                    <p className="text-muted-foreground text-base">
+                    <p className="text-muted-foreground text-ui">
                       {agentsError
                         ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
                         : "Send a message to get started."}
@@ -1753,8 +1780,14 @@ function MainAgentSurface({
               <>
                 {/* Older pages prepend here while their request is in flight. */}
                 {loadingMoreHistory && <HistoryLoadingIndicator />}
-                {streamBubbles.map((bubble) => (
-                  <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
+                {streamBubbles.map((bubble, bubbleIndex) => (
+                  <BubbleView
+                    key={bubbleKey(bubble)}
+                    bubble={bubble}
+                    canApprove={canApprove}
+                    isLastAssistant={bubbleIndex === lastAssistantIndex}
+                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
+                  />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
                     chat so an outstanding question stays in view (stick-to-
@@ -1790,7 +1823,7 @@ function MainAgentSurface({
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingStatus && <RunnerStartingIndicator variant="row" />}
+                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
@@ -1809,7 +1842,7 @@ function MainAgentSurface({
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingStatus} suppress={subAgentLabel != null} />
+          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
           <UserMessageNavConnected
             goPrev={nav.goPrev}
             goNext={nav.goNext}
@@ -1882,7 +1915,6 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
-        hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
@@ -1902,7 +1934,7 @@ function MainAgentSurface({
 
 function HydratingPlaceholder() {
   return (
-    <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-sm">
+    <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-ui">
       <Loader2Icon className="size-4 animate-spin" />
       Loading conversation…
     </div>
@@ -1929,7 +1961,7 @@ function ConversationLoadError({
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-md flex-col items-center gap-3 text-center">
         <h1 className="font-medium text-foreground text-lg">Conversation not found</h1>
-        <p className="text-muted-foreground text-sm">
+        <p className="text-muted-foreground text-ui">
           Couldn't load{" "}
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{conversationId}</code>
           : {error.message}
@@ -1997,9 +2029,9 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           (scrolled up) or collapsed (at the bottom, where the inline shimmer
           owns the visuals). */}
       {show && <span className="sr-only">Working…</span>}
-      {/* Mirror the conversation content column (mx-auto + px-6 + width) so the
+      {/* Mirror the conversation content column (mx-auto + px-4 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
-      <div className={cn("mx-auto w-full px-6", CHAT_COLUMN_WIDTH)}>
+      <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
         {show && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
           // its flat bottom edge merges into the chat box. aria-hidden: the
@@ -2116,7 +2148,7 @@ function HistoryLoadingIndicator() {
   return (
     <div
       role="status"
-      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm"
+      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-ui"
     >
       <Loader2Icon className="size-4 animate-spin" aria-hidden />
       Loading earlier messages…
@@ -2567,7 +2599,7 @@ export function JumpToTopButton({
           // variant's hover (bg-muted) is a translucent black wash (--muted is
           // #0000000f), so over the faded chat text behind the pill it bleeds
           // through and reads as transparent. bg-background is opaque (#fff /
-          // #0d1218); hover feedback comes from a brightness filter, which keeps
+          // #0e1013); hover feedback comes from a brightness filter, which keeps
           // the fill fully opaque.
           "bg-background hover:bg-background hover:brightness-95",
           "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
@@ -2759,14 +2791,13 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
-    // A `host_offline` session moves the reconnect affordance up into the
-    // composer's host badge (ComposerStatusLine), where the host is already
-    // named — so render nothing here whenever that composer is on screen
-    // (sub-agent sessions included; their badge carries it just like a normal
-    // session's). The composer is hidden only in the terminal-first *terminal*
-    // view (the PTY owns the surface); there the banner still carries the
-    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
-    // no badge).
+    // A host-bound session carries the reconnect affordance in the composer's
+    // host badge (ComposerStatusLine), which names the host that dropped — so
+    // render nothing here whenever that composer is on screen (sub-agent
+    // sessions included; their badge carries it just like a normal session's).
+    // The composer is hidden only in the terminal-first *terminal* view (the
+    // PTY owns the surface); there the banner still carries the affordance.
+    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
       return null;
@@ -2908,7 +2939,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
       aria-live="polite"
     >
       <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-sm">
+        <span className="flex items-center gap-2 text-muted-foreground text-ui">
           <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
           {line}
         </span>
@@ -2977,7 +3008,7 @@ export function McpStartupIndicator() {
         aria-live="polite"
       >
         <MessageContent>
-          <span className="flex items-center gap-2 text-muted-foreground text-sm">
+          <span className="flex items-center gap-2 text-muted-foreground text-ui">
             <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
             {mcpStartingLine(starting, names.length)}
           </span>
@@ -2994,7 +3025,7 @@ export function McpStartupIndicator() {
   return (
     <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
       <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-sm">
+        <span className="flex items-center gap-2 text-muted-foreground text-ui">
           <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
           {`MCP startup incomplete (${parts.join("; ")})`}
         </span>
@@ -3102,7 +3133,17 @@ function CompactionLoadingIndicator() {
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
 // the user-bubble markdown render tests.
 export const BubbleView = memo(
-  function BubbleView({ bubble, canApprove = true }: { bubble: Bubble; canApprove?: boolean }) {
+  function BubbleView({
+    bubble,
+    canApprove = true,
+    isLastAssistant = false,
+    showsWorking = false,
+  }: {
+    bubble: Bubble;
+    canApprove?: boolean;
+    isLastAssistant?: boolean;
+    showsWorking?: boolean;
+  }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator />;
@@ -3118,9 +3159,20 @@ export const BubbleView = memo(
         />
       );
     }
-    return <AssistantBubble bubble={bubble} canApprove={canApprove} />;
+    return (
+      <AssistantBubble
+        bubble={bubble}
+        canApprove={canApprove}
+        isLastAssistant={isLastAssistant}
+        showsWorking={showsWorking}
+      />
+    );
   },
-  (prev, next) => prev.canApprove === next.canApprove && bubblesEqual(prev.bubble, next.bubble),
+  (prev, next) =>
+    prev.canApprove === next.canApprove &&
+    (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
+    (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
+    bubblesEqual(prev.bubble, next.bubble),
 );
 
 /**
@@ -3157,7 +3209,7 @@ function useCopyMessage(getText: () => string): {
         window.clearTimeout(timeoutRef.current);
         timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
         if (isMobile) {
-          showToast(<span className="text-sm">Copied to clipboard</span>, { duration: 1500 });
+          showToast(<span className="text-ui">Copied to clipboard</span>, { duration: 1500 });
         }
       },
       (error) => {
@@ -3212,7 +3264,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
-      className="max-w-3xl"
+      className="max-w-[640px]"
     >
       {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
           immediately left of the right-aligned bubble (the bubble's own
@@ -3339,15 +3391,25 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
 function AssistantBubble({
   bubble,
   canApprove,
+  isLastAssistant = false,
+  showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   canApprove: boolean;
+  isLastAssistant?: boolean;
+  showsWorking?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // A pending elicitation means the turn is parked awaiting the user —
+  // still in flight even when its lifecycle or the session status reads
+  // settled (e.g. a reload while parked). Feeds the fold suppression.
+  const hasPendingElicitation = useChatStore((s) =>
+    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
+  );
   // Getter computes the markdown lazily at click time — the hook must run
   // before the early return below (rules of hooks), but `markdownText` is
   // derived after it.
@@ -3378,6 +3440,13 @@ function AssistantBubble({
             items={bubble.items}
             sessionStatus={sessionStatus}
             canApprove={canApprove}
+            turnLifecycle={bubble.lifecycle}
+            workedForS={bubble.workedForS}
+            continued={bubble.continued}
+            isLastAssistant={isLastAssistant}
+            hasPendingElicitation={hasPendingElicitation}
+            lastActivityAtS={bubble.lastActivityAtS}
+            showsWorking={showsWorking}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -3390,7 +3459,7 @@ function AssistantBubble({
           </p>
         )}
         {markdownText && (
-          <MessageActions className="mt-1 opacity-40 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
@@ -3512,13 +3581,10 @@ interface ComposerProps {
    */
   unreachable?: boolean;
   /**
-   * The session is host-bound to an offline, non-resumable host
-   * (`host_offline`): the composer's host badge turns into a clickable
-   * "Host is offline — click to reconnect" affordance (see HostBadge's
-   * `onReconnect`), replacing the separate banner below the composer.
+   * Open the reconnect help dialog. Always wired to the status line's host
+   * badge, which turns itself into a clickable reconnect affordance whenever
+   * its bound host is offline and reconnectable.
    */
-  hostOffline?: boolean;
-  /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
   onShowReconnectHelp?: () => void;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
@@ -3740,10 +3806,9 @@ function ComposerStatusLine({
   goal: Goal | null;
   isSubAgentSession: boolean;
   /**
-   * When set (`host_offline` liveness), the host badge becomes a clickable
-   * "Host is offline — click to reconnect" affordance. Also forces the tray
-   * to render even when it would otherwise be empty, so the prompt is always
-   * visible for an unreachable host.
+   * Opens the reconnect help dialog, handed to the host badge — which turns
+   * itself into a clickable reconnect affordance when its bound host is
+   * offline and reconnectable.
    */
   onHostReconnect?: () => void;
 }) {
@@ -3773,19 +3838,14 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  // The offline-host reconnect affordance lives in the host badge, so the tray
-  // must render even when every other slot is empty (an unreachable session
-  // often has no branch/ring yet). Gated by `showHost`: only host-bound
-  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
-  // never host-bound — a stranded child is `local_stranded`, which keeps its
-  // banner elsewhere.
-  const showReconnect = showHost && !!onHostReconnect;
   // A host-bound session shows the badge, so the tray must render for it even
   // with no branch/ring yet — otherwise the host + context footer vanishes for
   // sessions with no worktree branch (e.g. codex) until the ring populates.
+  // This also keeps the offline host's reconnect affordance on screen, since
+  // the badge is where it lives and an unreachable session often has no
+  // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showReconnect && !showHostBadge)
-    return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
 
   return (
     <div
@@ -3940,7 +4000,6 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
-  hostOffline = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
   subAgentLabel = null,
@@ -4786,7 +4845,7 @@ export function Composer({
       >
         {isDragActive && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-            <span className="text-sm font-medium text-ring">Drop files here</span>
+            <span className="text-ui font-medium text-ring">Drop files here</span>
           </div>
         )}
         {/* Slash-command suggestions — floats above the composer box */}
@@ -4844,7 +4903,7 @@ export function Composer({
               ref={backdropRef}
               aria-hidden
               data-testid="composer-highlight-overlay"
-              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-4 pt-3 pb-2 text-sm text-foreground"
+              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-4 pt-3 pb-2 text-ui text-foreground"
             >
               {(() => {
                 const split = splitSlashCommand(value);
@@ -4926,7 +4985,7 @@ export function Composer({
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
-              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60",
+              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-ui outline-none placeholder:text-muted-foreground disabled:opacity-60",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
               composerIsCommand && "text-transparent caret-foreground",
@@ -5141,7 +5200,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 shrink-0 rounded-full md:size-8",
+                "size-9 shrink-0 rounded-lg md:size-8",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
@@ -5157,7 +5216,7 @@ export function Composer({
               {showInterruptButton ? (
                 <SquareIcon className="size-4 fill-current" />
               ) : (
-                <ArrowUpIcon className="size-4" />
+                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
               )}
               <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
             </Button>
@@ -5167,7 +5226,7 @@ export function Composer({
       <ComposerStatusLine
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
-        onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
+        onHostReconnect={onShowReconnectHelp}
       />
     </form>
   );
@@ -5981,23 +6040,35 @@ function useResolvedComposerModel(
   // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
   // so like cursor/kiro/opencode the live model is the session override, never
   // the cross-session sticky ``selectedModel``.
+  // The sticky is this session's model only when the session itself advertises
+  // it. `switchTo` clears the session-scoped fields but deliberately keeps
+  // `selectedModel`, so until the incoming snapshot lands the catalog is empty
+  // and the sticky still holds the OUTGOING session's pick — surfacing it paints
+  // e.g. a Codex gpt-5.5 on a Claude session for the whole bind round trip.
+  // Gating on the session's own catalog mirrors the compatibility rule bindStream
+  // applies a moment later, so the label never advertises a model this session
+  // would reject. Post-bind this is a no-op: the store only ever leaves a
+  // catalog-compatible sticky (or the override) in `selectedModel`.
+  const sessionStickyModel =
+    findNativeModelOption(codexModelOptions, selectedModel) !== null ? selectedModel : null;
   const pickerSelectedModel =
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "pi"
       ? sessionModelOverride
-      : (sessionModelOverride ?? selectedModel);
+      : (sessionModelOverride ?? sessionStickyModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
   // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
-  // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
-  // there the sticky IS the applied model.
+  // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
+  // there it IS the applied model — but only once this session's catalog vouches
+  // for it (see `sessionStickyModel`).
   const nonNativeModel =
     modelPickerKind === null
       ? (sessionModelOverride ?? llmModel)
-      : (sessionModelOverride ?? selectedModel ?? llmModel);
+      : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 
 from omnigent.codex_native_app_server import NativeCodexLaunch
 from omnigent.harness_plugins import BackgroundTitleGeneratorSpec
+from omnigent.inner.codex_executor import _provider_codex_config_overrides
 from omnigent.runner import create_runner_app
 from omnigent.runner.background_titles import BackgroundTitleContext
 from omnigent.runner.background_titles import claude_native as claude_native_titles
@@ -559,7 +561,10 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
             output_path = Path(args[args.index("--output-last-message") + 1])
             codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
             captured["auth_text"] = (codex_home / "auth.json").read_text()
-            captured["config_text"] = (codex_home / "config.toml").read_text()
+            config_path = codex_home / "config.toml"
+            captured["config_text"] = config_path.read_text()
+            captured["codex_home_mode"] = stat.S_IMODE(codex_home.stat().st_mode)
+            captured["config_mode"] = stat.S_IMODE(config_path.stat().st_mode)
             captured["agents_exists"] = (codex_home / "AGENTS.md").exists()
             output_path.write_text("Debug authentication timeout\n")
             return b"", b"ignored warning"
@@ -592,9 +597,15 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     (source_home / "AGENTS.md").write_text("Do unrelated work")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    provider_overrides = _provider_codex_config_overrides(
+        model="gpt-5.4-mini",
+        base_url="https://provider.invalid/v1",
+        auth_command="printf %s sk-sentinel-do-not-use",
+        wire_api="responses",
+    )
     monkeypatch.setattr(
         "omnigent.codex_native_app_server.resolve_native_codex_launch",
-        lambda *, model: NativeCodexLaunch([], model, None),
+        lambda *, model: NativeCodexLaunch(provider_overrides, model, None),
     )
     monkeypatch.setattr(
         "omnigent.codex_native_app_server._find_codex_cli",
@@ -625,6 +636,7 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert args[args.index("--model") + 1] == "gpt-5.4-mini"
     assert "features.shell_tool=false" in args
     assert 'web_search="disabled"' in args
+    assert all("sk-sentinel-do-not-use" not in arg for arg in args)
     assert "omnigent-codex-title-" in captured["kwargs"]["cwd"]
     codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
     assert codex_home != source_home
@@ -636,6 +648,10 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert "unrelated_top_level" not in config_text
     assert "mcp_servers" not in config_text
     assert "[features]" not in config_text
+    assert "sk-sentinel-do-not-use" in config_text
+    assert "omnigent_provider" in config_text
+    assert captured["codex_home_mode"] == 0o700
+    assert captured["config_mode"] == 0o600
     assert captured["agents_exists"] is False
 
 

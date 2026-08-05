@@ -909,6 +909,35 @@ describe("Composer model/effort label", () => {
     // the leaked model was suppressed.
     expect(label()).toHaveTextContent("High");
   });
+
+  it("does not leak the cross-session sticky model on a native session before its catalog lands", () => {
+    // The Codex→Claude switch repro: `switchTo` clears the session-scoped model
+    // fields but keeps the sticky, so mid-switch a claude-native session has an
+    // empty catalog and the `gpt-5.5` the outgoing Codex session left behind.
+    // The label must wait for a model this session vouches for rather than
+    // paint the previous session's pick for the whole bind round trip.
+    useChatStore.setState({
+      selectedModel: "gpt-5.5", // outgoing Codex session's pick — must not surface
+      sessionModelOverride: null,
+      selectedEffort: "high",
+      llmModel: null,
+      codexModelOptions: [], // cleared by `switchTo`, refilled when the snapshot lands
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    expect(label()).not.toHaveTextContent("gpt-5.5");
+    // The real effort still renders — only the leaked model was suppressed.
+    expect(label()).toHaveTextContent("High");
+  });
 });
 
 describe("Composer effort slash-command visibility", () => {
