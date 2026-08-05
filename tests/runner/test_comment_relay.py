@@ -722,3 +722,62 @@ async def test_relay_policy_evaluate_rejects_wrong_token(
         assert resp.status_code == 401
     finally:
         relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_policy_evaluate_surfaces_upstream_error_in_502_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay /policies/evaluate returns a 502 whose body names the upstream failure.
+
+    When the refresh-capable server_client raises (e.g. the Databricks token
+    could not be refreshed), the relay must surface that reason instead of the
+    generic http.server 502 page, so the hook's fail-closed ``Detail:`` is
+    actionable rather than an opaque gateway error.
+    """
+    import asyncio
+
+    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
+    from omnigent.claude_native_bridge import start_tool_relay
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+
+    bridge_dir = _prep("relay-policy-error-test", workspace=tmp_path)
+
+    class _RaisingServerClient:
+        """Fake server_client whose policy POST fails like a lapsed token."""
+
+        async def post(self, *a: object, **kw: object) -> object:
+            raise httpx.RequestError("Databricks token refresh returned no token")
+
+    loop = asyncio.get_running_loop()
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=loop,
+        policy_client=_RaisingServerClient(),
+        session_id="conv_err_test",
+    )
+    try:
+        relay_info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+        relay_url = relay_info["url"]
+        relay_token = relay_info["token"]
+
+        async with httpx.AsyncClient() as c:
+            resp = await c.post(
+                f"{relay_url}/policies/evaluate",
+                json={"event": {"type": "PHASE_REQUEST", "target": "", "data": {"text": "hi"}}},
+                headers={"Authorization": f"Bearer {relay_token}"},
+                timeout=5.0,
+            )
+
+        assert resp.status_code == 502
+        # The body must name the upstream cause, not the generic HTML page, so
+        # the hook's fail-closed reason is actionable.
+        assert "Databricks token refresh returned no token" in resp.text
+        assert "<html" not in resp.text.lower()
+    finally:
+        relay.close()
