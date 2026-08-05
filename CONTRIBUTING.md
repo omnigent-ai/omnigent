@@ -258,7 +258,7 @@ request enforces this, so unsigned commits will block merging.
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
 - Sign off your commits with `git commit -s` (see
   [Developer Certificate of Origin](#developer-certificate-of-origin) above).
-- **Link an issue** (see below).
+- **Reference an issue** (see below).
 - Fill in the PR template. For **UI / frontend changes**, check the
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
@@ -269,14 +269,28 @@ request enforces this, so unsigned commits will block merging.
 We require an issue for every pull request. Issues are how work gets
 prioritized, so a PR without one arrives unsorted and waits longer.
 
-Link it in the description with a closing keyword, for example `Closes #123`, or
-from the **Development** section of the sidebar. Either way GitHub records the
-link, gives your PR the issue's priority, and closes the issue when the PR
-merges.
+Reference it in the description. Which keyword you use depends on whether the PR
+finishes the issue:
 
-**No issue for your change yet?** Open one first, then link it. That is also the
-faster path for anything non-trivial: it lets a maintainer confirm the approach
-before you write code.
+| Your PR | Write | Effect |
+| --- | --- | --- |
+| Finishes the issue | `Closes #123` (or `Fixes` / `Resolves`) | GitHub links the PR and closes the issue on merge |
+| Is one step towards it | `Part of #123` (or `Related to` / `Towards` / `Refs`) | The issue stays open |
+
+`Closes` is preferred when it applies, because GitHub records a real link and
+closes the issue for you. For a partial change, do not claim `Closes`: use one of
+the second-row keywords instead, so the issue is not closed before the work is
+done. You can also link a closing issue from the **Development** section of the
+sidebar, which counts the same as a `Closes` keyword.
+
+A bare `#123` is not enough on its own. It creates a cross-reference rather than
+saying anything about this PR, so pair it with one of the keywords above. The
+reference also has to point at an **issue**: naming another pull request does not
+count, since a PR is not a tracking record.
+
+**No issue for your change yet?** Open one first, then reference it. That is also
+the faster path for anything non-trivial: it lets a maintainer confirm the
+approach before you write code.
 
 The only exceptions are changes with no user-visible behaviour: pure
 **Refactor / chore**, **Docs**, or **Test / CI** work. If that is genuinely what
@@ -284,7 +298,7 @@ your PR is, check that box under *Type of change* and no issue is needed.
 Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
 even when it also touches docs or tests.
 
-A bot comments once on PRs that link no issue. It never closes anything.
+A bot comments once on PRs that reference no issue. It never closes anything.
 
 ### Review state labels
 

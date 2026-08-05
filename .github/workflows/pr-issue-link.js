@@ -53,6 +53,25 @@ const DECLARED_EXEMPT_TYPE = /- \[[xX]\]\s*(?:Refactor \/ chore|Docs|Test \/ CI)
 // otherwise ticking `Test / CI` next to `Bug fix` is a free opt-out.
 const DECLARED_TRACKED_TYPE = /- \[[xX]\]\s*(?:Bug fix|Feature|UI \/ frontend change)\b/;
 
+// Non-closing references to an issue. GitHub only creates a *link* for the
+// closing keywords, so these never reach closingIssuesReferences -- but they do
+// say the work is tracked, which is what the rule is actually asking for. A PR
+// that only partly addresses an issue should not have to claim it closes it.
+// Deliberately excludes a bare `#123`, which is a cross-reference rather than a
+// statement about this PR.
+const TRACKING_REFERENCE =
+  /\b(?:part of|related to|towards?|refs?|references?|see(?:\s+also)?)\b[:\s]*(?:https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/(\d+)|(?:[\w.-]+\/[\w.-]+)?#(\d+))/gi;
+
+// Issue numbers a body claims to be working towards, deduped and in order.
+function trackingReferences(body) {
+  const seen = [];
+  for (const m of (body ?? "").matchAll(TRACKING_REFERENCE)) {
+    const n = Number(m[1] ?? m[2]);
+    if (n && !seen.includes(n)) seen.push(n);
+  }
+  return seen;
+}
+
 const QUERY = `
   query($cursor: String, $searchQuery: String!) {
     rateLimit { remaining resetAt }
@@ -113,11 +132,14 @@ function exemptReason(pr, maintainers = new Set()) {
 }
 
 const message = (author) =>
-  `@${author} Thanks for the PR! It doesn't link an issue yet.
+  `@${author} Thanks for the PR! It doesn't reference an issue yet.
 
-**We require an issue for every PR**, so the work can be prioritized before it's reviewed. Please add one to the description with a closing keyword, e.g. \`Closes #123\`, or link it from the **Development** section of the sidebar. Linking gives your PR the issue's priority in our review queue, and closes the issue when this merges.
+**We require an issue for every PR**, so the work can be prioritized before it's reviewed. Add one to the description:
 
-No issue exists for this yet? Open one first, then link it. That's how we track what's worth doing, and it's usually quicker than it sounds.
+- \`Closes #123\` if this PR finishes the issue. That links it, gives your PR the issue's priority, and closes the issue when this merges. You can also link it from the **Development** section of the sidebar.
+- \`Part of #123\` if this is one step towards it. \`Related to\`, \`Towards\`, and \`Refs\` work the same way, and leave the issue open.
+
+No issue exists for this yet? Open one first, then reference it. That's how we track what's worth doing, and it's usually quicker than it sounds. Note a reference has to point at an issue: naming another PR doesn't count.
 
 The only exceptions are changes with no user-visible behaviour: pure **Refactor / chore**, **Docs**, or **Test / CI** work. If that's genuinely what this is, check that box under *Type of change*. Anything that fixes a bug, adds a feature, or changes the UI needs an issue, even when it also touches docs or tests.
 
@@ -214,6 +236,31 @@ module.exports = async ({ context, github, core }) => {
         continue;
       }
 
+      // No closing link, but the body may still name the issue it works towards.
+      // Each candidate is resolved, because "Refs #4147" often points at another
+      // PR, and a PR is not the tracking record this rule is asking for.
+      let tracked = null;
+      for (const candidate of trackingReferences(pr.body)) {
+        try {
+          const { data } = await github.rest.issues.get({
+            owner,
+            repo,
+            issue_number: candidate,
+          });
+          if (!data.pull_request) {
+            tracked = candidate;
+            break;
+          }
+        } catch (err) {
+          // A number that doesn't resolve proves nothing either way; try the next.
+          core.warning(`Could not resolve #${candidate} from #${pr.number}: ${err.message}`);
+        }
+      }
+      if (tracked) {
+        verdicts.push({ pr: pr.number, verdict: "ok", reason: `references #${tracked}` });
+        continue;
+      }
+
       const author = pr.author?.login ?? "contributor";
 
       // A dry run enumerates every verdict -- that's its whole point, so LIMIT
@@ -285,5 +332,6 @@ module.exports = async ({ context, github, core }) => {
 
 // Exported for the offline unit test.
 module.exports.exemptReason = exemptReason;
+module.exports.trackingReferences = trackingReferences;
 module.exports.MARKER = MARKER;
 module.exports.EFFECTIVE_FROM = EFFECTIVE_FROM;

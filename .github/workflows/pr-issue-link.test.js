@@ -36,7 +36,14 @@ function pr({
 // `env` overrides process.env for the run.
 async function run(
   nodes,
-  { linked = {}, env = {}, linkError = false, maintainers = [], existingComments = {} } = {}
+  {
+    linked = {},
+    env = {},
+    linkError = false,
+    maintainers = [],
+    existingComments = {},
+    issues = {},
+  } = {}
 ) {
   const commented = [];
   const labeled = [];
@@ -77,6 +84,16 @@ async function run(
         listComments: "listComments",
         createComment: async ({ issue_number, body }) => commented.push({ issue_number, body }),
         addLabels: async ({ issue_number, labels: ls }) => labeled.push({ issue_number, labels: ls }),
+        // `issues` maps number -> "issue" | "pr" | undefined (404).
+        get: async ({ issue_number }) => {
+          const kind = issues[issue_number];
+          if (!kind) {
+            const err = new Error("Not Found");
+            err.status = 404;
+            throw err;
+          }
+          return { data: kind === "pr" ? { pull_request: {} } : {} };
+        },
       },
     },
   };
@@ -196,6 +213,27 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
   );
 }
 
+// ---- tracking-reference parsing (pure) ----
+{
+  const { trackingReferences: refs } = script;
+  assert.deepStrictEqual(refs("Refs #3644"), [3644], "Refs #N");
+  assert.deepStrictEqual(refs("Part of #123"), [123], "Part of #N");
+  assert.deepStrictEqual(refs("blah\nRelated to #5\nblah"), [5], "Related to #N");
+  assert.deepStrictEqual(refs("Towards #9"), [9], "Towards #N");
+  assert.deepStrictEqual(
+    refs("Part of https://github.com/omnigent-ai/omnigent/issues/321"),
+    [321],
+    "full issue URL"
+  );
+  assert.deepStrictEqual(refs("Refs omnigent-ai/omnigent#77"), [77], "cross-repo ref");
+  assert.deepStrictEqual(refs("Part of #7 and refs #7"), [7], "dedupes");
+  // A bare mention is a cross-reference, not a statement about this PR.
+  assert.deepStrictEqual(refs("similar to #77 maybe"), [], "bare #N does not count");
+  assert.deepStrictEqual(refs("this fixes the thing generally"), [], "prose does not count");
+  assert.deepStrictEqual(refs(""), [], "empty body");
+  assert.deepStrictEqual(refs(undefined), [], "missing body");
+}
+
 // ---- end-to-end behaviour ----
 (async () => {
   // Forward-only: the search must never reach past the effective date, so the
@@ -228,6 +266,44 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
     assert.match(commented[0].body, /require an issue for every PR/);
     assert.match(commented[0].body, /even when it also touches docs or tests/);
     assert.deepStrictEqual(labeled, [], "no label is applied");
+  }
+
+  // A non-closing reference to a real ISSUE satisfies the rule: a PR that only
+  // partly addresses an issue should not have to claim it closes it.
+  for (const kw of ["Part of #77", "Related to #77", "Towards #77", "Refs #77", "See #77"]) {
+    const { commented } = await run([pr({ number: 50, body: `Work here.\n\n${kw}` })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 0, `${kw} must satisfy the rule`);
+  }
+
+  // ...but only when it resolves to an issue. "Refs #4147" pointing at another PR
+  // is not a tracking record, and three real backlog PRs do exactly this.
+  {
+    const { commented } = await run([pr({ number: 51, body: "Refs #88" })], {
+      env: ENFORCE,
+      issues: { 88: "pr" },
+    });
+    assert.strictEqual(commented.length, 1, "a reference to a PR does not count");
+  }
+
+  // A bare mention is a cross-reference, not a claim about this PR.
+  {
+    const { commented } = await run([pr({ number: 52, body: "similar to #77 maybe" })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 1, "a bare #N does not count");
+  }
+
+  // An unresolvable number proves nothing; keep checking the rest.
+  {
+    const { commented } = await run([pr({ number: 53, body: "Refs #999\nPart of #77" })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 0, "falls through to the next candidate");
   }
 
   // A linked PR is left alone even when enforcing.
