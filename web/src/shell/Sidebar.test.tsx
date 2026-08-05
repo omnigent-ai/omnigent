@@ -222,11 +222,20 @@ function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => voi
   );
 }
 
-// "Shared with me" sessions live on their own sidebar tab now; click it to
-// reveal the flat shared list (the default tab is "My sessions").
+// Session scope lives in the Sessions heading's filter menu; pick an option to
+// switch the slice the list shows (the default filter is "All sessions").
+function selectSessionFilter(value: "all" | "mine" | "shared" | "archived") {
+  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  fireEvent.click(screen.getByTestId(`session-filter-${value}`));
+}
+
+/** Show only sessions others shared with the viewer. */
 function showSharedTab() {
-  // Radix Tabs triggers activate on mousedown (primary button), not click.
-  fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+  selectSessionFilter("shared");
 }
 
 /** Open the Projects header kebab (expand-all / revert / select sessions). */
@@ -312,18 +321,102 @@ describe("Sidebar session list", () => {
     expect(row.className).not.toMatch(/(?:^|\s)md:pr-14(?:\s|$)/);
   });
 
-  it("renders no filter funnel and requests the list with archived included", () => {
+  it("offers the four display filters and defaults to All sessions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
-    // The funnel (agent-type filter + "Show archived" toggle) was removed,
-    // so its trigger button must be gone entirely.
-    expect(screen.queryByRole("button", { name: "Filter sessions" })).toBeNull();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByText("Display")).toBeInTheDocument();
+    for (const value of ["all", "mine", "shared", "archived"]) {
+      expect(screen.getByTestId(`session-filter-${value}`)).toBeInTheDocument();
+    }
+    // Radio semantics: exactly one option is checked, and it's "All sessions".
+    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("shows archived sessions only under the Archived filter", () => {
+    mockConversations([
+      conv("conv_live", "Claude Code"),
+      conv("conv_done", "Claude Code", { archived: true }),
+    ]);
+    renderSidebar();
+
+    // Every other filter hides archived sessions.
+    expect(screen.getByText("conv_live")).toBeInTheDocument();
+    expect(screen.queryByText("conv_done")).toBeNull();
+
+    // The Archived filter shows them, and only them.
+    selectSessionFilter("archived");
+    expect(screen.getByText("conv_done")).toBeInTheDocument();
+    expect(screen.queryByText("conv_live")).toBeNull();
+  });
+
+  it("re-scopes the list across every filter, in both directions", () => {
+    // One fixture spanning all three states the filters slice on, cycled through
+    // each option (and back) so a filter that leaks rows — or strands them after
+    // a previous selection — fails here rather than only in one direction.
+    mockConversations([
+      conv("conv_owned", "Claude Code"),
+      conv("conv_from_other", "Claude Code", { owner: "other@example.com" }),
+      conv("conv_archived", "Claude Code", { archived: true }),
+    ]);
+    renderSidebar();
+
+    const visible = () => ({
+      owned: screen.queryByText("conv_owned") !== null,
+      shared: screen.queryByText("conv_from_other") !== null,
+      archived: screen.queryByText("conv_archived") !== null,
+    });
+
+    // Default: everything except archived.
+    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
+
+    selectSessionFilter("mine");
+    expect(visible()).toEqual({ owned: true, shared: false, archived: false });
+
+    selectSessionFilter("shared");
+    expect(visible()).toEqual({ owned: false, shared: true, archived: false });
+
+    selectSessionFilter("archived");
+    expect(visible()).toEqual({ owned: false, shared: false, archived: true });
+
+    // Back to All: leaving Archived restores the unarchived rows.
+    selectSessionFilter("all");
+    expect(visible()).toEqual({ owned: true, shared: true, archived: false });
+
+    // And Archived is still reachable a second time (state isn't one-shot).
+    selectSessionFilter("archived");
+    expect(visible()).toEqual({ owned: false, shared: false, archived: true });
+  });
+
+  it("keeps the filter menu reachable when the chosen filter matches nothing", () => {
+    // The filter lives on the Sessions header. Hiding that header on an empty
+    // slice would strand the viewer on, say, Archived with no way back.
+    mockConversations([conv("conv_live", "Claude Code")]);
+    renderSidebar();
+
+    selectSessionFilter("archived");
+    expect(screen.queryByText("conv_live")).toBeNull();
+    expect(screen.getByText("No archived sessions")).toBeInTheDocument();
+
+    // Still there, and still able to switch back.
+    expect(screen.getByTestId("session-filter")).toBeInTheDocument();
+    selectSessionFilter("all");
+    expect(screen.getByText("conv_live")).toBeInTheDocument();
+  });
+
+  it("requests the list with archived included", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
 
     // The sidebar requests the session list with `includeArchived`
-    // hard-wired to true, so archived sessions can be peeled into the
-    // bottom "Archived" section. A regression to false would make that
-    // section perpetually empty.
+    // hard-wired to true, so the "Archived sessions" filter has something to
+    // show. A regression to false would leave that filter perpetually empty.
     expect(useConvMock.mock.calls.length).toBeGreaterThanOrEqual(1);
     for (const call of useConvMock.mock.calls) {
       expect(call).toEqual(["", true, { reconcileWhileConnected: true }]);
@@ -429,7 +522,9 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
-    expect(selectSessions.parentElement).toHaveClass(
+    // The select + filter buttons share a flex wrapper inside the header's
+    // hover-reveal slot, so the reveal classes sit on the grandparent.
+    expect(selectSessions.parentElement?.parentElement).toHaveClass(
       "md:opacity-0",
       "md:group-hover/header:opacity-100",
       "md:group-focus-within/header:opacity-100",
@@ -741,7 +836,7 @@ describe("Sidebar session list", () => {
 // another user; a null/absent owner is the viewer's own (single-user / legacy).
 // In tests the resolved viewer id is null, so any non-null owner reads as shared.
 describe("Sidebar sections", () => {
-  it("splits owned and shared sessions across the My sessions / Shared with me tabs", () => {
+  it("splits owned and shared sessions across the My / Shared filters", () => {
     mockConversations([
       conv("conv_mine_legacy", "Claude Code"), // owner absent = owned
       conv("conv_mine_acl", "Claude Code", { owner: null }),
@@ -749,14 +844,20 @@ describe("Sidebar sections", () => {
     ]);
     renderSidebar();
 
-    // Default ("My sessions") tab: owned sessions under Sessions, no shared one
-    // leaking in (which would make the viewer think they own it).
+    // Default ("All sessions"): everything the viewer can see.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_mine_legacy")).toBeInTheDocument();
     expect(within(recentSection).getByText("conv_mine_acl")).toBeInTheDocument();
+    expect(within(recentSection).getByText("conv_shared")).toBeInTheDocument();
+
+    // "My sessions": owned only, no shared one leaking in (which would make the
+    // viewer think they own it).
+    selectSessionFilter("mine");
+    expect(screen.getByText("conv_mine_legacy")).toBeInTheDocument();
+    expect(screen.getByText("conv_mine_acl")).toBeInTheDocument();
     expect(screen.queryByText("conv_shared")).toBeNull();
 
-    // Shared tab: only the shared session, and the owned ones are hidden.
+    // "Shared sessions": only the shared one, owned ones hidden.
     showSharedTab();
     expect(screen.getByText("conv_shared")).toBeInTheDocument();
     expect(screen.queryByText("conv_mine_legacy")).toBeNull();
@@ -802,26 +903,35 @@ describe("Sidebar tabs", () => {
     expect(screen.queryByText("conv_shared")).toBeNull();
   });
 
-  it("hides the tabs on a single-user (local) server and shows only owned sessions", () => {
-    // A loopback-only server can't share sessions with anyone, so the tab
-    // split is meaningless — collapse to the plain owned-session list.
+  it("drops the Shared filter option on a single-user (local) server", () => {
+    // A loopback-only server can't share sessions, so that one option is
+    // meaningless there. The rest of the menu keeps working.
     isServerLocalMock.mockReturnValue(true);
     mockConversations([
       conv("conv_mine", "Claude Code"),
-      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+      conv("conv_done", "Claude Code", { archived: true }),
     ]);
     renderSidebar();
-    expect(screen.queryByTestId("sidebar-tab-mine")).toBeNull();
-    expect(screen.queryByTestId("sidebar-tab-shared")).toBeNull();
-    // Falls back to the owned list; the shared row never appears.
-    expect(screen.getByText("conv_mine")).toBeInTheDocument();
-    expect(screen.queryByText("conv_shared")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
+    expect(screen.getByTestId("session-filter-all")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("session-filter-archived"));
+
+    // Picking a filter still re-scopes the list here — the local-server case
+    // must not pin the scope and swallow the choice.
+    expect(screen.getByText("conv_done")).toBeInTheDocument();
+    expect(screen.queryByText("conv_mine")).toBeNull();
   });
 
-  it("gives a pinned shared session a Pinned section on the Shared tab, not My sessions", () => {
-    // Pins are ownership-agnostic (localStorage), so both tabs reuse the same
-    // Pinned section — scoped to that tab's conversations. A pinned shared
-    // session floats to Pinned on the Shared tab and never leaks onto My
+  it("gives a pinned shared session a Pinned section under Shared, not My sessions", () => {
+    // Pins are ownership-agnostic (localStorage), so every filter reuses the
+    // same Pinned section — scoped to that filter's conversations. A pinned
+    // shared session floats to Pinned under Shared and never leaks onto My
     // sessions (which shows only owned sessions).
     mockConversations([
       conv("conv_mine", "Claude Code"),
@@ -830,13 +940,14 @@ describe("Sidebar tabs", () => {
     seedPins(["conv_shared"]);
     renderSidebar();
 
-    // My sessions tab: owned session is unpinned (no Pinned section), and the
+    // "My sessions": owned session is unpinned (no Pinned section), and the
     // pinned shared row doesn't appear here at all.
+    selectSessionFilter("mine");
     expect(screen.queryByText("Pinned")).toBeNull();
     expect(screen.getByText("conv_mine")).toBeInTheDocument();
     expect(screen.queryByText("conv_shared")).toBeNull();
 
-    // Shared tab: the shared session shows under its own Pinned section.
+    // "Shared sessions": the shared session shows under its own Pinned section.
     showSharedTab();
     const pinnedSection = screen.getByText("Pinned").closest("section")!;
     expect(within(pinnedSection).getByText("conv_shared")).toBeInTheDocument();
@@ -1208,7 +1319,7 @@ describe("Sidebar project sections", () => {
     expect(within(recentSection).getByText("conv_filed")).toBeInTheDocument();
   });
 
-  it("expands all project folders at once and reverts to the previously-open set", () => {
+  it("expands all project folders at once, then hides the now-redundant control", () => {
     projectsMock.push("Alpha", "Beta");
     mockConversations([
       conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
@@ -1223,28 +1334,21 @@ describe("Sidebar project sections", () => {
     );
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
 
-    // Open just one folder, then expand all → every folder opens and the
-    // control flips to "revert". Expand-all / revert live in the Projects
-    // header kebab, so open it before clicking the menu item.
+    // Open just one folder, then expand all → every folder opens. Expand-all
+    // lives in the Projects header kebab, so open it before clicking.
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
     openProjectsMenu();
     fireEvent.click(screen.getByTestId("expand-all-projects"));
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "true");
+
+    // With everything open it would be a no-op, so only Collapse all remains.
     openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
-
-    // Revert to last state → restores exactly the set that was open before
-    // (only Alpha), not collapse-everything.
-    fireEvent.click(screen.getByTestId("revert-projects"));
-    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("collapse-all-projects")).toBeInTheDocument();
   });
 
-  it("reverts to a collapse-all when folders are all opened by hand (no last state)", () => {
-    // When every folder is open the control is "Revert to last state". If that
-    // full-expansion happened by hand (no "Expand all" click → no real last
-    // state), reverting collapses everything rather than restoring a stale set.
+  it("offers both Expand all and Collapse all while folders are in mixed states", () => {
     projectsMock.push("Alpha", "Beta");
     mockConversations([
       conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
@@ -1252,39 +1356,53 @@ describe("Sidebar project sections", () => {
     ]);
     renderSidebar();
 
-    // Open every folder by hand → the control is revert (not expand-all).
-    // Expand-all / revert live in the Projects header kebab; open it to check.
+    // Nothing open: only Expand all applies — there's nothing to collapse.
+    openProjectsMenu();
+    expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+    expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
+    closeProjectsMenu();
+
+    // One of two open (mixed): both are offered, so a partly-open set can be
+    // closed in one go without expanding everything first.
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
+    expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+    expect(screen.getByTestId("collapse-all-projects")).toBeInTheDocument();
+
+    // Collapse all closes every folder outright.
+    fireEvent.click(screen.getByTestId("collapse-all-projects"));
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("collapses every folder regardless of how they were opened", () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([
+      conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_b", "Claude Code", { labels: { omni_project: "Beta" } }),
+    ]);
+    renderSidebar();
+
+    // Opened by hand rather than via Expand all — Collapse all still applies.
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
     fireEvent.click(screen.getByRole("button", { name: /^Beta/ }));
     openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
-    expect(screen.getByTestId("revert-projects")).toBeInTheDocument();
 
-    // Revert with no remembered state → collapse all; expand-all returns.
-    fireEvent.click(screen.getByTestId("revert-projects"));
+    fireEvent.click(screen.getByTestId("collapse-all-projects"));
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+
+    // Nothing left to collapse, so only Expand all is offered again.
     openProjectsMenu();
     expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
-    closeProjectsMenu();
-
-    // After expand-all, a manual collapse of one folder retires the snapshot, so
-    // the next full manual expansion reverts to collapse-all (not the stale set).
-    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
-    openProjectsMenu();
-    fireEvent.click(screen.getByTestId("expand-all-projects")); // snapshot = [Alpha]
-    fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // manual toggle clears it
-    fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // back to all open by hand
-    openProjectsMenu();
-    fireEvent.click(screen.getByTestId("revert-projects"));
-    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
   });
 
   it("hides the expand-all control while the Projects group is collapsed", () => {
@@ -1306,7 +1424,7 @@ describe("Sidebar project sections", () => {
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
     openProjectsMenu();
     expect(screen.queryByTestId("expand-all-projects")).toBeNull();
-    expect(screen.queryByTestId("revert-projects")).toBeNull();
+    expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
     closeProjectsMenu();
 
     // Re-expanding the group brings it back.
