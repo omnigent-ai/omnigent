@@ -1229,12 +1229,15 @@ async def _dispatch_native_turn(
     conv_store: SqlAlchemyConversationStore,
     *,
     model: str,
+    routing_client: Any = None,  # type: ignore[explicit-any]
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Send one web message into a native pane with the router returning *model*.
 
     :param conv: Conversation row to dispatch for (labels must be current).
     :param conv_store: Store the row lives in.
     :param model: Model the fake router picks for this turn.
+    :param routing_client: Routing-client double to use, so a caller can read
+        back what was offered. ``None`` builds one returning *model*.
     :returns: The last routing-decision item's data and the forwarded bodies.
     """
     forwarded: list[dict[str, Any]] = []
@@ -1245,7 +1248,9 @@ async def _dispatch_native_turn(
         return httpx.Response(202, json={"queued": True})
 
     caps = FakeCaps(
-        routing_client=FakeRoutingClient(
+        routing_client=routing_client
+        if routing_client is not None
+        else FakeRoutingClient(
             RoutingResult(model=model, rationale="deep refactor", harness="claude_code")
         )
     )
@@ -1316,6 +1321,196 @@ async def test_a_childs_second_spawn_cannot_pin_a_model_the_pane_rejects(
     # Nothing was carried in-band either, so the executor never types a
     # ``/model`` the pane would drop.
     assert [f.get("model_override") for f in second_forwards] == [None]
+
+
+async def _parent_with_native_child_pane(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    *,
+    agent_name: str,
+    parent_harness: str,
+    auto: bool,
+) -> tuple[str, Any, SqlAlchemyConversationStore]:
+    """A routing-on parent plus a claude-native sub-agent pane under it.
+
+    The pane is the shape a ``sys_session_create`` spawn produces when the
+    orchestrator names another family's wrapper agent: a native terminal child
+    whose harness was never routed. Live example: a pinned ``codex-native``
+    session that spawned a ``claude-native-ui`` child.
+
+    :param client: Test HTTP client.
+    :param db_uri: Database URI for a direct store handle.
+    :param agent_name: Agent name to register.
+    :param parent_harness: The parent agent's harness, e.g. ``"codex"``.
+    :param auto: ``True`` to start the parent in Smart Routing (auto) harness
+        mode, the only mode allowed cross-family spawns.
+    :returns: ``(parent_id, child_conversation, conversation_store)``.
+    """
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": parent_harness}},
+    )
+    # The spawned child is bound to another family's native wrapper, exactly as
+    # a ``sys_session_create`` that named ``claude-native-ui`` leaves it.
+    child_agent = await create_test_agent(
+        client,
+        name=f"{agent_name}-claude-pane",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            **({"harness_override": "auto"} if auto else {}),
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    parent_id = str(parent.json()["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent_conv = conv_store.get_conversation(parent_id)
+    assert parent_conv is not None
+    # Both cases route their spawns; only the auto one may leave its family.
+    assert parent_conv.subagent_routing_override == "on"
+    assert (parent_conv.labels.get(AUTO_HARNESS_LABEL_KEY) == "1") is auto
+
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="claude-native-ui:say hello",
+        parent_conversation_id=parent_id,
+        agent_id=child_agent["id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": CLAUDE_NATIVE_CODING_AGENT.wrapper_label,
+        },
+    )
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    return parent_id, refreshed, conv_store
+
+
+async def test_a_pinned_parents_child_pane_is_never_routed_onto_another_family(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A pinned codex parent's ``child_session`` route cannot land a claude arm.
+
+    Cross-family spawns are for auto-harness sessions only. The in-harness
+    spawn gate already held that line (``candidate_models(cross_harness=False)``)
+    but the child-session path did not: a live pinned codex session spawned a
+    ``claude-native-ui`` child and the router happily pinned it to
+    ``claude-sonnet-5``. Now nothing is routed and the chip says why.
+    """
+    _parent_id, child, conv_store = await _parent_with_native_child_pane(
+        client,
+        db_uri,
+        agent_name="routing-child-pane-pinned",
+        parent_harness="codex",
+        auto=False,
+    )
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="escalate", harness="claude_code")
+    )
+
+    data, forwarded = await _dispatch_native_turn(
+        child, conv_store, model=ROUTED_MODEL, routing_client=routing_client
+    )
+
+    # The router is never even asked: this pane has no candidate the parent's
+    # family can serve.
+    assert routing_client.calls == []
+    assert data.scope == "child_session"
+    assert data.applied is False
+    assert data.model == UNAVAILABLE_MODEL
+    assert "stay in its own model family" in data.rationale
+    assert "claude-native" in data.rationale
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    # Nothing pinned, nothing switched in-band, and the route-once label is
+    # left unclaimed — the pane runs on its CLI's own model.
+    assert refreshed.model_override is None
+    assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)
+    assert [f.get("model_override") for f in forwarded] == [None]
+    # The spawn still ran: the message reached the terminal.
+    assert forwarded
+
+
+async def test_an_auto_parents_child_pane_still_routes_across_families(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The same claude pane under an auto-harness parent is routed as before.
+
+    Smart Routing owns an auto session's harness, so its spawns may cross
+    families — the one case the rule above allows.
+    """
+    _parent_id, child, conv_store = await _parent_with_native_child_pane(
+        client,
+        db_uri,
+        agent_name="routing-child-pane-auto",
+        parent_harness="codex",
+        auto=True,
+    )
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="escalate", harness="claude_code")
+    )
+
+    data, forwarded = await _dispatch_native_turn(
+        child, conv_store, model=ROUTED_MODEL, routing_client=routing_client
+    )
+
+    assert len(routing_client.calls) == 1
+    # Offered this pane's own family only: it is a claude terminal, whatever
+    # the router may pick for a session that has no terminal yet.
+    assert set(routing_client.offered[0]) == {"claude-native"}
+    assert data.scope == "child_session"
+    assert data.applied is True
+    assert data.model == ROUTED_MODEL
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    assert refreshed.model_override == ROUTED_MODEL
+    assert [f.get("model_override") for f in forwarded] == [ROUTED_MODEL]
+
+
+async def test_a_pane_still_on_the_auto_sentinel_is_routed_in_its_own_family(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The pane's terminal decides its family, not its unresolved sentinel.
+
+    A forced-auto child keeps ``harness_override="auto"`` until its first
+    message routes, and the sentinel carries no family — so the pane was
+    offered every model its gateway serves and could be pinned to one its
+    running CLI cannot speak.
+    """
+    _parent_id, child, conv_store = await _parent_with_native_child_pane(
+        client,
+        db_uri,
+        agent_name="routing-child-pane-sentinel",
+        parent_harness="codex",
+        auto=True,
+    )
+    sentinel = conv_store.update_conversation(child.id, harness_override="auto")
+    assert sentinel is not None
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="escalate", harness="claude_code")
+    )
+
+    data, _forwarded = await _dispatch_native_turn(
+        sentinel, conv_store, model=ROUTED_MODEL, routing_client=routing_client
+    )
+
+    assert set(routing_client.offered[0]) == {"claude-native"}
+    assert all(
+        "claude" in model for models in routing_client.offered[0].values() for model in models
+    )
+    assert data.applied is True
 
 
 async def test_turn_candidates_come_from_the_panes_own_vocabulary(

@@ -4131,6 +4131,59 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
+def _native_pane_harness(conv: Conversation) -> str | None:
+    """The native harness a pane actually runs, past the ``"auto"`` sentinel.
+
+    A forced-auto child keeps ``harness_override="auto"`` until its first
+    message routes, but its terminal is already up on one CLI. Routing that
+    pane off the sentinel offered every family (the sentinel carries none), so
+    the pick could be a model the running CLI cannot speak; its wrapper label
+    names the real harness.
+
+    :param conv: Conversation row for the native session.
+    :returns: The canonical native harness, e.g. ``"claude-native"``, or
+        ``None`` when it cannot be resolved.
+    """
+    harness = _resolve_harness(conv)
+    if harness is not None and harness != "auto":
+        return harness
+    native = _native_coding_agent_for_session(conv)
+    return native.harness if native is not None else harness
+
+
+def _out_of_family_spawn_notice(
+    conv: Conversation,
+    parent: Conversation | None,
+    harness: str | None,
+) -> str | None:
+    """Why a pinned parent's cross-family spawn is not routed, if it is not.
+
+    Cross-family picks belong to sessions whose harness the router owns (Smart
+    Routing / auto): a pinned codex session's spawns stay on codex, so a child
+    pane running another family's CLI has no candidate the parent's family can
+    serve. Same predicate the in-harness spawn gate uses, so "auto" means one
+    thing on both spawn paths.
+
+    :param conv: The child session's row.
+    :param parent: The parent session's row, or ``None`` for a top-level
+        session (nothing to stay in family with).
+    :param harness: The child's resolved harness, e.g. ``"claude-native"``.
+    :returns: The rationale for the declined decision, or ``None`` when the
+        spawn may be routed.
+    """
+    if parent is None or auto_harness_session(conv, parent):
+        return None
+    parent_harness = _resolve_harness(parent)
+    parent_family = harness_family(parent_harness)
+    child_family = harness_family(harness)
+    if parent_family is None or child_family is None or parent_family == child_family:
+        return None
+    return (
+        f"Not routed: a {parent_harness} session's spawns stay in its own model "
+        f"family, and this sub-agent runs on {harness}."
+    )
+
+
 def _publish_routed_model(session_id: str, model: str) -> None:
     """
     Publish a ``session.model`` SSE for a router-selected model.
@@ -4889,6 +4942,7 @@ async def _dispatch_session_event_to_runner_impl(
         # The native CLI reads model_override from the session. A child
         # routes off its parent's subagent-routing switch.
         _native_parent_routing_on = False
+        _native_parent_conv: Conversation | None = None
         if conv.parent_conversation_id is not None:
             _native_parent_conv = await asyncio.to_thread(
                 conversation_store.get_conversation, conv.parent_conversation_id
@@ -4902,8 +4956,10 @@ async def _dispatch_session_event_to_runner_impl(
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
-        # Set when the routing call itself failed; the chip then carries the
-        # "unavailable" placeholder and nothing is pinned or switched.
+        # Set when nothing was routed — the call failed, or the family rule
+        # below refused a cross-family spawn. The chip then carries the
+        # "unavailable" placeholder, nothing is pinned or switched, and the
+        # route-once label is left unclaimed.
         _native_route_failed = False
         _native_scope = "child_session" if _native_parent_routing_on else "turn"
         # The routed pick in the spelling this pane accepts, or ``None`` when
@@ -4916,9 +4972,22 @@ async def _dispatch_session_event_to_runner_impl(
         ):
             from omnigent.server.smart_routing import route_turn_or_decline
 
-            _harness = _resolve_harness(conv)
+            _harness = _native_pane_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
-            if _user_text:
+            # Cross-family spawns belong to auto-harness sessions: a pinned
+            # session's children stay in its family (the rule the in-harness
+            # spawn gate applies via ``candidate_models(cross_harness=False)``).
+            # This pane already runs another family's CLI, so the parent's
+            # family has no candidate for it and nothing is routed.
+            _native_out_of_family = _out_of_family_spawn_notice(
+                conv, _native_parent_conv, _harness
+            )
+            if _user_text and _native_out_of_family is not None:
+                _native_routed_model, _native_verdict = _unavailable_routing_card(
+                    _native_out_of_family
+                )
+                _native_route_failed = True
+            elif _user_text:
                 _native_runner_client = await _get_runner_client(session_id, runner_router)
                 # This pane's own family decides which router can serve it: off
                 # the gateway the built-in judge routes off the pane's picker
