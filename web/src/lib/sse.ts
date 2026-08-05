@@ -49,6 +49,7 @@ import type {
   SessionStatusEvent,
   SessionModelEvent,
   SessionCollaborationModeEvent,
+  SessionPermissionModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -544,6 +545,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       mode,
     } satisfies SessionCollaborationModeEvent;
+  }
+  if (eventType === "session.permission_mode") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const permissionMode = data.permission_mode;
+    if (typeof permissionMode !== "string" || !permissionMode) return null;
+    return {
+      type: "session_permission_mode",
+      conversationId,
+      permissionMode,
+    } satisfies SessionPermissionModeEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;

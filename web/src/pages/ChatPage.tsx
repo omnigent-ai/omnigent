@@ -181,6 +181,11 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import {
+  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+  claudePermissionModeLabel,
+  isClaudeNativeSession,
+} from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
@@ -1143,6 +1148,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -1378,6 +1384,7 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -1454,6 +1461,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -1892,6 +1900,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
+        showClaudePermissionMode={showClaudePermissionMode}
         showGoalControl={showGoalControl}
         showClaudeGoalControl={showClaudeGoalControl}
         showPollyCodexGoalControl={showPollyCodexGoalControl}
@@ -3527,6 +3536,7 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
+  showClaudePermissionMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -3980,6 +3990,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
+  showClaudePermissionMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -5167,6 +5178,7 @@ export function Composer({
               harnessLabel={harnessLabel}
               showModels={showModels}
               showEffort={showEffort}
+              showClaudePermissionMode={showClaudePermissionMode}
               effortLevels={effortLevels}
               modelPickerKind={modelPickerKind}
               codexModelOptions={codexModelOptions}
@@ -5510,6 +5522,22 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
+ * True when the claude-native permission-mode picker should be visible.
+ *
+ * Claude-native sessions only: the switch drives Claude Code's own
+ * shift+tab cycle, which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session
+ *     or missing labels fails closed.
+ * :returns: True only for sessions running the claude-native wrapper.
+ */
+export function shouldShowClaudePermissionModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
+}
+
+/**
  * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
@@ -5587,6 +5615,7 @@ function SessionConfigModal({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -5597,12 +5626,14 @@ function SessionConfigModal({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
 }) {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
@@ -5631,11 +5662,13 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
+    setDraftPermissionMode(claudePermissionMode);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -5693,6 +5726,10 @@ function SessionConfigModal({
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        // Same pane as /model + /effort, so this must stay in the awaited
+        // sequence rather than firing concurrently.
+        if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
+          await store.setClaudePermissionMode(draftPermissionMode);
       } catch {
         // Individual setters already roll back their optimistic state; a failed
         // PATCH shouldn't wedge the modal open.
@@ -5800,6 +5837,31 @@ function SessionConfigModal({
               </Select>
             </ConfigRow>
           )}
+          {/* Hidden when the mode is unknown — Claude only renders its mode
+              footer in some pane states, and a guess would misreport it. */}
+          {showClaudePermissionMode && claudePermissionMode !== "" && (
+            <ConfigRow label="Permissions" description="How much Claude asks before acting">
+              <Select value={draftPermissionMode} onValueChange={setDraftPermissionMode}>
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-permission-mode"
+                  aria-label="Permission mode"
+                >
+                  <SelectValue>{claudePermissionModeLabel(draftPermissionMode)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
+                    <SelectItem key={mode.value} value={mode.value}>
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
         </div>
 
         <DialogFooter className="border-t-0 bg-transparent">
@@ -5834,6 +5896,7 @@ function ComposerConfigGear({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -5844,6 +5907,7 @@ function ComposerConfigGear({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -5871,7 +5935,7 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible) return null;
+  if (!showModels && !showEffort && !costRoutingEligible && !showClaudePermissionMode) return null;
 
   return (
     <>
@@ -5922,6 +5986,7 @@ function ComposerConfigGear({
         harnessLabel={harnessLabel}
         showModels={showModels}
         showEffort={showEffort}
+        showClaudePermissionMode={showClaudePermissionMode}
         effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
@@ -5934,7 +5999,7 @@ function ComposerConfigGear({
 /**
  * Label/value rows summarizing the session's live run-config, for the gear
  * icon's hover tooltip. Mirrors the new-session summary but with in-session
- * values and no Permissions row (permission mode is launch-time only).
+ * values. The Permissions row lives in the modal itself, not this summary.
  */
 function useSessionConfigSummary({
   harnessLabel,

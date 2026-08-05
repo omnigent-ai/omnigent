@@ -101,6 +101,7 @@ import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
+import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
@@ -388,6 +389,15 @@ export interface ChatState {
    */
   codexPlanMode: boolean;
   /**
+   * Permission mode of a running claude-native session, e.g. ``"auto"``.
+   * Hydrated from ``omnigent.claude_native.permission_mode`` on bind
+   * (falling back to the launch flag) and updated by the composer's mode
+   * picker. Empty string when unknown — a non-Claude session, or a mode set
+   * via ``permissions.defaultMode`` that never reaches the launch args. The
+   * composer hides the picker rather than showing a guessed mode.
+   */
+  claudePermissionMode: string;
+  /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
    * scroll-up `loadMoreHistory` pages older until this goes false.
@@ -635,6 +645,13 @@ export interface ChatState {
    * active conversation.
    */
   setCodexPlanMode: (enabled: boolean) => Promise<void>;
+  /**
+   * Switch a running claude-native session's permission mode (e.g. to
+   * ``"auto"``). Rejects when the live TUI could not reach the mode, so
+   * callers surface the error rather than assuming the switch landed.
+   * No-ops when there is no active conversation.
+   */
+  setClaudePermissionMode: (mode: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -958,6 +975,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessionModelOverride: null,
   costControlModeOverride: null,
   codexPlanMode: false,
+  claudePermissionMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -1663,6 +1681,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sessionModelOverride: null,
         costControlModeOverride: null,
         codexPlanMode: false,
+        claudePermissionMode: "",
         contextWindow: null,
         tokensUsed: null,
         sessionCostUsd: null,
@@ -1862,6 +1881,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch (err) {
       if (get().conversationId === conversationId) {
         set({ codexPlanMode: previous });
+      }
+      throw err;
+    }
+  },
+
+  setClaudePermissionMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().claudePermissionMode;
+    // Optimistic, then reconciled against the mode the server confirms the
+    // pane landed on — which may differ from what was asked.
+    set({ claudePermissionMode: mode });
+    try {
+      const session = await updateSession(conversationId, { claudePermissionMode: mode });
+      if (get().conversationId !== conversationId) return;
+      set({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
+    } catch (err) {
+      if (get().conversationId === conversationId) {
+        set({ claudePermissionMode: previous });
       }
       throw err;
     }
@@ -2168,6 +2206,7 @@ function sessionBindingPatch(
   | "subAgentName"
   | "costControlModeOverride"
   | "codexPlanMode"
+  | "claudePermissionMode"
   | "contextWindow"
   | "gitBranch"
   | "skills"
@@ -2192,6 +2231,9 @@ function sessionBindingPatch(
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
+    claudePermissionMode: isNativeWrapper(wrapper)
+      ? (claudePermissionModeFromSession(session) ?? "")
+      : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
@@ -4301,6 +4343,15 @@ export function handleSessionEvent(event: StreamEvent): void {
       // cannot overwrite the effort picker for the currently-open one.
       useChatStore.setState((s) =>
         s.conversationId === event.conversationId ? { selectedEffort: event.reasoningEffort } : {},
+      );
+      return;
+    case "session_permission_mode":
+      // Pane-driven (in-TUI shift+tab) or UI-driven; either way the server
+      // has confirmed this is the session's live mode.
+      useChatStore.setState((s) =>
+        s.conversationId === event.conversationId
+          ? { claudePermissionMode: event.permissionMode }
+          : {},
       );
       return;
     case "session_collaboration_mode":
