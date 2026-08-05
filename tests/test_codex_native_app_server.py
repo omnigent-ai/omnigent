@@ -884,6 +884,7 @@ def test_user_prompt_submit_carries_the_route_turn_hook(tmp_path: Path) -> None:
         bridge_dir,
         sys.executable,
         user_hooks_source=user_hooks,
+        turn_routing=True,
     )
 
     hooks = json.loads((codex_home / "hooks.json").read_text())["hooks"]

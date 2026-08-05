@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1082,6 +1083,275 @@ async def test_external_routing_client_mints_fresh_token_per_call_from_profile()
     assert captured == ["Bearer tok-1", "Bearer tok-2"]
 
 
+# ── Per-request auth: auth_provider and the ambient SDK chain ──────────────
+#
+# One managed process serves many workspaces, so the credential cannot be bound
+# at construction: ``auth_provider`` is evaluated per route() call and carries
+# the calling identity. The ambient chain covers the other server posture — no
+# profile, no api_key, a workspace credential in the environment — and engages
+# only when the ambient host IS the router host, so an unauthenticated endpoint
+# stays unauthenticated.
+
+
+def _auth_handler(captured: list[str | None]) -> Any:
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.headers.get("Authorization"))
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "m", "harness": "h"}}]},
+        )
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_auth_provider_is_evaluated_on_every_call() -> None:
+    """Per-caller identity: the provider runs per route(), never once."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    tokens = iter(["caller-1", "caller-2"])
+    captured: list[str | None] = []
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v0",
+        auth_provider=lambda: {"Authorization": f"Bearer {next(tokens)}"},
+    )
+    with _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        await client.route("hi", {"h": ["m"]})
+        await client.route("hi again", {"h": ["m"]})
+    assert captured == ["Bearer caller-1", "Bearer caller-2"]
+
+
+@pytest.mark.asyncio
+async def test_auth_provider_wins_over_the_static_auth() -> None:
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
+
+    captured: list[str | None] = []
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v0",
+        auth=_bearer_auth("static-key"),
+        databricks_profile="agent",
+        auth_provider=lambda: {"Authorization": "Bearer per-caller"},
+    )
+    with _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        await client.route("hi", {"h": ["m"]})
+    assert captured == ["Bearer per-caller"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [None, {}, {"Authorization": "  "}])
+async def test_auth_provider_returning_nothing_sends_no_credential(headers: Any) -> None:  # type: ignore[explicit-any]
+    """The provider is the sole authority: no credential means unauthenticated."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
+
+    captured: list[str | None] = []
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v0",
+        auth=_bearer_auth("static-key"),
+        auth_provider=lambda: headers,
+    )
+    with _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        await client.route("hi", {"h": ["m"]})
+    assert captured == [None]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_auth_provider_still_routes() -> None:
+    """A provider that blows up degrades to unauthenticated, not to a failed turn."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def boom() -> dict[str, str]:
+        raise RuntimeError("no identity")
+
+    captured: list[str | None] = []
+    client = ExternalRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", auth_provider=boom
+    )
+    with _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        assert await client.route("hi", {"h": ["m"]}) is not None
+    assert captured == [None]
+
+
+@pytest.mark.asyncio
+async def test_auth_provider_carries_more_than_the_bearer_header() -> None:
+    """A managed provider may need to name the workspace as well as the caller."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(
+            {
+                "authorization": request.headers.get("Authorization"),
+                "workspace": request.headers.get("X-Databricks-Workspace-Id"),
+                "content_type": request.headers.get("Content-Type"),
+            }
+        )
+        return httpx.Response(
+            200, json={"route_selection": [{"route_option": {"model": "m", "harness": "h"}}]}
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v0",
+        auth_provider=lambda: {
+            "Authorization": "Bearer u-1",
+            "X-Databricks-Workspace-Id": "42",
+        },
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        await client.route("hi", {"h": ["m"]})
+    assert captured == {
+        "authorization": "Bearer u-1",
+        "workspace": "42",
+        "content_type": "application/json",
+    }
+
+
+class _AmbientConfig:
+    """Stand-in for a databricks-sdk ``Config`` resolved from the environment."""
+
+    def __init__(self, host: str, token: str = "ambient-tok") -> None:
+        self.host = host
+        self._token = token
+        self.calls = 0
+
+    def authenticate(self) -> dict[str, str]:
+        self.calls += 1
+        return {"Authorization": f"Bearer {self._token}-{self.calls}"}
+
+
+@contextmanager
+def _ambient_sdk(config: Any) -> Any:  # type: ignore[explicit-any]
+    """Patch the SDK ``Config`` the ambient chain builds; ``None`` raises."""
+
+    def factory(**kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        assert not kwargs, "the ambient chain takes no profile"
+        if config is None:
+            raise ValueError("default auth: cannot configure default credentials")
+        return config
+
+    with patch("databricks.sdk.config.Config", factory):
+        yield
+
+
+@pytest.mark.asyncio
+async def test_ambient_credential_is_used_when_it_names_the_router_host() -> None:
+    """No profile, no api_key: the workspace credential in the environment answers."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: list[str | None] = []
+    client = ExternalRoutingClient(
+        base_url="https://ws.example.invalid/ai-gateway/routing/v1", router_name="task_v0"
+    )
+    config = _AmbientConfig("https://ws.example.invalid")
+    with _ambient_sdk(config), _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        await client.route("hi", {"h": ["m"]})
+        await client.route("hi again", {"h": ["m"]})
+    # Re-authenticated per call, so an expiring OAuth token is refreshed.
+    assert captured == ["Bearer ambient-tok-1", "Bearer ambient-tok-2"]
+
+
+@pytest.mark.asyncio
+async def test_ambient_credential_is_withheld_from_another_host() -> None:
+    """The guard: a workspace token never reaches an endpoint off that workspace."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: list[str | None] = []
+    client = ExternalRoutingClient(
+        base_url="https://router.acme.invalid/v1", router_name="task_v0"
+    )
+    config = _AmbientConfig("https://ws.example.invalid")
+    with _ambient_sdk(config), _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        await client.route("hi", {"h": ["m"]})
+        await client.route("hi again", {"h": ["m"]})
+    assert captured == [None, None]
+    # The chain is probed once, not on every call.
+    assert config.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_no_ambient_credential_leaves_the_request_unauthenticated() -> None:
+    """A plain unauthenticated endpoint keeps working when the SDK resolves nothing."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: list[str | None] = []
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _ambient_sdk(None), _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        await client.route("hi", {"h": ["m"]})
+    assert captured == [None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        # Scheme-less and trailing-slash spellings still match the router host.
+        ("ws.example.invalid", "Bearer ambient-tok-1"),
+        ("https://ws.example.invalid/", "Bearer ambient-tok-1"),
+        # A same-suffix host is a DIFFERENT host, not a match.
+        ("https://evil-ws.example.invalid", None),
+        ("", None),
+    ],
+)
+async def test_ambient_host_matching(host: str, expected: str | None) -> None:
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: list[str | None] = []
+    client = ExternalRoutingClient(
+        base_url="https://ws.example.invalid/ai-gateway/routing/v1", router_name="task_v0"
+    )
+    with (
+        _ambient_sdk(_AmbientConfig(host)),
+        _patch_httpx(httpx.MockTransport(_auth_handler(captured))),
+    ):
+        await client.route("hi", {"h": ["m"]})
+    assert captured == [expected]
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_chain_is_skipped_when_any_other_mode_is_configured() -> None:
+    """Explicit config wins; the ambient chain is the last resort only."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
+
+    captured: list[str | None] = []
+    config = _AmbientConfig("https://ws.example.invalid")
+    client = ExternalRoutingClient(
+        base_url="https://ws.example.invalid/v1",
+        router_name="task_v0",
+        auth=_bearer_auth("static-key"),
+    )
+    with _ambient_sdk(config), _patch_httpx(httpx.MockTransport(_auth_handler(captured))):
+        await client.route("hi", {"h": ["m"]})
+    assert captured == ["Bearer static-key"]
+    assert config.calls == 0
+
+
 @pytest.mark.asyncio
 async def test_external_routing_client_records_last_error_on_http_failure() -> None:
     """A 4xx/5xx sets last_error with the gateway's unwrapped message."""
@@ -1987,6 +2257,166 @@ def test_explicit_model_prefixes_win_over_the_settings() -> None:
         )
     assert resolved is not None
     assert resolved.model == "system.ai.gpt-5-6-sol"
+
+
+# ── The frozen router tables are deployment-overridable ───────────────────
+#
+# The arm menus, the served-spelling aliases and the current-generation arms are
+# facts probed against ONE gateway's catalog. A managed deployment fronting a
+# different catalog sets them in its ``routing:`` block; the module constants
+# stay the default so nothing changes for a deployment that names none of them.
+
+
+def test_route_option_source_offers_a_configured_arm_menu() -> None:
+    from omnigent.server.smart_routing import RoutingSettings, route_option_source
+
+    settings = RoutingSettings(menus={"codex": ("acme-large", "acme-small")})
+    options = route_option_source(settings).build_route_options(
+        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+    )
+    # The configured arms are injected and the default task_v1 ones are not.
+    assert [o.model for o in options] == ["gpt-5-4", "acme-large", "acme-small"]
+
+
+def test_a_configured_menu_applies_to_a_router_other_than_task_v1() -> None:
+    """The router-name gate only guards the DEFAULT menu, not a configured one."""
+    from omnigent.server.smart_routing import RoutingSettings, route_option_source
+
+    settings = RoutingSettings(router_name="task_v9", menus={"codex": ("acme-large",)})
+    options = route_option_source(settings).build_route_options(
+        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+    )
+    assert [o.model for o in options] == ["gpt-5-4", "acme-large"]
+
+
+def test_an_unconfigured_menu_stays_off_for_a_router_other_than_task_v1() -> None:
+    from omnigent.server.smart_routing import RoutingSettings, route_option_source
+
+    settings = RoutingSettings(router_name="task_v9")
+    options = route_option_source(settings).build_route_options(
+        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+    )
+    assert [o.model for o in options] == ["gpt-5-4"]
+
+
+def test_an_empty_configured_menu_means_no_arms() -> None:
+    """``menus: {}`` is honoured, not treated as absent."""
+    from omnigent.server.smart_routing import RoutingSettings, route_option_source
+
+    settings = RoutingSettings(menus={})
+    options = route_option_source(settings).build_route_options(
+        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+    )
+    assert [o.model for o in options] == ["gpt-5-4"]
+
+
+def test_a_configured_alias_maps_a_pick_onto_the_served_spelling() -> None:
+    from omnigent.server.smart_routing import RoutePick, RoutingSettings, route_option_source
+
+    settings = RoutingSettings(
+        model_prefixes=("databricks-",),
+        servable_aliases={"gpt-5-6-sol": "acme.serving.sol"},
+    )
+    resolved = route_option_source(settings).resolve_selection(
+        RoutePick(model="gpt-5-6-sol"), ["codex"], {"codex": ["databricks-gpt-5-6-sol"]}
+    )
+    assert resolved is not None
+    assert (resolved.model, resolved.raw_model) == ("acme.serving.sol", "gpt-5-6-sol")
+
+
+def test_apply_servable_alias_reads_the_deployment_table() -> None:
+    from omnigent.server.smart_routing import RoutingSettings, apply_servable_alias
+
+    settings = RoutingSettings(servable_aliases={"gpt-5-6-sol": "acme.serving.sol"})
+    with patch("omnigent.runtime._globals._caps", new=_SettingsCaps(settings)):
+        assert apply_servable_alias("databricks-gpt-5-6-sol") == "acme.serving.sol"
+        # A configured table replaces the default one wholesale.
+        assert apply_servable_alias("databricks-glm-5-2") == "databricks-glm-5-2"
+    assert apply_servable_alias("databricks-glm-5-2") == "system.ai.glm-5-2"
+
+
+def test_infer_models_takes_the_current_generation_arms_from_the_settings() -> None:
+    from omnigent.server.smart_routing import RoutingSettings
+
+    settings = RoutingSettings(current_generation_models={"gpt": ("databricks-acme-1",)})
+    with patch("omnigent.runtime._globals._caps", new=_SettingsCaps(settings)):
+        models = infer_models("codex")
+    assert models is not None
+    assert models[-1] == "databricks-acme-1"
+    assert "databricks-glm-5-2" not in models
+    # The curated cost/capability spread is not a deployment knob.
+    assert models[0] == "databricks-gpt-5-4-nano"
+
+
+def test_task_v1_claude_arms_follows_a_configured_menu() -> None:
+    """The claude-native alias pins can't drift from the deployment's own menu."""
+    from omnigent.server.smart_routing import RoutingSettings, task_v1_claude_arms
+
+    settings = RoutingSettings(menus={"cc": ("acme-opus", "acme-sonnet")})
+    with patch("omnigent.runtime._globals._caps", new=_SettingsCaps(settings)):
+        assert task_v1_claude_arms() == ("acme-opus", "acme-sonnet")
+    assert task_v1_claude_arms() == ("claude-opus-4-8", "claude-sonnet-5")
+
+
+def test_parse_routing_tables_reads_every_table() -> None:
+    from omnigent.reasoning_effort import ModelEffortCaps
+    from omnigent.server.smart_routing import parse_routing_tables
+
+    tables = parse_routing_tables(
+        {
+            "menus": {"cc": ["acme-opus"], "codex": "acme-sol"},
+            "servable_aliases": {"ACME.Sol": "acme.serving.sol"},
+            "current_generation_models": {"gpt": ["acme-sol"]},
+            "effort_caps": {"acme-sol": {"fallback": "medium", "unsupported": ["xhigh", "max"]}},
+        }
+    )
+    assert tables["menus"] == {"cc": ("acme-opus",), "codex": ("acme-sol",)}
+    # Alias keys are the comparison spelling, so a dotted/upper id still matches.
+    assert tables["servable_aliases"] == {"acme-sol": "acme.serving.sol"}
+    assert tables["current_generation_models"] == {"gpt": ("acme-sol",)}
+    assert tables["model_effort_caps"] == ModelEffortCaps(
+        fallback={"acme-sol": "medium"}, unsupported={"acme-sol": frozenset({"xhigh", "max"})}
+    )
+
+
+@pytest.mark.parametrize("cfg", [None, {}, {"router_name": "task_v1"}, {"menus": 5}])
+def test_parse_routing_tables_leaves_absent_or_malformed_tables_at_their_default(
+    cfg: Any,  # type: ignore[explicit-any]
+) -> None:
+    from omnigent.server.smart_routing import parse_routing_tables
+
+    tables = parse_routing_tables(cfg)
+    assert tables["menus"] is None
+    assert tables["servable_aliases"] is None
+    assert tables["current_generation_models"] is None
+    assert tables["model_effort_caps"] is None
+
+
+def test_configured_tables_reach_the_behaviour_through_the_config_block() -> None:
+    """End to end: a ``routing:`` block's tables drive the seam's decisions."""
+    from omnigent.cli import parse_routing_settings
+    from omnigent.server.smart_routing import RoutePick, route_option_source
+
+    settings = parse_routing_settings(
+        {
+            "model_prefix": ["databricks-"],
+            "menus": {"codex": ["acme-sol"]},
+            "servable_aliases": {"acme-sol": "acme.serving.sol"},
+        }
+    )
+    source = route_option_source(settings)
+    catalog = {"codex": ["databricks-gpt-5-4"]}
+    assert [o.model for o in source.build_route_options(["codex"], catalog)] == [
+        "gpt-5-4",
+        "acme-sol",
+    ]
+    # The injected arm is unservable here, so it substitutes — and the pick that
+    # IS servable resolves through the configured alias.
+    resolved = source.resolve_selection(
+        RoutePick(model="acme-sol"), ["codex"], {"codex": ["databricks-acme-sol"]}
+    )
+    assert resolved is not None
+    assert resolved.model == "acme.serving.sol"
 
 
 # ── RoutingSettings parsing (cli) ─────────────────────────────────────────

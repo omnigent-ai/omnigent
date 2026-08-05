@@ -27,11 +27,18 @@ from omnigent.runner.turn_routing import (
     schedule_replay,
     shutdown_session_turn_router,
     start_turn_router,
+    turn_routing_marker_present,
     write_pending_replay,
+    write_turn_routing_marker,
 )
 
 ROUTED_MODEL = "gpt-5.6-luna"
 LAUNCH_MODEL = "gpt-5.6-sol"
+
+
+def _mark(bridge_dir: Path, session_id: str = "conv_1") -> None:
+    """Write the block marker the way the harness hooks write it."""
+    write_turn_routing_marker(bridge_dir, session_id=session_id, decision_id="decision-1")
 
 
 @dataclass
@@ -141,8 +148,15 @@ async def test_the_forwarders_model_mirror_is_not_treated_as_a_pin() -> None:
     assert rec.pinned == [ROUTED_MODEL]
 
 
-async def test_routing_disabled_is_a_non_terminal_no_op() -> None:
-    """The toggle can be flipped mid-session, so the hook must keep asking."""
+async def test_routing_disabled_is_a_terminal_no_op() -> None:
+    """
+    "Routing is off" ends the hook's involvement for this session.
+
+    The hook is only registered for a session that launched with routing on, so
+    this answer means it was turned off afterwards. Left non-terminal, every
+    later prompt paid a full round trip (25s worst case on a degraded server)
+    to be told the same thing.
+    """
     rec = _Recorder()
     decision = await resolve_turn_route(
         "conv_1",
@@ -153,8 +167,10 @@ async def test_routing_disabled_is_a_non_terminal_no_op() -> None:
         persist=rec.persist,
     )
     assert decision.action == "allow"
-    assert decision.terminal is False
+    assert decision.terminal is True
     assert rec.routed == []
+    assert rec.pinned == []
+    assert rec.chips == []
 
 
 async def test_a_routed_parent_routes_its_child() -> None:
@@ -503,7 +519,7 @@ async def test_replay_delivers_the_prompt_through_the_events_path(
     monkeypatch.setattr(turn_routing, "REPLAY_IDLE_WAIT_S", 5.0)
     monkeypatch.setattr(turn_routing, "REPLAY_IDLE_GRACE_S", 0.05)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     client = _FakeServerClient()
     await schedule_replay(
         "conv_1",
@@ -542,7 +558,7 @@ async def test_a_routed_replay_carries_the_model_in_band(
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_IDLE_GRACE_S", 0.05)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     client = _FakeServerClient()
     await schedule_replay(
         "conv_1",
@@ -586,7 +602,7 @@ async def test_replay_waits_for_the_blocked_turn_to_clear(
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_IDLE_WAIT_S", 5.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     active: list[str | None] = ["turn_1", "turn_1", "turn_1", None]
     client = _FakeServerClient()
 
@@ -614,7 +630,7 @@ async def test_replay_delivers_even_if_the_turn_never_clears(
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_IDLE_WAIT_S", 0.2)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     client = _FakeServerClient()
     await schedule_replay(
         "conv_1",
@@ -654,7 +670,7 @@ async def test_a_delivered_replay_clears_the_pending_record(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fast_replay(monkeypatch)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
     await schedule_replay(
         "conv_1",
@@ -673,7 +689,7 @@ async def test_a_failed_delivery_keeps_the_record_for_the_next_launch(
 ) -> None:
     """The routed model is applied but the prompt is not lost."""
     _fast_replay(monkeypatch)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
     await schedule_replay(
         "conv_1",
@@ -710,7 +726,7 @@ async def test_a_hook_that_fell_open_clears_the_record(
 async def test_recovery_replays_a_prompt_a_dead_launch_never_delivered(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
     client = _FakeServerClient(items=[])
     task = schedule_pending_replay_recovery(
@@ -736,10 +752,17 @@ async def test_recovery_replays_a_prompt_a_dead_launch_never_delivered(
 async def test_recovery_does_not_redeliver_a_prompt_that_already_ran(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
     client = _FakeServerClient(
-        items=[{"type": "message", "content": [{"type": "input_text", "text": "hello"}]}]
+        items=[
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            }
+        ]
     )
     task = schedule_pending_replay_recovery(
         "conv_1",
@@ -757,7 +780,7 @@ async def test_recovery_keeps_the_record_when_it_cannot_check_the_session(
     tmp_path: Path,
 ) -> None:
     """An unreadable session is 'unknown' — a double-run is worse than a retry."""
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
     client = _FakeServerClient(items_fail=True)
     task = schedule_pending_replay_recovery(
@@ -795,7 +818,7 @@ async def test_recovery_ignores_another_session_sharing_the_bridge_dir(
     tmp_path: Path,
 ) -> None:
     """A fork inherits the parent's bridge id; its prompt is not ours to send."""
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     write_pending_replay(tmp_path, session_id="conv_other", prompt="hello", blocked_turn_id="t1")
     assert (
         schedule_pending_replay_recovery(
@@ -861,7 +884,7 @@ async def test_replay_switches_the_claude_pane_before_delivering(
     """
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     switched: list[tuple[Path, tuple[str, ...]]] = []
     client = _FakeServerClient()
 
@@ -899,7 +922,7 @@ async def test_replay_still_delivers_when_the_claude_switch_fails(
     """A switch that does not take must not cost the user their prompt."""
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     client = _FakeServerClient()
 
     def _boom(_bridge_dir: Path, *, targets: tuple[str, ...]) -> None:
@@ -940,7 +963,7 @@ async def test_replay_skips_the_switch_for_an_unspeakable_model(
     """
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
         "omnigent.claude_native_bridge.inject_model_selection",
@@ -973,7 +996,7 @@ async def test_replay_leaves_the_model_alone_for_codex(
     """Codex's hook already switched the thread over its app-server RPC."""
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
         "omnigent.claude_native_bridge.inject_model_selection",
@@ -1030,7 +1053,7 @@ async def test_replay_skips_the_switch_when_the_pane_is_already_there(
     """
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+    _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
         "omnigent.claude_native_bridge.read_claude_status_model",
@@ -1227,3 +1250,383 @@ async def test_a_manually_pinned_session_with_routing_on_is_still_hook_routed_on
     )
     assert second.action == "allow"
     assert len(rec.routed) == 1
+
+
+# ── D1: the recovery dedup is a structural compare, not a substring ──
+
+
+@pytest.mark.parametrize(
+    ("case", "prompt"),
+    [
+        ("multiline", "fix the bug\n\nthen run the tests"),
+        ("quote", 'rename "old_name" to new_name'),
+        ("non-ascii", "explain the café heuristic — briefly"),
+        ("backslash", r"match the \d+ in the regex"),
+    ],
+)
+async def test_recovery_does_not_redeliver_an_escaped_prompt_that_already_ran(
+    tmp_path: Path,
+    case: str,
+    prompt: str,
+) -> None:
+    """
+    A prompt whose JSON form is escaped is still recognized as already run.
+
+    The dedup used to ask ``prompt in json.dumps(page)``. Serializing escapes
+    the text — ``\\n``, ``\\"``, ``\\uXXXX``, ``\\\\`` — so the recovery never
+    found the prompt's OWN recorded copy and delivered it a second time. Any
+    prompt with a newline in it (most real ones) got a duplicate first turn on
+    every crash-recovered session.
+    """
+    del case
+    _mark(tmp_path)
+    write_pending_replay(tmp_path, session_id="conv_1", prompt=prompt, blocked_turn_id="t1")
+    client = _FakeServerClient(
+        items=[
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ]
+    )
+
+    task = schedule_pending_replay_recovery(
+        "conv_1", bridge_dir=tmp_path, server_client=client, ready=lambda: True
+    )
+    assert task is not None
+    await task
+
+    assert client.posts == []
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_recovery_still_delivers_a_short_prompt_the_page_merely_mentions(
+    tmp_path: Path,
+) -> None:
+    """
+    A short prompt must not match some unrelated corner of the page.
+
+    ``"continue" in json.dumps(page)`` was true for an assistant's prose, an
+    item id, or a tool argument — so the recovery concluded the prompt had
+    already run and dropped it. The prompt was gone for good: the hook had
+    blocked it, so it was persisted nowhere else, and the marker stopped any
+    later hook from asking again.
+    """
+    _mark(tmp_path)
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="continue", blocked_turn_id="t1")
+    client = _FakeServerClient(
+        items=[
+            {
+                "id": "msg_continue_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Shall I continue with the plan?"}],
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "name": "Bash",
+                "arguments": '{"command": "make continue"}',
+            },
+        ]
+    )
+
+    task = schedule_pending_replay_recovery(
+        "conv_1", bridge_dir=tmp_path, server_client=client, ready=lambda: True
+    )
+    assert task is not None
+    await task
+
+    assert [url for url, _body in client.posts] == ["/v1/sessions/conv_1/events"]
+    assert client.posts[0][1]["data"]["content"][0]["text"] == "continue"
+
+
+async def test_recovery_matches_only_the_whole_prompt_on_a_user_message(
+    tmp_path: Path,
+) -> None:
+    """A user message that merely CONTAINS the prompt is not the prompt."""
+    _mark(tmp_path)
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="ship it", blocked_turn_id="t1")
+    client = _FakeServerClient(
+        items=[
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "review the diff then ship it"}],
+            }
+        ]
+    )
+
+    task = schedule_pending_replay_recovery(
+        "conv_1", bridge_dir=tmp_path, server_client=client, ready=lambda: True
+    )
+    assert task is not None
+    await task
+
+    assert len(client.posts) == 1
+
+
+# ── D2: a pick equal to the live model is a terminal no-op ───────────
+
+
+@pytest.mark.parametrize(
+    ("case", "live_model", "routed_model"),
+    [
+        # Codex reports its live model as a dotted slug; the catalog uses
+        # dashes and a prefix. A raw ``==`` never matched.
+        ("codex-slug-vs-catalog-id", "gpt-5.6-luna", "databricks-gpt-5-6-luna"),
+        ("codex-catalog-id-vs-slug", "databricks-gpt-5-6-luna", "gpt-5.6-luna"),
+        # Claude's live model comes off the statusLine snapshot, which may or
+        # may not carry the catalog prefix (or a ``[1m]`` suffix).
+        ("claude-bare-vs-prefixed", "claude-sonnet-5", "databricks-claude-sonnet-5"),
+        ("claude-prefixed-vs-bare", "databricks-claude-sonnet-5", "claude-sonnet-5"),
+        ("claude-long-context-suffix", "databricks-claude-sonnet-5[1m]", "claude-sonnet-5"),
+        # And the identical-spelling case, which did already work.
+        ("identical", "gpt-5.6-luna", "gpt-5.6-luna"),
+    ],
+)
+async def test_a_pick_equal_to_the_live_model_is_allowed_not_blocked(
+    case: str,
+    live_model: str,
+    routed_model: str,
+) -> None:
+    """
+    Nothing to switch means nothing to block and nothing to replay.
+
+    The old code logged "already on routed model" and then fell through to
+    ``action="route"`` anyway: the hook blocked the prompt, the runner replayed
+    it, and the user watched their first turn vanish and come back — for a
+    switch onto the model the pane was already running. The comparison was also
+    on raw spellings, so it never fired for codex at all.
+    """
+    del case
+    rec = _Recorder()
+
+    async def _route(harness: str | None, prompt: str) -> tuple[str | None, dict[str, Any]]:
+        rec.routed.append((harness, prompt))
+        return routed_model, {"rationale": "cheap lookup", "model": routed_model}
+
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(model=live_model),
+        conv=_FakeConv(),
+        route_turn=_route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+
+    # Allowed, so the hook fast-paths: no block, and the relay arms no replay.
+    assert decision.action == "allow"
+    # Terminal AND naming the pick, so the chip and the marker agree with it.
+    assert decision.terminal is True
+    assert decision.model == routed_model
+    assert decision.rationale == "cheap lookup"
+    # The decision row and the pin still land — they are the route-once gate.
+    assert rec.pinned == [routed_model]
+    assert [model for model, _verdict in rec.chips] == [routed_model]
+
+
+async def test_a_no_op_verdict_arms_no_replay(tmp_path: Path) -> None:
+    """The relay only owes a replay for a verdict that blocked something."""
+    client = _FakeServerClient(
+        verdict={
+            "action": "allow",
+            "model": ROUTED_MODEL,
+            "rationale": "already there",
+            "terminal": True,
+        }
+    )
+
+    decision = await make_server_relay_resolver(client, bridge_dir=tmp_path)("conv_1", _request())
+
+    assert decision.action == "allow"
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_the_no_op_verdicts_decision_row_closes_the_gate() -> None:
+    """The label the no-op wrote is what stops the next prompt re-routing."""
+    rec = _Recorder()
+    conv = _FakeConv()
+
+    async def _route(harness: str | None, prompt: str) -> tuple[str | None, dict[str, Any]]:
+        rec.routed.append((harness, prompt))
+        return LAUNCH_MODEL, {"rationale": "cheap lookup", "model": LAUNCH_MODEL}
+
+    first = await resolve_turn_route(
+        "conv_1",
+        _request(model=LAUNCH_MODEL),
+        conv=conv,
+        route_turn=_route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert first.action == "allow"
+    # What the server writes once the decision persists.
+    conv.labels.update(_routed_labels())
+
+    second = await resolve_turn_route(
+        "conv_1",
+        _request(turn_id="turn_2", model=LAUNCH_MODEL),
+        conv=conv,
+        route_turn=_route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert second.action == "allow"
+    assert len(rec.routed) == 1
+
+
+# ── D4: the block marker is scoped to the session that wrote it ──────
+
+
+def test_a_clear_rotation_can_route_again_while_the_same_session_still_skips(
+    tmp_path: Path,
+) -> None:
+    """
+    A bridge dir outlives the conversation keyed on it.
+
+    ``/clear`` re-keys the superseded session to ``{id}-cleared`` and hands the
+    SAME live dir to a brand-new conversation, and a fork inherits its parent's
+    bridge id. A bare marker file therefore made every later conversation in
+    the pane fast-skip on a verdict that was never theirs: after one routed
+    first message, nothing in that pane could ever route again, and the routing
+    it never got was attributed to the old session id.
+
+    Scope: this covers the marker, which is the only gate that was silently
+    wrong. Whether the replacement conversation then GETS routed is decided by
+    the server — and the ``/clear`` rotation currently copies the old session's
+    labels (routing-decision id included) while dropping its
+    ``cost_control_mode_override``, so today the answer is a truthful, recorded
+    "no" instead of a silent skip.
+    """
+    write_turn_routing_marker(tmp_path, session_id="conv_old", decision_id="decision-1")
+
+    # The session that wrote it still skips — route-once is untouched.
+    assert turn_routing_marker_present(tmp_path, "conv_old") is True
+    # The /clear replacement, and a fork, each get their own first-message
+    # routing rather than inheriting the old verdict.
+    assert turn_routing_marker_present(tmp_path, "conv_new") is False
+    assert turn_routing_marker_present(tmp_path, "conv_old-cleared") is False
+    # And the decision it belongs to is on disk for diagnosis.
+    assert json.loads((tmp_path / MARKER_FILE).read_text())["decision_id"] == "decision-1"
+
+
+def test_a_marker_predating_the_scoping_reads_as_absent(tmp_path: Path) -> None:
+    """A bare marker costs one round trip, which the server then declines.
+
+    Route-once cannot regress on it: the authoritative gate is the session's
+    routing-decision label, never this file.
+    """
+    (tmp_path / MARKER_FILE).write_text("", encoding="utf-8")
+
+    assert turn_routing_marker_present(tmp_path, "conv_1") is False
+    assert turn_routing.turn_routing_marker_session(tmp_path) is None
+
+
+async def test_a_replay_waits_for_its_own_marker_not_a_forks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another session's marker is not the confirmation that WE blocked."""
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 0.2)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    _mark(tmp_path, session_id="conv_other")
+    client = _FakeServerClient()
+
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id="turn_1",
+        server_client=client,
+        idle=lambda _turn: True,
+    )
+
+    assert client.posts == []
+
+
+async def test_recovery_ignores_a_marker_another_session_left_behind(
+    tmp_path: Path,
+) -> None:
+    """
+    The fork-shared-dir guard now covers the marker too.
+
+    The pending record was already session-checked; the marker beside it was
+    not, so a fork's marker made our own recovery look confirmed.
+    """
+    _mark(tmp_path, session_id="conv_other")
+    write_pending_replay(tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id="t1")
+
+    assert (
+        schedule_pending_replay_recovery(
+            "conv_1",
+            bridge_dir=tmp_path,
+            server_client=_FakeServerClient(items=[]),
+            ready=lambda: True,
+        )
+        is None
+    )
+    # No marker of ours means the hook fell open, so nothing is owed.
+    assert read_pending_replay(tmp_path) is None
+
+
+# ── H2: a session that cannot route pays nothing per prompt ──────────
+
+
+async def test_no_turn_router_is_started_for_a_session_with_routing_off(tmp_path: Path) -> None:
+    """
+    No advertisement is the switch that keeps the hook unregistered.
+
+    Installed unconditionally, the hook put a routing round trip (25s worst
+    case on a degraded server) in front of every submit of every native
+    session, only ever to be told the session does not route.
+    """
+    router = ensure_session_turn_router(
+        "conv_off",
+        bridge_dir=tmp_path,
+        server_client=_FakeServerClient(),
+        harness="codex-native",
+        routing_enabled=False,
+    )
+    try:
+        assert router is None
+        assert not (tmp_path / ADVERTISEMENT_FILE).exists()
+    finally:
+        shutdown_session_turn_router("conv_off", router)
+
+
+# ── H4: every hook budget is strictly outside the call it waits on ───
+
+
+def test_the_subagent_hook_budget_is_strictly_outside_its_request_budget() -> None:
+    """
+    A hook killed the instant its HTTP call gives up never fails open.
+
+    ``claude-sdk`` registered its ``PreToolUse`` routing hook with the router
+    call's OWN timeout, so the SDK could cancel the hook at the same moment the
+    request timed out and the harness saw a dead hook instead of "no opinion".
+    The other two paths already carried headroom.
+    """
+    from omnigent.inner.codex_executor import _CODEX_ROUTER_HOOK_TIMEOUT_SECONDS
+    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S, REQUEST_TIMEOUT_S
+    from omnigent.runner.subagent_routing import RELAY_TIMEOUT_S
+
+    assert HOOK_TIMEOUT_S > REQUEST_TIMEOUT_S > RELAY_TIMEOUT_S
+    # And the harness entries that register a budget agree with it.
+    assert _CODEX_ROUTER_HOOK_TIMEOUT_SECONDS >= HOOK_TIMEOUT_S
+
+
+def test_the_claude_sdk_spawn_hook_is_registered_outside_its_own_request() -> None:
+    """The in-process claude-sdk hook reads the outer constant, not the inner."""
+    import inspect
+
+    from omnigent.inner import claude_sdk_executor
+    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S, REQUEST_TIMEOUT_S
+
+    source = inspect.getsource(claude_sdk_executor)
+    assert "timeout=subagent_router.HOOK_TIMEOUT_S" in source
+    assert "timeout=subagent_router.REQUEST_TIMEOUT_S" not in source
+    assert HOOK_TIMEOUT_S > REQUEST_TIMEOUT_S

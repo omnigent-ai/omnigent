@@ -1979,8 +1979,11 @@ class ClaudeSDKExecutor(Executor):
         entries.append(
             hook_matcher_cls(
                 matcher=subagent_router.AGENT_TOOL_MATCHER,
+                # Strictly outside the router call's own HTTP budget: equal
+                # numbers let the SDK cancel the hook at the same instant its
+                # request gives up, so the fail-open branch never ran.
+                timeout=subagent_router.HOOK_TIMEOUT_S,
                 hooks=[route_spawn],
-                timeout=subagent_router.REQUEST_TIMEOUT_S,
             )
         )
         hooks["PreToolUse"] = entries

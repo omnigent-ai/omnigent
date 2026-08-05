@@ -28,6 +28,11 @@ import sqlalchemy as sa
 from omnigent.db.db_models import SqlConversation
 from omnigent.db.utils import generate_agent_id
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, ROUTING_DECISION_LABEL_KEY
+from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes._sessions.common import (
+    get_server_host_registry,
+    set_server_host_registry,
+)
 from omnigent.server.routes._sessions.orchestration import (
     _installed_native_harnesses,
     _pre_session_model_catalog,
@@ -44,6 +49,9 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import Host
 from tests.server.helpers import FakeCaps, FakeRoutingClient, create_test_agent
+
+# Uuid-shaped so the registry's canonical keying accepts it.
+_GATEWAY_HOST_ID = "aa11bb22cc33dd44ee55ff6677889900"
 
 # Names ``init_runtime`` (via the shared ``runtime_init`` fixture) rebinds and
 # never restores.
@@ -828,17 +836,15 @@ async def test_no_installed_native_candidates_reports_the_standard_error() -> No
 
 def _host(
     readiness: dict[str, Any] | None,  # type: ignore[explicit-any]
-    gateway: dict[str, bool] | None = None,
 ) -> Host:
     return Host(
-        host_id="host_1",
+        host_id=_GATEWAY_HOST_ID,
         name="dev",
         user_id="alice@example.com",
         status="online",
         created_at=0,
         updated_at=0,
         configured_harnesses=readiness,
-        gateway_inference=gateway,
     )
 
 
@@ -867,36 +873,75 @@ def test_installed_native_harnesses_follows_host_readiness(
 #
 # Routing rewrites the launch model to a gateway catalog id, so a pane whose CLI
 # resolves credentials somewhere else (a personal Claude/ChatGPT subscription,
-# Bedrock) cannot run the pick. The host reports that per family as
-# ``gateway_inference``; only an explicit ``False`` gates, so an older host that
-# reports nothing keeps every option.
+# Bedrock) cannot run the pick. The host reports that per family on its connect
+# handshake and the server holds the map in memory; only an explicit ``False``
+# gates, so a host that has reported nothing keeps every option.
+
+
+@pytest.fixture(autouse=True)
+def gateway_host_registry() -> Iterator[HostRegistry]:
+    """Install a fresh process-global host registry, as app startup does.
+
+    Gateway backing is reported on the host's connect handshake and held here,
+    so a test with no report models a replica that has not heard from the host.
+    """
+    registry = HostRegistry()
+    set_server_host_registry(registry)
+    try:
+        yield registry
+    finally:
+        set_server_host_registry(None)
+
+
+def _host_reporting(gateway: dict[str, bool] | None) -> Host:
+    """A host row whose gateway map is already reported to the live registry.
+
+    :param gateway: The map the host reported, or ``None`` for no report.
+    :returns: The matching host row.
+    """
+    registry = get_server_host_registry()
+    assert registry is not None
+    registry.record_gateway_inference(_GATEWAY_HOST_ID, gateway)
+    return _host(None)
 
 
 @pytest.mark.parametrize(
-    ("host", "expected"),
+    ("gateway", "expected"),
     [
-        (_host(None, {"claude-native": True, "codex-native": True}), []),
+        ({"claude-native": True, "codex-native": True}, []),
         # Claude Code on the gateway, Codex on a ChatGPT subscription.
-        (_host(None, {"claude-native": True, "codex-native": False}), ["codex-native"]),
+        ({"claude-native": True, "codex-native": False}, ["codex-native"]),
         (
-            _host(None, {"claude-native": False, "codex-native": False}),
+            {"claude-native": False, "codex-native": False},
             AUTO_NATIVE_ROUTING_HARNESSES,
         ),
         # Reversed spellings resolve to the same family.
-        (_host(None, {"native-codex": False}), ["codex-native"]),
-        # Unknown is not "unavailable": an older host, an unevaluable family,
-        # and no host at all all keep both arms.
-        (_host(None, {"claude-native": True}), []),
-        (_host(None, None), []),
+        ({"native-codex": False}, ["codex-native"]),
+        # Unknown is not "unavailable": a partial report, a host that reported
+        # nothing, and no host at all all keep both arms.
+        ({"claude-native": True}, []),
         (None, []),
     ],
 )
-def test_ungatewayed_native_harnesses_reads_the_hosts_gateway_map(
-    host: Host | None, expected: list[str]
+def test_ungatewayed_native_harnesses_reads_the_reported_gateway_map(
+    gateway: dict[str, bool] | None,
+    expected: list[str],
+    gateway_host_registry: HostRegistry,
 ) -> None:
     from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
 
-    assert _ungatewayed_native_harnesses(host, AUTO_NATIVE_ROUTING_HARNESSES) == list(expected)
+    gateway_host_registry.record_gateway_inference(_GATEWAY_HOST_ID, gateway)
+    assert _ungatewayed_native_harnesses(_host(None), AUTO_NATIVE_ROUTING_HARNESSES) == list(
+        expected
+    )
+
+
+def test_ungatewayed_native_harnesses_without_a_host(
+    gateway_host_registry: HostRegistry,
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
+
+    assert _ungatewayed_native_harnesses(None, AUTO_NATIVE_ROUTING_HARNESSES) == []
 
 
 def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
@@ -932,7 +977,7 @@ async def test_auto_routing_is_refused_when_no_router_can_serve_an_off_gateway_a
     with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=False)):
         agent_name, model, verdict, error = await _resolve_native_smart_routing(
             cast("Any", body),
-            cast("Any", _routing_request(_host(None, gateway))),
+            cast("Any", _routing_request(_host_reporting(gateway))),
             "alice@example.com",
         )
 
@@ -979,7 +1024,7 @@ async def test_auto_routing_falls_back_to_the_built_in_judge_off_the_gateway(
     ):
         agent_name, model, verdict, error = await orchestration._resolve_native_smart_routing(
             cast("Any", body),
-            cast("Any", _routing_request(_host(None, gateway))),
+            cast("Any", _routing_request(_host_reporting(gateway))),
             "alice@example.com",
         )
 
@@ -1004,7 +1049,7 @@ async def test_auto_routing_declines_off_the_gateway_when_the_host_answers_nothi
     with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=True)):
         agent_name, model, verdict, error = await orchestration._resolve_native_smart_routing(
             cast("Any", body),
-            cast("Any", _routing_request(_host(None, {"codex-native": False}))),
+            cast("Any", _routing_request(_host_reporting({"codex-native": False}))),
             "alice@example.com",
         )
 
@@ -1023,7 +1068,7 @@ async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() ->
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
         agent_name, model, _verdict, error = await _resolve_native_smart_routing(
             cast("Any", body),
-            cast("Any", _routing_request(_host(None, None))),
+            cast("Any", _routing_request(_host_reporting(None))),
             "alice@example.com",
         )
 
@@ -1039,7 +1084,7 @@ async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_ser
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
-    ungatewayed = _host(None, {"claude-native": True, "codex-native": False})
+    ungatewayed = _host_reporting({"claude-native": True, "codex-native": False})
     with patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed):
         created = await _create_smart_routing_session(client, wrappers, routing_client, oss=False)
 
@@ -1058,7 +1103,7 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
     routing_client = FakeRoutingClient(
         RoutingResult(model="gpt-5-5", rationale="narrow change", harness="codex-native")
     )
-    ungatewayed = _host(None, {"claude-native": True, "codex-native": False})
+    ungatewayed = _host_reporting({"claude-native": True, "codex-native": False})
     with (
         patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed),
         patch.object(
@@ -1087,7 +1132,7 @@ async def test_fixed_harness_routing_create_is_rejected_when_no_router_can_serve
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
-    ungatewayed = _host(None, {harness: False})
+    ungatewayed = _host_reporting({harness: False})
     with patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed):
         created = await _create_fixed_harness_session(
             client, wrappers[harness], routing_client, oss=False
@@ -1110,7 +1155,7 @@ async def test_fixed_harness_routing_create_succeeds_off_the_gateway_with_the_ju
     wrappers = await _native_wrappers(client, db_uri)
     pick = _OFF_GATEWAY_CATALOG[harness][0]
     routing_client = FakeRoutingClient(RoutingResult(model=pick, rationale="sized task"))
-    ungatewayed = _host(None, {harness: False})
+    ungatewayed = _host_reporting({harness: False})
     with (
         patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed),
         patch.object(
@@ -1152,7 +1197,7 @@ async def test_fixed_harness_create_is_allowed_when_its_own_family_is_backed(
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
     with patch.object(
-        orchestration, "_routing_host_for_create", return_value=_host(None, gateway)
+        orchestration, "_routing_host_for_create", return_value=_host_reporting(gateway)
     ):
         created = await _create_fixed_harness_session(
             client, wrappers["claude-native"], routing_client, **extra
@@ -1176,7 +1221,7 @@ async def test_child_create_is_not_gated_by_the_parents_gateway_state(
     with patch.object(
         orchestration,
         "_routing_host_for_create",
-        return_value=_host(None, {"codex-native": False}),
+        return_value=_host_reporting({"codex-native": False}),
     ):
         created = await _create_fixed_harness_session(
             client,
@@ -1200,7 +1245,7 @@ async def test_sdk_harness_create_is_not_gated_by_native_gateway_state(
     with patch.object(
         orchestration,
         "_routing_host_for_create",
-        return_value=_host(None, {"claude-native": False, "codex-native": False}),
+        return_value=_host_reporting({"claude-native": False, "codex-native": False}),
     ):
         created = await _create_fixed_harness_session(client, agent["id"], None)
 

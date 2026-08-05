@@ -1274,13 +1274,6 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
-    :param gateway_inference: JSON-encoded per-harness map of whether that
-        family's launch on the host resolves AI-Gateway-backed inference, e.g.
-        ``'{"claude-native": true, "codex": false}'``. A family the host could
-        not evaluate is omitted; ``NULL`` means the host never reported the map
-        (older host build) — unknown, not "nothing is gateway-backed".
-        Surfaced via ``GET /v1/hosts`` so the web UI only offers Smart Routing
-        where the routing apply layer can work.
     """
 
     __tablename__ = "hosts"
@@ -1310,8 +1303,6 @@ class SqlHost(OmnigentBase):
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
-    # Opaque; never SQL-filtered — stored compressed (CompressedText).
-    gateway_inference: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
     __table_args__ = (
         CheckConstraint(

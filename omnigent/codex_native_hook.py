@@ -219,9 +219,11 @@ def _main_route_turn(argv: list[str]) -> int:
     ``UserPromptSubmit`` command alongside the policy gate. On every
     prompt submit, in order:
 
-    1. Fast skip on ``<bridge_dir>/turn_routing_done`` — no output, no
-       network. The authoritative gate is the endpoint's
-       ``model_override`` check; this file only saves the round trip.
+    1. Fast skip on ``<bridge_dir>/turn_routing_done`` **when it names this
+       session** — no output, no network. The authoritative gate is the
+       endpoint's routing-decision check; this file only saves the round
+       trip, and a marker another conversation in the same bridge dir wrote
+       is not ours to skip on.
     2. POST ``{session_id, prompt, harness, turn_id, model}`` to the
        advertised loopback ``route-turn`` endpoint. ``model`` comes from
        the hook payload, which tracks the LIVE thread model —
@@ -244,9 +246,9 @@ def _main_route_turn(argv: list[str]) -> int:
     from omnigent.runner.turn_routing import (
         ADVERTISEMENT_FILE,
         HOOK_REQUEST_TIMEOUT_S,
-        MARKER_FILE,
         ROUTE_PATH_TEMPLATE,
         trace_turn_routing,
+        turn_routing_marker_present,
     )
 
     parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook route-turn")
@@ -259,9 +261,6 @@ def _main_route_turn(argv: list[str]) -> int:
     # session that "just never routed" is otherwise indistinguishable from
     # one the harness never fired the hook for at all.
     raw = sys.stdin.read()
-    if (bridge_dir / MARKER_FILE).exists():
-        trace_turn_routing(bridge_dir, "skip", "marker present")
-        return 0
 
     try:
         payload = json.loads(raw or "{}")
@@ -288,6 +287,14 @@ def _main_route_turn(argv: list[str]) -> int:
         trace_turn_routing(bridge_dir, "fail-open", "no session id to route")
         return 0
 
+    # The marker is checked here, after the session id is known, because it is
+    # scoped to a session: this bridge dir is shared with whichever
+    # conversation a ``/clear`` rotation or a fork left behind, and their
+    # verdict is not ours. Still zero network on the fast path.
+    if turn_routing_marker_present(bridge_dir, session_id):
+        trace_turn_routing(bridge_dir, "skip", "marker present")
+        return 0
+
     body = {
         "harness": args.harness,
         "prompt": prompt,
@@ -312,8 +319,10 @@ def _main_route_turn(argv: list[str]) -> int:
             f"(terminal={bool(decision.get('terminal'))})",
         )
         if decision.get("terminal"):
-            # Nothing will route this session again, so stop asking.
-            _write_marker(bridge_dir / MARKER_FILE)
+            # Nothing will route this session again, so stop asking. Covers the
+            # no-op verdict too (the pick equals the live model): terminal and
+            # unblocking, so the prompt runs where it already was.
+            _write_marker(bridge_dir, session_id, decision)
         return 0
 
     if not _apply_thread_model(bridge_dir, model):
@@ -331,7 +340,7 @@ def _main_route_turn(argv: list[str]) -> int:
     # Marker after the switch and before the block, so its presence means
     # both "the routed model is applied" and "this prompt was dropped, you
     # owe it a replay".
-    if not _write_marker(bridge_dir / MARKER_FILE):
+    if not _write_marker(bridge_dir, session_id, decision):
         trace_turn_routing(bridge_dir, "fail-open", "could not write the block marker")
         return 0
     trace_turn_routing(bridge_dir, "route", f"blocked and switched to {model}")
@@ -358,22 +367,30 @@ def _payload_str(payload: dict[str, object], key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _write_marker(path: Path) -> bool:
+def _write_marker(bridge_dir: Path, session_id: str, decision: dict[str, object]) -> bool:
     """
-    Write the turn-routing marker file.
+    Write the session-scoped turn-routing marker file.
 
-    :param path: Marker path, ``<bridge_dir>/turn_routing_done``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param session_id: Session the verdict belongs to — a later conversation
+        sharing this dir must not fast-skip on it.
+    :param decision: The verdict, for its ``decision_id``.
     :returns: ``True`` when the marker is on disk.
     """
-    try:
-        path.write_text("", encoding="utf-8")
-    except OSError:
-        print(
-            f"omnigent codex route-turn hook: could not write {path}",
-            file=sys.stderr,
-        )
-        return False
-    return True
+    from omnigent.runner.turn_routing import write_turn_routing_marker
+
+    decision_id = decision.get("decision_id")
+    if write_turn_routing_marker(
+        bridge_dir,
+        session_id=session_id,
+        decision_id=decision_id if isinstance(decision_id, str) else None,
+    ):
+        return True
+    print(
+        f"omnigent codex route-turn hook: could not write the marker in {bridge_dir}",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _post_json(

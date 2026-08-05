@@ -75,11 +75,6 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
-    :param gateway_inference: Per-harness flag for whether that family's
-        launch on the host resolves AI-Gateway-backed inference, e.g.
-        ``{"claude-native": True, "codex": False}``. A family the host could
-        not evaluate is omitted; ``None`` means the host never reported the
-        map at all (older build) — unknown, not "nothing is gateway-backed".
     """
 
     host_id: str
@@ -91,7 +86,6 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
-    gateway_inference: dict[str, bool] | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -143,32 +137,6 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
     return {k: v for k, v in parsed.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
-def _parse_gateway_inference(raw: str | None) -> dict[str, bool] | None:
-    """
-    Parse the JSON-encoded ``hosts.gateway_inference`` column.
-
-    Tolerant like :func:`_parse_configured_harnesses`: ``NULL``, malformed
-    JSON, or a non-object payload map to ``None`` ("unknown"), and entries
-    whose value is not a bool are dropped, so a corrupt value never breaks
-    host listing.
-
-    :param raw: The raw column value, e.g. ``'{"claude-native": true}'`` or
-        ``None``.
-    :returns: The gateway-inference map, or ``None`` when absent or
-        unparseable.
-    """
-    if raw is None:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        _logger.warning("Ignoring malformed hosts.gateway_inference value")
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, bool)}
-
-
 def _row_to_host(row: SqlHost) -> Host:
     """
     Convert a :class:`SqlHost` ORM row to a :class:`Host` entity.
@@ -186,7 +154,6 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
-        gateway_inference=_parse_gateway_inference(row.gateway_inference),
     )
 
 
@@ -235,7 +202,6 @@ class HostStore:
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
-        gateway_inference: dict[str, bool] | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -275,18 +241,11 @@ class HostStore:
             Written on every connect — including ``None`` from an older
             host that doesn't report it, which correctly resets any
             stale value back to "unknown".
-        :param gateway_inference: Per-harness AI-Gateway-backed inference flags
-            from the host's ``host.hello`` frame, e.g.
-            ``{"claude-native": True}``. Written on every connect, including
-            ``None`` from a host that doesn't report it.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
-        )
-        gateway_inference_json = (
-            json.dumps(gateway_inference) if gateway_inference is not None else None
         )
         with self._session("upsert_host_on_connect") as session:
             # Primary lookup: by (workspace_id, host_id) — the new PK.
@@ -308,7 +267,6 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
-                row.gateway_inference = gateway_inference_json
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -323,7 +281,6 @@ class HostStore:
                     name=name,
                     user_id=user_id,
                     configured_harnesses_json=harnesses_json,
-                    gateway_inference_json=gateway_inference_json,
                 )
                 if reowned is not None:
                     return reowned
@@ -346,7 +303,6 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
-                    gateway_inference_json,
                 )
                 return _row_to_host(row)
 
@@ -359,7 +315,6 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
-                gateway_inference=gateway_inference_json,
             )
             session.add(row)
             return _row_to_host(row)
@@ -371,7 +326,6 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
-        gateway_inference_json: str | None = None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -392,8 +346,6 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
-        :param gateway_inference_json: JSON-encoded gateway-inference map, or
-            None when the host didn't report it.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -447,7 +399,6 @@ class HostStore:
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
             configured_harnesses=harnesses_json,
-            gateway_inference=gateway_inference_json,
         )
         session.add(new_row)
         session.flush()
@@ -473,7 +424,6 @@ class HostStore:
         name: str,
         user_id: str,
         configured_harnesses_json: str | None = None,
-        gateway_inference_json: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -498,9 +448,6 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
-        :param gateway_inference_json: JSON-encoded gateway-inference map from
-            the connecting host's hello, e.g. ``'{"claude-native": true}'``, or
-            ``None`` when unreported.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -525,7 +472,6 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
-                gateway_inference=gateway_inference_json,
             )
         )
         return Host(
@@ -538,7 +484,6 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
-            gateway_inference=_parse_gateway_inference(gateway_inference_json),
         )
 
     def set_offline(self, host_id: str) -> None:
@@ -565,15 +510,11 @@ class HostStore:
         self,
         host_id: str,
         configured_harnesses: dict[str, HarnessAvailability],
-        gateway_inference: dict[str, bool] | None = None,
     ) -> None:
         """Replace a connected host's live per-harness readiness map.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param configured_harnesses: Current readiness keyed by harness spelling.
-        :param gateway_inference: Current per-harness AI-Gateway-backed
-            inference flags, or ``None`` when the host didn't report them
-            (stored as NULL, i.e. "unknown").
         """
         with self._session("update_harness_readiness") as session:
             session.execute(
@@ -584,9 +525,6 @@ class HostStore:
                 )
                 .values(
                     configured_harnesses=json.dumps(configured_harnesses),
-                    gateway_inference=(
-                        json.dumps(gateway_inference) if gateway_inference is not None else None
-                    ),
                     updated_at=now_epoch(),
                 )
             )

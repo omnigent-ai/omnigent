@@ -604,10 +604,10 @@ def test_route_turn_fast_skips_on_the_marker(
     re-fires ``UserPromptSubmit``, and a second block there would drop the
     routed turn.
     """
-    from omnigent.runner.turn_routing import MARKER_FILE
+    from omnigent.runner.turn_routing import write_turn_routing_marker
 
     _advertise_turn_router(bridge_dir)
-    (bridge_dir / MARKER_FILE).write_text("", encoding="utf-8")
+    write_turn_routing_marker(bridge_dir, session_id="conv_active", decision_id="d1")
     monkeypatch.setattr(
         codex_native_hook,
         "_post_json",
@@ -1045,3 +1045,108 @@ def test_apply_thread_model_pages_the_catalog(
         "thread/settings/update",
         {"threadId": "thread_abc", "model": "gpt-5.6-luna"},
     )
+
+
+def test_route_turn_ignores_a_marker_another_session_left_in_the_dir(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``/clear`` rotation hands this dir to a NEW conversation.
+
+    The old session's marker must not make the new one fast-skip: it would
+    never route its first message, and the routing it never got would be
+    attributed to the superseded session id.
+    """
+    from omnigent.runner.turn_routing import turn_routing_marker_session, write_turn_routing_marker
+
+    _advertise_turn_router(bridge_dir)
+    write_turn_routing_marker(bridge_dir, session_id="conv_superseded", decision_id="d0")
+    asked: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        del token, body, timeout
+        asked.append(url)
+        return {"action": "allow", "rationale": "already pinned", "terminal": True}
+
+    monkeypatch.setattr(codex_native_hook, "_post_json", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    # It asked, and the terminal answer re-keyed the marker onto THIS session.
+    assert asked == ["http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"]
+    assert turn_routing_marker_session(bridge_dir) == "conv_active"
+
+
+def test_route_turn_writes_a_session_scoped_marker_on_a_terminal_no_op(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The marker names the session and the decision it belongs to."""
+    from omnigent.runner.turn_routing import MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    monkeypatch.setattr(
+        codex_native_hook,
+        "_post_json",
+        lambda *args, **kwargs: {
+            "action": "allow",
+            "rationale": "smart routing is off for this session",
+            "terminal": True,
+            "decision_id": "decision-7",
+        },
+    )
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+
+    marker = json.loads((bridge_dir / MARKER_FILE).read_text(encoding="utf-8"))
+    assert marker["session_id"] == "conv_active"
+    assert marker["decision_id"] == "decision-7"
+
+
+def test_route_turn_is_not_registered_for_a_session_that_cannot_route(
+    tmp_path: Path,
+) -> None:
+    """
+    A routing-off session's ``hooks.json`` carries no route-turn command.
+
+    Registered unconditionally, every submit of every codex-native session paid
+    the hook's routing round trip (25s worst case on a degraded server) only to
+    be told the session does not route. The policy gate stays, unaffected.
+    """
+    from omnigent.codex_native_app_server import _codex_policy_hooks_settings
+
+    off = _codex_policy_hooks_settings(tmp_path, sys.executable, turn_routing=False)
+    commands = [
+        hook["command"] for entry in off["hooks"]["UserPromptSubmit"] for hook in entry["hooks"]
+    ]
+    assert not any("route-turn" in command for command in commands)
+    assert any("evaluate-policy" in command for command in commands)
+
+    on = _codex_policy_hooks_settings(tmp_path, sys.executable, turn_routing=True)
+    on_commands = [
+        hook["command"] for entry in on["hooks"]["UserPromptSubmit"] for hook in entry["hooks"]
+    ]
+    assert sum("route-turn" in command for command in on_commands) == 1
+    assert any("evaluate-policy" in command for command in on_commands)
+
+
+def test_the_turn_router_advertisement_is_the_switch_for_the_hook(tmp_path: Path) -> None:
+    """The runner only advertises for a session that launched with routing on."""
+    import os
+
+    from omnigent.codex_native_app_server import _turn_router_advertised
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    assert _turn_router_advertised(tmp_path) is False
+    (tmp_path / ADVERTISEMENT_FILE).write_text(
+        json.dumps(
+            {
+                "url": "http://127.0.0.1:54321",
+                "token": "turn-token",
+                "pid": os.getpid(),
+                "session_id": "conv_active",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _turn_router_advertised(tmp_path) is True

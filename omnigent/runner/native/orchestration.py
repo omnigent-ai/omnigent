@@ -413,6 +413,9 @@ class _CodexNativeLaunchConfig:
         ``harness_override`` of ``"auto"``), so the router may re-route its
         spawns onto the Claude family. Only then are the routed-spawn developer
         instructions installed.
+    :param routing_enabled: ``True`` when the session launched with Smart
+        Routing on. Gates the first-message turn-routing endpoint, whose
+        advertisement in turn gates the ``UserPromptSubmit`` routing hook.
     """
 
     workspace: Path
@@ -425,6 +428,7 @@ class _CodexNativeLaunchConfig:
     fork_carry_history: bool
     bypass_sandbox: bool
     auto_harness: bool = False
+    routing_enabled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -532,20 +536,23 @@ def _start_turn_router_for_native_session(
     bridge_dir: Path,
     harness: str,
     server_client: httpx.AsyncClient | None,
+    routing_enabled: bool,
 ) -> TurnRouter | None:
     """Start the first-message turn-routing endpoint for a native session.
 
-    Installed for every session of a supported harness, routed or not: the
-    server re-reads the session's routing state on each prompt, so a
-    session that starts unrouted can still be toggled on before its first
-    message.
+    Installed only for a session that launched with Smart Routing on. The
+    advertisement it writes is also the switch the harness launch reads to
+    decide whether to register the ``UserPromptSubmit`` routing hook at all,
+    so an unrouted session's prompts never pay the round trip.
 
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Session bridge directory the hook discovers.
     :param harness: Harness the endpoint is being installed for.
     :param server_client: Runner→server client the relay forwards on, and
         the replay delivers through.
-    :returns: The router handle, or ``None`` when it could not start.
+    :param routing_enabled: The session's launch-time Smart Routing state.
+    :returns: The router handle, or ``None`` when routing is off for this
+        session or the endpoint could not start.
     """
     from omnigent.runner.turn_routing import ensure_session_turn_router
 
@@ -554,6 +561,7 @@ def _start_turn_router_for_native_session(
         bridge_dir=bridge_dir,
         server_client=server_client,
         harness=harness,
+        routing_enabled=routing_enabled,
     )
 
 
@@ -932,7 +940,7 @@ async def _codex_native_launch_config(
     # Fork directives stamped on a clone at fork time. Only consulted when
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
-    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, routing_enabled
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
@@ -944,6 +952,7 @@ async def _codex_native_launch_config(
     fork_source_external_id: str | None = None
     fork_carry_history = False
     auto_harness = snapshot.get("harness_override") == "auto"
+    _cost_control = snapshot.get("cost_control_mode_override")
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
@@ -970,6 +979,7 @@ async def _codex_native_launch_config(
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
         auto_harness=auto_harness,
+        routing_enabled=routing_enabled(_cost_control if isinstance(_cost_control, str) else None),
     )
 
 
@@ -3943,6 +3953,7 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         harness="codex-native",
         server_client=server_client,
+        routing_enabled=launch_config.routing_enabled,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
@@ -6281,7 +6292,11 @@ async def _auto_create_claude_terminal(
         bridge_dir=bridge_dir,
         harness="claude-native",
         server_client=server_client,
+        routing_enabled=launch_metadata.routing_enabled,
     )
+    # Crash recovery for a blocked-but-never-replayed prompt is not wired here:
+    # the pending record on disk is the seam if it ever is, and the recovery's
+    # default readiness probe waits on a codex bridge thread.
     # Only an auto-harness session's spawns can be re-routed across harness
     # families, so only it needs the routed-spawn note and the pre-approval for
     # the three Omnigent tools that carry out the re-route. A pinned session's
@@ -6299,6 +6314,9 @@ async def _auto_create_claude_terminal(
         subagent_router_dir=subagent_router_dir,
         append_system_prompt=routed_spawn_note,
         allowed_tools=routed_spawn_tools,
+        # The route-turn hook is registered only when this session can
+        # actually route; otherwise every submit would pay its round trip.
+        turn_routing=_claude_turn_router is not None,
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the

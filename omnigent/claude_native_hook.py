@@ -1150,9 +1150,11 @@ def _main_route_turn(argv: list[str]) -> int:
     ``UserPromptSubmit`` command alongside the forwarder's status hook and
     the policy gate. On every prompt submit, in order:
 
-    1. Fast skip on ``<bridge_dir>/turn_routing_done`` — no output, no
-       network. The authoritative gate is the endpoint's routing-decision
-       check; this file only saves the round trip.
+    1. Fast skip on ``<bridge_dir>/turn_routing_done`` **when it names this
+       session** — no output, no network. The authoritative gate is the
+       endpoint's routing-decision check; this file only saves the round
+       trip, and a ``/clear`` rotation hands the same bridge dir to a new
+       conversation whose first message must still be able to route.
     2. POST ``{session_id, prompt, harness, model}`` to the advertised
        loopback ``route-turn`` endpoint. Claude's hook payload carries no
        model, so ``model`` is the live one from ``context.json`` (the
@@ -1177,8 +1179,8 @@ def _main_route_turn(argv: list[str]) -> int:
     from omnigent.runner.turn_routing import (
         ADVERTISEMENT_FILE,
         HOOK_REQUEST_TIMEOUT_S,
-        MARKER_FILE,
         ROUTE_PATH_TEMPLATE,
+        turn_routing_marker_present,
     )
 
     parser = argparse.ArgumentParser(prog="python -m omnigent.claude_native_hook route-turn")
@@ -1186,9 +1188,6 @@ def _main_route_turn(argv: list[str]) -> int:
     parser.add_argument("--harness", default="claude-native")
     args = parser.parse_args(argv)
     bridge_dir = Path(args.bridge_dir)
-
-    if (bridge_dir / MARKER_FILE).exists():
-        return 0
 
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -1205,8 +1204,21 @@ def _main_route_turn(argv: list[str]) -> int:
     endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
     if endpoint is None:
         return 0
-    session_id = endpoint.session_id or read_active_session_id(bridge_dir)
+    # The bridge's ACTIVE session wins over the advertisement's, which is
+    # written once at launch and goes stale the moment ``/clear`` re-keys this
+    # pane onto a new conversation. Same source the permission hook reads for
+    # the same reason — approvals and routing both have to follow rotations.
+    # Reading the stale id instead made the new conversation ask (and skip) as
+    # the superseded one.
+    session_id = read_active_session_id(bridge_dir) or endpoint.session_id
     if not session_id:
+        return 0
+
+    # The marker is checked here, after the session id is known, because it is
+    # scoped to a session: a ``/clear`` rotation hands this same bridge dir to
+    # a NEW conversation, whose first message must still be able to route.
+    # Still zero network on the fast path.
+    if turn_routing_marker_present(bridge_dir, session_id):
         return 0
 
     body = {
@@ -1224,12 +1236,14 @@ def _main_route_turn(argv: list[str]) -> int:
     model = decision.get("model")
     if decision.get("action") != "route" or not isinstance(model, str) or not model:
         if decision.get("terminal"):
-            # Nothing will route this session again, so stop asking.
-            _write_turn_routing_marker(bridge_dir / MARKER_FILE)
+            # Nothing will route this session again, so stop asking. Covers the
+            # no-op verdict too (the pick equals the live model): terminal and
+            # unblocking, so the prompt runs where it already was.
+            _write_turn_routing_marker(bridge_dir, session_id, decision)
         return 0
     # The marker is what tells the runner "this prompt was dropped, you owe
     # it a replay", so a marker we could not write means we must not block.
-    if not _write_turn_routing_marker(bridge_dir / MARKER_FILE):
+    if not _write_turn_routing_marker(bridge_dir, session_id, decision):
         return 0
     sys.stdout.write(
         json.dumps(
@@ -1243,19 +1257,32 @@ def _main_route_turn(argv: list[str]) -> int:
     return 0
 
 
-def _write_turn_routing_marker(path: Path) -> bool:
+def _write_turn_routing_marker(
+    bridge_dir: Path, session_id: str, decision: dict[str, object]
+) -> bool:
     """
-    Write the turn-routing marker file.
+    Write the session-scoped turn-routing marker file.
 
-    :param path: Marker path, ``<bridge_dir>/turn_routing_done``.
+    :param bridge_dir: Native Claude bridge directory.
+    :param session_id: Session the verdict belongs to — the conversation a
+        later ``/clear`` rotation creates must not fast-skip on it.
+    :param decision: The verdict, for its ``decision_id``.
     :returns: ``True`` when the marker is on disk.
     """
-    try:
-        path.write_text("", encoding="utf-8")
-    except OSError:
-        print(f"omnigent claude route-turn hook: could not write {path}", file=sys.stderr)
-        return False
-    return True
+    from omnigent.runner.turn_routing import write_turn_routing_marker
+
+    decision_id = decision.get("decision_id")
+    if write_turn_routing_marker(
+        bridge_dir,
+        session_id=session_id,
+        decision_id=decision_id if isinstance(decision_id, str) else None,
+    ):
+        return True
+    print(
+        f"omnigent claude route-turn hook: could not write the marker in {bridge_dir}",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _route_turn_post(

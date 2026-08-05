@@ -86,15 +86,41 @@ def select_router(
     return None
 
 
+def reported_gateway_inference(
+    host: Any,  # type: ignore[explicit-any]  # a Host row, or None for a sandbox
+) -> dict[str, bool] | None:
+    """The gateway-inference map *host* last reported over its tunnel.
+
+    Read from this replica's live :class:`~omnigent.server.host_registry.HostRegistry`,
+    which the host fills on its connect handshake — nothing about gateway
+    backing is persisted, so a replica that has not seen the host (a fresh
+    process, another replica) simply reads unknown until it reconnects and
+    re-reports.
+
+    :param host: The session's target host row, or ``None``.
+    :returns: The reported map, or ``None`` when nothing has been reported here.
+    """
+    host_id = getattr(host, "host_id", None) if host is not None else None
+    if not isinstance(host_id, str):
+        return None
+    from omnigent.server.routes._sessions.common import get_server_host_registry
+
+    registry = get_server_host_registry()
+    if registry is None:
+        return None
+    return registry.gateway_inference(host_id)
+
+
 def gateway_backs_all(
     host: Any,  # type: ignore[explicit-any]  # a Host row, or None for a sandbox
     harnesses: Iterable[str],
 ) -> bool:
     """Whether *host* backs every one of *harnesses* with the workspace AI gateway.
 
-    Unknown reads as backed: an older host build (or none bound at all) reports
-    nothing, and withholding the external router there would downgrade every
-    deployment that cannot yet answer.
+    Unknown reads as backed: a host that reports nothing, an older build, one
+    bound to another replica, or none bound at all all land here, and
+    withholding the external router there would downgrade every deployment that
+    cannot yet answer.
 
     :param host: The session's target host, or ``None``.
     :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
@@ -102,8 +128,7 @@ def gateway_backs_all(
     """
     from omnigent.gateway_inference import not_gateway_backed
 
-    gateway = getattr(host, "gateway_inference", None) if host is not None else None
-    return not not_gateway_backed(gateway, harnesses)
+    return not not_gateway_backed(reported_gateway_inference(host), harnesses)
 
 
 def backends_from_caps(caps: Any) -> RoutingBackends:  # type: ignore[explicit-any]  # RuntimeCaps-shaped
@@ -132,3 +157,42 @@ def backends_from_caps(caps: Any) -> RoutingBackends:  # type: ignore[explicit-a
     if isinstance(client, ExternalRoutingClient):
         return RoutingBackends(external=client)
     return RoutingBackends(local=client)
+
+
+def _managed_llm_capability(caps: Any) -> bool:  # type: ignore[explicit-any]  # RuntimeCaps-shaped
+    """Whether a managed deployment registered its policy-LLM factory.
+
+    The factory means the deployment has LLM capability and supplies its own
+    :class:`~omnigent.server.smart_routing.RoutingClient` later, so routing is
+    available even though no client is on the caps yet.
+    """
+    return caps is not None and getattr(caps, "policy_llm_connection_factory", None) is not None
+
+
+def routing_sources(caps: Any) -> dict[str, bool]:  # type: ignore[explicit-any]  # RuntimeCaps
+    """Report which routers this deployment can answer a routing call with.
+
+    :param caps: A ``RuntimeCaps`` (or structural equivalent), or ``None``.
+    :returns: ``{"external": ..., "oss": ...}`` — ``"external"`` is the
+        workspace AI-Gateway ``task_v1`` client, ``"oss"`` the built-in judge
+        (or a managed factory that will supply one).
+    """
+    backends = backends_from_caps(caps)
+    return {
+        "external": backends.external is not None,
+        "oss": backends.local is not None or _managed_llm_capability(caps),
+    }
+
+
+def routing_available(caps: Any) -> bool:  # type: ignore[explicit-any]  # RuntimeCaps-shaped
+    """Whether this deployment can route at all, from ANY source.
+
+    The single "is routing configured" gate. It is exactly "some source can
+    answer", so it can never disagree with :func:`routing_sources` — the drift
+    that let a deployment configuring only ``routing_backends`` report routing
+    off while the server routed anyway.
+
+    :param caps: A ``RuntimeCaps`` (or structural equivalent), or ``None``.
+    :returns: ``True`` when at least one router can answer.
+    """
+    return any(routing_sources(caps).values())

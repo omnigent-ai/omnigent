@@ -2541,11 +2541,11 @@ def test_route_turn_fast_skips_on_the_marker(
     This is the re-entrancy guard the replayed prompt relies on: the replay
     re-fires ``UserPromptSubmit``, and a second block would erase it.
     """
-    from omnigent.runner.turn_routing import MARKER_FILE
+    from omnigent.runner.turn_routing import write_turn_routing_marker
 
     bridge_dir = _turn_routing_bridge_dir(tmp_path)
     _advertise_turn_router(bridge_dir)
-    (bridge_dir / MARKER_FILE).write_text("", encoding="utf-8")
+    write_turn_routing_marker(bridge_dir, session_id="conv_active", decision_id="d1")
 
     def _boom(*args: object, **kwargs: object) -> dict[str, object]:
         raise AssertionError("the marker must skip the route-turn round trip")
@@ -2689,7 +2689,7 @@ def test_route_turn_does_not_block_when_the_marker_cannot_be_written(
         "_route_turn_post",
         lambda *a, **k: {"action": "route", "model": "databricks-claude-sonnet-5"},
     )
-    monkeypatch.setattr(claude_native_hook, "_write_turn_routing_marker", lambda _path: False)
+    monkeypatch.setattr(claude_native_hook, "_write_turn_routing_marker", lambda *_args: False)
 
     assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
     assert capsys.readouterr().out == ""
@@ -2798,7 +2798,7 @@ def test_build_hook_settings_registers_the_route_turn_hook(
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_rt", workspace=tmp_path)
 
-    settings = build_hook_settings(bridge_dir)
+    settings = build_hook_settings(bridge_dir, turn_routing=True)
     entries = [
         hook
         for group in settings["hooks"]["UserPromptSubmit"]
@@ -2813,3 +2813,102 @@ def test_build_hook_settings_registers_the_route_turn_hook(
     assert entries[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
     # The spike scaffolding this replaced must be gone.
     assert "spike-userprompt" not in json.dumps(settings)
+
+
+def test_route_turn_ignores_a_marker_another_session_left_in_the_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``/clear`` rotation hands this bridge dir to a NEW conversation.
+
+    ``_create_clear_replacement_session`` re-keys the superseded session onto
+    ``{id}-cleared`` and gives the new one the same live dir, which
+    ``prepare_bridge_dir`` does not wipe the marker from. A bare marker
+    therefore stopped every later conversation in the pane from routing its
+    first message.
+    """
+    from omnigent.runner.turn_routing import turn_routing_marker_session, write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    write_turn_routing_marker(bridge_dir, session_id="conv_superseded", decision_id="d0")
+    asked: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        del token, body, timeout
+        asked.append(url)
+        return {"action": "allow", "rationale": "already pinned", "terminal": True}
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert asked == ["http://127.0.0.1:54321/v1/sessions/conv_active/route-turn"]
+    # The terminal answer re-keys the marker onto THIS session, so its own
+    # later prompts still fast-skip.
+    assert turn_routing_marker_session(bridge_dir) == "conv_active"
+
+
+def test_build_hook_settings_omits_the_route_turn_hook_when_routing_is_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A session that cannot route registers no first-message routing hook.
+
+    Registered unconditionally, every submit of every claude-native session
+    paid the hook's routing round trip (25s worst case on a degraded server)
+    only to be told the session does not route. The forwarder's status hook and
+    the request-phase policy gate stay on ``UserPromptSubmit`` either way.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_off", bridge_id="bridge_off", workspace=tmp_path)
+
+    settings = build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+
+    commands = [
+        hook["command"]
+        for group in settings["hooks"]["UserPromptSubmit"]
+        for hook in group["hooks"]
+    ]
+    assert not any("route-turn" in command for command in commands)
+    assert any("evaluate-policy" in command for command in commands)
+    assert commands, "the forwarder's own UserPromptSubmit hooks must survive"
+
+
+def test_route_turn_follows_a_clear_rotation_onto_the_new_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After ``/clear`` the hook asks — and marks — as the NEW conversation.
+
+    ``turn_router.json`` is written once at launch, so its session id goes
+    stale the moment ``_create_clear_replacement_session`` re-keys the pane.
+    Reading it made the replacement conversation ask (and fast-skip) under the
+    superseded session's id, so the marker the old session wrote silenced it
+    and its routing — had any happened — would have been pinned on the wrong
+    conversation. The bridge's active session is the live source, exactly as
+    the permission hook reads it.
+    """
+    from omnigent.runner.turn_routing import turn_routing_marker_session, write_turn_routing_marker
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir, session_id="conv_active")
+    # What the /clear rotation leaves behind: the old session's marker, and the
+    # bridge pointed at the replacement conversation.
+    write_turn_routing_marker(bridge_dir, session_id="conv_active", decision_id="d0")
+    write_active_session_id(bridge_dir, "conv_replacement")
+    urls: list[str] = []
+
+    def _post(url: str, token: str, body: dict[str, object], timeout: float) -> dict[str, object]:
+        del token, body, timeout
+        urls.append(url)
+        return {"action": "allow", "rationale": "already pinned", "terminal": True}
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _post)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert urls == ["http://127.0.0.1:54321/v1/sessions/conv_replacement/route-turn"]
+    assert turn_routing_marker_session(bridge_dir) == "conv_replacement"

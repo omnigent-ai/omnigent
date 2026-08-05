@@ -144,6 +144,7 @@ def parse_routing_settings(
         DEFAULT_ROUTER_NAME,
         MODEL_ID_PREFIXES,
         RoutingSettings,
+        parse_routing_tables,
     )
 
     if not isinstance(routing_cfg, dict):
@@ -156,6 +157,9 @@ def parse_routing_settings(
         selection_model=selection_model,
         # Only an absent key falls back: ``model_prefix: []`` means bare ids.
         model_prefixes=MODEL_ID_PREFIXES if prefixes is None else tuple(prefixes),
+        # The arm menu / alias / effort tables a deployment fronting a different
+        # catalog overrides; absent keys keep the built-in defaults.
+        **parse_routing_tables(routing_cfg),
     )
 
 
@@ -237,6 +241,8 @@ def _build_default_databricks_routing_client(
         databricks_profile=profile,
         model_prefixes=list(settings.model_prefixes),
         selection_model=settings.selection_model,
+        menus=settings.menus,
+        servable_aliases=settings.servable_aliases,
     )
 
 
@@ -302,6 +308,8 @@ def _build_external_routing_client(
         databricks_profile=databricks_profile,
         model_prefixes=list(settings.model_prefixes),
         selection_model=settings.selection_model,
+        menus=settings.menus,
+        servable_aliases=settings.servable_aliases,
     )
 
 

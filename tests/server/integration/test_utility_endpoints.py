@@ -255,6 +255,34 @@ async def test_info_reports_which_routers_can_answer(
     assert resp.json()["smart_routing_sources"] == expected
 
 
+async def test_info_reports_routing_on_for_a_backends_only_deployment(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``routing_backends`` alone is enough — it is the managed override point.
+
+    Regression: the flag read ``routing_client`` while the sources read the
+    backends pair, so a deployment that set only ``routing_backends`` reported
+    routing off and the SPA hid a surface the server would have served.
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    monkeypatch.setattr(
+        "omnigent.runtime._globals._caps",
+        SimpleNamespace(
+            routing_backends=RoutingBackends(external=_external_client()),
+            routing_client=None,
+            policy_llm_connection_factory=None,
+        ),
+        raising=False,
+    )
+
+    resp = await client.get("/v1/info")
+    data = resp.json()
+    assert data["smart_routing_enabled"] is True
+    assert data["smart_routing_sources"] == {"external": True, "oss": False}
+
+
 async def test_info_classifies_a_legacy_single_routing_client_as_the_oss_judge(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

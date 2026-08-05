@@ -68,6 +68,7 @@ def test_router_hook_coexists_with_policy_hooks(tmp_path: Path) -> None:
         bridge_dir,
         ap_server_url="http://127.0.0.1:8787",
         subagent_router_dir=bridge_dir,
+        turn_routing=True,
     )
     pre_tool_use = settings["hooks"]["PreToolUse"]
     matchers = [entry.get("matcher") for entry in pre_tool_use]
@@ -97,6 +98,7 @@ def test_both_routing_hooks_coexist_with_the_policy_hooks(tmp_path: Path) -> Non
         bridge_dir,
         ap_server_url="http://127.0.0.1:8787",
         subagent_router_dir=bridge_dir,
+        turn_routing=True,
     )
 
     prompt_submit = _commands(settings, "UserPromptSubmit")
@@ -130,7 +132,7 @@ def test_the_route_turn_hook_is_registered_above_its_own_request_budget(
     """
     from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S, HOOK_REQUEST_TIMEOUT_S
 
-    settings = build_hook_settings(_bridge_dir(tmp_path))
+    settings = build_hook_settings(_bridge_dir(tmp_path), turn_routing=True)
     entries = [
         hook
         for entry in settings["hooks"]["UserPromptSubmit"]

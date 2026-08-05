@@ -24,8 +24,10 @@ handler forwards to it with :func:`make_server_relay_resolver`.
 strictly larger than the hop it waits on — otherwise an inner hop's
 fail-open branch can never run. Canonical values, outermost first:
 
-1. harness hook timeout — 40s (``claude_native_bridge`` PreToolUse entry,
-   codex's spawn hook)
+1. harness hook timeout — 40s (``claude_native_bridge``'s PreToolUse entry,
+   codex's spawn hook, and ``HOOK_TIMEOUT_S`` for the in-process claude-sdk
+   hook). Strictly larger than hop 2, never equal to it: a hook killed at the
+   same instant its request gives up never reaches its fail-open branch.
 2. hook script HTTP request — :data:`HOOK_REQUEST_TIMEOUT_S` (30s, defined
    as ``REQUEST_TIMEOUT_S`` in ``omnigent.inner.hook_scripts.subagent_router``,
    which stays stdlib-only and cannot import this module)
@@ -147,30 +149,35 @@ def routing_enabled(
         e.g. ``"on"``.
     :param parent_cost_control_mode: The parent session's value for a
         spawned child. ``None`` for a top-level session.
-    :param caps: ``RuntimeCaps``-shaped object whose ``routing_client``
-        must be configured. ``None`` skips that check — the runner
-        process holds no routing client (the server relay owns the
-        policy), so runner-side callers pass nothing.
+    :param caps: ``RuntimeCaps``-shaped object that must carry a routing
+        backend. ``None`` skips that check — the runner process holds no
+        routing client (the server relay owns the policy), so runner-side
+        callers pass nothing.
     :returns: ``True`` when routing applies to this session.
     """
     if cost_control_mode != "on" and parent_cost_control_mode != "on":
         return False
     if caps is None:
         return True
-    return getattr(caps, "routing_client", None) is not None
+    from omnigent.server.routing_backend import backends_from_caps
+
+    return backends_from_caps(caps).any() is not None
 
 
 def subagent_routing_enabled(subagent_routing_override: str | None) -> bool:
     """Report whether subagent spawns are routed for one session.
 
-    Two-state: ``"on"`` routes spawns, and anything else (``"off"`` or
-    unset) leaves them to the harness. Sessions that start on Smart
-    Routing are stamped ``"on"`` at create, so unset genuinely means
-    Default rather than "ask somewhere else". Read per spawn (not at
-    launch) so a mid-session flip takes effect on the next spawn.
+    Two-state: ``"on"`` routes spawns, and anything else leaves them to
+    the harness — ``"off"``, unset, and a legacy row still carrying the
+    old tri-state ``"inherit"`` all read the same, so no stored value
+    has to be rewritten for the gate to be sound. Sessions that start on
+    Smart Routing are stamped ``"on"`` at create, so unset genuinely
+    means Default rather than "ask somewhere else". Read per spawn (not
+    at launch) so a mid-session flip takes effect on the next spawn.
 
     :param subagent_routing_override: The session's
         ``subagent_routing_override`` — ``"on"``, ``"off"``, or ``None``.
+        Legacy rows may hold any other string; only ``"on"`` enables.
     :returns: ``True`` when subagent spawns should be routed.
     """
     return subagent_routing_override == "on"

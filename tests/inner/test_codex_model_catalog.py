@@ -9,6 +9,7 @@ codex's own catalog plus the gateway-only arms.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -139,10 +140,12 @@ def test_the_cli_is_probed_once_per_host_process(
     assert calls == ["/bin/codex"]
 
 
-def test_a_cli_that_cannot_answer_is_not_re_probed(
+def test_a_cli_that_cannot_answer_is_not_re_probed_within_the_ttl(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A broken CLI must not cost the full timeout per session, so the failure is
+    # remembered — but only briefly (see the test below).
     calls: list[str] = []
 
     def _probe(codex_path: str, source_home: Path, *, timeout: float) -> None:
@@ -150,11 +153,76 @@ def test_a_cli_that_cannot_answer_is_not_re_probed(
         calls.append(codex_path)
 
     monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
     monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", _probe)
 
     for _ in range(3):
         assert codex_executor.read_codex_model_catalog("/bin/codex", tmp_path) is None
     assert calls == ["/bin/codex"]
+
+
+def test_a_transient_probe_failure_is_retried_after_the_ttl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One 10 s timeout must not disable the catalog for the whole process.
+
+    The failure used to be cached permanently, so a single slow probe — a loaded
+    host, a cold binary — meant every LATER session on that host silently lost
+    the gateway-only arms from its ``spawn_agent`` catalog, with nothing in the
+    logs after the first warning to say why.
+    """
+    results: list[dict[str, Any] | None] = [None, _catalog()]
+    calls: list[str] = []
+
+    def _probe(codex_path: str, source_home: Path, *, timeout: float) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+        del source_home, timeout
+        calls.append(codex_path)
+        return results[min(len(calls) - 1, len(results) - 1)]
+
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
+    monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", _probe)
+
+    assert codex_executor.read_codex_model_catalog("/bin/codex", tmp_path) is None
+    # Inside the TTL: no re-probe.
+    assert codex_executor.read_codex_model_catalog("/bin/codex", tmp_path) is None
+    assert len(calls) == 1
+
+    # The TTL lapses.
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURE_TTL_S", 0.0)
+    codex_executor._MODEL_CATALOG_FAILURES[("/bin/codex", str(tmp_path))] = time.monotonic() - 1.0
+
+    assert codex_executor.read_codex_model_catalog("/bin/codex", tmp_path) is not None
+    assert len(calls) == 2
+    # And the success is remembered for good.
+    assert codex_executor.read_codex_model_catalog("/bin/codex", tmp_path) is not None
+    assert len(calls) == 2
+
+
+def test_the_catalog_probe_runs_off_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``codex debug models`` is a ~10 s subprocess, so it must not run inline.
+
+    Both async callers populate the private CODEX_HOME (which is what shells out
+    to the probe) through ``asyncio.to_thread``; run on the loop it stalled every
+    other session sharing it for the probe's whole timeout.
+    """
+    import inspect
+
+    from omnigent import codex_native_app_server
+
+    for module in (codex_executor, codex_native_app_server):
+        source = inspect.getsource(module)
+        assert "await asyncio.to_thread(\n            _populate_codex_home_config," in source, (
+            f"{module.__name__} must populate the codex home off the event loop"
+        )
+        assert "\n        _populate_codex_home_config(" not in source
+    del tmp_path, monkeypatch
 
 
 def test_the_config_key_lands_above_the_first_table(tmp_path: Path) -> None:

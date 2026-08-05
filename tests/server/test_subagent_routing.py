@@ -1012,6 +1012,11 @@ def test_turn_routing_enabled_requires_a_client_when_caps_are_given(
         ("on", True),
         ("off", False),
         (None, False),
+        # A row written before the switch became two-state can still hold the
+        # old tri-state "inherit"; it reads as not-enabled, so no stored value
+        # needs rewriting for the gate to be sound.
+        ("inherit", False),
+        ("", False),
     ],
 )
 def test_subagent_routing_enabled_is_two_state(override: str | None, expected: bool) -> None:

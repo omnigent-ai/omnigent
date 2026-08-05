@@ -1370,8 +1370,12 @@ def register_hooks_routes(
         from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
 
         user_id = _get_user_id(request, auth_provider)
+        # LEVEL_EDIT, like POST /events: a routed verdict mutates the session
+        # (a persisted ``routing_decision`` item, and on the sibling route-turn
+        # relay a ``model_override`` pin). A read-only viewer must not be able
+        # to steer somebody else's spawns.
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1498,8 +1502,11 @@ def register_hooks_routes(
         from omnigent.server.smart_routing import route_turn as _route_turn_seam
 
         user_id = _get_user_id(request, auth_provider)
+        # LEVEL_EDIT, like POST /events: this route writes ``model_override``
+        # for the rest of the session and persists a decision item. LEVEL_READ
+        # let a read-only viewer repin somebody else's model.
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1599,15 +1606,18 @@ def register_hooks_routes(
             persist=_persist,
         )
         _logger.info(
-            "route-turn: session=%s harness=%s live_model=%s pinned=%s action=%s model=%s (%s)",
+            "route-turn: session=%s harness=%s live_model=%s pinned=%s action=%s model=%s",
             session_id,
             route_request.harness,
             route_request.model,
             conv.model_override if conv is not None else None,
             decision.action,
             decision.model,
-            decision.rationale,
         )
+        # The rationale paraphrases the user's prompt, so it stays off INFO —
+        # the same invariant ``omnigent.server.smart_routing`` keeps at each of
+        # its own three log sites.
+        _logger.debug("route-turn: session=%s rationale=%s", session_id, decision.rationale)
         return Response(
             content=json.dumps(decision.to_payload()),
             media_type="application/json",

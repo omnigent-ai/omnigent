@@ -9,14 +9,20 @@ providers whose supported set doesn't already contain the raw value.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 from omnigent.reasoning_effort import (
     ANTHROPIC_EFFORTS,
     CODEX_EFFORTS,
+    DEFAULT_MODEL_EFFORT_CAPS,
     EFFORT_VALUES,
+    ModelEffortCaps,
     clamp_effort_for_model,
     effort_for_model_switch,
+    model_effort_caps,
     validate_effort,
 )
 
@@ -122,3 +128,50 @@ def test_switch_to_uncapped_model_without_effort_stays_none() -> None:
     """A model with no ceiling and no requested effort sends no override."""
     assert effort_for_model_switch(None, "databricks-gpt-5-6-sol") is None
     assert effort_for_model_switch(None, None) is None
+
+
+# ── Deployment-configurable effort caps ────────────────────────────────────
+#
+# The GLM ceiling above is one gateway's probed fact, not a property of the
+# effort ladders. A deployment whose gateway caps a different model set puts it
+# in ``routing.effort_caps`` instead of forking the module, so both clamps must
+# read the caps rather than the frozen tables.
+
+
+def _caps(fallback: dict[str, str], unsupported: dict[str, frozenset[str]]) -> ModelEffortCaps:
+    return ModelEffortCaps(fallback=fallback, unsupported=unsupported)
+
+
+def test_default_caps_are_the_frozen_tables() -> None:
+    assert model_effort_caps(None).fallback["glm-5-2"] == "medium"
+    assert model_effort_caps(DEFAULT_MODEL_EFFORT_CAPS) is DEFAULT_MODEL_EFFORT_CAPS
+
+
+def test_explicit_caps_replace_the_glm_ceiling() -> None:
+    caps = _caps({"gpt-5-6-sol": "low"}, {"gpt-5-6-sol": frozenset({"high", "xhigh"})})
+    assert clamp_effort_for_model("xhigh", "databricks-gpt-5-6-sol", caps=caps) == "low"
+    # GLM is uncapped under these caps, so its effort passes through.
+    assert clamp_effort_for_model("xhigh", "system.ai.glm-5-2", caps=caps) == "xhigh"
+
+
+def test_explicit_caps_drive_the_model_switch_default() -> None:
+    caps = _caps({"gpt-5-6-sol": "low"}, {})
+    assert effort_for_model_switch(None, "databricks-gpt-5-6-sol", caps=caps) == "low"
+    assert effort_for_model_switch(None, "system.ai.glm-5-2", caps=caps) is None
+
+
+def test_routing_settings_effort_caps_reach_the_clamp() -> None:
+    """A ``routing.effort_caps`` override reaches the clamp with no threading."""
+    from omnigent.server.smart_routing import RoutingSettings, parse_routing_tables
+
+    settings = RoutingSettings(
+        **parse_routing_tables(
+            {"effort_caps": {"gpt-5.6-sol": {"fallback": "medium", "unsupported": ["xhigh"]}}}
+        )
+    )
+    with patch("omnigent.runtime._globals._caps", new=SimpleNamespace(routing_settings=settings)):
+        assert clamp_effort_for_model("xhigh", "databricks-gpt-5-6-sol") == "medium"
+        # The configured table REPLACES the default, so GLM is no longer capped.
+        assert clamp_effort_for_model("xhigh", "system.ai.glm-5-2") == "xhigh"
+    # Outside that deployment the frozen default is back.
+    assert clamp_effort_for_model("xhigh", "system.ai.glm-5-2") == "medium"

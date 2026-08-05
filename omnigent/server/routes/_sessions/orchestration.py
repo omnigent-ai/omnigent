@@ -4384,6 +4384,19 @@ async def _forward_event_to_runner(
     # before routing overwrites it: when the router picks something else the
     # attempt is recorded on the decision instead of silently vanishing.
     _attempted_override = effective_runner_override
+    # A child that already carries a routing decision is done: its harness and
+    # model were chosen on its first message and must not move again. Without
+    # this the child clause below (which deliberately routes past an
+    # orchestrator-supplied model) matched on EVERY message, so a follow-up
+    # re-ran the judge and re-persisted ``harness_override`` — a mid-session
+    # harness flip, contradicting the create-time-only contract the
+    # ``harness_override`` forward below documents. The top-level arm's own
+    # once-only gate is ``effective_runner_override is None``; the decision
+    # label is the child's equivalent, because a child's model_override can be
+    # set by ``sys_session_send`` without anything having routed.
+    _child_routed_before = conv.parent_conversation_id is not None and bool(
+        conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    )
     # For child sessions, route even when the orchestrator specified a model via
     # sys_session_send (effective_runner_override is already set). Smart routing
     # always wins over the LLM's own model choice when the parent toggle is on.
@@ -4393,6 +4406,7 @@ async def _forward_event_to_runner(
         # The auto-harness block above already routed this turn (harness +
         # model) — don't re-run the router for the same message.
         and not _auto_resolved_this_turn
+        and not _child_routed_before
         and (effective_runner_override is None or conv.parent_conversation_id is not None)
     )
     if _should_route:
@@ -6139,17 +6153,17 @@ def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -
     The external router's picks are gateway catalog ids, so a CLI pointed at
     Bedrock, a personal subscription, or any other provider cannot run one even
     with the binary installed — those harnesses are served by the built-in judge
-    instead. Reads the host's ``gateway_inference`` map; unknown (an older host,
-    or none bound) counts as backed.
+    instead. Reads the map the host reported on its connect handshake; unknown
+    (nothing reported to this replica yet, or no host bound) counts as backed.
 
     :param host: The session's target host, or ``None`` (e.g. a sandbox).
     :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
     :returns: The not-backed ids, in the order given.
     """
     from omnigent.gateway_inference import not_gateway_backed
+    from omnigent.server.routing_backend import reported_gateway_inference
 
-    gateway = getattr(host, "gateway_inference", None) if host is not None else None
-    return not_gateway_backed(gateway, harnesses)
+    return not_gateway_backed(reported_gateway_inference(host), harnesses)
 
 
 def _gateway_backed(host: Host | None, harnesses: Sequence[str]) -> bool:
@@ -6882,10 +6896,9 @@ async def _create_session_from_existing_agent(
     #
     # The gate is the parent's subagent-routing switch — the one routing knob the
     # in-session UI exposes — matching the gate the native-subagent hook applies
-    # to in-harness spawns. Behaviour-preserving for existing rows: a session
-    # that started on Smart Routing is stamped "on" at create, and the
-    # e6f7a8b9c0d1 migration backfilled the rows that predate the stamp. An
-    # explicit "off" now actually stops the forcing.
+    # to in-harness spawns. A session that starts on Smart Routing is stamped
+    # "on" at create; a legacy row that predates the stamp carries no switch, so
+    # it reads as Default and its children are not forced.
     #
     # A child of a session pinned to one harness family (a plain codex or
     # claude session) must NOT be forced to auto: the sentinel would hand the

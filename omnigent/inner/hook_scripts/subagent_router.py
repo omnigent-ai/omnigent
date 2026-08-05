@@ -100,6 +100,13 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 # script's fail-open branch can run.
 REQUEST_TIMEOUT_S = 30.0
 
+# Hop 1: the budget a harness registers on its own spawn hook. STRICTLY larger
+# than ``REQUEST_TIMEOUT_S`` — a hook killed at the same instant its HTTP call
+# gives up never reaches its fail-open branch, and the harness sees a dead hook
+# instead of "no opinion". The claude-native and codex entries derive the same
+# +10s headroom; the in-process claude-sdk hook reads this constant.
+HOOK_TIMEOUT_S = REQUEST_TIMEOUT_S + 10.0
+
 # ``tool_input`` keys naming the requested subagent, in preference order.
 # Claude Code sends ``subagent_type``; codex sends ``task_name`` /
 # ``agent_name``.

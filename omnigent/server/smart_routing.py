@@ -21,10 +21,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     import httpx  # used in type annotations only; runtime import is lazy in fetch_runner_models
     from databricks.sdk.config import Config
+
+    from omnigent.reasoning_effort import ModelEffortCaps
 
 _logger = logging.getLogger(__name__)
 
@@ -73,13 +75,18 @@ MODEL_LISTS: dict[str, list[str]] = {
 # :data:`_SERVABLE_ALIASES`), so this table is the only place a glm pick can be
 # offered from — without it a routed glm substitutes down to the luna fallback.
 # It resolves through :func:`apply_servable_alias` to ``system.ai.glm-5-2``.
-_CURRENT_GENERATION_MODELS: dict[str, tuple[str, ...]] = {
-    "gpt": (
-        "databricks-glm-5-2",
-        "databricks-gpt-5-6-luna",
-        "databricks-gpt-5-6-sol",
-    ),
-}
+#
+# A workspace-probed fact, so ``routing.current_generation_models`` overrides it
+# (:class:`RoutingSettings`) rather than a managed deployment forking this module.
+_CURRENT_GENERATION_MODELS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "gpt": (
+            "databricks-glm-5-2",
+            "databricks-gpt-5-6-luna",
+            "databricks-gpt-5-6-sol",
+        ),
+    }
+)
 
 _HARNESS_FAMILY: dict[str, str] = {
     "claude-sdk": "claude",
@@ -94,12 +101,19 @@ _HARNESS_FAMILY: dict[str, str] = {
 }
 
 
-def infer_models(harness: str | None) -> list[str] | None:
+def infer_models(
+    harness: str | None,
+    *,
+    current_generation: Mapping[str, Sequence[str]] | None = None,
+) -> list[str] | None:
     """Return available models for *harness*, or ``None`` if unroutable.
 
     The curated ordering plus the current generation's endpoints
     (:data:`_CURRENT_GENERATION_MODELS`), so a routed current arm resolves to
     its own endpoint rather than substituting down a generation.
+
+    :param current_generation: Family → current-generation endpoints; ``None``
+        reads this deployment's configured table.
     """
     if harness is None:
         return None
@@ -109,7 +123,8 @@ def infer_models(harness: str | None) -> list[str] | None:
     curated = MODEL_LISTS.get(family)
     if curated is None:
         return None
-    return [*curated, *_CURRENT_GENERATION_MODELS.get(family, ())]
+    arms = current_generation_models(current_generation)
+    return [*curated, *arms.get(family, ())]
 
 
 def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
@@ -532,6 +547,53 @@ def _bearer_auth(token: str) -> httpx.Auth:
     return _BearerAuth()
 
 
+def _config_bearer(
+    config: Any,  # type: ignore[explicit-any]  # databricks.sdk.config.Config
+    label: str,
+) -> Any:  # type: ignore[explicit-any]  # httpx.Auth | None
+    """Mint a bearer from a databricks-sdk ``Config``, per call.
+
+    ``authenticate()`` refreshes an expired OAuth token, so calling it on every
+    request is what keeps a long-lived server from sending a stale token.
+
+    :param config: A resolved SDK ``Config``.
+    :param label: How to name the credential's source in a warning.
+    :returns: An httpx auth, or ``None`` when the credential can't be minted
+        (auth failure degrades to unauthenticated rather than failing the turn).
+    """
+    try:
+        headers = config.authenticate()
+    except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+        _logger.warning(
+            "ExternalRoutingClient: could not resolve auth from %s", label, exc_info=True
+        )
+        return None
+    token = (dict(headers or {}).get("Authorization") or "").removeprefix("Bearer ").strip()
+    if not token:
+        return None
+    return _bearer_auth(token)
+
+
+def _same_host(candidate: str | None, url: str) -> bool:
+    """Whether *candidate* names the same host as *url*, schemes ignored.
+
+    :param candidate: A workspace host, with or without a scheme.
+    :param url: The URL being posted to.
+    :returns: ``True`` only when both resolve to a non-empty, equal hostname.
+    """
+    from urllib.parse import urlsplit
+
+    def _host(value: str) -> str:
+        value = value.strip().rstrip("/")
+        if "//" not in value:
+            value = "//" + value
+        return (urlsplit(value).hostname or "").lower()
+
+    if not candidate:
+        return False
+    return bool(_host(candidate)) and _host(candidate) == _host(url)
+
+
 def _router_error_detail(body: str) -> str:
     """Extract a clean, short reason from a router error response body.
 
@@ -604,6 +666,9 @@ _TASK_V1_CLAUDE_ARMS: tuple[str, ...] = ("claude-opus-4-8", "claude-sonnet-5")
 _TASK_V1_CODEX_ARMS: tuple[str, ...] = ("glm-5-2", "gpt-5-6-sol", "gpt-5-6-luna")
 
 # Scenario → the full arm menu task_v1 requires when that scenario is inferred.
+# A router fronting a different catalog has a different menu, so this is the
+# DEFAULT rather than the only answer: ``routing.menus`` replaces it wholesale
+# (:class:`RoutingSettings`).
 TASK_V1_MENUS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
         "cc": _TASK_V1_CLAUDE_ARMS,
@@ -635,29 +700,89 @@ _FAMILY_FALLBACK: Mapping[str, str] = MappingProxyType(
 # endpoint ``databricks-glm-5-2`` the catalog offers advertises chat-completions
 # only and 400s on ``/codex/v1``, and GLM appears in no discovery listing, so the
 # working spelling has to be named here.
+# One workspace's probe, so ``routing.servable_aliases`` replaces it for a
+# gateway that spells its models differently (:class:`RoutingSettings`).
 _SERVABLE_ALIASES: Mapping[str, str] = MappingProxyType({"glm-5-2": "system.ai.glm-5-2"})
 
+#: The scenario key a menu-less router is offered under: no arms, catalog only.
+_NO_MENUS: Mapping[str, tuple[str, ...]] = MappingProxyType({})
 
-def apply_servable_alias(model: str, prefixes: Sequence[str] | None = None) -> str:
+
+def scenario_menus(
+    menus: Mapping[str, Sequence[str]] | None = None,
+    *,
+    router_name: str | None = None,
+) -> Mapping[str, Sequence[str]]:
+    """Resolve the scenario → arm menus that apply.
+
+    :param menus: An explicit table, e.g. from :class:`RoutingSettings`.
+        ``None`` falls back to the built-in default.
+    :param router_name: The router the menu is for. Only ``task_v1`` demands an
+        arm menu, so any other version defaults to none rather than inheriting
+        task_v1's arms; ``None`` skips that gate.
+    :returns: Scenario key → the arms that scenario requires.
+    """
+    if menus is not None:
+        return menus
+    if router_name is not None and router_name != DEFAULT_ROUTER_NAME:
+        return _NO_MENUS
+    return TASK_V1_MENUS
+
+
+def servable_aliases(aliases: Mapping[str, str] | None = None) -> Mapping[str, str]:
+    """Resolve the bare-id → served-spelling table that applies.
+
+    :param aliases: An explicit table; ``None`` reads this deployment's.
+    """
+    return _SERVABLE_ALIASES if aliases is None else aliases
+
+
+def current_generation_models(
+    arms: Mapping[str, Sequence[str]] | None = None,
+) -> Mapping[str, Sequence[str]]:
+    """Resolve the family → current-generation-endpoints table that applies.
+
+    :param arms: An explicit table; ``None`` reads this deployment's.
+    """
+    if arms is not None:
+        return arms
+    return routing_settings().current_generation_models or _CURRENT_GENERATION_MODELS
+
+
+def apply_servable_alias(
+    model: str,
+    prefixes: Sequence[str] | None = None,
+    *,
+    aliases: Mapping[str, str] | None = None,
+) -> str:
     """Map a resolved model id onto the spelling this gateway actually serves.
 
     :param model: A servable catalog id, in either vocabulary.
     :param prefixes: Catalog prefixes to strip before comparing ids.
+    :param aliases: Bare id → served spelling; ``None`` reads this
+        deployment's configured table.
     :returns: The aliased id, or *model* unchanged when no alias applies.
     """
-    return _SERVABLE_ALIASES.get(_bare_id(model, prefixes), model)
+    table = servable_aliases(
+        aliases if aliases is not None else routing_settings().servable_aliases
+    )
+    return table.get(_bare_id(model, prefixes), model)
 
 
 def task_v1_claude_arms() -> tuple[str, ...]:
-    """Return the frozen Claude-family arms task_v1 may select.
+    """Return the Claude-family arms the configured router may select.
 
     Read by the claude-native launch path, which pins Claude Code's family
     aliases to these arms so the first turn's ``/model`` can reach whatever
-    the router picks. One definition, so the pins can't drift from the menu.
+    the router picks. Derived from the deployment's own menu, so the pins can't
+    drift from it — including when a managed gateway configures other arms.
 
     :returns: Bare arm ids, e.g. ``("claude-opus-4-8", "claude-sonnet-5")``.
     """
-    return _TASK_V1_CLAUDE_ARMS
+    menus = routing_settings().menus
+    if menus is None:
+        return _TASK_V1_CLAUDE_ARMS
+    return tuple(menus.get("cc", _TASK_V1_CLAUDE_ARMS))
 
 
 @dataclass(frozen=True)
@@ -667,17 +792,133 @@ class RoutingSettings:
     Hung on :attr:`~omnigent.runtime.caps.RuntimeCaps.routing_settings` so
     every consumer reads one value object instead of re-parsing config.
 
+    The four table fields carry facts probed against ONE gateway's catalog. They
+    are overridable so a managed deployment fronting a different menu configures
+    it instead of forking this module; ``None`` on any of them keeps the
+    module-level constant, which stays the single definition of the default.
+
     :param router_name: Router strategy to invoke, e.g. ``"task_v1"``.
     :param selection_model: Model the router should use for its own
         extraction call, sent as ``route_selector.config.model``. ``None``
         leaves the router's frozen default in place.
     :param model_prefixes: Prefixes this deployment's catalog attaches to
         model ids that the router keys bare; see :data:`MODEL_ID_PREFIXES`.
+    :param menus: Scenario key (``cc`` / ``codex`` / ``both``) → the full arm
+        menu the router requires when that scenario is inferred. ``None`` uses
+        :data:`TASK_V1_MENUS` for ``task_v1`` and no menu for any other router.
+    :param servable_aliases: Bare model id → the exact id this gateway serves
+        it as, for models whose catalog spelling is not the served one.
+        ``None`` uses :data:`_SERVABLE_ALIASES`.
+    :param current_generation_models: Harness family → the router's own current
+        arms, offered as candidates so a routed arm resolves to its own
+        endpoint. ``None`` uses :data:`_CURRENT_GENERATION_MODELS`.
+    :param model_effort_caps: Per-model reasoning-effort ceilings this
+        gateway imposes. ``None`` uses
+        :data:`~omnigent.reasoning_effort.DEFAULT_MODEL_EFFORT_CAPS`. The
+        provider ladders themselves are not configurable — they are the wire
+        APIs' own vocabularies, not a deployment fact.
     """
 
     router_name: str = DEFAULT_ROUTER_NAME
     selection_model: str | None = None
     model_prefixes: tuple[str, ...] = MODEL_ID_PREFIXES
+    menus: Mapping[str, Sequence[str]] | None = None
+    servable_aliases: Mapping[str, str] | None = None
+    current_generation_models: Mapping[str, Sequence[str]] | None = None
+    model_effort_caps: ModelEffortCaps | None = None
+
+
+def _string_list(raw: Any) -> tuple[str, ...] | None:  # type: ignore[explicit-any]  # parsed YAML
+    """Read a YAML scalar-or-list of ids into a tuple, or ``None`` if malformed."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return None
+    return tuple(item.strip() for item in raw if isinstance(item, str) and item.strip())
+
+
+def _id_table(raw: Any) -> Mapping[str, tuple[str, ...]] | None:  # type: ignore[explicit-any]
+    """Read a ``key: [ids]`` block, or ``None`` when it is not a mapping."""
+    if not isinstance(raw, dict):
+        return None
+    table: dict[str, tuple[str, ...]] = {}
+    for key, value in raw.items():
+        ids = _string_list(value)
+        if isinstance(key, str) and key.strip() and ids is not None:
+            table[key.strip()] = ids
+    return MappingProxyType(table)
+
+
+def _alias_table(raw: Any) -> Mapping[str, str] | None:  # type: ignore[explicit-any]
+    """Read a ``bare-id: served-id`` block, or ``None`` when it is not a mapping."""
+    if not isinstance(raw, dict):
+        return None
+    return MappingProxyType(
+        {
+            key.strip().replace(".", "-").lower(): value.strip()
+            for key, value in raw.items()
+            if isinstance(key, str) and isinstance(value, str) and key.strip() and value.strip()
+        }
+    )
+
+
+def parse_routing_tables(
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+) -> dict[str, Any]:  # type: ignore[explicit-any]  # RoutingSettings kwargs
+    """Parse the overridable routing tables out of a ``routing:`` block.
+
+    The keys a managed deployment sets to front a different catalog without
+    forking this module::
+
+        routing:
+          menus:
+            cc: [claude-opus-4-8, claude-sonnet-5]
+            codex: [glm-5-2, gpt-5-6-sol]
+            both: [claude-opus-4-8, claude-sonnet-5, glm-5-2, gpt-5-6-sol]
+          servable_aliases:
+            glm-5-2: system.ai.glm-5-2
+          current_generation_models:
+            gpt: [databricks-gpt-5-6-sol]
+          effort_caps:
+            glm-5-2:
+              fallback: medium
+              unsupported: [xhigh, max]
+
+    Each key is independent and a malformed one is dropped (routing keeps its
+    default rather than failing the boot). An explicit empty mapping is honoured
+    — ``menus: {}`` means "this router demands no arm menu".
+
+    :param routing_cfg: The parsed ``routing:`` mapping, or ``None``.
+    :returns: Keyword arguments for :class:`RoutingSettings`; every value is
+        ``None`` when the block names none of these keys.
+    """
+    from omnigent.reasoning_effort import ModelEffortCaps
+
+    cfg = routing_cfg if isinstance(routing_cfg, dict) else {}
+    caps: ModelEffortCaps | None = None
+    raw_caps = cfg.get("effort_caps")
+    if isinstance(raw_caps, dict):
+        fallback: dict[str, str] = {}
+        unsupported: dict[str, frozenset[str]] = {}
+        for model, entry in raw_caps.items():
+            if not isinstance(model, str) or not isinstance(entry, dict):
+                continue
+            key = model.strip().replace(".", "-").lower()
+            value = entry.get("fallback")
+            if isinstance(value, str) and value.strip():
+                fallback[key] = value.strip()
+            barred = _string_list(entry.get("unsupported"))
+            if barred:
+                unsupported[key] = frozenset(barred)
+        caps = ModelEffortCaps(
+            fallback=MappingProxyType(fallback), unsupported=MappingProxyType(unsupported)
+        )
+    return {
+        "menus": _id_table(cfg.get("menus")),
+        "servable_aliases": _alias_table(cfg.get("servable_aliases")),
+        "current_generation_models": _id_table(cfg.get("current_generation_models")),
+        "model_effort_caps": caps,
+    }
 
 
 @dataclass(frozen=True)
@@ -799,6 +1040,7 @@ def substitute_model(
     *,
     prefixes: Sequence[str] | None = None,
     barred: Sequence[str] = (),
+    aliases: Mapping[str, str] | None = None,
 ) -> str | None:
     """Find something in *candidates* to run in place of *model*.
 
@@ -816,6 +1058,8 @@ def substitute_model(
     :param prefixes: Catalog prefixes to strip before comparing ids; ``None``
         uses this deployment's configured ones.
     :param barred: Bare ids to skip, e.g. models the harness's gateway 400s on.
+    :param aliases: Served-spelling table for :func:`apply_servable_alias`;
+        ``None`` reads this deployment's.
     :returns: A servable candidate id (through :func:`apply_servable_alias`),
         or ``None`` when nothing servable matches the pick, its tier, or its
         family fallback.
@@ -829,7 +1073,7 @@ def substitute_model(
     # 1. The exact pick, when the workspace serves it.
     bare = _bare_id(model, prefixes)
     if bare not in skip and bare in local:
-        return apply_servable_alias(local[bare], prefixes)
+        return apply_servable_alias(local[bare], prefixes, aliases=aliases)
 
     # 2. The best servable model of the pick's own tier (opus/sonnet/sol/luna).
     tier = _model_tier(model, prefixes)
@@ -843,12 +1087,12 @@ def substitute_model(
         ]
         if same_tier:
             best = max(same_tier, key=lambda m: _version_key(m, prefixes))
-            return apply_servable_alias(best, prefixes)
+            return apply_servable_alias(best, prefixes, aliases=aliases)
 
     # 3. The family fallback, then decline.
     fallback = _FAMILY_FALLBACK.get(family)
     if fallback is not None and fallback not in skip and fallback in local:
-        return apply_servable_alias(local[fallback], prefixes)
+        return apply_servable_alias(local[fallback], prefixes, aliases=aliases)
     return None
 
 
@@ -968,15 +1212,25 @@ class TaskV1RouteOptionSource:
         *,
         router_name: str = DEFAULT_ROUTER_NAME,
         model_prefixes: Sequence[str] = MODEL_ID_PREFIXES,
+        menus: Mapping[str, Sequence[str]] | None = None,
+        servable_aliases: Mapping[str, str] | None = None,
     ) -> None:
         """
         :param router_name: Router strategy name. Only ``task_v1`` demands an
             arm menu; another version is offered exactly the caller's catalog.
         :param model_prefixes: Catalog prefixes to strip on the way out and
             restore on the way back; see :data:`MODEL_ID_PREFIXES`.
+        :param menus: Scenario → required arm menu; ``None`` uses
+            :data:`TASK_V1_MENUS` for ``task_v1`` and no menu otherwise. An
+            explicit table applies whatever *router_name* is, so a managed
+            gateway's own router can demand its own arms.
+        :param servable_aliases: Bare id → served spelling; ``None`` reads this
+            deployment's configured table.
         """
         self._router_name = router_name
         self._model_prefixes = tuple(model_prefixes)
+        self._menus = scenario_menus(menus, router_name=router_name)
+        self._aliases = servable_aliases
 
     def to_router_id(self, model: str) -> str:
         """Strip the first matching configured prefix from a catalog id."""
@@ -1052,11 +1306,13 @@ class TaskV1RouteOptionSource:
             if not self._is_menu_arm(raw, harnesses, catalog):
                 return None
             pool = catalog.get(harness or "") or [m for models in catalog.values() for m in models]
-            local = substitute_model(raw, pool, prefixes=self._model_prefixes)
+            local = substitute_model(
+                raw, pool, prefixes=self._model_prefixes, aliases=self._aliases
+            )
         if local is None:
             return None
         return ResolvedRoute(
-            model=apply_servable_alias(local, self._model_prefixes),
+            model=apply_servable_alias(local, self._model_prefixes, aliases=self._aliases),
             harness=harness,
             raw_model=raw,
         )
@@ -1092,6 +1348,7 @@ class TaskV1RouteOptionSource:
             pool,
             prefixes=self._model_prefixes,
             barred=_HARNESS_EXCLUDED_MODELS.get(harness, ()),
+            aliases=self._aliases,
         )
         if local is None:
             return None
@@ -1099,9 +1356,7 @@ class TaskV1RouteOptionSource:
 
     def menu(self, harnesses: Iterable[str]) -> tuple[str, ...]:
         """Return the arm menu the router requires for *harnesses*."""
-        if self._router_name != DEFAULT_ROUTER_NAME:
-            return ()
-        return TASK_V1_MENUS.get(self._scenario(harnesses), ())
+        return tuple(self._menus.get(self._scenario(harnesses), ()))
 
     def _scenario(self, harnesses: Iterable[str]) -> str:
         """Map a harness set to a router scenario key."""
@@ -1206,6 +1461,8 @@ def route_option_source(
     return TaskV1RouteOptionSource(
         router_name=resolved.router_name,
         model_prefixes=tuple(model_prefixes) or resolved.model_prefixes,
+        menus=resolved.menus,
+        servable_aliases=resolved.servable_aliases,
     )
 
 
@@ -1230,9 +1487,12 @@ class ExternalRoutingClient:
         router_name: str,
         auth: httpx.Auth | None = None,
         databricks_profile: str | None = None,
+        auth_provider: Callable[[], Mapping[str, str] | None] | None = None,
         model_prefixes: Sequence[str] | None = None,
         request_timeout: float = 20.0,
         selection_model: str | None = None,
+        menus: Mapping[str, Sequence[str]] | None = None,
+        servable_aliases: Mapping[str, str] | None = None,
     ) -> None:
         """
         :param base_url: Routing service base, e.g.
@@ -1247,6 +1507,15 @@ class ExternalRoutingClient:
             call via the databricks-sdk ``Config`` — which refreshes OAuth
             tokens transparently, so a long-lived server never sends a stale
             token (the 401 an at-startup captured token hits after ~1h).
+        :param auth_provider: Optional callable returning the request headers to
+            authenticate ONE :meth:`route` call, e.g.
+            ``{"Authorization": "Bearer ..."}``. Evaluated per call and takes
+            precedence over every other mode, so one process serving many
+            workspaces can carry the calling identity instead of a
+            construction-time credential. Returning ``None`` (or an empty
+            mapping) means this caller has no credential and the request goes
+            out unauthenticated — the provider is the sole authority once set,
+            never a first attempt that falls back to *auth*.
         :param model_prefixes: Prefixes this deployment's catalog attaches to
             model ids the router keys bare, stripped on the way out and
             restored on its answer. ``None`` uses :data:`MODEL_ID_PREFIXES`.
@@ -1256,14 +1525,23 @@ class ExternalRoutingClient:
             extraction call, sent as ``route_selector.config.model`` so a
             deployment can pin one it has query access to. ``None`` omits
             ``config`` entirely and leaves the router's frozen default.
+        :param menus: Scenario → required arm menu, overriding
+            :data:`TASK_V1_MENUS`; see :class:`RoutingSettings`.
+        :param servable_aliases: Bare id → served spelling, overriding
+            :data:`_SERVABLE_ALIASES`; see :class:`RoutingSettings`.
         """
         self._url = base_url.rstrip("/") + "/" + ROUTES_SELECT_PATH
         self._router_name = router_name
         self._auth = auth
         self._databricks_profile = databricks_profile
+        self._auth_provider = auth_provider
         # Cached SDK Config for the profile (created lazily), reused across
         # calls; its authenticate() refreshes the OAuth token as needed.
         self._sdk_config: Config | None = None
+        # Same cache for the ambient chain, plus a latch that stops re-probing
+        # the SDK on every call once it is known not to apply here.
+        self._ambient_config: Config | None = None
+        self._ambient_off = False
         self._model_prefixes = (
             list(MODEL_ID_PREFIXES) if model_prefixes is None else list(model_prefixes)
         )
@@ -1272,7 +1550,10 @@ class ExternalRoutingClient:
         # All router-contract knowledge (arm menus, harness derivation,
         # unservable-pick substitution) lives behind this seam.
         self._source = TaskV1RouteOptionSource(
-            router_name=router_name, model_prefixes=self._model_prefixes
+            router_name=router_name,
+            model_prefixes=self._model_prefixes,
+            menus=menus,
+            servable_aliases=servable_aliases,
         )
         # Human-readable reason the most recent route() returned None, for the
         # caller to surface in the UI (a bare None hides the actual cause, e.g.
@@ -1280,34 +1561,92 @@ class ExternalRoutingClient:
         # path, cleared on success.
         self.last_error: str | None = None
 
-    def _resolve_auth(self) -> httpx.Auth | None:
-        """Return the auth for a request, refreshing an OAuth token per call.
+    def _resolve_credentials(self) -> tuple[Any, Mapping[str, str]]:  # type: ignore[explicit-any]
+        """Resolve one request's credentials as ``(httpx auth, extra headers)``.
 
-        A static *auth* (explicit api_key) is returned as-is. When only a
-        Databricks profile is configured, mint a fresh bearer from the cached
-        SDK ``Config`` so token expiry never surfaces as a router 401.
+        Evaluated per :meth:`route` call, in precedence order: the injected
+        *auth_provider* (per-caller identity), a static *auth* (explicit
+        api_key), the Databricks *databricks_profile* (fresh bearer per call so
+        token expiry never surfaces as a router 401), then the ambient SDK
+        chain. Both slots empty means the request goes out unauthenticated.
         """
+        if self._auth_provider is not None:
+            return None, self._provider_headers()
         if self._auth is not None:
-            return self._auth
-        if self._databricks_profile is None:
-            return None
+            return self._auth, {}
+        if self._databricks_profile is not None:
+            return self._profile_auth(), {}
+        return self._ambient_auth(), {}
+
+    def _provider_headers(self) -> Mapping[str, str]:
+        """Call the injected provider for this request's auth headers."""
         try:
-            if self._sdk_config is None:
+            headers = self._auth_provider() if self._auth_provider is not None else None
+        except Exception:  # noqa: BLE001 — a caller with no credential still routes
+            _logger.warning(
+                "ExternalRoutingClient: auth_provider raised; sending no credential",
+                exc_info=True,
+            )
+            return {}
+        return {k: v for k, v in dict(headers or {}).items() if isinstance(v, str) and v.strip()}
+
+    def _profile_auth(self) -> Any:  # type: ignore[explicit-any]  # httpx.Auth | None
+        """Mint a bearer from the configured Databricks CLI profile."""
+        if self._sdk_config is None:
+            try:
                 from databricks.sdk.config import Config
 
                 self._sdk_config = Config(profile=self._databricks_profile)
-            headers = self._sdk_config.authenticate()
-        except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
-            _logger.warning(
-                "ExternalRoutingClient: could not resolve auth for profile %r",
-                self._databricks_profile,
-                exc_info=True,
-            )
+            except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+                _logger.warning(
+                    "ExternalRoutingClient: could not resolve auth for profile %r",
+                    self._databricks_profile,
+                    exc_info=True,
+                )
+                return None
+        return _config_bearer(self._sdk_config, f"profile {self._databricks_profile!r}")
+
+    def _ambient_auth(self) -> Any:  # type: ignore[explicit-any]  # httpx.Auth | None
+        """Mint a bearer from the ambient Databricks SDK chain, if it applies.
+
+        A server deployment has no CLI profile and no api_key: its workspace
+        credential is the ambient environment (``DATABRICKS_HOST`` plus
+        ``DATABRICKS_CLIENT_ID``/``DATABRICKS_CLIENT_SECRET``, or whatever the
+        SDK's default chain resolves). Rather than make that a config flag, it
+        engages only when the ambient workspace host IS the host this client
+        posts to.
+
+        Host matching is the safer guard than an ``auth: ambient`` opt-in: the
+        hazard is sending a workspace token to an endpoint that is not that
+        workspace, and a config value cannot prevent that (a deployment that
+        sets it and later re-points ``base_url`` leaks the token), whereas host
+        matching cannot leak regardless of config. It also keeps a plain
+        unauthenticated endpoint unauthenticated — a non-matching host never
+        attaches a credential — while costing managed no configuration.
+        """
+        if self._ambient_off:
             return None
-        token = (headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-        if not token:
-            return None
-        return _bearer_auth(token)
+        if self._ambient_config is None:
+            try:
+                from databricks.sdk.config import Config
+
+                config = Config()
+            except Exception:  # noqa: BLE001 — no ambient credential is the normal case
+                _logger.debug(
+                    "ExternalRoutingClient: no ambient Databricks credential", exc_info=True
+                )
+                self._ambient_off = True
+                return None
+            if not _same_host(getattr(config, "host", None), self._url):
+                _logger.debug(
+                    "ExternalRoutingClient: ambient Databricks host %r is not the router host; "
+                    "sending no credential",
+                    getattr(config, "host", None),
+                )
+                self._ambient_off = True
+                return None
+            self._ambient_config = config
+        return _config_bearer(self._ambient_config, "the ambient Databricks environment")
 
     async def route(
         self,
@@ -1357,13 +1696,13 @@ class ExternalRoutingClient:
         # token that has expired since startup.
         import asyncio
 
-        auth = await asyncio.to_thread(self._resolve_auth)
+        auth, auth_headers = await asyncio.to_thread(self._resolve_credentials)
         self.last_error = None
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as http:
                 resp = await http.post(
                     self._url,
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", **auth_headers},
                     json=body,
                     auth=auth if auth is not None else httpx.USE_CLIENT_DEFAULT,
                 )

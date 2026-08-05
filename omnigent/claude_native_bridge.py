@@ -1253,6 +1253,7 @@ def build_hook_settings(
     launch_permission_mode: str | None = None,
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
+    turn_routing: bool = False,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -1285,6 +1286,12 @@ def build_hook_settings(
         ``route-subagent`` endpoint (``subagent_router.json``). When set,
         a ``PreToolUse`` hook routes native subagent spawns; ``None``
         leaves spawns unrouted.
+    :param turn_routing: ``True`` when the session launched with Smart
+        Routing on, which registers the ``UserPromptSubmit`` first-message
+        routing hook. ``False`` omits it: the hook would otherwise put a
+        routing round trip (25s worst case on a degraded server) in front of
+        every prompt of every native session, to be told every time that the
+        session does not route.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1371,7 +1378,8 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
-    hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
+    if turn_routing:
+        hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
         _write_json_file(
             bridge_dir / _PERMISSION_HOOK_FILE,
@@ -1602,6 +1610,7 @@ def augment_claude_args(
     append_system_prompt: str | None = None,
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
+    turn_routing: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1645,6 +1654,10 @@ def augment_claude_args(
         ``route-subagent`` endpoint, threaded to
         :func:`build_hook_settings` so native ``Task`` spawns are routed.
         ``None`` leaves them unrouted.
+    :param turn_routing: ``True`` when the session launched with Smart
+        Routing on, threaded to :func:`build_hook_settings` so the
+        ``UserPromptSubmit`` first-message routing hook is registered.
+        ``False`` keeps every prompt off the routing round trip.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1658,6 +1671,7 @@ def augment_claude_args(
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_effort=_arg_value(claude_args, "--effort"),
         subagent_router_dir=subagent_router_dir,
+        turn_routing=turn_routing,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)

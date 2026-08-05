@@ -522,10 +522,12 @@ export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
 }
 
 // Hide the sub-agent spawn chips of a session whose sub-agent routing is not
-// "on": those spawns aren't routed, so a `native_subagent` decision chip would
-// advertise a per-spawn pick that isn't happening. Historic rows stay persisted
-// (audit trail) and the session's own session/turn chips are untouched. Returns
-// the input array unchanged when nothing is hidden, so the memo stays stable.
+// "on". Deliberate product decision: the toggle hides `native_subagent` chips
+// WHOLESALE, including historic chips for spawns that already ran routed while
+// the switch was on — the display follows the current setting, not per-row
+// history. Rows stay persisted (audit trail; flipping the switch back reveals
+// them) and the session's own session/turn chips are untouched. Returns the
+// input array unchanged when nothing is hidden, so the memo stays stable.
 export function stripGatedSubagentRoutingChips(
   bubbles: Bubble[],
   subagentRoutingOverride: "on" | "off" | null,

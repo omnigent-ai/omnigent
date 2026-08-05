@@ -22,6 +22,7 @@ from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
 )
 from omnigent.server.routes._sessions import orchestration as orchestration_module
+from omnigent.server.routes._sessions.common import get_server_host_registry
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.smart_routing import RoutingResult
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -38,6 +39,8 @@ GPT_MODEL = "databricks-gpt-5-5"
 GLM_MODEL = "databricks-glm-5-2"
 # The spelling the gateway serves GLM under; see ``_SERVABLE_ALIASES``.
 GLM_SERVABLE = "system.ai.glm-5-2"
+# Uuid-shaped so the host registry's canonical keying accepts it.
+_GATEWAY_HOST_ID = "bb22cc33dd44ee55ff66778899001122"
 
 pytestmark = pytest.mark.asyncio
 
@@ -66,6 +69,22 @@ async def _parent_and_child(
     if child_model_override is not None:
         child = conv_store.update_conversation(child.id, model_override=child_model_override)
     return parent, child, conv_store
+
+
+def _host_reporting_gateway(gateway: dict[str, bool]) -> Any:  # type: ignore[explicit-any]
+    """A host row whose gateway-backing map is already reported to the server.
+
+    Gateway backing never reaches the database: the host delivers it on its
+    connect handshake and ``create_app`` publishes the receiving registry, so a
+    test stands a host up by recording into that registry.
+
+    :param gateway: Harness spelling → gateway-backed flag to report.
+    :returns: A host-row stand-in carrying the id the map was recorded under.
+    """
+    registry = get_server_host_registry()
+    assert registry is not None, "create_app publishes the host registry"
+    registry.record_gateway_inference(_GATEWAY_HOST_ID, gateway)
+    return SimpleNamespace(host_id=_GATEWAY_HOST_ID)
 
 
 def _routing_decisions(conv_store: SqlAlchemyConversationStore, session_id: str) -> list[Any]:
@@ -288,7 +307,9 @@ async def test_the_subagent_relay_falls_back_to_the_judge_off_the_gateway(
         routing_client=external,
         routing_backends=RoutingBackends(external=external, local=local),
     )
-    ungatewayed = SimpleNamespace(gateway_inference={"claude-native": False})
+    # Gateway backing is read from the live registry, filled by the host's
+    # connect handshake — stand in for a host that reported claude off-gateway.
+    ungatewayed = _host_reporting_gateway({"claude-native": False})
     # No runner is bound here, so stand in for the pane's live catalog — the only
     # provider-accurate candidate source once the static table is off the table.
     with (
@@ -1336,3 +1357,98 @@ async def test_turn_candidates_come_from_the_panes_own_vocabulary(
     assert [sorted(offer.values()) for offer in routing_client.offered] == [
         [["databricks-claude-opus-5", ROUTED_MODEL]]
     ]
+
+
+# ── 10. A routed child's harness is chosen once, not per message ─────
+
+
+class _SequenceRoutingClient:
+    """Routing-client double returning a different verdict per call.
+
+    :param results: One verdict per call, in order; the last repeats.
+    :ivar calls: ``(message, offered_models)`` per :meth:`route` call.
+    """
+
+    def __init__(self, *results: RoutingResult) -> None:
+        self._results = list(results)
+        self.last_error: str | None = None
+        self.calls: list[tuple[str, dict[str, list[str]]]] = []
+
+    async def route(
+        self, message: str, available_models: dict[str, list[str]]
+    ) -> RoutingResult | None:
+        """Record the offer and return this call's verdict."""
+        self.calls.append((message, dict(available_models)))
+        index = min(len(self.calls) - 1, len(self._results) - 1)
+        return self._results[index]
+
+
+async def _send_child_message(
+    child: Any,
+    conv_store: SqlAlchemyConversationStore,
+    routing_client: Any,
+    text: str,
+) -> None:
+    """Forward one user message for *child* with *routing_client* installed."""
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id,
+                child,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+
+async def test_a_follow_up_message_cannot_flip_a_routed_childs_harness(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A child's harness is decided on its first message and never again.
+
+    The child arm of the message-routing gate deliberately routes past an
+    orchestrator-supplied model, and its condition
+    (``conv.parent_conversation_id is not None``) was therefore true on EVERY
+    message: each follow-up re-ran the judge and re-persisted BOTH overrides, so
+    a second turn could move the child onto another harness family mid-session
+    — contradicting the create-time-only contract the ``harness_override``
+    forward documents, and stranding the pane the child was already running in.
+    """
+    _parent_id, child, conv_store = await _auto_parent_and_child(
+        client,
+        db_uri,
+        agent_name="routing-child-no-harness-flip",
+        cost_control="on",
+        subagent_routing="on",
+    )
+    routing_client = _SequenceRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="first", harness="codex"),
+        RoutingResult(model=ROUTED_MODEL, rationale="second", harness="claude_code"),
+    )
+
+    await _send_child_message(child, conv_store, routing_client, "audit routing")
+
+    after_first = conv_store.get_conversation(child.id)
+    assert after_first is not None
+    assert len(routing_client.calls) == 1
+    assert after_first.model_override == GPT_MODEL
+    first_harness = after_first.harness_override
+    assert first_harness not in (None, "auto")
+    assert after_first.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+    # A follow-up on the SAME child, with the router now preferring the other
+    # family. Nothing may move.
+    await _send_child_message(after_first, conv_store, routing_client, "and now the tests")
+
+    after_second = conv_store.get_conversation(child.id)
+    assert after_second is not None
+    assert len(routing_client.calls) == 1, "the follow-up must not re-run the judge"
+    assert after_second.harness_override == first_harness
+    assert after_second.model_override == GPT_MODEL
+    assert len(_routing_decisions(conv_store, child.id)) == 1

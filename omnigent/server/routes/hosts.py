@@ -563,7 +563,7 @@ def create_hosts_router(
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
             ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            the host never reported it).
+            no connected host has reported it to this replica).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -601,9 +601,11 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
-                    # ``None`` means the host never reported it — emitted as-is
-                    # so a client can tell "unknown" from "not gateway-backed".
-                    "gateway_inference": host.gateway_inference,
+                    # Held in memory from the host's connect handshake, not the
+                    # hosts row. ``None`` means this replica has no report yet —
+                    # emitted as-is so a client can tell "unknown" from "not
+                    # gateway-backed".
+                    "gateway_inference": host_registry.gateway_inference(host.host_id),
                 }
             )
         return {"hosts": result}
@@ -643,9 +645,9 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
-            # ``None`` means the host never reported it — emitted as-is so a
-            # client can tell "unknown" from "not gateway-backed".
-            "gateway_inference": host.gateway_inference,
+            # Same semantics as list_hosts: reported on connect and held in
+            # memory, so ``None`` is "no report on this replica yet".
+            "gateway_inference": host_registry.gateway_inference(host.host_id),
             "runners": [],
         }
 
@@ -1308,12 +1310,19 @@ def create_hosts_router(
                 detail=f"host install failed: {result.get('error') or 'unknown error'}",
             )
 
+        # An install can flip gateway backing (a freshly installed CLI now
+        # resolves the workspace gateway), so take the map the host just
+        # recomputed instead of waiting for its next readiness push.
+        installed_gateway = result.get("gateway_inference")
+        if installed_gateway is not None:
+            host_registry.record_gateway_inference(host.host_id, installed_gateway)
+
         return {
             "object": "harness_install",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
             # Passed through as-is: ``None`` is "unknown", not "none backed".
-            "gateway_inference": result.get("gateway_inference"),
+            "gateway_inference": installed_gateway,
         }
 
     @router.post("/hosts/{host_id}/harnesses/{harness}/credential")
@@ -1411,12 +1420,19 @@ def create_hosts_router(
                 detail=f"host credential write failed: {result.get('error') or 'unknown error'}",
             )
 
+        # Pointing a family at the workspace gateway is exactly what this write
+        # does, so record the recomputed map now rather than on the host's next
+        # readiness push.
+        written_gateway = result.get("gateway_inference")
+        if written_gateway is not None:
+            host_registry.record_gateway_inference(host.host_id, written_gateway)
+
         return {
             "object": "harness_credential",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
             # Passed through as-is: ``None`` is "unknown", not "none backed".
-            "gateway_inference": result.get("gateway_inference"),
+            "gateway_inference": written_gateway,
         }
 
     @router.get("/hosts/{host_id}/credentials/detected")

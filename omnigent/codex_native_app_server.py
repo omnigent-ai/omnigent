@@ -877,7 +877,11 @@ class CodexNativeAppServer:
         router_bridge_dir = codex_router_bridge_dir(self.env)
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         config_source = _codex_home_config_source_from_env()
-        _populate_codex_home_config(
+        # Off the loop: this copies/symlinks a home AND (on the routing path)
+        # shells out to ``codex debug models`` with a 10s timeout. Run inline it
+        # stalled every other session sharing this event loop for that long.
+        await asyncio.to_thread(
+            _populate_codex_home_config,
             self.codex_home,
             config_source,
             subagent_routing=self.router_hooks_registered,
@@ -918,6 +922,11 @@ class CodexNativeAppServer:
                 router_bridge_dir=router_bridge_dir,
                 router_session_id=codex_router_session_id(self.env),
                 user_hooks_source=config_source / _CODEX_HOOKS_FILE,
+                # The runner only advertises a route-turn endpoint for a
+                # session that launched with Smart Routing on, so its presence
+                # is the switch for the first-message routing hook. Same
+                # rendezvous-as-switch shape as the subagent router above.
+                turn_routing=_turn_router_advertised(self.bridge_dir),
             )
             if self.ap_server_url:
                 write_policy_hook_config(
@@ -1223,7 +1232,26 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
     )
 
 
-def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
+def _turn_router_advertised(bridge_dir: Path) -> bool:
+    """
+    Report whether the runner advertised a ``route-turn`` endpoint here.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` when a usable ``turn_router.json`` is present, i.e. the
+        session launched with Smart Routing on.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    return read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE) is not None
+
+
+def _codex_policy_hooks_settings(
+    bridge_dir: Path,
+    python_executable: str | None,
+    *,
+    turn_routing: bool = False,
+) -> _JsonObject:
     """
     Build the ``hooks.json`` payload registering the policy hook.
 
@@ -1238,6 +1266,10 @@ def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None
 
     :param bridge_dir: Native Codex bridge directory.
     :param python_executable: Python executable for the hook command.
+    :param turn_routing: ``True`` when the runner advertised a ``route-turn``
+        endpoint for this session, i.e. it launched with Smart Routing on.
+        ``False`` leaves the first-message routing hook unregistered, so a
+        session that will never route pays no per-prompt round trip.
     :returns: A ``hooks.json``-shaped dict.
     """
     hook = {
@@ -1245,13 +1277,14 @@ def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
+    prompt_submit = [hook]
+    if turn_routing:
+        prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
     return {
         "hooks": {
             "PreToolUse": [{"hooks": [hook]}],
             "PostToolUse": [{"hooks": [hook]}],
-            "UserPromptSubmit": [
-                {"hooks": [hook, _codex_route_turn_hook(bridge_dir, python_executable)]}
-            ],
+            "UserPromptSubmit": [{"hooks": prompt_submit}],
         }
     }
 
@@ -1303,6 +1336,7 @@ def _write_codex_policy_hooks_file(
     router_bridge_dir: Path | None = None,
     router_session_id: str | None = None,
     user_hooks_source: Path | None = None,
+    turn_routing: bool = False,
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
@@ -1322,10 +1356,13 @@ def _write_codex_policy_hooks_file(
     :param user_hooks_source: The user's real ``hooks.json`` to merge when
         the private home holds no symlink to it (the routing path unlinks
         it before this runs).
+    :param turn_routing: ``True`` when the session launched with Smart Routing
+        on, which registers the ``UserPromptSubmit`` first-message routing
+        hook.
     :returns: None.
     """
     payloads: list[Mapping[str, object]] = [
-        _codex_policy_hooks_settings(bridge_dir, python_executable)
+        _codex_policy_hooks_settings(bridge_dir, python_executable, turn_routing=turn_routing)
     ]
     if router_bridge_dir is not None:
         payloads.append(

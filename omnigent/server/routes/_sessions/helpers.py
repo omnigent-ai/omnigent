@@ -8301,8 +8301,8 @@ async def _handle_advise_models_mcp(
     """
     Server-side handler for ``sys_advise_models`` MCP tool calls.
 
-    Intercepts the call before the runner forward because
-    ``RuntimeCaps.routing_client`` lives in the server process.
+    Intercepts the call before the runner forward because the deployment's
+    routing backends live in the server process.
 
     :param rpc_id: The JSON-RPC request id.
     :param conv: The :class:`Conversation` for this session.
@@ -8316,8 +8316,10 @@ async def _handle_advise_models_mcp(
             rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
         )
 
+    from omnigent.server.routing_backend import backends_from_caps
+
     caps = get_caps()
-    routing_client = caps.routing_client
+    routing_client = backends_from_caps(caps).any()
     if routing_client is None:
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 

@@ -9,6 +9,13 @@ which hosts are live *here*.
 Simpler than :class:`TunnelRegistry` because the host tunnel
 carries only control frames (launch/stop runner), not HTTP
 request/response traffic. No per-request reassembly queues needed.
+
+The registry also holds what connected hosts *report* about themselves and
+nothing persists — today the per-family gateway-inference map (see
+:mod:`omnigent.gateway_inference`). It is delivered on the connect handshake, so
+a replica that has never seen a host simply knows nothing about it, and the
+readers' unknown-is-backed rule covers that window until the host reconnects and
+re-reports.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -323,6 +331,13 @@ class HostRegistry:
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
         self._hosts: dict[tuple[int, str], HostConnection] = {}
+        # Last gateway-inference map each host reported, keyed by canonical
+        # host_id alone: the map describes the machine's local config, so the
+        # same machine connected to two workspaces reports the same answer.
+        # Kept across a host disconnect (a tunnel flap shouldn't blank a known
+        # answer) and lost with the process, which is the point — a restarted
+        # server re-learns it from the reconnect handshake.
+        self._gateway_inference: dict[str, dict[str, bool]] = {}
 
     def register(
         self,
@@ -485,6 +500,42 @@ class HostRegistry:
         if conn is None:
             return None
         return conn.hello.installation_id
+
+    def record_gateway_inference(
+        self,
+        host_id: str,
+        gateway_inference: Mapping[str, bool] | None,
+    ) -> None:
+        """Store the gateway-inference map a host just reported.
+
+        Called for every frame that carries the map — the connect handshake and
+        each readiness refresh — so the server's view is delivered rather than
+        persisted. ``None`` (a host that cannot evaluate the map at all) clears
+        the entry back to unknown instead of recording "nothing is backed".
+
+        :param host_id: Host identifier, in any accepted spelling (see
+            :func:`_canonical_host_id`).
+        :param gateway_inference: Harness spelling → gateway-backed flag, e.g.
+            ``{"claude-native": True, "codex": False}``, or ``None``.
+        """
+        key = _canonical_host_id(host_id)
+        with self._lock:
+            if gateway_inference is None:
+                self._gateway_inference.pop(key, None)
+            else:
+                self._gateway_inference[key] = dict(gateway_inference)
+
+    def gateway_inference(self, host_id: str) -> dict[str, bool] | None:
+        """Return the gateway-inference map *host_id* last reported here.
+
+        :param host_id: Host identifier, in any accepted spelling.
+        :returns: A copy of the reported map, or ``None`` when this replica has
+            never had a report from the host — unknown, which readers treat as
+            gateway-backed rather than unavailable.
+        """
+        with self._lock:
+            reported = self._gateway_inference.get(_canonical_host_id(host_id))
+        return dict(reported) if reported is not None else None
 
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.

@@ -530,7 +530,11 @@ def test_sdk_hook_registered_when_router_advertised(
     assert options.hooks is not None
     matcher = options.hooks["PreToolUse"][0]
     assert matcher.matcher == subagent_router.AGENT_TOOL_MATCHER
-    assert matcher.timeout == subagent_router.REQUEST_TIMEOUT_S
+    # Strictly outside the router call's own budget: registered AT it, the SDK
+    # could cancel the hook at the same instant its request gave up, so the
+    # fail-open branch never ran and the harness saw a dead hook.
+    assert matcher.timeout == subagent_router.HOOK_TIMEOUT_S
+    assert matcher.timeout > subagent_router.REQUEST_TIMEOUT_S
 
 
 def test_sdk_hook_not_registered_without_advertisement(

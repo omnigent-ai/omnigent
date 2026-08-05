@@ -1222,11 +1222,18 @@ def extended_model_catalog(
 
 
 # Cached ``codex debug models`` result, keyed by (binary, CODEX_HOME). The
-# catalog is a property of the installed CLI, not of a session, and the probe
-# runs on the event loop during session boot — so it is paid once per host
-# process rather than once per session. ``None`` is cached too: a CLI that
-# cannot answer will not start answering mid-process.
-_MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, Any] | None] = {}
+# catalog is a property of the installed CLI, not of a session, so a successful
+# probe is paid once per host process rather than once per session.
+_MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+# Failures are cached only briefly, keyed the same way and holding the
+# monotonic time the negative expires. Caching them forever turned one
+# transient 10s timeout — a loaded host, a cold binary — into "this host has no
+# catalog" for the life of the process, silently dropping the gateway-only arms
+# from every later session's ``spawn_agent``. Caching them not at all would pay
+# the full timeout per session on a genuinely broken CLI.
+_MODEL_CATALOG_FAILURE_TTL_S = 60.0
+_MODEL_CATALOG_FAILURES: dict[tuple[str, str], float] = {}
 
 
 def read_codex_model_catalog(
@@ -1242,15 +1249,27 @@ def read_codex_model_catalog(
     whatever codex version is installed: it is ~300 kB of vendor metadata
     (per-model prompts included) that a pinned copy would silently freeze.
 
+    Blocking (it shells out with a timeout), so callers on the event loop must
+    reach it through a thread — see :func:`write_codex_model_catalog`.
+
     :param codex_path: The codex binary.
     :param source_home: ``CODEX_HOME`` to resolve config from.
     :param timeout: Seconds to wait; a slow probe must not delay session boot.
     :returns: ``{"models": [...]}``, or ``None`` on any failure.
     """
     cache_key = (codex_path, str(source_home))
-    if cache_key in _MODEL_CATALOG_CACHE:
-        return _MODEL_CATALOG_CACHE[cache_key]
+    cached = _MODEL_CATALOG_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    failed_until = _MODEL_CATALOG_FAILURES.get(cache_key)
+    if failed_until is not None:
+        if time.monotonic() < failed_until:
+            return None
+        del _MODEL_CATALOG_FAILURES[cache_key]
     catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
+    if catalog is None:
+        _MODEL_CATALOG_FAILURES[cache_key] = time.monotonic() + _MODEL_CATALOG_FAILURE_TTL_S
+        return None
     _MODEL_CATALOG_CACHE[cache_key] = catalog
     return catalog
 
@@ -1944,7 +1963,11 @@ class _CodexAppServerSession:
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched.
         router_bridge_dir = codex_router_bridge_dir(self._env)
-        _populate_codex_home_config(
+        # Off the loop: this copies/symlinks a home AND (on the routing path)
+        # shells out to ``codex debug models`` with a 10s timeout. Run inline it
+        # stalled every other session sharing this event loop for that long.
+        await asyncio.to_thread(
+            _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
             subagent_routing=router_bridge_dir is not None,

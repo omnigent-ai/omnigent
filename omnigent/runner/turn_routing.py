@@ -25,7 +25,9 @@ handler forwards to it with :func:`make_server_relay_resolver`.
 
 **The authoritative gate is** :func:`already_routed` — the session's
 routing-decision label. The hook's local :data:`MARKER_FILE` is only a
-fast skip that saves a round trip; it is never the source of truth.
+fast skip that saves a round trip; it is never the source of truth, and it
+is scoped to the session that wrote it because the bridge dir it lives in
+outlives that session (``/clear`` rotations, forks).
 
 **Block-and-replay.** Neither harness can retarget the turn that is
 already in flight — codex binds the turn's model before
@@ -91,6 +93,14 @@ ADVERTISEMENT_FILE = "turn_router.json"
 #: Two jobs: the next prompt's hook fast-skips on it (no network), and the
 #: runner reads it as "this prompt was blocked, you owe it a replay". Absent
 #: means the hook let the prompt run.
+#:
+#: **Scoped to the session that wrote it.** A bridge dir outlives the
+#: conversation keyed on it — a ``/clear`` rotation re-keys the superseded
+#: session and hands the SAME live dir to the new one, and a fork inherits its
+#: parent's bridge id — so a bare file would make every later conversation in
+#: the pane fast-skip on a verdict that was never theirs. The session id (and
+#: the decision it belongs to) go INSIDE the file and a mismatch reads as
+#: absent; see :func:`turn_routing_marker_present`.
 MARKER_FILE = "turn_routing_done"
 
 #: Bridge-dir file holding the prompt a routed verdict still owes a replay.
@@ -311,6 +321,71 @@ def _opt_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+# ── The block marker (session-scoped) ──────────────────────────────────────
+
+
+def write_turn_routing_marker(
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    decision_id: str | None = None,
+) -> bool:
+    """Record that *session_id*'s route-turn hook has had its one answer.
+
+    Called from harness hook subprocesses. The session id is written INSIDE
+    the file rather than implied by the directory, because the directory is
+    shared: see :data:`MARKER_FILE`.
+
+    :param bridge_dir: Session bridge directory.
+    :param session_id: Session the verdict belongs to.
+    :param decision_id: Verdict identity, for diagnosing a stale marker.
+    :returns: ``True`` when the marker is on disk. A marker that cannot be
+        written must stop the hook from blocking — it is the runner's "you
+        owe this prompt a replay" handshake.
+    """
+    body = {"session_id": session_id, "decision_id": decision_id, "at": time.time()}
+    try:
+        (bridge_dir / MARKER_FILE).write_text(json.dumps(body), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def turn_routing_marker_session(bridge_dir: Path) -> str | None:
+    """Return the session id the bridge dir's marker was written for.
+
+    :param bridge_dir: Session bridge directory.
+    :returns: The session id, or ``None`` when there is no marker, it is
+        unreadable, or it predates the scoping (a bare file).
+    """
+    try:
+        raw = json.loads((bridge_dir / MARKER_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return _opt_str(raw.get("session_id")) if isinstance(raw, dict) else None
+
+
+def turn_routing_marker_present(bridge_dir: Path, session_id: str) -> bool:
+    """Report whether *session_id*'s own block marker is on disk.
+
+    A marker naming a different session reads as ABSENT — that is the whole
+    point of scoping it. Bridge dirs outlive conversations (a ``/clear``
+    rotation hands the live dir to a new session, a fork inherits its
+    parent's), so a bare marker made every later conversation in the pane
+    fast-skip on a verdict that was never theirs, and attribute the routing
+    it never got to the old session id.
+
+    Reading a stale marker as absent cannot regress route-once: the
+    authoritative gate is the server's routing-decision label
+    (:func:`already_routed`), and this file only ever saves a round trip.
+
+    :param bridge_dir: Session bridge directory.
+    :param session_id: Session asking.
+    :returns: ``True`` only when the marker names *session_id*.
+    """
+    return turn_routing_marker_session(bridge_dir) == session_id
+
+
 def _allow(reason: str, *, terminal: bool = False) -> TurnRouteDecision:
     """Let the prompt run unrouted and say why."""
     return TurnRouteDecision(action="allow", rationale=reason, terminal=terminal)
@@ -381,6 +456,8 @@ async def resolve_turn_route(
         ``persist(model, verdict)``. ``None`` skips persistence.
     :returns: The verdict the hook enforces.
     """
+    from omnigent.codex_model_vocabulary import comparable_model_id
+
     if conv is None:
         return _allow("session not found")
     if already_routed(conv):
@@ -389,7 +466,15 @@ async def resolve_turn_route(
         getattr(conv, "cost_control_mode_override", None),
         parent_cost_control_mode=getattr(parent, "cost_control_mode_override", None),
     ):
-        return _allow("smart routing is off for this session")
+        # Terminal: the hook is only registered for a session that launched
+        # with routing on, so this answer means it was turned off afterwards.
+        # Left non-terminal, every prompt for the rest of the session paid a
+        # full round trip (25s worst case on a degraded server) to be told the
+        # same thing. The cost of terminality is narrow — routing toggled off
+        # and back on again before the FIRST prompt no longer routes that
+        # prompt in the TUI; the composer gate and create-time path are
+        # unaffected.
+        return _allow("smart routing is off for this session", terminal=True)
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])
@@ -407,11 +492,22 @@ async def resolve_turn_route(
             req.harness,
         )
         return _allow("routing unavailable (no verdict)")
-    if req.model and model == req.model:
-        # Already there: nothing to switch, nothing to replay. Still
-        # terminal, and the pin below is what records the cadence.
+    # Spelling-insensitive: codex reports its live model as a dotted slug
+    # (``gpt-5.6-luna``) where the catalog writes dashes and a prefix
+    # (``databricks-gpt-5-6-luna``), and claude reports whatever the picker
+    # last showed. A raw ``==`` never matched for either, so a pick equal to
+    # the model already running still blocked the prompt and replayed it —
+    # a needless block, a needless ``/model`` echo, and a turn the user
+    # watched disappear and come back.
+    already_on_model = bool(req.model) and comparable_model_id(model) == comparable_model_id(
+        req.model or ""
+    )
+    if already_on_model:
         _logger.info("route-turn: session=%s already on routed model=%s", session_id, model)
 
+    # Both verdicts pin and record: the decision row and the label are what
+    # the route-once gate reads, so a no-op that skipped them would re-route
+    # on the next prompt.
     if pin is not None and not await pin(model):
         return _allow("routing unavailable (could not pin the routed model)")
     if persist is not None:
@@ -421,7 +517,9 @@ async def resolve_turn_route(
             _logger.exception("route-turn: decision persist failed for session=%s", session_id)
     rationale = verdict.get("rationale")
     return TurnRouteDecision(
-        action="route",
+        # A no-op verdict must be terminal AND unblocking: there is nothing to
+        # switch and nothing to replay, so the hook fast-paths on it.
+        action="allow" if already_on_model else "route",
         rationale=rationale if isinstance(rationale, str) and rationale else f"Routed to {model}",
         model=model,
         terminal=True,
@@ -861,8 +959,12 @@ async def _replay(
     """Run the replay handshake and deliver the prompt. See
     :func:`schedule_replay` for the ordering contract."""
     turn_cleared = idle if idle is not None else _settle_probe(bridge_dir, harness)
-    marker = bridge_dir / MARKER_FILE
-    if not await _wait_for(marker.exists, REPLAY_MARKER_WAIT_S):
+    # Our OWN marker: a fork or a ``/clear`` rotation can leave another
+    # session's marker in this dir, and treating it as ours would replay a
+    # prompt whose hook never blocked.
+    if not await _wait_for(
+        lambda: turn_routing_marker_present(bridge_dir, session_id), REPLAY_MARKER_WAIT_S
+    ):
         _logger.warning(
             "route-turn: no block marker for session=%s within %.0fs; "
             "the hook fell open, so the prompt is not replayed",
@@ -969,7 +1071,7 @@ def schedule_pending_replay_recovery(
         # A bridge dir shared with another session (a fork inherits the
         # parent's bridge id); that session's prompt is not ours to send.
         return None
-    if not (bridge_dir / MARKER_FILE).exists():
+    if not turn_routing_marker_present(bridge_dir, session_id):
         clear_pending_replay(bridge_dir)
         return None
     try:
@@ -1038,8 +1140,42 @@ async def _recover_pending_replay(
     )
 
 
+def _user_message_texts(items: Any) -> list[str]:
+    """Collect the text of every user message block in an items page.
+
+    :param items: The ``data`` array from ``GET /sessions/{id}/items``, whose
+        entries are flat api dicts (``{"type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": ...}]}``).
+    :returns: Every text block on a user message, in page order.
+    """
+    texts: list[str] = []
+    if not isinstance(items, list):
+        return texts
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        if item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+    return texts
+
+
 async def _prompt_already_ran(session_id: str, prompt: str, server_client: Any) -> bool | None:
     """Report whether *prompt* is already a turn on the session.
+
+    Compared STRUCTURALLY — the message blocks' own text fields, exactly —
+    never as a substring of the serialized page. Serializing escapes the text
+    (``\\n``, ``\\"``, ``\\uXXXX``), so any prompt carrying a newline, a quote
+    or a non-ASCII character never matched its own recorded copy and the
+    recovery re-delivered it: a duplicate first turn on every crash-recovered
+    session. The same test read the other way round too — a short prompt
+    ("continue") matched anywhere in the JSON, including an unrelated id or an
+    assistant's prose, and the user's prompt was dropped for good.
 
     :param session_id: Session/conversation identifier.
     :param prompt: The recovered prompt text.
@@ -1059,9 +1195,9 @@ async def _prompt_already_ran(session_id: str, prompt: str, server_client: Any) 
         return None
     if not isinstance(payload, dict):
         return None
-    # A blocked prompt is persisted nowhere, so finding the text at all means
-    # the replay (or the user re-typing it) already landed.
-    return prompt in json.dumps(payload.get("data", []))
+    # A blocked prompt is persisted nowhere, so finding the exact text on a
+    # user message means the replay (or the user re-typing it) already landed.
+    return prompt in _user_message_texts(payload.get("data"))
 
 
 def _bridge_thread_probe(bridge_dir: Path) -> Callable[[], bool]:
@@ -1251,6 +1387,7 @@ def ensure_session_turn_router(
     bridge_dir: Path,
     server_client: httpx.AsyncClient | None,
     harness: str | None = None,
+    routing_enabled: bool = True,
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> TurnRouter | None:
     """Start (once) the loopback turn router serving *session_id*.
@@ -1265,10 +1402,14 @@ def ensure_session_turn_router(
     :param server_client: Runner→server client. ``None`` skips the router
         (nowhere to relay verdicts, nowhere to replay).
     :param harness: Harness being launched; gates the start.
+    :param routing_enabled: Whether the session launched with Smart Routing
+        on. ``False`` skips the router entirely, and the harness launch reads
+        the absent advertisement as "do not register the route-turn hook" —
+        so a session that will never route pays no per-prompt round trip.
     :param loop: Event loop owning the relay. ``None`` uses the running one.
     :returns: The running router handle, or ``None``.
     """
-    if server_client is None or harness not in _TURN_HOOK_HARNESSES:
+    if server_client is None or harness not in _TURN_HOOK_HARNESSES or not routing_enabled:
         return None
     try:
         resolver_loop = loop if loop is not None else asyncio.get_running_loop()
