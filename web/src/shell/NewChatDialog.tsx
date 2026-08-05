@@ -1084,7 +1084,7 @@ export function AgentHarnessPicker({
           )}
         >
           <span
-            className={cn("max-w-[12rem] truncate text-sm text-foreground", triggerLabelClassName)}
+            className={cn("max-w-[12rem] truncate text-ui text-foreground", triggerLabelClassName)}
           >
             {hasAgents ? agentLabel : "No agents"}
           </span>
@@ -3152,10 +3152,10 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
-      <FolderIcon className="size-4 shrink-0" />
+      <FolderIcon className="ui-icon" />
       {/* Label collapses to icon-only on narrow viewports (mobile). Capped
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
@@ -3631,13 +3631,13 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     {isCloudHost ? (
-                      <MonitorCloudIcon className="size-4 shrink-0" />
+                      <MonitorCloudIcon className="ui-icon" />
                     ) : (
-                      <MonitorIcon className="size-4 shrink-0" />
+                      <MonitorIcon className="ui-icon" />
                     )}
                     <span
                       className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
@@ -3777,7 +3777,7 @@ export function NewChatLandingScreen() {
                   <DropdownMenuItem
                     onSelect={() => setConnectOpen(true)}
                     data-testid="new-chat-landing-connect-host"
-                    className="gap-2 text-sm text-muted-foreground"
+                    className="gap-2 text-ui text-muted-foreground"
                   >
                     <PlusIcon className="size-3.5" />
                     Connect new host
@@ -3795,10 +3795,10 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
-                      <GitBranchIcon className="size-4 shrink-0" />
+                      <GitBranchIcon className="ui-icon" />
                       <span
                         className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
                       >
@@ -3905,10 +3905,10 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-ui font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
-                      <GitBranchIcon className="size-4 shrink-0" />
+                      <GitBranchIcon className="ui-icon" />
                       <span
                         className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
                       >

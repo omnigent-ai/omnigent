@@ -231,13 +231,12 @@ const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
   { value: "archived", label: "Archived sessions" },
 ];
 
-// Shown in place of the list when a filter matches nothing. Named per filter so
-// the empty state says which slice is empty, not just "No sessions".
+// Shown in place of the list when a filter matches nothing.
 const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
-  all: "No active sessions",
-  mine: "No sessions of your own",
-  shared: "No sessions shared with you",
-  archived: "No archived sessions",
+  all: "No sessions",
+  mine: "No sessions",
+  shared: "No sessions",
+  archived: "No sessions",
 };
 
 // Bulk-selection targets either the flat "Sessions" list or the sessions
@@ -1682,11 +1681,7 @@ function ConversationList({
     );
   }
   const showShared = activeTab === "shared";
-  const emptyMessage = searchQuery
-    ? "No matching conversations"
-    : showShared
-      ? "No sessions shared with you"
-      : "No active sessions";
+  const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
 
   // Archived sessions are surfaced on the Settings page, not here, so they
   // don't count toward the sidebar's empty-state threshold. Each project
@@ -1836,9 +1831,7 @@ function ConversationList({
                     ))}
                     {sections.projectGroups.length === 0 &&
                       !effectiveCollapsedSections.includes("Projects") && (
-                        <p className="px-3 py-1.5 text-sm text-muted-foreground">
-                          No projects yet. Create one to group your sessions.
-                        </p>
+                        <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
                       )}
                   </SectionGroup>
                 )}
@@ -2172,7 +2165,7 @@ function SessionFilterMenu({
         </TooltipTrigger>
         <TooltipContent side="bottom">Filter sessions</TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-sm">
+      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
         <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={value}

@@ -282,6 +282,7 @@ describe("index.css body text tokens", () => {
     /@media \(width < 48rem\) \{\s*\/\*[^*]*\*\/\s*:root \{[^}]*\}/,
   )?.[0];
   const CAPTION_RATIO = 0.9;
+  const LINE_HEIGHT_RATIO = 1.6;
 
   it("derives the caption step from the body step on desktop", () => {
     expect(desktopMap).toContain(`--text-sm: calc(var(--desktop-ui-font-size) * ${CAPTION_RATIO})`);
@@ -315,11 +316,11 @@ describe("index.css body text tokens", () => {
   });
 
   it("gives both steps a unitless line height so the rhythm scales", () => {
-    // 1.4 puts the 13px default on ~18px and the caption tier on ~16px. Fixed
-    // px pairs would re-freeze the line box at the larger settings.
+    // Unitless, not px: a fixed pair would re-freeze the line box at the
+    // larger settings. 1.6 puts the 13px default on ~21px.
     const themeBlock = cssSource.match(/@theme \{[^}]*--text-ui:[^}]*\}/)?.[0];
-    expect(themeBlock).toContain("--text-ui--line-height: 1.4");
-    expect(themeBlock).toContain("--text-sm--line-height: 1.4");
+    expect(themeBlock).toContain(`--text-ui--line-height: ${LINE_HEIGHT_RATIO}`);
+    expect(themeBlock).toContain(`--text-sm--line-height: ${LINE_HEIGHT_RATIO}`);
   });
 
   it("retires the duplicate 13px and caption tokens", () => {

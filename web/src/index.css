@@ -111,15 +111,15 @@
 /* The two body text steps. Keep these non-inline: `@theme inline` bakes the
  * literal value into each utility, which would make the runtime typography
  * mapping below a no-op. Line heights are unitless so both tiers keep their
- * 1.4 rhythm at every size the Appearance setting allows. */
+ * 1.6 rhythm at every size the Appearance setting allows. */
 @theme {
   /* App-default interface/body text — every control, label, and menu item. */
   --text-ui: 1rem;
-  --text-ui--line-height: 1.4;
+  --text-ui--line-height: 1.6;
   /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
    * body step, mapped below so it tracks the Appearance setting. */
   --text-sm: 0.9rem;
-  --text-sm--line-height: 1.4;
+  --text-sm--line-height: 1.6;
   /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
    * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
    * ignores the Appearance setting — the same trap the ramp test guards. Keeps

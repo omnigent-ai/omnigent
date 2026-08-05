@@ -282,8 +282,8 @@ describe("Sidebar session list", () => {
     mockConversations([]);
     renderSidebar();
 
-    expect(screen.getByText("No active sessions")).toHaveClass("text-ui");
-    expect(screen.getByText("No active sessions")).not.toHaveClass("text-sm");
+    expect(screen.getByText("No sessions")).toHaveClass("text-ui");
+    expect(screen.getByText("No sessions")).not.toHaveClass("text-sm");
   });
 
   it("uses the interface text token for session-list errors", () => {
@@ -402,7 +402,7 @@ describe("Sidebar session list", () => {
 
     selectSessionFilter("archived");
     expect(screen.queryByText("conv_live")).toBeNull();
-    expect(screen.getByText("No archived sessions")).toBeInTheDocument();
+    expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
 
     // Still there, and still able to switch back.
     expect(screen.getByTestId("session-filter")).toBeInTheDocument();
@@ -874,7 +874,7 @@ describe("Sidebar sections", () => {
     // With no shared sessions, the Shared tab shows its empty state rather
     // than any session rows.
     showSharedTab();
-    expect(screen.getByText("No sessions shared with you")).toBeInTheDocument();
+    expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 });
@@ -1014,7 +1014,7 @@ describe("Sidebar tabs", () => {
 
     showSharedTab();
     // False-empty on the loaded window, but the sentinel is still mounted.
-    expect(screen.getByText("No sessions shared with you")).toBeInTheDocument();
+    expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
     observerCallback?.(
       [{ isIntersecting: true } as IntersectionObserverEntry],
       {} as IntersectionObserver,

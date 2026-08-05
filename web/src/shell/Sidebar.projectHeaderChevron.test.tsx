@@ -183,7 +183,11 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     fireEvent.click(headerButton("My Project"));
 
-    const empty = screen.getByText("No sessions");
+    // Both the flat session list and the expanded project render "No sessions";
+    // this assertion is about the project's indented dashed well.
+    const empty = screen
+      .getAllByText("No sessions")
+      .find((el) => el.classList.contains("sidebar-row"))!;
     expect(empty).toHaveClass(
       "ml-8",
       "mr-2",
