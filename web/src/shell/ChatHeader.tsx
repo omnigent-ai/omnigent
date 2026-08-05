@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
+import { ResumeSessionButton, ResumeSessionMenuItem } from "./ResumeSessionButton";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
@@ -146,11 +147,11 @@ interface ChatHeaderProps {
  * mask, index.css; chat reserves clearance via ``pt-20``,
  * terminal-first via ``pt-14``). Left slot: open-sidebar +
  * back-to-parent. Right slot: desktop action buttons (Agent info ·
- * Share · right-panel toggle), a mobile three-dot menu mirroring the
- * same actions, and a mobile FAB that opens the rail tabs as
- * full-screen drawers. Stop session lives in the sidebar row's kebab
- * menu; Clone lives on each assistant message's "Fork from here"
- * action (ChatPage), not here.
+ * copy-resume-command · Share · right-panel toggle), a mobile
+ * three-dot menu mirroring the same actions, and a mobile FAB that
+ * opens the rail tabs as full-screen drawers. Stop session lives in
+ * the sidebar row's kebab menu; Clone lives on each assistant
+ * message's "Fork from here" action (ChatPage), not here.
  *
  * All state lives in AppShell — this is a pure presentational component.
  */
@@ -273,11 +274,19 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
+        {/* Copy `omnigent resume <id>` so this session can be picked back
+            up in a terminal. Desktop-only — on a phone there's no terminal
+            to paste into, so it folds into the three-dot menu below. */}
+        {conversationId && (
+          <span className="hidden md:inline-flex">
+            <ResumeSessionButton conversationId={conversationId} />
+          </span>
+        )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise (and in the iOS shell, where it's the native bar). */}
         {conversationId && <ViewModeToggle />}
         {/* Mobile-only three-dot menu folding the action buttons above
-            (Share · Agent info) so the header stays
+            (Share · Agent info · Copy resume command) so the header stays
             uncluttered on a phone. The right-panel/rail control is
             deliberately left out — it has its own affordance below. */}
         {hasHeaderMenu && (
@@ -317,6 +326,7 @@ export function ChatHeader({
                   Agent info
                 </DropdownMenuItem>
               )}
+              {conversationId && <ResumeSessionMenuItem conversationId={conversationId} />}
             </DropdownMenuContent>
           </DropdownMenu>
         )}
