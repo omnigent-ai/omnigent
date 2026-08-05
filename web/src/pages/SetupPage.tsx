@@ -76,7 +76,7 @@ export function SetupPage() {
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-semibold tracking-tight">Create the admin account</h1>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-ui text-muted-foreground">
             First run — pick the username and password for this server's admin. You can invite
             others once you're in.
           </p>
@@ -84,7 +84,7 @@ export function SetupPage() {
 
         <form onSubmit={onSubmit} className="space-y-4">
           <div className="space-y-1.5">
-            <label htmlFor="setup-username" className="text-sm font-medium leading-none">
+            <label htmlFor="setup-username" className="text-ui font-medium leading-none">
               Username
             </label>
             <Input
@@ -104,7 +104,7 @@ export function SetupPage() {
           </div>
 
           <div className="space-y-1.5">
-            <label htmlFor="setup-password" className="text-sm font-medium leading-none">
+            <label htmlFor="setup-password" className="text-ui font-medium leading-none">
               Password
             </label>
             <Input
@@ -120,7 +120,7 @@ export function SetupPage() {
           </div>
 
           <div className="space-y-1.5">
-            <label htmlFor="setup-confirm" className="text-sm font-medium leading-none">
+            <label htmlFor="setup-confirm" className="text-ui font-medium leading-none">
               Confirm password
             </label>
             <Input
@@ -138,7 +138,7 @@ export function SetupPage() {
           {error !== null && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {error}
             </div>

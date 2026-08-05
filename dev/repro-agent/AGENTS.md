@@ -173,26 +173,68 @@ and verifies the same test goes fail→pass).
 
 ## Output — the reproduction artifacts
 
-End with a single structured verdict block — this is the handoff to the fix step,
-so make it self-contained. These are the artifacts you **produce**:
+The **last thing in your final message** must be exactly one fenced ```json code
+block — the machine-readable handoff to the fix step and to the caller that
+labels the issue. This block is parsed programmatically by taking the last
+```json fence in the message, so the format and its position are **not** your
+choice:
 
-- `bug_url` and the overall `verdict` (`reproduced` / `not_reproduced` /
-  `already_fixed` / `needs_more_info`), rolled up per the Step 2 rule (any live
-  sub-symptom ⇒ overall `reproduced`).
-- `facets` — the per-sub-symptom breakdown from Steps 1–2: each claimed symptom
-  with its own verdict and one line of evidence (e.g. `picker display: reproduced
-  (raw IDs shown)`, `catalog default: already_fixed (#3448)`). Always include
-  this, even for a single-symptom bug (then it's one row). This is what stops a
-  partially-landed fix from being averaged into a misleading single verdict.
-- `test_path` — the e2e test you authored (the durable regression test); when
-  multiple facets still reproduce, the test(s) should cover each live one.
-- `session_id` — **this session** (in the app), so the fix step can replay how
-  you reproduced it and you can browse it in the app UI at `<server>/c/<session_id>`.
-  Get it from `sys_session_get_info`.
-- `journey` — the reconstructed user journey, in brief.
+- You may write comprehensive prose above the block (a human-readable summary,
+  the journey, the per-facet notes) — that's fine and encouraged. But it is
+  **context, not the contract**: everything the parser needs lives *inside* the
+  JSON block, and the ```json block is the **last chunk** of the message, with
+  nothing after its closing fence.
+- Do **not** split the artifacts across separate sections or headers (no lone
+  "Reproduction Verdict" / "Journey" / "Facets" blocks standing in for the
+  handoff, and no second data block). Whatever you also say in prose, the single
+  ```json block below carries the complete, self-contained handoff.
+- Emit that block as **JSON**, never YAML. One ` ```json ` fence, one JSON
+  object.
+- Include **every** key below, always, even when a value is empty (`""`, `[]`) —
+  the parser expects a fixed shape.
+- `verdict` must be **exactly one** of the four string literals
+  `"reproduced"`, `"not_reproduced"`, `"already_fixed"`, `"needs_more_info"` —
+  lowercase, no other wording. This is the field the caller reads to label the
+  issue, so it must match verbatim.
+
+```json
+{
+  "bug_url": "https://github.com/omnigent-ai/omnigent/issues/1234",
+  "verdict": "reproduced",
+  "facets": [
+    {"symptom": "picker display", "verdict": "reproduced", "evidence": "raw IDs shown"},
+    {"symptom": "catalog default", "verdict": "already_fixed", "evidence": "#3448"}
+  ],
+  "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
+  "session_id": "dc59e331-...",
+  "journey": "open model picker → select catalog → picker shows raw IDs",
+  "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
+}
+```
+
+Field meanings:
+
+- `bug_url` — the input bug link, echoed back.
+- `verdict` — the overall roll-up per the Step 2 rule (any live sub-symptom ⇒
+  overall `reproduced`; only when *every* sub-symptom is fixed is it
+  `already_fixed`).
+- `facets` — an array of the per-sub-symptom breakdown from Steps 1–2, each an
+  object with `symptom`, its own `verdict` (same four literals), and one line of
+  `evidence`. Always a list, even for a single-symptom bug (then it's one
+  element). This is what stops a partially-landed fix from being averaged into a
+  misleading single verdict.
+- `test_path` — the e2e test you authored (the durable regression test), repo-
+  relative. When multiple facets still reproduce, cover each live one; if you
+  authored more than one file, make this an array of paths. Empty string if you
+  authored none (e.g. `needs_more_info`).
+- `session_id` — **this session** (in the app), from `sys_session_get_info`, so
+  the fix step can replay how you reproduced it and you can browse it at
+  `<server>/c/<session_id>`.
+- `journey` — the reconstructed user journey, in brief (one line).
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
 
-Be terse. You produce the live-confirmed reproduction + the test; the fix step
-takes it from here. You take no further action — no fix, no merge, no push.
+Keep the prose before the block terse. You produce the live-confirmed
+reproduction + the test; the fix step takes it from here. You take no further
+action — no fix, no merge, no push.

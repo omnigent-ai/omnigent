@@ -126,13 +126,14 @@ _CODEX_MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"
 # SYNTHESIZED: at forwarder start the config-declared servers are
 # recorded as ``starting`` (true — codex boots them all at thread start)
 # in the bridge dir and posted to Omnigent as ``external_mcp_startup``; the
-# round is settled (unresolved entries dropped) when the thread goes
-# idle after a turn — codex defers turn execution until startup ends, so
-# an idle edge proves the round is over — or when the config-derived
-# startup window elapses. ``cancelled`` states are recorded locally by
-# the Stop path. The notification handler is kept as a zero-cost path
-# for any delivery codex broadens later (it fully supersedes synthesis
-# when edges do arrive).
+# round is settled (unresolved entries dropped) when the first
+# model-produced item arrives or the thread goes idle after a turn —
+# codex defers turn EXECUTION until startup ends, so model output (and
+# the later idle edge) proves the round is over — or when the
+# config-derived startup window elapses. ``cancelled`` states are
+# recorded locally by the Stop path. The notification handler is kept as
+# a zero-cost path for any delivery codex broadens later (it fully
+# supersedes synthesis when edges do arrive).
 _CODEX_MCP_STARTUP_STATUS_METHOD = "mcpServer/startupStatus/updated"
 _CODEX_THREAD_STATUS_CHANGED_METHOD = "thread/status/changed"
 _EXTERNAL_MCP_STARTUP_TYPE = "external_mcp_startup"
@@ -419,6 +420,11 @@ class _CodexForwarderState:
     # the block finalizes when the turn's assistant message arrives.
     reasoning_stream_item_id: str | None = None
     turn_diff_by_turn: dict[str, str] = field(default_factory=dict)
+    # Whether model output has already settled the synthesized MCP startup
+    # round. The round is seeded once per forwarder connection (never on
+    # thread rotation), so a settled round stays settled and later items
+    # can skip re-reading the bridge file for the life of the session.
+    mcp_startup_settled: bool = False
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -2450,6 +2456,21 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    # First model-produced item settles the synthesized MCP startup round
+    # mid-turn — codex defers turn execution until the round ends, so
+    # assistant-side output proves startup is over before the idle edge.
+    # Guarded by the state flag so only that first item pays the
+    # bridge-file read; every later item in the session short-circuits.
+    if (
+        not is_child
+        and (forwarder_state is None or not forwarder_state.mcp_startup_settled)
+        and _is_model_output_item_event(method, params)
+    ):
+        await _settle_mcp_startup(
+            client, session_id=session_id, bridge_dir=bridge_dir, reason="model output observed"
+        )
+        if forwarder_state is not None:
+            forwarder_state.mcp_startup_settled = True
     # item/started: register collab-agent children early (before item/completed)
     # so live child events can be routed to the child session immediately.
     # Only meaningful for the parent thread; children don't spawn grandchildren here.
@@ -3448,6 +3469,32 @@ def _is_thread_idle_status_event(method: str, params: _JsonObject) -> bool:
         return False
     status = params.get("status")
     return isinstance(status, dict) and status.get("type") == "idle"
+
+
+def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
+    """
+    Return whether an event carries a model-produced turn item.
+
+    The mid-turn settle signal for the synthesized MCP startup round:
+    codex defers turn execution until the round ends, so an
+    assistant-side item proves the round is over while the turn is still
+    running — the idle edge only fires after it. The turn's
+    ``userMessage`` item is excluded: like the thread-active edge, it
+    materializes when a turn is merely ACCEPTED, which happens
+    mid-startup.
+
+    :param method: Codex method value, e.g. ``"item/started"``.
+    :param params: Codex notification params.
+    :returns: ``True`` for an ``item/started`` / ``item/completed``
+        carrying a non-``userMessage`` item.
+    """
+    if method not in {"item/started", "item/completed"}:
+        return False
+    item = params.get("item")
+    if not isinstance(item, dict):
+        return False
+    item_type = item.get("type")
+    return isinstance(item_type, str) and item_type != "userMessage"
 
 
 async def _post_mcp_startup(

@@ -1347,7 +1347,7 @@ function FileViewerBody({
           className="flex-1 overflow-y-auto min-w-0"
         >
           {isDeletedFile && viewMode !== "diff" ? (
-            <div className="flex flex-col items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
+            <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
               <Trash2Icon className="size-5 opacity-40" />
               <span>This file has been deleted.</span>
               {isDiffAvailable && (
@@ -1363,7 +1363,7 @@ function FileViewerBody({
             // hanging on "Loading diff…" forever — diffQuery.data stays
             // undefined on error, which would otherwise read as still-loading.
             diffQuery.isError ? (
-              <div className="flex items-center justify-center p-8 text-destructive text-sm">
+              <div className="flex items-center justify-center p-8 text-destructive text-ui">
                 Failed to load:{" "}
                 {diffQuery.error instanceof Error
                   ? diffQuery.error.message
@@ -1375,13 +1375,13 @@ function FileViewerBody({
             // wrong content and mis-set EOL (onMount runs once). Once data is
             // present, pass the real before/after through (legitimate nulls and all).
             !diffQuery.data ? (
-              <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
               </div>
             ) : (
               <Suspense
                 fallback={
-                  <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+                  <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                     Loading diff…
                   </div>
                 }

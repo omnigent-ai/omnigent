@@ -188,6 +188,7 @@ describe("BubbleView dispatch", () => {
     );
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "user");
+    expect(bubble).toHaveClass("max-w-[640px]");
     expect(bubble).toHaveTextContent("hello there");
   });
 

@@ -21,7 +21,7 @@ module importable for testing / tooling without a live database.
 Configuration is via environment variables:
 
   DATABASE_URL          Required. SQLAlchemy URL. Both PaaS-style URLs
-                        (``postgresql://user:pw@host:5432/db``,
+                        (``postgresql://<user>:<password>@host:5432/db``,
                         ``postgres://...``) and the explicit psycopg3
                         form (``postgresql+psycopg://...``) are accepted;
                         the prefix is normalized automatically.

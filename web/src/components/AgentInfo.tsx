@@ -59,7 +59,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
 
 const MCP_SERVERS_UPDATED_TOAST = (
-  <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>
+  <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>
 );
 
 /**
@@ -115,7 +115,7 @@ export function McpServerList({
               <div className="flex flex-col gap-2">
                 <div className="flex items-center gap-1.5">
                   <ServerIcon className="size-3.5 text-muted-foreground" />
-                  <span className="font-medium text-sm">{srv.name}</span>
+                  <span className="font-medium text-ui">{srv.name}</span>
                 </div>
                 {srv.description && (
                   <p className="text-xs text-muted-foreground">{srv.description}</p>
@@ -407,7 +407,7 @@ function AddPolicyDialog({
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
                     placeholder="Filter policies..."
-                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-ui placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
                     autoFocus
                   />
                   <div className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
@@ -418,7 +418,7 @@ function AddPolicyDialog({
                         onClick={() => handleSelect(r.handler)}
                         className="flex flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-muted"
                       >
-                        <span className="text-sm">{r.name}</span>
+                        <span className="text-ui">{r.name}</span>
                         {r.description && (
                           <span className="line-clamp-2 text-[11px] text-muted-foreground">
                             {r.description}
@@ -438,7 +438,7 @@ function AddPolicyDialog({
           {entry && (
             <div className="flex flex-col gap-1 rounded border border-border bg-muted/50 px-2.5 py-2">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">{entry.name}</span>
+                <span className="text-ui font-medium">{entry.name}</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -466,7 +466,7 @@ function AddPolicyDialog({
                 type="text"
                 value={policyName}
                 onChange={(e) => setPolicyName(e.target.value)}
-                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
               />
             </div>
           )}
@@ -507,7 +507,7 @@ function AddPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         <option value="true">true</option>
                         <option value="false">false</option>
@@ -526,7 +526,7 @@ function AddPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         {prop.enum.map((v: string) => (
                           <option key={v} value={v}>
@@ -605,7 +605,7 @@ function AddPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       />
                     )}
                   </div>
@@ -616,7 +616,7 @@ function AddPolicyDialog({
           {(paramError || addPolicy.isError) && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {paramError ?? addPolicy.error?.message}
             </div>
@@ -789,7 +789,7 @@ function McpServerManagerDialog({
   function notifyRestart() {
     onDirty();
     showToast(
-      <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
+      <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>,
     );
   }
 
@@ -835,7 +835,7 @@ function McpServerManagerDialog({
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
         </DialogHeader>
         {dirty && (
-          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-400">
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-ui text-yellow-700 dark:text-yellow-400">
             <AlertTriangleIcon className="size-4 shrink-0" />
             Restart the session to apply your changes.
           </div>
@@ -918,7 +918,7 @@ function McpServerManagerDialog({
                     transport: e.target.value === "stdio" ? "stdio" : "http",
                   }))
                 }
-                className="h-8 rounded-lg border border-input bg-background px-2 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                className="h-8 rounded-lg border border-input bg-background px-2 text-ui text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               >
                 <option value="http">HTTP</option>
                 <option value="stdio">stdio</option>
@@ -1027,7 +1027,7 @@ function McpServerManagerDialog({
             {(formError || mutationError) && (
               <div
                 role="alert"
-                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
               >
                 {formError ?? mutationError}
               </div>
@@ -1205,7 +1205,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                      <span className="min-w-0 break-all font-medium text-sm">{p.name}</span>
+                      <span className="min-w-0 break-all font-medium text-ui">{p.name}</span>
                     </div>
                     {description && (
                       <p className="break-words text-xs text-muted-foreground">{description}</p>
@@ -1344,7 +1344,7 @@ export function AgentInfoContent({
     <div className="flex flex-col divide-y divide-border/50">
       {displayName && (
         <div className="flex flex-col gap-0.5 pb-3">
-          <span className="font-medium text-sm">{displayName}</span>
+          <span className="font-medium text-ui">{displayName}</span>
           {agent?.description && (
             <span className="text-xs text-muted-foreground">{agent.description}</span>
           )}

@@ -182,3 +182,81 @@ describe("index.css table link wrapping rule", () => {
     link.parentElement?.remove();
   });
 });
+
+describe("index.css sidebar canvas", () => {
+  const omniLightRule = cssSource.match(
+    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
+  )?.[0];
+  const omniDarkRule = cssSource.match(
+    /\.dark:not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
+  )?.[0];
+  const paletteRule = cssSource.match(
+    /:root:not\(\.dark\)\[data-theme\] \.conversations-sidebar,[^{]*\.dark\[data-theme\] \.conversations-sidebar \{[^}]*\}/,
+  )?.[0];
+  const lightEdgeRule = cssSource.match(
+    /html:not\(\.dark\) \.conversations-sidebar \{[^}]*\}/,
+  )?.[0];
+  const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
+
+  it("uses the specified left-to-right gradient for Omnigent light only", () => {
+    expect(omniLightRule).toContain("background: #fffefe");
+    expect(omniLightRule).toContain(
+      "background: -webkit-linear-gradient(to right, #fffefe, #fcf6fa)",
+    );
+    expect(omniLightRule).toContain("background: linear-gradient(to right, #fffefe, #fcf6fa)");
+    expect(paletteRule).toContain("background: var(--sidebar)");
+  });
+
+  it("removes the dot-grid layer from both modes", () => {
+    expect(cssSource).not.toContain("--sidebar-dot-color");
+    expect(omniLightRule).not.toContain("radial-gradient");
+    expect(omniDarkRule).not.toContain("radial-gradient");
+  });
+
+  it("uses the shared inset shadow with a dark-only right border", () => {
+    const shadow = "inset -8px 0 12px -8px rgb(0 0 0 / 5%)";
+    expect(lightEdgeRule).toContain(`box-shadow: ${shadow}`);
+    expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
+    expect(lightEdgeRule).toContain("border-right: none");
+    expect(darkEdgeRule).toContain("border-right: 1px solid rgb(255 255 255 / 2%)");
+  });
+});
+
+/* Regression test for the "mobile sidebar is see-through" bug.
+ *
+ * Below md the sidebar is a full-screen overlay on top of the chat. The
+ * per-theme `.conversations-sidebar` rules paint its canvas with the
+ * `background` SHORTHAND, which resets background-color to transparent — and
+ * the dark stack is entirely translucent, so the conversation showed straight
+ * through. A later media-query rule restores an opaque fill under the
+ * gradients. It only works if it keeps matching the theme rules' specificity
+ * (they'd win the tie otherwise) and stays declared after them.
+ */
+describe("index.css mobile sidebar opacity", () => {
+  const mobileRule = cssSource.match(
+    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
+  )?.[0];
+
+  it("keeps an opaque fill for the mobile sidebar overlay", () => {
+    expect(mobileRule, "the mobile sidebar background-color rule is gone").toBeDefined();
+    expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+  });
+
+  it("declares it after the per-theme canvas rules so it wins the cascade", () => {
+    // Matching specificity — the shorthand in the theme rules would otherwise
+    // keep background-color transparent.
+    const light = cssSource.indexOf(":root:not(.dark):not([data-theme]) .conversations-sidebar {");
+    const dark = cssSource.indexOf(".dark:not([data-theme]) .conversations-sidebar {");
+    const palette = cssSource.indexOf(":root:not(.dark)[data-theme] .conversations-sidebar,");
+    const mobile = cssSource.indexOf(mobileRule!);
+    expect(light).toBeGreaterThan(-1);
+    expect(dark).toBeGreaterThan(-1);
+    expect(palette).toBeGreaterThan(-1);
+    expect(mobile).toBeGreaterThan(Math.max(light, dark, palette));
+    // Every palette/mode selector must be covered, or one can go transparent.
+    expect(mobileRule).toContain(":root:not(.dark):not([data-theme]) .conversations-sidebar");
+    expect(mobileRule).toContain(":root:not(.dark)[data-theme] .conversations-sidebar");
+    expect(mobileRule).toContain(".dark:not([data-theme]) .conversations-sidebar");
+    expect(mobileRule).toContain(".dark[data-theme] .conversations-sidebar");
+  });
+});

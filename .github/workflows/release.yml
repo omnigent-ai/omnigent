@@ -11,7 +11,7 @@
 # oss-publish-images.yml) hangs off the tag push.
 #
 # PyPI publishing does NOT happen here — after this run, dispatch the secure
-# release repo on the tag (see RELEASING.md). Everything here is idempotent:
+# release repo on the tag (see the maintainer release runbook). Everything here is idempotent:
 # re-dispatch with identical inputs after any failure and it converges
 # (branch exists -> reused; version stamped -> no new commit; tag at the
 # converged commit -> no-op; tag anywhere else -> loud failure).
@@ -164,7 +164,7 @@ jobs:
               echo "Tag ${TAG} already at the converged release commit ${base_sha} — nothing to do." \
                 | tee -a "$GITHUB_STEP_SUMMARY"
             else
-              echo "::error::Tag ${TAG} already exists at ${tag_sha} (stamped version: ${stamped:-unknown}), which is not the converged branch head ${base_sha}. Delete the tag first if this is recovery (see RELEASING.md)."
+              echo "::error::Tag ${TAG} already exists at ${tag_sha} (stamped version: ${stamped:-unknown}), which is not the converged branch head ${base_sha}. Delete the tag first if this is recovery (see the maintainer release runbook)."
               exit 1
             fi
           fi
@@ -645,15 +645,18 @@ jobs:
           {
             echo "## Next steps"
             echo ""
-            echo "1. Dispatch the secure-release repo on this tag:"
+            # Run summaries are world-readable on a public repo, so the
+            # secure-release repo is a placeholder here; the runbook names it.
+            echo "1. Dispatch the secure-release repo on this tag. Substitute the repo"
+            echo "   name from the maintainer release runbook, then run:"
             echo '   ```'
-            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "   gh workflow run omnigent.yml --repo <secure-release-repo> \\"
             echo "     -f ref=${TAG} -f destination=pypi -f dry-run=true    # gates rehearsal"
-            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "   gh workflow run omnigent.yml --repo <secure-release-repo> \\"
             echo "     -f ref=${TAG} -f destination=pypi -f dry-run=false   # real publish"
             echo '   ```'
             if [ "$PRERELEASE" = "true" ]; then
-              echo "2. Validate the rc from PyPI (see RELEASING.md). No GitHub release is created for rc tags (rcs live on PyPI only) — skip straight to the next rc or the final cut."
+              echo "2. Validate the rc from PyPI (see the maintainer release runbook). No GitHub release is created for rc tags (rcs live on PyPI only) — skip straight to the next rc or the final cut."
             else
               echo "2. Merge the CHANGELOG PR, curate the ${TAG} draft notes, then dispatch finalize-release.yml (tag=${TAG})."
             fi

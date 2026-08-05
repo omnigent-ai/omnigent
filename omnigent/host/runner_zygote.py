@@ -207,6 +207,12 @@ class ZygoteManager:
         :raises OSError: If the interpreter could not be spawned.
         """
         env = {**os.environ, ZYGOTE_CONTROL_FD_ENV_VAR: str(child_fd)}
+        # glibc reads these once, when its allocator initializes at exec. This is
+        # the only exec on the zygote path — forked runners just replace
+        # os.environ, far too late to matter — so the cap must be applied here to
+        # reach every child. setdefault keeps an operator override winning.
+        for key, value in _proc.malloc_tuning_env().items():
+            env.setdefault(key, value)
         with contextlib.ExitStack() as stack:
             # The zygote's own stdout/stderr go to its log file when configured,
             # else inherit the daemon's; stdin is always /dev/null.

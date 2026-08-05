@@ -86,7 +86,7 @@ function TerminalsCard({ terminals, onExpand }: TerminalsCardProps) {
   return (
     <Card size="sm" data-testid="terminals-card">
       <CardHeader>
-        <CardTitle className="text-sm">Terminals</CardTitle>
+        <CardTitle className="text-ui">Terminals</CardTitle>
         <CardAction>
           <button
             type="button"
@@ -150,7 +150,7 @@ function ExecutionLogsCard({ childSessions, onExpand }: ExecutionLogsCardProps) 
   return (
     <Card size="sm" data-testid="execution-logs-card">
       <CardHeader>
-        <CardTitle className="text-sm">Execution logs</CardTitle>
+        <CardTitle className="text-ui">Execution logs</CardTitle>
         <CardAction>
           <button
             type="button"

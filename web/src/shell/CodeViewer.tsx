@@ -301,7 +301,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
   const filename = path.split("/").pop() ?? path;
 
   const body = errored ? (
-    <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
       {data.truncated
         ? "Image is too large to preview (truncated by the server)."
         : "Unable to render image."}
@@ -658,14 +658,14 @@ export function CodeViewer({
 
   if (fileQuery.isLoading) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Loading…
       </div>
     );
   }
   if (fileQuery.isError) {
     return (
-      <div className="p-8 text-destructive text-sm">
+      <div className="p-8 text-destructive text-ui">
         Error loading file:{" "}
         {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
       </div>
@@ -678,7 +678,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }
@@ -697,7 +697,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading 3D preview…
           </div>
         }
@@ -708,7 +708,7 @@ export function CodeViewer({
   }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Preview not available for binary files.
       </div>
     );
@@ -769,7 +769,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }

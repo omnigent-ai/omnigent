@@ -412,7 +412,7 @@ export function ApprovalCard({
         data-state="responded"
         className="flex flex-col gap-1 border-muted"
       >
-        <AlertTitle className="flex items-center gap-2 text-sm">
+        <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
           {label}
           {policyName && <span className="text-muted-foreground text-xs">· {policyName}</span>}
@@ -463,7 +463,7 @@ export function ApprovalCard({
       data-state="pending"
       className="flex flex-col gap-2 py-3 px-4"
     >
-      <AlertTitle className="flex items-center gap-2 text-sm">
+      <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval ? (
           <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
         ) : isExitPlanMode ? (

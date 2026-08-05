@@ -768,6 +768,10 @@ class CodexNativeAppServer:
         per-session ``config.toml`` at start, or ``None``. Keeps the
         forwarder's config.toml model mirror (and the cost gate's hook
         read) consistent with what the session was launched to run.
+    :param trust_project: Whether to trust :attr:`cwd` in the private
+        session config before startup. Runner-owned headless sessions set
+        this because nobody can answer Codex's project-trust TUI prompt.
+        Interactive CLI sessions leave it disabled.
     :param policy_notice_pending: One-shot flag: ``True`` once a degrade
         reason is recorded, until the runner's terminal-ensure handler
         surfaces it to Omnigent (which posts a single durable banner). Prevents
@@ -796,6 +800,7 @@ class CodexNativeAppServer:
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
+    trust_project: bool = False
 
     async def start(self) -> None:
         """
@@ -812,6 +817,8 @@ class CodexNativeAppServer:
             self.codex_home,
             _codex_home_config_source_from_env(),
         )
+        if self.trust_project:
+            _trust_codex_project(self.codex_home, self.cwd)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
         # by `codex app-server`, so we write directly to the file.
@@ -1405,6 +1412,35 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
         )
 
 
+def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
+    """
+    Trust a runner-selected workspace in the private Codex config.
+
+    Codex 0.146 introduced a project-trust screen before the remote TUI
+    creates its thread. Headless sessions cannot answer it, so startup waits
+    until Omnigent reports a timeout. The config is already a private copy;
+    this never modifies the user's shared ``~/.codex/config.toml``.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param cwd: Workspace selected for this runner-owned session.
+    :returns: None.
+    """
+    config_path = codex_home / "config.toml"
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    projects = document.get("projects")
+    if projects is None:
+        projects = tomlkit.table()
+        document["projects"] = projects
+    project_key = str(cwd.resolve())
+    project = projects.get(project_key)
+    if project is None:
+        project = tomlkit.table()
+        projects[project_key] = project
+    project["trust_level"] = "trusted"
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
 def build_codex_native_server(
     *,
     socket_path: Path,
@@ -1420,6 +1456,7 @@ def build_codex_native_server(
     extra_config_overrides: list[str] | None = None,
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
+    trust_project: bool = False,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -1454,6 +1491,9 @@ def build_codex_native_server(
         disables both approval prompts and the command sandbox; gated
         behind an explicit, typed-confirmation opt-in in the web UI.
         Default ``False``. See issue #657.
+    :param trust_project: Whether to trust ``cwd`` in the private session
+        config before app-server startup. Intended for runner-owned headless
+        sessions whose hidden TUI cannot answer Codex's project-trust prompt.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -1515,6 +1555,7 @@ def build_codex_native_server(
         ap_auth_headers=ap_auth_headers,
         python_executable=python_executable,
         pinned_model=model,
+        trust_project=trust_project,
     )
 
 

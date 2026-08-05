@@ -2103,12 +2103,31 @@ export function NewChatLandingScreen() {
   // once per settled workspace (and can't loop once it sets a branch name).
   const worktreeSeededForRef = useRef<string | null>(null);
 
+  // Signature of the stored config the machine last settled from. Lets a later
+  // save be noticed even when the pencil re-opens the SAME project — the config
+  // content changes while `projectParam` does not. `null` = not yet seeded.
+  const seededConfigSigRef = useRef<string | null>(null);
+  const prefillConfigSig = useMemo(
+    () => (prefillConfig === undefined ? null : JSON.stringify(prefillConfig)),
+    [prefillConfig],
+  );
+
   // The landing screen stays mounted while `?project=` changes (clicking
   // another project's pencil), so re-create a fresh visit by hand: clear
   // every seedable slot and restart the machine. Values the user set are
-  // reset too — a pencil click means "set me up for this project".
+  // reset too — a pencil click means "set me up for this project". Also
+  // restart when the SAME project's stored defaults change (the user edited
+  // its settings, then re-opened its composer): `projectParam` stays put, so
+  // without this the already-settled machine would keep the stale seeds.
   useEffect(() => {
-    if (prefill.project === projectParam) return;
+    const projectChanged = prefill.project !== projectParam;
+    const configChanged =
+      !projectChanged &&
+      projectParam !== "" &&
+      prefillConfigSig !== null &&
+      seededConfigSigRef.current !== null &&
+      prefillConfigSig !== seededConfigSigRef.current;
+    if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
@@ -2116,8 +2135,19 @@ export function NewChatLandingScreen() {
     setBranchName("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
+    seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project]);
+  }, [projectParam, prefill.project, prefillConfigSig]);
+
+  // Record the config the machine settled from, once it's loaded and the
+  // machine is done, so the reseed effect above can spot a later change to it
+  // (the reseed on a project switch runs before the config has loaded, leaving
+  // the signature `null` until this fills it in).
+  useEffect(() => {
+    if (prefill.project !== projectParam) return;
+    if (prefillConfigSig === null || !prefillDone(prefill)) return;
+    seededConfigSigRef.current = prefillConfigSig;
+  }, [prefill, projectParam, prefillConfigSig]);
 
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
@@ -3101,6 +3131,10 @@ export function NewChatLandingScreen() {
     }
   }
 
+  const placeholderText = selectedProject
+    ? `Start a new session in ${selectedProject}`
+    : "Describe a task to start a new session…";
+
   // The working-directory chip — a single Popover trigger button that opens
   // the file browser. The directory-conflict warning lives inside the browser
   // (a banner on the occupied folder), not on the chip.
@@ -3136,20 +3170,22 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 sm:flex-row">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-display-alt">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
             // to Otto's h-18 box so the centered composer doesn't shift when
             // toggling between the two landings.
             <span className="flex h-18 shrink-0 items-center">
-              <FolderIcon className="size-12 text-muted-foreground" />
+              <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
+                <FolderIcon className="size-6 text-brand-accent" />
+              </div>
             </span>
           ) : (
             <OttoEyes className="h-18 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-3xl font-medium tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
-            {selectedProject || "What should we do?"}
+          <h1 className="min-w-0 break-words text-center text-[1.75em] font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+            {selectedProject || "What should we build?"}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
@@ -3178,7 +3214,7 @@ export function NewChatLandingScreen() {
           >
             {isDragActive && (
               <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-sm font-medium text-ring">Drop files here</span>
+                <span className="text-ui font-medium text-ring">Drop files here</span>
               </div>
             )}
             {/* Skill suggestions — floats above the composer box. */}
@@ -3293,8 +3329,8 @@ export function NewChatLandingScreen() {
               }}
               // Suppress the native placeholder when the overlay supplies its
               // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : "Describe a task to start a new session…"}
-              aria-label="Describe a task to start a new session"
+              placeholder={pillSkills.length > 0 ? "" : placeholderText}
+              aria-label={placeholderText}
               rows={1}
               autoFocus
               data-testid="new-chat-landing-input"
@@ -3305,14 +3341,14 @@ export function NewChatLandingScreen() {
               // inside them): min 60px = one 20px line + a spare line of
               // breathing room; max 200px = the spec's 180px of content.
               // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
                 textarea; the pills themselves opt back in. */}
             {pillSkills.length > 0 && message.length === 0 && (
               <div className="pointer-events-none absolute inset-x-4 top-4 flex flex-wrap items-center gap-2">
-                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-muted-foreground">
+                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
                   Describe a task, or try a skill
                 </span>
                 <SkillPills skills={pillSkills} onPick={applySkillPill} />

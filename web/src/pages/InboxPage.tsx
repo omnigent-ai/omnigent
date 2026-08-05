@@ -191,7 +191,7 @@ export function InboxPage() {
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Inbox</h1>
         {(items.length > 0 || commentInbox.items.length > 0) && (
-          <span className="text-sm text-muted-foreground">
+          <span className="text-ui text-muted-foreground">
             {[
               items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
               commentInbox.items.length > 0 &&
@@ -209,7 +209,7 @@ export function InboxPage() {
       {failedSessionCount > 0 && (
         <div
           data-testid="inbox-load-error"
-          className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm"
+          className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui"
         >
           <AlertTriangleIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">
@@ -230,7 +230,7 @@ export function InboxPage() {
       )}
 
       {assembling && items.length === 0 && commentInbox.items.length === 0 && (
-        <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">
+        <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading inbox…
         </div>
@@ -242,7 +242,7 @@ export function InboxPage() {
         commentInbox.items.length === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-sm font-medium">Nothing waiting on you</p>
+            <p className="text-ui font-medium">Nothing waiting on you</p>
             <p className="text-xs text-muted-foreground">
               When an agent needs your input or someone comments on a file, it will show up here.
             </p>
@@ -286,7 +286,7 @@ export function InboxPage() {
                       !expanded && "-rotate-90",
                     )}
                   />
-                  <span className="min-w-0 shrink-0 truncate text-sm font-medium">
+                  <span className="min-w-0 shrink-0 truncate text-ui font-medium">
                     {title}
                     {agentLabel !== title && (
                       <span className="ml-2 text-xs font-normal text-muted-foreground">
@@ -360,7 +360,7 @@ export function InboxPage() {
               </Avatar>
               <div className="flex min-w-0 flex-1 flex-col gap-1">
                 <div className="flex items-center gap-2">
-                  <span className="min-w-0 truncate text-sm">
+                  <span className="min-w-0 truncate text-ui">
                     <span className="font-medium">{author}</span>
                     <span className="text-muted-foreground"> commented on </span>
                     <span className="font-mono text-xs">{comment.path}</span>
@@ -388,7 +388,7 @@ export function InboxPage() {
                     {comment.anchor_content.trim()}
                   </p>
                 )}
-                <p className="line-clamp-3 text-sm break-words whitespace-pre-wrap">
+                <p className="line-clamp-3 text-ui break-words whitespace-pre-wrap">
                   {comment.body}
                 </p>
                 <span className="text-xs text-muted-foreground">{sessionTitle}</span>
