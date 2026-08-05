@@ -70,13 +70,14 @@ jobs:
             const script = require(".github/workflows/pr-issue-link.js");
             await script({ context, github, core });
       # Applies `waiting-for-review` to PRs that clear the bar, giving maintainers
-      # a queue of reviewable PRs instead of the whole open list. Dry-run by
-      # default; ENFORCE="true" applies the label.
+      # a queue of reviewable PRs instead of the whole open list. No LIMIT: a label
+      # notifies nobody and is trivially reversible, unlike the nudge above.
+      # ENFORCE="false" returns to a dry run that reports verdicts and writes nothing.
       - name: Ready-for-review gate
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
-          ENFORCE: "false"
+          ENFORCE: "true"
         with:
           retries: 3
           script: |
