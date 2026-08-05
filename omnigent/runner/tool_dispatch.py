@@ -3751,8 +3751,9 @@ async def _session_get_info_via_rest(
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host, reasoning effort, effective model,
-    parent linkage, workspace / git branch, and the outstanding approval
-    prompts (the prompts themselves plus a count). Runner connectivity
+    parent linkage, workspace / git branch, persisted last-activity time,
+    and the outstanding approval prompts (the prompts themselves plus a
+    count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound). The full transcript is
@@ -3774,7 +3775,11 @@ async def _session_get_info_via_rest(
             {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
         )
     try:
-        resp = await server_client.get(f"/v1/sessions/{raw_target}", timeout=30.0)
+        resp = await server_client.get(
+            f"/v1/sessions/{raw_target}",
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_get_info failed: {exc}"})
     if resp.status_code == 404:
@@ -3792,6 +3797,10 @@ async def _session_get_info_via_rest(
         {
             "session_id": snap.get("id"),
             "status": snap.get("status"),
+            # Persisted conversation activity is distinct from lifecycle
+            # status: repeated polls with an unchanged value let an
+            # orchestrator detect a running session that is not advancing.
+            "last_activity_at": snap.get("updated_at"),
             "title": snap.get("title"),
             "agent_id": snap.get("agent_id"),
             # Present the public agent name: a native-UI wrapper session

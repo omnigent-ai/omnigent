@@ -97,13 +97,12 @@
       "owners": [
         "dhruv0811",
         "TomeHirata",
-        "SabhyaC26",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -117,10 +116,10 @@
         "dhruv0811",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -134,10 +133,10 @@
         "dhruv0811",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -150,13 +149,12 @@
       "owners": [
         "dhruv0811",
         "TomeHirata",
-        "SabhyaC26",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -167,7 +165,6 @@
         "omnigent/onboarding/"
       ],
       "owners": [
-        "SabhyaC26",
         "dhruv0811",
         "fanzeyi"
       ]
@@ -195,10 +192,7 @@
       ],
       "owners": [
         "TomeHirata",
-        "SabhyaC26",
-        "bbqiu"
-      ],
-      "owners_paused": [
+        "bbqiu",
         "dbczumar"
       ]
     },
@@ -211,8 +205,7 @@
       ],
       "owners": [
         "dhruv0811",
-        "PattaraS",
-        "SabhyaC26"
+        "PattaraS"
       ]
     },
     {
@@ -225,9 +218,7 @@
       "owners": [
         "fanzeyi",
         "dhruv0811",
-        "bbqiu"
-      ],
-      "owners_paused": [
+        "bbqiu",
         "dbczumar"
       ]
     },
@@ -239,10 +230,7 @@
         "omnigent/sandbox/"
       ],
       "owners": [
-        "SabhyaC26",
-        "fanzeyi"
-      ],
-      "owners_paused": [
+        "fanzeyi",
         "dbczumar"
       ]
     },
@@ -255,13 +243,12 @@
       ],
       "owners": [
         "bbqiu",
-        "aravind-segu",
         "fanzeyi",
         "dhruv0811",
-        "SabhyaC26"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -273,16 +260,15 @@
       ],
       "owners": [
         "bbqiu",
-        "aravind-segu",
         "fanzeyi",
         "dhruv0811",
-        "SabhyaC26",
         "serena-ruan",
         "daniellok-db",
-        "TomeHirata"
+        "TomeHirata",
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -295,12 +281,11 @@
       "owners": [
         "fanzeyi",
         "dhruv0811",
-        "aravind-segu",
         "bbqiu",
-        "SabhyaC26"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -313,13 +298,12 @@
       "owners": [
         "dhruv0811",
         "TomeHirata",
-        "SabhyaC26",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -345,9 +329,7 @@
         "dhruv0811",
         "fanzeyi",
         "serena-ruan",
-        "daniellok-db"
-      ],
-      "owners_paused": [
+        "daniellok-db",
         "dbczumar"
       ]
     },
@@ -374,9 +356,6 @@
       "owners": [
         "dhruv0811",
         "PattaraS",
-        "SabhyaC26"
-      ],
-      "owners_paused": [
         "dbczumar"
       ]
     },
@@ -390,13 +369,12 @@
       "owners": [
         "dhruv0811",
         "fanzeyi",
-        "SabhyaC26",
         "TomeHirata",
         "bbqiu",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -410,13 +388,12 @@
       "owners": [
         "dhruv0811",
         "TomeHirata",
-        "SabhyaC26",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -432,13 +409,12 @@
       "owners": [
         "dhruv0811",
         "TomeHirata",
-        "SabhyaC26",
         "bbqiu",
         "fanzeyi",
-        "aravind-segu"
+        "dbczumar"
       ],
       "owners_paused": [
-        "dbczumar"
+        "aravind-segu"
       ]
     },
     {
@@ -450,10 +426,7 @@
         "omnigent/cursor_native"
       ],
       "owners": [
-        "SabhyaC26",
-        "dhruv0811"
-      ],
-      "owners_paused": [
+        "dhruv0811",
         "dbczumar"
       ]
     },
@@ -468,8 +441,8 @@
         "omnigent/onboarding/gemini_auth.py"
       ],
       "owners": [
-        "SabhyaC26",
-        "TomeHirata"
+        "TomeHirata",
+        "PattaraS"
       ]
     },
     {
@@ -496,7 +469,6 @@
       ],
       "owners": [
         "dhruv0811",
-        "SabhyaC26",
         "TomeHirata"
       ]
     },
@@ -509,9 +481,11 @@
         "omnigent/kimi_native"
       ],
       "owners": [
-        "aravind-segu",
         "dhruv0811",
         "fanzeyi"
+      ],
+      "owners_paused": [
+        "aravind-segu"
       ]
     },
     {
@@ -524,7 +498,6 @@
       ],
       "owners": [
         "PattaraS",
-        "SabhyaC26",
         "TomeHirata",
         "dhruv0811"
       ]
@@ -542,9 +515,6 @@
         "dhruv0811",
         "PattaraS",
         "TomeHirata",
-        "SabhyaC26"
-      ],
-      "owners_paused": [
         "dbczumar"
       ]
     },
@@ -557,7 +527,6 @@
         "omnigent/pi_native"
       ],
       "owners": [
-        "SabhyaC26",
         "TomeHirata",
         "dhruv0811"
       ]
@@ -585,7 +554,6 @@
         "omnigent/onboarding/copilot_auth.py"
       ],
       "owners": [
-        "SabhyaC26",
         "PattaraS",
         "TomeHirata",
         "dhruv0811"

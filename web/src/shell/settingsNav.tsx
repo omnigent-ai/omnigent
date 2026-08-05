@@ -225,7 +225,7 @@ export function SettingsSidebarBody({
           closing onto the content behind it. On desktop onNavClick is a no-op
           (persistent card), so dropping it changes nothing there. */}
           <Link to={settingsReturnPath} componentId="settings.back_to_omnigent">
-            <ArrowLeftIcon className="size-4" />
+            <ArrowLeftIcon className="ui-icon" />
             Back to Omnigent
           </Link>
         </Button>
@@ -239,7 +239,7 @@ export function SettingsSidebarBody({
               onClick={onClose}
               className="rounded-full"
             >
-              <PanelRightOpenIcon className="size-4" />
+              <PanelRightOpenIcon className="ui-icon" />
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
@@ -248,9 +248,7 @@ export function SettingsSidebarBody({
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
         {groups.map((group) => (
           <div key={group.title} className="flex flex-col gap-0.5">
-            <h2 className="px-2 py-1 text-muted-foreground text-xs font-medium uppercase tracking-wide">
-              {group.title}
-            </h2>
+            <h2 className="px-2 py-1 text-sm font-normal text-muted-foreground">{group.title}</h2>
             {group.items.map((item) => {
               const Icon = item.icon;
               const selected = section === item.id;
@@ -260,7 +258,7 @@ export function SettingsSidebarBody({
                   asChild
                   variant="ghost"
                   className={cn(
-                    "w-full justify-start gap-2 text-sm",
+                    "w-full justify-start gap-2 text-ui",
                     selected && "bg-muted font-semibold",
                     item.hideOnMobile && "max-md:hidden",
                   )}
@@ -271,7 +269,7 @@ export function SettingsSidebarBody({
                     data-testid={`settings-nav-${item.id}`}
                     aria-current={selected ? "page" : undefined}
                   >
-                    <Icon className="size-4 text-muted-foreground" />
+                    <Icon className="ui-icon text-muted-foreground" />
                     {item.label}
                   </Link>
                 </Button>

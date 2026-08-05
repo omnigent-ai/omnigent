@@ -1073,8 +1073,8 @@ describe("Workspace rail maximize", () => {
     fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
     expect(rail().className).toContain("md:absolute");
     expect(rail().className).toContain("md:inset-0");
-    // Still keeps the docked card inset/rounding — only the width changes.
-    expect(rail().className).toContain("md:m-2");
+    // Still keeps the docked flush/bordered styling — only the width changes.
+    expect(rail().className).toContain("md:border-l");
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     // Minimize → back to the docked flex child, and the sidebar is restored to

@@ -43,6 +43,9 @@ from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
+)
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -603,6 +606,104 @@ async def _best_effort_stop(
             await _stop(descendant_id)
 
 
+# Strong references to detached archive stops so the tasks can't be
+# garbage-collected mid-stop (asyncio only holds weak refs to tasks).
+_detached_stop_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _archive_stop(
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_router: Any,
+    host_registry: Any,
+) -> None:
+    """
+    Stop an archived session and tear down its host-launched runner.
+
+    Archive carries the whole teardown: it is the one lifecycle action
+    with no client-side stop, so both halves run here. Killing the pane
+    alone leaves a host-spawned session's dedicated runner connected,
+    which keeps ``runner_online`` true and hangs a later message on
+    "working" against a dead pane — the failure
+    :func:`_stop_session_host_runner` exists to prevent.
+
+    Every step is best-effort: a wedged, offline, or already-stopped
+    runner must not leave the session un-archived.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store for descendant and row lookups.
+    :param runner_router: The ``RunnerRouter`` for runner-client
+        resolution, or ``None`` in tests / in-process setups.
+    :param host_registry: The ``HostRegistry`` tracking live host
+        tunnels, or ``None`` when host support is not wired.
+    """
+    # Resolve through the facade so a test's monkeypatch is honored here.
+    from omnigent.server.routes import sessions as _facade
+
+    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001
+        _logger.debug(
+            "Archive host-runner teardown lookup failed for %s",
+            session_id,
+            exc_info=True,
+        )
+        return
+    if conv is None or not conv.host_id or not conv.runner_id:
+        return
+    # Mark the tunnel drop intentional BEFORE tearing it down so the relay
+    # renders a quiet stopped state rather than "runner_disconnected".
+    _intentional_stop_sessions.add(session_id)
+    try:
+        delivered = await _facade._stop_session_host_runner(
+            session_id,
+            conv.host_id,
+            conv.runner_id,
+            host_registry,
+        )
+    except Exception:  # noqa: BLE001
+        _logger.debug(
+            "Archive host-runner teardown failed for %s",
+            session_id,
+            exc_info=True,
+        )
+        delivered = False
+    if not delivered:
+        # No tunnel drop will follow, so the marker would outlive this stop
+        # and later swallow a genuine runner_disconnected as a quiet idle.
+        _intentional_stop_sessions.discard(session_id)
+
+
+def _spawn_archive_stop(
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_router: Any,
+    host_registry: Any = None,
+) -> None:
+    """
+    Run :func:`_archive_stop` as a retained background task.
+
+    Archiving needs the stop to *happen*, not to have happened before
+    the response is written: awaiting it inline held the PATCH for the
+    stop's per-runner timeouts (seconds per running session against a
+    wedged or asleep runner) even though the archive proceeds
+    regardless of the stop's outcome.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store for descendant and row lookups.
+    :param runner_router: The ``RunnerRouter`` for runner-client
+        resolution, or ``None`` in tests / in-process setups.
+    :param host_registry: The ``HostRegistry`` tracking live host
+        tunnels, or ``None`` when host support is not wired.
+    """
+    task = asyncio.create_task(
+        _archive_stop(session_id, conversation_store, runner_router, host_registry)
+    )
+    _detached_stop_tasks.add(task)
+    task.add_done_callback(_detached_stop_tasks.discard)
+
+
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
     """
     Collapse per-user pin keys to the canonical pin label for one viewer.
@@ -916,6 +1017,7 @@ def _build_session_response(
         status=status,
         background_task_count=background_task_count,
         created_at=conv.created_at,
+        updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
         runner_id=conv.runner_id,
@@ -2833,10 +2935,25 @@ async def ensure_runner_connected(
                 host_registry,
                 host_conn,
             )
-            # A harness-not-configured refusal is a real host-side error, but
-            # out of band there's no turn to persist it against — leave the
-            # binding and let the caller surface the transport failure.
-            if launch_attempt.error_code != _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            # A harness-not-configured or workspace-missing refusal means the
+            # runner will never appear — don't set relaunched_runner_id or the
+            # caller will wait out the full connect timeout for nothing.
+            # Record the refusal message in runner_exit_reports so the
+            # runner_failed_to_start error surfaces the actionable cause
+            # rather than the generic "may have failed to start" fallback.
+            _fatal_refusal = launch_attempt.error_code in (
+                _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                _WORKSPACE_MISSING_ERROR_CODE,
+            )
+            if _fatal_refusal and launch_attempt.error is not None:
+                _rer = getattr(app_state, "runner_exit_reports", None)
+                if _rer is not None:
+                    _rer.record(
+                        launch_attempt.runner_id,
+                        launch_attempt.error,
+                        owner=None,
+                    )
+            if not _fatal_refusal:
                 relaunched_runner_id = launch_attempt.runner_id
         elif await _maybe_relaunch_managed_sandbox(
             session_id=session_id,
@@ -3067,10 +3184,24 @@ async def _run_managed_wake(
         tracker.fail(session_id, reason)
         _publish_sandbox_status(session_id, "failed", reason)
         return
+
+    def _on_stage(stage: str) -> None:
+        """Relay the wake's launch-pipeline stage to the session's progress surface.
+
+        Without it the wake shows the single ``"provisioning"`` band that
+        ``_kick_managed_wake`` seeded for its whole duration, even while the host
+        is already re-execing. resume_managed_host may invoke this from the
+        worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
+        thread-safe.
+        """
+        _publish_sandbox_status(session_id, stage)
+
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
-        await resume_managed_host(host_id, host_store, sandbox_config, force=True)
+        await resume_managed_host(
+            host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
+        )
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:
@@ -7045,6 +7176,7 @@ async def _get_session_snapshot(
 
 __all__ = [
     "_accumulate_session_usage",
+    "_archive_stop",
     "_best_effort_stop",
     "_bind_and_launch_managed_runner",
     "_build_native_terminal_message_event",
@@ -7053,6 +7185,7 @@ __all__ = [
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
+    "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",
     "_enrich_idle_status_with_subagent_output",
@@ -7098,6 +7231,7 @@ __all__ = [
     "_run_managed_launch",
     "_run_managed_wake",
     "_schedule_deferred_elicitation_clear",
+    "_spawn_archive_stop",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
     "_wait_for_host_bound_runner_client",

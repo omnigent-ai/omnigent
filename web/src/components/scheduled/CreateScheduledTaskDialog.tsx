@@ -344,7 +344,7 @@ export function CreateScheduledTaskDialog({
               value={name}
               placeholder="daily-brief"
               data-testid="task-name-input"
-              className="text-sm"
+              className="text-ui"
               onChange={(e) => setName(e.target.value)}
             />
           </div>
@@ -358,7 +358,7 @@ export function CreateScheduledTaskDialog({
               placeholder="What should the agent do each run?"
               data-testid="task-prompt-input"
               // No native resize grip — match the clean styling of the other fields.
-              className="resize-none text-sm"
+              className="resize-none text-ui"
               onChange={(e) => setPrompt(e.target.value)}
             />
           </div>
@@ -370,7 +370,7 @@ export function CreateScheduledTaskDialog({
             <Label>Runs with</Label>
             {isEdit ? (
               <div
-                className="flex h-8 w-full items-center rounded-lg border border-input bg-transparent px-2.5 text-sm text-foreground dark:bg-input/30"
+                className="flex h-8 w-full items-center rounded-lg border border-input bg-transparent px-2.5 text-ui text-foreground dark:bg-input/30"
                 data-testid="task-agent-readonly"
               >
                 {agentLabel}
@@ -416,7 +416,7 @@ export function CreateScheduledTaskDialog({
                   // width, bordered, h-8, normal foreground text — not the compact
                   // muted ghost styling the composer footer uses.
                   triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input/30"
-                  triggerLabelClassName="max-w-none text-sm"
+                  triggerLabelClassName="max-w-none text-ui"
                 />
               </div>
             )}

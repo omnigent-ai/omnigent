@@ -131,6 +131,20 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it("uses fixed default icon geometry for navigation items", () => {
+    renderBody();
+    expect(screen.getByTestId("settings-nav-appearance").querySelector("svg")).toHaveClass(
+      "ui-icon",
+    );
+  });
+
+  it("renders group subtitles in sentence case at the text-sm tier", () => {
+    renderBody();
+    const heading = screen.getByRole("heading", { name: "General" });
+    expect(heading).toHaveClass("text-sm", "font-normal");
+    expect(heading).not.toHaveClass("font-medium", "uppercase");
+  });
+
   it("marks the Keyboard shortcuts nav item hidden on mobile via max-md:hidden", () => {
     renderBody();
     expect(screen.getByTestId("settings-nav-shortcuts").className).toContain("max-md:hidden");

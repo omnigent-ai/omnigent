@@ -182,3 +182,38 @@ describe("index.css table link wrapping rule", () => {
     link.parentElement?.remove();
   });
 });
+
+/* Regression test for the "mobile sidebar is see-through" bug.
+ *
+ * Below md the sidebar is a full-screen overlay on top of the chat. The
+ * per-theme `.conversations-sidebar` rules paint its canvas with the
+ * `background` SHORTHAND, which resets background-color to transparent — and
+ * the dark stack is entirely translucent, so the conversation showed straight
+ * through. A later media-query rule restores an opaque fill under the
+ * gradients. It only works if it keeps matching the theme rules' specificity
+ * (they'd win the tie otherwise) and stays declared after them.
+ */
+describe("index.css mobile sidebar opacity", () => {
+  const mobileRule = cssSource.match(
+    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
+  )?.[0];
+
+  it("keeps an opaque fill for the mobile sidebar overlay", () => {
+    expect(mobileRule, "the mobile sidebar background-color rule is gone").toBeDefined();
+    expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+  });
+
+  it("declares it after the per-theme canvas rules so it wins the cascade", () => {
+    // Equal specificity — the shorthand in the theme rules would otherwise
+    // keep background-color transparent.
+    const light = cssSource.indexOf("html:not(.dark) .conversations-sidebar {");
+    const dark = cssSource.indexOf(".dark .conversations-sidebar {");
+    const mobile = cssSource.indexOf(mobileRule!);
+    expect(light).toBeGreaterThan(-1);
+    expect(dark).toBeGreaterThan(-1);
+    expect(mobile).toBeGreaterThan(Math.max(light, dark));
+    // Both themes must be covered, or one of them goes transparent again.
+    expect(mobileRule).toContain("html:not(.dark) .conversations-sidebar");
+    expect(mobileRule).toContain(".dark .conversations-sidebar");
+  });
+});

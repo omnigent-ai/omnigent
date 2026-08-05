@@ -25,6 +25,9 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
+)
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -1270,6 +1273,31 @@ def register_events_routes(
                             body,
                             conversation_store,
                             launch_attempt.error,
+                            runner_router,
+                            created_by=created_by,
+                        )
+                        return {"queued": True, "item_id": item_id}
+                    if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
+                        # The host refused: the workspace directory no longer
+                        # exists (e.g. the worktree was deleted). Consume the
+                        # message and persist an actionable error banner so the
+                        # user knows to start a new session with a valid
+                        # workspace — instead of timing out into a generic
+                        # RUNNER_UNAVAILABLE.
+                        item_id = await _persist_native_terminal_failure(
+                            session_id,
+                            conv,
+                            body,
+                            conversation_store,
+                            ErrorData(
+                                source="execution",
+                                code="runner_failed_to_start",
+                                message=(
+                                    launch_attempt.error
+                                    or "The session workspace no longer exists on the host. "
+                                    "Start a new session with a valid workspace."
+                                ),
+                            ),
                             runner_router,
                             created_by=created_by,
                         )

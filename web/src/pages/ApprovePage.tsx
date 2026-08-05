@@ -106,13 +106,13 @@ export function ApprovePage() {
     <div className="mx-auto flex min-h-screen max-w-xl items-center justify-center p-6">
       {state.kind === "loading" && (
         <Alert className="flex flex-col gap-2 py-4 px-5">
-          <AlertTitle className="text-sm">Loading elicitation…</AlertTitle>
+          <AlertTitle className="text-ui">Loading elicitation…</AlertTitle>
         </Alert>
       )}
 
       {state.kind === "resolved" && (
         <Alert className="flex flex-col gap-2 border-muted py-4 px-5">
-          <AlertTitle className="text-sm">Elicitation resolved</AlertTitle>
+          <AlertTitle className="text-ui">Elicitation resolved</AlertTitle>
           <AlertDescription className="text-xs">
             This approval request is no longer pending. It may have been resolved, timed out, or
             cancelled.
@@ -122,14 +122,14 @@ export function ApprovePage() {
 
       {state.kind === "error" && (
         <Alert variant="destructive" className="flex flex-col gap-2 py-4 px-5">
-          <AlertTitle className="text-sm">Error</AlertTitle>
+          <AlertTitle className="text-ui">Error</AlertTitle>
           <AlertDescription className="text-xs">{state.message}</AlertDescription>
         </Alert>
       )}
 
       {state.kind === "submitted" && (
         <Alert className="flex flex-col gap-1 border-muted py-4 px-5">
-          <AlertTitle className="flex items-center gap-2 text-sm">
+          <AlertTitle className="flex items-center gap-2 text-ui">
             {state.action === "accept" ? (
               <>
                 <CheckIcon className="size-4 text-success" />
@@ -148,7 +148,7 @@ export function ApprovePage() {
 
       {state.kind === "pending" && (
         <Alert className="flex flex-col gap-3 py-4 px-5">
-          <AlertTitle className="flex items-center gap-2 text-sm">
+          <AlertTitle className="flex items-center gap-2 text-ui">
             <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
             Approval required
             {state.data.policy_name && (

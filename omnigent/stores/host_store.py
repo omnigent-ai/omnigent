@@ -28,7 +28,11 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
-from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    now_epoch,
+)
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # A host is considered live only if its row was touched (connect or
@@ -185,7 +189,10 @@ class HostStore:
             ``"sqlite:///hosts.db"``.
         """
         self._engine: Engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.host_store",
+        )
 
     def upsert_on_connect(
         self,
@@ -240,7 +247,7 @@ class HostStore:
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
-        with self._session() as session:
+        with self._session("upsert_host_on_connect") as session:
             # Primary lookup: by (workspace_id, host_id) — the new PK.
             row = session.get(SqlHost, (current_workspace_id(), host_id))
             if row is not None:
@@ -483,7 +490,7 @@ class HostStore:
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         """
-        with self._session() as session:
+        with self._session("set_host_offline") as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
@@ -503,7 +510,7 @@ class HostStore:
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param configured_harnesses: Current readiness keyed by harness spelling.
         """
-        with self._session() as session:
+        with self._session("update_harness_readiness") as session:
             session.execute(
                 update(SqlHost)
                 .where(
@@ -534,7 +541,7 @@ class HostStore:
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
         # pure overhead. A missing host simply matches no rows (a no-op).
-        with self._session() as session:
+        with self._session("update_host_heartbeat") as session:
             session.execute(
                 update(SqlHost)
                 .where(
@@ -585,7 +592,7 @@ class HostStore:
             return set()
         unique_ids = list(set(host_ids))
         ref = now_epoch()
-        with self._session() as session:
+        with self._session("select_online_host_ids") as session:
             rows = session.execute(
                 select(SqlHost.host_id, SqlHost.status, SqlHost.updated_at).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -610,7 +617,7 @@ class HostStore:
             ``"corey.zumar@databricks.com"``.
         :returns: List of :class:`Host` entities.
         """
-        with self._session() as session:
+        with self._session("list_hosts") as session:
             rows = (
                 session.query(SqlHost)
                 .filter(
@@ -630,7 +637,7 @@ class HostStore:
             ``"host_a1b2c3d4..."``.
         :returns: The :class:`Host` if found, otherwise ``None``.
         """
-        with self._session() as session:
+        with self._session("select_host_by_id") as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
@@ -689,7 +696,7 @@ class HostStore:
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
-        with self._session() as session:
+        with self._session("register_managed_host") as session:
             existing = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
@@ -749,7 +756,7 @@ class HostStore:
             or ``None`` when the host is unknown, the token does not match,
             or the token is expired.
         """
-        with self._session() as session:
+        with self._session("resolve_launch_token") as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -781,7 +788,7 @@ class HostStore:
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session() as session:
+        with self._session("delete_host") as session:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -810,7 +817,7 @@ class HostStore:
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session() as session:
+        with self._session("revoke_launch_token") as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id

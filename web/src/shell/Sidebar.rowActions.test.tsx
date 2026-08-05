@@ -568,11 +568,10 @@ describe("pinned row project flyout", () => {
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     const flyoutTitle = within(flyout).getByText("My Session");
     expect(flyoutTitle).toBeInTheDocument();
-    // The flyout title is sized to match the sidebar row name
-    // (`sidebar-compact-text`, 13px at the default), not the larger `text-sm`.
-    // Both scale with the UI font-size setting via the rem-based root.
+    // The flyout title matches sidebar row names through the shared compact
+    // class, which resolves to the same text-ui step as Appearance content.
     expect(flyoutTitle).toHaveClass("sidebar-compact-text");
-    expect(flyoutTitle).not.toHaveClass("text-sm");
+    expect(flyoutTitle).not.toHaveClass("text-ui");
     expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );

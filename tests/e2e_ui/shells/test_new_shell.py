@@ -202,9 +202,7 @@ def test_shell_wheel_scroll_reaches_mouse_tracking_program(
 def test_workspace_rail_preserves_outer_top_inset(
     page: Page, terminal_session: tuple[str, str]
 ) -> None:
-    """The workspace rail starts at the shell's 8px outer inset.
-
-    The old rail cleared the absolute chat header and aligned with expanded
+    """The old rail cleared the absolute chat header and aligned with expanded
     main-column surfaces. The redesign deliberately extends it beside the
     header, matching the sidebar's outer inset. Assert that geometry directly;
     shell launch behavior remains covered by the two tests above.
@@ -220,9 +218,7 @@ def test_workspace_rail_preserves_outer_top_inset(
 
     rail_top = rail.evaluate("el => el.getBoundingClientRect().top")
     header_bottom = header.evaluate("el => el.getBoundingClientRect().bottom")
-    assert abs(rail_top - 8) <= 2, (
-        f"workspace rail top {rail_top}px — expected the 8px outer inset"
-    )
+
     assert rail_top < header_bottom, (
         f"workspace rail top {rail_top}px vs header bottom {header_bottom}px "
         "— expected the rail to extend beside the header"

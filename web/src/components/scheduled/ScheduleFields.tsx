@@ -229,7 +229,7 @@ export function ScheduleFields({
               value={timeText}
               data-testid="schedule-minute"
               placeholder="0"
-              className="text-sm"
+              className="text-ui"
               aria-invalid={error ? true : undefined}
               onChange={(e) => handleTimeTextChange(e.target.value)}
               onBlur={canonicalizeTimeText}
@@ -244,7 +244,7 @@ export function ScheduleFields({
                     value={timeText}
                     data-testid="schedule-time"
                     placeholder="5:00 PM"
-                    className="pr-8 text-sm"
+                    className="pr-8 text-ui"
                     aria-invalid={error ? true : undefined}
                     onFocus={() => handleTimePickerOpenChange(true)}
                     onChange={(e) => handleTimeTextChange(e.target.value)}
@@ -423,7 +423,7 @@ function PickerCell({
       data-selected={selected ? "true" : undefined}
       data-testid={testId}
       className={cn(
-        "flex h-8 w-full items-center justify-center rounded-sm text-sm transition-colors",
+        "flex h-8 w-full items-center justify-center rounded-sm text-ui transition-colors",
         selected ? "bg-primary text-primary-foreground" : "text-foreground hover:bg-muted",
       )}
       onClick={onClick}

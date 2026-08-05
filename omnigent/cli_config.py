@@ -2549,29 +2549,30 @@ def _print_kimi_auth_help() -> None:
 def _manage_kimi_harness() -> None:
     """Run the level-2 loop for Kimi Code: install the CLI and drive ``kimi login``.
 
-    Unlike Qwen (which has no ``login`` subcommand), Kimi ships a real
-    ``kimi login`` (Moonshot OAuth or API key) and ``kimi logout``, so this
-    drill-in offers sign-in / sign-out directly. Kimi has no first-class
-    "am I logged in?" probe (its install spec sets ``status_args=None``), so
+    Kimi ships a real ``kimi login`` (Moonshot OAuth or API key), so this
+    drill-in offers sign-in directly. It has **no** ``kimi logout`` subcommand
+    (verified against kimi CLI v0.29.1), so there is no sign-out row — the user
+    clears credentials by removing kimi's own credential file. Kimi has no
+    first-class "am I logged in?" exit-code probe (its install spec sets
+    ``status_args=None``), so
     :func:`~omnigent.onboarding.harness_install.harness_cli_logged_in` always
     reports ``False`` for it — meaning ``harness_login`` runs ``kimi login``
     every time it is asked (the interactive flow lets the user cancel if
     already authenticated) and its boolean return is not a reliable success
-    signal. We therefore treat login / logout as best-effort side effects and
-    report that the flow finished rather than asserting an auth state.
+    signal. We therefore treat login as a best-effort side effect and report
+    that the flow finished rather than asserting an auth state.
 
     Like the other CLI-backed harnesses, a missing CLI gates the drill-in —
     there is nothing to configure for a harness you can't run.
 
     :returns: None. Side effects: may install the kimi CLI and run
-        ``kimi login`` / ``kimi logout`` in the foreground.
+        ``kimi login`` in the foreground.
     """
     from omnigent.onboarding.harness_install import (
         KIMI_KEY,
         harness_cli_installed,
         harness_install_spec,
         harness_login,
-        harness_logout,
     )
     from omnigent.onboarding.interactive import console, select
 
@@ -2594,7 +2595,6 @@ def _manage_kimi_harness() -> None:
     while True:
         rows: list[_HarnessMenuRow] = [
             _HarnessMenuRow("Sign in (kimi login)", action="login"),
-            _HarnessMenuRow("Sign out (kimi logout)", action="logout"),
             _HarnessMenuRow("Show auth options", action="help"),
             _HarnessMenuRow("← Back", action="back"),
         ]
@@ -2616,10 +2616,6 @@ def _manage_kimi_harness() -> None:
             console.print("  [dim]Signing in to Kimi (its login will open)…[/dim]")
             harness_login(KIMI_KEY)
             status = "kimi login flow finished — kimi stores its own credentials"
-        elif action == "logout":
-            console.print("  [dim]Signing out of Kimi…[/dim]")
-            harness_logout(KIMI_KEY)
-            status = "kimi logout flow finished"
         elif action == "help":
             _print_kimi_auth_help()
             status = None
@@ -3747,13 +3743,20 @@ def _run_configure_harnesses_interactive() -> None:
                 (_KIRO, "Kiro", _cli_absence_label(KIRO_KEY), "missing", _install_hint(kiro_hint))
             )
 
-        # Kimi Code — native CLI, own auth via `kimi login`; there is no local
-        # login status probe yet. Curl-installed (no npm package), so use its
-        # install_hint when absent and show "not configured" when present.
+        # Kimi Code — native CLI, own auth via `kimi login`. There is no CLI
+        # login-status probe, but `kimi login` writes a credential file, so a
+        # subprocess-free file check (`kimi_login_detected`) distinguishes
+        # "signed in" (green) from "installed but not configured" (yellow).
+        # Curl-installed (no npm package), so use its install_hint when absent.
         if harness_cli_installed(KIMI_KEY):
-            rows.append(
-                (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
-            )
+            from omnigent.onboarding.kimi_auth import kimi_login_detected
+
+            if kimi_login_detected():
+                rows.append((_KIMI, "Kimi Code", "Signed in", "ready", ""))
+            else:
+                rows.append(
+                    (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
+                )
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
