@@ -3780,3 +3780,78 @@ async def test_supervise_reader_external_cancel_propagates_not_rotation(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Quiescence backstop (agy's own CASCADE_RUN_STATUS)
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_is_idle_reads_agys_own_run_status() -> None:
+    """
+    The bound cascade's own ``CASCADE_RUN_STATUS`` is the quiescence signal.
+
+    agy publishes this per cascade in ``GetAllCascadeTrajectories``. It reports
+    ``RUNNING`` both while working AND while parked on a permission gate
+    (live-verified against agy 1.1.8 over a 75s gate), so IDLE genuinely means the
+    turn is over — never "waiting for the human".
+    """
+    idle = {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_IDLE"}}
+    running = {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_RUNNING"}}
+    assert reader._cascade_is_idle(idle, _BOUND_CASCADE)
+    assert not reader._cascade_is_idle(running, _BOUND_CASCADE)
+    # An absent / malformed entry is never treated as idle: closing a turn on
+    # missing information would be worse than leaving the accelerator to do it.
+    assert not reader._cascade_is_idle({}, _BOUND_CASCADE)
+    assert not reader._cascade_is_idle({_BOUND_CASCADE: "nope"}, _BOUND_CASCADE)
+    assert not reader._cascade_is_idle({_BOUND_CASCADE: {}}, _BOUND_CASCADE)
+
+
+@pytest.mark.asyncio
+async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Quiescence is reported only after CONSECUTIVE idle observations.
+
+    A single idle reading can catch the gap between a turn being delivered and
+    agy starting it, which would close a turn that is about to run. Requiring two
+    in a row makes the backstop conservative — it exists to guarantee no session
+    is stranded, not to race the step-based close.
+    """
+    calls: list[int] = []
+
+    async def _on_quiescent() -> None:
+        calls.append(1)
+
+    idle = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_IDLE"}}}
+    busy = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
+    # idle, busy (resets), idle, idle -> exactly one signal, on the 4th tick.
+    script = [idle, busy, idle, idle]
+    seen = {"n": 0}
+
+    def _fetch(port: int) -> dict[str, object]:
+        i = seen["n"]
+        seen["n"] += 1
+        if i >= len(script):
+            raise asyncio.CancelledError()
+        return script[i]
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _fetch)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await reader._watch_for_rotation(
+            port=_PORT,
+            bound_cascade_id=_BOUND_CASCADE,
+            interval_s=0.0,
+            skip_cascade_ids=frozenset(),
+            on_rotation=_fail_rotation,
+            on_quiescent=_on_quiescent,
+        )
+
+    assert calls == [1], "expected exactly one quiescence signal, after two idle ticks"

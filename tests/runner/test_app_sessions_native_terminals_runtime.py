@@ -413,6 +413,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -516,9 +517,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
-    preload_calls: list[tuple[str, str]] = []
+    preload_calls: list[tuple[str, str, list[str] | None]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """
         Record preloading of the known Codex thread.
 
@@ -530,7 +536,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
         )
-        preload_calls.append((transport, loaded_thread_id))
+        preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """
@@ -579,24 +585,32 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert app_server.codex_home == expected_codex_home
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
+    assert build_calls[0]["trust_project"] is True
     assert "developer_instructions" not in build_calls[0]
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
-    assert launched.args[:3] == [
+    assert launched.args[0] == "--dangerously-bypass-hook-trust"
+    assert launched.args[1:4] == [
         "--config",
         "approval_policy=on-request",
         "resume",
     ]
-    assert launched.args[3] == "--remote"
-    assert launched.args[4].startswith("ws://127.0.0.1:")
-    assert launched.args[5] == thread_id
+    assert launched.args[4] == "--remote"
+    assert launched.args[5].startswith("ws://127.0.0.1:")
+    assert launched.args[6] == thread_id
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
-    assert preload_calls == [(app_server.listen_url, thread_id)]
+    assert preload_calls == [
+        (
+            app_server.listen_url,
+            thread_id,
+            ["--config", "approval_policy=on-request"],
+        )
+    ]
     assert published_events[0]["type"] == "session.resource.created"
     assert forward_calls == [
         {
@@ -721,6 +735,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -805,7 +820,12 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """
         Record preloading of the cloned Codex thread.
 
@@ -816,6 +836,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "fork-resume must not expose stale bridge state before preload"
         )
+        assert terminal_launch_args is None
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -994,6 +1015,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1069,8 +1091,14 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
+        assert terminal_launch_args is None
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -1220,6 +1248,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1442,6 +1471,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         """Minimal app-server object."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1787,6 +1817,11 @@ async def _run_antigravity_auto_create(
 
     monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _no_sleep)
     monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", lambda: list(candidate_ports))
+    monkeypatch.setattr(
+        rpc_mod,
+        "get_available_models",
+        lambda _port: {"models": {"ready": {"model": "ready"}}},
+    )
     start_cascade_calls: list[tuple[int, str]] = []
 
     def _fake_start_cascade(port: int, cascade_id: str, **_kwargs: Any) -> None:
@@ -2117,6 +2152,120 @@ async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_st
     state = bridge_mod.read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == real_id
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_waits_for_model_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StartCascade runs only after models appear and the settling delay passes."""
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner.native import orchestration as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "158889f76b7143cd97d1c564db115235"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=f"agy_conv_{'a' * 32}",
+        ),
+    )
+
+    events: list[tuple[str, object]] = []
+    catalogs = iter(
+        [
+            {},
+            {"models": {}},
+            {"models": {"gemini": {"model": "MODEL_GEMINI"}}},
+        ]
+    )
+    monkeypatch.setattr(
+        rpc_mod,
+        "resolve_cold_start_agy_rpc_port",
+        lambda *_args: 52548,
+    )
+
+    def _models(port: int) -> dict[str, object]:
+        events.append(("models", port))
+        return next(catalogs)
+
+    monkeypatch.setattr(rpc_mod, "get_available_models", _models)
+
+    def _start(port: int, cascade_id: str) -> None:
+        events.append(("start", (port, cascade_id)))
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _start)
+
+    async def _sleep(seconds: float) -> None:
+        events.append(("sleep", seconds))
+
+    monkeypatch.setattr(runner_app_mod, "_agy_cold_start_poll_sleep", _sleep)
+
+    result = await runner_app_mod._cold_start_agy_conversation(
+        bridge_dir,
+        session_id,
+        timeout_s=1.0,
+    )
+
+    assert result is not None
+    assert events[:-1] == [
+        ("models", 52548),
+        ("sleep", runner_app_mod._AGY_COLD_START_PORT_POLL_INTERVAL_S),
+        ("models", 52548),
+        ("sleep", runner_app_mod._AGY_COLD_START_PORT_POLL_INTERVAL_S),
+        ("models", 52548),
+        ("sleep", 4.0),
+    ]
+    assert events[-1] == ("start", (52548, result))
+
+
+@pytest.mark.asyncio
+async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound RPC port without models never receives StartCascade."""
+    import omnigent.antigravity_native_rpc as rpc_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner.native import orchestration as runner_app_mod
+
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    session_id = "4908a3a50e4c4323a3f0183013ea79ba"
+    bridge_dir = bridge_mod.prepare_bridge_dir(session_id)
+    placeholder = f"agy_conv_{'b' * 32}"
+    bridge_mod.write_bridge_state(
+        bridge_dir,
+        bridge_mod.AntigravityNativeBridgeState(
+            session_id=session_id,
+            conversation_id=placeholder,
+        ),
+    )
+    monkeypatch.setattr(
+        rpc_mod,
+        "resolve_cold_start_agy_rpc_port",
+        lambda *_args: 52548,
+    )
+    monkeypatch.setattr(rpc_mod, "get_available_models", lambda _port: {"models": {}})
+
+    def _unexpected_start(_port: int, _cascade_id: str) -> None:
+        raise AssertionError("StartCascade must wait for a non-empty model catalog")
+
+    monkeypatch.setattr(rpc_mod, "start_cascade", _unexpected_start)
+
+    result = await runner_app_mod._cold_start_agy_conversation(
+        bridge_dir,
+        session_id,
+        timeout_s=0.0,
+    )
+
+    assert result is None
+    state = bridge_mod.read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == placeholder
 
 
 @pytest.mark.asyncio

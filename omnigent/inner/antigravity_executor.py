@@ -13,7 +13,7 @@ agent reuse, and a streaming :meth:`run_turn` mapping SDK events onto Omnigent
    harness only runs on hosts with glibc ≳ 2.36; older hosts surface an
    :class:`ExecutorError`.
 
-Default model is Gemini 3.5 Flash; the SDK can also drive Claude / GPT-OSS.
+Model selection defaults to the SDK when no explicit override is configured.
 
 Streaming model:
 
@@ -72,9 +72,6 @@ from .executor import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Default model when neither spec nor provider pins one.
-_ANTIGRAVITY_DEFAULT_MODEL = "gemini-3.5-flash"
 
 # Sentinel the producer pushes when the step stream is exhausted, so the
 # consumer can distinguish "turn finished" from a queued event.
@@ -313,7 +310,7 @@ class _AntigravitySessionState:
 
     agent: SDKAgent = None
     conversation: SDKConversation = None
-    agent_signature: tuple[str, str, str] | None = field(default=None)
+    agent_signature: tuple[str | None, str, str] | None = field(default=None)
     pending_tools: dict[str, _PendingTool] = field(default_factory=dict)
     active_queue: _EventQueue | None = field(default=None)
     last_usage: SDKUsage = None
@@ -336,9 +333,8 @@ class AntigravityExecutor(Executor):
         """Create an AntigravityExecutor.
 
         :param model: Default model when per-turn :attr:`ExecutorConfig.model`
-            is unset, e.g. ``"gemini-3.5-flash"`` (from
-            ``HARNESS_ANTIGRAVITY_MODEL``). ``None`` falls back to
-            :data:`_ANTIGRAVITY_DEFAULT_MODEL`.
+            is unset, typically from ``HARNESS_ANTIGRAVITY_MODEL``. ``None``
+            delegates model selection to the installed SDK.
         :param api_key: Direct Antigravity / Gemini API key (from
             ``HARNESS_ANTIGRAVITY_API_KEY``). ``None`` lets the SDK read its
             ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``.
@@ -490,11 +486,7 @@ class AntigravityExecutor(Executor):
             terminal :class:`TurnComplete` / :class:`TurnCancelled` /
             :class:`ExecutorError`.
         """
-        model = (
-            (config.model if config and config.model else None)
-            or self._model_override
-            or (_ANTIGRAVITY_DEFAULT_MODEL)
-        )
+        model = (config.model if config and config.model else None) or self._model_override
         session_key = self._session_key(messages)
         prompt = _latest_user_text(messages)
 
@@ -776,7 +768,7 @@ class AntigravityExecutor(Executor):
         self,
         session_key: str,
         *,
-        model: str,
+        model: str | None,
         system_prompt: str,
         tools: list[ToolSpec],
     ) -> tuple[_AntigravitySessionState, bool]:
@@ -788,7 +780,8 @@ class AntigravityExecutor(Executor):
         closes over it) stays valid.
 
         :param session_key: The Omnigent session id.
-        :param model: The resolved model id to pin, e.g. ``"gemini-3.5-flash"``.
+        :param model: The resolved model id to pin, or ``None`` to use the SDK
+            default.
         :param system_prompt: The agent's system instructions.
         :param tools: Omnigent tool specs to expose to the agent.
         :returns: ``(state, created)`` — the session's
@@ -844,7 +837,7 @@ class AntigravityExecutor(Executor):
         self,
         state: _AntigravitySessionState,
         *,
-        model: str,
+        model: str | None,
         system_prompt: str,
         tools: list[ToolSpec],
     ) -> SDKAgent:
@@ -858,7 +851,8 @@ class AntigravityExecutor(Executor):
         :class:`ToolCallComplete` for every tool the agent runs.
 
         :param state: The session state the tool-completion hook closes over.
-        :param model: The resolved model id to pin.
+        :param model: The resolved model id to pin, or ``None`` to use the SDK
+            default.
         :param system_prompt: The agent's system instructions.
         :param tools: Omnigent tool specs to expose as callables.
         :returns: The opened SDK ``Agent``.
@@ -996,7 +990,7 @@ class AntigravityExecutor(Executor):
         self,
         antigravity: ModuleType,
         *,
-        model: str,
+        model: str | None,
         kwargs: _StrAnyDict,
     ) -> SDKConfig:
         """Build a ``LocalAgentConfig``, passing only supported optional fields.
@@ -1005,14 +999,16 @@ class AntigravityExecutor(Executor):
         field the installed SDK doesn't accept, rather than crashing on drift.
 
         :param antigravity: The imported ``google.antigravity`` module.
-        :param model: The resolved model id to pin.
+        :param model: The resolved model id to pin, or ``None`` to use the SDK
+            default.
         :param kwargs: Base config kwargs (system instructions, tools, hooks).
         :returns: A ``LocalAgentConfig`` instance.
         """
         local_config_cls = antigravity.LocalAgentConfig
         supported = self._config_field_names(local_config_cls)
         candidate: _StrAnyDict = dict(kwargs)
-        candidate["model"] = model
+        if model is not None:
+            candidate["model"] = model
         if self._api_key:
             candidate["api_key"] = self._api_key
         if self._vertex:

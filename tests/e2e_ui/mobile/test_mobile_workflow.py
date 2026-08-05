@@ -188,11 +188,12 @@ def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
 ) -> None:
     """Shell-capable agents expose the mobile Shells drawer at zero shells.
 
-    The desktop rail shows Shells by default when the session agent declares a
-    ``terminals:`` block, because the empty state is the "+ New shell" entry
-    point. Mobile must mirror that behavior: the FAB should list Shells before
-    any user shell has been created, and selecting it should open the full-screen
-    Shells drawer containing the same "+ New shell" row.
+    Mobile has no tab-strip "+" menu, so the Shells drawer is the create entry
+    point: when the session agent declares a ``terminals:`` block, the FAB lists
+    Shells before any user shell exists, and selecting it opens the full-screen
+    drawer carrying a "+ New shell" row. (On desktop the create affordance lives
+    in the tab strip's "+" menu and the rail's Shells tab only lists existing
+    shells — see AppShell.test.tsx.)
     """
     base_url, session_id = terminal_session
     page.set_viewport_size(_MOBILE_VIEWPORT)

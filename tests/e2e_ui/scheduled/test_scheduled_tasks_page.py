@@ -114,6 +114,14 @@ def _pick_minute(page: Page, minute: int) -> None:
     Radix Dialog and close it) and wait for it to unmount, letting the layout
     settle before the caller submits.
 
+    Every dismiss click on the name input uses force=True: while the picker
+    popover is open the Radix Dialog owns pointer hit-testing over the modal, so
+    a normal actionability-gated click resolves to the ``dialog-overlay`` at the
+    input's coordinates ("overlay intercepts pointer events") and blocks the full
+    30s under load. A forced click still dispatches a real pointerdown on the
+    input, which Radix registers as the interaction-outside that closes the
+    popover — the same reason the open click below is forced.
+
     :param page: Playwright page with the create/edit task dialog open.
     :param minute: Minute of the hour to select (0-59).
     """
@@ -133,12 +141,12 @@ def _pick_minute(page: Page, minute: int) -> None:
         except (AssertionError, PlaywrightTimeoutError):
             # The popover flickered shut before the click landed; dismiss any
             # partial-open state (click-outside, not Escape) and try again.
-            name_input.click()
+            name_input.click(force=True)
     else:
         expect(cell).to_be_visible(timeout=3_000)
         cell.click(force=True)
     # Dismiss the picker so its floating position stops churning the layout.
-    name_input.click()
+    name_input.click(force=True)
     expect(picker).to_be_hidden(timeout=5_000)
 
 
@@ -281,7 +289,10 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.click()
     page.keyboard.type("9:37")
     assert time_input.input_value() == "9:37"
-    page.get_by_test_id("task-name-input").click()
+    # force=True: focusing the time input opened the picker popover, so a normal
+    # click here can resolve to the dialog overlay (see _pick_minute's note). A
+    # forced click still blurs the input and closes the picker.
+    page.get_by_test_id("task-name-input").click(force=True)
     expect(time_input).to_have_value("09:37 AM")
     _pick_minute(page, 37)
     expect(time_input).to_have_value("09:37 AM")
@@ -324,7 +335,9 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.fill("")
     time_input.click()
     page.keyboard.type("10:37")
-    page.get_by_test_id("task-name-input").click()
+    # force=True: the time input's focus reopened the picker popover, so blur it
+    # with a forced click that can't be swallowed by the dialog overlay.
+    page.get_by_test_id("task-name-input").click(force=True)
     expect(time_input).to_have_value("10:37 AM")
     submit.click()
 

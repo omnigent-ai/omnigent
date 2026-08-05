@@ -108,6 +108,57 @@ async def test_concurrent_identical_imports_return_one_session(
     assert imported is not None
 
 
+async def test_force_import_replaces_existing_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A forced retry replaces the transcript while retaining its stable id."""
+    _seed_claude_agent(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-force-1",
+        "workspace": "/repo/old",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:old",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old prompt"}],
+                },
+            }
+        ],
+    }
+    created = await client.post("/v1/imports", json=payload)
+    payload["force"] = True
+    payload["workspace"] = "/repo/new"
+    payload["items"] = [
+        {
+            "type": "message",
+            "response_id": "claude:new",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "new prompt"}],
+            },
+        }
+    ]
+
+    replaced = await client.post("/v1/imports", json=payload)
+
+    assert created.status_code == 201
+    assert replaced.status_code == 201
+    assert replaced.json()["session_id"] == created.json()["session_id"]
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
+        replaced.json()["session_id"]
+    )
+    assert conversation is not None
+    assert conversation.workspace == "/repo/new"
+    assert conversation.title == "new prompt"
+    items = await client.get(f"/v1/sessions/{conversation.id}/items")
+    assert items.status_code == 200
+    assert [item["content"][0]["text"] for item in items.json()["data"]] == ["new prompt"]
+
+
 async def test_import_session_rejects_empty_history(client: httpx.AsyncClient) -> None:
     """An empty parser result cannot create a permanently claimed session."""
     response = await client.post(

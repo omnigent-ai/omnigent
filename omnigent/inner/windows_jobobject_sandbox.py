@@ -33,8 +33,10 @@ import ctypes
 import ctypes.wintypes as wintypes
 import functools
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
+from typing import Protocol, cast
 
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
@@ -106,6 +108,35 @@ _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 
 
+class _WinFunction(Protocol):
+    restype: object
+    argtypes: list[object]
+
+    def __call__(self, *args: object) -> int | None:
+        raise NotImplementedError
+
+
+class _Kernel32(Protocol):
+    CreateJobObjectW: _WinFunction
+    SetInformationJobObject: _WinFunction
+    OpenProcess: _WinFunction
+    AssignProcessToJobObject: _WinFunction
+    CloseHandle: _WinFunction
+
+
+class _WinLibraries(Protocol):
+    kernel32: _Kernel32
+
+
+def _kernel32() -> _Kernel32:
+    return cast(_WinLibraries, vars(ctypes)["windll"]).kernel32
+
+
+def _get_last_error() -> int:
+    get_last_error = cast(Callable[[], int], vars(ctypes)["get_last_error"])
+    return get_last_error()
+
+
 class _JobHandle:
     """Owns a Windows Job Object handle; closing it kills the contained tree.
 
@@ -121,7 +152,7 @@ class _JobHandle:
         if self._handle is None:
             return
         handle, self._handle = self._handle, None
-        if not ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle)):
+        if not _kernel32().CloseHandle(wintypes.HANDLE(handle)):
             _LOGGER.debug("windows_jobobject: CloseHandle failed for job handle")
 
     def __enter__(self) -> _JobHandle:
@@ -219,14 +250,14 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             not be established.
         """
         del policy
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _kernel32()
 
         job = kernel32.CreateJobObjectW(None, None)
         if not job:
             _LOGGER.warning(
                 "windows_jobobject: CreateJobObject failed (err=%d); helper pid "
                 "%d runs without Job Object containment.",
-                ctypes.get_last_error(),
+                _get_last_error(),
                 pid,
             )
             return None
@@ -242,7 +273,7 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             _LOGGER.warning(
                 "windows_jobobject: SetInformationJobObject failed (err=%d); "
                 "closing job and continuing uncontained.",
-                ctypes.get_last_error(),
+                _get_last_error(),
             )
             kernel32.CloseHandle(wintypes.HANDLE(job))
             return None
@@ -254,7 +285,7 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             _LOGGER.warning(
                 "windows_jobobject: OpenProcess(pid=%d) failed (err=%d); continuing uncontained.",
                 pid,
-                ctypes.get_last_error(),
+                _get_last_error(),
             )
             kernel32.CloseHandle(wintypes.HANDLE(job))
             return None
@@ -268,7 +299,7 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
                     "(err=%d) — process may already be in a non-nestable job. "
                     "Continuing without Job Object containment.",
                     pid,
-                    ctypes.get_last_error(),
+                    _get_last_error(),
                 )
                 kernel32.CloseHandle(wintypes.HANDLE(job))
                 return None
@@ -290,7 +321,7 @@ def os_name() -> str:
 # HANDLE/DWORD widths correct on 64-bit Python (pointers must not be truncated
 # to 32-bit ints).
 def _configure_prototypes() -> None:
-    k = ctypes.windll.kernel32
+    k = _kernel32()
     k.CreateJobObjectW.restype = wintypes.HANDLE
     k.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
     k.SetInformationJobObject.restype = wintypes.BOOL

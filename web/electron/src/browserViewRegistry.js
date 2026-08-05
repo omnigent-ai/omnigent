@@ -208,7 +208,9 @@ function createBrowserViewRegistry({
         if (prev) {
           try {
             detachFromHost(prev.view);
-          } catch {}
+          } catch {
+            /* view already detached */
+          }
         }
         activeConversationId = null;
         sendToRenderer("browser-host-active-changed", { conversationId: null });
@@ -224,7 +226,9 @@ function createBrowserViewRegistry({
         if (prev) {
           try {
             detachFromHost(prev.view);
-          } catch {}
+          } catch {
+            /* view already detached */
+          }
         }
         activeConversationId = null;
         sendToRenderer("browser-host-active-changed", { conversationId: null });
@@ -263,7 +267,9 @@ function createBrowserViewRegistry({
     if (activeConversationId === conversationId) {
       try {
         detachFromHost(entry.view);
-      } catch {}
+      } catch {
+        /* view already detached */
+      }
       activeConversationId = null;
     }
     // Detach any design-mode listeners before closing the webContents, so a

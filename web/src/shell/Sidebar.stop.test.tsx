@@ -5,6 +5,8 @@
 // confirms through a dialog before firing the stop mutation. See
 // ConversationRow in Sidebar.tsx.
 
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -54,7 +56,7 @@ vi.mock("@/hooks/useConversations", () => ({
 }));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionRunnerOnline: (id: string | undefined) => mocks.runnerOnline(id),
 }));
 
@@ -203,7 +205,12 @@ describe("sidebar Stop session item", () => {
     mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
     openKebab();
     const item = screen.getByTestId("stop-conversation");
     expect(item).toHaveAttribute("data-disabled");

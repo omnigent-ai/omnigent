@@ -188,6 +188,7 @@ describe("BubbleView dispatch", () => {
     );
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "user");
+    expect(bubble).toHaveClass("max-w-[640px]");
     expect(bubble).toHaveTextContent("hello there");
   });
 
@@ -199,6 +200,14 @@ describe("BubbleView dispatch", () => {
     expect(bubble).toHaveAttribute("data-role", "assistant");
     expect(bubble).toHaveTextContent("the answer is 42");
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+  });
+
+  it("uses full-width layout for assistant display math", () => {
+    render(<BubbleView bubble={assistantText(String.raw`$$d = \sqrt{x^2 + y^2}$$`)} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
   });
 
   it("marks a cancelled assistant turn as Interrupted", () => {

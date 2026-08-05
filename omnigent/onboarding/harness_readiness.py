@@ -29,6 +29,7 @@ import os
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
+import omnigent.onboarding.kimi_auth as _kimi_auth
 from omnigent._platform import resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.harness_availability import (
@@ -77,16 +78,20 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
     {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
 )
 
-# Families whose CLIs authenticate via file-based credentials rather than a CLI
-# login command. For these, ``harness_is_configured`` checks BOTH the binary
-# (via ``harness_cli_installed``) AND the credential (via the callable here).
-# The ``anthropic`` / ``openai`` families authenticate via subscription provider
-# config and do not appear here. The lambda resolves through the module at call
-# time so a test can monkeypatch
-# ``omnigent.onboarding.gemini_auth.gemini_login_detected`` and have the patch
-# take effect without this dict caching the old function object.
+# Families/harnesses whose CLIs authenticate via file-based credentials rather
+# than a CLI login-status command. For these, ``harness_is_configured`` checks
+# BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
+# callable here). ``agy`` writes an OAuth token on its first interactive run;
+# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json`` (kimi has no
+# login-status probe). The ``anthropic`` / ``openai`` families authenticate via
+# subscription provider config and do not appear here. Each lambda resolves
+# through its module at call time so a test can monkeypatch
+# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_login_detected``
+# and have the patch take effect without this dict caching the old function
+# object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
+    KIMI_KEY: lambda: _kimi_auth.kimi_login_detected(),
 }
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native

@@ -1,3 +1,6 @@
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
@@ -60,12 +63,12 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // The project list + config are the unit under test's inputs — stub the hooks
 // so each case controls them without HTTP-layer plumbing.
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
   useProjectConfig: vi.fn(),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({}),
   // Stub so the setup dialog's hook doesn't fire its own /v1/harnesses fetch
   // (which would skew the create-flow call-count assertions here).
@@ -266,6 +269,30 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(BETA_REPO);
     expect(body.agent_id).toBe("ag_other");
+  });
+
+  it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
+    const EDITED_REPO = "/Users/corey/projects/alpha-edited";
+    // First open reads the original config.
+    setProjectConfig({ host_id: "host_1", workspace: REPO });
+    const rerender = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    // User edits the project's defaults; the save seeds the fresh config into
+    // the cache, so a re-open of the SAME project (`?project=Alpha` unchanged)
+    // must pick up the new workspace rather than latch onto the settled seed.
+    setProjectConfig({ host_id: "host_1", workspace: EDITED_REPO });
+    rerender(<NewChatLandingScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "alpha-edited",
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(EDITED_REPO);
   });
 
   it("does not seed an offline config host (falls back to the generic default)", async () => {

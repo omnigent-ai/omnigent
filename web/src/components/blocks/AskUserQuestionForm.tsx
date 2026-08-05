@@ -44,6 +44,7 @@ interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
+  canSubmit?: boolean;
 }
 
 /**
@@ -82,7 +83,12 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({
+  questions,
+  onSubmit,
+  onReject,
+  canSubmit = true,
+}: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -236,7 +242,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
         className="flex flex-col gap-2 mb-2"
         data-testid="ask-user-question-section"
       >
-        <legend className="text-foreground text-sm font-medium flex items-center gap-2 mb-2">
+        <legend className="text-foreground text-ui font-medium flex items-center gap-2 mb-2">
           {current.question}
         </legend>
         <div className="flex flex-col gap-2">
@@ -249,7 +255,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                 <label
                   key={opt.label}
                   htmlFor={inputId}
-                  className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                  className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
                 >
                   <input
                     type="checkbox"
@@ -273,7 +279,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               <label
                 key={opt.label}
                 htmlFor={inputId}
-                className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
               >
                 <input
                   type="radio"
@@ -298,7 +304,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               same way. */}
           <label
             htmlFor={customRowId}
-            className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+            className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
           >
             <input
               type={current.multiSelect ? "checkbox" : "radio"}
@@ -323,7 +329,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               value={customRowValue}
               onChange={(e) => handleCustomInput(currentKey, e)}
               data-testid="ask-user-question-custom-input"
-              className="field-sizing-content flex-1 resize-none bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none"
+              className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
             />
           </label>
         </div>
@@ -367,7 +373,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
           <Button
             size="sm"
             onClick={handleSubmit}
-            disabled={!allAnswered}
+            disabled={!allAnswered || !canSubmit}
             data-testid="ask-user-question-submit"
           >
             <CheckIcon className="mr-1 size-3.5" />

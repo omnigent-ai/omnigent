@@ -127,6 +127,70 @@ const FORMATTERS: Record<string, ArgFormatter> = {
       : { verb: `Send to '${id}':`, body: payload };
   },
 
+  // Claude Code native harness tools — mirror the step lines its TUI
+  // prints. Shell steps carry a model-written description ("List docs
+  // directory") which the CLI surfaces; prefer it over the raw command.
+  Bash: (args) => {
+    const desc = asString(args.description);
+    if (desc !== null) return { verb: null, body: desc };
+    const cmd = asString(args.command);
+    return cmd === null ? null : { verb: null, body: cmd };
+  },
+  Read: (args) => withPath("Read", args.file_path),
+  Write: (args) => withPath("Write", args.file_path),
+  Edit: (args) => withPath("Edit", args.file_path),
+  MultiEdit: (args) => withPath("Edit", args.file_path),
+  NotebookEdit: (args) => withPath("Edit", args.notebook_path),
+  Grep: (args) => {
+    const pattern = asString(args.pattern);
+    return pattern === null ? null : { verb: "Search:", body: pattern };
+  },
+  Glob: (args) => {
+    const pattern = asString(args.pattern);
+    return pattern === null ? null : { verb: "Find files:", body: pattern };
+  },
+  WebSearch: (args) => {
+    const q = asString(args.query);
+    return q === null ? null : { verb: "Web search:", body: `"${q}"` };
+  },
+  WebFetch: (args) => {
+    const url = asString(args.url);
+    return url === null ? null : { verb: "Web fetch:", body: url };
+  },
+  TodoWrite: () => verbOnly("Update todos"),
+  Task: (args) => {
+    const desc = asString(args.description);
+    return desc === null ? verbOnly("Run sub-agent") : { verb: "Sub-agent:", body: desc };
+  },
+
+  // Codex native harness tools. Codex wraps every command in a login
+  // shell (`/bin/bash -lc '...'`); show the inner command like its TUI.
+  shell: (args) => {
+    const cmd = asString(args.command);
+    return cmd === null ? null : { verb: null, body: unwrapShellCommand(cmd) };
+  },
+  apply_patch: (args) => {
+    const changes = Array.isArray(args.changes) ? args.changes : null;
+    if (changes === null || changes.length === 0) return null;
+    if (changes.length === 1) {
+      const only = changes[0];
+      const path = only !== null && typeof only === "object" ? Reflect.get(only, "path") : null;
+      const p = asString(path);
+      if (p !== null) return { verb: "Edit", body: p };
+    }
+    return { verb: "Edit", body: `${changes.length} files` };
+  },
+
+  // Pi / OpenCode native harness tools (lowercase names). OpenCode
+  // passes `filePath`, Pi passes `path`.
+  bash: (args) => {
+    const cmd = asString(args.command);
+    return cmd === null ? null : { verb: null, body: cmd };
+  },
+  read: (args) => withPath("Read", args.filePath ?? args.path),
+  edit: (args) => withPath("Edit", args.filePath ?? args.path),
+  write: (args) => withPath("Write", args.filePath ?? args.path),
+
   // Web tools.
   web_search: (args) => {
     const q = asString(args.query);
@@ -161,6 +225,127 @@ export function formatToolTitle(
   const fallback =
     argsSummary !== undefined && argsSummary.length > 0 ? `${name}(${argsSummary})` : name;
   return { verb: null, body: fallback };
+}
+
+/**
+ * Action categories for the collapsed tool-run summary line. Names cover
+ * the omnigent sys_* tools plus the native harness CLIs (Claude Code's
+ * Bash/Read/Edit..., Codex's shell/apply_patch). Shell calls whose
+ * command is a bare `ls` re-categorize as directory listings, matching
+ * the Claude Code TUI's step summaries.
+ */
+type RunCategory = "shell" | "list" | "read" | "edit" | "search";
+
+/** One tool call in a folded run: its name plus (optional) arguments. */
+export interface ToolRunCall {
+  name: string;
+  args?: Record<string, unknown>;
+}
+
+const RUN_CATEGORIES: Record<string, RunCategory> = {
+  Bash: "shell",
+  sys_os_shell: "shell",
+  shell: "shell",
+  local_shell: "shell",
+  bash: "shell",
+  Read: "read",
+  sys_os_read: "read",
+  read: "read",
+  Edit: "edit",
+  Write: "edit",
+  MultiEdit: "edit",
+  NotebookEdit: "edit",
+  apply_patch: "edit",
+  sys_os_edit: "edit",
+  sys_os_write: "edit",
+  edit: "edit",
+  write: "edit",
+  patch: "edit",
+  Grep: "search",
+  Glob: "search",
+  WebSearch: "search",
+  web_search: "search",
+  grep: "search",
+  glob: "search",
+  list: "list",
+};
+
+const RUN_CATEGORY_ORDER: readonly RunCategory[] = ["shell", "list", "read", "edit", "search"];
+
+function runPhrase(category: RunCategory, n: number): string {
+  const s = n === 1 ? "" : "s";
+  switch (category) {
+    case "shell":
+      return `ran ${n} shell command${s}`;
+    case "list":
+      return `listed ${n} director${n === 1 ? "y" : "ies"}`;
+    case "read":
+      return `read ${n} file${s}`;
+    case "edit":
+      return `edited ${n} file${s}`;
+    case "search":
+      return `ran ${n} search${n === 1 ? "" : "es"}`;
+  }
+}
+
+function stripOmnigentPrefix(name: string): string {
+  return name.startsWith("mcp__omnigent__") ? name.slice("mcp__omnigent__".length) : name;
+}
+
+// Login-shell wrapper Codex puts around every command, e.g.
+// `/bin/bash -lc 'cat notes.txt'` or `/bin/zsh -lc ls`.
+const SHELL_WRAPPER_RE = /^(?:\S+\/)?(?:bash|zsh|sh|dash|fish)\s+-l?c\s+([\s\S]+)$/;
+
+/** Peel a login-shell wrapper (and its quotes) off a command string. */
+function unwrapShellCommand(command: string): string {
+  const match = SHELL_WRAPPER_RE.exec(command.trim());
+  if (match === null) return command.trim();
+  const inner = match[1]!.trim();
+  const quote = inner[0];
+  if ((quote === "'" || quote === '"') && inner.length >= 2 && inner.endsWith(quote)) {
+    return inner.slice(1, -1).trim();
+  }
+  return inner;
+}
+
+function categorizeCall(call: ToolRunCall): RunCategory | "other" {
+  const name = stripOmnigentPrefix(call.name);
+  const category = RUN_CATEGORIES[name] ?? "other";
+  if (category === "shell") {
+    const raw = typeof call.args?.command === "string" ? call.args.command : "";
+    const command = unwrapShellCommand(raw);
+    if (command === "ls" || command.startsWith("ls ")) return "list";
+    if (command === "cat" || command.startsWith("cat ")) return "read";
+  }
+  return category;
+}
+
+/**
+ * Label for the folded (hidden) part of a tool run, mirroring the
+ * semantic one-liners the native CLIs print: "Read 2 files", "Ran 1
+ * shell command, read 2 files". Runs made up entirely of unrecognized
+ * tools fall back to a generic "Called N tools".
+ */
+export function formatToolRunLabel(calls: ToolRunCall[]): string {
+  const counts = new Map<RunCategory | "other", number>();
+  for (const call of calls) {
+    const category = categorizeCall(call);
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+
+  const known = RUN_CATEGORY_ORDER.filter((c) => counts.has(c));
+  const other = counts.get("other") ?? 0;
+
+  if (known.length === 0) {
+    return `Called ${calls.length} tool${calls.length === 1 ? "" : "s"}`;
+  }
+
+  const phrases = known.map((c) => runPhrase(c, counts.get(c)!));
+  if (other > 0) {
+    phrases.push(`called ${other} other tool${other === 1 ? "" : "s"}`);
+  }
+  const label = phrases.join(", ");
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
 function asString(v: unknown): string | null {

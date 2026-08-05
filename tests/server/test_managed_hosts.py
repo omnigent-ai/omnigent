@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -229,6 +228,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cloud": {"endpoint": "https://boxlite.example.com:8100"},
+                "disk_size_gb": 100,
             },
         }
     )
@@ -243,6 +243,7 @@ def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
     assert fake.endpoint == "https://boxlite.example.com:8100"
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.disk_size_gb == 100
 
 
 def test_parse_boxlite_without_section_defaults_local(
@@ -261,6 +262,7 @@ def test_parse_boxlite_without_section_defaults_local(
     assert fake.endpoint is None
     assert fake.image is None
     assert fake.env is None
+    assert fake.disk_size_gb is None
 
 
 def test_parse_boxlite_local_customization_reaches_launcher(
@@ -464,6 +466,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
                 "image": "docker.io/me/omnigent-host:latest",
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cluster": "my-gateway",
+                "workspace": "team-alpha",
             },
         }
     )
@@ -478,6 +481,7 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
     assert fake.image == "docker.io/me/omnigent-host:latest"
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.cluster == "my-gateway"
+    assert fake.workspace == "team-alpha"
 
 
 def test_parse_openshell_without_section_defaults(
@@ -496,6 +500,7 @@ def test_parse_openshell_without_section_defaults(
     assert fake.image is None
     assert fake.env is None
     assert fake.cluster is None
+    assert fake.workspace is None
 
 
 def test_parse_valid_kubernetes_config_builds_parameterized_factory(
@@ -909,6 +914,215 @@ def test_parse_kubernetes_pvc_mounts_allows_same_claim_at_two_paths() -> None:
                 "pvc_mounts": [
                     {"claim_name": "shared", "mount_path": "/mnt/a"},
                     {"claim_name": "shared", "mount_path": "/mnt/b", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_secret_mounts_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """secret_mounts parse into normalized {secret_name, mount_path} on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "secret_mounts": [
+                    {"secret_name": "git-token", "mount_path": "/mnt/secrets/git"},
+                    {"secret_name": "npm-token", "mount_path": "/mnt/secrets/npm"},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.secret_mounts == [
+        {"secret_name": "git-token", "mount_path": "/mnt/secrets/git"},
+        {"secret_name": "npm-token", "mount_path": "/mnt/secrets/npm"},
+    ]
+
+
+def test_parse_kubernetes_without_secret_mounts_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) secret_mounts reach the launcher as None — no volumes added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"secret_mounts": []},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.secret_mounts is None
+
+
+@pytest.mark.parametrize(
+    ("secret_mounts", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("git-token", "must be a list"),
+        ([["git-token"]], "must be a mapping"),
+        # Unknown / missing keys. read_only is NOT a secret_mounts key (a Secret
+        # volume is read-only by nature), so it reads as an unknown key.
+        ([{"secret_name": "s", "mount_path": "/mnt/x", "read_only": True}], "unknown key"),
+        ([{"secret_name": "s", "mount_path": "/mnt/x", "default_mode": 292}], "unknown key"),
+        ([{"mount_path": "/mnt/x"}], "secret_name"),
+        ([{"secret_name": "s"}], "mount_path"),
+        # Bad Secret names (Secret names are DNS-1123 subdomains).
+        ([{"secret_name": "Bad_Secret", "mount_path": "/mnt/x"}], "secret_name"),
+        # Bad mount paths: relative, unnormalized, doubled-slash, root, reserved.
+        ([{"secret_name": "s", "mount_path": "mnt/x"}], "absolute"),
+        ([{"secret_name": "s", "mount_path": "/mnt/../etc"}], "normalized"),
+        ([{"secret_name": "s", "mount_path": "/mnt/x/"}], "normalized"),
+        ([{"secret_name": "s", "mount_path": "//mnt/x"}], "normalized"),
+        ([{"secret_name": "s", "mount_path": "/"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/home/omnigent/data"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/var/run/secrets/x"}], "reserved"),
+        # Ancestors of reserved paths would mount over HOME / the Secret projections.
+        ([{"secret_name": "s", "mount_path": "/home"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/var/run"}], "reserved"),
+        ([{"secret_name": "s", "mount_path": "/etc"}], "reserved"),
+        # Duplicates / nesting between entries.
+        (
+            [
+                {"secret_name": "a", "mount_path": "/mnt/x"},
+                {"secret_name": "b", "mount_path": "/mnt/x"},
+            ],
+            "duplicate",
+        ),
+        (
+            [
+                {"secret_name": "a", "mount_path": "/mnt/x"},
+                {"secret_name": "b", "mount_path": "/mnt/x/sub"},
+            ],
+            "nested",
+        ),
+    ],
+)
+def test_parse_kubernetes_secret_mounts_invalid_fails_loud(
+    secret_mounts: object, expected_fragment: str
+) -> None:
+    """An operator typo in secret_mounts fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"secret_mounts": secret_mounts},
+            }
+        )
+
+
+@pytest.mark.parametrize("mount_path", ["/home/other", "/var/lib", "/runway", "/mnt/secrets"])
+def test_parse_kubernetes_secret_mounts_reserved_check_is_segment_aware(mount_path: str) -> None:
+    """Siblings sharing a string prefix with a reserved path (or its parent) are allowed."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"secret_mounts": [{"secret_name": "s", "mount_path": mount_path}]},
+        }
+    )
+    assert cfg is not None
+
+
+@pytest.mark.parametrize(
+    ("secret_path", "expected_fragment"),
+    [("/mnt/data", "same mount_path"), ("/mnt/data/token", "nested")],
+)
+def test_parse_kubernetes_rejects_pvc_and_secret_mount_overlap(
+    secret_path: str, expected_fragment: str
+) -> None:
+    """A secret_mounts path equal to or nested under a pvc_mounts path fails loud."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [{"claim_name": "c", "mount_path": "/mnt/data"}],
+                    "secret_mounts": [{"secret_name": "s", "mount_path": secret_path}],
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_pvc_and_secret_mounts_coexist_at_distinct_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-overlapping PVC and Secret mounts both reach the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [{"claim_name": "datasets", "mount_path": "/mnt/datasets"}],
+                "secret_mounts": [{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts == [
+        {"claim_name": "datasets", "mount_path": "/mnt/datasets", "read_only": True}
+    ]
+    assert fake.secret_mounts == [{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}]
+
+
+def test_parse_kubernetes_secret_mounts_sibling_prefix_is_not_nested() -> None:
+    """/mnt/data vs /mnt/database share a string prefix but are distinct mounts."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "secret_mounts": [
+                    {"secret_name": "a", "mount_path": "/mnt/data"},
+                    {"secret_name": "b", "mount_path": "/mnt/database"},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_secret_mounts_nesting_is_rejected_regardless_of_order() -> None:
+    """The pairwise collision check catches nesting anywhere in a 3-entry list."""
+    with pytest.raises(ValueError, match="nested"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "secret_mounts": [
+                        {"secret_name": "a", "mount_path": "/mnt/x/sub"},
+                        {"secret_name": "b", "mount_path": "/mnt/y"},
+                        {"secret_name": "c", "mount_path": "/mnt/x"},
+                    ]
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> None:
+    """One Secret may be projected at two distinct paths."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "secret_mounts": [
+                    {"secret_name": "shared", "mount_path": "/mnt/a"},
+                    {"secret_name": "shared", "mount_path": "/mnt/b"},
                 ]
             },
         }
@@ -1477,13 +1691,13 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
     assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
 
 
-async def test_launch_without_host_config_supports_legacy_start_host_signature(
+async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_host_signature(
     db_uri: str,
 ) -> None:
     """
     A deployment-injected launcher whose ``start_host`` override predates the
-    ``host_config`` parameter keeps launching when no host_config is set —
-    the kwarg is omitted entirely rather than passed as ``None``.
+    optional ``host_config`` and ``on_stage`` parameters keeps launching and
+    resuming when neither value is set.
     """
     host_store = HostStore(db_uri)
 
@@ -1508,7 +1722,6 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
             repo_url: str | None = None,
             repo_branch: str | None = None,
             repo_name: str | None = None,
-            on_stage: Callable[[str], None] | None = None,
         ) -> str:
             return super().start_host(
                 sandbox_id,
@@ -1519,17 +1732,17 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
                 repo_url=repo_url,
                 repo_branch=repo_branch,
                 repo_name=repo_name,
-                on_stage=on_stage,
             )
 
-    fake = _LegacySignatureLauncher(on_host_start=_register)
+    fake = _LegacySignatureLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
 
-    result = await launch_managed_host(
-        config=_injected_config(fake), owner=_OWNER, host_store=host_store
-    )
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(result.host_id)
+    await resume_managed_host(result.host_id, host_store, config)
 
-    [start] = fake.host_starts
-    assert result.host_id == start.host_id
+    assert [start.host_id for start in fake.host_starts] == [result.host_id, result.host_id]
+    assert fake.resumed == ["sb-fake-1"]
 
 
 async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
@@ -2092,6 +2305,35 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, first_token) is None
     resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, second_token)
     assert resolved is not None and resolved.host_id == first.host_id
+
+
+async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
+    """A wake reports launch-pipeline stages through ``on_stage``.
+
+    Parity with the fresh-launch path (``_arm_and_start_host``): base
+    ``start_host`` emits ``"starting"`` before it execs the host, so a wake
+    with an observer must surface at least that stage rather than leaving the
+    caller on a single frozen ``"provisioning"`` band for the whole resume.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+
+    stages: list[str] = []
+    await resume_managed_host(first.host_id, host_store, config, on_stage=stages.append)
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert "starting" in stages
 
 
 async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> None:

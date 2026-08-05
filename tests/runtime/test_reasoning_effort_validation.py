@@ -62,7 +62,7 @@ async def test_codex_coerces_max_to_xhigh() -> None:
             messages=[{"role": "user", "content": "hi"}],
             tools=[],
             system_prompt="",
-            config=ExecutorConfig(extra={"reasoning_effort": "max"}),
+            config=ExecutorConfig(model="test-model", extra={"reasoning_effort": "max"}),
         )
     ]
     assert not any(isinstance(e, ExecutorError) for e in events)
@@ -112,7 +112,7 @@ async def test_openai_agents_coerces_max_to_xhigh(monkeypatch: pytest.MonkeyPatc
             messages=[{"role": "user", "content": "hi"}],
             tools=[],
             system_prompt="",
-            config=ExecutorConfig(extra={"reasoning_effort": "max"}),
+            config=ExecutorConfig(model="test-model", extra={"reasoning_effort": "max"}),
         ):
             pass
 

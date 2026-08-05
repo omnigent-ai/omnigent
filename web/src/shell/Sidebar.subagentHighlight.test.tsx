@@ -14,6 +14,8 @@
 // per-session snapshot API so the REAL useSession / useRootSessionId chain
 // resolves the child up to its root.
 
+import type * as SessionsApiModule from "@/lib/sessionsApi";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -55,7 +57,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // The snapshot API feeds the real useSession / useRootSessionId walk: the
 // child reports its parent, the parent reports null (top-level).
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/sessionsApi")>()),
+  ...(await importOriginal<typeof SessionsApiModule>()),
   getSessionSlim: vi.fn(),
 }));
 
@@ -152,14 +154,13 @@ describe("sidebar highlight while viewing a sub-agent", () => {
     expect(wordmark.getAttribute("src")).toContain("omnigent-wordmark");
   });
 
-  it("uses the same Otto structural-container radius as the workspace rail", () => {
+  it("sits flush to the window edge, no floating margin or border", () => {
     mockConversations([]);
     renderAt("/");
 
-    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
-      "md:rounded-[var(--radius-otto-md)]",
-      "md:m-2",
-    );
+    const sidebar = screen.getByRole("complementary", { name: "Conversations" });
+    expect(sidebar).toHaveClass("md:m-0");
+    expect(sidebar).not.toHaveClass("md:m-2", "md:rounded-[var(--radius-otto-md)]", "md:border");
   });
 
   it("highlights the top-level parent row when the active session is its child", async () => {

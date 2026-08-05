@@ -1,3 +1,9 @@
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +13,7 @@ import { useChatStore } from "@/store/chatStore";
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
@@ -18,19 +24,19 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: () => ({ data: [] }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: () => undefined,
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -903,6 +909,35 @@ describe("Composer model/effort label", () => {
     // the leaked model was suppressed.
     expect(label()).toHaveTextContent("High");
   });
+
+  it("does not leak the cross-session sticky model on a native session before its catalog lands", () => {
+    // The Codex→Claude switch repro: `switchTo` clears the session-scoped model
+    // fields but keeps the sticky, so mid-switch a claude-native session has an
+    // empty catalog and the `gpt-5.5` the outgoing Codex session left behind.
+    // The label must wait for a model this session vouches for rather than
+    // paint the previous session's pick for the whole bind round trip.
+    useChatStore.setState({
+      selectedModel: "gpt-5.5", // outgoing Codex session's pick — must not surface
+      sessionModelOverride: null,
+      selectedEffort: "high",
+      llmModel: null,
+      codexModelOptions: [], // cleared by `switchTo`, refilled when the snapshot lands
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    expect(label()).not.toHaveTextContent("gpt-5.5");
+    // The real effort still renders — only the leaked model was suppressed.
+    expect(label()).toHaveTextContent("High");
+  });
 });
 
 describe("Composer effort slash-command visibility", () => {
@@ -1378,7 +1413,13 @@ describe("Composer reply-quote focus", () => {
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    rerender(<Composer {...composerProps({ replyQuotes: ["selected response text"] })} />);
+    rerender(
+      <Composer
+        {...composerProps({
+          replyQuotes: [{ id: "quote-1", text: "selected response text" }],
+        })}
+      />,
+    );
     expect(document.activeElement).toBe(ta);
   });
 
@@ -1386,13 +1427,20 @@ describe("Composer reply-quote focus", () => {
     // Removing a chip (the X button) shrinks the count — the effect only
     // fires when the count grows, so focus must stay put.
     const { rerender } = render(
-      <Composer {...composerProps({ replyQuotes: ["first", "second"] })} />,
+      <Composer
+        {...composerProps({
+          replyQuotes: [
+            { id: "quote-1", text: "first" },
+            { id: "quote-2", text: "second" },
+          ],
+        })}
+      />,
     );
     const ta = textarea();
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    rerender(<Composer {...composerProps({ replyQuotes: ["first"] })} />);
+    rerender(<Composer {...composerProps({ replyQuotes: [{ id: "quote-1", text: "first" }] })} />);
     expect(document.activeElement).not.toBe(ta);
   });
 });
@@ -1569,19 +1617,23 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
-  it("soft-disables the gear when the session isn't live (asleep/stranded/unknown — no runner to configure)", () => {
-    // A config change can't wake a sleeping runner (unlike a message) and
-    // those states never load the model catalog, so the gear is inert
-    // whenever the session isn't online — not just the two unreachable kinds.
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true, sessionLive: false })} />);
+  it("soft-disables the gear when the session is unreachable (host offline / stranded)", () => {
+    // No message can wake an unreachable session, so a config change has
+    // nothing to apply to — the gear is inert like the composer.
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true, unreachable: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(gear()!);
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
-  it("keeps the gear live (not aria-disabled) on an online session", () => {
-    renderWithTooltips(<Composer {...composerProps({ showEffort: true, sessionLive: true })} />);
+  it("keeps the gear live on an asleep session (change persists and applies on wake)", () => {
+    // Asleep/starting/unknown sessions accept sends (which wake the runner),
+    // and a config PATCH persists server-side and applies on the next
+    // wake/turn — so the gear stays live wherever the composer does.
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "false");
+    fireEvent.click(gear()!);
+    expect(screen.queryByTestId("composer-config-modal")).not.toBeNull();
   });
 
   it("still shows the config tooltip on a disabled gear (soft-disable preserves hover)", async () => {
@@ -1592,7 +1644,7 @@ describe("Composer config gear", () => {
           showEffort: true,
           showModels: true,
           modelPickerKind: "claude",
-          sessionLive: false,
+          unreachable: true,
         })}
       />,
     );
@@ -1673,8 +1725,29 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-config-effort")).toBeTruthy();
   });
 
-  it("does not open the modal via bare /model when the gear is disabled (not live)", async () => {
-    // Bare /model bumps the open nonce; on a non-live session the gear is
+  it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {
+    const options = [
+      { id: "auto", displayName: "Automatic", isDefault: false },
+      { id: "provider-latest", displayName: "Latest", isDefault: false },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "kiro",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-model")).toHaveTextContent("Default");
+  });
+
+  it("does not open the modal via bare /model when the gear is disabled (unreachable)", async () => {
+    // Bare /model bumps the open nonce; on an unreachable session the gear is
     // inert, so the nonce must NOT open a modal that can't apply a change.
     const options = [{ id: "opus", model: "opus", displayName: "Opus" }] as never;
     useChatStore.setState({ codexModelOptions: options });
@@ -1683,14 +1756,14 @@ describe("Composer config gear", () => {
         {...composerProps({
           showModels: true,
           modelPickerKind: "claude",
-          sessionLive: false,
+          unreachable: true,
           codexModelOptions: options,
         })}
       />,
     );
-    const textarea = document.querySelector("textarea") as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: "/model" } });
-    fireEvent.keyDown(textarea, { key: "Enter", code: "Enter" });
+    const modelTextarea = document.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(modelTextarea, { target: { value: "/model" } });
+    fireEvent.keyDown(modelTextarea, { key: "Enter", code: "Enter" });
     // Give the nonce effect a tick; the modal must stay closed.
     await waitFor(() => expect(gear()).toHaveAttribute("aria-disabled", "true"));
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();

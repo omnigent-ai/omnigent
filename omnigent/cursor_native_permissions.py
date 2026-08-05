@@ -91,7 +91,7 @@ async def _park_cursor_elicitation(
     *,
     session_id: str,
     payload: dict[str, object],
-) -> dict | None:
+) -> dict[str, object] | None:
     """POST the cursor permission hook and return the web verdict, or ``None``.
 
     ``None`` covers every "no keystroke" outcome: an empty 2xx (resolved in the
@@ -408,7 +408,7 @@ def cursor_tool_call_elicitation_id(session_id: str, tool_call_id: str) -> str:
     return f"elicit_cursor_{session_id}_{digest}"
 
 
-def _iter_embedded_json_objects(raw: bytes) -> list[dict]:
+def _iter_embedded_json_objects(raw: bytes) -> list[dict[str, object]]:
     """Extract top-level JSON objects embedded anywhere in a blob's raw bytes.
 
     A pending tool call lives inside cursor's binary protobuf checkpoint frame
@@ -423,7 +423,7 @@ def _iter_embedded_json_objects(raw: bytes) -> list[dict]:
     :returns: Every successfully parsed JSON object (dicts only), in order.
     """
     text = raw.decode("latin-1")
-    objects: list[dict] = []
+    objects: list[dict[str, object]] = []
     i, n = 0, len(text)
     while i < n:
         # Only attempt at a plausible object opener: ``{`` then (whitespace) ``"``.
@@ -477,7 +477,7 @@ def _iter_embedded_json_objects(raw: bytes) -> list[dict]:
     return objects
 
 
-def _pending_started_ms(obj: dict) -> int | None:
+def _pending_started_ms(obj: dict[str, object]) -> int | None:
     """Return ``providerOptions.cursor.pendingToolCallStartedAtMs`` or ``None``."""
     provider = obj.get("providerOptions")
     if not isinstance(provider, dict):
@@ -582,7 +582,7 @@ def _is_question_call(call: CursorPendingToolCall) -> bool:
     return call.tool_name.lower() in _QUESTION_TOOL_NAMES
 
 
-def _iter_askquestion_questions(args: dict[str, object]) -> list[dict]:
+def _iter_askquestion_questions(args: dict[str, object]) -> list[dict[str, object]]:
     """Return the well-formed question dicts from an ``AskQuestion`` args blob."""
     questions = args.get("questions")
     if not isinstance(questions, list):
@@ -640,7 +640,10 @@ def _askquestion_preview(args: dict[str, object]) -> str:
     return "AskUserQuestion(" + json.dumps(_askquestion_payload(args)) + ")"
 
 
-def _askquestion_keystrokes(args: dict[str, object], content: dict) -> list[str]:
+def _askquestion_keystrokes(
+    args: dict[str, object],
+    content: dict[str, object],
+) -> list[str]:
     """Compute the TUI key sequence that enters ``content`` and submits.
 
     cursor's picker: ``↑/↓`` move within a question's options, ``Space`` toggles
@@ -659,7 +662,12 @@ def _askquestion_keystrokes(args: dict[str, object], content: dict) -> list[str]
         prompt = question.get("prompt") or question.get("question")
         qid = question.get("id")
         answer_key = qid if isinstance(qid, str) and qid else prompt
-        labels = [opt.get("label") for opt in question.get("options", []) if isinstance(opt, dict)]
+        options = question.get("options")
+        labels = (
+            [option.get("label") for option in options if isinstance(option, dict)]
+            if isinstance(options, list)
+            else []
+        )
         answer = content.get(answer_key) if isinstance(answer_key, str) else None
         if isinstance(answer, list):
             chosen: list[object] = answer

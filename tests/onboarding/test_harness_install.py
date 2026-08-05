@@ -68,7 +68,9 @@ def test_kimi_install_spec_is_login_only_no_npm() -> None:
     """Kimi ships via a curl installer (no npm package) and authenticates
     through its own ``kimi login`` (OAuth or Moonshot API key), so it carries
     an ``install_hint`` instead of a ``package`` and intentionally has no
-    ``status_args`` (no exit-code "am I logged in?" probe to read).
+    ``status_args`` (no exit-code "am I logged in?" probe to read). It has no
+    ``kimi logout`` subcommand (verified against kimi CLI v0.29.1), so
+    ``logout_args`` is ``None`` and ``harness_logout`` is a no-op for it.
     """
     spec = hi.harness_install_spec(hi.KIMI_KEY)
     assert spec is not None
@@ -76,7 +78,7 @@ def test_kimi_install_spec_is_login_only_no_npm() -> None:
     assert spec.package is None
     assert spec.install_hint is not None and "code.kimi.com" in spec.install_hint
     assert spec.login_args == ("login",)
-    assert spec.logout_args == ("logout",)
+    assert spec.logout_args is None
     assert spec.status_args is None
 
 
@@ -153,11 +155,11 @@ def test_hermes_install_spec_has_actionable_vendor_installer() -> None:
     ]
 
 
-def test_antigravity_install_spec_status_only_no_npm() -> None:
-    """Antigravity (agy) ships via a shell installer (no npm) and has no login
-    subcommand — the user signs in by launching ``agy`` once. It DOES expose a
-    status check (``agy models``), so the spec carries ``status_args`` +
-    ``install_hint`` but no ``package`` / ``login_args`` / ``logout_args``.
+def test_antigravity_install_spec_launches_auth_service_no_npm() -> None:
+    """Antigravity (agy) ships via a shell installer (no npm) and signs in by
+    launching ``agy`` once. It also exposes a status check (``agy models``), so
+    the spec carries empty ``login_args`` plus ``status_args`` + ``install_hint``
+    but no ``package`` / ``logout_args``.
 
     Drift here (a package sneaking in, or losing ``status_args``) would make the
     setup menu offer a bogus ``npm install`` or fall back to a file-only login
@@ -170,16 +172,16 @@ def test_antigravity_install_spec_status_only_no_npm() -> None:
     assert spec.install_hint is not None
     assert "antigravity.google/cli/install.sh" in spec.install_hint
     assert spec.status_args == ("models",)
-    assert spec.login_args is None
+    assert spec.login_args == ()
     assert spec.logout_args is None
     assert spec.login_status_key is None
     assert spec.auth_hint is not None
 
 
 def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
-    """A not-yet-signed-in agy can't be fixed by ``agy login`` (no such
-    command), so the launch hint names the installer AND the "run agy to sign
-    in" step — otherwise a user who already has agy installed gets a misleading
+    """A not-yet-signed-in agy is fixed by launching ``agy`` itself, so the
+    launch hint names the installer AND the "run agy to sign in" step —
+    otherwise a user who already has agy installed gets a misleading
     install-only hint.
     """
     hint = hi.harness_setup_hint("antigravity-native")
@@ -641,6 +643,7 @@ def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPa
     [
         (ANTHROPIC_FAMILY, ["claude", "auth", "login", "--claudeai"]),
         (OPENAI_FAMILY, ["codex", "login"]),
+        (GEMINI_FAMILY, ["/usr/bin/agy"]),
     ],
 )
 def test_harness_login_runs_cli_login_then_verifies(
@@ -671,6 +674,30 @@ def test_harness_login_runs_cli_login_then_verifies(
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_login(key) is True
     assert calls == [expected_argv]
+
+
+def test_harness_login_resolves_agy_outside_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Antigravity sign-in launches agy's resolved fallback install path."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda name: "/home/user/.local/bin/agy")
+    monkeypatch.setattr(hi.sys.stdin, "isatty", lambda: True)
+    state = {"logged_in": False}
+    monkeypatch.setattr(
+        hi,
+        "harness_cli_logged_in",
+        lambda key: state["logged_in"],
+    )
+    calls: list[list[str]] = []
+
+    def _run(argv: list[str], **kwargs: object):
+        calls.append(argv)
+        state["logged_in"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.harness_login(GEMINI_FAMILY) is True
+    assert calls == [["/home/user/.local/bin/agy"]]
 
 
 def test_harness_login_wires_dev_tty_when_stdin_not_a_tty(
@@ -934,7 +961,7 @@ def test_harness_cli_logged_in_agy_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["agy", "models"]  # the status subcommand
+        assert argv == ["/usr/bin/agy", "models"]  # the status subcommand
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )

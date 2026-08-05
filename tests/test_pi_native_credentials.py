@@ -5,10 +5,21 @@ from __future__ import annotations
 import json
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent import pi_native_credentials as creds
+
+
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
 
 
 def _databricks_config() -> dict[str, object]:
@@ -40,7 +51,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
     assert provider is not None
     assert provider.api == "anthropic-messages"
     assert provider.base_url == "https://wkspc.example.com/ai-gateway/anthropic"
-    assert provider.model == "databricks-claude-sonnet-4-6"
+    assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
     # apiKey is a "!command" so Pi refreshes the gateway token per request.
     assert provider.api_key.startswith("!")
@@ -67,7 +78,6 @@ def test_databricks_unresolvable_credentials_sets_warning(
     session is worse than a visible notice — so the resolver flags it.
     """
     from omnigent.inner import databricks_executor
-    from omnigent.runtime.credentials import databricks as rt_databricks
 
     monkeypatch.setattr(
         databricks_executor,
@@ -78,7 +88,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
     def _boom(profile: str | None):
         raise OSError("refresh token is invalid")
 
-    monkeypatch.setattr(rt_databricks, "resolve_databricks_workspace", _boom)
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -101,7 +111,7 @@ def test_databricks_model_list_failure_has_no_warning(
         lambda profile: "https://wkspc.example.com/",
     )
     monkeypatch.setattr(
-        rt_databricks,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: rt_databricks.WorkspaceCreds(
             host="https://wkspc.example.com", token="tok"
@@ -244,6 +254,33 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
     assert env == {creds.PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     assert args == ["--provider", "omnigent", "--model", "claude-sonnet-4-6"]
     assert (agent_dir / "models.json").exists()
+
+
+def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
+    tmp_path: Path,
+) -> None:
+    """A model id containing '/' is passed as 'provider/model' to avoid mis-routing.
+
+    Pi's arg parser treats 'provider/model' in --model as a provider override.
+    When the model id itself contains a slash (e.g. an OpenRouter-namespaced
+    id like 'moonshotai/kimi-k2.5'), passing it bare as --model causes Pi to
+    route to the builtin 'moonshotai' provider (which has no API key) rather
+    than our custom 'omnigent' provider. The fix qualifies the arg as
+    'omnigent/moonshotai/kimi-k2.5' so Pi's findExactModelReferenceMatch
+    finds the canonical form under our provider.
+    """
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://openrouter.ai/api/v1",
+        api="openai-completions",
+        model="moonshotai/kimi-k2.5",
+        api_key="sk-or-secret",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "pi-agent"
+    _env, args = creds.pi_native_provider_launch(agent_dir, provider)
+
+    assert args == ["--provider", "omnigent", "--model", "omnigent/moonshotai/kimi-k2.5"]
 
 
 def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -398,7 +435,7 @@ def test_cli_config_databricks_resolves_to_anthropic_gateway(
     assert (
         provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
     )
-    assert provider.model == "databricks-claude-sonnet-4-6"
+    assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
     # apiKey is a "!command" rebuilt from the table's [X.auth] command + args
     # so Pi refreshes the gateway token per request.
@@ -708,6 +745,35 @@ def test_is_databricks_ai_gateway_url_rejects_lookalikes(gateway_url: str) -> No
     assert creds._is_databricks_ai_gateway_url(gateway_url) is False
 
 
+def test_workspace_url_for_dedicated_gateway_uses_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dedicated AI Gateway origin is not itself a workspace API host."""
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    def resolve(profile: str | None) -> db_creds_mod.WorkspaceCreds:
+        assert profile == "prod"
+        return db_creds_mod.WorkspaceCreds(
+            host="https://workspace.cloud.databricks.com",
+            token="unused",
+        )
+
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", resolve)
+
+    assert (
+        creds._databricks_workspace_url_for_gateway(
+            "https://123.ai-gateway.cloud.databricks.com/anthropic",
+            profile="prod",
+        )
+        == "https://workspace.cloud.databricks.com"
+    )
+
+
+def test_workspace_url_for_generic_provider_is_none() -> None:
+    """Generic compatible providers are not probed through Databricks APIs."""
+    assert creds._databricks_workspace_url_for_gateway("https://api.anthropic.com/v1") is None
+
+
 def test_anthropic_family_ignores_wire_api() -> None:
     """The Anthropic family always uses anthropic-messages, ignoring wire_api.
 
@@ -902,7 +968,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     monkeypatch.setattr(
-        db_creds_mod,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
     )
@@ -952,7 +1018,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     monkeypatch.setattr(
-        db_creds_mod,
+        creds,
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(
             host="https://dbc-a5d4177a-49dc.cloud.databricks.com", token="sdk-tok"
@@ -1011,6 +1077,8 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
             _make_service(
                 "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
             ),
+            # Future GPT metadata, deliberately Chat-only.
+            _make_service("system.ai.gpt-chat-only", ["mlflow/v1/chat/completions"]),
             # Llama - chat only
             _make_service("system.ai.llama-4-maverick", ["mlflow/v1/chat/completions"]),
             # Kimi - chat only (no Responses API per UC metadata)
@@ -1050,6 +1118,7 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     # Llama routes to mlflow gateway (system.ai.* ids 404 at serving-endpoints).
     mlflow_ids = [m["id"] for m in _gemini]
     assert "system.ai.llama-4-maverick" in mlflow_ids
+    assert "system.ai.gpt-chat-only" in mlflow_ids
     completions_ids = [m["id"] for m in completions]
     assert not completions_ids  # no completions-only models in this test payload
     # Embedding excluded

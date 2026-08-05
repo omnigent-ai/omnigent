@@ -44,6 +44,7 @@ from omnigent.onboarding.sandboxes.base import (
     foreground_record_prefix,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -208,6 +209,19 @@ class _ModalRemoteProcess(RemoteProcess):
     site merges stderr in-shell or via a PTY).
     """
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=True,
+            foreground_exec=True,
+        )
+
     def __init__(self, process: modal.container_process.ContainerProcess[str]) -> None:
         """
         Wrap a running exec'd process.
@@ -235,7 +249,7 @@ class _ModalRemoteProcess(RemoteProcess):
 
         :returns: The process's exit code.
         """
-        return self._process.wait()
+        return int(self._process.wait())
 
     def close(self) -> None:
         """
@@ -379,9 +393,10 @@ class ModalSandboxLauncher(SandboxLauncher):
             secrets=secrets or None,
         )
         handle.set_tags({"omnigent-name": name})
-        self._sandboxes[handle.object_id] = handle
-        click.echo(f"  → created {handle.object_id}")
-        return handle.object_id
+        sandbox_id = str(handle.object_id)
+        self._sandboxes[sandbox_id] = handle
+        click.echo(f"  → created {sandbox_id}")
+        return sandbox_id
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -540,7 +555,7 @@ class ModalSandboxLauncher(SandboxLauncher):
         # dir in /tmp. The interrupt path already cleans up via
         # :func:`foreground_kill_command`.
         handle.exec("bash", "-c", f"rm -rf {run_dir} 2>/dev/null").wait()
-        return rc
+        return int(rc)
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """

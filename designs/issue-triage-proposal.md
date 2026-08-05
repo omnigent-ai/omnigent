@@ -29,7 +29,7 @@ Two templates:
 | Template | Auto-labels | Required | Optional hints |
 |---|---|---|---|
 | Bug Report | `bug`, `needs-triage` | Description only | Component, repro steps, version, OS |
-| Feature Request | `enhancement`, `needs-triage` | Problem/use case only | Proposed solution, alternatives |
+| Feature Request | `Feature`, `needs-triage` | Problem/use case only | Proposed solution, alternatives |
 
 Questions redirect to GitHub Discussions (via `config.yml` contact link) - they aren't actionable work and would clog the issue tracker. Blank issues enabled for anything that doesn't fit a template.
 
@@ -74,7 +74,7 @@ A maintainer only sees issues that the bot could not fully resolve. The escalati
 - **`P0-critical` / `P1-high`** - always escalated; exempt from stale bot
 - **`needs-triage` still present** - bot wasn't confident enough to classify
 - **Duplicate contested** - reporter reacted 👎 on the duplicate comment
-- **Complex feature requests** - labeled `enhancement` + `P2-medium` or higher
+- **Complex feature requests** - labeled `Feature` + `P2-medium` or higher
 
 Maintainers work from a filtered view: `is:issue is:open label:P0-critical,P1-high,needs-triage -label:stale`. Everything else is either being handled by the bot/lifecycle or picked up by contributors.
 
@@ -137,7 +137,7 @@ Duplicates get a 3-day grace period. Reporter can react 👎 to prevent closure.
 
 | Category | Labels | Purpose |
 |---|---|---|
-| **Type** | `bug`, `enhancement`, `documentation` | What kind of issue |
+| **Type** | `bug`, `Feature`, `Docs` | What kind of issue |
 | **Triage** | `needs-triage`, `triaged`, `needs-info`, `duplicate`, `wontfix` | Triage state |
 | **Priority** | `P0-critical`, `P1-high`, `P2-medium`, `P3-low` | Severity |
 | **Component** | `comp:server`, `comp:runner`, `comp:repr`, `comp:web-ui`, `comp:policies`, `comp:harnesses`, ... | Which subsystem (mirrors CODEOWNERS) |

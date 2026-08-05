@@ -343,6 +343,79 @@ async def test_sync_codex_collaboration_mode_change_posts_and_dedupes() -> None:
     assert state.posted_collaboration_mode == "plan"
 
 
+@pytest.mark.asyncio
+async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
+    """Codex ``/permissions`` changes mirror to terminal_launch_args once."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "auto_review",
+                "sandboxPolicy": {"type": "danger-full-access"},
+                "activePermissionProfile": {"id": "dev", "extends": ":workspace"},
+            }
+        }
+    )
+
+    await fwd._sync_codex_approval_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+    await fwd._sync_codex_approval_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "terminal_launch_args": [
+                        "-c",
+                        'default_permissions="dev"',
+                        "-c",
+                        'approval_policy="never"',
+                        "-c",
+                        'approvals_reviewer="auto_review"',
+                    ]
+                },
+            },
+        )
+    ]
+    assert state.posted_terminal_launch_args == [
+        "-c",
+        'default_permissions="dev"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'approvals_reviewer="auto_review"',
+    ]
+
+
+def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
+    """Legacy settings without an active profile keep approval and sandbox."""
+    assert fwd._codex_terminal_launch_args_from_settings(
+        {
+            "approvalPolicy": "on-failure",
+            "approvalsReviewer": "user",
+            "sandboxPolicy": {"type": "workspace-write"},
+        }
+    ) == [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-failure",
+        "-c",
+        'approvals_reviewer="user"',
+    ]
+
+
 @pytest.mark.parametrize(
     "content,expected",
     [
@@ -2192,6 +2265,168 @@ async def test_thread_active_status_does_not_settle_round(tmp_path: Path) -> Non
         event={
             "method": "thread/status/changed",
             "params": {"threadId": "thread_1", "status": {"type": "active", "activeFlags": []}},
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_model_output_item_settles_synthesized_round(tmp_path: Path) -> None:
+    """
+    The first model-produced item resolves the synthesized round mid-turn.
+
+    Codex defers turn execution until MCP startup settles, so an
+    assistant-side item proves the round is over while the turn is still
+    running. Without this signal, a server stuck ``starting`` (e.g. a
+    misconfigured command that never handshakes) pins the "Starting MCP
+    servers" band under a visibly working agent until the turn ends or
+    the config-derived window elapses.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_1",
+                "item": {"id": "item_1", "type": "agentMessage", "text": ""},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {}
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_mcp_startup", "data": {"servers": {}}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_output_settles_the_round_only_once(tmp_path: Path) -> None:
+    """
+    Only the first model item pays the settle path; later items skip it.
+
+    The round is seeded once per forwarder connection (never on thread
+    rotation), so once model output settles it the outcome cannot change
+    — every later item in the session would otherwise re-read the bridge
+    file for nothing. The state flag short-circuits them, which this
+    pins by re-populating the map behind the flag: a second item must
+    leave it untouched.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    item_event = {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_1",
+            "item": {"id": "item_1", "type": "agentMessage", "text": "hi"},
+        },
+    }
+
+    async def deliver() -> None:
+        """Feed the model-output item through the forwarder dispatch."""
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=item_event,
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            expected_thread_id="thread_1",
+            forwarder_state=state,
+        )
+
+    await deliver()
+    assert state.mcp_startup_settled is True
+    settle_posts = [p for p in client.posts if p[1]["type"] == "external_mcp_startup"]
+    assert len(settle_posts) == 1
+
+    # Re-populate the map behind the flag: without the short-circuit the
+    # next item would read it, settle again, and post a second time.
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+    await deliver()
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert len([p for p in client.posts if p[1]["type"] == "external_mcp_startup"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_user_message_item_does_not_settle_round(tmp_path: Path) -> None:
+    """
+    The turn's ``userMessage`` item must not settle the round.
+
+    Like the thread-active edge, the user message materializes when a
+    turn is merely ACCEPTED — which happens mid-startup — so settling on
+    it would clear the band during the genuine pre-turn wait.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_1",
+                "item": {"id": "item_0", "type": "userMessage", "text": "hi"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_other_thread_item_does_not_settle_round(tmp_path: Path) -> None:
+    """
+    An item on an unrecognized thread must not settle the parent round.
+
+    MCP startup is bridge-level state surfaced on the parent session;
+    another thread's activity proves nothing about this round.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_other",
+                "item": {"id": "item_1", "type": "agentMessage", "text": ""},
+            },
         },
         usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
         elicitation_tracker=fwd._CodexElicitationTaskTracker(),

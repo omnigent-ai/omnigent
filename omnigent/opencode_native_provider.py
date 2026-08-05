@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent import model_catalog
+
 if TYPE_CHECKING:
     from omnigent.spec.types import MCPServerConfig
 
@@ -39,8 +41,6 @@ DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
 DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
-# Fallback chat model when neither the spec nor config names one.
-DEFAULT_DATABRICKS_GATEWAY_MODEL = "databricks-claude-sonnet-4-6"
 
 
 @dataclass(frozen=True)
@@ -213,13 +213,34 @@ def build_opencode_omnigent_mcp_server(
     claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
     # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
     # opencode wants a flat command list + ``environment``.
-    name, server = next(iter(claude_cfg["mcpServers"].items()))
+    servers = claude_cfg.get("mcpServers")
+    if not isinstance(servers, dict) or not servers:
+        raise ValueError("Claude MCP config is missing mcpServers")
+    name, server = next(iter(servers.items()))
+    if not isinstance(server, dict):
+        raise ValueError("Claude MCP server config is malformed")
+    command = server.get("command")
+    args = server.get("args", [])
+    if (
+        not isinstance(command, str)
+        or not isinstance(args, list)
+        or not all(isinstance(arg, str) for arg in args)
+    ):
+        raise ValueError("Claude MCP server command is malformed")
     entry: dict[str, object] = {
         "type": "local",
-        "command": [server["command"], *server.get("args", [])],
+        "command": [command, *args],
         "enabled": True,
     }
-    env = dict(server.get("env", {}) or {})
+    env_value = server.get("env")
+    if env_value is None:
+        env: dict[str, str] = {}
+    elif isinstance(env_value, dict) and all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env_value.items()
+    ):
+        env = dict(env_value)
+    else:
+        raise ValueError("Claude MCP server environment is malformed")
     if env:
         entry["environment"] = env
     return {str(name): entry}
@@ -254,9 +275,8 @@ def resolve_databricks_gateway(
 
     :param profile: A ``~/.databrickscfg`` profile name, e.g. ``"oss"``;
         ``None`` short-circuits.
-    :param model_id: Endpoint/model id to pin; defaults to
-        :data:`DEFAULT_DATABRICKS_GATEWAY_MODEL` (a ``databricks-*`` chat
-        endpoint the gateway routes).
+    :param model_id: Endpoint/model id to pin. When omitted or incompatible,
+        the Databricks Claude catalog supplies the endpoint.
     :returns: A resolution, or ``None`` when the gateway can't be resolved.
     """
     if not profile:
@@ -277,7 +297,11 @@ def resolve_databricks_gateway(
         _logger.info("opencode Databricks gateway resolve failed for %r: %r", profile, exc)
         return None
 
-    resolved_model = _gateway_endpoint_for_model(model_id) or DEFAULT_DATABRICKS_GATEWAY_MODEL
+    resolved_model = _gateway_endpoint_for_model(model_id)
+    if resolved_model is None:
+        resolved_model = model_catalog.resolve_catalog_model(
+            "databricks", family="claude"
+        ).model_id
     return OpenCodeGatewayResolution(
         base_url=f"{host}/{_SERVING_ENDPOINTS_PATH}",
         api_key=token,

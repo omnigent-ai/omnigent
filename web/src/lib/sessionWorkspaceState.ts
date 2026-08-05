@@ -1,8 +1,10 @@
 // Per-session UI state for the right "Workspace" rail, keyed by conversationId
 // so each session restores its own layout: whether the rail is open, its width,
-// the selected rail tab, and the set of open file tabs (plus which one is
-// active). A brand-new session (no stored `open`) follows the Appearance
-// Workspace panel default; width and file tabs start empty.
+// the selected rail tab, the set of open file tabs, and the set of open shell
+// tabs (plus which one is active). A brand-new session (no stored `open`)
+// follows the Appearance Workspace panel default; width and tabs start empty.
+// Shell tabs restore to whichever terminals still exist — the AppShell prune
+// effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
 
@@ -19,6 +21,10 @@ export interface SessionWorkspaceState {
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
   selectedFilePath?: string | null;
+  /** Ordered list of open shell tabs (``terminalTabKey`` values). */
+  openTerminals?: string[];
+  /** The active shell tab (null = a file/scope view is active). */
+  selectedTerminalKey?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -65,6 +71,15 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedFilePath === null || typeof record.selectedFilePath === "string") {
     state.selectedFilePath = record.selectedFilePath;
+  }
+  if (
+    Array.isArray(record.openTerminals) &&
+    record.openTerminals.every((k) => typeof k === "string")
+  ) {
+    state.openTerminals = record.openTerminals as string[];
+  }
+  if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
+    state.selectedTerminalKey = record.selectedTerminalKey;
   }
   return state;
 }
@@ -116,6 +131,10 @@ export function writeSessionWorkspaceState(
   // Keep only the most-recent open-file tabs (tabs are appended in open order).
   if (next.openFiles && next.openFiles.length > MAX_OPEN_FILES) {
     next.openFiles = next.openFiles.slice(-MAX_OPEN_FILES);
+  }
+  // Same bound for shell tabs (also appended in open order).
+  if (next.openTerminals && next.openTerminals.length > MAX_OPEN_FILES) {
+    next.openTerminals = next.openTerminals.slice(-MAX_OPEN_FILES);
   }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).

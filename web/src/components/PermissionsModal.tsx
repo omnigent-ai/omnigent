@@ -61,9 +61,15 @@ interface PermissionsModalProps {
   sessionId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  canDelegateApprovals?: boolean;
 }
 
-export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsModalProps) {
+export function PermissionsModal({
+  sessionId,
+  open,
+  onOpenChange,
+  canDelegateApprovals = false,
+}: PermissionsModalProps) {
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
   // server-side gate is the real enforcement point regardless.
@@ -99,8 +105,9 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
     const trimmed = newUserId.trim();
     if (!trimmed) return;
     setError(null);
+    const canApprove = newLevel === "2-approve";
     grant.mutate(
-      { userId: trimmed, level: parseInt(newLevel, 10) },
+      { userId: trimmed, level: canApprove ? 2 : parseInt(newLevel, 10), canApprove },
       {
         onSuccess: () => {
           setNewUserId("");
@@ -118,9 +125,9 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
     });
   }
 
-  function handleChangeLevel(userId: string, level: number) {
+  function handleChangeLevel(userId: string, level: number, canApprove: boolean) {
     setError(null);
-    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
+    grant.mutate({ userId, level, canApprove }, { onError: (err) => setError(err.message) });
   }
 
   function handlePublicToggle(checked: boolean) {
@@ -172,7 +179,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {publicSharingEnabled && (
           <div className="flex items-center justify-between rounded-lg border px-3 py-2">
             <div>
-              <p className="text-sm font-medium">Public access</p>
+              <p className="text-ui font-medium">Public access</p>
               <p className="text-xs text-muted-foreground">Anyone can view this session</p>
             </div>
             <Switch
@@ -188,9 +195,9 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             track's min-content and pushes every row past the dialog edge. */}
         <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
-            <p className="text-sm text-muted-foreground py-2">Loading…</p>
+            <p className="text-ui text-muted-foreground py-2">Loading…</p>
           ) : userGrants.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-2">No grants yet.</p>
+            <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (
             <>
               {/* Column headers */}
@@ -212,6 +219,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
                     onChangeLevel={handleChangeLevel}
                     busy={grant.isPending || revoke.isPending}
                     readOnly={sharingReadOnly}
+                    canDelegateApprovals={canDelegateApprovals}
                   />
                 ))}
               </div>
@@ -239,6 +247,9 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
                 <SelectItem value="1">Read</SelectItem>
                 {/* Read-only sharing caps new grants at view; hide Edit. */}
                 {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                {!sharingReadOnly && canDelegateApprovals && (
+                  <SelectItem value="2-approve">Edit + approve</SelectItem>
+                )}
               </SelectContent>
             </Select>
           </div>
@@ -247,6 +258,12 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             Grant
           </Button>
         </form>
+
+        {canDelegateApprovals && !sharingReadOnly && (
+          <p className="text-xs text-muted-foreground">
+            Approvers can authorize actions that use your session credentials.
+          </p>
+        )}
 
         {error && <p className="text-xs text-destructive">{error}</p>}
 
@@ -407,9 +424,9 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
         // Wider than the (narrow) field so suggested emails aren't truncated.
         <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
           {isLoading ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">Searching…</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">Searching…</div>
           ) : suggestions.length === 0 ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">No matches</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">No matches</div>
           ) : (
             <div ref={listRef} id={listId} role="listbox" className="max-h-72 overflow-y-auto">
               {suggestions.map((s, index) => (
@@ -424,7 +441,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                     commit(index);
                   }}
                   className={cn(
-                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm",
+                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-ui",
                     index === activeIndex && "bg-muted",
                   )}
                 >
@@ -568,12 +585,14 @@ function GrantRow({
   onChangeLevel,
   busy,
   readOnly,
+  canDelegateApprovals,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
-  onChangeLevel: (userId: string, level: number) => void;
+  onChangeLevel: (userId: string, level: number, canApprove: boolean) => void;
   busy: boolean;
   readOnly: boolean;
+  canDelegateApprovals: boolean;
 }) {
   const isOwner = permission.level === 4;
   // Manage is not grantable from the UI, so a pre-existing manage grant
@@ -582,24 +601,30 @@ function GrantRow({
   const isManage = permission.level === 3;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
-  const fixedLevel = isOwner || isManage || readOnly;
+  const fixedLevel =
+    isOwner || isManage || readOnly || (permission.can_approve && !canDelegateApprovals);
+  const baseLevelLabel = LEVEL_LABELS[permission.level] ?? "Read";
+  const levelLabel = permission.can_approve ? `${baseLevelLabel} + approve` : baseLevelLabel;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
       {/* Tail truncation keeps the local part — the distinguishing half when
           every grantee shares one company domain — and the title tooltip
           carries the full id. */}
-      <span className="flex-1 truncate text-sm" title={permission.user_id}>
+      <span className="flex-1 truncate text-ui" title={permission.user_id}>
         {permission.user_id}
       </span>
       {fixedLevel ? (
-        <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
-          {LEVEL_LABELS[permission.level] ?? "Read"}
+        <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
+          {levelLabel}
         </span>
       ) : (
         <Select
-          value={String(permission.level)}
-          onValueChange={(v) => onChangeLevel(permission.user_id, parseInt(v, 10))}
+          value={permission.can_approve ? "2-approve" : String(permission.level)}
+          onValueChange={(value) => {
+            const canApprove = value === "2-approve";
+            onChangeLevel(permission.user_id, canApprove ? 2 : parseInt(value, 10), canApprove);
+          }}
           disabled={busy}
         >
           <SelectTrigger
@@ -611,6 +636,7 @@ function GrantRow({
           <SelectContent>
             <SelectItem value="1">Read</SelectItem>
             <SelectItem value="2">Edit</SelectItem>
+            {canDelegateApprovals && <SelectItem value="2-approve">Edit + approve</SelectItem>}
           </SelectContent>
         </Select>
       )}

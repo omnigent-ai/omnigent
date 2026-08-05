@@ -1,7 +1,7 @@
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -19,9 +19,10 @@ import {
   useCreateMcpServer,
   useDeleteMcpServer,
   useUpdateMcpServer,
+  type Agent,
+  type McpServerSummary,
   type UpsertMcpServerInput,
 } from "@/hooks/useAgents";
-import type { Agent, McpServerSummary } from "@/hooks/useAgents";
 import type { ModelUsage } from "@/lib/types";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -56,6 +57,10 @@ import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
+
+const MCP_SERVERS_UPDATED_TOAST = (
+  <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>
+);
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -110,7 +115,7 @@ export function McpServerList({
               <div className="flex flex-col gap-2">
                 <div className="flex items-center gap-1.5">
                   <ServerIcon className="size-3.5 text-muted-foreground" />
-                  <span className="font-medium text-sm">{srv.name}</span>
+                  <span className="font-medium text-ui">{srv.name}</span>
                 </div>
                 {srv.description && (
                   <p className="text-xs text-muted-foreground">{srv.description}</p>
@@ -176,7 +181,7 @@ function formatTokenCount(tokens: number): string {
  * Token buckets shown per model in the ``usage_by_model`` section, mapping
  * the ``ModelUsage`` field to its row label. Cost is rendered separately.
  */
-const MODEL_TOKEN_ROWS: ReadonlyArray<{ key: keyof ModelUsage; label: string }> = [
+const MODEL_TOKEN_ROWS: readonly { key: keyof ModelUsage; label: string }[] = [
   { key: "inputTokens", label: "Input" },
   { key: "outputTokens", label: "Output" },
   { key: "cacheReadInputTokens", label: "Cache read" },
@@ -402,8 +407,7 @@ function AddPolicyDialog({
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
                     placeholder="Filter policies..."
-                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
-                    // eslint-disable-next-line jsx-a11y/no-autofocus
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-ui placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
                     autoFocus
                   />
                   <div className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
@@ -414,7 +418,7 @@ function AddPolicyDialog({
                         onClick={() => handleSelect(r.handler)}
                         className="flex flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-muted"
                       >
-                        <span className="text-sm">{r.name}</span>
+                        <span className="text-ui">{r.name}</span>
                         {r.description && (
                           <span className="line-clamp-2 text-[11px] text-muted-foreground">
                             {r.description}
@@ -434,7 +438,7 @@ function AddPolicyDialog({
           {entry && (
             <div className="flex flex-col gap-1 rounded border border-border bg-muted/50 px-2.5 py-2">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">{entry.name}</span>
+                <span className="text-ui font-medium">{entry.name}</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -462,7 +466,7 @@ function AddPolicyDialog({
                 type="text"
                 value={policyName}
                 onChange={(e) => setPolicyName(e.target.value)}
-                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
               />
             </div>
           )}
@@ -503,7 +507,7 @@ function AddPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         <option value="true">true</option>
                         <option value="false">false</option>
@@ -522,7 +526,7 @@ function AddPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         {prop.enum.map((v: string) => (
                           <option key={v} value={v}>
@@ -601,7 +605,7 @@ function AddPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       />
                     )}
                   </div>
@@ -612,7 +616,7 @@ function AddPolicyDialog({
           {(paramError || addPolicy.isError) && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {paramError ?? addPolicy.error?.message}
             </div>
@@ -661,9 +665,15 @@ interface McpFormState {
   description: string;
   url: string;
   /** Key-value pairs for HTTP headers. Values from existing servers are "[REDACTED]". */
-  headers: { key: string; value: string }[];
+  headers: { id: string; key: string; value: string }[];
   command: string;
   argsText: string;
+}
+
+let nextMcpHeaderId = 0;
+
+function mcpHeader(key = "", value = "") {
+  return { id: `mcp-header-${nextMcpHeaderId++}`, key, value };
 }
 
 const EMPTY_MCP_FORM: McpFormState = {
@@ -684,7 +694,7 @@ function mcpFormFromServer(server: McpServerSummary): McpFormState {
     transport: server.transport === "stdio" ? "stdio" : "http",
     description: server.description ?? "",
     url: server.url ?? "",
-    headers: Object.entries(server.headers ?? {}).map(([key, value]) => ({ key, value })),
+    headers: Object.entries(server.headers ?? {}).map(([key, value]) => mcpHeader(key, value)),
     command: server.command ?? "",
     argsText: (server.args ?? []).join("\n"),
   };
@@ -779,7 +789,7 @@ function McpServerManagerDialog({
   function notifyRestart() {
     onDirty();
     showToast(
-      <span className="text-sm">MCP servers updated. Restart the session to apply changes.</span>,
+      <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>,
     );
   }
 
@@ -825,7 +835,7 @@ function McpServerManagerDialog({
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
         </DialogHeader>
         {dirty && (
-          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-400">
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-ui text-yellow-700 dark:text-yellow-400">
             <AlertTriangleIcon className="size-4 shrink-0" />
             Restart the session to apply your changes.
           </div>
@@ -908,7 +918,7 @@ function McpServerManagerDialog({
                     transport: e.target.value === "stdio" ? "stdio" : "http",
                   }))
                 }
-                className="h-8 rounded-lg border border-input bg-background px-2 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                className="h-8 rounded-lg border border-input bg-background px-2 text-ui text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               >
                 <option value="http">HTTP</option>
                 <option value="stdio">stdio</option>
@@ -932,7 +942,7 @@ function McpServerManagerDialog({
                       onClick={() =>
                         setForm((prev) => ({
                           ...prev,
-                          headers: [...prev.headers, { key: "", value: "" }],
+                          headers: [...prev.headers, mcpHeader()],
                         }))
                       }
                       className="rounded p-0.5 hover:bg-muted"
@@ -942,7 +952,7 @@ function McpServerManagerDialog({
                     </button>
                   </div>
                   {form.headers.map((header, i) => (
-                    <div key={i} className="flex items-center gap-1">
+                    <div key={header.id} className="flex items-center gap-1">
                       <Input
                         value={header.key}
                         onChange={(e) =>
@@ -1017,7 +1027,7 @@ function McpServerManagerDialog({
             {(formError || mutationError) && (
               <div
                 role="alert"
-                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
               >
                 {formError ?? mutationError}
               </div>
@@ -1069,10 +1079,13 @@ function McpServersSection({
   const dirtyControlled = controlledDirty !== undefined;
   const mcpDirty = controlledDirty ?? localDirty;
 
-  function setMcpDirty(dirty: boolean) {
-    if (!dirtyControlled) setLocalDirty(dirty);
-    onDirtyChange?.(dirty);
-  }
+  const setMcpDirty = useCallback(
+    (dirty: boolean) => {
+      if (!dirtyControlled) setLocalDirty(dirty);
+      onDirtyChange?.(dirty);
+    },
+    [dirtyControlled, onDirtyChange],
+  );
 
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   // Clear the dirty flag when the session restarts (launching picks up
@@ -1085,6 +1098,16 @@ function McpServersSection({
   }, [dirtyControlled, sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
+  const handleDeleteServer = useCallback(
+    (name: string) =>
+      deleteServer.mutate(name, {
+        onSuccess: () => {
+          setMcpDirty(true);
+          showToast(MCP_SERVERS_UPDATED_TOAST);
+        },
+      }),
+    [deleteServer, setMcpDirty],
+  );
   const showSection = servers.length > 0 || canEdit;
   if (!showSection) return null;
 
@@ -1111,24 +1134,7 @@ function McpServersSection({
         </p>
       )}
       {servers.length > 0 ? (
-        <McpServerList
-          servers={servers}
-          onDelete={
-            canEdit
-              ? (name) =>
-                  deleteServer.mutate(name, {
-                    onSuccess: () => {
-                      setMcpDirty(true);
-                      showToast(
-                        <span className="text-sm">
-                          MCP servers updated. Restart the session to apply changes.
-                        </span>,
-                      );
-                    },
-                  })
-              : undefined
-          }
-        />
+        <McpServerList servers={servers} onDelete={canEdit ? handleDeleteServer : undefined} />
       ) : (
         <p className="text-xs text-muted-foreground">No MCP servers</p>
       )}
@@ -1199,7 +1205,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <ShieldCheckIcon className="size-3.5 text-muted-foreground" />
-                      <span className="min-w-0 break-all font-medium text-sm">{p.name}</span>
+                      <span className="min-w-0 break-all font-medium text-ui">{p.name}</span>
                     </div>
                     {description && (
                       <p className="break-words text-xs text-muted-foreground">{description}</p>
@@ -1338,7 +1344,7 @@ export function AgentInfoContent({
     <div className="flex flex-col divide-y divide-border/50">
       {displayName && (
         <div className="flex flex-col gap-0.5 pb-3">
-          <span className="font-medium text-sm">{displayName}</span>
+          <span className="font-medium text-ui">{displayName}</span>
           {agent?.description && (
             <span className="text-xs text-muted-foreground">{agent.description}</span>
           )}
@@ -1600,8 +1606,8 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
           sessionId={sessionId}
           mcpDirty={mcpDirty}
           onMcpDirtyChange={setMcpDirty}
-          onSubdialogOpenChange={(open) => {
-            subdialogOpenRef.current = open;
+          onSubdialogOpenChange={(isOpen) => {
+            subdialogOpenRef.current = isOpen;
           }}
         />
       </PopoverContent>
