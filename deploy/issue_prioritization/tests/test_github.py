@@ -98,6 +98,23 @@ def test_apply_preserves_human_priority_changed_after_dry_run() -> None:
     assert states.updated == []
 
 
+def test_apply_preserves_human_label_removals_after_dry_run() -> None:
+    state = BotState(1, "P2-medium", "severity:S2", ("comp:server",))
+    states = FakeStates({1: state})
+    manifest = _manifest()
+    planner = MutationPlanner(manifest, states)
+    target = MutationTarget(1, "P2-medium", "severity:S2", ("comp:server",))
+    proposed = MutationPlan(target, (), (), (), state)
+    run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, (proposed,))
+    client = FakeClient()
+    client.labels = ()
+
+    GitHubMutationSink(client, manifest, planner, states).apply(run)
+
+    assert client.applied == []
+    assert states.updated == []
+
+
 def test_apply_checkpoints_successful_writes_after_a_later_failure() -> None:
     first = BotState(1, "P2-medium", "severity:S2", ("comp:server",))
     second = BotState(2, "P2-medium", "severity:S2", ("comp:server",))

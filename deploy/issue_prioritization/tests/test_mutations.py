@@ -99,6 +99,22 @@ def test_human_priority_change_is_never_overwritten() -> None:
     assert "P1-high" not in plan.labels_add
 
 
+def test_human_priority_and_severity_removal_is_never_undone() -> None:
+    state = BotState(1, "P1-high", "severity:S1", ("comp:db",))
+    planner = MutationPlanner(_manifest(), FakeStates({1: state}))
+
+    plan = planner.plan_one(_target(), ("comp:db",), state)
+
+    assert set(plan.blocked) == {
+        "priority_human_override",
+        "severity_human_override",
+    }
+    assert "P1-high" not in plan.labels_add
+    assert "severity:S1" not in plan.labels_add
+    assert plan.next_state.priority == "P1-high"
+    assert plan.next_state.severity == "severity:S1"
+
+
 def test_human_component_labels_are_not_removed() -> None:
     state = BotState(1, None, None, ("comp:server",))
     planner = MutationPlanner(_manifest(), FakeStates({1: state}))
@@ -120,6 +136,18 @@ def test_existing_bot_owned_component_stays_owned() -> None:
 
     plan = planner.plan_one(_target(), ("comp:db",), state)
 
+    assert plan.next_state.components == ("comp:db",)
+
+
+def test_human_removed_bot_component_is_not_readded() -> None:
+    state = BotState(1, None, None, ("comp:db",))
+    planner = MutationPlanner(_manifest(), FakeStates({1: state}))
+
+    plan = planner.plan_one(_target(), (), state)
+
+    assert plan.labels_add == ("P1-high", "severity:S1")
+    assert plan.labels_remove == ()
+    assert plan.blocked == ("component_human_override:comp:db",)
     assert plan.next_state.components == ("comp:db",)
 
 

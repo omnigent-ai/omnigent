@@ -68,7 +68,8 @@ priorities were adopted. Human-authored priority events remain blocked in
 The schedule is paused. GitHub writes additionally require `mode=apply`, the
 deploy variable `allow_github_writes=true`, and a configured secret scope. The
 job re-reads every issue's live labels before writing and preserves maintainer
-priority and severity overrides. Human-added component labels are never removed.
+priority and severity overrides. Removing a bot-owned label is also a durable
+override; human-added component labels are never removed.
 
 ```bash
 databricks bundle deploy --target dev --profile <profile> \

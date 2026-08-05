@@ -119,7 +119,7 @@ class MutationPlanner:
         current_priorities = existing & self.priority_labels
         current_priority = next(iter(current_priorities)) if len(current_priorities) == 1 else None
         priority_written = False
-        priority_owned = not current_priorities or (
+        priority_owned = (not current_priorities and (state is None or state.priority is None)) or (
             state is not None and current_priority == state.priority
         )
         if len(current_priorities) > 1:
@@ -136,7 +136,7 @@ class MutationPlanner:
         current_severities = existing & self.manifest.severity_labels
         current_severity = next(iter(current_severities)) if len(current_severities) == 1 else None
         severity_written = False
-        severity_owned = not current_severities or (
+        severity_owned = (not current_severities and (state is None or state.severity is None)) or (
             state is not None and current_severity == state.severity
         )
         if len(current_severities) > 1:
@@ -152,13 +152,15 @@ class MutationPlanner:
 
         existing_components = existing & self.manifest.component_labels
         target_components = set(target.components)
-        components_added = target_components - existing_components
+        owned_components = set(state.components) if state else set()
+        suppressed_components = (owned_components - existing_components) & target_components
+        components_added = target_components - existing_components - suppressed_components
         labels_add.update(components_added)
-        if state:
-            labels_remove.update((set(state.components) & existing_components) - target_components)
-        bot_components = components_added
-        if state:
-            bot_components |= set(state.components) & existing_components & target_components
+        labels_remove.update((owned_components & existing_components) - target_components)
+        blocked.extend(
+            f"component_human_override:{component}" for component in sorted(suppressed_components)
+        )
+        bot_components = (owned_components & target_components) | components_added
 
         next_state = BotState(
             issue_number=target.issue_number,
