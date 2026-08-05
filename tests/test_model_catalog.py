@@ -22,11 +22,27 @@ from cachetools import TTLCache
 
 import omnigent.model_catalog as model_catalog
 from omnigent.model_catalog import (
+    ModelEntry,
+    ModelListing,
     catalog_for_spec,
+    catalog_model_entries,
     list_models_for_worker,
+    resolve_catalog_model,
     resolve_model_provider,
     spec_harness,
 )
+from omnigent.model_fallbacks import static_model_fallback
+from omnigent.model_metadata import (
+    ModelCapability,
+    ModelCostTier,
+    ModelIntent,
+    ModelMetadata,
+    ModelReasoningMetadata,
+    ModelReasoningMode,
+    ModelWireAPI,
+)
+from omnigent.model_resolver import ModelResolutionError, ModelResolutionSource
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec
 
@@ -484,10 +500,11 @@ def _databricks_transport(
 
     _UC_PAGE = {
         "model_services": [
-            _uc_service("system.ai.claude-sonnet-4-6", ["mlflow/v1/chat/completions"]),
+            _uc_service("system.ai.claude-sonnet-4-6", ["anthropic/v1/messages"]),
             _uc_service(
                 "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
             ),
+            _uc_service("system.ai.gpt-responses-only", ["openai/v1/responses"]),
             _uc_service("system.ai.meta-llama-3-3-70b-instruct", ["mlflow/v1/chat/completions"]),
             _uc_service("system.ai.qwen3-embedding", ["mlflow/v1/embeddings"]),
         ]
@@ -517,10 +534,10 @@ def _stub_workspace_creds(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_databricks_listing_filters_to_chat_llms(
+def test_databricks_listing_filters_to_llm_wire_surfaces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The gateway listing keeps chat LLM endpoints and tags families.
+    """The gateway listing keeps supported LLM wires and tags families.
 
     The embeddings endpoint must be excluded — including it would let an
     orchestrator dispatch a worker onto a non-chat endpoint.
@@ -545,11 +562,21 @@ def test_databricks_listing_filters_to_chat_llms(
     assert set(by_id) == {
         "system.ai.claude-sonnet-4-6",
         "system.ai.gpt-5-4",
+        "system.ai.gpt-responses-only",
         "system.ai.meta-llama-3-3-70b-instruct",
     }
     assert by_id["system.ai.claude-sonnet-4-6"].family == "claude"
     assert by_id["system.ai.gpt-5-4"].family == "openai"
     assert by_id["system.ai.meta-llama-3-3-70b-instruct"].family == "other"
+    assert by_id["system.ai.claude-sonnet-4-6"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.ANTHROPIC_MESSAGES}
+    )
+    assert by_id["system.ai.gpt-5-4"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_CHAT, ModelWireAPI.OPENAI_RESPONSES}
+    )
+    assert by_id["system.ai.gpt-responses-only"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_RESPONSES}
+    )
 
 
 def test_databricks_listing_skips_explicitly_non_ready_endpoints(
@@ -614,6 +641,7 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
             {
                 "system.ai.claude-sonnet-4-6",
                 "system.ai.gpt-5-4",
+                "system.ai.gpt-responses-only",
                 "system.ai.meta-llama-3-3-70b-instruct",
             },
             id="pi-everything",
@@ -736,7 +764,29 @@ def test_anthropic_api_listing_uses_api_key_headers(
             200,
             json={
                 "data": [
-                    {"type": "model", "id": "claude-opus-4-8", "display_name": "Claude Opus 4.8"},
+                    {
+                        "type": "model",
+                        "id": "claude-opus-4-8",
+                        "display_name": "Claude Opus 4.8",
+                        "max_input_tokens": 1_000_000,
+                        "capabilities": {
+                            "thinking": {
+                                "supported": True,
+                                "types": {
+                                    "enabled": {"supported": False},
+                                    "adaptive": {"supported": True},
+                                },
+                            },
+                            "effort": {
+                                "supported": True,
+                                "low": {"supported": True},
+                                "medium": {"supported": True},
+                                "high": {"supported": True},
+                                "xhigh": {"supported": True},
+                                "max": {"supported": True},
+                            },
+                        },
+                    },
                     {
                         "type": "model",
                         "id": "claude-sonnet-4-6",
@@ -758,6 +808,11 @@ def test_anthropic_api_listing_uses_api_key_headers(
     assert requests_seen[0].headers["anthropic-version"] == "2023-06-01"
     assert listing.source == "anthropic-api"
     assert [m.id for m in listing.models] == ["claude-opus-4-8", "claude-sonnet-4-6"]
+    opus = listing.models[0]
+    assert opus.context_window == 1_000_000
+    assert opus.metadata.supports(ModelCapability.REASONING) is True
+    assert opus.metadata.reasoning is not None
+    assert opus.metadata.reasoning.modes == frozenset({ModelReasoningMode.ADAPTIVE})
 
 
 def test_subscription_listing_is_static_and_unverified(
@@ -786,6 +841,14 @@ def test_subscription_listing_is_static_and_unverified(
         "claude-haiku-4-5",
     ]
     assert "CLI login" in listing.note
+    assert listing.static_fallback is not None
+    assert listing.static_fallback.owner == "Claude subscription adapter"
+    payload = model_catalog._listing_payload(listing)
+    assert payload["static_fallback"] == {
+        "owner": "Claude subscription adapter",
+        "provenance": "Omnigent's release-curated Claude Code alias catalog",
+        "discovery_gap": "Claude subscription logins expose no model-listing API",
+    }
 
 
 def test_cli_config_listing_is_static_and_unverified(
@@ -805,30 +868,94 @@ def test_cli_config_listing_is_static_and_unverified(
     listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
     assert listing.source == "static"
     assert listing.verified is False
-    assert [m.id for m in listing.models] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+    assert [m.id for m in listing.models] == [
+        "gpt-5-6-sol",
+        "gpt-5-6-luna",
+        "gpt-5-6-terra",
+        "gpt-5-5",
+    ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
     assert "resolved by the CLI at launch" in listing.note
     assert "cannot run here" not in listing.note
+    assert listing.static_fallback is not None
+    assert listing.static_fallback.owner == "Codex CLI-config adapter"
 
 
-def test_cursor_listing_is_static_with_curated_base_models(
+@pytest.mark.parametrize(
+    ("provider_kind", "cli"),
+    [
+        ("subscription", "claude"),
+        ("subscription", "codex"),
+        ("cli-config", "codex"),
+    ],
+)
+def test_static_model_fallbacks_document_ownership(
+    provider_kind: str,
+    cli: str,
+) -> None:
+    """Every registered fallback explains who owns it and why it exists."""
+    fallback = static_model_fallback(provider_kind, cli)
+
+    assert fallback is not None
+    assert fallback.model_ids
+    assert fallback.owner
+    assert fallback.provenance
+    assert fallback.discovery_gap
+
+
+def test_cursor_listing_uses_live_cli_base_models(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A cursor worker lists the curated cursor-agent base models.
+    """A cursor worker lists base models discovered from cursor-agent.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
+    from omnigent import cursor_native
+
     _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setattr(
+        cursor_native,
+        "list_cursor_cli_model_options",
+        lambda: [
+            {
+                "id": "provider-latest",
+                "displayName": "Provider Latest",
+                "isDefault": True,
+                "isCurrent": False,
+            }
+        ],
+    )
     listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
-    assert listing.source == "static"
-    assert listing.verified is False
-    ids = [m.id for m in listing.models]
-    # Spot-check the picker catalog rather than pinning the whole list —
-    # it is regenerated when cursor ships models.
-    assert "composer-2.5" in ids
-    assert "cannot run here" not in listing.note
+    assert listing.source == "cli"
+    assert listing.verified is True
+    assert [m.id for m in listing.models] == ["provider-latest"]
+    assert "live models advertised" in listing.note
+
+
+def test_cursor_listing_failure_is_empty_and_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transient Cursor CLI failure does not cache an empty catalog."""
+    from omnigent import cursor_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    calls = 0
+
+    def fail() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        raise OSError("cursor unavailable")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", fail)
+
+    first = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+    second = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+
+    assert first.source == second.source == "none"
+    assert first.models == second.models == ()
+    assert calls == 2
 
 
 def test_none_listing_explains_dead_worker(
@@ -1118,6 +1245,207 @@ def test_catalog_payload_is_json_serializable_and_omits_unknown_context(
     payload = json.loads(json.dumps(catalog))
     assert payload["worker"]["source"] == "gateway"
     assert all("context_window" not in m for m in payload["worker"]["models"])
+
+
+def test_catalog_payload_serializes_normalized_model_metadata() -> None:
+    """Known metadata is exposed without inventing values for unknown fields."""
+    listing = ModelListing(
+        source="catalog",
+        verified=True,
+        models=(
+            ModelEntry(
+                id="provider/model-a",
+                family="provider-family",
+                metadata=ModelMetadata(
+                    supported_capabilities=frozenset({ModelCapability.TOOL_USE}),
+                    unsupported_capabilities=frozenset({ModelCapability.VISION}),
+                    context_window=200_000,
+                    max_output_tokens=16_000,
+                    cost_tier=ModelCostTier.STANDARD,
+                    wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+                    reasoning=ModelReasoningMetadata(
+                        modes=frozenset({ModelReasoningMode.ADAPTIVE}),
+                        efforts=frozenset({"low", "high"}),
+                    ),
+                ),
+            ),
+        ),
+        note="test catalog",
+    )
+
+    payload = model_catalog._listing_payload(listing)
+
+    assert payload["models"] == [
+        {
+            "id": "provider/model-a",
+            "family": "provider-family",
+            "context_window": 200_000,
+            "max_output_tokens": 16_000,
+            "capabilities": {"tool-use": True, "vision": False},
+            "cost_tier": "standard",
+            "wire_apis": ["openai-responses"],
+            "reasoning": {"modes": ["adaptive"], "efforts": ["high", "low"]},
+        }
+    ]
+
+
+def test_bundled_catalog_entries_normalize_capabilities_context_and_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MLflow model facts become provider-neutral resolver metadata."""
+    models = [
+        ModelInfo(
+            name="provider/model-premium",
+            provider="provider",
+            mode="chat",
+            supports_function_calling=True,
+            supports_reasoning=True,
+            supports_vision=False,
+            supports_structured_output=True,
+            max_input_tokens=100_000,
+            max_output_tokens=20_000,
+            input_price=10.0,
+            output_price=30.0,
+        ),
+        ModelInfo(
+            name="provider/model-economy",
+            provider="provider",
+            mode="chat",
+            input_price=0.1,
+            output_price=0.2,
+        ),
+        ModelInfo(
+            name="provider/model-standard",
+            provider="provider",
+            mode="chat",
+            input_price=2.0,
+            output_price=6.0,
+        ),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: models)
+
+    entries = catalog_model_entries("provider")
+
+    premium = entries[0]
+    assert premium.metadata.context_window == 100_000
+    assert premium.metadata.max_output_tokens == 20_000
+    assert premium.metadata.cost_tier == ModelCostTier.PREMIUM
+    assert premium.metadata.supports(ModelCapability.TOOL_USE) is True
+    assert premium.metadata.supports(ModelCapability.REASONING) is True
+    assert premium.metadata.supports(ModelCapability.VISION) is False
+    assert premium.metadata.supports(ModelCapability.STRUCTURED_OUTPUT) is True
+    assert entries[1].metadata.cost_tier == ModelCostTier.ECONOMY
+    assert entries[2].metadata.cost_tier == ModelCostTier.STANDARD
+
+
+def test_resolve_catalog_model_uses_intent_and_configured_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = [
+        ModelInfo(
+            name="model-economy",
+            provider="provider",
+            mode="chat",
+            input_price=0.1,
+            output_price=0.2,
+        ),
+        ModelInfo(
+            name="model-premium",
+            provider="provider",
+            mode="chat",
+            input_price=10.0,
+            output_price=30.0,
+        ),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: models)
+
+    powerful = resolve_catalog_model("provider", intent=ModelIntent.POWERFUL)
+    configured = resolve_catalog_model(
+        "provider",
+        intent=ModelIntent.POWERFUL,
+        configured_default="model-configured",
+        family="other",
+    )
+
+    assert powerful.model_id == "model-premium"
+    assert powerful.source == ModelResolutionSource.LIVE_CATALOG
+    assert configured.model_id == "model-configured"
+    assert configured.source == ModelResolutionSource.CONFIGURED_DEFAULT
+
+
+def test_resolve_catalog_default_preserves_provider_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default resolution skips specialty models after family filtering."""
+    models = [
+        ModelInfo(name="gpt-audio-new", provider="gateway", mode="chat"),
+        ModelInfo(name="gpt-general", provider="gateway", mode="chat"),
+        ModelInfo(name="claude-general", provider="gateway", mode="chat"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda provider: models)
+
+    resolution = resolve_catalog_model("gateway", family="openai")
+
+    assert resolution.model_id == "gpt-general"
+    assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
+
+
+def test_resolve_catalog_default_preserves_provider_tier_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default resolution retains broadly accessible provider tiers."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_chat_models",
+        lambda _provider: [
+            ModelInfo(name="claude-opus-new", provider="anthropic", mode="chat"),
+            ModelInfo(name="claude-sonnet-stable", provider="anthropic", mode="chat"),
+        ],
+    )
+
+    resolution = resolve_catalog_model("anthropic", family="claude")
+
+    assert resolution.model_id == "claude-sonnet-stable"
+    assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("family", "expected_model"),
+    [
+        ("claude", "databricks-claude-general"),
+        ("openai", "databricks-gpt-general"),
+    ],
+)
+def test_resolve_databricks_default_requires_gateway_routable_id(
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    expected_model: str,
+) -> None:
+    """Databricks defaults exclude bare vendor ids the gateway rejects."""
+    models = [
+        ModelInfo(name="claude-newer", provider="databricks", mode="chat"),
+        ModelInfo(name="gpt-newer", provider="databricks", mode="chat"),
+        ModelInfo(name="databricks-claude-general", provider="databricks", mode="chat"),
+        ModelInfo(name="databricks-gpt-general", provider="databricks", mode="chat"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda _provider: models)
+
+    resolution = resolve_catalog_model("databricks", family=family)
+
+    assert resolution.model_id == expected_model
+    assert resolution.model_id.startswith("databricks-")
+    assert resolution.family == family
+
+
+def test_resolve_catalog_model_fails_when_discovery_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.onboarding.providers.get_chat_models", lambda provider: [])
+
+    with pytest.raises(
+        ModelResolutionError,
+        match="configure an explicit model or retry when catalog discovery is available",
+    ):
+        resolve_catalog_model("provider")
 
 
 def test_spec_harness_derivation() -> None:

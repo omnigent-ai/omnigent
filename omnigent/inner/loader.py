@@ -6,7 +6,7 @@ import importlib
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import yaml
 
@@ -626,7 +626,7 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             raise ValueError(
                 f"executor: key(s) {', '.join(nested)} belong to the bundle "
                 "config.yaml format; this format spells the executor flat, "
-                "e.g. executor: {harness: codex-native, model: gpt-5.4-mini}"
+                "e.g. executor: {harness: codex-native, model: MODEL_ID}"
             )
         # ``ExecutorSpec.{model,harness,profile}`` are ``str | None``;
         # missing keys map to ``None`` directly. ``data.get`` happens to
@@ -822,6 +822,8 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     fields = OSEnvSandboxSpec.__dataclass_fields__
     max_entries_raw = data.get("cwd_hidden_scan_max_entries")
     overflow_raw = data.get("cwd_hidden_scan_overflow")
+    recursive_raw = data.get("cwd_hidden_scan_recursive")
+    mask_paths_raw = data.get("mask_paths")
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=data.get("read_paths"),
@@ -840,13 +842,19 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         cwd_hidden_scan_max_entries=(
             int(max_entries_raw)
             if max_entries_raw is not None
-            else fields["cwd_hidden_scan_max_entries"].default
+            else cast(int, fields["cwd_hidden_scan_max_entries"].default)
         ),
         cwd_hidden_scan_overflow=(
             str(overflow_raw)
             if overflow_raw is not None
-            else fields["cwd_hidden_scan_overflow"].default
+            else cast(str, fields["cwd_hidden_scan_overflow"].default)
         ),
+        cwd_hidden_scan_recursive=(
+            bool(recursive_raw)
+            if recursive_raw is not None
+            else cast(bool, fields["cwd_hidden_scan_recursive"].default)
+        ),
+        mask_paths=list(mask_paths_raw) if mask_paths_raw is not None else None,
         env_passthrough=data.get("env_passthrough"),
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,

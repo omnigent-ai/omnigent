@@ -87,7 +87,7 @@ const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
- * file). `let` (not const) so tests can shrink them via __test.setQuitTimeouts
+ * file). `let` (not const) so tests can shrink them via testApi.setQuitTimeouts
  * to exercise the force-exit safety nets without waiting seconds in real
  * time. Production code never writes them.
  */
@@ -370,8 +370,8 @@ function registerLocalhostAccess() {
 // never a tight loop. In the normal case the gate full-page-redirects the
 // reload's top-level navigation to its login page, so no further API calls
 // (hence no further redirects) fire anyway.
-const _lastExpiryReloadAt = new WeakMap();
-const _EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
+const lastExpiryReloadAt = new WeakMap();
+const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 
 /**
  * Recover the desktop window when the workspace SSO session expires.
@@ -386,9 +386,9 @@ function registerSessionExpiryAccess() {
     const now = Date.now();
     for (const [win, state] of windows) {
       if (state.origin !== origin || win.isDestroyed()) continue;
-      const last = _lastExpiryReloadAt.get(win) ?? 0;
-      if (now - last < _EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
-      _lastExpiryReloadAt.set(win, now);
+      const last = lastExpiryReloadAt.get(win) ?? 0;
+      if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
+      lastExpiryReloadAt.set(win, now);
       win.webContents.reload();
     }
   });
@@ -616,8 +616,7 @@ function broadcastHostStatus() {
 function activeWindow() {
   const focused = BrowserWindow.getFocusedWindow();
   if (focused && windows.has(focused)) return focused;
-  for (const win of windows.keys()) return win;
-  return null;
+  return windows.keys().next().value ?? null;
 }
 
 // Desktop auto-update orchestration lives in its own module; the main process
@@ -941,11 +940,11 @@ function hardenOauthPopup(child) {
  * (re-pointing an existing window) so the mount-aware join is in one place.
  *
  * @param {string} serverUrl A normalized server URL (origin or origin+mount).
- * @param {string} path An absolute in-app path beginning with ``/``.
+ * @param {string} routePath An absolute in-app path beginning with ``/``.
  * @returns {string}
  */
-function resolveServerPath(serverUrl, path) {
-  return serverUrl.replace(/\/+$/, "") + (path.startsWith("/") ? path : "/" + path);
+function resolveServerPath(serverUrl, routePath) {
+  return serverUrl.replace(/\/+$/, "") + (routePath.startsWith("/") ? routePath : "/" + routePath);
 }
 
 /**
@@ -957,13 +956,13 @@ function resolveServerPath(serverUrl, path) {
  *
  * @param {BrowserWindow} win
  * @param {string} serverUrl Clean server URL (origin or origin+mount).
- * @param {string} [path] Optional basename-less in-app path (e.g. ``/c/<id>``).
+ * @param {string} [routePath] Optional basename-less in-app path (e.g. ``/c/<id>``).
  * @returns {Promise<void>}
  */
-function loadServerUrl(win, serverUrl, path) {
+function loadServerUrl(win, serverUrl, routePath) {
   pinWindow(win, originOf(serverUrl));
   setWindowServerUrl(win, serverUrl);
-  return win.loadURL(path ? resolveServerPath(serverUrl, path) : serverUrl);
+  return win.loadURL(routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
 }
 
 /**
@@ -2102,6 +2101,16 @@ function registerIpc() {
     return Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [];
   });
 
+  ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("copy-setup-text is only available to the setup page");
+    }
+    if (typeof text !== "string") {
+      throw new TypeError("copy-setup-text requires a string");
+    }
+    clipboard.writeText(text);
+  });
+
   // SPA title-bar server picker → the sender window's pinned origin plus the
   // persisted recent-servers list, so the picker can render "current server"
   // and the switch targets. Foreign pages get null (nothing to fingerprint).
@@ -2563,13 +2572,13 @@ function focusAndRestore(win) {
  * defense-in-depth on top of that.
  *
  * @param {BrowserWindow | null | undefined} win
- * @param {string} path
+ * @param {string} routePath
  */
-function sendOpenPath(win, path) {
+function sendOpenPath(win, routePath) {
   if (!win || win.isDestroyed()) return;
-  console.log(`[omnigent] deep-link: send open-path ${path}`);
+  console.log(`[omnigent] deep-link: send open-path ${routePath}`);
   try {
-    win.webContents.send("omnigent:open-path", path);
+    win.webContents.send("omnigent:open-path", routePath);
   } catch {
     // Window torn down between the check and the send; ignore.
   }
@@ -2838,9 +2847,9 @@ if (!gotLock) {
     // subsequent spawn/execFile call inherits it. Runs before resolvedCliPath()
     // (a PATH consumer) and any host spawn, so the ordering guarantee is implicit.
     const { resolveLoginShellPath, mergePath } = require("./loginShellPath");
-    const _loginPath = resolveLoginShellPath();
-    if (_loginPath) {
-      process.env.PATH = mergePath(process.env.PATH, _loginPath);
+    const loginPath = resolveLoginShellPath();
+    if (loginPath) {
+      process.env.PATH = mergePath(process.env.PATH, loginPath);
     }
     // Resolve the CLI path once at startup so the first status/control call is
     // instant (primes the in-memory cache in resolvedCliPath); also lets the

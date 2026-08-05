@@ -120,6 +120,7 @@ class FireDeps:
     permission_store: Any | None
     host_store: Any | None
     host_registry: Any | None
+    host_permission_store: Any | None = None
     agent_cache: Any | None = None
     runner_router: Any | None = None
     tunnel_registry: Any | None = None
@@ -531,7 +532,7 @@ async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
     hosts = await asyncio.to_thread(deps.host_store.list_hosts, owner)
     for host in hosts:
         if deps.host_registry.get(host.host_id) is not None:
-            return host.host_id
+            return str(host.host_id)
     raise _CannotLaunchScheduledFire(
         "no online host is available for the scheduled task owner",
         error_code="no_online_host",
@@ -588,7 +589,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     # Connected-host, existing-workspace runs create the conversation directly.
     # Future execution modes such as managed sandbox, branch selection, and
     # replay/backfill must use shared session-create orchestration.
-    conv = await asyncio.to_thread(
+    conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
         title=task.name,
@@ -596,7 +597,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         workspace=task.workspace,
     )
     if task.model_override is not None or task.reasoning_effort is not None:
-        updated = await asyncio.to_thread(
+        updated: Conversation | None = await asyncio.to_thread(
             deps.conversation_store.update_conversation,
             conv.id,
             model_override=task.model_override,
@@ -799,7 +800,11 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             _wait_for_runner_client,
         )
 
-        if deps.host_registry is None or deps.host_store is None:
+        if (
+            deps.host_registry is None
+            or deps.host_store is None
+            or deps.host_permission_store is None
+        ):
             raise RuntimeError("connected host registry/store is not configured")
 
         owner = task.user_id or RESERVED_USER_LOCAL
@@ -818,6 +823,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             host_registry=deps.host_registry,
             conversation_store=deps.conversation_store,
             permission_store=deps.permission_store,
+            host_permission_store=deps.host_permission_store,
         )
 
         attempt = await _launch_runner_on_host(

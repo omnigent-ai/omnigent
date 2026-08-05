@@ -8,16 +8,16 @@
 //!   keep a git-based omnigent up to date. These need no checkout and run
 //!   anywhere.
 //! - **omnigent passthrough** (`omnidev omnigent …`): run any omnigent command
-//!   against the current checkout's pod via `uv run omnigent …`, with the pod's
+//!   against the current checkout's pod via pinned `uv run --python …`, with the pod's
 //!   isolated env applied. Requires a checkout, like the supervisor.
 
 mod install;
 mod lan;
 mod lock;
 mod logs;
+mod omnigent_cmd;
 mod paths;
 mod pod;
-mod omnigent_cmd;
 mod ports;
 mod process;
 mod shellhook;
@@ -81,7 +81,7 @@ enum Command {
     Refresh,
     /// Print a shell snippet to eval from .zshrc/.bashrc for daily checks.
     ShellHook,
-    /// Run an omnigent command against this checkout's pod (`uv run omnigent …`).
+    /// Run an omnigent command against this checkout's pod (pinned `uv run --python …`).
     ///
     /// Everything after the subcommand is forwarded verbatim to omnigent. The
     /// pod's isolated env (data dir, database, config, server URL) is applied,
@@ -172,7 +172,7 @@ fn main() -> Result<()> {
 }
 
 /// `omnidev omnigent …` — run an arbitrary omnigent command against this
-/// checkout's pod via `uv run omnigent …`, with the pod's isolated env (data
+/// checkout's pod via pinned `uv run --python …`, with the pod's isolated env (data
 /// dir, database URI, config home, server URL) applied on top of the inherited
 /// parent env. Resolves the repo root and pod dir (same as the supervisor),
 /// ensures the pod tree exists, then spawns in the foreground inheriting stdio.

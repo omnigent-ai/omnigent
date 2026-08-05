@@ -42,9 +42,9 @@ function hsvToHex({ hue, saturation, value }: HsvColor): string {
   const secondary = chroma * (1 - Math.abs((segment % 2) - 1));
   const offset = value - chroma;
 
-  let red = 0;
-  let green = 0;
-  let blue = 0;
+  let red: number;
+  let green: number;
+  let blue: number;
   if (segment < 1) [red, green, blue] = [chroma, secondary, 0];
   else if (segment < 2) [red, green, blue] = [secondary, chroma, 0];
   else if (segment < 3) [red, green, blue] = [0, chroma, secondary];
@@ -110,7 +110,7 @@ export function ThemeColorPicker({
 
   return (
     <div className="flex items-center justify-between gap-4 border-b border-border/70 py-3 last:border-b-0">
-      <span className="text-sm font-medium">{label}</span>
+      <span className="text-ui font-medium">{label}</span>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button

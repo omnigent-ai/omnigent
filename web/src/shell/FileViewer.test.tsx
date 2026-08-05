@@ -129,7 +129,7 @@ vi.mock("@/hooks/useResizablePanel", () => ({
 }));
 
 vi.mock("@/hooks/CommentSenderContext", () => ({
-  CommentSenderProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  CommentSenderProvider: ({ children }: { children: React.ReactNode }) => children,
   useOptionalCommentSender: vi.fn(() => null),
 }));
 

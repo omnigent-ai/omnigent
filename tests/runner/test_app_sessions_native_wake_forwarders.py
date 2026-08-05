@@ -28,10 +28,12 @@ class _WakePost:
     :param url: The path the wake notice was POSTed to, e.g.
         ``"/v1/sessions/0349c7f62dcaa06b868e9c088c39f062/events"``.
     :param notice: The injected notice text pulled out of the request body.
+    :param created_by: Optional attribution actor sent with the wake notice.
     """
 
     url: str
     notice: str
+    created_by: str | None = None
 
 
 class _QueuedResponseServerClient:
@@ -69,7 +71,14 @@ class _QueuedResponseServerClient:
         :raises AssertionError: If more POSTs are made than responses queued.
         """
         notice = json["data"]["content"][0]["text"]
-        self.calls.append(_WakePost(url=url, notice=notice))
+        created_by = json.get("created_by")
+        self.calls.append(
+            _WakePost(
+                url=url,
+                notice=notice,
+                created_by=created_by if isinstance(created_by, str) else None,
+            )
+        )
         assert self._responses, (
             f"Wake POST made {len(self.calls)} call(s) but only "
             f"{len(self.calls) - 1} response(s) were queued — the retry "
@@ -138,6 +147,43 @@ async def test_wake_post_retries_transient_503_then_succeeds(
     assert len(_no_wake_backoff) == 1, (
         f"Expected one backoff before the single retry, got {_no_wake_backoff}."
     )
+
+
+async def test_wake_post_carries_dispatch_actor() -> None:
+    """A wake notice preserves the collaborator that dispatched the child."""
+    parent_id = "5a81ef19fce549929c8f9925c2ee034f"
+    client = _QueuedResponseServerClient([_wake_response(200, parent_id)])
+
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
+        client,  # type: ignore[arg-type]
+        parent_id,
+        "[System: worker completed]",
+        created_by="bob@example.com",
+    )
+
+    assert delivered is True
+    assert len(client.calls) == 1
+    assert client.calls[0].created_by == "bob@example.com"
+
+
+async def test_wake_post_retries_without_actor_when_attribution_is_rejected() -> None:
+    """A stale collaborator grant cannot permanently drop a parent wake."""
+    parent_id = "32561551610d43b39dc4e394b78ea89d"
+    client = _QueuedResponseServerClient(
+        [_wake_response(403, parent_id), _wake_response(200, parent_id)]
+    )
+
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
+        client,  # type: ignore[arg-type]
+        parent_id,
+        "[System: worker completed]",
+        created_by="bob@example.com",
+    )
+
+    assert delivered is True
+    assert len(client.calls) == 2
+    assert client.calls[0].created_by == "bob@example.com"
+    assert client.calls[1].created_by is None
 
 
 async def test_wake_post_persistent_503_returns_failure(
@@ -332,6 +378,144 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
     finally:
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_server() -> None:
+    """
+    Codex pane teardown cancels the forwarder and closes the app-server.
+
+    The idle pane reaper and an unexpected TUI exit both close only the tmux
+    pane; without this helper the per-session ``codex app-server`` (and its
+    forwarder) survives with no TUI, orphaning a ``codex`` process for the
+    runner's lifetime. Teardown must both cancel the registered forwarder and
+    close the registered app-server so neither leaks.
+    """
+    session_id = "c0d3f00d0000000000000000deadbeef"
+    run = _ForwarderRun()
+    closed = False
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    class _FakeAppServer:
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(session_id, task)
+        runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] = _FakeAppServer()
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_codex_native_app_server(session_id)
+
+        assert task.cancelled(), "forwarder must be finished-cancelled after teardown"
+        assert run.cancelled is True
+        assert closed is True, "registered codex app-server must be closed"
+        assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+        assert session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_teardown_codex_native_app_server_noop_without_registered_server() -> None:
+    """
+    Teardown is a no-op for a session with no registered codex app-server.
+
+    The shared pane-teardown paths (reaper, terminal-exit publisher) fire for
+    every native harness, so calling this for a non-codex session — or a codex
+    session whose server is already gone — must not touch that session's
+    forwarder or raise.
+    """
+    session_id = "1111111122222222aaaaaaaabbbbbbbb"
+    run = _ForwarderRun()
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        await asyncio.Event().wait()
+
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(session_id, task)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_codex_native_app_server(session_id)
+
+        # No registered codex app-server -> the forwarder is left untouched.
+        assert not task.done()
+        assert session_id in runner_app_mod._AUTO_FORWARDER_TASKS
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_teardown_all_codex_native_app_servers_closes_every_session() -> None:
+    """
+    Runner shutdown closes every registered codex app-server.
+
+    A host-initiated stop SIGTERMs the runner without a per-session
+    ``DELETE /v1/sessions``, so the shutdown sweep is the only thing that
+    closes the host-spawned codex app-servers (each spawned in its own
+    session, so it outlives the runner otherwise). Every registered session
+    must be torn down, and the registry left empty.
+    """
+    session_ids = [
+        "aaaa0000aaaa0000aaaa0000aaaa0000",
+        "bbbb1111bbbb1111bbbb1111bbbb1111",
+        "cccc2222cccc2222cccc2222cccc2222",
+    ]
+    runs = [_ForwarderRun() for _ in session_ids]
+    closed: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeAppServer:
+        def __init__(self, sid: str) -> None:
+            self._sid = sid
+
+        async def close(self) -> None:
+            closed.append(self._sid)
+
+    try:
+        for sid, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(sid, task)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS[sid] = _FakeAppServer(sid)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_codex_native_app_servers()
+
+        assert sorted(closed) == sorted(session_ids), "every app-server must be closed"
+        assert all(sid not in runner_app_mod._AUTO_CODEX_APP_SERVERS for sid in session_ids)
+        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
+        # Idempotent: a second sweep with an empty registry is a no-op.
+        await runner_app_mod.teardown_all_codex_native_app_servers()
+    finally:
+        for sid in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(sid, None)
+        await _drain_forwarder_runs(runs)
 
 
 @pytest.mark.asyncio
@@ -623,6 +807,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -666,7 +851,12 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         async def close(self) -> None:
             """:returns: None."""
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """
         No-op thread preload.
 
@@ -674,7 +864,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
-        del transport, loaded_thread_id
+        del transport, loaded_thread_id, terminal_launch_args
 
     runs: list[_ForwarderRun] = []
 

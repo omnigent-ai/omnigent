@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
 
 import httpx
 
@@ -16,6 +15,8 @@ _MODEL_SERVICES_PATH = "/api/2.1/unity-catalog/model-services"
 _ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 _MODEL_SERVICE_PREFIX = "model-services/"
 _SYSTEM_MODEL_PREFIX = "system.ai."
+_MODEL_SERVICES_MAX_RESULTS = 1000
+_MODEL_SERVICES_PARENT = "schemas/system.ai"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
@@ -54,7 +55,10 @@ def _list_model_service_ids(
     page_token: str | None = None
     seen_tokens: set[str] = set()
     for _ in range(_MAX_PAGES):
-        params = {"page_size": str(_PAGE_SIZE)}
+        params: dict[str, str] = {
+            "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
+            "parent": _MODEL_SERVICES_PARENT,
+        }
         if page_token is not None:
             params["page_token"] = page_token
         response = client.get(
@@ -63,7 +67,7 @@ def _list_model_service_ids(
             params=params,
         )
         response.raise_for_status()
-        payload: Any = response.json()
+        payload: object = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Databricks model-services response must be an object")
         services = payload.get("model_services")
@@ -106,7 +110,7 @@ def _list_anthropic_gateway_ids(
         headers=headers,
     )
     response.raise_for_status()
-    payload: Any = response.json()
+    payload: object = response.json()
     if not isinstance(payload, dict):
         raise ValueError("Databricks Anthropic models response must be an object")
     data = payload.get("data")

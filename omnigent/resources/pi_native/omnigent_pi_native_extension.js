@@ -99,6 +99,22 @@ function freshAuthHeaders(fallback) {
   return fallback || {};
 }
 
+// Return the relay URL and token from config.json when available. The runner
+// writes relayUrl + relayToken into config.json after the tool relay starts,
+// so policy POSTs can use the relay's non-expiring local token instead of a
+// baked server bearer.
+function relayCredentials() {
+  const cfg = readConfig();
+  if (
+    cfg &&
+    typeof cfg.relayUrl === "string" &&
+    typeof cfg.relayToken === "string"
+  ) {
+    return { url: cfg.relayUrl, token: cfg.relayToken };
+  }
+  return null;
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -153,7 +169,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
     typeof fetch !== "function"
   )
     return null;
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  // Prefer relay (non-expiring local token); fall back to direct server call.
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/policies/evaluate`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
   // Mint one stable re-attach id for this tool call. Every (re)POST carries
   // it so a re-park lands on the SAME elicitation — no duplicate approval
   // card. Kept for the whole call, across both the park loop and any
@@ -168,10 +188,15 @@ async function evalNativePolicyHttp(config, toolName, args) {
     },
     _omnigent_elicitation_id: elicitationId,
   });
-  const reqHeaders = {
-    "content-type": "application/json",
-    ...freshAuthHeaders(config.authHeaders),
-  };
+  const reqHeaders = relay
+    ? {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.token}`,
+      }
+    : {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
   // Independent transient-error budget so a server that is actually down
@@ -1199,6 +1224,157 @@ module.exports = function (pi) {
     }
   }
 
+  let taskList = [];
+
+  function normalizeTaskList(value) {
+    if (!Array.isArray(value)) return null;
+    const statuses = new Set(["not-started", "in-progress", "completed"]);
+    const normalized = [];
+    for (const task of value) {
+      if (
+        !task ||
+        typeof task !== "object" ||
+        !Number.isInteger(task.id) ||
+        typeof task.title !== "string" ||
+        typeof task.description !== "string" ||
+        !statuses.has(task.status)
+      ) {
+        return null;
+      }
+      normalized.push({
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+      });
+    }
+    return normalized;
+  }
+
+  async function publishTaskList() {
+    const status = {
+      "not-started": "pending",
+      "in-progress": "in_progress",
+      completed: "completed",
+    };
+    await postEvent(config, {
+      type: "external_session_todos",
+      data: {
+        todos: taskList.map((task) => ({
+          content: task.title,
+          status: status[task.status],
+          activeForm: task.description || task.title,
+        })),
+      },
+    });
+  }
+
+  function restoreTaskList(ctx) {
+    taskList = [];
+    const entries =
+      ctx &&
+      ctx.sessionManager &&
+      typeof ctx.sessionManager.getBranch === "function"
+        ? ctx.sessionManager.getBranch()
+        : [];
+    for (const entry of entries) {
+      const message = entry && entry.type === "message" ? entry.message : null;
+      if (
+        !message ||
+        message.role !== "toolResult" ||
+        message.toolName !== "manage_todo_list"
+      ) {
+        continue;
+      }
+      const restored = normalizeTaskList(
+        message.details && message.details.todos,
+      );
+      if (restored) taskList = restored;
+    }
+  }
+
+  function registerTaskToolIfMissing() {
+    if (typeof pi.registerTool !== "function") return;
+    const existing =
+      typeof pi.getAllTools === "function"
+        ? pi.getAllTools().some((tool) => tool.name === "manage_todo_list")
+        : false;
+    if (existing) return;
+    pi.registerTool({
+      name: "manage_todo_list",
+      label: "Task Plan",
+      description:
+        "Read or replace the task plan shown in the Omnigent Tasks panel.",
+      promptSnippet: "Read or replace the current task plan",
+      promptGuidelines: [
+        "For every multi-step task, you must call manage_todo_list before using other tools to create a plan, then update it after each step until all tasks are completed.",
+      ],
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["read", "write"] },
+          todoList: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "integer" },
+                title: { type: "string" },
+                description: { type: "string" },
+                status: {
+                  type: "string",
+                  enum: ["not-started", "in-progress", "completed"],
+                },
+              },
+              required: ["id", "title", "description", "status"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+      async execute(_toolCallId, params) {
+        if (params && params.operation === "read") {
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(taskList, null, 2) },
+            ],
+            details: { operation: "read", todos: taskList },
+          };
+        }
+        if (!params || params.operation !== "write") {
+          throw new Error("operation must be read or write");
+        }
+        const next = normalizeTaskList(params.todoList);
+        if (!next) throw new Error("todoList must contain valid task items");
+        taskList = next;
+        await publishTaskList();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task plan updated (${taskList.length} task${taskList.length === 1 ? "" : "s"}).`,
+            },
+          ],
+          details: { operation: "write", todos: taskList },
+        };
+      },
+    });
+  }
+
+  async function syncTaskListFromResult(event) {
+    if (!event || event.toolName !== "manage_todo_list" || event.isError)
+      return;
+    const result =
+      event.result && typeof event.result === "object" ? event.result : event;
+    const next = normalizeTaskList(result.details && result.details.todos);
+    if (!next) return;
+    const changed = JSON.stringify(next) !== JSON.stringify(taskList);
+    taskList = next;
+    if (changed) await publishTaskList();
+  }
+
   // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
   // assistant message per LLM call); session billing is their SUM — each call
   // is billed for the full context it re-sent, so summing per-message inputs is
@@ -1520,6 +1696,9 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    registerTaskToolIfMissing();
+    restoreTaskList(ctx);
+    if (taskList.length) await publishTaskList();
     setOmnigentStatus(config, ctx, "linked");
     startInboxPoller(
       pi,
@@ -1554,6 +1733,11 @@ module.exports = function (pi) {
       type: "external_session_status",
       data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
     });
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreTaskList(ctx);
+    await publishTaskList();
   });
 
   pi.on("model_select", async (event, ctx) => {
@@ -1728,6 +1912,7 @@ module.exports = function (pi) {
   pi.on("tool_result", async (event, ctx) => {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
+    await syncTaskListFromResult(event);
     await postToolResult(event, currentResponseId());
   });
 

@@ -47,6 +47,7 @@ from typing import NamedTuple
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.opencode_native_client import (
@@ -224,15 +225,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
     # npm). ``kimi login`` is the interactive provider login (OAuth or a
     # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
     # no first-class "am I logged in?" exit-code probe — login state is
-    # only inspected interactively. With ``None`` the login path runs every
-    # time the operator asks for it (interactive, so they can cancel if
-    # already authenticated).
+    # inspected file-based via ``kimi_auth.kimi_login_detected`` instead. With
+    # ``None`` the login path runs every time the operator asks for it
+    # (interactive, so they can cancel if already authenticated).
+    # ``logout_args`` is ``None`` because kimi has no ``kimi logout`` subcommand
+    # (verified against kimi CLI v0.29.1 — ``kimi logout`` errors "unknown
+    # command"), so ``harness_logout`` is a no-op for it (same as Qwen / agy).
     KIMI_KEY: HarnessInstallSpec(
         "Kimi",
         "kimi",
         package=None,
         login_args=("login",),
-        logout_args=("logout",),
         install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         # First kimi-cli release after 2026-06-01. Older builds may lack
         # newer TUI/session wiring needed by the native harness.
@@ -245,26 +248,23 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
         min_version=_KIRO_MIN_VERSION,
     ),
-    # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. ``agy`` has
-    # no ``login`` / ``logout`` subcommand — the user authenticates via browser
-    # OAuth by launching ``agy`` with no arguments on first run — so login_args /
-    # logout_args stay ``None`` (``harness_login`` / ``harness_logout`` no-op for
-    # it). It DOES expose a usable status check: ``agy models`` lists models and
-    # exits 0 only when signed in (else exits non-zero with "Please sign in …"),
-    # so status_args wires it the way Codex's exit-code ``login status`` is — so
-    # ``harness_cli_logged_in`` reads a real, revocation-aware verdict from the
-    # CLI instead of guessing from a credential file. (The readiness layer still
-    # uses the subprocess-free file check ``gemini_login_detected`` for its fast
-    # path.) ``agy`` ships via a shell installer rather than npm, so ``package``
-    # is ``None`` and the manual command lives in ``install_hint`` (shown as
-    # guidance; ``install_harness_cli`` refuses to auto-run it).
+    # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. agy's auth
+    # service is reached by launching ``agy`` itself (no login subcommand); after
+    # the browser flow completes, ``agy models`` exits 0 and provides the same
+    # revocation-aware status probe Codex gets from ``codex login status``. An
+    # empty ``login_args`` tuple intentionally means “run the binary with no
+    # arguments” in ``harness_login``. ``agy`` ships via a shell installer rather
+    # than npm, so ``package`` is ``None`` and the manual command lives in
+    # ``install_hint`` (shown as guidance; ``install_harness_cli`` refuses to
+    # auto-run it).
     GEMINI_FAMILY: HarnessInstallSpec(
         "Antigravity",
         "agy",
         package=None,
+        login_args=(),
         status_args=("models",),
         install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
-        auth_hint="run `agy` once and complete the browser sign-in",
+        auth_hint="run `agy` and complete the browser sign-in",
     ),
     GOOSE_KEY: HarnessInstallSpec(
         "Goose",
@@ -362,6 +362,14 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     OPENCODE_KEY: OPENCODE_KEY,
     QWEN_KEY: QWEN_KEY,
 }
+
+# Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) with an npm package
+# are one-click installable; rows shipping via curl/shell installers stay out,
+# like cursor/kimi above.
+for _acp_name, _acp_row in ACP_CLI_HARNESSES.items():
+    if _acp_row.install.package is not None:
+        for _acp_spelling in (_acp_name, *_acp_row.aliases):
+            _UI_INSTALLABLE_HARNESS_TO_KEY[_acp_spelling] = _acp_name
 
 
 # Family keys the UI may install, derived once from the allowlist so the
@@ -513,6 +521,20 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
         status_key=None,
     ),
 }
+
+# Builtin ACP CLI harnesses own their credentials (vendor CLI login), so each
+# row with a login command gets a run-on-host auth step, untracked like qwen's.
+for _acp_name, _acp_row in ACP_CLI_HARNESSES.items():
+    _acp_login = _acp_row.login_command
+    if _acp_login is not None:
+        _UI_AUTH_STEP_BY_KEY[_acp_name] = SetupStep(
+            kind="auth",
+            title=f"Sign in to {_acp_row.label}",
+            detail=f"{_acp_row.label} manages its own credentials; sign in on the host.",
+            action="command",
+            command=_acp_login,
+            status_key=None,
+        )
 
 
 def ui_setup_steps(harness: str) -> list[SetupStep]:
@@ -969,11 +991,13 @@ def harness_cli_logged_in(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
-    if shutil.which(spec.binary) is None:
+    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    if binary is None:
         return False
+    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
         result = subprocess.run(
-            [spec.binary, *spec.status_args],
+            [argv_binary, *spec.status_args],
             check=False,
             timeout=30,
             capture_output=True,
@@ -1002,15 +1026,16 @@ def harness_login(key: str) -> bool:
     """Run the harness CLI's interactive subscription login; return logged-in state.
 
     Lets ``configure harnesses`` be the single place to sign in: when the user
-    picks "Claude / Codex — subscription" we drive the harness's own login
-    command (``claude auth login --claudeai`` / ``codex login``) **in the
-    foreground** (inheriting stdio so the OAuth / device-code prompts and any
-    browser URL reach the user), then confirm via :func:`harness_cli_logged_in`.
+    picks a subscription or Antigravity sign-in, we drive the harness's own
+    auth entrypoint (``claude auth login --claudeai`` / ``codex login`` / bare
+    ``agy``) **in the foreground** (inheriting stdio so OAuth / device-code
+    prompts and browser URLs reach the user), then confirm via
+    :func:`harness_cli_logged_in`.
     If the CLI is already logged in this is a no-op that returns ``True``
     immediately (no redundant re-auth).
 
-    :param key: A harness family, ``"anthropic"`` (Claude) or ``"openai"``
-        (Codex).
+    :param key: A harness family, ``"anthropic"`` (Claude), ``"openai"``
+        (Codex), or ``"gemini"`` (Antigravity).
     :returns: ``True`` when the harness CLI is logged in after the attempt
         (including the already-logged-in short-circuit); ``False`` when the key
         has no login command, the CLI binary is missing, the login process
@@ -1019,8 +1044,10 @@ def harness_login(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None or spec.login_args is None:
         return False
-    if shutil.which(spec.binary) is None:
+    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    if binary is None:
         return False
+    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     if harness_cli_logged_in(key):
         return True
     try:
@@ -1036,7 +1063,7 @@ def harness_login(key: str) -> bool:
                 tty_fd = os.open("/dev/tty", os.O_RDWR)
             except OSError:
                 tty_fd = None
-        argv = [spec.binary, *spec.login_args]
+        argv = [argv_binary, *spec.login_args]
         try:
             if tty_fd is not None:
                 subprocess.run(

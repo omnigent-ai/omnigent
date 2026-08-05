@@ -403,7 +403,7 @@ function StatusOverlay({
   // Render outside the xterm container so close/error messages don't
   // pollute the scrollback buffer the way ANSI-escape writes would.
   return (
-    <div className="absolute inset-0 z-[10000] flex items-center justify-center bg-background/85 text-sm text-foreground backdrop-blur-[1px]">
+    <div className="absolute inset-0 z-[10000] flex items-center justify-center bg-background/85 text-ui text-foreground backdrop-blur-[1px]">
       {state.kind === "connecting" && (
         <span className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />

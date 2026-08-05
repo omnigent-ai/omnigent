@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import stat
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from omnigent.inner.codex_executor import (
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _prompt_for_turn,
+    _provider_codex_config_overrides,
     _to_codex_input_items,
 )
 from omnigent.inner.executor import (
@@ -413,7 +415,7 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            self.assertEqual(fake_session.calls[0]["model"], "gpt-5.4-mini")
+            self.assertEqual(fake_session.calls[0]["model"], "catalog-openai-openai-default")
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -441,7 +443,7 @@ class TestCodexExecutor(unittest.TestCase):
             ]
 
             self.assertEqual(events[-1].response, "done")
-            self.assertEqual(fake_session.calls[0]["model"], "databricks-gpt-5-5")
+            self.assertEqual(fake_session.calls[0]["model"], "catalog-databricks-openai-default")
 
         _run(_t())
 
@@ -2354,6 +2356,76 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
     assert not (codex_home / "skills").exists()
 
 
+@pytest.mark.parametrize(
+    "auth_command",
+    [
+        "printf %s sk-sentinel-do-not-use",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ],
+)
+async def test_embedded_codex_materializes_provider_auth_outside_argv(
+    tmp_path: Path,
+    auth_command: str,
+) -> None:
+    """Embedded Codex keeps provider credentials only in private config."""
+    import tomllib
+
+    captured_argv: list[str] = []
+    captured_env: dict[str, str] = {}
+    process = _FakeProcess()
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _FakeProcess:
+        captured_argv.extend(args)
+        captured_env.update(kwargs["env"])
+        return process
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    overrides = _provider_codex_config_overrides(
+        model="test-model",
+        base_url="https://provider.invalid/v1",
+        auth_command=auth_command,
+        wire_api="responses",
+    )
+    session = _CodexAppServerSession(
+        codex_path="/test/codex",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        codex_config_overrides=overrides,
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    with (
+        patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=_fake_create_subprocess_exec,
+        ),
+        patch(
+            "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+            return_value=source_home,
+        ),
+    ):
+        await session.start()
+        codex_home = Path(captured_env["CODEX_HOME"])
+        config_path = codex_home / "config.toml"
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+        assert all("sk-sentinel-do-not-use" not in arg for arg in captured_argv)
+        assert 'model_provider="omnigent_provider"' in captured_argv
+        assert 'model="test-model"' in captured_argv
+        assert config["model_providers"]["omnigent_provider"]["auth"]["args"] == [
+            "-c",
+            auth_command,
+        ]
+        assert config["model_providers"]["omnigent_provider"]["wire_api"] == "responses"
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        await session.close()
+
+    assert not codex_home.exists()
+
+
 # ---------------------------------------------------------------------------
 # _populate_codex_home_config tests
 # ---------------------------------------------------------------------------
@@ -2393,6 +2465,52 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
+def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> None:
+    """``plugins/cache`` is symlinked to the shared home to dedupe it.
+
+    Codex materializes tens of MB of versioned plugin data into every private
+    home; sharing the one real cache keeps each session small. Only the
+    ``cache`` subdir is shared — sibling scratch dirs stay session-local.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "config.toml").write_text("[default]\n")
+    cache = source / "plugins" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "big-plugin.bin").write_text("payload")
+    (source / "plugins" / ".remote-plugin-install-staging").mkdir()
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    link = target / "plugins" / "cache"
+    assert link.is_symlink()
+    assert (link / "big-plugin.bin").read_text() == "payload"
+    # Only cache is shared; the sibling scratch dir is not created here.
+    assert not (target / "plugins" / ".remote-plugin-install-staging").exists()
+
+
+def test_populate_codex_home_config_minimal_mode_skips_plugins_cache(tmp_path: Path) -> None:
+    """Minimal (title-sidecar) mode does not link plugins — it runs no plugins."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "config.toml").write_text("[default]\n")
+    (source / "plugins" / "cache").mkdir(parents=True)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source, minimal_config=True)
+
+    assert not (target / "plugins" / "cache").exists()
+
+
 def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2419,10 +2537,6 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
 
     assert (target / "auth.json").is_symlink()
     assert not (target / "AGENTS.md").exists()
-    # hooks.json must NOT be symlinked in minimal mode: the rebuilt config.toml
-    # carries no [hooks.state] entries, so a symlinked hooks.json with no trust
-    # state would re-introduce the interactive trust prompt.
-    assert not (target / "hooks.json").exists()
     config_text = (target / "config.toml").read_text()
     assert 'model_provider = "Databricks"' in config_text
     assert "[model_providers.Databricks]" in config_text
@@ -2562,11 +2676,7 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
 
 
 def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
-    """``hooks.json`` is symlinked into the private home when present.
-
-    The user's hooks must be reachable at the same relative path inside the
-    private home so rewritten hook-trust keys in ``config.toml`` resolve.
-    """
+    """``hooks.json`` is symlinked so user hooks fire inside the private home."""
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
@@ -2581,227 +2691,23 @@ def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
     assert (target / "hooks.json").read_text() == '{"hooks": {}}'
 
 
-def test_populate_codex_home_config_no_hooks_json_is_fine(tmp_path: Path) -> None:
-    """No ``hooks.json`` in the source is silently skipped."""
+def test_populate_codex_home_config_hooks_json_skipped_in_minimal_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hooks.json`` is not symlinked in minimal mode (title worker)."""
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
-    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "hooks.json").write_text('{"hooks": {}}')
     target = tmp_path / "temp_codex_home"
     target.mkdir()
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
 
     _populate_codex_home_config(target, source)
 
     assert not (target / "hooks.json").exists()
-
-
-def test_populate_codex_home_config_retargets_hook_trust_keys(tmp_path: Path) -> None:
-    """``[hooks.state]`` path keys are rewritten from source to target dir.
-
-    Trust entries that reference the global ``CODEX_HOME`` path are rewritten
-    to reference the private session home so Codex recognises previously-trusted
-    hooks without an interactive review prompt.  The hash value is preserved.
-    """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    source_hooks = str(source / "hooks.json")
-    config_text = (
-        f'[hooks.state."{source_hooks}:pre_tool_use:0:0"]\n'
-        'trusted_hash = "sha256:abc123"\n'
-        f'[hooks.state."{source_hooks}:post_tool_use:0:0"]\n'
-        'trusted_hash = "sha256:def456"\n'
-    )
-    (source / "config.toml").write_text(config_text)
-    (source / "hooks.json").write_text('{"hooks": {}}')
-    target = tmp_path / "temp_codex_home"
-    target.mkdir()
-
-    _populate_codex_home_config(target, source)
-
-    copied = (target / "config.toml").read_text()
-    target_hooks = str(target / "hooks.json")
-    assert source_hooks not in copied
-    assert f'[hooks.state."{target_hooks}:pre_tool_use:0:0"]' in copied
-    assert f'[hooks.state."{target_hooks}:post_tool_use:0:0"]' in copied
-    assert 'trusted_hash = "sha256:abc123"' in copied
-    assert 'trusted_hash = "sha256:def456"' in copied
-    # Source must be untouched.
-    assert (source / "config.toml").read_text() == config_text
-
-
-def test_populate_codex_home_config_retargets_config_toml_trust_keys(tmp_path: Path) -> None:
-    """Trust keys referencing ``config.toml`` itself are also rewritten."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    source_config = str(source / "config.toml")
-    config_text = (
-        f'[hooks.state."{source_config}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:abc123"\n'
-    )
-    (source / "config.toml").write_text(config_text)
-    target = tmp_path / "temp_codex_home"
-    target.mkdir()
-
-    _populate_codex_home_config(target, source)
-
-    copied = (target / "config.toml").read_text()
-    target_config = str(target / "config.toml")
-    assert source_config not in copied
-    assert f'[hooks.state."{target_config}:pre_tool_use:0:0"]' in copied
-    assert 'trusted_hash = "sha256:abc123"' in copied
-
-
-def test_populate_codex_home_config_preserves_unrelated_trust_keys(tmp_path: Path) -> None:
-    """Trust entries referencing other paths are left untouched."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    other_path = "/some/other/machine/hooks.json"
-    source_hooks = str(source / "hooks.json")
-    config_text = (
-        f'[hooks.state."{other_path}:pre_tool_use:0:0"]\n'
-        'trusted_hash = "sha256:other"\n'
-        f'[hooks.state."{source_hooks}:pre_tool_use:0:0"]\n'
-        'trusted_hash = "sha256:mine"\n'
-    )
-    (source / "config.toml").write_text(config_text)
-    (source / "hooks.json").write_text('{"hooks": {}}')
-    target = tmp_path / "temp_codex_home"
-    target.mkdir()
-
-    _populate_codex_home_config(target, source)
-
-    copied = (target / "config.toml").read_text()
-    # The unrelated path is untouched.
-    assert f'[hooks.state."{other_path}:pre_tool_use:0:0"]' in copied
-    assert 'trusted_hash = "sha256:other"' in copied
-    # The source-home entry is rewritten.
-    target_hooks = str(target / "hooks.json")
-    assert f'[hooks.state."{target_hooks}:pre_tool_use:0:0"]' in copied
-    assert 'trusted_hash = "sha256:mine"' in copied
-
-
-# ---------------------------------------------------------------------------
-# _merge_codex_hook_trust_back tests
-# ---------------------------------------------------------------------------
-
-
-def test_merge_codex_hook_trust_back_writes_to_global(tmp_path: Path) -> None:
-    """Trust accepted in a session is flushed back to the global config.toml.
-
-    After close(), the next session's copy of config.toml will contain the
-    translated trust entries so _retarget_codex_hook_trust_keys can carry
-    them forward and Codex won't prompt again.
-    """
-    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    (source / "config.toml").write_text('model = "gpt-5.5"\n')
-    target = tmp_path / "session_codex_home"
-    target.mkdir()
-    target_config_path = str(target / "config.toml")
-    private_config = target / "config.toml"
-    private_config.write_text(
-        'model = "gpt-5.5"\n'
-        f'[hooks.state."{target_config_path}:pre_tool_use:0:0"]\n'
-        'trusted_hash = "sha256:abc123"\n'
-    )
-
-    _merge_codex_hook_trust_back(private_config, source, target)
-
-    import tomllib
-
-    with open(source / "config.toml", "rb") as f:
-        global_doc = tomllib.load(f)
-    state = global_doc["hooks"]["state"]
-    source_config_path = str(source / "config.toml")
-    assert f"{source_config_path}:pre_tool_use:0:0" in state
-    assert state[f"{source_config_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:abc123"
-    # Private path must not appear in global config.
-    assert target_config_path not in str(global_doc)
-
-
-def test_merge_codex_hook_trust_back_merges_into_existing_state(tmp_path: Path) -> None:
-    """Existing [hooks.state] entries in the global config are preserved."""
-    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    source_config_path = str(source / "config.toml")
-    (source / "config.toml").write_text(
-        'model = "gpt-5.5"\n'
-        f'[hooks.state."{source_config_path}:post_tool_use:0:0"]\n'
-        'trusted_hash = "sha256:existing"\n'
-    )
-    target = tmp_path / "session_codex_home"
-    target.mkdir()
-    target_config_path = str(target / "config.toml")
-    private_config = target / "config.toml"
-    private_config.write_text(
-        f'[hooks.state."{target_config_path}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:new"\n'
-    )
-
-    _merge_codex_hook_trust_back(private_config, source, target)
-
-    import tomllib
-
-    with open(source / "config.toml", "rb") as f:
-        global_doc = tomllib.load(f)
-    state = global_doc["hooks"]["state"]
-    assert f"{source_config_path}:post_tool_use:0:0" in state
-    assert state[f"{source_config_path}:post_tool_use:0:0"]["trusted_hash"] == "sha256:existing"
-    assert f"{source_config_path}:pre_tool_use:0:0" in state
-    assert state[f"{source_config_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:new"
-
-
-def test_merge_codex_hook_trust_back_noop_when_no_state(tmp_path: Path) -> None:
-    """No-op when the private config has no [hooks.state] entries."""
-    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    original = 'model = "gpt-5.5"\n'
-    (source / "config.toml").write_text(original)
-    target = tmp_path / "session_codex_home"
-    target.mkdir()
-    private_config = target / "config.toml"
-    private_config.write_text('model = "gpt-5.5"\n')
-
-    _merge_codex_hook_trust_back(private_config, source, target)
-
-    assert (source / "config.toml").read_text() == original
-
-
-def test_merge_codex_hook_trust_back_preserves_unrelated_keys(tmp_path: Path) -> None:
-    """Trust entries keyed to unrelated paths are carried through unchanged."""
-    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    (source / "config.toml").write_text('model = "gpt-5.5"\n')
-    target = tmp_path / "session_codex_home"
-    target.mkdir()
-    other_path = "/some/other/machine/hooks.json"
-    private_config = target / "config.toml"
-    private_config.write_text(
-        f'[hooks.state."{other_path}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:other"\n'
-    )
-
-    _merge_codex_hook_trust_back(private_config, source, target)
-
-    import tomllib
-
-    with open(source / "config.toml", "rb") as f:
-        global_doc = tomllib.load(f)
-    state = global_doc["hooks"]["state"]
-    assert f"{other_path}:pre_tool_use:0:0" in state
-    assert state[f"{other_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:other"
 
 
 def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
@@ -3407,7 +3313,9 @@ def test_clean_codex_env_deny_wins_over_extra_allow(monkeypatch):
 
 
 def test_declared_passthrough_reads_sandbox_env_passthrough():
-    from omnigent.inner.codex_executor import _declared_passthrough
+    # Codex consumes the shared helper in agent_env rather than keeping its own
+    # copy; this still covers the codex spawn path's source of extra_allowed.
+    from omnigent.inner.agent_env import declared_passthrough as _declared_passthrough
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     # env_passthrough lives on os_env.sandbox, not os_env directly
@@ -3510,3 +3418,27 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
             expected = str(Path(writable_dir) / ".codex-tmp")
             self.assertEqual(dir_used, expected)
+
+
+def test_run_turn_cli_config_passes_no_model_to_thread_create():
+    """On the cli-config path (model_provider_override set), model=None is passed
+    to thread/create so the codex binary uses its own configured model rather than
+    forwarding an unresolvable alias (e.g. gpt-5.6) to the Databricks UC API."""
+
+    async def _t():
+        fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.6",
+            model_provider_override="Databricks",
+            app_session_factory=lambda **kwargs: fake_session,
+        )
+        async for _ in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}],
+            [],
+            "",
+        ):
+            pass
+        assert fake_session.calls[0]["model"] is None
+
+    _run(_t())

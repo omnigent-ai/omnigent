@@ -1,5 +1,5 @@
 import { ChevronRightIcon, FileIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   RunnerOfflineError,
   type WorkspaceChangedFile,
@@ -26,13 +26,12 @@ function IndentGuides({ depth }: { depth: number }) {
   if (depth <= 0) return null;
   return (
     <>
-      {Array.from({ length: depth }).map((_, i) => (
+      {Array.from({ length: depth }, (_, level) => indentFor(level) + GUIDE_OFFSET).map((left) => (
         <span
-          // biome-ignore lint/suspicious/noArrayIndexKey: fixed positional guides
-          key={i}
+          key={left}
           aria-hidden
           className="pointer-events-none absolute top-0 bottom-0 w-px bg-border"
-          style={{ left: `${indentFor(i) + GUIDE_OFFSET}px` }}
+          style={{ left: `${left}px` }}
         />
       ))}
     </>
@@ -244,10 +243,21 @@ export function FolderTree({
   });
 
   // When files arrive for the first time (async load) and no cache entry
-  // exists yet, compute and persist the default open set.
-  useEffect(() => {
+  // exists yet, compute and persist the default open set. Also re-sync from
+  // the cache when the panel switches conversations without remounting —
+  // otherwise the tree keeps the previous conversation's expanded set. A
+  // layout effect so the switch resolves before paint (no collapsed flash).
+  const expandedForRef = useRef(conversationId);
+  useLayoutEffect(() => {
     if (!conversationId) return;
-    if (!files || expandedPathsCache.has(conversationId)) return;
+    const switched = expandedForRef.current !== conversationId;
+    expandedForRef.current = conversationId;
+    const cached = expandedPathsCache.get(conversationId);
+    if (cached) {
+      if (switched) setExpandedPaths(new Set(cached));
+      return;
+    }
+    if (!files) return;
     const initial = defaultExpandedPaths(files);
     expandedPathsCache.set(conversationId, initial);
     setExpandedPaths(new Set(initial));
@@ -467,7 +477,7 @@ function FileRowItem({
           />
           <span
             className={cn(
-              "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
+              "min-w-0 flex-1 truncate font-mono text-ui md:text-xs",
               labelIsPath ? "[direction:rtl]" : fileStatus === "created" && "font-semibold",
               isDeleted && "line-through opacity-50",
               fileColorClass,
@@ -672,7 +682,7 @@ function TreeNodeRow({
         />
         <span
           className={cn(
-            "min-w-0 flex-1 truncate font-mono text-sm md:text-xs",
+            "min-w-0 flex-1 truncate font-mono text-ui md:text-xs",
             dirStatus === "created" && "font-semibold",
             dirDotClass,
           )}

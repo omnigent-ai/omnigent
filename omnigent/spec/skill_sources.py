@@ -17,7 +17,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
@@ -118,13 +118,15 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
     return [s for s in _dedup(provider(ctx)) if s.user_invocable]
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
-    """Best-effort JSON read; ``None`` on missing/unreadable/non-dict."""
+def _read_json(path: Path) -> dict[str, object] | None:
+    """Best-effort JSON read; ``None`` unless it is a string-keyed object."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not all(isinstance(key, str) for key in data):
+        return None
+    return cast(dict[str, object], data)
 
 
 def _enabled_plugin_settings_files(ctx: SkillSourceContext) -> list[Path]:

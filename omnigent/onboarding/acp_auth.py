@@ -48,6 +48,7 @@ class AcpAgentEntry:
         in ``session/new``; see :class:`omnigent.inner.acp_executor.AcpAgentConfig`).
     :param session_id_mode: ``"server"`` (default) or ``"client"``.
     :param send_model: Send the model in ``session/new`` (Qwen-shaped agents).
+    :param omnigent_mcp: Lend Omnigent's builtin MCP relay in ``session/new``.
     """
 
     slug: str
@@ -56,6 +57,7 @@ class AcpAgentEntry:
     model: str | None = None
     session_id_mode: str = "server"
     send_model: bool = False
+    omnigent_mcp: bool = True
 
 
 def slugify(name: str) -> str:
@@ -76,9 +78,10 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
     """Return the configured ACP agents, each with a unique derived slug.
 
     Reads the ``acp:`` block's ``agents`` list. Malformed entries (not a dict,
-    or missing ``name`` / ``command``) are skipped. Slugs are assigned in list
-    order; a collision (two names slugifying the same) gets a ``-2`` / ``-3`` …
-    suffix so every returned entry is uniquely addressable.
+    or missing ``name`` / ``command``) are skipped. Invalid ``omnigent_mcp``
+    values raise ``ValueError`` instead of being silently coerced. Slugs are
+    assigned in list order; a collision (two names slugifying the same) gets a
+    ``-2`` / ``-3`` … suffix so every returned entry is uniquely addressable.
 
     :param config: A pre-loaded config mapping; ``None`` loads
         ``~/.omnigent/config.yaml`` via :func:`load_config`.
@@ -109,6 +112,9 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         slug = base if count == 1 else f"{base}-{count}"
         model = raw.get("model")
         mode = raw.get("session_id_mode")
+        omnigent_mcp = raw.get("omnigent_mcp", True)
+        if not isinstance(omnigent_mcp, bool):
+            raise ValueError("acp agent omnigent_mcp must be a boolean")
         entries.append(
             AcpAgentEntry(
                 slug=slug,
@@ -117,6 +123,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 model=model.strip() if isinstance(model, str) and model.strip() else None,
                 session_id_mode=mode if mode in ("server", "client") else "server",
                 send_model=bool(raw.get("send_model", False)),
+                omnigent_mcp=omnigent_mcp,
             )
         )
     return entries
@@ -154,6 +161,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["session_id_mode"] = e.session_id_mode
         if e.send_model:
             item["send_model"] = True
+        if not e.omnigent_mcp:
+            item["omnigent_mcp"] = False
         agents.append(item)
     return {ACP_CONFIG_KEY: {_AGENTS_FIELD: agents}}
 

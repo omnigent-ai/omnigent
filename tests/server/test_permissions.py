@@ -38,6 +38,7 @@ from omnigent.server.permissions import (
     check_is_manager,
     check_session_access,
     resolved_allows,
+    resolved_can_approve,
     resolved_level,
 )
 
@@ -919,3 +920,56 @@ def test_resolved_level_none_when_no_access() -> None:
     access = ResolvedAccess(is_admin=False, user_grant_level=None, public_grant_level=None)
     assert resolved_level(access) is None
     assert resolved_allows(access, LEVEL_READ) is False
+
+
+@pytest.mark.parametrize(
+    ("access", "expected"),
+    [
+        (
+            ResolvedAccess(
+                is_admin=True,
+                user_grant_level=None,
+                public_grant_level=None,
+            ),
+            True,
+        ),
+        (
+            ResolvedAccess(
+                is_admin=False,
+                user_grant_level=LEVEL_OWNER,
+                public_grant_level=None,
+            ),
+            True,
+        ),
+        (
+            ResolvedAccess(
+                is_admin=False,
+                user_grant_level=LEVEL_EDIT,
+                public_grant_level=None,
+                user_can_approve=True,
+            ),
+            True,
+        ),
+        (
+            ResolvedAccess(
+                is_admin=False,
+                user_grant_level=LEVEL_EDIT,
+                public_grant_level=None,
+            ),
+            False,
+        ),
+        (
+            ResolvedAccess(
+                is_admin=False,
+                user_grant_level=None,
+                public_grant_level=LEVEL_OWNER,
+            ),
+            False,
+        ),
+    ],
+)
+def test_resolved_can_approve_uses_direct_authority(
+    access: ResolvedAccess, expected: bool
+) -> None:
+    """Only admins, owners, and explicitly delegated users may approve."""
+    assert resolved_can_approve(access) is expected

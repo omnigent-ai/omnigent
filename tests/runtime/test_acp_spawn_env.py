@@ -23,7 +23,13 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig
 _AGENTS = [
     {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
     {"name": "Goose", "command": "goose acp", "model": "gpt-5.3", "session_id_mode": "client"},
+    {
+        "name": "OpenClaw",
+        "command": "openclaw acp --url https://gateway --token token",
+        "omnigent_mcp": False,
+    },
 ]
+_MISSING = object()
 
 
 @pytest.fixture(autouse=True)
@@ -39,10 +45,17 @@ def _write_acp_config(tmp_path: Path, agents: list[dict] | None = None) -> None:
     )
 
 
-def _make_spec(*, harness: str, model: str | None = None) -> AgentSpec:
+def _make_spec(
+    *,
+    harness: str,
+    model: str | None = None,
+    acp_agent: object = _MISSING,
+) -> AgentSpec:
     config: dict[str, object] = {"harness": harness}
     if model is not None:
         config["model"] = model
+    if acp_agent is not _MISSING:
+        config["acp_agent"] = acp_agent
     return AgentSpec(
         spec_version=1,
         name="test-acp",
@@ -58,6 +71,7 @@ def test_slug_resolves_to_command(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_COMMAND"] == "goose acp"
     assert env["HARNESS_ACP_NAME"] == "Goose"
     assert env["HARNESS_ACP_SESSION_ID_MODE"] == "client"
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "1"
     # Per-agent model applies when the spec pins none.
     assert env["HARNESS_ACP_MODEL"] == "gpt-5.3"
 
@@ -110,3 +124,40 @@ def test_send_model_flag_forwarded(_isolate_config: Path) -> None:
     )
     env = _build_acp_spawn_env(_make_spec(harness="acp:qwen"))
     assert env["HARNESS_ACP_SEND_MODEL"] == "1"
+
+
+def test_omnigent_mcp_flag_forwarded(_isolate_config: Path) -> None:
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:openclaw"))
+    assert env["HARNESS_ACP_COMMAND"] == "openclaw acp --url https://gateway --token token"
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+
+def test_embedded_omnigent_mcp_flag_forwarded() -> None:
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:openclaw",
+            acp_agent={
+                "name": "OpenClaw",
+                "command": "openclaw acp",
+                "omnigent_mcp": False,
+            },
+        )
+    )
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+
+@pytest.mark.parametrize(
+    "acp_agent",
+    [
+        None,
+        "not-a-mapping",
+        {},
+        {"name": "Helper"},
+        {"name": "Helper", "command": " "},
+        {"name": "Helper", "command": "helper", "omnigent_mcp": "false"},
+    ],
+)
+def test_malformed_embedded_agent_fails_loudly(acp_agent: object) -> None:
+    with pytest.raises(ValueError, match="executor acp_agent"):
+        _build_acp_spawn_env(_make_spec(harness="acp:helper", acp_agent=acp_agent))

@@ -24,6 +24,32 @@ export interface UserSuggestion {
   displayName?: string;
 }
 
+/**
+ * The kind of UI element an analytics event came from. A small, closed set kept
+ * intentionally host-agnostic — the host maps each value onto whatever its own
+ * telemetry taxonomy uses. Omitted when the element doesn't fit any of these.
+ */
+export type OmnigentComponentKind =
+  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select";
+
+/**
+ * A product-analytics event forwarded to the host. Each carries a stable,
+ * caller-chosen `componentId` / `pageId` so the host can attribute the action.
+ *
+ * PII: `value` on a value-change is only ever set when the emitting call site
+ * explicitly declares the value PII-free (see `useOmnigentAnalytics` in
+ * `lib/analytics.ts`). Free-form field text is never forwarded.
+ */
+export type OmnigentAnalyticsEvent =
+  | { type: "click"; componentId: string; componentKind?: OmnigentComponentKind }
+  | {
+      type: "value_change";
+      componentId: string;
+      componentKind?: OmnigentComponentKind;
+      value?: string | number | boolean;
+    }
+  | { type: "page_view"; pageId: string };
+
 export interface OmnigentHostConfig {
   /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
@@ -41,6 +67,15 @@ export interface OmnigentHostConfig {
    * logic and returns the suggestions to display.
    */
   searchUsers?: (query: string, options?: { signal?: AbortSignal }) => Promise<UserSuggestion[]>;
+  /**
+   * Optional product-analytics sink. When supplied by the host, the app's
+   * instrumented components forward clicks, field value-changes, and page views
+   * here (see `lib/analytics.ts`); when omitted (standalone, or before the host
+   * wires it) every emit is a no-op — the app records nothing on its own. The
+   * host owns transport, batching, and any PII policy beyond the app's default
+   * value redaction.
+   */
+  analytics?: (event: OmnigentAnalyticsEvent) => void;
   /**
    * Maps an web WS path (e.g.
    * `/v1/sessions/{id}/resources/terminals/{tid}/attach`) to a fully
@@ -82,8 +117,8 @@ export interface OmnigentHostConfig {
   };
 }
 
-let _config: OmnigentHostConfig = {};
-let _embedRoot: HTMLElement | null = null;
+let hostConfig: OmnigentHostConfig = {};
+let embedRoot: HTMLElement | null = null;
 
 export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // Guard: never clobber an already-installed fetcher with an empty config.
@@ -91,12 +126,12 @@ export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // default/empty props on concurrent or Suspense renders; without this guard
   // such a render would wipe the host transport and API calls would fall back
   // to bare same-origin paths.
-  if (!config?.fetcher && _config.fetcher) return;
-  _config = config ?? {};
+  if (!config?.fetcher && hostConfig.fetcher) return;
+  hostConfig = config ?? {};
 }
 
 export function getOmnigentHostConfig(): OmnigentHostConfig {
-  return _config;
+  return hostConfig;
 }
 
 /**
@@ -104,7 +139,15 @@ export function getOmnigentHostConfig(): OmnigentHostConfig {
  * configured. Consumers use the absence to stay inert (plain text input).
  */
 export function getOmnigentUserSearch(): OmnigentHostConfig["searchUsers"] {
-  return _config.searchUsers;
+  return hostConfig.searchUsers;
+}
+
+/**
+ * The host-provided analytics sink, or `undefined` when none is configured.
+ * Consumers use the absence to stay inert (emit nothing).
+ */
+export function getOmnigentAnalytics(): OmnigentHostConfig["analytics"] {
+  return hostConfig.analytics;
 }
 
 /**
@@ -112,7 +155,7 @@ export function getOmnigentUserSearch(): OmnigentHostConfig["searchUsers"] {
  * configured. Absence means the relative URL is used unchanged.
  */
 export function getOmnigentTransformShareLink(): OmnigentHostConfig["transformShareLink"] {
-  return _config.transformShareLink;
+  return hostConfig.transformShareLink;
 }
 
 /**
@@ -122,11 +165,11 @@ export function getOmnigentTransformShareLink(): OmnigentHostConfig["transformSh
  * Returns null in standalone mode, where Radix falls back to `document.body`.
  */
 export function setEmbedRoot(el: HTMLElement | null): void {
-  _embedRoot = el;
+  embedRoot = el;
 }
 
 export function getEmbedRoot(): HTMLElement | null {
-  return _embedRoot;
+  return embedRoot;
 }
 
 /**
@@ -134,15 +177,15 @@ export function getEmbedRoot(): HTMLElement | null {
  * otherwise calls native `fetch` with the path unchanged (standalone).
  */
 export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
-  if (_config.fetcher) {
-    return _config.fetcher(path, init);
+  if (hostConfig.fetcher) {
+    return hostConfig.fetcher(path, init);
   }
   return fetch(path, init);
 }
 
 export function resolveWebSocketUrl(path: string): string {
-  if (_config.resolveWebSocketUrl) {
-    return _config.resolveWebSocketUrl(path);
+  if (hostConfig.resolveWebSocketUrl) {
+    return hostConfig.resolveWebSocketUrl(path);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${scheme}//${window.location.host}${path}`;
@@ -155,5 +198,5 @@ export function resolveWebSocketUrl(path: string): string {
  */
 export function getCliServerUrl(): string {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  return origin + (_config.cliServerUrlSuffix ?? "");
+  return origin + (hostConfig.cliServerUrlSuffix ?? "");
 }

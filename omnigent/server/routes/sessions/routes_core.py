@@ -78,6 +78,9 @@ from omnigent.server.routes._auth_helpers import (
     authorize_runner_or_user,
 )
 from omnigent.server.routes._auth_helpers import (
+    get_approval_access as _get_approval_access,
+)
+from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -97,13 +100,66 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_UI_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODES,
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _logger,
+    _managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    SessionLiveness,
+    _agent_carries_cursor_fork_history,
+    _agent_carries_native_fork_history,
+    _announce_session_added,
+    _apply_liveness_to_items,
+    _authorize_bundled_parent_and_inherit_runner,
+    _codex_plan_mode_enabled,
+    _discovery_key,
+    _forward_session_change_to_runner,
+    _get_runner_client,
+    _invalidate_runner_backed_snapshot_state,
+    _multipart_missing_detail,
+    _notify_runner_of_bundled_child,
+    _parse_session_create_metadata,
+    _permission_level_from_grants,
+    _presentation_labels_for_agent,
+    _prune_session_read_state,
+    _publish_collaboration_mode,
+    _publish_sandbox_status,
+    _publish_terminal_pending,
+    _reject_reserved_cost_control_label_seed,
+    _reject_server_reserved_label_seed,
+    _require_collaboration_mode_forward,
+    _require_cost_control_label_authority,
+    _reset_runner_resources_after_switch,
+    _same_provider_family,
+    _session_status_from_cache,
+    _set_read_state,
+    _title_content_from_item,
+    _validate_terminal_launch_args,
+    _validated_cost_control_mode_override,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _best_effort_stop,
+    _build_session_list_item,
+    _build_session_response,
+    _create_session_from_bundle,
+    _create_session_from_existing_agent,
+    _ensure_runner_relay_ready,
+    _get_session_snapshot,
+    _is_native_terminal_session,
+    _labels_for_viewer,
+    _persist_model_change_note,
+    _publish_runner_recovered_status,
+    _run_managed_launch,
+    _spawn_archive_stop,
+)
 from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -299,6 +355,7 @@ def register_core_routes(
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, resp.id, LEVEL_OWNER)
             resp.permission_level = await _get_permission_level(user_id, resp.id, permission_store)
+            resp.can_approve = True
         # Push the new session to this user's other open tabs (see the
         # multipart path above for the rationale).
         _announce_session_added(user_id, resp.id)
@@ -380,7 +437,12 @@ def register_core_routes(
         if launch_host_id is not None and resp.runner_id is None:
             host_registry = getattr(request.app.state, "host_registry", None)
             host_store_inst = getattr(request.app.state, "host_store", None)
-            if host_registry is not None and host_store_inst is not None:
+            host_permission_store = getattr(request.app.state, "host_permission_store", None)
+            if (
+                host_registry is not None
+                and host_store_inst is not None
+                and host_permission_store is not None
+            ):
                 from omnigent.host.frames import (
                     HostLaunchRunnerFrame,
                     encode_host_frame,
@@ -397,9 +459,7 @@ def register_core_routes(
                     host_registry=host_registry,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
-                    host_permission_store=getattr(
-                        request.app.state, "host_permission_store", None
-                    ),
+                    host_permission_store=host_permission_store,
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)
@@ -445,11 +505,11 @@ def register_core_routes(
                 )
                 host_registry.send_text(conn, launch_frame)
                 try:
-                    result = await asyncio.wait_for(future, timeout=30.0)
+                    launch_result = await asyncio.wait_for(future, timeout=30.0)
                 except asyncio.TimeoutError:
                     conn.pending_launches.pop(request_id, None)
-                    result = {"status": "failed", "error": "host launch timed out"}
-                if result.get("status") == "failed":
+                    launch_result = {"status": "failed", "error": "host launch timed out"}
+                if launch_result.get("status") == "failed":
                     # Lenient on every create-time launch failure, including
                     # an unconfigured harness: the picker's readiness data
                     # can be stale (the user may have run `omnigent setup`
@@ -463,7 +523,7 @@ def register_core_routes(
                         "Host %s failed to launch runner for session %s: %s",
                         launch_host_id,
                         resp.id,
-                        result.get("error"),
+                        launch_result.get("error"),
                     )
                     # The runner never booted, so its pending=False clear
                     # will never fire. Clear the spin-up flag here so a
@@ -699,6 +759,7 @@ def register_core_routes(
             conversation_store,
             session_id,
             access.level,
+            access.can_approve,
             agent_store,
             agent_cache,
             conversation=access.conversation,
@@ -903,6 +964,7 @@ def register_core_routes(
         # The tasks table has been removed — status comes exclusively from
         # the relay-fed ``_session_status_cache``.
         unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
+        perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
             perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
                 asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
@@ -925,7 +987,7 @@ def register_core_routes(
                     conv_ids,
                 ),
             )
-            perms_by_conv: dict[str, list[SessionPermission]] = {}
+            perms_by_conv = {}
             user_is_admin = False
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
@@ -1464,7 +1526,10 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
-        :returns: The updated :class:`SessionResponse` snapshot.
+        :returns: The updated :class:`SessionResponse` snapshot, with
+            ``items`` always empty — PATCH callers use only scalar
+            fields, and transcripts are served by
+            ``GET /sessions/{id}/items``.
         :raises OmnigentError: 400 if the runner is not
             registered; 404 if no session exists.
         """
@@ -1501,8 +1566,6 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
-        if body.archived is True:
-            await _best_effort_stop(session_id, conversation_store, runner_router)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -1741,6 +1804,18 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
+            # Stop the session now that the flag is committed, so a request
+            # rejected after this point can't leave a stopped-but-unarchived
+            # session. Detached, not awaited: the response must not wait out
+            # the stop's per-runner timeouts (seconds against a wedged or
+            # asleep runner). Archive has no client-side stop, so this also
+            # carries the host-runner teardown.
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+            )
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries
         # (today: claude-native, whose ``claude`` binary has
@@ -1873,14 +1948,27 @@ def register_core_routes(
                 )
                 if not filed:
                     raise _session_not_found()
-        level = await _get_permission_level(user_id, session_id, permission_store)
+        level, can_approve = await asyncio.gather(
+            _get_permission_level(user_id, session_id, permission_store),
+            _get_approval_access(
+                user_id,
+                session_id,
+                permission_store,
+                conversation_store,
+            ),
+        )
+        # PATCH callers consume only the snapshot's scalar fields (clients
+        # hydrate transcripts via GET /sessions/{id}/items), so skip the
+        # items read — it dominated this response's size and build time.
         return await _get_session_snapshot(
             conversation_store,
             session_id,
             level,
+            can_approve,
             agent_store,
             agent_cache,
             liveness_lookup=liveness_lookup,
+            include_items=False,
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
         )
@@ -1970,12 +2058,13 @@ def register_core_routes(
         # agent belongs to one conversation (possibly another user's) and
         # must never be cloned across sessions.
         base_agent = source_agent
-        switching_agent = body.agent_id is not None and body.agent_id != source.agent_id
-        if switching_agent:
-            target_agent = await asyncio.to_thread(agent_store.get, body.agent_id)
+        target_agent_id = body.agent_id
+        switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
+        if target_agent_id is not None and switching_agent:
+            target_agent = await asyncio.to_thread(agent_store.get, target_agent_id)
             if target_agent is None or target_agent.session_id is not None:
                 raise OmnigentError(
-                    f"Agent not found or not bindable: {body.agent_id!r}",
+                    f"Agent not found or not bindable: {target_agent_id!r}",
                     code=ErrorCode.NOT_FOUND,
                 )
             base_agent = target_agent
@@ -2041,6 +2130,18 @@ def register_core_routes(
             else None
         )
 
+        # Keep the fork filed in the source's first-class project, but only
+        # when the forker owns that project — projects are owner-private, so
+        # a fork of a shared session filed in someone else's project stays
+        # unfiled (a foreign project id would show in no folder view).
+        fork_project_id = None
+        if source.project_id is not None and project_store is not None:
+            owned = await asyncio.to_thread(
+                project_store.get, source.project_id, owner_user_id=user_id
+            )
+            if owned is not None:
+                fork_project_id = source.project_id
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -2061,6 +2162,7 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                project_id=fork_project_id,
             )
         except LookupError as exc:
             raise OmnigentError(
@@ -2090,6 +2192,7 @@ def register_core_routes(
             fork_items.data,
             "idle",
             permission_level=level,
+            can_approve=True if permission_store is not None else None,
             last_task_error=None,
             agent_name=base_agent.name,
         )
@@ -2274,6 +2377,14 @@ def register_core_routes(
                 code=ErrorCode.NOT_FOUND,
             ) from exc
 
+        # The catalog cache is keyed by session, not harness family, and
+        # outlives runner death — after a switch its rows may belong to the
+        # old wrapper. Drop them (and any in-flight fetch against the old
+        # endpoint) so the next live snapshot re-fetches the new family's.
+        _invalidate_runner_backed_snapshot_state(
+            session_id, cancel_inflight=True, drop_model_options=True
+        )
+
         # Tell every connected client the binding changed so they re-derive
         # session state (presentation labels, bound agent) from a fresh
         # snapshot. Without this, a client that bound before the switch keeps
@@ -2307,12 +2418,21 @@ def register_core_routes(
         background_tasks.add_task(_reset_runner_resources_after_switch, session_id)
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
-        level = await _get_permission_level(user_id, session_id, permission_store)
+        level, can_approve = await asyncio.gather(
+            _get_permission_level(user_id, session_id, permission_store),
+            _get_approval_access(
+                user_id,
+                session_id,
+                permission_store,
+                conversation_store,
+            ),
+        )
         return _build_session_response(
             updated,
             items.data,
             "idle",
             permission_level=level,
+            can_approve=can_approve,
             last_task_error=None,
             agent_name=target_agent.name,
         )

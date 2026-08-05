@@ -53,7 +53,8 @@ def test_model_services_are_paginated_filtered_and_version_sorted() -> None:
         "haiku": "system.ai.claude-haiku-4-5",
     }
     assert len(requests) == 2
-    assert requests[0].url.params["page_size"] == "100"
+    assert requests[0].url.params["max_results"] == "1000"
+    assert requests[0].url.params["parent"] == "schemas/system.ai"
 
 
 def test_anthropic_gateway_is_the_legacy_fallback() -> None:

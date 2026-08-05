@@ -667,6 +667,7 @@ def test_append_error_item_round_trips_for_history(
         "response_id": "resp_failed",
         "type": "error",
         "status": "completed",
+        "created_at": read_back.created_at,
         "source": "execution",
         "code": "native_terminal_start_failed",
         "message": "Native Codex requires the 'codex' CLI on PATH.",
@@ -751,9 +752,9 @@ def test_position_not_enforced_by_db(
 
     # Neither a same-second nor a later-second duplicate is rejected now: the
     # index is not UNIQUE, and distinct ids keep the PK unique so both persist.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at))
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at + 1))
 
 
@@ -1090,6 +1091,28 @@ def test_list_items_before_cursor(
     # asc order: [0, 1, 2, 3, 4]; before item[3] should give [0, 1, 2]
     page = conversation_store.list_items(conv.id, before=items[3].id, order="asc")
     assert [it.id for it in page.data] == [items[i].id for i in range(3)]
+
+
+def test_list_items_cursor_scoped_to_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A cursor id from another conversation resolves to no position.
+
+    The cursor subquery is scoped to conversation_id so it stays a
+    primary-key point lookup. A foreign cursor id therefore matches no
+    row, the scalar subquery is NULL, and the position comparison yields
+    an empty page rather than silently using the other conversation's
+    position as a cutoff.
+    """
+    conv = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    _make_5_items(conversation_store, conv.id)
+    other_items = _make_5_items(conversation_store, other.id)
+
+    after_page = conversation_store.list_items(conv.id, after=other_items[1].id)
+    assert after_page.data == []
+    before_page = conversation_store.list_items(conv.id, before=other_items[1].id)
+    assert before_page.data == []
 
 
 # ── Conversation ID / response ID lookups ────────────
@@ -3256,6 +3279,23 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+def test_fork_conversation_files_into_project(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``project_id=`` files the fork; the default leaves it unfiled even
+    when the source itself is filed (the route resolves ownership)."""
+    project_id = "b" * 32
+    source = conversation_store.create_conversation(title="src")
+    conversation_store.set_conversation_project(source.id, project_id)
+
+    filed_fork = conversation_store.fork_conversation(source.id, project_id=project_id)
+    assert filed_fork.project_id == project_id
+    assert conversation_store.get_conversation(filed_fork.id).project_id == project_id
+
+    unfiled_fork = conversation_store.fork_conversation(source.id)
+    assert unfiled_fork.project_id is None
+
+
 def test_fork_copies_terminal_launch_args_by_default(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -4494,7 +4534,7 @@ def _stored_next_position(
     """Read the raw ``conversations.next_position`` counter for assertions."""
     from omnigent.db.db_models import SqlConversation
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         row = session.get(SqlConversation, (0, conversation_id))
         assert row is not None
         return row.next_position
@@ -4509,7 +4549,7 @@ def _stored_positions(
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         return sorted(
             session.execute(
                 select(SqlConversationItem.position).where(
@@ -4564,7 +4604,7 @@ def test_append_reads_counter_not_max_scan(
     conv = conversation_store.create_conversation()
     conversation_store.append(conv.id, [_user_message("a"), _user_message("b")])
     # Real max position is 1; jump the counter ahead to 100.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = 100
 
     conversation_store.append(conv.id, [_user_message("c")])
@@ -4590,7 +4630,7 @@ def test_append_falls_back_to_scan_when_counter_null(
     if preexisting:
         conversation_store.append(conv.id, [_user_message(f"pre{i}") for i in range(preexisting)])
     # Simulate a pre-counter row: clear the maintained counter.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = None
     assert _stored_next_position(conversation_store, conv.id) is None
 
@@ -5140,7 +5180,7 @@ def _stored_item_data(store: SqlAlchemyConversationStore, conversation_id: str) 
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         return list(
             session.execute(
                 select(SqlConversationItem.data)
@@ -5255,7 +5295,7 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
         ],
     )
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         stored = list(
             session.execute(
                 select(SqlConversationItem.search_text).where(

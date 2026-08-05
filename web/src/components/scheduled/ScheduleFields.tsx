@@ -81,12 +81,14 @@ export function ScheduleFields({
   const hourColumnRef = useRef<HTMLDivElement | null>(null);
   const minuteColumnRef = useRef<HTMLDivElement | null>(null);
   const periodColumnRef = useRef<HTMLDivElement | null>(null);
-  const [timeText, setTimeText] = useState(() => formatInputValue(model, isHourly));
+  const [timeText, setTimeText] = useState(() =>
+    formatInputValue(model.hour, model.minute, isHourly),
+  );
   const [timePickerOpen, setTimePickerOpen] = useState(false);
 
   useEffect(() => {
     if (document.activeElement === inputRef.current) return;
-    setTimeText(formatInputValue(model, isHourly));
+    setTimeText(formatInputValue(model.hour, model.minute, isHourly));
   }, [isHourly, model.hour, model.minute]);
 
   const pickerParts = toPickerParts(getPickerTime());
@@ -227,7 +229,7 @@ export function ScheduleFields({
               value={timeText}
               data-testid="schedule-minute"
               placeholder="0"
-              className="text-sm"
+              className="text-ui"
               aria-invalid={error ? true : undefined}
               onChange={(e) => handleTimeTextChange(e.target.value)}
               onBlur={canonicalizeTimeText}
@@ -242,7 +244,7 @@ export function ScheduleFields({
                     value={timeText}
                     data-testid="schedule-time"
                     placeholder="5:00 PM"
-                    className="pr-8 text-sm"
+                    className="pr-8 text-ui"
                     aria-invalid={error ? true : undefined}
                     onFocus={() => handleTimePickerOpenChange(true)}
                     onChange={(e) => handleTimeTextChange(e.target.value)}
@@ -363,10 +365,10 @@ function pad(n: number): string {
   return n.toString().padStart(2, "0");
 }
 
-function formatInputValue(model: ScheduleModel, isHourly: boolean): string {
-  if (isHourly) return formatMinuteInput(model.minute);
-  if (!Number.isInteger(model.hour) || !Number.isInteger(model.minute)) return "";
-  return formatTimeInput(model.hour, model.minute);
+function formatInputValue(hour: number, minute: number, isHourly: boolean): string {
+  if (isHourly) return formatMinuteInput(minute);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return "";
+  return formatTimeInput(hour, minute);
 }
 
 function formatMinuteInput(minute: number): string {
@@ -421,7 +423,7 @@ function PickerCell({
       data-selected={selected ? "true" : undefined}
       data-testid={testId}
       className={cn(
-        "flex h-8 w-full items-center justify-center rounded-sm text-sm transition-colors",
+        "flex h-8 w-full items-center justify-center rounded-sm text-ui transition-colors",
         selected ? "bg-primary text-primary-foreground" : "text-foreground hover:bg-muted",
       )}
       onClick={onClick}

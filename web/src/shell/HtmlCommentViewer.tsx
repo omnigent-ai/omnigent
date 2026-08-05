@@ -12,7 +12,7 @@
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
-import { type Comment } from "@/hooks/useComments";
+import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { getEmbedRoot } from "@/lib/host";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
@@ -233,7 +233,6 @@ export function HtmlCommentViewer({
     <iframe
       ref={iframeRef}
       srcDoc={srcDoc}
-      // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
       sandbox={HTML_PREVIEW_SANDBOX}
       title="HTML preview"
       className="w-full h-full border-0"

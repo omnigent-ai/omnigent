@@ -180,12 +180,33 @@ export function filterConversations(
 // pill. The active chat uses its frozen snapshot from
 // `activeOverride` instead of its live `updated_at`, so sending a message
 // in the chat you're already viewing doesn't move it.
+//
+// `frozenKeys` (when non-null) pins EVERY row's sort key at its
+// first-seen value: a row's key is read from the map, or captured into it
+// on first sight. The sidebar passes its map while the pointer is inside
+// the list, so background `updated_at` bumps can't slide rows under the
+// cursor — a mid-interaction reorder sends clicks, right-clicks, and the
+// renames they trigger to the wrong session. Rows first seen while frozen
+// (a folder expanding, a page loading) capture their key on entry, and
+// the caller clears the map when the pointer leaves so the order snaps
+// back to reality.
 export function sortByUpdatedAtDesc(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
+  frozenKeys?: Map<string, number> | null,
 ): Conversation[] {
-  const effective = (c: Conversation): number =>
-    activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+  const effective = (c: Conversation): number => {
+    if (frozenKeys) {
+      const frozen = frozenKeys.get(c.id);
+      if (frozen !== undefined) return frozen;
+      // Capture the override value for the active row so dropping the
+      // override mid-hover (navigating to another chat) can't move it.
+      const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+      frozenKeys.set(c.id, live);
+      return live;
+    }
+    return activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+  };
   return [...conversations].sort((a, b) => effective(b) - effective(a));
 }
 

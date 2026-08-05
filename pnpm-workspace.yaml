@@ -2,13 +2,24 @@ packages:
   - 'web'
   - 'web/electron'
   - '.github/ci-deps'
+  - 'editors/vscode'
+  - 'deploy/cloudflare'
 
 settings:
   # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
   minimumReleaseAge: 10080
   autoInstallPeers: false
   strictPeerDependencies: false
-  nodeLinker: hoisted
+
+# jest-dom doesn't declare vitest as a (peer) dependency, so under pnpm's store
+# layout its `declare module "vitest"` matcher-type augmentation can't resolve
+# vitest and silently fails to merge — `tsc` then loses every DOM matcher
+# (toBeInTheDocument, toHaveClass, …) though they work at runtime. Re-enable the
+# peer so the augmentation resolves. Drop once jest-dom ships the peer upstream.
+packageExtensions:
+  '@testing-library/jest-dom':
+    peerDependencies:
+      vitest: '*'
 
 catalog:
   react: ^18.2.0
@@ -26,8 +37,8 @@ overrides:
   '@tailwindcss/postcss': 4.3.1
   jiti: 2.7.0
   lightningcss: 1.32.0
-  postcss: 8.5.15
-  linkify-it: 5.0.1
+  postcss: 8.5.18
+  linkify-it: 5.0.2
   shiki: "catalog:"
   react: "catalog:"
   react-dom: "catalog:"
@@ -75,7 +86,12 @@ overrides:
 allowBuilds:
   '@anthropic-ai/claude-code': true
   '@google/genai': true
+  '@vscode/vsce-sign': true
   canvas: true
   electron-winstaller: true
+  esbuild: true
+  keytar: true
   msw: true
   protobufjs: true
+  sharp: true
+  workerd: true

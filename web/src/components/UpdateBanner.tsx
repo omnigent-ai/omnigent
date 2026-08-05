@@ -129,7 +129,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
       role={isError ? "status" : "region"}
       aria-label="Desktop update"
       className={cn(
-        "rounded-xl border border-border bg-background p-3.5 text-sm shadow-lg",
+        "rounded-xl border border-border bg-background p-3.5 text-ui shadow-lg",
         // `floating`: pin bottom-right for the in-page web build. `bare`: fill
         // the shell's overlay window, which supplies position + size itself.
         variant === "floating"

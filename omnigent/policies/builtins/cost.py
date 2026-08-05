@@ -68,8 +68,8 @@ a non-empty ``arguments`` block (the registry declares it
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -111,7 +111,7 @@ _UNPRICED_ASK: PolicyResponse = {
 }
 
 
-def _usage_is_unpriced(usage: dict[str, Any]) -> bool:
+def _usage_is_unpriced(usage: Mapping[str, object]) -> bool:
     """Return ``True`` when token usage is present but cost is unpriced.
 
     The session has had at least one turn (token counters are non-zero) yet
@@ -500,7 +500,7 @@ def cost_budget(
             a new soft checkpoint is newly crossed; ALLOW otherwise.
         """
         phase = event.get("type")
-        if phase not in _GATED_PHASES:
+        if not isinstance(phase, str) or phase not in _GATED_PHASES:
             return _ALLOW
         context = event.get("context") or {}
         if _usage_is_unpriced(context.get("usage") or {}):
@@ -533,7 +533,10 @@ def cost_budget(
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
                 state = event.get("session_state") or {}
-                approved_up_to = float(state.get(_ASK_APPROVED_KEY, 0.0) or 0.0)
+                approved_value = state.get(_ASK_APPROVED_KEY, 0.0)
+                approved_up_to = (
+                    float(approved_value) if isinstance(approved_value, int | float | str) else 0.0
+                )
                 if crossed > approved_up_to:
                     limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd is not None else ""
                     return {
@@ -552,7 +555,7 @@ def cost_budget(
                     }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 def _user_daily_cost_usd(event: PolicyEvent) -> float:
@@ -676,7 +679,7 @@ def user_daily_cost_budget(
             otherwise.
         """
         phase = event.get("type")
-        if phase not in _GATED_PHASES:
+        if not isinstance(phase, str) or phase not in _GATED_PHASES:
             return _ALLOW
         context = event.get("context") or {}
         if _usage_is_unpriced(context.get("usage") or {}):
@@ -737,7 +740,7 @@ def user_daily_cost_budget(
                     }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # session_state key recording the highest ``ask_thresholds_usd`` checkpoint
@@ -820,7 +823,7 @@ def subagent_cost_budget(
             a new soft checkpoint is newly crossed; ALLOW otherwise.
         """
         phase = event.get("type")
-        if phase not in _GATED_PHASES:
+        if not isinstance(phase, str) or phase not in _GATED_PHASES:
             return _ALLOW
         context = event.get("context") or {}
         if _usage_is_unpriced(context.get("subtree_usage") or {}):
@@ -855,7 +858,10 @@ def subagent_cost_budget(
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
                 state = event.get("session_state") or {}
-                approved_up_to = float(state.get(_SUBAGENT_ASK_APPROVED_KEY, 0.0) or 0.0)
+                approved_value = state.get(_SUBAGENT_ASK_APPROVED_KEY, 0.0)
+                approved_up_to = (
+                    float(approved_value) if isinstance(approved_value, int | float | str) else 0.0
+                )
                 if crossed > approved_up_to:
                     limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd else ""
                     return {
@@ -874,12 +880,12 @@ def subagent_cost_budget(
                     }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.cost.cost_budget",
         "kind": "factory",
