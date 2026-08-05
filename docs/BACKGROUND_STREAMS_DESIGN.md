@@ -502,8 +502,18 @@ so the existing 328 tests are the regression net; only phase 3 changes semantics
   guards to liveness checks so background pumps keep reconnecting and
   reconciling, and delete `transcriptCache`, `pendingByConversation`, and the
   cache-bridge paths. The feature lands here. Presence is untouched (§ 5).
+  ✅ `3fc0adb2` (registry) → `8617e6df` (feature) → `f2472cb7` (stagger +
+  cache-merge cleanup)
+
+  Net −566 lines across the feature commit. Two bugs surfaced only by wiring it
+  up, both now covered by tests: `send` on the landing route pushes its
+  optimistic bubble before the session exists (buffered on the root store, then
+  adopted by the new entry), and late-settling send work must land on the
+  conversation it targeted rather than the visible one.
 - **Phase 4** *(optional)* — drop the mirror, migrate components to
-  `useActiveConversation(selector)`.
+  `useActiveConversation(selector)`. Not needed for correctness: the mirror is
+  one shallow projection per change on the active conversation, and it is what
+  keeps 45 of 46 consumer files untouched.
 
 A follow-on this unlocks: the sidebar could read live per-conversation state
 (working spinner, token counts) straight from entries instead of the
@@ -515,8 +525,8 @@ A follow-on this unlocks: the sidebar could read live per-conversation state
    is forced by HTTP/1.1. Enabling `server.https` in the dev server (Vite 8 then
    serves HTTP/2) lets dev converge on 30 — worth doing soon after, so developers
    exercise production's eviction rate.
-2. Whether the reconnect stagger is worth adding up front or only if 30
-   simultaneous recycles actually show up as a burst in practice.
+2. ~~Whether the reconnect stagger is worth adding up front~~ — added in
+   `f2472cb7`; background entries only.
 
 *Settled:*
 - *memory is unbounded by choice (§ Layer 2);*
