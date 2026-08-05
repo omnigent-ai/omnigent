@@ -325,7 +325,7 @@ function DictationSection() {
       description="Choose how voice dictation works on this device. These preferences stay in this browser and are not synced to your account."
     >
       <div className="flex flex-col gap-8">
-        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-x-6">
           <div className="flex min-w-0 flex-1 flex-col">
             <span className="text-sm font-medium">Dictation path</span>
             <span className="text-sm text-muted-foreground">
@@ -340,7 +340,7 @@ function DictationSection() {
             onValueChange={(value) => update({ path: value as DictationPath })}
           >
             <SelectTrigger
-              className="w-full max-w-48 shrink-0"
+              className="w-full shrink-0 sm:max-w-48"
               data-testid="dictation-path-select"
               aria-label="Dictation path"
             >
@@ -354,7 +354,7 @@ function DictationSection() {
           </Select>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-x-6">
           <div className="flex min-w-0 flex-1 flex-col">
             <span className="text-sm font-medium">Browser recognition language</span>
             <span className="text-sm text-muted-foreground">
@@ -380,13 +380,13 @@ function DictationSection() {
             }}
             aria-label="Browser recognition language"
             aria-invalid={languageInvalid || undefined}
-            className="h-9 w-full max-w-48 shrink-0"
+            className="h-9 w-full shrink-0 sm:max-w-48"
             spellCheck={false}
             maxLength={64}
           />
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-x-6">
           <div className="flex min-w-0 flex-1 flex-col">
             <span className="text-sm font-medium">Microphone</span>
             <span className="text-sm text-muted-foreground">
@@ -401,7 +401,7 @@ function DictationSection() {
             }
           >
             <SelectTrigger
-              className="w-full max-w-64 shrink-0"
+              className="w-full shrink-0 sm:max-w-64"
               data-testid="dictation-microphone-select"
               aria-label="Microphone"
             >
