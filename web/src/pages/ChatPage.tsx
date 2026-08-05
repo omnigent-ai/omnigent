@@ -1157,13 +1157,16 @@ export function ChatPage() {
   // the CLI instructions instead so users learn the right entry point.
   if (!urlConvId) return <NewChatLandingScreen />;
 
-  // Pick the reconnect dialog's state from liveness. The dialog only
-  // opens for the two unreachable variants; `host_offline` carries
-  // ownership (a non-owner can't reach the host machine). Any other
-  // liveness defaults to `local_stranded` — harmless since the dialog
-  // stays closed unless an unreachable interaction opened it.
-  const reconnectState = liveness.kind === "host_offline" ? "host_offline" : "local_stranded";
-  const reconnectIsOwner = liveness.kind === "host_offline" ? liveness.isOwner : true;
+  // Pick the reconnect dialog's state from the session's host binding, not
+  // from liveness: the dialog opens both from an unreachable send AND from the
+  // composer's host badge, which offers reconnect whenever the host tunnel is
+  // down — including states liveness still calls reachable (a runner that
+  // outlived its host). A host-bound session always reconnects via
+  // `omnigent host`; only an unbound one relaunches locally. Ownership gates
+  // the host command — a non-owner can't reach that machine.
+  const hostBound = !!(activeSession?.hostId ?? activeConv?.host_id);
+  const reconnectState = hostBound ? "host_offline" : "local_stranded";
+  const reconnectIsOwner = isOwnerLevel(permissionLevel);
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
@@ -1770,6 +1773,7 @@ function MainAgentSurface({
                     bubble={bubble}
                     canApprove={canApprove}
                     isLastAssistant={bubbleIndex === lastAssistantIndex}
+                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
                   />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
@@ -1898,7 +1902,6 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
-        hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
@@ -2775,14 +2778,13 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
-    // A `host_offline` session moves the reconnect affordance up into the
-    // composer's host badge (ComposerStatusLine), where the host is already
-    // named — so render nothing here whenever that composer is on screen
-    // (sub-agent sessions included; their badge carries it just like a normal
-    // session's). The composer is hidden only in the terminal-first *terminal*
-    // view (the PTY owns the surface); there the banner still carries the
-    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
-    // no badge).
+    // A host-bound session carries the reconnect affordance in the composer's
+    // host badge (ComposerStatusLine), which names the host that dropped — so
+    // render nothing here whenever that composer is on screen (sub-agent
+    // sessions included; their badge carries it just like a normal session's).
+    // The composer is hidden only in the terminal-first *terminal* view (the
+    // PTY owns the surface); there the banner still carries the affordance.
+    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
       return null;
@@ -3122,10 +3124,12 @@ export const BubbleView = memo(
     bubble,
     canApprove = true,
     isLastAssistant = false,
+    showsWorking = false,
   }: {
     bubble: Bubble;
     canApprove?: boolean;
     isLastAssistant?: boolean;
+    showsWorking?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
@@ -3143,12 +3147,18 @@ export const BubbleView = memo(
       );
     }
     return (
-      <AssistantBubble bubble={bubble} canApprove={canApprove} isLastAssistant={isLastAssistant} />
+      <AssistantBubble
+        bubble={bubble}
+        canApprove={canApprove}
+        isLastAssistant={isLastAssistant}
+        showsWorking={showsWorking}
+      />
     );
   },
   (prev, next) =>
     prev.canApprove === next.canApprove &&
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
+    (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -3369,10 +3379,12 @@ function AssistantBubble({
   bubble,
   canApprove,
   isLastAssistant = false,
+  showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   canApprove: boolean;
   isLastAssistant?: boolean;
+  showsWorking?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
@@ -3421,6 +3433,7 @@ function AssistantBubble({
             isLastAssistant={isLastAssistant}
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
+            showsWorking={showsWorking}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -3555,13 +3568,10 @@ interface ComposerProps {
    */
   unreachable?: boolean;
   /**
-   * The session is host-bound to an offline, non-resumable host
-   * (`host_offline`): the composer's host badge turns into a clickable
-   * "Host is offline — click to reconnect" affordance (see HostBadge's
-   * `onReconnect`), replacing the separate banner below the composer.
+   * Open the reconnect help dialog. Always wired to the status line's host
+   * badge, which turns itself into a clickable reconnect affordance whenever
+   * its bound host is offline and reconnectable.
    */
-  hostOffline?: boolean;
-  /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
   onShowReconnectHelp?: () => void;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
@@ -3783,10 +3793,9 @@ function ComposerStatusLine({
   goal: Goal | null;
   isSubAgentSession: boolean;
   /**
-   * When set (`host_offline` liveness), the host badge becomes a clickable
-   * "Host is offline — click to reconnect" affordance. Also forces the tray
-   * to render even when it would otherwise be empty, so the prompt is always
-   * visible for an unreachable host.
+   * Opens the reconnect help dialog, handed to the host badge — which turns
+   * itself into a clickable reconnect affordance when its bound host is
+   * offline and reconnectable.
    */
   onHostReconnect?: () => void;
 }) {
@@ -3816,19 +3825,14 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  // The offline-host reconnect affordance lives in the host badge, so the tray
-  // must render even when every other slot is empty (an unreachable session
-  // often has no branch/ring yet). Gated by `showHost`: only host-bound
-  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
-  // never host-bound — a stranded child is `local_stranded`, which keeps its
-  // banner elsewhere.
-  const showReconnect = showHost && !!onHostReconnect;
   // A host-bound session shows the badge, so the tray must render for it even
   // with no branch/ring yet — otherwise the host + context footer vanishes for
   // sessions with no worktree branch (e.g. codex) until the ring populates.
+  // This also keeps the offline host's reconnect affordance on screen, since
+  // the badge is where it lives and an unreachable session often has no
+  // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showReconnect && !showHostBadge)
-    return null;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
 
   return (
     <div
@@ -3983,7 +3987,6 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
-  hostOffline = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
   subAgentLabel = null,
@@ -5210,7 +5213,7 @@ export function Composer({
       <ComposerStatusLine
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
-        onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
+        onHostReconnect={onShowReconnectHelp}
       />
     </form>
   );
@@ -6024,23 +6027,35 @@ function useResolvedComposerModel(
   // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
   // so like cursor/kiro/opencode the live model is the session override, never
   // the cross-session sticky ``selectedModel``.
+  // The sticky is this session's model only when the session itself advertises
+  // it. `switchTo` clears the session-scoped fields but deliberately keeps
+  // `selectedModel`, so until the incoming snapshot lands the catalog is empty
+  // and the sticky still holds the OUTGOING session's pick — surfacing it paints
+  // e.g. a Codex gpt-5.5 on a Claude session for the whole bind round trip.
+  // Gating on the session's own catalog mirrors the compatibility rule bindStream
+  // applies a moment later, so the label never advertises a model this session
+  // would reject. Post-bind this is a no-op: the store only ever leaves a
+  // catalog-compatible sticky (or the override) in `selectedModel`.
+  const sessionStickyModel =
+    findNativeModelOption(codexModelOptions, selectedModel) !== null ? selectedModel : null;
   const pickerSelectedModel =
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "pi"
       ? sessionModelOverride
-      : (sessionModelOverride ?? selectedModel);
+      : (sessionModelOverride ?? sessionStickyModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
   // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
-  // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
-  // there the sticky IS the applied model.
+  // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
+  // there it IS the applied model — but only once this session's catalog vouches
+  // for it (see `sessionStickyModel`).
   const nonNativeModel =
     modelPickerKind === null
       ? (sessionModelOverride ?? llmModel)
-      : (sessionModelOverride ?? selectedModel ?? llmModel);
+      : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it

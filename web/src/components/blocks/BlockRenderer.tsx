@@ -371,6 +371,8 @@ interface BlockRendererProps {
   hasPendingElicitation?: boolean;
   /** Server epoch seconds of the turn's newest item (`Bubble.lastActivityAtS`). */
   lastActivityAtS?: number;
+  /** Whether this final bubble is still part of a visible active turn. */
+  showsWorking?: boolean;
 }
 
 type ToolRunFragment =
@@ -394,9 +396,12 @@ export function BlockRenderer({
   isLastAssistant = false,
   hasPendingElicitation = false,
   lastActivityAtS,
+  showsWorking = false,
 }: BlockRendererProps) {
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
-  const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
+  const isTurnLive =
+    (turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive) ||
+    (isLastAssistant && showsWorking);
 
   // Fold a turn that did work AND either answered here or continues in a
   // later bubble: the trace collapses behind the "Worked for" row, exempt
@@ -473,13 +478,17 @@ export function BlockRenderer({
         <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
           {renderSequence(process, { liveEdge: false, canApprove })}
         </TurnWorkedFold>
-        {exempt.map(({ item, index }) => renderItem(item, index, false, false, canApprove))}
+        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false, canApprove))}
         {renderSequence(final, { liveEdge: false, canApprove, indexBase: finalStart })}
       </>
     );
   }
 
-  return renderSequence(items, { liveEdge: isTurnLive, canApprove });
+  return renderSequence(items, {
+    liveEdge: isTurnLive,
+    canApprove,
+    suppressReasoningDuration: showsWorking,
+  });
 }
 
 /**
@@ -491,7 +500,7 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, canApprove, indexBase = 0 }: TurnSequenceOptions,
+  { liveEdge, canApprove, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -547,7 +556,14 @@ function renderSequence(
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
     rendered.push(
-      renderItem(item, indexBase + i, i === reasoningStreamingIdx, followsText, canApprove),
+      renderItem(
+        item,
+        indexBase + i,
+        i === reasoningStreamingIdx,
+        suppressReasoningDuration,
+        followsText,
+        canApprove,
+      ),
     );
     previousRenderedItemWasText = item.kind === "text";
   }
@@ -558,6 +574,7 @@ function renderSequence(
 interface TurnSequenceOptions {
   liveEdge: boolean;
   canApprove: boolean;
+  suppressReasoningDuration?: boolean;
   indexBase?: number;
 }
 
@@ -877,6 +894,7 @@ function renderItem(
   item: RenderItem,
   index: number,
   isReasoningStreaming: boolean,
+  suppressReasoningDuration = false,
   followsText = false,
   canApprove = true,
 ): ReactNode {
@@ -898,7 +916,7 @@ function renderItem(
           key={key}
           text={item.text}
           isStreaming={isReasoningStreaming}
-          duration={item.duration}
+          duration={suppressReasoningDuration ? undefined : item.duration}
         />
       );
     case "tool":
