@@ -139,22 +139,31 @@ class GitHubAPI:
             "POST", f"/repos/{self.repo}/issues/{issue_number}/labels", {"labels": [label]}
         )
 
-    def request_review(self, pull_number: int, reviewers: list[str]) -> None:
-        # Best effort: a reviewer who lost repo access, or the PR author, is
-        # rejected with 422, and that must not fail the handoff.
-        if not reviewers:
-            return
-        try:
-            self.request(
-                "POST",
-                f"/repos/{self.repo}/pulls/{pull_number}/requested_reviewers",
-                {"reviewers": reviewers},
-            )
-        except urllib.error.HTTPError as error:
-            if error.code in (403, 422):
-                print(f"::warning::Could not re-request review on #{pull_number}: {error.code}")
-                return
-            raise
+    def request_review(self, pull_number: int, reviewers: list[str]) -> int:
+        """Re-request each reviewer, returning how many were queued.
+
+        One request per reviewer: GitHub rejects the whole batch when any single
+        login is invalid (a 422 for a non-collaborator), which would silently drop
+        the reviewers who are still valid.
+        """
+        queued = 0
+        for reviewer in reviewers:
+            try:
+                self.request(
+                    "POST",
+                    f"/repos/{self.repo}/pulls/{pull_number}/requested_reviewers",
+                    {"reviewers": [reviewer]},
+                )
+                queued += 1
+            except urllib.error.HTTPError as error:
+                if error.code in (403, 422):
+                    print(
+                        f"::warning::Could not re-request @{reviewer} on "
+                        f"#{pull_number}: {error.code}"
+                    )
+                    continue
+                raise
+        return queued
 
     def close_pull(self, pull_number: int) -> None:
         self.request("PATCH", f"/repos/{self.repo}/pulls/{pull_number}", {"state": "closed"})
@@ -207,7 +216,12 @@ def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> N
         )
         if login and login.lower() != author
     ]
-    api.request_review(number, sorted(set(owners)))
+    queued = api.request_review(number, sorted(set(owners))) if owners else 0
+    if not queued:
+        # The label says "ready for a reviewer", so an empty queue makes it a lie
+        # to whoever filters on it. Auto-assign normally populates assignees, so
+        # this means something upstream skipped the PR.
+        print(f"::warning::#{number} is {REVIEW_LABEL} with no reviewer queued")
 
 
 def user_login(item: dict[str, Any]) -> str | None:

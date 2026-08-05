@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import unittest
+import urllib.error
 from datetime import UTC, datetime
+from email.message import Message
 from typing import Any
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("waiting_on_author.py")
@@ -104,8 +106,9 @@ class FakeAPI:
     def add_label(self, issue_number: int, label: str) -> None:
         self.added.append((issue_number, label))
 
-    def request_review(self, pull_number: int, reviewers: list[str]) -> None:
+    def request_review(self, pull_number: int, reviewers: list[str]) -> int:
         self.review_requests.append((pull_number, reviewers))
+        return len(reviewers)
 
     def close_pull(self, pull_number: int) -> None:
         self.closed.append(pull_number)
@@ -325,6 +328,26 @@ class WaitingForReviewTest(unittest.TestCase):
         )
         self.assertFalse(handled)
         self.assertEqual(api.removed, [])
+
+    def test_one_invalid_reviewer_does_not_drop_the_others(self) -> None:
+        # GitHub 422s the whole batch when any login is invalid, so the request
+        # has to be per-reviewer or the valid owners are silently skipped.
+        posted: list[list[str]] = []
+
+        class OneBadReviewerAPI(waiting_on_author.GitHubAPI):
+            def __init__(self) -> None:
+                super().__init__("token", "omnigent-ai/omnigent")
+
+            def request(self, method: str, path: str, body: dict[str, Any] | None = None):
+                reviewers = (body or {}).get("reviewers", [])
+                posted.append(reviewers)
+                if reviewers == ["gone"]:
+                    raise urllib.error.HTTPError(path, 422, "not a collaborator", None, None)
+                return None, Message()
+
+        queued = OneBadReviewerAPI().request_review(12, ["gone", "maintainer1"])
+        self.assertEqual(posted, [["gone"], ["maintainer1"]], "one call per reviewer")
+        self.assertEqual(queued, 1, "the valid reviewer is still queued")
 
     def test_scheduled_sweep_hands_off_when_author_replied(self) -> None:
         api = FakeAPI(
