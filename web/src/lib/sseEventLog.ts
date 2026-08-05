@@ -36,16 +36,20 @@ function getOrCreate(sessionId: string): SessionLog {
   return log;
 }
 
-function isDebugMode(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).get("debug") === "1"
-  );
+// Cache the debug flag so pushSseEvent is a single boolean check per call.
+// Updated on popstate so SPA navigation that adds/removes ?debug=1 is picked up.
+let debugMode =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debug") === "1";
+
+if (typeof window !== "undefined") {
+  window.addEventListener("popstate", () => {
+    debugMode = new URLSearchParams(window.location.search).get("debug") === "1";
+  });
 }
 
 /** Push one event into the session's ring buffer. No-op when debug is off. */
 export function pushSseEvent(sessionId: string, event: StreamEvent): void {
-  if (!isDebugMode()) return;
+  if (!debugMode) return;
   const log = getOrCreate(sessionId);
   const entry: SseLogEntry = { index: log.nextIndex++, ts: Date.now(), event };
   if (log.entries.length >= MAX_EVENTS) {
