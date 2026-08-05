@@ -34,6 +34,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
 import { INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import type {
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -7402,6 +7403,59 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("recomputes the idle flag on every reconnect, so a backgrounded tab reports idle", async () => {
+    // The `idle` query param on the stream GET is the whole presence uplink, so
+    // the flag has to be recomputed at each (re)connect rather than reused from
+    // the first open — that is what keeps presence eventually-correct even when
+    // a background tab's debounce timer never fires.
+    //
+    // This covers the recompute, NOT the abort that triggers it: the mock body
+    // stream has no signal wiring, so the drop is simulated explicitly below.
+    // `presenceAttemptControllers` (one controller per live stream) is covered
+    // directly in "presence idle tracker" instead.
+    seedSession("conv_pflip", []);
+    const opened: { id: string; idle: boolean }[] = [];
+    const sinks: StreamSink[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const match = /\/v1\/sessions\/([^/?]+)\/stream(\?idle=true)?$/.exec(url);
+      if (match) {
+        opened.push({ id: match[1]!, idle: match[2] !== undefined });
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_pflip", abortController: controller });
+    const loop = startStreamPump("conv_pflip", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(opened).toEqual([{ id: "conv_pflip", idle: false }]);
+
+    // Tab goes hidden; past the debounce the tracker reports idle by aborting
+    // the live attempt.
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(PRESENCE_IDLE_AFTER_MS + 1000);
+
+    // A real fetch errors the response body when its signal aborts; the mock
+    // stream has no signal wiring, so surface that here. The pump reads the
+    // failed read as a drop and reopens carrying the recomputed idle flag.
+    sinks[0]!.error(Object.assign(new Error("aborted"), { name: "AbortError" }));
+    await vi.advanceTimersByTimeAsync(6000);
+
+    expect(opened.slice(1)).toEqual([{ id: "conv_pflip", idle: true }]);
+
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    controller.abort();
+    // Only the reopened stream is still open — the first was errored above.
+    sinks[sinks.length - 1]!.close();
     await drainAsync(2);
     await loop;
   });

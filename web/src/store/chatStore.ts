@@ -3204,9 +3204,16 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
 // by recycling the live stream attempt — the same abort-and-reopen the
 // ingress already forces every ~5 minutes. The tracker aborts only the
 // per-attempt controller; the outer controller (teardown) stays live.
-let presenceAttemptController: AbortController | null = null;
+// One entry per live stream: an idle flip must recycle EVERY open stream,
+// since each carries its own `idle` uplink. A single controller would leave
+// all but one stream reporting a stale flag once streams outlive a switch.
+const presenceAttemptControllers = new Set<AbortController>();
 const presenceIdle = createPresenceIdleTracker({
-  onFlip: () => presenceAttemptController?.abort(),
+  onFlip: () => {
+    // Copy first: aborting settles each attempt's `finally`, which mutates
+    // this set while we iterate it.
+    for (const controller of [...presenceAttemptControllers]) controller.abort();
+  },
 });
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () =>
@@ -3272,7 +3279,7 @@ export async function startStreamPump(
       const attempt = new AbortController();
       const onOuterAbort = () => attempt.abort();
       controller.signal.addEventListener("abort", onOuterAbort);
-      presenceAttemptController = attempt;
+      presenceAttemptControllers.add(attempt);
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -3359,9 +3366,7 @@ export async function startStreamPump(
         if (reason !== "dropped") break;
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
-        if (presenceAttemptController === attempt) {
-          presenceAttemptController = null;
-        }
+        presenceAttemptControllers.delete(attempt);
       }
     }
   } finally {
