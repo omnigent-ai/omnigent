@@ -221,12 +221,35 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_installs: Per-``request_id`` futures for in-flight
+        ``host.install_harness`` requests. Resolved when the host sends
+        ``host.install_harness_result``. Values carry the result fields
+        (``status``, ``configured_harnesses``, ``error``). Same ``Any``
+        typing rationale as ``pending_stats``.
+    :param inflight_installs: Install tasks used to coalesce concurrent
+        install requests for the same harness family (a double-click, or
+        two spellings of one npm package) onto one in-flight install, so
+        npm's non-race-safe global writes never run twice at once. Keyed by
+        the resolved install key (not ``request_id``) and cleared when the
+        install completes.
+    :param pending_secret_writes: Per-``request_id`` futures for in-flight
+        ``host.store_secret`` requests (a UI-driven harness credential write).
+        Resolved when the host sends ``host.store_secret_result``. Values carry
+        the result fields (``status``, ``configured_harnesses``, ``error``) —
+        never the secret. Same ``Any`` typing rationale as ``pending_stats``.
+    :param credential_write_lock: Serializes credential writes to this host so
+        two overlapping requests (a double-click, or key + gateway in quick
+        succession) can't interleave the daemon's non-atomic
+        load→merge→save of ``config.yaml`` and clobber a sibling ``providers:``
+        entry. Held around the whole store-secret round-trip.
     :param pending_fs_requests: Per-``request_id`` futures for
         in-flight ``host.fs_request`` reads (the workspace file
         panel served from the host while the runner is offline).
         Resolved when the host sends ``host.fs_result``. Values
         carry ``status``, ``payload``, ``error_status``,
         ``error_code``, and ``error``.
+    :param pending_model_options: Per-``request_id`` futures for pre-launch
+        model catalogs resolved by the selected host.
     """
 
     workspace_id: int
@@ -264,7 +287,23 @@ class HostConnection:
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_secret_writes: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_credential_detects: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 
@@ -343,8 +382,13 @@ class HostRegistry:
             self._hosts[key] = conn
         return conn
 
-    def deregister(self, host_id: str, workspace_id: int | None = None) -> None:
-        """Remove a host connection.
+    def deregister(
+        self,
+        host_id: str,
+        workspace_id: int | None = None,
+        conn: HostConnection | None = None,
+    ) -> bool:
+        """Remove a host connection and end its sender loop.
 
         No-op if ``(workspace_id, host_id)`` is not registered.
 
@@ -352,10 +396,38 @@ class HostRegistry:
             spelling (see :func:`_canonical_host_id`).
         :param workspace_id: Tenant partition; defaults to
             :func:`current_workspace_id`.
+        :param conn: Optional generation guard, as on
+            :meth:`TunnelRegistry.deregister`. When given, the entry is
+            removed only if it is still this exact connection.
+        :returns: ``True`` when an entry was removed. ``False`` means
+            nothing was registered or the guard did not match, so the
+            caller is superseded and must not flip the host's durable
+            row offline — that row describes the live reconnect.
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
-            self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
+            key = (ws_id, _canonical_host_id(host_id))
+            current = self._hosts.get(key)
+            if current is None or (conn is not None and current is not conn):
+                return False
+            removed = self._hosts.pop(key)
+        # Without this the route handler's loops keep running and its ping loop
+        # keeps the host row online, even though the host is now unreachable.
+        removed.outbound_queue.put_nowait(None)
+        return True
+
+    def mark_frame_seen(self, conn: HostConnection) -> bool:
+        """Record that a frame arrived for ``conn``.
+
+        :param conn: Connection that received the frame.
+        :returns: ``True`` if the connection is still current,
+            ``False`` if it has been replaced or deregistered.
+        """
+        with self._lock:
+            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
+                return False
+            conn.last_frame_at = time.time()
+            return True
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.

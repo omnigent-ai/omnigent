@@ -80,6 +80,13 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["needs_setup"] is False
     assert isinstance(data["databricks_features"], bool)
     assert isinstance(data["managed_sandboxes_enabled"], bool)
+    # harness_install_enabled gates the UI Install action; default off unless
+    # OMNIGENT_HARNESS_INSTALL_ENABLED is set, so it's false in the test app.
+    assert data["harness_install_enabled"] is False
+    # installable_harnesses is the allowlist the SPA offers setup for; blank
+    # while the feature is off so the UI never offers an install the disabled
+    # route would reject.
+    assert data["installable_harnesses"] == []
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
@@ -105,6 +112,27 @@ async def test_info_single_user_false_without_marker(
     # Auth shape is unchanged — single_user is orthogonal to it.
     assert data["accounts_enabled"] is False
     assert data["login_url"] is None
+
+
+async def test_info_advertises_installable_harnesses_when_enabled(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the feature on, ``/v1/info`` publishes the install allowlist.
+
+    The SPA gates its setup offer on membership in this set, so it must carry
+    the ids the route accepts — including the native spellings a session
+    declares (``codex-native``), not just the bare ids.
+    """
+    from omnigent.onboarding.harness_install import ui_installable_harnesses
+    from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
+
+    monkeypatch.setenv(HARNESS_INSTALL_ENABLED_ENV, "1")
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["harness_install_enabled"] is True
+    assert set(data["installable_harnesses"]) == set(ui_installable_harnesses())
+    assert "codex-native" in data["installable_harnesses"]
 
 
 # ── GET /v1/me ───────────────────────────────────────────

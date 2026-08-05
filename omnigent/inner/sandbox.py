@@ -14,8 +14,9 @@ from abc import ABC, abstractmethod
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, cast
 
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
 from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
@@ -48,10 +49,9 @@ _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
 
-# JSON-shaped payload passed across the parent/launcher boundary: the
-# SandboxPolicy serialized via `to_jsonable()` plus whatever `json.loads`
-# returns on the helper side.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+
+def _json_string_list(values: Sequence[object]) -> list[JsonValue]:
+    return cast(list[JsonValue], [str(value) for value in values])
 
 
 @dataclass
@@ -88,6 +88,15 @@ class SandboxPolicy:
     :param cwd_hidden_scan_overflow: One of ``"error"``, ``"warn"``,
         or ``"unlimited"``. See :class:`OSEnvSandboxSpec` for the
         per-mode semantics.
+    :param cwd_hidden_scan_recursive: When ``False`` (default) the
+        dotfile / escaping-symlink masker scans only the top level of
+        cwd and each read root; when ``True`` it recurses the full
+        tree. See :class:`OSEnvSandboxSpec` for the security
+        trade-off.
+    :param mask_paths: Explicit files/directories the helper must not
+        see, resolved to absolute paths by the backend. Masked with
+        the same emit shape as the dotfile walker's entries (empty
+        dir / empty file). ``None`` means no explicit masks.
     :param env_passthrough: User-declared environment-variable names
         the helper subprocess is allowed to inherit beyond the
         always-passed minimal default
@@ -130,6 +139,14 @@ class SandboxPolicy:
         connect) emits an explicit last-match deny for each path.
         ``None`` is treated identically to an empty list, e.g.
         ``[Path("/tmp/omnigent-terminal-ab12/tmux.sock")]``.
+    :param mask_scan_skip_roots: Write roots the dotfile / escaping-symlink
+        mask scan must skip — the framework's own scratch / runtime dirs
+        added post-resolve via :func:`with_additional_write_roots`. These
+        hold sandbox scaffolding (the egress ``.egress.sock``, CA bundle,
+        credential-proxy files), never pre-existing user secrets, so
+        scanning them is both pointless and harmful (masking
+        ``.egress.sock`` breaks the egress relay). ``None`` is treated
+        identically to an empty list.
 
     Historical note: a previous revision carried an
     ``egress_auth_token`` field shared between the parent (embedded
@@ -151,6 +168,8 @@ class SandboxPolicy:
     cwd_allow_hidden: list[str] | None = None
     cwd_hidden_scan_max_entries: int = 50000
     cwd_hidden_scan_overflow: str = "warn"
+    cwd_hidden_scan_recursive: bool = False
+    mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
     egress_relay_port: int | None = None
@@ -163,32 +182,55 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
+    # Parent-side only: write roots the dotfile / escaping-symlink mask
+    # scan must NOT walk. Framework code adds the sandbox's own runtime
+    # scaffolding to ``write_roots`` via
+    # :func:`with_additional_write_roots` (the per-helper scratch tmpdir
+    # holding the egress ``.egress.sock``, the CA bundle, credential-proxy
+    # files, harness state dirs). Those are created fresh by the framework
+    # and never hold pre-existing user secrets, so scanning them is
+    # pointless — and actively harmful: the scan would ``--bind-try
+    # /dev/null`` the dotfile ``.egress.sock``, breaking the egress relay.
+    # Every root recorded here is dropped from the scan set (along with
+    # anything nested under it). Built parent-side during arg emission;
+    # like ``credential_proxy`` it is intentionally NOT serialised.
+    mask_scan_skip_roots: list[Path] | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {
             "backend_type": self.backend_type,
             "active": self.active,
             "read_roots": (
-                [str(root) for root in self.read_roots] if self.read_roots is not None else None
+                _json_string_list(self.read_roots) if self.read_roots is not None else None
             ),
-            "write_roots": [str(root) for root in self.write_roots],
-            "write_files": [str(path) for path in self.write_files],
+            "write_roots": _json_string_list(self.write_roots),
+            "write_files": _json_string_list(self.write_files),
             "allow_network": self.allow_network,
             "cwd_allow_hidden": (
-                list(self.cwd_allow_hidden) if self.cwd_allow_hidden is not None else None
+                _json_string_list(self.cwd_allow_hidden)
+                if self.cwd_allow_hidden is not None
+                else None
             ),
             "cwd_hidden_scan_max_entries": self.cwd_hidden_scan_max_entries,
             "cwd_hidden_scan_overflow": self.cwd_hidden_scan_overflow,
+            "cwd_hidden_scan_recursive": self.cwd_hidden_scan_recursive,
+            "mask_paths": (
+                _json_string_list(self.mask_paths) if self.mask_paths is not None else None
+            ),
             "env_passthrough": (
-                list(self.env_passthrough) if self.env_passthrough is not None else None
+                _json_string_list(self.env_passthrough)
+                if self.env_passthrough is not None
+                else None
             ),
             "spawn_env_allowlist": (
-                list(self.spawn_env_allowlist) if self.spawn_env_allowlist is not None else None
+                _json_string_list(self.spawn_env_allowlist)
+                if self.spawn_env_allowlist is not None
+                else None
             ),
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
             "deny_unix_socket_paths": (
-                [str(path) for path in self.deny_unix_socket_paths]
+                _json_string_list(self.deny_unix_socket_paths)
                 if self.deny_unix_socket_paths is not None
                 else None
             ),
@@ -220,6 +262,12 @@ class SandboxPolicy:
         max_entries = max_entries_raw if isinstance(max_entries_raw, int) else 50000
         overflow_raw = data.get("cwd_hidden_scan_overflow", "warn")
         overflow = overflow_raw if isinstance(overflow_raw, str) else "warn"
+        recursive_raw = data.get("cwd_hidden_scan_recursive", False)
+        recursive = recursive_raw if isinstance(recursive_raw, bool) else False
+        mask_paths_data = data.get("mask_paths")
+        mask_paths: list[Path] | None = None
+        if isinstance(mask_paths_data, list):
+            mask_paths = [Path(str(path)) for path in mask_paths_data]
         env_passthrough_data = data.get("env_passthrough")
         env_passthrough: list[str] | None = None
         if isinstance(env_passthrough_data, list):
@@ -250,6 +298,8 @@ class SandboxPolicy:
             cwd_allow_hidden=cwd_allow_hidden,
             cwd_hidden_scan_max_entries=max_entries,
             cwd_hidden_scan_overflow=overflow,
+            cwd_hidden_scan_recursive=recursive,
+            mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
             egress_relay_port=egress_relay_port,
@@ -453,6 +503,7 @@ def _clone_policy_with(
     read_roots: list[Path] | None,
     write_roots: list[Path],
     write_files: list[Path],
+    mask_scan_skip_roots: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a new :class:`SandboxPolicy` with the supplied root/file
@@ -476,6 +527,8 @@ def _clone_policy_with(
         ),
         cwd_hidden_scan_max_entries=policy.cwd_hidden_scan_max_entries,
         cwd_hidden_scan_overflow=policy.cwd_hidden_scan_overflow,
+        cwd_hidden_scan_recursive=policy.cwd_hidden_scan_recursive,
+        mask_paths=(list(policy.mask_paths) if policy.mask_paths is not None else None),
         env_passthrough=(
             list(policy.env_passthrough) if policy.env_passthrough is not None else None
         ),
@@ -492,6 +545,18 @@ def _clone_policy_with(
         # ``_start_locked``, so dropping it here would silently disable
         # the feature.
         credential_proxy=policy.credential_proxy,
+        # Preserve (or, when a helper is extending it, override) the set
+        # of framework write roots excluded from the mask scan. ``None``
+        # from a caller means "keep whatever the source policy carried".
+        mask_scan_skip_roots=(
+            list(mask_scan_skip_roots)
+            if mask_scan_skip_roots is not None
+            else (
+                list(policy.mask_scan_skip_roots)
+                if policy.mask_scan_skip_roots is not None
+                else None
+            )
+        ),
         # Egress fields are intentionally NOT preserved here — the
         # ``with_additional_*`` helpers run BEFORE the egress proxy
         # starts, so the source policy never carries egress fields.
@@ -505,15 +570,27 @@ def with_additional_write_roots(
     extra_roots: Sequence[Path],
 ) -> SandboxPolicy:
     write_roots = list(policy.write_roots)
+    skip_roots = (
+        list(policy.mask_scan_skip_roots) if policy.mask_scan_skip_roots is not None else []
+    )
     for root in extra_roots:
         resolved = root.resolve(strict=False)
         if all(existing != resolved for existing in write_roots):
             write_roots.append(resolved)
+        # Framework-added write roots hold the sandbox's own runtime
+        # scaffolding (scratch tmpdir with the egress ``.egress.sock``, CA
+        # bundle, credential-proxy files, harness state dirs), never
+        # pre-existing user secrets. Record them so the dotfile mask scan
+        # skips them — otherwise the scan hides ``.egress.sock`` and the
+        # egress relay's connection is reset.
+        if all(existing != resolved for existing in skip_roots):
+            skip_roots.append(resolved)
     return _clone_policy_with(
         policy,
         read_roots=list(policy.read_roots) if policy.read_roots is not None else None,
         write_roots=write_roots,
         write_files=list(policy.write_files),
+        mask_scan_skip_roots=skip_roots,
     )
 
 
@@ -521,10 +598,13 @@ def with_additional_read_roots(
     policy: SandboxPolicy,
     extra_roots: Sequence[Path],
 ) -> SandboxPolicy:
-    if policy.read_roots is None:
-        return policy
-
-    read_roots = list(policy.read_roots)
+    # ``read_roots=None`` means "no spec-supplied grants" for deny-default
+    # backends (darwin_seatbelt, linux_bwrap). Treat it as an empty list so
+    # caller-supplied extra roots (e.g. the pi node_modules dir granted by
+    # _try_sandbox_pi) are not silently dropped when the spec declares no
+    # read_paths. Do NOT short-circuit: the caller is explicitly widening the
+    # policy, so we must honour it even when the spec itself has no grants.
+    read_roots = list(policy.read_roots) if policy.read_roots is not None else []
     for root in extra_roots:
         resolved = root.resolve(strict=False)
         if all(existing != resolved for existing in read_roots):
@@ -725,14 +805,14 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         # tempdir root, which the profile only granted a subpath of —
         # ``FileNotFoundError: No usable temporary directory`` on
         # seatbelt (bwrap masked it via its ``--tmpfs /tmp`` fallback).
-        tmpdir = create_private_tmpdir()
+        host_tmpdir = create_private_tmpdir()
         try:
-            sandbox = with_additional_write_roots(sandbox, [tmpdir])
-            set_temp_env(os.environ, tmpdir)
+            sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
+            set_temp_env(os.environ, host_tmpdir)
             encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
-            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(tmpdir)
+            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(host_tmpdir)
             # Re-invoke run_launcher via an INLINE python -c script
             # rather than re-running the launcher tempfile. Reason:
             # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
@@ -777,7 +857,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # ``except`` only fires if the wrap/exec never handed off.
             os.execvp(wrapped[0], wrapped)
         except BaseException:
-            cleanup_private_tmpdir(tmpdir)
+            cleanup_private_tmpdir(host_tmpdir)
             raise
 
     tmpdir: Path | None = None

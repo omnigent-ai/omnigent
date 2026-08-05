@@ -3,8 +3,9 @@ Provider catalog and model discovery for onboarding.
 
 Model lists are fetched live from the MLflow GitHub Release catalog
 (``https://github.com/mlflow/mlflow/releases/download/model-catalog%2Flatest/{provider}.json``)
-with a 1-hour in-process TTL cache. MLflow is **not** a required
-dependency — the fetch uses only the stdlib ``urllib.request``.
+with a 1-hour memory/disk freshness window and a validated 7-day
+stale-if-error cache. MLflow is **not** a required dependency — the fetch uses
+only the standard library ``urllib.request``.
 Auth configuration (``PROVIDER_ENV_VARS``, ``get_provider_config``) is
 omnigent-specific and lives here permanently.
 """
@@ -12,14 +13,25 @@ omnigent-specific and lives here permanently.
 from __future__ import annotations
 
 import json
+import logging
+import math
+import os
 import re
+import sys
+import tempfile
 import threading
+import time
+import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Collection
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, TypeGuard
 
 import cachetools
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,17 +42,35 @@ class ModelInfo:
     :param name: The model identifier, e.g. ``"claude-sonnet-4-20250514"``.
     :param provider: The provider name, e.g. ``"anthropic"``.
     :param mode: The model mode, e.g. ``"chat"``, ``"embedding"``, or ``None``.
-    :param supports_function_calling: Whether the model supports tool use.
+    :param supports_function_calling: Whether the model supports tool use, or
+        ``None`` when the catalog does not report it.
+    :param supports_reasoning: Whether the model supports reasoning, or
+        ``None`` when unknown.
+    :param supports_vision: Whether the model supports image input, or
+        ``None`` when unknown.
+    :param supports_structured_output: Whether the model supports response
+        schemas, or ``None`` when unknown.
     :param max_input_tokens: Maximum input context window size, or ``None``.
     :param max_output_tokens: Maximum output tokens, or ``None``.
+    :param input_price: Input price per million tokens, or ``None``.
+    :param output_price: Output price per million tokens, or ``None``.
+    :param cache_read_price: Cache-read price per million tokens, or ``None``.
+    :param cache_write_price: Cache-write price per million tokens, or ``None``.
     """
 
     name: str
     provider: str
     mode: str | None = None
-    supports_function_calling: bool = False
+    supports_function_calling: bool | None = None
+    supports_reasoning: bool | None = None
+    supports_vision: bool | None = None
+    supports_structured_output: bool | None = None
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
+    input_price: float | None = None
+    output_price: float | None = None
+    cache_read_price: float | None = None
+    cache_write_price: float | None = None
 
 
 @dataclass
@@ -100,11 +130,166 @@ _MLFLOW_CATALOG_URL = (
     "https://github.com/mlflow/mlflow/releases/download/model-catalog%2Flatest/{provider}.json"
 )
 _CATALOG_TTL_SECONDS = 3600
-_catalog_cache: cachetools.TTLCache[str, dict[str, Any] | None] = cachetools.TTLCache(
+_CATALOG_STALE_IF_ERROR_SECONDS = 7 * 24 * 60 * 60
+_CATALOG_DISK_SCHEMA_VERSION = 1
+_CATALOG_UPSTREAM_SCHEMA_MAJOR = 1
+_CATALOG_CACHE_PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+@dataclass(frozen=True)
+class _DiskCatalogEntry:
+    """Validated persistent catalog plus its source metadata."""
+
+    catalog: dict[str, Any]
+    source_url: str
+    fetched_at: float
+
+
+_catalog_cache: cachetools.TTLCache[str, _DiskCatalogEntry | None] = cachetools.TTLCache(
     maxsize=64, ttl=_CATALOG_TTL_SECONDS
 )
 _catalog_cache_lock = threading.Lock()
-_CATALOG_MISS = object()
+
+
+def _catalog_source_url(provider: str) -> str:
+    """Return the release-asset URL for one provider catalog."""
+    return _MLFLOW_CATALOG_URL.format(provider=urllib.parse.quote(provider, safe=""))
+
+
+def _catalog_now() -> float:
+    """Return wall-clock time through a test-local patch seam."""
+    return time.time()
+
+
+def _catalog_cache_root() -> Path:
+    """Return the platform user-cache directory for model catalogs."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Caches" / "Omnigent" / "model-catalog"
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        root = Path(local_app_data) if local_app_data else home / "AppData" / "Local"
+        return root / "Omnigent" / "Cache" / "model-catalog"
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    root = Path(xdg_cache).expanduser() if xdg_cache else home / ".cache"
+    return root / "omnigent" / "model-catalog"
+
+
+def _catalog_cache_path(provider: str) -> Path | None:
+    """Return the safe cache path for *provider*, or ``None`` if invalid."""
+    if _CATALOG_CACHE_PROVIDER_RE.fullmatch(provider) is None:
+        return None
+    return _catalog_cache_root() / f"{provider}.json"
+
+
+def _supported_catalog_schema_version(value: object) -> bool:
+    """Return whether *value* has a compatible MLflow catalog major version."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == _CATALOG_UPSTREAM_SCHEMA_MAJOR
+    if not isinstance(value, str):
+        return False
+    components = value.split(".")
+    return (
+        bool(components)
+        and all(component.isascii() and component.isdigit() for component in components)
+        and int(components[0]) == _CATALOG_UPSTREAM_SCHEMA_MAJOR
+    )
+
+
+def _valid_catalog_payload(value: object) -> TypeGuard[dict[str, Any]]:
+    """Return whether *value* matches a compatible MLflow catalog schema."""
+    if not isinstance(value, dict):
+        return False
+    if not _supported_catalog_schema_version(value.get("schema_version")):
+        return False
+    models = value.get("models")
+    return (
+        isinstance(models, dict)
+        and bool(models)
+        and all(
+            isinstance(model_id, str) and bool(model_id) and isinstance(entry, dict)
+            for model_id, entry in models.items()
+        )
+    )
+
+
+def _read_disk_catalog(provider: str, source_url: str) -> _DiskCatalogEntry | None:
+    """Read and validate one persistent catalog cache entry."""
+    path = _catalog_cache_path(provider)
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    fetched_at = value.get("fetched_at")
+    if (
+        isinstance(fetched_at, bool)
+        or not isinstance(fetched_at, (int, float))
+        or not math.isfinite(fetched_at)
+    ):
+        return None
+    catalog = value.get("catalog")
+    if (
+        value.get("cache_schema_version") != _CATALOG_DISK_SCHEMA_VERSION
+        or value.get("source_url") != source_url
+    ):
+        return None
+    if not _valid_catalog_payload(catalog):
+        return None
+    if value.get("catalog_schema_version") != catalog.get("schema_version"):
+        return None
+    return _DiskCatalogEntry(
+        catalog=catalog,
+        source_url=source_url,
+        fetched_at=float(fetched_at),
+    )
+
+
+def _write_disk_catalog(entry: _DiskCatalogEntry, provider: str) -> None:
+    """Atomically persist one validated provider catalog."""
+    path = _catalog_cache_path(provider)
+    if path is None or not _valid_catalog_payload(entry.catalog):
+        return
+    value = {
+        "cache_schema_version": _CATALOG_DISK_SCHEMA_VERSION,
+        "catalog_schema_version": entry.catalog["schema_version"],
+        "source_url": entry.source_url,
+        "fetched_at": entry.fetched_at,
+        "catalog": entry.catalog,
+    }
+    temp_path: Path | None = None
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(value, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    except (OSError, TypeError, ValueError) as exc:
+        _logger.debug("Could not persist model catalog cache for %s: %s", provider, exc)
+    finally:
+        if temp_path is not None:
+            with suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+
+
+def _catalog_age_seconds(entry: _DiskCatalogEntry, now: float) -> float:
+    """Return a non-negative age, tolerating a local clock moving backward."""
+    return max(0.0, now - entry.fetched_at)
 
 
 def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
@@ -118,14 +303,15 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
     :returns: Parsed JSON dict (the full catalog file), or ``None`` on
         any network or parse error or when the lookup is disabled.
     """
-    import os
-
     if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
         return None
-    url = _MLFLOW_CATALOG_URL.format(provider=provider)
+    url = _catalog_source_url(provider)
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
             result: dict[str, Any] = json.loads(resp.read())
+        if not _valid_catalog_payload(result):
+            _logger.warning("Ignoring incompatible model catalog payload for %s", provider)
+            return None
         return result
     except Exception:
         return None
@@ -133,24 +319,63 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
 
 def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
     """
-    Return the MLflow catalog for *provider*, cached with a 1-hour TTL.
+    Return the MLflow catalog for *provider* through memory and disk caches.
 
-    Falls back to an empty dict on network failure (or when the lookup
-    is disabled via ``OMNIGENT_DISABLE_CATALOG_LOOKUP``) so callers
-    degrade gracefully rather than raising.
+    Fresh cache entries last one hour. A live failure can use a validated disk
+    entry for seven days and retains that fallback in memory for at most one
+    cache TTL before retrying discovery. Otherwise callers receive an empty
+    dict. Setting ``OMNIGENT_DISABLE_CATALOG_LOOKUP=1`` bypasses every cache
+    tier and network.
 
     :param provider: Provider name, e.g. ``"anthropic"``.
     :returns: Parsed catalog dict (``schema_version`` + ``models`` keys),
         or ``{}`` on failure.
     """
+    if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
+        return {}
+    now = _catalog_now()
+    source_url = _catalog_source_url(provider)
     with _catalog_cache_lock:
-        cached = _catalog_cache.get(provider, _CATALOG_MISS)
-        if cached is not _CATALOG_MISS:
-            return cached or {}
+        cached: _DiskCatalogEntry | None
+        try:
+            cached = _catalog_cache[provider]
+        except KeyError:
+            pass
+        else:
+            if cached is None:
+                return {}
+            if _catalog_age_seconds(cached, now) <= _CATALOG_STALE_IF_ERROR_SECONDS:
+                return cached.catalog
+            del _catalog_cache[provider]
+    disk_entry = _read_disk_catalog(provider, source_url)
+    if disk_entry is not None and _catalog_age_seconds(disk_entry, now) <= _CATALOG_TTL_SECONDS:
+        with _catalog_cache_lock:
+            _catalog_cache[provider] = disk_entry
+        return disk_entry.catalog
     result = _download_provider_catalog(provider)
+    live_entry: _DiskCatalogEntry | None = None
+    if result is not None and _valid_catalog_payload(result):
+        live_entry = _DiskCatalogEntry(
+            catalog=result,
+            source_url=source_url,
+            fetched_at=now,
+        )
+        _write_disk_catalog(live_entry, provider)
+    elif (
+        disk_entry is not None
+        and _catalog_age_seconds(disk_entry, now) <= _CATALOG_STALE_IF_ERROR_SECONDS
+    ):
+        age_seconds = _catalog_age_seconds(disk_entry, now)
+        _logger.warning(
+            "Using stale model catalog cache provider=%s age_seconds=%.0f source=%s",
+            provider,
+            age_seconds,
+            disk_entry.source_url,
+        )
+        live_entry = disk_entry
     with _catalog_cache_lock:
-        _catalog_cache[provider] = result
-    return result or {}
+        _catalog_cache[provider] = live_entry
+    return live_entry.catalog if live_entry is not None else {}
 
 
 def _list_provider_names() -> list[str]:
@@ -352,22 +577,120 @@ def get_models(provider: str) -> list[ModelInfo]:
 
             context = entry.get("context_window", {})
             capabilities = entry.get("capabilities", {})
+            pricing = entry.get("pricing", {})
 
             models.append(
                 ModelInfo(
                     name=model_name,
                     provider=provider,
                     mode=entry.get("mode"),
-                    supports_function_calling=capabilities.get(
-                        "function_calling",
-                        False,
-                    ),
+                    supports_function_calling=capabilities.get("function_calling"),
+                    supports_reasoning=capabilities.get("reasoning"),
+                    supports_vision=capabilities.get("vision"),
+                    supports_structured_output=capabilities.get("response_schema"),
                     max_input_tokens=context.get("max_input"),
                     max_output_tokens=context.get("max_output"),
+                    input_price=pricing.get("input_per_million_tokens"),
+                    output_price=pricing.get("output_per_million_tokens"),
+                    cache_read_price=pricing.get("cache_read_per_million_tokens"),
+                    cache_write_price=pricing.get("cache_write_per_million_tokens"),
                 )
             )
 
     return models
+
+
+_MODEL_PROVIDER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^claude-", re.IGNORECASE), "anthropic"),
+    (re.compile(r"^(?:gpt-|o\d(?:-|$))", re.IGNORECASE), "openai"),
+    (re.compile(r"^gemini-", re.IGNORECASE), "gemini"),
+    (re.compile(r"^qwen(?:\d|-)", re.IGNORECASE), "dashscope"),
+    (re.compile(r"^llama-", re.IGNORECASE), "meta_llama"),
+    (re.compile(r"^mistral-", re.IGNORECASE), "mistral"),
+)
+
+
+def _inferred_catalog_provider(model: str) -> str | None:
+    """Infer a catalog file from a stable vendor-family prefix."""
+    for pattern, provider in _MODEL_PROVIDER_PATTERNS:
+        if pattern.match(model):
+            return provider
+    return None
+
+
+def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
+    """Return bounded provider/id pairs for a model catalog lookup."""
+    normalized = model.split(":", 1)[0].strip()
+    known_providers = set(get_all_providers())
+    targets: list[tuple[str, str]] = []
+
+    def _add(provider: str | None, model_id: str) -> None:
+        if provider is not None and (provider, model_id) not in targets:
+            targets.append((provider, model_id))
+
+    if "/" in normalized:
+        namespace, bare = normalized.split("/", 1)
+        provider = namespace.lower()
+        if provider in known_providers:
+            _add(provider, bare)
+            if provider == "databricks" and bare.lower().startswith("databricks-"):
+                base = bare[len("databricks-") :]
+                _add(_inferred_catalog_provider(base), base)
+        else:
+            _add("openrouter", normalized)
+            _add(_inferred_catalog_provider(bare), bare)
+        return targets
+
+    if normalized.lower().startswith("databricks-"):
+        _add("databricks", normalized)
+        base = normalized[len("databricks-") :]
+        _add(_inferred_catalog_provider(base), base)
+    else:
+        _add(_inferred_catalog_provider(normalized), normalized)
+    _add("openrouter", normalized)
+    return targets
+
+
+def find_catalog_models(model: str) -> list[ModelInfo]:
+    """Find exact or unambiguous-family candidates in the shared catalog.
+
+    Provider-qualified ids query that provider directly. Vendor-namespaced ids
+    query OpenRouter, while bare ids use stable family-to-provider routing with
+    OpenRouter as a bounded fallback. Exact matches win; otherwise all entries
+    sharing the id without its final hyphen segment are returned so callers can
+    accept a field only when every candidate reports the same value.
+
+    :param model: Provider-local, provider-qualified, or vendor-namespaced id.
+    :returns: One exact match, compatible family-prefix matches, or an empty list.
+    """
+    family_matches: list[ModelInfo] = []
+    for provider, lookup_id in _catalog_lookup_targets(model):
+        models = get_models(provider)
+        lookup_lower = lookup_id.lower()
+        for candidate in models:
+            names = {candidate.name.lower()}
+            if provider == "openrouter":
+                names.add(candidate.name.rsplit("/", 1)[-1].lower())
+            if lookup_lower in names:
+                return [candidate]
+        if "-" not in lookup_id:
+            continue
+        prefixes = {lookup_lower.rsplit("-", 1)[0]}
+        if provider == "openrouter":
+            prefixes.add(lookup_lower.rsplit("/", 1)[-1].rsplit("-", 1)[0])
+        family_matches.extend(
+            candidate
+            for candidate in models
+            if any(
+                candidate_name.startswith(prefix)
+                for prefix in prefixes
+                for candidate_name in (
+                    candidate.name.lower(),
+                    candidate.name.rsplit("/", 1)[-1].lower(),
+                )
+            )
+        )
+    return family_matches
 
 
 def get_chat_models(provider: str) -> list[ModelInfo]:
@@ -416,24 +739,18 @@ _PREFERRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "anthropic": "sonnet",
 }
 
-# Explicit per-provider default-model pins. These win over the catalog's
-# dynamic rule so the out-of-box default is a specific, current model even
-# when the bundled catalog lags a new release (these ids may not be in the
-# catalog yet). The user can still pick another via ``configure harness`` /
-# ``/model``.
-_DEFAULT_MODEL_OVERRIDE: dict[str, str] = {
-    "anthropic": "claude-opus-4-8",
-    "openai": "gpt-5.5",
-    # OpenRouter (and the gateway add's OSS pre-fill) → a broadly-served OSS
-    # model rather than an OpenAI/Anthropic id.
-    "openrouter": "moonshotai/kimi-k2.6",
-    # xAI — pin the flagship so click.prompt(default=...) always has a value
-    # even when the catalog fetch is disabled (e.g. in tests).
-    "xai": "grok-3",
+# Required provider → case-insensitive model-id substring. If no entry matches,
+# onboarding asks explicitly instead of choosing an unexpected alternative.
+_REQUIRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
+    "openrouter": "kimi",
 }
 
 
-def default_chat_model(provider: str) -> str | None:
+def default_chat_model(
+    provider: str,
+    *,
+    allowed_models: Collection[str] | None = None,
+) -> str | None:
     """
     Return the catalog's canonical default chat model for a provider.
 
@@ -447,35 +764,36 @@ def default_chat_model(provider: str) -> str | None:
        also tags ``mode="chat"`` and which would otherwise outrank the
        flagship text model by release date for some providers (OpenAI's
        ``gpt-audio-*`` / ``gpt-realtime-*`` sort above ``gpt-5.4``).
-    3. If the provider has a preferred default *tier*
+    3. If the provider requires a default *tier*
+       (:data:`_REQUIRED_DEFAULT_TIER_TOKEN`), return its newest model or
+       ``None`` when the catalog offers none.
+    4. If the provider has a preferred default *tier*
        (:data:`_PREFERRED_DEFAULT_TIER_TOKEN`), return the newest remaining
        model of that tier — so a fresh user gets a model their key can
        actually use. Fall back to the newest remaining general-purpose model
        when no model matches the tier.
 
-    ``anthropic`` and ``openai`` carry an explicit pin
-    (:data:`_DEFAULT_MODEL_OVERRIDE`) that wins over steps 1-3, so the
-    out-of-box default is a specific current model (``claude-opus-4-8`` /
-    ``gpt-5.5``) even when the bundled catalog lags. Other providers follow
-    the dynamic rule above.
+    ``allowed_models`` constrains the catalog rule so callers can apply family
+    or routing compatibility before selection.
 
     :param provider: Provider name, e.g. ``"anthropic"`` or ``"openai"``.
-    :returns: The default model id, e.g. ``"claude-opus-4-8"`` or
-        ``"gpt-5.5"``, or ``None`` when the catalog has no chat model for
-        that provider (genuinely unknown provider).
+    :param allowed_models: Optional model ids eligible for selection.
+    :returns: The selected catalog model id, or ``None`` when the catalog has
+        no chat model for that provider.
     """
-    # An explicit pin wins over the dynamic catalog rule (and may name a
-    # model newer than the bundled catalog).
-    override = _DEFAULT_MODEL_OVERRIDE.get(provider)
-    if override is not None:
-        return override
-
+    allowed = set(allowed_models) if allowed_models is not None else None
     general: list[str] = []
     for model in get_chat_models(provider):
+        if allowed is not None and model.name not in allowed:
+            continue
         lowered = model.name.lower()
         if any(token in lowered for token in _SPECIALTY_MODEL_TOKENS):
             continue
         general.append(model.name)
+
+    required_token = _REQUIRED_DEFAULT_TIER_TOKEN.get(provider)
+    if required_token is not None:
+        return next((name for name in general if required_token in name.lower()), None)
 
     preferred_token = _PREFERRED_DEFAULT_TIER_TOKEN.get(provider)
     if preferred_token is not None:
@@ -490,12 +808,11 @@ def default_chat_model(provider: str) -> str | None:
 # Model sorting — newest/best models first
 # ---------------------------------------------------------------------------
 
-# Matches version-like numbers in model names: gpt-4 → 4, claude-3.5 → 3.5,
-# o1 → 1, gpt-4.1 → 4.1, llama-4 → 4
-_VERSION_PATTERN = re.compile(
-    r"(?:^|[-/])"  # start of string or separator
-    r"(?:gpt-?|o|claude-?|llama-?|gemini-?|deepseek-?v?)?"
-    r"(\d+(?:\.\d+)?)"  # version number (e.g. 4, 3.5, 4.1)
+# Vendor marker used to isolate version tokens from provider prefixes, model
+# sizes, and dates. The previous optional marker treated any number as a model
+# version, so a size such as ``120b`` could outrank a newer vendor model.
+_VERSION_FAMILY_PATTERN = re.compile(
+    r"(?:^|[-/])(?:gpt|claude|llama|gemini|deepseek(?:-v)?|o)(?=[-/]?\d|[-/])"
 )
 
 # Matches dates: 2025-04-14, 20250414, 20241022
@@ -509,10 +826,19 @@ def _extract_model_version(name: str) -> float:
     :param name: Model name, e.g. ``"gpt-4.1-2025-04-14"``.
     :returns: Version as float, or ``0.0`` if none found.
     """
-    match = _VERSION_PATTERN.search(name)
-    if match:
-        return float(match.group(1))
-    return 0.0
+    family = _VERSION_FAMILY_PATTERN.search(name.lower())
+    if family is None:
+        return 0.0
+    suffix = _DATE_PATTERN.sub("", name[family.end() :])
+    tokens = [
+        token for token in re.split(r"[-/]", suffix) if re.fullmatch(r"\d+(?:\.\d+)?", token)
+    ]
+    if not tokens:
+        return 0.0
+    primary = float(tokens[0])
+    if "." not in tokens[0] and len(tokens) > 1 and len(tokens[1]) == 1:
+        return float(f"{tokens[0]}.{tokens[1]}")
+    return primary
 
 
 def _extract_model_date(name: str) -> int:

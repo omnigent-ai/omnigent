@@ -13,8 +13,9 @@ harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
 ``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Quit``. There is no "More" folding — every harness is
-visible at once — and the actionable hint (install command / next step)
+``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
+``15=Quit``. There is no "More" folding — every harness is visible at once —
+and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
 credential`` and ``← Back``. So an empty harness's level 2 is ``1=+Add 2=Back``;
@@ -37,6 +38,7 @@ load-bearing behavior — it has dedicated coverage below.
 from __future__ import annotations
 
 import os
+from unittest.mock import Mock
 
 import pytest
 import tomllib
@@ -44,6 +46,7 @@ import yaml
 from click.testing import CliRunner
 
 from omnigent.cli import cli
+from omnigent.onboarding import providers as provider_catalog
 from omnigent.onboarding import secrets
 from omnigent.onboarding.configure_models import (
     add_menu_options,
@@ -132,6 +135,38 @@ def _harnesses_installed(monkeypatch):
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_logged_in",
         lambda family: True,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide deterministic live-catalog defaults for interactive setup tests."""
+    catalogs = {
+        "anthropic": {
+            "models": {
+                "claude-sonnet-4-6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openai": {
+            "models": {
+                "gpt-5.5": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openrouter": {
+            "models": {
+                "moonshotai/kimi-k2.6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "xai": {
+            "models": {
+                "grok-3": {"mode": "chat", "capabilities": {}},
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider_catalog,
+        "_fetch_provider_catalog",
+        lambda provider: catalogs.get(provider, {}),
     )
 
 
@@ -1279,7 +1314,8 @@ def test_promote_global_auth_backfills_databricks_for_existing_configs(isolated_
     defaulting both families (the config only ever had the auth: block, so
     routing already used databricks for both).
     """
-    from omnigent.cli import _promote_global_auth_to_provider, _save_global_config
+    from omnigent.cli import _save_global_config
+    from omnigent.cli_config import _promote_global_auth_to_provider
 
     _save_global_config({"auth": {"type": "databricks", "profile": "oss"}})
 
@@ -1305,7 +1341,8 @@ def test_promote_global_auth_respects_explicit_default(isolated_config) -> None:
     must NOT steal it — it only claims families with no existing default. Here
     an explicit anthropic key default is kept while databricks takes openai.
     """
-    from omnigent.cli import _promote_global_auth_to_provider, _save_global_config
+    from omnigent.cli import _save_global_config
+    from omnigent.cli_config import _promote_global_auth_to_provider
 
     _save_global_config(
         {
@@ -1335,7 +1372,8 @@ def test_promote_global_auth_respects_explicit_default(isolated_config) -> None:
 
 def test_promote_global_auth_noop_without_databricks_auth(isolated_config) -> None:
     """No databricks ``auth:`` block → nothing to backfill (returns None)."""
-    from omnigent.cli import _promote_global_auth_to_provider, _save_global_config
+    from omnigent.cli import _save_global_config
+    from omnigent.cli_config import _promote_global_auth_to_provider
 
     # An api_key auth block (not databricks) must not synthesize a databricks
     # provider, and a config with no auth: block at all is a clean no-op.
@@ -1642,7 +1680,7 @@ def _overview_row_names(options: list[str], selectable: list[bool]) -> list[str]
 def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeypatch) -> None:
     """The overview shows every harness on one compact row, in 0.3 priority order.
 
-    No "More" folding: all thirteen harnesses are visible at once, followed by
+    No "More" folding: all harness actions are visible at once, followed by
     Quit. A regression that hides a harness, reorders the core six, or
     reintroduces a collapse row fails here. The menu also opts into the compact
     top-level rendering.
@@ -1663,6 +1701,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Copilot",
         "Kiro",
         "Kimi Code",
+        "Import from OpenClaw",
         "Custom ACP agent",
         "Quit",
     ]
@@ -1714,6 +1753,124 @@ def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypat
     assert "Add custom ACP agent" in names
     # Once agents exist, the single opaque "Custom ACP agent" row is gone.
     assert "Custom ACP agent" not in names
+
+
+def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "OpenClaw",
+                            "command": "openclaw acp",
+                            "omnigent_mcp": "false",
+                        }
+                    ]
+                }
+            },
+            f,
+        )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+
+    assert result.exit_code != 0
+    assert (
+        "Invalid acp.agents configuration: acp agent omnigent_mcp must be a boolean"
+        in result.output
+    )
+
+
+def test_overview_always_lists_openclaw_import_row(isolated_config, monkeypatch) -> None:
+    """OpenClaw import remains available even when discovery finds nothing."""
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    names = _overview_row_names(options, selectable)
+
+    assert "Import from OpenClaw" in names
+    assert names.index("Import from OpenClaw") < names.index("Custom ACP agent")
+
+
+def test_overview_hints_at_automatically_discovered_openclaw_agents(
+    isolated_config, monkeypatch
+) -> None:
+    """The always-visible import action hints at canonical-path discoveries."""
+    acpx_dir = isolated_config / ".acpx"
+    acpx_dir.mkdir()
+    (acpx_dir / "config.json").write_text(
+        '{"agents": {"Gemini CLI": {"command": "gemini", "args": ["--experimental-acp"]}}}',
+        encoding="utf-8",
+    )
+
+    options, _selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    from rich.text import Text
+
+    rendered = [Text.from_markup(option).plain for option in options]
+    assert any(
+        "Import from OpenClaw" in option and "1 agent found automatically" in option
+        for option in rendered
+    )
+
+
+def test_setup_imports_openclaw_agents(isolated_config) -> None:
+    """Selecting the OpenClaw import row writes the generic ``acp:`` block."""
+    acpx_dir = isolated_config / ".acpx"
+    acpx_dir.mkdir()
+    (acpx_dir / "config.json").write_text(
+        '{"agents": {"Gemini CLI": {"command": "gemini", "args": ["--experimental-acp"]}}}',
+        encoding="utf-8",
+    )
+
+    stdin = "\n".join(["13", "", "", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "~/.acpx/config.json" in result.output
+    assert "1 agent" in result.output
+    assert "Import coding agents from OpenClaw?" in result.output
+    assert "Imported 1 OpenClaw/acpx agent" in result.output
+    assert _config_yaml(isolated_config)["acp"] == {
+        "agents": [{"name": "Gemini CLI", "command": "gemini --experimental-acp"}]
+    }
+
+
+def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) -> None:
+    """The import action accepts a non-canonical OpenClaw/acpx config path."""
+    selected = isolated_config / "downloads" / "agents.json"
+    selected.parent.mkdir()
+    selected.write_text(
+        '{"agents": {"My Goose": {"command": "goose", "args": ["acp"]}}}',
+        encoding="utf-8",
+    )
+
+    stdin = "\n".join(["13", "", str(selected), "", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "Choose another file" in result.output
+    assert "OpenClaw/acpx config path" in result.output
+    assert "Imported 1 OpenClaw/acpx agent" in result.output
+    assert _config_yaml(isolated_config)["acp"] == {
+        "agents": [{"name": "My Goose", "command": "goose acp"}]
+    }
+
+
+def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
+    """A selected JSON file must contain an acpx or wrapped OpenClaw registry."""
+    selected = isolated_config / "package.json"
+    selected.write_text('{"name": "unrelated"}', encoding="utf-8")
+
+    stdin = "\n".join(["13", "", str(selected), "2", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "file is not an OpenClaw/acpx agent registry" in result.output
+    config = _config_yaml(isolated_config)
+    assert "acp" not in config
 
 
 def test_overview_rows_are_single_line(isolated_config, monkeypatch) -> None:
@@ -1901,7 +2058,7 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("10", "_manage_copilot_harness"),
         ("11", "_manage_kiro_harness"),
         ("12", "_manage_kimi_harness"),
-        ("13", "_add_acp_agent"),
+        ("14", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -1919,7 +2076,7 @@ def test_overview_dispatches_to_correct_manager(
     """
     called: list[str] = []
     monkeypatch.setattr(
-        f"omnigent.cli.{manager_attr}", lambda *a, **k: called.append(manager_attr)
+        f"omnigent.cli_config.{manager_attr}", lambda *a, **k: called.append(manager_attr)
     )
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
     assert result.exit_code == 0, result.output
@@ -1951,6 +2108,7 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _name: None)
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -1970,11 +2128,17 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     not a green ``Installed`` row that implies the harness is ready to use.
     (Hermes, like Goose, *does* have a config probe now — its ``model`` is read
     from ``~/.hermes/config.yaml`` — so its ready/unconfigured split is covered
-    by ``test_overview_hermes_row_reflects_configured_model`` instead.)
+    by ``test_overview_hermes_row_reflects_configured_model`` instead. Kimi now
+    has a file-based login probe too, so its signed-in split is covered by
+    ``test_overview_kimi_row_reflects_detected_login`` — here we pin the
+    not-signed-in case, so ``kimi_login_detected`` is forced ``False``.)
     """
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
+    # Kimi's row now consults a file-based login probe; force "no login" so the
+    # not-configured assertion is deterministic regardless of the dev machine.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -1982,6 +2146,28 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     assert "[yellow]✗ Not configured[/]" in options[row_index]
     assert "[green]✓ Installed[/]" not in options[row_index]
     assert descriptions[row_index]
+
+
+def test_overview_kimi_row_reflects_detected_login(isolated_config, monkeypatch) -> None:
+    """An installed kimi with a detected ``kimi login`` renders green "Signed in".
+
+    Bug fix: the kimi row was hardcoded to yellow "Not configured" whenever the
+    CLI was installed, so a successful ``kimi login`` never showed. It now
+    consults the subprocess-free file probe ``kimi_login_detected`` and renders
+    a green ready row when a credential is present.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: True)
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    row_index = _overview_row_names(options, selectable).index("Kimi Code")
+    assert "[green]✓ Signed in[/]" in options[row_index]
+    assert "[yellow]✗ Not configured[/]" not in options[row_index]
+    # A ready row carries no next-step hint.
+    assert descriptions[row_index] == ""
 
 
 def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -> None:
@@ -2003,7 +2189,14 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     monkeypatch.setattr(
         "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed", lambda: True
     )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: family != GEMINI_FAMILY,
+    )
     monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    # Kimi's row consults a file-based login probe; force "no login" so the
+    # "Sign in with `kimi login`" hint is asserted deterministically.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
@@ -2031,7 +2224,9 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     assert desc_by_name["OpenCode"] == "Open to sign in (opencode auth login)."
     assert desc_by_name["Hermes"] == "Open to configure with `hermes model`."
     assert desc_by_name["Pi"] == "Open to add a credential."
-    assert desc_by_name["Antigravity"] == "Open to add the Gemini API key."
+    assert (
+        desc_by_name["Antigravity"] == "Open to sign in with Antigravity, or add a Gemini API key."
+    )
     assert desc_by_name["Qwen Code"] == "Open to set up auth (/auth or env vars)."
     assert desc_by_name["Goose"] == "Open to run `goose configure`."
     assert desc_by_name["Copilot"] == "Open to add the GitHub token."
@@ -2314,18 +2509,18 @@ def test_add_key_does_not_steal_pi_from_fallback_default(isolated_config) -> Non
 # ── cli-config labels + entry builder ───────────────────────────────────────
 
 
-def test_credential_label_cli_config_uses_display_name() -> None:
-    """A cli-config credential labels as the provider's own display name.
+def test_credential_label_cli_config_uses_provider_name() -> None:
+    """A cli-config credential labels from the provider entry name.
 
-    Failure means configure-harnesses shows the raw entry id instead of
-    the friendly name isaac wrote into the provider table.
+    The display_name is ignored so cli-config providers show consistently
+    alongside other kinds (e.g. isaac-databricks-codex → Isaac-Databricks-Codex).
     """
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "codex-databricks", display_name="Databricks AI Gateway"
+        "cli-config", "isaac-databricks-codex", display_name="Databricks AI Gateway"
     )
-    assert label == "Databricks AI Gateway"
+    assert label == "Isaac-Databricks-Codex"
 
 
 def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
@@ -2335,7 +2530,7 @@ def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
     """
     from omnigent.onboarding.configure_models import credential_label
 
-    assert credential_label("cli-config", "codex-myproxy") == "codex-myproxy"
+    assert credential_label("cli-config", "codex-myproxy") == "Codex-Myproxy"
 
 
 def test_build_cli_config_provider_entry_shapes() -> None:
@@ -2669,11 +2864,11 @@ def test_cursor_install_now_invokes_runner_without_index(
     assert not any("index" in part or "://" in part for part in argv)
 
 
-# ── Antigravity Gemini API-key flow ─────────────────────────────────────────
+# ── Antigravity auth flow ───────────────────────────────────────────────────
 # Antigravity (Gemini-native, no provider family) is row 7 on the overview (it
 # follows Pi) and stores its key in the secret store + the ``antigravity:``
-# config block. API-key-only menu (Set/Replace/Remove); ``isolated_config``
-# clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
+# config block. The same drill-in also exposes native ``agy`` sign-in;
+# ``isolated_config`` clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
 
 
 @pytest.fixture()
@@ -2734,6 +2929,46 @@ def test_antigravity_adopt_env_api_key_writes_env_ref(
     cfg = _config_yaml(isolated_config)
     assert cfg["antigravity"] == {"api_key_ref": "env:GEMINI_API_KEY"}
     assert secrets.load_secret("antigravity") is None
+
+
+def test_antigravity_sign_in_runs_agy_auth_service(
+    isolated_config, monkeypatch, _antigravity_sdk_present
+) -> None:
+    """Selecting Antigravity sign-in launches bare ``agy`` through harness auth."""
+    login = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
+
+    # L1 7=Antigravity → 2=Sign in → q back → q quit.
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "2", "q", "q"]) + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    login.assert_called_once_with(GEMINI_FAMILY)
+
+
+def test_antigravity_sign_in_skips_sdk_install_prompt(isolated_config, monkeypatch) -> None:
+    """An installed agy can sign in even when the optional SDK is absent."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
+        lambda: False,
+    )
+    prompt = Mock()
+    monkeypatch.setattr("omnigent.cli_config._prompt_install_antigravity", prompt)
+    login = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
+
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "2", "q", "q"]) + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    prompt.assert_not_called()
+    login.assert_called_once_with(GEMINI_FAMILY)
 
 
 def test_antigravity_remove_api_key_drops_block_and_secret(
@@ -2812,17 +3047,23 @@ def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(
 
 @pytest.fixture()
 def _antigravity_sdk_absent(monkeypatch):
-    """Force ``google-antigravity`` detection to report missing.
+    """Force ``google-antigravity`` and native ``agy`` detection to report missing.
 
     Both call sites (overview row + drill-in) resolve ``antigravity_sdk_installed``
     from the source module at call time, so patching the module attribute is seen by
-    both.
+    both. The autouse harness fixture marks CLIs installed by default, so this
+    also clears only the Gemini/agy install bit to exercise the SDK-install hint
+    instead of the native sign-in row.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(
         "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
         lambda: False,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: family != GEMINI_FAMILY,
     )
 
 

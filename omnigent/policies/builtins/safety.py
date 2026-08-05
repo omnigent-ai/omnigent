@@ -8,10 +8,18 @@ Python. Each callable follows the :class:`PolicyEvent` →
 
 from __future__ import annotations
 
+import hashlib as _hashlib
+import json as _json
 import re as _re
-from typing import Any
+from typing import Literal
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_attachments,
+    request_user_text,
+)
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
@@ -95,7 +103,8 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
         if event.get("type") != "tool_call":
             return _ALLOW
         state = event.get("session_state") or {}
-        count = int(state.get("_policy_tool_call_count", 0))
+        count_value = state.get("_policy_tool_call_count", 0)
+        count = int(count_value) if isinstance(count_value, int | float | str) else 0
         if count >= limit:
             return {
                 "result": "DENY",
@@ -108,7 +117,98 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
             ],
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
+
+
+_LOOP_STATE_KEY = "_policy_loop_recent_hashes"
+
+
+def _args_hash(tool_name: str, arguments: object) -> str:
+    """Deterministic hash of (tool_name, arguments).
+
+    :param tool_name: Tool being called.
+    :param arguments: Arguments dict (or any JSON-serializable value).
+    :returns: SHA-256 hex digest identifying this (tool, args) pair.
+    """
+    blob = _json.dumps({"t": tool_name, "a": arguments}, sort_keys=True, default=str)
+    return _hashlib.sha256(blob.encode()).hexdigest()
+
+
+def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
+    """Factory: detect repeated identical tool calls.
+
+    Tracks recent tool-call hashes in ``session_state`` as a
+    bounded list of SHA-256 hex digests keyed by
+    ``_policy_loop_recent_hashes``.  When the same hash
+    appears *threshold* times within the last *window* calls,
+    returns ASK so the user can break the loop.
+
+    This catches the #1 token-waste pattern — an agent retrying
+    the exact same failing tool call — which
+    ``max_tool_calls_per_session`` cannot detect because it only
+    counts total calls.
+
+    :param window: Number of recent calls to consider.
+        Defaults to ``10``. Clamped to a minimum of ``1``.
+    :param threshold: How many times a call must repeat within
+        *window* to trigger. Defaults to ``3``. Clamped to a
+        minimum of ``1``.
+    :returns: A policy callable that ASKs when a loop is
+        detected.
+    """
+    window = max(1, window)
+    threshold = max(1, threshold)
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate whether the current tool call is a repeated loop.
+
+        :param event: Policy event dict.
+        :returns: ASK if loop detected, ALLOW otherwise.
+        """
+        if event.get("type") != "tool_call":
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+
+        tool_name = data.get("name", "")
+        arguments = data.get("arguments", {})
+        h = _args_hash(tool_name, arguments)
+
+        state = event.get("session_state") or {}
+        recent_value = state.get(_LOOP_STATE_KEY)
+        recent = (
+            [item for item in recent_value if isinstance(item, str)]
+            if isinstance(recent_value, list)
+            else []
+        )
+
+        recent.append(h)
+        # Trim to sliding window.
+        recent = recent[-window:]
+
+        count = recent.count(h)
+        if count >= threshold:
+            return {
+                "result": "ASK",
+                "reason": (
+                    f"The agent appears stuck in a retry loop — "
+                    f"tool '{tool_name}' called with identical arguments "
+                    f"{count} times in the last {len(recent)} calls."
+                ),
+                "state_updates": [
+                    {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
+                ],
+            }
+
+        return {
+            "result": "ALLOW",
+            "state_updates": [
+                {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
+            ],
+        }
+
+    return evaluate
 
 
 # ── OS tool approval ────────────────────────────────────────────────────────
@@ -302,8 +402,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
         # user message ``"/<name> <args>"`` and evaluates it at the
         # REQUEST phase.  Match ``/<blocked-name>`` at the start.
         if event_type == "request":
-            data = event.get("data")
-            text = data if isinstance(data, str) else ""
+            text = request_user_text(event.get("data"))
             if text.startswith("/"):
                 # Extract the command name: first token after "/".
                 # ``split(None, ...)`` drops empty tokens, so a bare "/"
@@ -320,7 +419,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
 
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Sandbox enforcement ────────────────────────────────────────────────────
@@ -380,7 +479,7 @@ def enforce_sandbox(
         ``__agent_start`` tool calls.
     """
     # Build the override dict — only include keys the admin explicitly set.
-    override: dict[str, Any] = {
+    override: dict[str, object] = {
         "type": sandbox_type,
         "allow_network": allow_network,
     }
@@ -412,7 +511,12 @@ def enforce_sandbox(
             args = {}
 
         # Merge: existing sandbox config as base, policy overrides on top.
-        current_sandbox: dict[str, Any] = args.get("sandbox") or {}
+        raw_sandbox = args.get("sandbox")
+        current_sandbox: dict[str, object] = (
+            {key: value for key, value in raw_sandbox.items() if isinstance(key, str)}
+            if isinstance(raw_sandbox, dict)
+            else {}
+        )
         forced_sandbox = {
             k: v for k, v in {**current_sandbox, **override}.items() if k in _SANDBOX_OVERRIDE_KEYS
         }
@@ -425,7 +529,7 @@ def enforce_sandbox(
             },
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── PII detection on LLM requests ────────────────────────────────────────────
@@ -482,7 +586,7 @@ def deny_pii_in_llm_request(
         # None or empty list → all categories enabled.
         selected = dict(_PII_CATEGORY_PATTERNS)
 
-    effective_action = action if action in ("DENY", "ASK") else "DENY"
+    effective_action: Literal["DENY", "ASK"] = "ASK" if action == "ASK" else "DENY"
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate user input or LLM request for PII matches.
@@ -502,19 +606,18 @@ def deny_pii_in_llm_request(
         event_type = event.get("type")
 
         if event_type == "request":
-            # REQUEST phase: ``data`` is the user message string.
-            text = event.get("data")
-            if isinstance(text, str):
-                return _scan_text(text)
-            # Content-block list (multimodal input).
-            if isinstance(text, list):
-                for block in text:
-                    if isinstance(block, dict):
-                        t = block.get("text", "")
-                        if isinstance(t, str):
-                            result = _scan_text(t)
-                            if result is not _ALLOW:
-                                return result
+            # REQUEST phase: scan the typed message plus each text attachment.
+            # ``data`` is {"user_content", "attachments"} from the input gate.
+            data = event.get("data")
+            result = _scan_text(request_user_text(data))
+            if result is not _ALLOW:
+                return result
+            for attachment in request_attachments(data):
+                att_text = attachment.get("text", "")
+                if isinstance(att_text, str) and att_text:
+                    result = _scan_text(att_text)
+                    if result is not _ALLOW:
+                        return result
             return _ALLOW
 
         if event_type == "llm_request":
@@ -548,12 +651,12 @@ def deny_pii_in_llm_request(
                 }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.safety.max_tool_calls_per_session",
         "kind": "factory",
@@ -570,6 +673,31 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                 },
             },
             "required": ["limit"],
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.detect_loop",
+        "kind": "factory",
+        "name": "Detect Tool Call Retry Loops",
+        "description": "Detects when the agent is stuck retrying the same tool call with "
+        "identical arguments. ASKs for user approval when the same (tool, args) "
+        "repeats N times within a sliding window of recent calls",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "window": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of recent tool calls to consider",
+                    "default": 10,
+                },
+                "threshold": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of identical repeats within the window to trigger",
+                    "default": 3,
+                },
+            },
         },
     },
     {

@@ -34,9 +34,9 @@ async def _drain_runner_skills(session_id: str) -> None:
 
 
 async def _drain_model_options(session_id: str) -> None:
-    """Pump the loop until the background Codex model-options fetch lands.
+    """Pump the loop until the background native model-options fetch lands.
 
-    Codex model options are eventual-consistent like skills: the first
+    Runner model options are eventual-consistent like skills: the first
     snapshot returns ``[]`` and starts the runner query; a later snapshot
     serves the cache.
     """
@@ -44,6 +44,31 @@ async def _drain_model_options(session_id: str) -> None:
         if session_id in _sessions_mod._model_options_cache:
             return
         await asyncio.sleep(0)
+
+
+def test_model_options_wire_keeps_rows_without_display_name() -> None:
+    """Provider rows may omit ``displayName`` — the UI falls back to ``id``.
+
+    Codex ``model/list`` and OpenCode ``/api/model`` rows are
+    provider-supplied; requiring ``displayName`` would blank the whole
+    picker when one row lacks it.
+    """
+    options = _sessions_mod._model_options_from_wire([{"id": "opencode-go/glm-5.2"}])
+    assert [option["id"] for option in options] == ["opencode-go/glm-5.2"]
+    assert "displayName" not in options[0]
+
+
+def test_model_options_wire_skips_malformed_rows_not_the_catalog() -> None:
+    """One invalid row (or non-dict) is dropped; its siblings survive."""
+    options = _sessions_mod._model_options_from_wire(
+        [
+            {"id": "opus", "displayName": "Opus 4.10"},
+            {"displayName": "no id"},
+            "not-a-dict",
+            {"id": 42},
+        ]
+    )
+    assert [option["id"] for option in options] == ["opus"]
 
 
 class _ConversationStore:
@@ -745,13 +770,179 @@ async def test_session_snapshot_includes_model_options_from_runner(
     )
 
     assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
-    assert snapshot.model_options[0]["displayName"] == "GPT-5.5"
-    assert snapshot.model_options[0]["supportedReasoningEfforts"] == [
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0].displayName == "GPT-5.5"
+    assert [
+        effort.model_dump(exclude_none=True)
+        for effort in snapshot.model_options[0].supportedReasoningEfforts
+    ] == [
         {"reasoningEffort": "low", "description": "Low"},
         {"reasoningEffort": "medium", "description": "Medium"},
         {"reasoningEffort": "high", "description": "High"},
         {"reasoningEffort": "xhigh", "description": "Extra high"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_kiro_session_snapshot_loads_runner_model_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            del timeout
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/kiro-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "provider-latest",
+                                "displayName": "Provider Latest",
+                                "isDefault": True,
+                                "description": "Provider supplied description",
+                                "contextWindow": 256_000,
+                                "rateMultiplier": 0.5,
+                                "rateUnit": "Credit",
+                            }
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    session_id = "5c782829093f4ebcbf18684eed8a9155"
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._KIRO_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
+    assert [model.id for model in snapshot.model_options] == ["provider-latest"]
+    assert snapshot.model_options[0].model_dump()["description"] == (
+        "Provider supplied description"
+    )
+    assert snapshot.model_options[0].model_dump()["contextWindow"] == 256_000
+    assert snapshot.model_options[0].model_dump()["rateMultiplier"] == 0.5
+    assert snapshot.model_options[0].model_dump()["rateUnit"] == "Credit"
+
+
+@pytest.mark.asyncio
+async def test_claude_session_snapshot_loads_launch_time_model_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude snapshots populate from the runner's launch-time catalog."""
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/claude-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "opus",
+                                "model": "system.ai.claude-opus-4-10",
+                                "displayName": "Opus 4.10",
+                                "isDefault": True,
+                            },
+                            {
+                                "id": "haiku",
+                                "model": "system.ai.claude-haiku-4-5",
+                                "displayName": "Haiku 4.5",
+                                "isDefault": False,
+                            },
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    session_id = "conv_claude_options"
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert f"/v1/sessions/{session_id}/claude-model-options" in fake_client.get_calls
+    assert [(m.id, m.displayName) for m in snapshot.model_options] == [
+        ("opus", "Opus 4.10"),
+        ("haiku", "Haiku 4.5"),
     ]
 
 
@@ -846,26 +1037,18 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
     # Served straight from the pushed cache — no runner model-options fetch.
     assert not any("model-options" in url for url in fake_client.get_calls)
-    assert [m["id"] for m in snapshot.model_options] == [
+    assert [m.id for m in snapshot.model_options] == [
         "databricks-claude-sonnet-4-6",
         "anthropic-claude-opus-4-1",
     ]
-    assert snapshot.model_options[0]["displayName"] == "Sonnet 4.6"
+    assert snapshot.model_options[0].displayName == "Sonnet 4.6"
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_serves_static_cursor_model_options(
+async def test_session_snapshot_fetches_live_cursor_model_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Cursor-native model options are a curated *static* catalog, served directly.
-
-    Unlike codex (live runner ``model/list``), cursor's catalog never changes
-    per session, so the snapshot returns it on the FIRST read with no runner
-    round-trip and no background fetch. Serving it directly (not through the
-    runner-backed cache) is what keeps the picker from blanking on a
-    ``refresh_state`` snapshot — the regression behind the effort-change bug.
-    """
+    """Cursor options are fetched from the runner and cached for later snapshots."""
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
@@ -890,6 +1073,18 @@ async def test_session_snapshot_serves_static_cursor_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
+            if url.endswith("/cursor-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "provider-latest",
+                                "displayName": "Provider Latest",
+                                "isDefault": True,
+                            }
+                        ]
+                    }
+                )
             return _FakeResponse({"status": "idle"})
 
     fake_client = _FakeRunnerClient()
@@ -911,34 +1106,40 @@ async def test_session_snapshot_serves_static_cursor_model_options(
         conversations={"4747fb03a3b45bb1f96bf130f4d704e5": conv},
     )
 
-    # First snapshot already carries the full catalog — no kick-and-empty.
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "4747fb03a3b45bb1f96bf130f4d704e5",
+    )
+    assert first.model_options == []
+
+    await _drain_model_options("4747fb03a3b45bb1f96bf130f4d704e5")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "4747fb03a3b45bb1f96bf130f4d704e5",
     )
 
-    # No runner round-trip for cursor model options (served statically).
-    assert not any("model-options" in url for url in fake_client.get_calls)
-    ids = [m["id"] for m in snapshot.model_options]
-    assert "claude-opus-4-6" in ids and "gpt-5.2" in ids and "composer-2.5" in ids
-    # base-id namespace only — no flattened effort variants leak through.
-    assert not any("-high" in i or "-xhigh" in i for i in ids)
-    # The cache must stay untouched — that's what makes it refresh_state-proof.
-    assert "4747fb03a3b45bb1f96bf130f4d704e5" not in _mod._model_options_cache
+    assert [m.id for m in snapshot.model_options] == ["provider-latest"]
+    assert snapshot.model_options[0].displayName == "Provider Latest"
+    assert (
+        "/v1/sessions/4747fb03a3b45bb1f96bf130f4d704e5/cursor-model-options"
+        in fake_client.get_calls
+    )
+    assert "4747fb03a3b45bb1f96bf130f4d704e5" in _mod._model_options_cache
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_refresh_state_reloads_model_options(
+@pytest.mark.parametrize("wrapper_name", ["cursor", "codex"])
+async def test_snapshot_refresh_scopes_cached_options_to_cursor(
     monkeypatch: pytest.MonkeyPatch,
+    wrapper_name: str,
 ) -> None:
     """
-    ``refresh_state=True`` pierces stale runner-backed Codex catalogs.
+    ``refresh_state=True`` retains only Cursor's previous picker options.
 
-    Browser reloads pass this flag so an AP-process cache warmed by an older
-    bug or older Codex response does not keep driving the model picker after
-    refresh. The first refreshed snapshot must not serve the stale cached row;
-    once the background runner read lands, a later snapshot serves the live
-    catalog.
+    Browser reloads and effort changes can request a refresh while the runner
+    catalog fetch is still in flight. The previous catalog remains available
+    for Cursor until the live response replaces it; Codex retains its existing
+    drop-on-refresh behavior.
     """
     from omnigent.server.routes import sessions as _mod
 
@@ -974,18 +1175,13 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
             self.get_calls.append(url)
             if url.endswith("/skills"):
                 return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith(f"/{wrapper_name}-model-options"):
                 return _FakeResponse(
                     {
                         "models": [
                             {
                                 "id": "fresh-model",
-                                "model": "fresh-provider-model",
                                 "displayName": "Fresh Model",
-                                "defaultReasoningEffort": "high",
-                                "supportedReasoningEfforts": [
-                                    {"reasoningEffort": "high", "description": "High"}
-                                ],
                                 "isDefault": True,
                             }
                         ]
@@ -1004,7 +1200,10 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
         root_conversation_id="3626053dfa9668a8604cc06e0b590ae0",
         agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
-            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: getattr(
+                _mod,
+                f"_{wrapper_name.upper()}_NATIVE_WRAPPER_LABEL_VALUE",
+            ),
         },
     )
     conv_store = _ConversationStore(
@@ -1017,9 +1216,8 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
         "3626053dfa9668a8604cc06e0b590ae0",
         refresh_state=True,
     )
-    # Refresh must not echo the stale cached row. If this is "stale-model",
-    # browser reloads would not recover after the server-side cache shape is fixed.
-    assert [m["id"] for m in refreshed.model_options] == []
+    expected_during_refresh = ["stale-model"] if wrapper_name == "cursor" else []
+    assert [m.id for m in refreshed.model_options] == expected_during_refresh
     await _drain_model_options("3626053dfa9668a8604cc06e0b590ae0")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -1027,11 +1225,247 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
     )
 
     assert (
-        "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/codex-model-options"
+        f"/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/{wrapper_name}-model-options"
         in fake_client.get_calls
     )
-    assert [m["id"] for m in snapshot.model_options] == ["fresh-model"]
-    assert snapshot.model_options[0]["displayName"] == "Fresh Model"
+    assert [m.id for m in snapshot.model_options] == ["fresh-model"]
+    assert snapshot.model_options[0].displayName == "Fresh Model"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_serves_cached_model_options_while_runner_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The cached catalog outlives runner death so asleep pickers stay filled.
+
+    A model/effort change is valid while the runner is down (the PATCH
+    persists and applies at the next wake), so a browser reload of an
+    asleep session must not blank the model picker: relay teardown only
+    marks the catalog stale, and a ``refresh_state`` snapshot that resolves
+    no runner client keeps serving the cached rows.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_offline_catalog"
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_stale.discard(session_id)
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse({"models": [{"id": "gpt-5.5", "displayName": "GPT-5.5"}]})
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+
+    # Runner death: the relay's exit path invalidates, then later snapshots
+    # resolve no runner client at all.
+    _mod._invalidate_runner_backed_snapshot_state(
+        session_id, cancel_inflight=True, drop_model_options=False
+    )
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+
+    refreshed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        refresh_state=True,
+    )
+    assert [m.id for m in refreshed.model_options] == ["gpt-5.5"]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stale catalog serves immediately, then converges on the live one.
+
+    After runner death marks the cache stale, the first snapshot with a
+    relaunched runner must not blank the picker: it serves the old rows
+    while a background re-fetch runs, and once that lands a later snapshot
+    serves the runner's current catalog.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_stale_catalog"
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_stale.discard(session_id)
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.model_id = "old-model"
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse({"models": [{"id": self.model_id}]})
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+
+    _mod._invalidate_runner_backed_snapshot_state(
+        session_id, cancel_inflight=True, drop_model_options=False
+    )
+    fake_client.model_id = "new-model"
+
+    stale = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert [m.id for m in stale.model_options] == ["old-model"]
+    # The cache already holds this session, so ``_drain_model_options``
+    # would return immediately — wait on the re-fetch task instead.
+    for _ in range(100):
+        if session_id not in _mod._model_options_inflight:
+            break
+        await asyncio.sleep(0)
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert [m.id for m in snapshot.model_options] == ["new-model"]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_fills_cold_claude_catalog_from_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cold cache with no runner falls back to the session's host.
+
+    A server restart while a claude-native session sleeps empties the
+    in-memory catalog and there is no runner to refill it. The snapshot
+    then asks the session's host — the same pre-launch source the
+    new-session picker uses — so the model picker refills without a wake.
+    Host rows are stale-marked so the next live runner replaces them with
+    its launch-exact catalog.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_host_catalog"
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_stale.discard(session_id)
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    host_queries: list[str] = []
+
+    async def _fake_host_options(host_id: str) -> list[dict[str, object]] | None:
+        host_queries.append(host_id)
+        return [{"id": "opus", "displayName": "Opus"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="host_abc",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert host_queries == ["host_abc"]
+    assert [m.id for m in snapshot.model_options] == ["opus"]
+    assert session_id in _mod._model_options_stale
 
 
 @pytest.mark.asyncio
@@ -1053,7 +1487,7 @@ async def test_session_snapshot_retries_empty_model_options(
     _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
-    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
 
     class _FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -1131,8 +1565,8 @@ async def test_session_snapshot_retries_empty_model_options(
         )
         == 2
     )
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
-    assert snapshot.model_options[0]["defaultReasoningEffort"] == "xhigh"
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0].defaultReasoningEffort == "xhigh"
 
 
 @pytest.mark.asyncio
@@ -1154,7 +1588,7 @@ async def test_session_snapshot_retries_503_model_options(
     _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
-    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
 
     class _FakeResponse:
         def __init__(
@@ -1245,8 +1679,8 @@ async def test_session_snapshot_retries_503_model_options(
         )
         == 2
     )
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.4"]
-    assert snapshot.model_options[0]["defaultReasoningEffort"] == "medium"
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.4"]
+    assert snapshot.model_options[0].defaultReasoningEffort == "medium"
 
 
 @pytest.mark.asyncio

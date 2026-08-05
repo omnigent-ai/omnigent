@@ -24,14 +24,14 @@ export type DictationEvent =
   | { type: "stopped"; text: string }
   | { type: "error"; message: string };
 
-export type DictationSessionEvents = {
+export interface DictationSessionEvents {
   /** Revisable in-progress utterance (server-throttled to ~6 Hz). */
   onPartial: (text: string) => void;
   /** An utterance completed by a pause; append it and clear the partial. */
   onFinal: (text: string) => void;
   /** Fatal error after start. The session has already cleaned itself up. */
   onError: (message: string) => void;
-};
+}
 
 /**
  * The server was reachable but at its concurrent-take cap (WS close 1013).
@@ -70,11 +70,15 @@ export function parseDictationEvent(raw: string): DictationEvent | null {
 }
 
 // Client budgets must exceed the server's own worst cases or takes fail
-// spuriously right when they'd have succeeded. The dominant cost is the
-// first take's engine construction, which loads the model weights (seconds
-// on a cold server); the stop budget just needs to outlast the tail flush.
-const READY_TIMEOUT_MS = 20_000;
-const STOP_TIMEOUT_MS = 5_000;
+// spuriously right when they'd have succeeded:
+// - ready: engine construction loads model weights on the first take, and
+//   the remote-relay path allows the worker 30 s for its own cold load
+//   (_REMOTE_READY_TIMEOUT_S in omnigent/server/dictation.py).
+// - stop: the relay waits up to 10 s (_REMOTE_STOP_TIMEOUT_S) for the
+//   worker to flush the tail; resolving earlier would drop the user's
+//   last words even though they were transcribed moments later.
+const READY_TIMEOUT_MS = 40_000;
+const STOP_TIMEOUT_MS = 15_000;
 
 // How long stop() waits for the worklet to post its final partial chunk
 // before tearing the audio graph down. Message-port turnaround is
@@ -140,15 +144,15 @@ class Pcm16Downsampler extends AudioWorkletProcessor {
 registerProcessor("omnigent-pcm16-downsampler", Pcm16Downsampler);
 `;
 
-let _workletUrl: string | null = null;
+let cachedWorkletUrl: string | null = null;
 
 function workletUrl(): string {
-  if (_workletUrl === null) {
-    _workletUrl = URL.createObjectURL(
+  if (cachedWorkletUrl === null) {
+    cachedWorkletUrl = URL.createObjectURL(
       new Blob([WORKLET_SOURCE], { type: "application/javascript" }),
     );
   }
-  return _workletUrl;
+  return cachedWorkletUrl;
 }
 
 /**

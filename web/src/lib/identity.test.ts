@@ -4,7 +4,7 @@
 // `identity.ts` keeps its cached user id at module scope (the entire
 // app shares one identity), so each test calls `vi.resetModules()` and
 // re-imports to start from a clean slate. Otherwise tests would leak
-// state into each other through the cached `_currentUserId`.
+// state into each other through the cached `currentUserId`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 

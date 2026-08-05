@@ -1,17 +1,12 @@
-"""
-Sandbox launchers: run Omnigent hosts in remote sandboxes.
+"""Sandbox launchers: run Omnigent hosts in remote sandboxes.
 
 Public API for the ``omnigent sandbox`` CLI and anything else that
-bootstraps a sandbox-backed host. Providers are registered by name in
-:data:`_LAUNCHERS`; launcher modules may be absent from a given
-distribution (e.g. the Databricks Lakebox launcher), in which case the
-provider simply isn't offered.
+bootstraps a sandbox-backed host. Core Omnigent contributes built-in
+providers directly; third-party packages can contribute providers through
+the ``omnigent.sandbox_providers`` entry point group.
 """
 
 from __future__ import annotations
-
-import importlib
-import importlib.util
 
 import click
 
@@ -19,6 +14,7 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxCapabilityError,
+    SandboxHostLauncher,
     SandboxLauncher,
 )
 from omnigent.onboarding.sandboxes.bootstrap import (
@@ -32,69 +28,64 @@ from omnigent.onboarding.sandboxes.bootstrap import (
     set_sandbox_host_name,
     ship_wheels,
 )
+from omnigent.onboarding.sandboxes.registry import (
+    COMMUNITY_MODULE_PREFIX,
+    SandboxProviderContribution,
+    SandboxProviderMetadata,
+    SandboxProviderPluginState,
+    SandboxRegistryError,
+    available_providers,
+    get_provider_metadata,
+    instantiate,
+    plugin_state,
+    reset_plugin_state_for_tests,
+)
+from omnigent.onboarding.sandboxes.types import (
+    HostContext,
+    SandboxCapabilities,
+    SandboxCommandError,
+    SandboxConfigError,
+    SandboxError,
+    SandboxInfo,
+    SandboxSpec,
+)
 
 __all__ = [
+    "COMMUNITY_MODULE_PREFIX",
     "DEFAULT_SANDBOX_NAME",
     "DerivedWorkspace",
+    "HostContext",
     "RemoteCommandResult",
     "RemoteProcess",
+    "SandboxCapabilities",
     "SandboxCapabilityError",
+    "SandboxCommandError",
+    "SandboxConfigError",
+    "SandboxError",
+    "SandboxHostLauncher",
+    "SandboxInfo",
     "SandboxLauncher",
+    "SandboxProviderContribution",
+    "SandboxProviderMetadata",
+    "SandboxProviderPluginState",
+    "SandboxRegistryError",
+    "SandboxSpec",
     "available_providers",
     "bootstrap_sandbox_host",
     "build_wheels",
     "connect_sandbox_host",
     "derive_workspace",
     "get_launcher",
+    "get_provider_metadata",
     "login_app_oauth_in_sandbox",
+    "plugin_state",
+    "reset_plugin_state_for_tests",
     "set_sandbox_host_name",
     "ship_wheels",
 ]
 
-# Provider name → "module:ClassName" of its SandboxLauncher. Modules are
-# imported lazily (some pull in optional SDKs) and may be absent from a
-# distribution entirely (e.g. lakebox).
-_LAUNCHERS: dict[str, str] = {
-    "lakebox": "omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
-    "modal": "omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
-    "daytona": "omnigent.onboarding.sandboxes.daytona:DaytonaSandboxLauncher",
-    "boxlite": "omnigent.onboarding.sandboxes.boxlite:BoxliteSandboxLauncher",
-    # CoreWeave Sandbox via the official cwsandbox SDK (the
-    # `omnigent[cwsandbox]` extra), imported lazily like modal/daytona.
-    "cwsandbox": "omnigent.onboarding.sandboxes.cwsandbox:CWSandboxLauncher",
-    "islo": "omnigent.onboarding.sandboxes.islo:IsloSandboxLauncher",
-    # E2B (https://e2b.dev) via the official `e2b` SDK (the
-    # `omnigent[e2b]` extra), imported lazily like modal/daytona.
-    "e2b": "omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
-    "openshell": "omnigent.onboarding.sandboxes.openshell:OpenShellSandboxLauncher",
-    # On-demand Kubernetes runner Pod via the official kubernetes client (the
-    # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
-    "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
-}
 
-
-def available_providers() -> tuple[str, ...]:
-    """
-    List the sandbox providers whose launcher modules exist in this
-    build.
-
-    Uses ``find_spec`` (no import side effects), so it is cheap enough
-    to call at CLI startup to decide whether to register the
-    ``omnigent sandbox`` command group.
-
-    :returns: Provider names in registration order, e.g.
-        ``("lakebox", "modal")`` internally or ``("modal",)`` in the
-        OSS build (where the lakebox module is excluded).
-    """
-    available: list[str] = []
-    for name, target in _LAUNCHERS.items():
-        module_name = target.partition(":")[0]
-        if importlib.util.find_spec(module_name) is not None:
-            available.append(name)
-    return tuple(available)
-
-
-def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxLauncher:
+def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxHostLauncher:
     """
     Resolve a provider name to a launcher instance.
 
@@ -113,20 +104,12 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
     :raises click.ClickException: If the provider is unknown or its
         launcher module is not present in this build.
     """
-    target = _LAUNCHERS.get(provider)
-    if target is None or provider not in available_providers():
+    if provider not in plugin_state():
         offered = ", ".join(available_providers()) or "(none in this build)"
         raise click.ClickException(
             f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."
         )
-    if provider == "lakebox" and workspace_host is not None:
-        # Imported here (not at module top) because the lakebox module
-        # may be absent from a distribution; the availability check above
-        # guarantees it exists in this one.
-        from omnigent.onboarding.sandboxes.lakebox import LakeboxLauncher
-
-        return LakeboxLauncher(workspace_host=workspace_host)
-    module_name, _, class_name = target.partition(":")
-    module = importlib.import_module(module_name)
-    launcher_cls: type[SandboxLauncher] = getattr(module, class_name)
-    return launcher_cls()
+    try:
+        return instantiate(provider, workspace_host=workspace_host)
+    except SandboxRegistryError as exc:
+        raise click.ClickException(str(exc)) from exc

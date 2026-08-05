@@ -45,6 +45,19 @@ for (const a of areas) {
   assert(`area ${a.key} has paths`, Array.isArray(a.paths) && a.paths.length > 0);
 }
 
+// Every area has a weight (importance multiplier for the priority score) drawn
+// from the allowed bands, tagged with its source (telemetry vs editorial).
+const ALLOWED_WEIGHTS = new Set([1.4, 1.2, 1.1, 1.0, 0.9]);
+const ALLOWED_WEIGHT_SOURCES = new Set(["telemetry", "editorial"]);
+for (const a of areas) {
+  assert(`area ${a.key} weight is an allowed band`, ALLOWED_WEIGHTS.has(a.weight), `${a.weight}`);
+  assert(
+    `area ${a.key} weight_source is telemetry|editorial`,
+    ALLOWED_WEIGHT_SOURCES.has(a.weight_source),
+    `${a.weight_source}`,
+  );
+}
+
 // Path resolution (last-match-wins startsWith) sends representative files to the
 // expected area -- especially the web/ carve-out ordering and harness prefixes.
 function resolve(fn) {

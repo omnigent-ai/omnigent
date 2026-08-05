@@ -15,8 +15,9 @@ import base64
 import os
 import re
 import stat
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Literal, ParamSpec
 
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
@@ -33,9 +34,10 @@ from omnigent.entities.pagination import PagedList
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
 
 if TYPE_CHECKING:
-    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.os_env import OpResult, OSEnvironment
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+_Params = ParamSpec("_Params")
 
 
 def _shell_quote(s: str) -> str:
@@ -157,10 +159,10 @@ def split_glob_list(raw: str | None) -> list[str]:
 
 
 async def _run_os_env_async(
-    method: Any,
-    *args: Any,
-    **kwargs: Any,
-) -> dict[str, Any]:
+    method: Callable[_Params, Awaitable[OpResult]],
+    *args: _Params.args,
+    **kwargs: _Params.kwargs,
+) -> OpResult:
     """Call an OSEnvironment async method.
 
     The OSEnvironment protocol uses ``OpResult = dict[str, Any]``
@@ -173,7 +175,7 @@ async def _run_os_env_async(
     :param kwargs: Keyword arguments.
     :returns: The OpResult dict.
     """
-    return await method(*args, **kwargs)  # type: ignore[no-any-return]
+    return await method(*args, **kwargs)
 
 
 def _validate_path(relative_path: str) -> str:
@@ -220,7 +222,7 @@ def _entry_from_stat(
         )
 
     if stat.S_ISDIR(st.st_mode):
-        entry_type = "directory"
+        entry_type: Literal["file", "directory", "symlink", "other"] = "directory"
         size = None
     elif stat.S_ISLNK(st.st_mode):
         entry_type = "symlink"
@@ -349,7 +351,7 @@ class CallerProcessFilesystem:
         for item in raw:
             name = item["n"]
             rel = os.path.join(validated, name) if validated else name
-            entry_type = "directory" if item["t"] == "d" else "file"
+            entry_type: Literal["file", "directory"] = "directory" if item["t"] == "d" else "file"
             entries.append(
                 FilesystemEntry(
                     id=rel,
@@ -658,7 +660,7 @@ class CallerProcessFilesystem:
         except _json.JSONDecodeError as exc:
             raise FilesystemPathNotFound(f"Path {path!r} not found") from exc
         name = os.path.basename(validated) if validated else ""
-        entry_type = "file"
+        entry_type: Literal["file", "directory", "symlink"] = "file"
         if info.get("d"):
             entry_type = "directory"
         elif info.get("l"):

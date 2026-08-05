@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.7.0.dev0"
+version = "0.9.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,10 +26,12 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.7.0.dev0",
-    "omnigent-ui-sdk==0.7.0.dev0",
+    "omnigent-client==0.9.0.dev0",
+    "omnigent-ui-sdk==0.9.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
+    # OpenClaw stores its wrapped acpx registry as JSON5.
+    "json5>=0.10,<1",
     # openai-agents<0.18.2 omits a field required by openai>=2.45.
     # Keep this cap until the websockets<15 compatibility pin can be lifted.
     "openai>=1.0,<2.45",
@@ -49,7 +51,10 @@ dependencies = [
     "psutil>=5.9,<8",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
-    # Pure-Python implementation; available on all platforms.
+    # NOT pure-Python: cel-python hard-depends on google-re2 (a C++ extension,
+    # imported at celpy module scope with no fallback), whose sdist needs bazel.
+    # Packagers must pin its prebuilt wheel — see WHEEL_PACKAGES in
+    # .github/scripts/homebrew/generate_formula.py.
     "cel-python>=0.5",
     # OS keychain for storing model-provider API keys (OSS model
     # selection). Used by omnigent/onboarding/secrets.py; falls back to
@@ -100,6 +105,11 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    # CA root bundle for client TLS verification (omnigent/tls.py,
+    # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
+    # python-build-standalone interpreters whose OpenSSL has no default cert
+    # path; previously only transitive, pinned here now that we import it.
+    "certifi>=2023.7",
     # Protobuf schema for the AI-gateway routing API
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.
@@ -157,7 +167,7 @@ islo = ["islo>=0.3.5,<0.4"]
 # NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
-openshell = ["openshell>=0.0.7,<1"]
+openshell = ["openshell>=0.0.88,<1"]
 # On-demand Kubernetes runner Pod launcher (server-managed
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the
@@ -212,6 +222,10 @@ hindsight = ["hindsight-client>=0.4.0"]
 # TODO(0.70): remove this `memory` alias extra — it exists only to keep the
 # pre-rename install command working during the deprecation window.
 memory = ["hindsight-client>=0.4.0"]
+# Nimble research runs (the `nimble_research` builtin). The tool imports the
+# nimble-python client lazily, so only users who enable nimble_research need
+# this extra. nimble_extract talks raw httpx and needs no extra.
+nimble = ["nimble-python>=1.2.0,<2"]
 # Slack integration (`omni integration slack`). The @omnigent socket-mode bot
 # lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
 # aiohttp — kept out of the baseline install). The CLI launches it as a
@@ -220,7 +234,13 @@ memory = ["hindsight-client>=0.4.0"]
 # installs resolve it from `integrations/slack` via [tool.uv.sources] below;
 # publishing `omnigent[slack]` to an index additionally requires publishing
 # `omnigent-slack` there (not yet wired into the release pipeline).
-slack = ["omnigent-slack"]
+# Version-locked (==) with the lockstep cycle — `scripts/update_versions.py`
+# keeps this pin in sync with the other sibling `==` pins
+# (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
+# `[project].version` in `integrations/slack/pyproject.toml`.
+slack = [
+    "omnigent-slack==0.9.0.dev0",
+]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -241,11 +261,21 @@ databricks = [
     # fresh install on Python 3.14 tries (and fails) to build it from source.
     "databricks-ai-bridge>=0.19",
 ]
+# Load testing (dev/loadtest/). Locust drives the concurrency; the test also
+# needs the `dev` + `agents-sdk` extras (BenchEnvironment boots the stack and the
+# openai-agents harness runs the mocked turns). Opt-in — only load-test users
+# need it.
+loadtest = [
+    "locust>=2.30,<3",
+]
 dev = [
     "pytest>=7.0",
     # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
     # memory tool tests import + mock it, so keep it in the dev set.
     "hindsight-client>=0.4.0",
+    # nimble-python is opt-in (the `nimble` extra), but the nimble_research
+    # tests drive the real client against respx, so keep it in the dev set.
+    "nimble-python>=1.2.0,<2",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -287,6 +317,7 @@ dev = [
     "filelock>=3.0",
     "ruff>=0.6",
     "mypy>=1.10",
+    "pyrefly==1.1.1",
     "pre-commit>=3.5",
     "types-PyYAML>=6.0",
     "filelock>=3.0",
@@ -322,6 +353,10 @@ dev = [
 # `omni` ship, internal and OSS alike.)
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
+
+# Share the repository lockfile with standalone deploy packages.
+[tool.uv.workspace]
+members = ["deploy/issue_prioritization"]
 
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
@@ -458,9 +493,10 @@ extend-exclude = [
 # ``RET``      — flake8-return (consistent return statements)
 # ``C4``       — flake8-comprehensions (cleaner list/dict/set comprehensions)
 # ``PIE``      — flake8-pie (misc correctness + style)
+# ``LOG``      — flake8-logging (correct exception and logger usage)
 # ``RUF``      — ruff-specific (sorted ``__all__``, dangling asyncio
 #                tasks, unused noqa, ...)
-select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "RUF"]
+select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "LOG", "RUF"]
 ignore = [
     # ARG003 (unused class-method args): too noisy on ABC-subclass signatures
     # where the arg is required by the interface contract.
@@ -558,6 +594,11 @@ known-first-party = ["omnigent"]
 "integrations/slack/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# The sessions route is a facade over an implementation package. Its explicit
+# imports intentionally re-export implementation names and load route modules
+# for registration, so F401 remains expected in this package.
+"omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
+"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -607,6 +648,10 @@ module = "claude_agent_sdk.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["copilot", "copilot.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "agents.*"
 ignore_missing_imports = true
 
@@ -626,10 +671,22 @@ ignore_missing_imports = true
 module = "daytona.*"
 ignore_missing_imports = true
 
+# islo is an optional dep (the `islo` extra); same lazy-import posture
+# as modal above.
+[[tool.mypy.overrides]]
+module = "islo.*"
+ignore_missing_imports = true
+
 # hindsight-client is an optional dep (the `hindsight` extra); the
 # hindsights tools import it lazily so the base install never needs it.
 [[tool.mypy.overrides]]
 module = "hindsight_client.*"
+ignore_missing_imports = true
+
+# nimble-python is an optional dep (the `nimble` extra); nimble_research
+# imports it lazily so the base install never needs it.
+[[tool.mypy.overrides]]
+module = "nimble_python.*"
 ignore_missing_imports = true
 
 # cwsandbox is an optional dep (the `cwsandbox` extra); same lazy-import
@@ -698,6 +755,12 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "google.*"
 ignore_missing_imports = true
+
+# protoc owns the checked-in routing stub. Its built-in pyi generator emits an
+# untyped Message base and bare Mapping hints that application code cannot fix.
+[[tool.mypy.overrides]]
+module = "omnigent.api.routing.v1.routing_pb2"
+disable_error_code = ["misc", "type-arg"]
 
 [[tool.mypy.overrides]]
 module = "opentelemetry.instrumentation.*"

@@ -8,8 +8,20 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
+from omnigent.runner.session_init_protocol import (
+    build_runner_session_init_payload,
+    parse_runner_session_init_envelope,
+)
 from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import (
+    FORK_CARRY_HISTORY_LABEL_KEY,
+    FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
 class _Registry:
@@ -135,3 +147,67 @@ async def test_session_init_readiness_is_explicit_and_backward_compatible(
     )
 
     assert ready is expected_ready
+
+
+def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) -> None:
+    """A forked native session's fork directives survive to the runner envelope.
+
+    End-to-end regression guard for the exact seam that dropped a forked
+    claude-native session's history: the runner reconnect path
+    (``_on_runner_connect``) sources its conversations from
+    ``list_conversations_by_runner_id`` and hands each straight to
+    ``build_runner_session_init_payload``, which projects
+    ``conversation.labels`` into the init envelope the runner reads to decide
+    whether to clone/rebuild the vendor transcript. When that store lookup
+    returned label-less conversations, the envelope shipped no ``omnigent.fork.*``
+    directives, so the runner skipped its clone/rebuild branch and launched the
+    TUI fresh -- history lost -- even though the fork copied the history into the
+    store.
+
+    This drives the real store (fork included), not a hand-built envelope, so it
+    fails if any layer between the by-runner-id lookup and the envelope stops
+    carrying labels. The label-to-launch-metadata projection is covered
+    separately by ``test_claude_launch_metadata_envelope_never_calls_server``.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+
+    # A claude-native SOURCE with a captured native session id and a bound
+    # workspace -- the two preconditions fork_conversation needs to stamp the
+    # source-transcript directive.
+    agent = agent_store.create(generate_agent_id(), "claude-native-ui", "bundle/loc")
+    source = conversation_store.create_conversation(agent_id=agent.id, workspace="/tmp/ws")
+    conversation_store.set_external_session_id(source.id, "src-claude-sid")
+
+    # Fork it the way the route does for a same-family native target: carry
+    # history and resume the source's native transcript.
+    fork = conversation_store.fork_conversation(
+        source.id,
+        carry_history_into_native=True,
+        resume_source_native_session=True,
+    )
+    # Bind the fork to a runner so the reconnect lookup returns it.
+    assert conversation_store.set_runner_id(fork.id, "runner_fork")
+
+    # The reconnect path: by-runner-id lookup -> init payload.
+    bound = conversation_store.list_conversations_by_runner_id("runner_fork")
+    assert [c.id for c in bound] == [fork.id]
+
+    payload = build_runner_session_init_payload(bound[0], server_version="0.6.0.dev0")
+    envelope = parse_runner_session_init_envelope(payload)
+    assert envelope is not None
+
+    # The directives that select the runner's clone/rebuild branch must be
+    # present in the envelope the runner actually reads.
+    labels = envelope.snapshot.labels
+    assert labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+    assert labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) == "src-claude-sid"
+    assert labels.get(FORK_SOURCE_LABEL_KEY) == source.id
+
+    # And the runner's own projection reads them as launch directives -- the
+    # boolean the clone/rebuild branch gates on.
+    from omnigent.runner.app import _claude_launch_metadata_from_envelope
+
+    metadata = _claude_launch_metadata_from_envelope(envelope)
+    assert metadata.fork_carry_history is True
+    assert metadata.fork_source_external_id == "src-claude-sid"

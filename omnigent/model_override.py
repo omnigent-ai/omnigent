@@ -152,8 +152,7 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
         return (
             f"harness {canon!r} is Gemini-native and cannot run Claude/GPT or "
             f"Databricks-gateway models; got {model!r}. Use a Gemini id "
-            "(e.g. 'gemini-3.5-flash'), or the claude_code / codex / pi worker "
-            "for those families."
+            "or the claude_code / codex / pi worker for those families."
         )
     return None
 
@@ -186,6 +185,11 @@ def canonical_model_spelling(model: str) -> str:
     """
     if model.startswith(_DATABRICKS_MODEL_PREFIX):
         bare = model[len(_DATABRICKS_MODEL_PREFIX) :]
+        if _MECHANICAL_VENDOR_ID_RE.fullmatch(bare):
+            return bare
+    _SYSTEM_AI_PREFIX = "system.ai."
+    if model.startswith(_SYSTEM_AI_PREFIX):
+        bare = model[len(_SYSTEM_AI_PREFIX) :]
         if _MECHANICAL_VENDOR_ID_RE.fullmatch(bare):
             return bare
     return model

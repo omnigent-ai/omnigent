@@ -31,7 +31,7 @@ prompt: |
 
   ```
   {
-    "type": "bug" | "enhancement" | "documentation" | null,
+    "type": "bug" | "Feature" | "Docs" | null,
     "components": ["comp:server" | "comp:runner" | "comp:repr" | "comp:web-ui" | "comp:tui" | "comp:policies" | "comp:harnesses" | "comp:infra"],
     "priority": "P0-critical" | "P1-high" | "P2-medium" | "P3-low" | null,
     "needs_info": true | false,
@@ -49,9 +49,9 @@ prompt: |
   repro steps for a bug). When `true`, leave type/component/priority as
   `null`.
 
-  **type** — the issue templates add `bug` or `enhancement` labels
+  **type** — the issue templates add `bug` or `Feature` labels
   automatically; if the existing labels already include one, set the
-  matching type. Otherwise determine from content. Use `documentation`
+  matching type. Otherwise determine from content. Use `Docs`
   for docs-only issues.
 
   **components** — list of affected subsystems (one or more):

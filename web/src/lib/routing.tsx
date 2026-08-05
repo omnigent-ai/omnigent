@@ -23,7 +23,9 @@
 
 import {
   type ComponentPropsWithoutRef,
+  type ComponentType,
   type ReactNode,
+  type RefAttributes,
   createContext,
   forwardRef,
   useContext,
@@ -44,12 +46,20 @@ import {
  * react-router-dom so call sites are identical and any host implementation
  * must conform to the same shapes (the adapter's job).
  */
+/**
+ * Link props: react-router-dom's `LinkProps` plus an optional `componentId` an
+ * embedding host can use for per-link analytics. Standalone ignores it; the
+ * Databricks host maps it to a namespaced analytics id (see the routing IoC
+ * override). Optional so existing call sites are unchanged.
+ */
+export type OmnigentLinkProps = ComponentPropsWithoutRef<typeof RRLink> & { componentId?: string };
+
 export interface RoutingApi {
   useNavigate: typeof useRRNavigate;
   useParams: typeof useRRParams;
   useSearchParams: typeof useRRSearchParams;
   useLocation: typeof useRRLocation;
-  Link: typeof RRLink;
+  Link: ComponentType<OmnigentLinkProps & RefAttributes<HTMLAnchorElement>>;
   Outlet: typeof RROutlet;
   /**
    * Rebase an app-absolute path (`/c/:id`) the same way `navigate()`/`<Link>`
@@ -60,13 +70,23 @@ export interface RoutingApi {
   rebasePath: (path: string) => string;
 }
 
+// Standalone Link: react-router-dom's Link, minus the host-only `componentId`
+// (standalone has no analytics sink; passing it to a real <a> would warn on an
+// unknown DOM attribute).
+const StandaloneLink = forwardRef<HTMLAnchorElement, OmnigentLinkProps>(function StandaloneLink(
+  { componentId: _componentId, ...props },
+  ref,
+) {
+  return <RRLink ref={ref} {...props} />;
+});
+
 /** Default implementation: plain react-router-dom. */
 export const reactRouterRouting: RoutingApi = {
   useNavigate: useRRNavigate,
   useParams: useRRParams,
   useSearchParams: useRRSearchParams,
   useLocation: useRRLocation,
-  Link: RRLink,
+  Link: StandaloneLink,
   Outlet: RROutlet,
   rebasePath: (path) => path,
 };
@@ -82,7 +102,7 @@ function rebasePath(path: string, basename: string): string {
   // and `/mount?o=1` are all "already under `/mount`", but a distinct segment
   // like `/mounting` is not. Checking only `=== basename` / `${basename}/`
   // missed the query/hash forms: a mount-absolute path carrying a search (e.g.
-  // the settings "Back to Omnigent" target `/mount?o=123`, captured from
+  // the settings Back target `/mount?o=123`, captured from
   // `useLocation()` which already includes the basename) fell through and got
   // prefixed again → `/mount/mount?o=123`, a 404.
   if (path === basename) return path;
@@ -129,7 +149,7 @@ export function basenamedRouting(
         return navigate(rebaseTo(to, basename), options);
       }) as ReturnType<typeof useRRNavigate>;
     },
-    Link: forwardRef<HTMLAnchorElement, ComponentPropsWithoutRef<typeof RRLink>>((props, ref) => {
+    Link: forwardRef<HTMLAnchorElement, OmnigentLinkProps>((props, ref) => {
       const Impl = base.Link;
       return <Impl ref={ref} {...props} to={rebaseTo(props.to, basename)} />;
     }),
@@ -172,12 +192,10 @@ export const useLocation: typeof useRRLocation = () => useRouting().useLocation(
  */
 export const useRebasePath = (): ((path: string) => string) => useRouting().rebasePath;
 
-export const Link = forwardRef<HTMLAnchorElement, ComponentPropsWithoutRef<typeof RRLink>>(
-  (props, ref) => {
-    const { Link: Impl } = useRouting();
-    return <Impl ref={ref} {...props} />;
-  },
-);
+export const Link = forwardRef<HTMLAnchorElement, OmnigentLinkProps>((props, ref) => {
+  const { Link: Impl } = useRouting();
+  return <Impl ref={ref} {...props} />;
+});
 Link.displayName = "Link";
 
 export const Outlet: typeof RROutlet = (props) => {

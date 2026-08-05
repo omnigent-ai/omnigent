@@ -122,16 +122,13 @@ function createDesktopUpdater({
   function setConfig(patch = {}) {
     const settings = loadSettings();
     const next = { ...settings };
-    if (Object.prototype.hasOwnProperty.call(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
+    if (Object.hasOwn(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
       next.update_mode = patch.mode;
     }
-    if (
-      Object.prototype.hasOwnProperty.call(patch, "autoInstall") &&
-      typeof patch.autoInstall === "boolean"
-    ) {
+    if (Object.hasOwn(patch, "autoInstall") && typeof patch.autoInstall === "boolean") {
       next.update_auto_install = patch.autoInstall;
     }
-    if (Object.prototype.hasOwnProperty.call(patch, "skippedVersion")) {
+    if (Object.hasOwn(patch, "skippedVersion")) {
       next.update_skipped_version =
         typeof patch.skippedVersion === "string" ? patch.skippedVersion : null;
     }
@@ -183,6 +180,10 @@ function createDesktopUpdater({
         () => autoUpdater.checkForUpdates().catch(() => {}),
         PERIODIC_CHECK_INTERVAL_MS,
       );
+      // Don't let the 6-hourly re-check keep the Node event loop alive at quit
+      // (a ref'd interval can leave the main process lingering after the
+      // windows close on some platforms).
+      if (typeof updateCheckTimer.unref === "function") updateCheckTimer.unref();
     }
   }
 

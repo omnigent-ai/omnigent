@@ -15,6 +15,7 @@ See ``designs/DEVICE_AUTH.md``.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from collections.abc import Iterator
 from pathlib import Path
@@ -378,6 +379,42 @@ def test_consent_page_requires_login(app: TestClient) -> None:
     assert "/login" in r.headers["location"]
 
 
+def test_consent_forces_reauth_for_stale_session(app: TestClient) -> None:
+    """A session that predates the grant is bounced to a FORCED re-login.
+
+    The whole anti-phishing property: even an already-signed-in user must
+    re-authenticate for THIS flow. Logging in BEFORE authorize makes the
+    session ``iat`` older than the grant's ``created_at``, so the consent GET
+    must bounce with ``reauth=1`` rather than render the approve screen — and
+    the approve POST must refuse the stale session outright.
+    """
+    # Sign in FIRST (stale session relative to the soon-to-be-created grant).
+    _login_admin(app)
+    import time as _t
+
+    _t.sleep(1)  # ensure the grant's created_at is a later second than iat
+
+    r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    assert r.status_code == 200, r.text
+    user_code = r.json()["user_code"]
+
+    # Consent GET bounces to a FORCED re-login (reauth=1), not the approve page.
+    r = app.get(f"/oauth/device?user_code={user_code}", follow_redirects=False)
+    assert r.status_code == 302, r.text
+    loc = r.headers["location"]
+    assert "/login" in loc and "reauth=1" in loc
+
+    # Approve POST refuses the stale session too (defense in depth — a direct
+    # POST must not bypass the GET's gate).
+    r = app.post(
+        "/oauth/device/approve",
+        data={"user_code": user_code},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert r.status_code == 200
+    assert "too old" in r.text.lower()
+
+
 def test_unsupported_grant_type(app: TestClient) -> None:
     r = app.post("/oauth/token", data={"grant_type": "password"})
     assert r.status_code == 400 and r.json()["error"] == "unsupported_grant_type"
@@ -503,3 +540,51 @@ def test_no_secret_configured_stays_public(app: TestClient) -> None:
     """Without the env var, authorize stays open (backward compatible)."""
     r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
     assert r.status_code == 200, r.text
+
+
+def _capture_app_warnings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Build the accounts app and return WARNING messages from ``server.app``.
+
+    Attaches a handler directly to the ``omnigent.server.app`` logger rather
+    than using ``caplog``: the server's telemetry/logging init runs during the
+    build and reconfigures logging, which can detach pytest's capture handler.
+    A directly-attached handler is immune to that.
+    """
+    captured: list[str] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.WARNING:
+                captured.append(record.getMessage())
+
+    logger = logging.getLogger("omnigent.server.app")
+    handler = _Collector()
+    logger.addHandler(handler)
+    try:
+        for _ in _build_accounts_app(tmp_path, monkeypatch):
+            break  # build (and immediately tear down) so the mount runs
+    finally:
+        logger.removeHandler(handler)
+    return captured
+
+
+def test_startup_warns_when_client_secret_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mounting the device grant on a multi-user server without the client
+    secret must log a loud warning — the authorize endpoint is public, so the
+    operator should know to opt into OMNIGENT_DEVICE_CLIENT_SECRET."""
+    monkeypatch.delenv("OMNIGENT_DEVICE_CLIENT_SECRET", raising=False)
+    warnings = _capture_app_warnings(tmp_path, monkeypatch)
+    assert any(
+        "OMNIGENT_DEVICE_CLIENT_SECRET is not set" in m and "PUBLIC" in m for m in warnings
+    ), warnings
+
+
+def test_startup_silent_when_client_secret_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the secret configured, the public-endpoint warning must NOT fire."""
+    monkeypatch.setenv("OMNIGENT_DEVICE_CLIENT_SECRET", _SECRET)
+    warnings = _capture_app_warnings(tmp_path, monkeypatch)
+    assert not any("OMNIGENT_DEVICE_CLIENT_SECRET is not set" in m for m in warnings)

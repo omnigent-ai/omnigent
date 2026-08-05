@@ -78,6 +78,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER] },
+      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
   },
@@ -158,7 +159,7 @@ export function KeyboardShortcutsList() {
                 key={item.label}
                 className="flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
               >
-                <span className="text-sm text-foreground">{item.label}</span>
+                <span className="text-ui text-foreground">{item.label}</span>
                 <span className="flex shrink-0 items-center gap-1">
                   {item.keys.map((key) => (
                     <Kbd key={`${item.label}-${key}`}>{key}</Kbd>

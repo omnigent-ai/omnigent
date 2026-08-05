@@ -7,6 +7,7 @@ table and its ``scheduled_task_runs`` history table.
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -87,16 +88,17 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list(self) -> list[ScheduledTask]:
+    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
         """
         List all scheduled tasks ordered by ``created_at ASC, id ASC``.
 
+        :param owner_user_id: When given, return only tasks owned by this user.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
 
     @abstractmethod
-    def list_active(self) -> list[ScheduledTask]:
+    def list_active(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks ordered by ``created_at ASC, id ASC``.
 
@@ -107,7 +109,7 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+    def list_active_all_workspaces(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks across every workspace.
 
@@ -199,12 +201,132 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_runs(self, scheduled_task_id: str) -> list[ScheduledTaskRun]:
+    def list_runs(
+        self,
+        scheduled_task_id: str,
+        *,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> tuple[builtins.list[ScheduledTaskRun], str | None]:
         """
-        List runs for a task ordered by ``scheduled_at DESC, id DESC``
+        List one page of a task's runs ordered by ``scheduled_at DESC, id DESC``
         (most recent first).
 
+        Cursor-paginated so run history is never silently truncated: returns
+        ``(runs, next_cursor)`` where ``next_cursor`` is the id to pass as
+        ``after_id`` for the next page, or ``None`` when the last page is
+        reached.
+
         :param scheduled_task_id: The task whose runs to return.
-        :returns: List of :class:`ScheduledTaskRun` instances.
+        :param limit: Maximum number of runs per page. Defaults to 100.
+        :param after_id: Return runs ordered after this run id (exclusive).
+        :returns: ``(runs, next_cursor)``.
+        """
+        ...
+
+    @abstractmethod
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """
+        Transition a still-``running`` run to a terminal status.
+
+        Idempotent and conditional: the update only applies to a run whose
+        current status is ``running`` (guarded by ``WHERE status = running``),
+        so a run already advanced to a terminal state (a fire-time
+        ``skipped``/``failed``, or a prior reconciliation) is never clobbered
+        and two concurrent sweeps cannot double-transition it.
+
+        :param run_id: The run to transition.
+        :param status: The terminal status to set — ``succeeded`` or
+            ``failed``.
+        :param finished_at: Unix epoch seconds the run reached the terminal
+            state.
+        :param error: Optional failure detail (only for ``failed``).
+        :param error_code: Optional short failure classification (only for
+            ``failed``), e.g. ``"incomplete"``.
+        :returns: The updated :class:`ScheduledTaskRun` if a ``running`` run
+            was transitioned; ``None`` if no matching ``running`` run existed
+            (not found, or already terminal).
+        """
+        ...
+
+    @abstractmethod
+    def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
+        """
+        Return the ``running`` run for a conversation, or ``None``.
+
+        The event-driven completion hook (fired when a conversation's turn
+        reaches a terminal state) uses this reverse lookup to find the
+        scheduled-task run to transition. Workspace-scoped like every other
+        store read (filters on ``current_workspace_id()``), so the caller must
+        run it inside the run's ``workspace_scope``. Backed by the
+        ``ix_scheduled_task_runs_conversation_id`` index on
+        ``(workspace_id, conversation_id)``.
+
+        A conversation maps to at most one ``running`` run (a fire creates one
+        run per conversation), so this returns a single row rather than a list.
+
+        :param conversation_id: The fired conversation to look up.
+        :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
+            ``None`` if the conversation has no run, or its run is already
+            terminal.
+        """
+        ...
+
+    @abstractmethod
+    def list_running_runs_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> builtins.list[ScheduledTaskRun]:
+        """
+        List ``running`` runs for the given tasks in the current workspace.
+
+        Powers the lazy-on-read stale backstop on the scheduled-task LIST
+        endpoint: the route resolves the owner's tasks, then this returns their
+        still-``running`` runs so the route can force-fail the ones past the max
+        age. Workspace-scoped (filters on ``current_workspace_id()``) like every
+        other read; an empty id list returns an empty list.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``running`` :class:`ScheduledTaskRun` instances for those
+            tasks, ordered ``scheduled_at DESC, id DESC``.
+        """
+        ...
+
+    @abstractmethod
+    def list_latest_run_status_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> dict[str, str]:
+        """
+        Return each task's MOST RECENT run status in one windowed query.
+
+        Powers the Tasks-list completion badge: the route resolves the owner's
+        tasks, then this returns ``{task_id: status}`` for the single latest run
+        per task, so a page of N tasks costs ONE query instead of N per-row
+        ``/runs`` fetches. A task with no runs is simply absent from the map (the
+        caller renders "never run").
+
+        "Latest" uses the same ``(scheduled_at DESC, id DESC)`` ordering as
+        :meth:`list_runs`, so the reported status matches the run that would head
+        that task's history — and, crucially, a run-now firing (which creates a
+        new run with a ``scheduled_at`` at/after the last scheduled fire) becomes
+        the reported status as soon as it is recorded. Callers should force-fail
+        stale ``running`` runs BEFORE calling this so a dead orphan reports
+        ``failed`` rather than a stuck ``running``.
+
+        Workspace-scoped (filters on ``current_workspace_id()``) like every other
+        read; an empty id list returns an empty map without a query.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``{scheduled_task_id: latest_run_status}`` for tasks that have
+            at least one run.
         """
         ...

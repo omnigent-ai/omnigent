@@ -159,8 +159,8 @@ def run_one_shot(
     :param harness: ``--harness`` value, or ``None`` to let the
         YAML's ``executor.type`` win (used when the YAML pins a
         specific harness like ``claude_sdk``).
-    :param model: ``--model`` override, only passed when *harness*
-        is non-None (co-selected).
+    :param model: Optional ``--model`` override, independent of whether
+        the YAML or the CLI selects the harness.
     :returns: The completed subprocess. Caller decides which
         fields to assert.
     """
@@ -218,8 +218,8 @@ def run_one_shot_at_path(
     ]
     if harness is not None:
         argv.extend(["--harness", harness])
-        if model is not None:
-            argv.extend(["--model", model])
+    if model is not None:
+        argv.extend(["--model", model])
     # run_with_group_timeout, not subprocess.run: grandchildren
     # (server / runner / harness) hold the pipes past timeout.
     return run_with_group_timeout(

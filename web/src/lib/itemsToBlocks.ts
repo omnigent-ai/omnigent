@@ -15,6 +15,7 @@ import {
   type CompactionBlock,
   type ErrorBlock,
   type NativeToolBlock,
+  type ReasoningBlock,
   type RoutingDecisionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
@@ -35,6 +36,7 @@ import {
   type FunctionCallOutputItem,
   type MessageItem,
   type NativeToolItem,
+  type ReasoningItem,
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
@@ -44,6 +46,7 @@ import {
   isFunctionCallOutputItem,
   isMessageItem,
   isNativeToolItem,
+  isReasoningItem,
   isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
@@ -83,7 +86,7 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
     // after /compact. It starts with a distinctive prefix and is
     // part of the model's context (needed for resume) but should
     // not be shown as a chat bubble in the web UI.
-    if (isCompactionSummaryMessage(item)) {
+    if (isCompactionSummaryMessage(item) || isClaudeTaskNotificationMessage(item)) {
       return null;
     }
     return userMessageToBlock(item);
@@ -99,6 +102,9 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   }
   if (isErrorItem(item)) {
     return errorToBlock(item);
+  }
+  if (isReasoningItem(item)) {
+    return reasoningToBlock(item);
   }
   if (isNativeToolItem(item)) {
     return nativeToolToBlock(item);
@@ -129,6 +135,23 @@ function isCompactionSummaryMessage(item: MessageItem): boolean {
   for (const block of item.content) {
     if (block.type === "input_text" && typeof block.text === "string") {
       if (block.text.startsWith(prefix)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Hide legacy Claude Task notifications persisted before the bridge marked them meta.
+function isClaudeTaskNotificationMessage(item: MessageItem): boolean {
+  const requiredMarkers = ["<task-notification>", "<task-id>", "</task-notification>"];
+  for (const block of item.content) {
+    if (block.type === "input_text" && typeof block.text === "string") {
+      const text = block.text.trimStart();
+      if (
+        text.startsWith("<task-notification>") &&
+        requiredMarkers.every((marker) => text.includes(marker))
+      ) {
         return true;
       }
     }
@@ -171,7 +194,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
 }
 
 function functionCallToBlock(item: FunctionCallItem): ToolGroup {
-  let args: Record<string, unknown> = {};
+  let args: Record<string, unknown>;
   try {
     args = JSON.parse(item.arguments) as Record<string, unknown>;
   } catch {
@@ -213,6 +236,15 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     source: item.source,
     code: item.code,
     message: item.message,
+  };
+}
+
+function reasoningToBlock(item: ReasoningItem): ReasoningBlock {
+  return {
+    type: "reasoning_block",
+    ctx: ctxFor(item),
+    reasoningText: (item.content ?? []).map((block) => block.text).join("\n\n"),
+    summaryText: item.summary.map((block) => block.text).join("\n\n"),
   };
 }
 
@@ -292,11 +324,11 @@ function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock
 }
 
 function ctxFor(item: ConversationItem): BlockContext {
-  // Items don't carry timestamps in the API surface — use 0 as a
-  // stable sentinel. `BlockContext.timestamp` is only meaningful for
-  // live streaming (drives the reasoning timer); historical blocks
-  // render without that affordance. `agent` comes from the item's
-  // `model` field when present.
+  // `BlockContext.timestamp` is the page-relative live-streaming clock —
+  // use 0 as a stable sentinel for historical items so timer affordances
+  // stay live-only. The server's epoch `created_at` travels separately as
+  // `createdAtS` (drives the completed-turn "Worked for" duration).
+  // `agent` comes from the item's `model` field when present.
   const agent = "model" in item && typeof item.model === "string" ? item.model : null;
   const depth = agent ? (agent.match(/\./g)?.length ?? 0) : 0;
   // Preserve human authorship only when the server sent it.
@@ -310,5 +342,8 @@ function ctxFor(item: ConversationItem): BlockContext {
     responseId: item.response_id,
     itemId: item.id,
     ...(createdBy !== undefined ? { createdBy } : {}),
+    ...(typeof item.created_at === "number" && item.created_at > 0
+      ? { createdAtS: item.created_at }
+      : {}),
   };
 }

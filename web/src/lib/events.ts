@@ -287,7 +287,7 @@ export interface NativeToolCall {
 /** The final assistant message from `output_item.done` (type `message`). */
 export interface MessageDone {
   type: "message_done";
-  content: Array<Record<string, unknown>>;
+  content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
 }
@@ -565,11 +565,11 @@ export interface SessionAgentChangedEvent {
 export interface SessionTodosEvent {
   type: "session_todos";
   conversationId: string;
-  todos: Array<{
+  todos: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
 }
 
 /**
@@ -787,9 +787,8 @@ export interface SessionSkillsEvent {
 }
 
 /**
- * `session.model_options` — the Codex app-server model catalog just
- * resolved for a session. Consumers refetch the session snapshot and apply
- * its now-populated `codexModelOptions`.
+ * `session.model_options` — a runner-owned native model catalog just resolved.
+ * Consumers refetch the session snapshot and apply its now-populated options.
  */
 export interface SessionModelOptionsEvent {
   type: "session_model_options";

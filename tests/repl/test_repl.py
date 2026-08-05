@@ -2158,6 +2158,20 @@ def test_completer_plain_text_yields_nothing() -> None:
     assert _completions_for("hello world") == []
 
 
+def _noop_handler(*_args: object, **_kwargs: object) -> None:
+    """Stand-in handler for synthetic COMMANDS entries in completer tests."""
+    return
+
+
+_FAKE_COMMANDS = {
+    "/superpowers:using-superpowers": (
+        "Establishes how to find and use skills",
+        _noop_handler,
+    ),
+    "/context": ("Show context window usage", _noop_handler),
+}
+
+
 def test_completer_lone_slash_lists_all_canonical_commands() -> None:
     """
     Claim: hitting ``/`` shows every canonical command in
@@ -2185,49 +2199,115 @@ def test_completer_lone_slash_lists_all_canonical_commands() -> None:
     assert actual == expected
 
 
-def test_completer_filters_by_prefix() -> None:
+def test_completer_substring_filters_real_registry() -> None:
     """
-    Claim: typing ``/h`` narrows the popup to commands whose
-    canonical name starts with ``/h``. With the current command
-    set that is ``/help`` and ``/history``.
+    Claim: the substring filter narrows the REAL ``COMMANDS`` registry
+    (not just a monkeypatched fake) and matches mid-name, not only as a
+    prefix. ``heme`` sits inside ``/theme`` but is a prefix of no
+    command, so a hit proves substring matching runs against the live
+    registry the REPL actually ships.
 
-    Failure modes:
-      - Empty result → the prefix-startswith filter is broken
-        (e.g. the completer is comparing against the description).
-      - Returning every command → the filter is being bypassed.
-      - Including ``/quit`` or ``/cancel`` → the prefix match
-        is doing substring matching instead of startswith.
+    The monkeypatched tests below replace ``COMMANDS`` wholesale, so this
+    is the only filtering test that touches the real set. It uses
+    membership assertions rather than an exact list so it stays green as
+    commands are added or removed — the claim is "filtering happens and
+    narrows," not "these exact commands exist."
     """
-    actual = _completions_for("/h")
+    all_names = [name for name, _, _ in _completions_for("/")]
+    names = [name for name, _, _ in _completions_for("/heme")]
+    # Mid-name match against the live registry (substring, not prefix).
+    assert "/theme" in names
+    # A command with no "heme" is excluded — the filter really narrows.
+    assert "/quit" not in names
+    # Narrowing genuinely happened: a non-empty strict subset of the full
+    # list. Catches both "filter bypassed" (== all) and "filter too
+    # greedy" (empty) regressions against the real registry.
+    assert 0 < len(names) < len(all_names)
+
+
+def test_completer_ranks_prefix_before_substring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: prefix matches surface before mid-string matches (mirrors the
+    web menu's ``rankedSlashCommandNames``). Typing ``/e`` offers
+    ``/effort`` (a prefix) before ``/context`` (which merely contains
+    "e"), so the first completion is the one the user most likely meant —
+    not an unrelated command that happens to contain the letter.
+    """
+    fake = {
+        "/compact": ("Compact", _noop_handler),
+        "/context": ("Context", _noop_handler),
+        "/effort": ("Effort", _noop_handler),
+        "/model": ("Model", _noop_handler),
+    }
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", fake)
+    names = [name for name, _, _ in _completions_for("/e")]
+    # /effort is the only prefix match; /context and /model merely contain
+    # "e" (/compact has none), so they rank after it.
+    assert names[0] == "/effort"
+    assert set(names) == {"/effort", "/context", "/model"}
+
+
+def test_completer_ranks_prefix_first_real_registry() -> None:
+    """
+    Claim: against the live registry, ``/m`` surfaces a prefix match
+    (e.g. ``/model``) first, ahead of commands that merely contain "m"
+    (e.g. ``/theme``, ``/compact``). Pins prefix-priority on the real
+    command set without coupling to the exact command list.
+    """
+    names = [name for name, _, _ in _completions_for("/m")]
+    assert "/model" in names
+    # The top completion is a genuine prefix match, not a mid-string one.
+    assert names[0][1:].lower().startswith("m")
+
+
+def test_completer_matches_name_leaf_after_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: typing a namespaced skill's leaf name surfaces the full
+    command — the core fix. `/using-superpowers` must find
+    `/superpowers:using-superpowers` even though the name starts with
+    `superpowers:`. Failure means the completer is still prefix-only.
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    actual = _completions_for("/using-superpowers")
     names = [name for name, _, _ in actual]
-    assert names == ["/help", "/history"], (
-        f"expected ['/help', '/history'] for prefix '/h', got {names}. "
-        f"If empty, the prefix filter no longer matches; if longer, "
-        f"the filter is broader than startswith."
-    )
-    # Every match replaces the full typed prefix (``/h`` == 2 chars).
-    # If start_position drifts, the completion will splice into the
-    # buffer wrong (e.g. produce ``//help``).
+    assert names == ["/superpowers:using-superpowers"]
+    # The completion replaces the full typed prefix so the splice
+    # yields the canonical name, not a doubled slash.
     for _, _, start in actual:
-        assert start == -2
+        assert start == -len("/using-superpowers")
 
 
-def test_completer_exact_match_still_yields_itself() -> None:
+def test_completer_does_not_match_description(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Claim: when the user has typed an entire command (``/help``),
-    that command itself is still offered — picking it from the
-    popup is a no-op replacement that lets the user press Enter
-    to submit without retyping.
-
-    Failure here would mean the popup vanishes the moment the
-    typed text equals a command, which is jarring during
-    keyboard-driven completion.
+    Claim: matching is name-only — a query that appears only in a command's
+    description does NOT surface it. Kept identical to the web menu, which
+    never shows descriptions inline, so a description-driven hit would look
+    unexplained. `window` appears in `/context`'s blurb but not its name, so
+    it must yield nothing.
     """
-    actual = _completions_for("/help")
-    names = [name for name, _, _ in actual]
-    # ``/help`` is a strict prefix of itself; no other current
-    # command starts with the full string ``/help``.
-    assert names == ["/help"]
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    assert _completions_for("/window") == []
+
+
+def test_completer_no_match_yields_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: a query present in no command name yields no rows (the popup
+    closes) — proves matching is a real containment test, not "always show
+    everything".
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    assert _completions_for("/zzz") == []
+
+
+def test_completer_full_name_still_yields_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: a fully-typed command name still offers itself, so the user
+    can press Enter to submit without the popup vanishing. `/context`
+    is a substring of its own name.
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    names = [name for name, _, _ in _completions_for("/context")]
+    assert names == ["/context"]
 
 
 def test_completer_display_meta_matches_command_help() -> None:
@@ -2344,7 +2424,7 @@ def test_render_history_item_renders_slash_command_metadata() -> None:
     assert "/grill-me review this plan" in rendered
 
 
-class _StubSkillSession:
+class _StubSkillSession(_SessionsChatReplAdapter):
     """Session stub that records structured skill slash-command sends."""
 
     model = "agent"
@@ -2524,15 +2604,16 @@ async def test_new_command_resets_session_without_clearing_screen(
     )
 
 
-class _StubSessionsModeSession:
+class _StubSessionsModeSession(_SessionsChatReplAdapter):
     """``_StubSession`` plus the async ``start_new_conversation`` hook the
     sessions-mode adapter exposes. Used to assert the slash-command
     handlers prefer the new async method over sync ``reset()``."""
 
+    model = "agent"
+
     def __init__(self, *, raise_on_start: Exception | None = None) -> None:
         self.reset_calls = 0
         self.start_new_calls = 0
-        self.model = "agent"
         self._raise_on_start = raise_on_start
 
     def reset(self) -> None:
@@ -2967,3 +3048,96 @@ def test_resume_hint_appends_resume_flag_to_invocation_parts() -> None:
         "--harness claude-sdk "
         "--resume conv_abc"
     )
+
+
+def _openai_key_default_config() -> dict[str, object]:
+    """A config whose openai key default the unmapped fallback used to fabricate."""
+    return {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": "openai",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "$OPENAI_API_KEY",
+                    "models": {"default": "gpt-5.5"},
+                },
+            }
+        }
+    }
+
+
+def test_model_readout_own_auth_acp_harness_reports_agent_not_provider() -> None:
+    """
+    Own-auth ACP harnesses must not report an Omnigent provider credential.
+
+    ``acp``/``acp:<slug>`` and ``goose`` spawn without any Omnigent provider
+    wiring, but ``default_provider_for_harness`` used to fall through to the
+    configured key/gateway default for them (the unmapped pi-style fallback),
+    so the readout named a model and credential the session never touches.
+    A failure here means that fabrication is back.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        lines = _build_model_readout_lines(config, harness, None)
+        assert any("ACP agent" in line for line in lines), (harness, lines)
+        assert not any("API Key" in line for line in lines), (harness, lines)
+        assert not any("gpt-5.5" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_own_auth_acp_harness_shows_live_override() -> None:
+    """
+    An in-session ``/model`` override is real state and must stay visible.
+
+    The runner forwards it to these harnesses (``model_env_keys()`` covers
+    acp/goose; goose applies it as ``GOOSE_MODEL``), so the readout may not
+    hide it or claim the model can't be changed.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "goose"):
+        lines = _build_model_readout_lines(config, harness, "qwen3-coder-plus")
+        assert any("qwen3-coder-plus" in line for line in lines), (harness, lines)
+        assert not any("does not reach" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_qwen_still_names_routed_provider() -> None:
+    """
+    qwen is provider-routed, so its readout keeps naming the openai default.
+
+    ``_build_qwen_spawn_env`` injects the configured openai-family default
+    into the qwen subprocess (see ``test_qwen_uses_openai_global_default``),
+    so for qwen — unlike acp/goose — the credential readout is truthful and
+    must not be declined as "own auth".
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    lines = _build_model_readout_lines(_openai_key_default_config(), "qwen", None)
+    assert any("OpenAI API Key" in line for line in lines), lines
+    assert not any("ACP agent" in line for line in lines), lines
+
+
+def test_describe_active_credential_declines_own_auth_acp_harnesses() -> None:
+    """
+    The resolver, not just the readout, must decline own-auth ACP harnesses.
+
+    ``_resolve_startup_header`` calls ``describe_active_credential``
+    independently of the ``/model`` readout, so fixing only the readout
+    would leave the startup banner naming the same wrong credential. The
+    config uses a key-kind default — the kind the unmapped fallback actually
+    fabricated (a subscription default was already skipped, so it can't pin
+    this fix).
+    """
+    from omnigent.onboarding.provider_config import describe_active_credential
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        assert describe_active_credential(config, harness) is None, harness
+    # Provider-routed harnesses on the same config still resolve, proving the
+    # short-circuit is scoped to own-auth ACP spawns and didn't blank the
+    # resolver: qwen consumes the openai family at spawn.
+    qwen_cred = describe_active_credential(config, "qwen")
+    assert qwen_cred is not None and qwen_cred.provider_name == "openai"

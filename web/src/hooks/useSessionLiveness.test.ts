@@ -163,6 +163,18 @@ describe("useSessionLiveness — derivation truth table", () => {
     expect(derive(false, false, conv({ host_id: null }))).toEqual({ kind: "local_stranded" });
   });
 
+  it("runner_asleep (not local_stranded) for sub-agent sessions with dead runner", () => {
+    // Sub-agents have no host binding but recover via their parent's live
+    // runner (server-side heal on message send). They must never be shown
+    // the CLI reconnect modal — keep the composer open.
+    expect(derive(false, null, conv({ host_id: null, kind: "sub_agent" }))).toEqual({
+      kind: "runner_asleep",
+    });
+    expect(derive(false, false, conv({ host_id: null, kind: "sub_agent" }))).toEqual({
+      kind: "runner_asleep",
+    });
+  });
+
   describe("startup grace (fresh session, runner not yet registered)", () => {
     it("starting for a just-created session whose runner is offline", () => {
       // A brand-new session's runner hasn't registered its tunnel yet, so the
@@ -270,14 +282,24 @@ describe("useSessionLiveness — derivation truth table", () => {
       } as Session;
     }
 
-    it("maps hostId / permissionLevel / createdAt / hostResumable into the snake_case row", () => {
+    it("maps hostId / permissionLevel / createdAt / hostResumable / kind into the snake_case row", () => {
       expect(
         livenessRowFromSession(session({ hostId: "h1", permissionLevel: 1, createdAt: 123 })),
-      ).toEqual({ host_id: "h1", permission_level: 1, created_at: 123, host_resumable: false });
+      ).toEqual({
+        host_id: "h1",
+        permission_level: 1,
+        created_at: 123,
+        host_resumable: false,
+        kind: undefined,
+      });
       // hostResumable flows through so an off-sidebar resumable host can
       // classify host_asleep rather than dead-ending on host_offline.
       expect(livenessRowFromSession(session({ hostId: "h1", hostResumable: true }))).toMatchObject({
         host_resumable: true,
+      });
+      // kind flows through so sub-agent sessions are not misclassified.
+      expect(livenessRowFromSession(session({ kind: "sub_agent" }))).toMatchObject({
+        kind: "sub_agent",
       });
     });
 

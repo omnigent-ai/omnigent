@@ -19,10 +19,10 @@ import uuid
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from omnigent.entities import ScheduledTask
+from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -33,6 +33,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -89,8 +90,24 @@ class UpdateScheduledTaskRequest(BaseModel):
         return self
 
 
-def _to_response(task: ScheduledTask) -> dict[str, Any]:
-    """Serialize a :class:`ScheduledTask` to a JSON-safe dict."""
+def _to_response(
+    task: ScheduledTask,
+    *,
+    last_run_status: str | None = None,
+    next_run_at: str | None = None,
+) -> dict[str, Any]:
+    """Serialize a :class:`ScheduledTask` to a JSON-safe dict.
+
+    :param last_run_status: The status of the task's most recent run
+        (``succeeded`` / ``failed`` / ``skipped`` / ``running`` / ``scheduled``),
+        or ``None`` when the task has never run. Surfaced so the Tasks list can
+        render a completion badge without an extra per-row ``/runs`` fetch.
+    :param next_run_at: ISO-8601 timestamp of the task's next scheduled fire as
+        computed by the live scheduler (the server's authoritative anchor), or
+        ``None`` when the task is paused / not armed. Deliberately server-sourced
+        — the client must never recompute next-run (it can't match the server
+        anchor for INTERVAL>1 rules).
+    """
     return {
         "id": task.id,
         "name": task.name,
@@ -108,8 +125,28 @@ def _to_response(task: ScheduledTask) -> dict[str, Any]:
         "host_id": task.host_id,
         "state": task.state,
         "last_run_at": task.last_run_at,
+        "last_run_status": last_run_status,
         "last_run_conversation_id": task.last_run_conversation_id,
+        "next_run_at": next_run_at,
         "updated_at": task.updated_at,
+    }
+
+
+def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
+    """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
+
+    Excludes the free-text ``error`` blob (never SQL-queried, potentially
+    large); ``error_code`` carries the queryable failure classification.
+    """
+    return {
+        "id": run.id,
+        "scheduled_task_id": run.scheduled_task_id,
+        "status": run.status,
+        "scheduled_at": run.scheduled_at,
+        "conversation_id": run.conversation_id,
+        "fired_at": run.fired_at,
+        "finished_at": run.finished_at,
+        "error_code": run.error_code,
     }
 
 
@@ -235,7 +272,7 @@ def create_scheduled_tasks_router(
         )
         return canonical_workspace, validated_model, validated_effort
 
-    def _require_owned(scheduled_task_id: str, owner: str) -> ScheduledTask:
+    def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
         """Load a task the caller owns, or raise 404.
 
         A task owned by someone else 404s (not 403) so tasks aren't
@@ -280,15 +317,46 @@ def create_scheduled_tasks_router(
         scheduler = _scheduler(request)
         if scheduler is not None:
             scheduler.add(task)
-        return _to_response(task)
+        # A freshly created task has no runs (last_run_status is None); its
+        # next_run_at is available now that the scheduler armed it above.
+        return _to_response(
+            task,
+            next_run_at=scheduler.next_run_at(task.id) if scheduler is not None else None,
+        )
 
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
-        """List the caller's scheduled tasks."""
+        """List the caller's scheduled tasks.
+
+        Lazy-on-read stale backstop: before returning, force-fail any of this
+        owner's runs still ``running`` past the 6h max age (``incomplete``), so
+        a future Tasks-list "last-run status" badge never shows a stale orphan
+        as ``running``. Pure age check — one indexed, owner-scoped query for the
+        owner's running runs, then a conditional ``update_run``; NO per-run
+        conversation I/O. Young in-flight runs are untouched, and completion of
+        a normal run is handled event-driven (the ``_publish_status`` hook), not
+        here.
+        """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list() if t.user_id == owner_id]
-        return {"scheduled_tasks": [_to_response(t) for t in tasks]}
+        tasks = store.list(owner_user_id=owner_id)
+        task_ids = [t.id for t in tasks]
+        running = store.list_running_runs_for_tasks(task_ids)
+        # Force-fail stale orphans FIRST so the completion badge below reports a
+        # dead run as ``failed`` rather than a stuck ``running``.
+        force_fail_stale_runs(store, running)
+        latest_status = store.list_latest_run_status_for_tasks(task_ids)
+        scheduler = _scheduler(request)
+        return {
+            "scheduled_tasks": [
+                _to_response(
+                    t,
+                    last_run_status=latest_status.get(t.id),
+                    next_run_at=scheduler.next_run_at(t.id) if scheduler is not None else None,
+                )
+                for t in tasks
+            ]
+        }
 
     @router.get("/scheduled-tasks/{scheduled_task_id}")
     async def get_scheduled_task(
@@ -299,7 +367,96 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
-        return _to_response(task)
+        running = store.list_running_runs_for_tasks([task.id])
+        force_fail_stale_runs(store, running)
+        latest_status = store.list_latest_run_status_for_tasks([task.id])
+        scheduler = _scheduler(request)
+        return _to_response(
+            task,
+            last_run_status=latest_status.get(task.id),
+            next_run_at=scheduler.next_run_at(task.id) if scheduler is not None else None,
+        )
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}/runs")
+    async def list_scheduled_task_runs(
+        request: Request,
+        scheduled_task_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """List the run history for one of the caller's scheduled tasks.
+
+        Owner-scoped: a task owned by someone else (or absent) 404s via
+        ``_require_owned``, so runs aren't enumerable across users. Runs come
+        back most-recent-first (``scheduled_at DESC``); an empty history is an
+        empty list.
+
+        Cursor-paginated so history is never silently truncated: pass ``limit``
+        (1-1000, default 100) and ``after`` (a prior page's ``next_cursor``).
+        The response is ``{"runs": [...], "next_cursor": <id or null>}``; a
+        ``null`` cursor marks the last page.
+
+        Lazy-on-read backstop: before listing, force-fail any of this task's
+        runs still ``running`` past the 6h max age (``incomplete``). Completion
+        itself is event-driven (the ``_publish_status`` hook); this only
+        catches a genuine orphan — a run whose terminal event never fired (host
+        died mid-turn) — so the "every run eventually terminal" invariant holds
+        without a background poll or startup sweep. Pure age check (no
+        conversation I/O); a young in-flight run is untouched, and the
+        conditional ``update_run`` never clobbers an already-terminal row.
+        """
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        _require_owned(scheduled_task_id, owner_id)
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        runs = force_fail_stale_runs(store, runs)
+        return {
+            "runs": [_run_to_response(r) for r in runs],
+            "next_cursor": next_cursor,
+        }
+
+    @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
+    async def run_scheduled_task_now(
+        request: Request,
+        scheduled_task_id: str,
+    ) -> dict[str, Any]:
+        """Trigger an immediate fire of one of the caller's scheduled tasks.
+
+        A manual override that reuses the SHARED scheduled-fire path (the same
+        ``on_fire`` machinery — session create, owner grant, runner launch,
+        prompt dispatch, run recording) via ``app.state.scheduled_task_run_now``.
+        It does NOT re-implement the fire logic and cannot collide with a
+        scheduled fire of the same task (both share the in-flight overlap guard).
+
+        Paused tasks ARE runnable here — run-now is an explicit manual override,
+        so it does not require the ``active`` state the scheduler enforces.
+
+        Fire-and-forget: like the scheduler, the session create + launch runs in
+        the background, so this returns ``202 Accepted`` with the task id rather
+        than the finished run. The new run row (status ``running`` / ``failed`` /
+        ``skipped``) appears in the task's ``/runs`` history and in the LIST
+        endpoint's ``last_run_status`` once recorded. Returns ``409`` when a fire
+        for this task is already in flight, and ``503`` when the scheduler
+        subsystem is not running (no trigger wired).
+        """
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        task = _require_owned(scheduled_task_id, owner_id)
+        run_now = getattr(request.app.state, "scheduled_task_run_now", None)
+        if run_now is None:
+            raise OmnigentError(
+                "scheduled task scheduler is not running",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        started = await run_now(task.workspace_id, task.id)
+        if not started:
+            # The row exists (we just loaded it) and paused is allowed, so the
+            # only skip reason is an already-in-flight fire for this task.
+            raise OmnigentError(
+                "a run for this scheduled task is already in flight",
+                code=ErrorCode.CONFLICT,
+            )
+        return {"triggered": True, "id": task.id}
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(
@@ -343,7 +500,12 @@ def create_scheduled_tasks_router(
         scheduler = _scheduler(request)
         if scheduler is not None:
             scheduler.update(updated)
-        return _to_response(updated)
+        latest_status = store.list_latest_run_status_for_tasks([updated.id])
+        return _to_response(
+            updated,
+            last_run_status=latest_status.get(updated.id),
+            next_run_at=scheduler.next_run_at(updated.id) if scheduler is not None else None,
+        )
 
     @router.delete("/scheduled-tasks/{scheduled_task_id}")
     async def delete_scheduled_task(

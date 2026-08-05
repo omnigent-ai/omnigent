@@ -291,3 +291,31 @@ async def test_done_approval_future_does_not_pin_runner() -> None:
     fut.set_result(False)
     assert fut.done()
     assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_drain_session_streams_enqueues_done_sentinel() -> None:
+    """Graceful shutdown signals end-of-stream to every open session stream.
+
+    ``app.state.drain_session_streams`` puts the ``None`` sentinel on each
+    session event queue so its ``GET /stream`` generator emits ``[DONE]`` and
+    the server relay returns cleanly — the mechanism that turns an idle-reaped
+    runner's abrupt drop into a quiet end-of-stream (no scary error banner).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    app = _scaffold_app()
+    q_a: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    q_b: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    _session_event_queues_ref["conv_drain_a"] = q_a
+    _session_event_queues_ref["conv_drain_b"] = q_b
+    try:
+        app.state.drain_session_streams()
+        # Each open stream received exactly the end-of-stream sentinel.
+        assert q_a.get_nowait() is None
+        assert q_b.get_nowait() is None
+        assert q_a.empty()
+        assert q_b.empty()
+    finally:
+        _session_event_queues_ref.pop("conv_drain_a", None)
+        _session_event_queues_ref.pop("conv_drain_b", None)

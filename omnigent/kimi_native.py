@@ -22,13 +22,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import KIMI_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -40,6 +40,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -51,6 +52,9 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
 
 _DEFAULT_KIMI_COMMAND = "kimi"
@@ -132,7 +136,7 @@ def resolve_kimi_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_kimi_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
             "Native Kimi requires the 'kimi' CLI on PATH. Install it with: "
@@ -157,7 +161,8 @@ def run_kimi_native(
     *,
     server: str | None,
     session_id: str | None,
-    kimi_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    kimi_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -172,6 +177,9 @@ def run_kimi_native(
         conversation URL after launch.
     :returns: None after the terminal attach session ends.
     """
+    kimi_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=kimi_args, legacy_param="kimi_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -198,7 +206,7 @@ def _materialize_kimi_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "kimi-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Kimi is running in the session terminal. The user drives the kimi TUI directly."
@@ -411,7 +419,7 @@ async def _create_kimi_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first kimi-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -431,7 +439,7 @@ async def _create_kimi_session(
     return new_session_id
 
 
-async def _fetch_kimi_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_kimi_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

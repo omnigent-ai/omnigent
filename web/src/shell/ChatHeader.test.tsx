@@ -1,9 +1,14 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { ChatHeader } from "./ChatHeader";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "./TerminalFirstContext";
 
 // Minimal mobile-menu prop block. All gating booleans are false / counts are
 // zero so the mobile FAB and three-dot menu never render — these tests only
@@ -39,6 +44,9 @@ function renderHeader(props: {
   isChildSession?: boolean;
   parentSessionId?: string;
   boundAgent?: Agent;
+  canShare?: boolean;
+  shareDisabled?: boolean;
+  shareDisabledReason?: string;
 }) {
   return render(
     <MemoryRouter initialEntries={["/"]}>
@@ -53,7 +61,9 @@ function renderHeader(props: {
           // isolating the left-slot affordances under test.
           conversationId={undefined}
           boundAgent={props.boundAgent}
-          canShare={false}
+          canShare={props.canShare ?? false}
+          shareDisabled={props.shareDisabled}
+          shareDisabledReason={props.shareDisabledReason}
           onShare={() => {}}
           hasAgentInfo={false}
           onAgentInfo={() => {}}
@@ -70,6 +80,57 @@ function renderHeader(props: {
 }
 
 afterEach(cleanup);
+
+describe("ChatHeader — deployed Share presentation", () => {
+  it("matches the compact Vercel action", () => {
+    renderHeader({ sidebarOpen: true, canShare: true });
+
+    const share = screen.getByRole("button", { name: "Share session" });
+    expect(share).toHaveClass(
+      "h-6",
+      "gap-1",
+      "rounded-[6px]",
+      "px-2",
+      "text-[13px]",
+      "share-button-glassy",
+      "md:inline-flex",
+    );
+    expect(share).not.toHaveClass("h-8", "rounded-full", "px-6");
+    expect(share.querySelector(".lucide-user-plus")).not.toBeNull();
+  });
+
+  it("keeps the compact geometry when sharing is disabled", () => {
+    renderHeader({
+      sidebarOpen: true,
+      canShare: true,
+      shareDisabled: true,
+      shareDisabledReason: "Sharing is unavailable",
+    });
+
+    const share = screen.getByRole("button", { name: "Share session" });
+    expect(share).toBeDisabled();
+    expect(share).toHaveAttribute("title", "Sharing is unavailable");
+    expect(share).toHaveClass(
+      "h-6",
+      "gap-1",
+      "rounded-[6px]",
+      "px-2",
+      "text-[13px]",
+      "share-button-glassy",
+    );
+    expect(share.querySelector(".lucide-user-plus")).not.toBeNull();
+  });
+});
+
+describe("ChatHeader — workspace pane alignment", () => {
+  it("uses the desktop workspace offset without changing the mobile inset", () => {
+    const { container } = renderHeader({ sidebarOpen: true });
+    const header = container.querySelector("header");
+
+    expect(header).not.toBeNull();
+    expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+  });
+});
 
 describe("ChatHeader — open-sidebar toggle visibility", () => {
   it("hides the toggle entirely when the sidebar is open", () => {
@@ -128,5 +189,100 @@ describe("ChatHeader — sub-agent affordance", () => {
       "/c/parent-123",
     );
     expect(screen.getByText("Sub-agent")).toBeInTheDocument();
+  });
+});
+
+function makeTerminalFirstCtx(
+  overrides: Partial<TerminalFirstContextValue> = {},
+): TerminalFirstContextValue {
+  return {
+    isClaudeNative: true,
+    isNativeWrapper: true,
+    isTerminalFirst: true,
+    isShellView: false,
+    view: "chat",
+    terminalViewKey: null,
+    setView: () => {},
+    terminalsAvailable: true,
+    terminalStartingUp: false,
+    ...overrides,
+  };
+}
+
+/**
+ * Renders the header with an active session (conversationId set) under the
+ * TerminalFirstContext, so the header's Chat/Terminal switcher (ViewModeToggle)
+ * mounts. QueryClientProvider covers AgentInfoButton's react-query hooks; it
+ * self-hides here (no agent info), leaving the toggle as the asserted control.
+ */
+function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <MemoryRouter initialEntries={["/c/sess-1"]}>
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          {ctx ? (
+            <TerminalFirstContextProvider value={ctx}>
+              <ChatHeader
+                sidebarOpen
+                onOpenSidebar={() => {}}
+                isChildSession={false}
+                parentSessionId={undefined}
+                conversationId="sess-1"
+                boundAgent={undefined}
+                canShare={false}
+                onShare={() => {}}
+                hasAgentInfo={false}
+                onAgentInfo={() => {}}
+                hasHeaderMenu={false}
+                showFilesPanel={false}
+                hasRailContent={false}
+                rightPanelOpen={false}
+                onToggleRightPanel={() => {}}
+                mobileMenu={mobileMenu}
+              />
+            </TerminalFirstContextProvider>
+          ) : (
+            <ChatHeader
+              sidebarOpen
+              onOpenSidebar={() => {}}
+              isChildSession={false}
+              parentSessionId={undefined}
+              conversationId="sess-1"
+              boundAgent={undefined}
+              canShare={false}
+              onShare={() => {}}
+              hasAgentInfo={false}
+              onAgentInfo={() => {}}
+              hasHeaderMenu={false}
+              showFilesPanel={false}
+              hasRailContent={false}
+              rightPanelOpen={false}
+              onToggleRightPanel={() => {}}
+              mobileMenu={mobileMenu}
+            />
+          )}
+        </TooltipProvider>
+      </QueryClientProvider>
+    </MemoryRouter>,
+  );
+}
+
+describe("ChatHeader — Chat/Terminal switcher wiring", () => {
+  it("mounts the ViewModeToggle for a terminal-first session", () => {
+    renderHeaderWithSession(makeTerminalFirstCtx());
+    expect(
+      screen.getByRole("button", { name: /switch between chat and terminal/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("omits the toggle for a non-terminal-first session", () => {
+    renderHeaderWithSession(makeTerminalFirstCtx({ isTerminalFirst: false }));
+    expect(screen.queryByRole("button", { name: /switch between chat and terminal/i })).toBeNull();
+  });
+
+  it("omits the toggle when there is no TerminalFirst context", () => {
+    renderHeaderWithSession(null);
+    expect(screen.queryByRole("button", { name: /switch between chat and terminal/i })).toBeNull();
   });
 });

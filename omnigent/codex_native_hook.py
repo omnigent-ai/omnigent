@@ -28,6 +28,8 @@ from omnigent.native_policy_hook import (
     hook_payload_to_evaluation_request,
     policy_hook_reauth,
     post_evaluate_with_retry,
+    read_relay_policy_config,
+    relay_policy_evaluate_url,
 )
 
 # Budget for the policy evaluation POST. Normally a quick
@@ -113,18 +115,6 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         return 0
     session_id = state.session_id
 
-    config = read_policy_hook_config(bridge_dir)
-    if config is None:
-        # No Omnigent server configured for this session — nothing to enforce.
-        return 0
-    ap_server_url = config.get("ap_server_url")
-    if not isinstance(ap_server_url, str) or not ap_server_url:
-        return 0
-    headers: dict[str, str] = {}
-    raw_headers = config.get("ap_auth_headers")
-    if isinstance(raw_headers, dict):
-        headers = {str(key): str(value) for key, value in raw_headers.items()}
-
     hook_event = payload.get("hook_event_name", "")
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
     if eval_request is None:
@@ -133,26 +123,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
 
     # Stamp the live model from this session's config.toml (what an in-TUI
     # ``/model`` writes) onto the request so the cost-budget gate evaluates
-    # against the user's CURRENT selection. Reading it here — synchronously,
-    # the instant the tool call is gated — is race-free, unlike relying on the
-    # forwarder's async ``model_override`` mirror which can lag behind the
-    # tool call within the same turn. The server prefers this over its own
-    # resolved model (see ``PolicyEngine._inject_model``).
-    # hook_payload_to_evaluation_request always returns an event dict with a
-    # "context" dict, so index it directly (fail loud if that contract ever
-    # changes rather than silently dropping these).
+    # against the user's CURRENT selection.
     context = eval_request["event"]["context"]
-    # Stamp the harness so policies can tailor messages to codex-native's
-    # model-switch surface (terminal /model only — no web picker).
     context["harness"] = "codex-native"
     model = read_codex_config_model(bridge_dir)
     if model:
         context["model"] = model
-
-    # The session is governed (bridge state + ap_server_url) and we have a
-    # policy-relevant event: from here a failure to obtain a usable verdict
-    # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
-    reauth = policy_hook_reauth(ap_server_url, headers)
 
     def _fail_closed(detail: str | None = None) -> int:
         out = fail_closed_hook_output(hook_event, detail)
@@ -160,19 +136,42 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(out))
         return 0
 
-    session_component = urllib.parse.quote(session_id, safe="")
-    url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
+    # Prefer the relay (non-expiring local token); fall back to direct server
+    # call when the relay isn't up yet (first-call race) or not configured.
+    relay = read_relay_policy_config(bridge_dir)
+    if relay:
+        relay_url, relay_token, _sid = relay
+        url = relay_policy_evaluate_url(relay_url)
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {relay_token}",
+        }
+        reauth = None
+    else:
+        config = read_policy_hook_config(bridge_dir)
+        if config is None:
+            return 0
+        ap_server_url = config.get("ap_server_url")
+        if not isinstance(ap_server_url, str) or not ap_server_url:
+            return 0
+        raw_headers = config.get("ap_auth_headers")
+        headers = {}
+        if isinstance(raw_headers, dict):
+            headers = {str(k): str(v) for k, v in raw_headers.items()}
+        session_component = urllib.parse.quote(session_id, safe="")
+        url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
+        reauth = policy_hook_reauth(ap_server_url, headers)
+
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
         eval_request,
         _EVALUATE_POLICY_TIMEOUT_S,
         "codex evaluate-policy hook",
-        # Re-mint the baked one-shot token if it lapses mid-session.
         reauth=reauth,
     )
     if resp is None:
-        return _fail_closed(api_error or reauth.failure_reason)
+        return _fail_closed(api_error or (reauth.failure_reason if reauth else None))
     if not resp.content:
         print("omnigent codex evaluate-policy hook: empty Omnigent response", file=sys.stderr)
         return _fail_closed()

@@ -10,7 +10,36 @@ The expression receives the full ``PolicyEvent`` dict as an
 (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
 ``"reason"`` key. Non-map returns abstain.
 
-Register via the session policy API::
+Register statically in an agent's YAML, or dynamically on a running
+session via the policy API.
+
+Static, in an agent ``config.yaml`` (``policies:`` block, parsed by
+:mod:`omnigent.inner.loader` — ``handler`` + ``factory_params``)::
+
+    policies:
+      block_shell:
+        type: function
+        handler: omnigent.policies.builtins.cel.cel_policy
+        factory_params:
+          expression: 'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+          reason: Shell access is blocked.
+
+Static, in a bundled agent spec (``guardrails.policies``, parsed by
+:mod:`omnigent.spec.parser` — note the different spelling: a
+``function`` mapping with ``path`` + ``arguments``; this parser does
+NOT read ``factory_params``)::
+
+    guardrails:
+      policies:
+        block_shell:
+          type: function
+          function:
+            path: omnigent.policies.builtins.cel.cel_policy
+            arguments:
+              expression: 'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+              reason: Shell access is blocked.
+
+Dynamic, via the session policy API::
 
     POST /v1/sessions/{session_id}/policies
     {
@@ -29,15 +58,22 @@ CEL reference: https://cel.dev/overview/cel-overview
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 try:
     import celpy
     import celpy.celtypes
+    from celpy.adapter import json_to_cel
+    from celpy.celparser import CELParseError
+    from celpy.evaluation import CELEvalError
 except ImportError:
     celpy = None  # type: ignore[assignment]
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_user_text,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -79,7 +115,7 @@ def cel_policy(
     env = celpy.Environment()
     try:
         ast = env.compile(expression)
-    except celpy.CELParseError as exc:
+    except CELParseError as exc:
         _log.warning("CEL compile error: %s", exc)
         raise ValueError(f"CEL policy: compile error in expression: {exc}") from exc
 
@@ -92,9 +128,18 @@ def cel_policy(
         # CEL expressions cannot call methods on it and json_to_cel would
         # raise ValueError trying to convert it.
         cel_event = {k: v for k, v in event.items() if k != "llm_client"}
+        # REQUEST-phase ``data`` is now the structured dict
+        # ({"user_content", "attachments"}) from the input gate, but CEL
+        # expressions authored against the request phase expect the user text as
+        # a bare string (e.g. ``event.data.contains("secret")``). Project it back
+        # to that string so existing request-phase CEL policies keep matching — a
+        # map here would silently fail-open (string ops raise -> abstain -> ALLOW,
+        # and ``==`` against a string is just false).
+        if event.get("type") == "request":
+            cel_event["data"] = request_user_text(event.get("data"))
         try:
-            result = prog.evaluate({"event": celpy.json_to_cel(cel_event)})
-        except (celpy.CELEvalError, ValueError, TypeError):
+            result = prog.evaluate({"event": json_to_cel(cel_event)})
+        except (CELEvalError, ValueError, TypeError):
             _log.debug(
                 "CEL policy eval error on event type %r, abstaining",
                 event.get("type"),
@@ -117,12 +162,12 @@ def cel_policy(
             out["reason"] = reason
         return out
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = (
+POLICY_REGISTRY: list[dict[str, object]] = (
     []
     if celpy is None
     else [

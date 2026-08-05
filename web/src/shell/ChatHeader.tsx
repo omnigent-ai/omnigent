@@ -11,6 +11,7 @@ import {
   PanelRightIcon,
   ShareIcon,
   TerminalIcon,
+  UserPlusIcon,
 } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,7 @@ import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
+import { ViewModeToggle } from "./ViewModeToggle";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -181,7 +183,7 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between px-2 py-3",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)]",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -245,13 +247,13 @@ export function ChatHeader({
               <BotIcon className="size-4 shrink-0 text-muted-foreground" />
               {boundAgent?.name ? (
                 <div className="flex min-w-0 flex-col leading-tight">
-                  <span className="truncate text-sm font-semibold text-foreground">
+                  <span className="truncate text-ui font-semibold text-foreground">
                     {boundAgent.name}
                   </span>
                   <span className="text-xs text-muted-foreground">Sub-agent</span>
                 </div>
               ) : (
-                <span className="text-sm font-semibold text-foreground">Sub-agent</span>
+                <span className="text-ui font-semibold text-foreground">Sub-agent</span>
               )}
             </div>
           </>
@@ -271,6 +273,9 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
+        {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
+            null otherwise (and in the iOS shell, where it's the native bar). */}
+        {conversationId && <ViewModeToggle />}
         {/* Mobile-only three-dot menu folding the action buttons above
             (Share · Agent info) so the header stays
             uncluttered on a phone. The right-panel/rail control is
@@ -296,7 +301,7 @@ export function ChatHeader({
                   disabled={shareDisabled}
                   data-testid="mobile-share-session"
                   title={shareDisabledReason}
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <ShareIcon className="size-4" />
                   Share
@@ -306,7 +311,7 @@ export function ChatHeader({
                 <DropdownMenuItem
                   onSelect={onAgentInfo}
                   data-testid="mobile-agent-info"
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <InfoIcon className="size-4" />
                   Agent info
@@ -332,9 +337,11 @@ export function ChatHeader({
                   title={shareDisabledReason}
                   // share-button-glassy (index.css) paints the pink gradient,
                   // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-8 rounded-full px-6 text-13 font-normal text-white"
+                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white"
                 >
-                  <ShareIcon className="size-4" />
+                  <span className="flex size-4 shrink-0 items-center justify-center">
+                    <UserPlusIcon />
+                  </span>
                   Share
                 </Button>
               </span>
@@ -348,9 +355,11 @@ export function ChatHeader({
             onClick={onShare}
             // share-button-glassy (index.css) paints the pink gradient,
             // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-8 rounded-full px-6 text-13 font-normal text-white md:inline-flex"
+            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white md:inline-flex"
           >
-            <ShareIcon className="size-4" />
+            <span className="flex size-4 shrink-0 items-center justify-center">
+              <UserPlusIcon />
+            </span>
             Share
           </Button>
         ) : null}
@@ -412,7 +421,7 @@ export function ChatHeader({
                 {showFilesPanel && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenFiles}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <FileIcon className="size-4" />
                     Files
@@ -430,7 +439,7 @@ export function ChatHeader({
                     main agent included. */}
                 <DropdownMenuItem
                   onSelect={mobileMenu.onOpenSubagents}
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <BotIcon className="size-4" />
                   Agents
@@ -455,7 +464,7 @@ export function ChatHeader({
                 {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenShells}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <TerminalIcon className="size-4" />
                     Shells
@@ -471,7 +480,7 @@ export function ChatHeader({
                 {mobileMenu.todosSupported && mobileMenu.todosTotal > 0 && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenTodos}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ListTodoIcon className="size-4" />
                     Tasks
@@ -483,7 +492,7 @@ export function ChatHeader({
                 {mobileMenu.debugMode && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenMainExecutionLog}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ListIcon className="size-4" />
                     Logs

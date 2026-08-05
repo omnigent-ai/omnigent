@@ -145,8 +145,6 @@ runs:
         OMNIGENT_CLAUDE_SDK_NO_SANDBOX: ${{ inputs.harness == 'claude-sdk' && '1' || '' }}
         PYTEST_PROGRESS_LOG_DIR: ${{ github.workspace }}/artifacts/progress-${{ inputs.harness }}
         OMNIGENT_TOKEN_USAGE_JSON: ${{ github.workspace }}/artifacts/tokens-${{ inputs.harness }}.json
-        OMNIGENT_TEST_MODEL_SPREAD: "1"
-        OMNIGENT_TEST_MODEL_POOL_GPT: "databricks-gpt-5-5,databricks-gpt-5-4-mini"
       run: |
         set -euo pipefail
         mkdir -p artifacts "$INTEGRATION_TMP_BASE"

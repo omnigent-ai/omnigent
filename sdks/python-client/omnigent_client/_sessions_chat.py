@@ -211,14 +211,14 @@ class _AgentToolsGetter(Protocol):
 # terminal set listed in ``omnigent/server/schemas.py`` (and
 # the ``_TERMINAL_STATUSES`` set in
 # :mod:`omnigent_client._session`).
-_TURN_TERMINAL_EVENT_TYPES: tuple[type[ServerStreamEvent], ...] = (
+_TURN_TERMINAL_EVENT_TYPES = (
     CompletedEvent,
     FailedEvent,
     IncompleteEvent,
     CancelledEvent,
 )
 
-_RESPONSE_START_EVENT_TYPES: tuple[type[ServerStreamEvent], ...] = (
+_RESPONSE_START_EVENT_TYPES = (
     CreatedEvent,
     QueuedEvent,
     InProgressEvent,
@@ -560,7 +560,7 @@ class SessionsChat:
         # turns cannot publish all output before this subscriber exists.
         stream_aiter = self._namespace.stream(self._session.id)
         hook_state = _StreamHookState()
-        first_event_task = asyncio.create_task(stream_aiter.__anext__())
+        first_event_task = asyncio.ensure_future(stream_aiter.__anext__())
         try:
             first_event: ServerStreamEvent | None
             try:
@@ -573,6 +573,7 @@ class SessionsChat:
             except StopAsyncIteration:
                 return
             await self._namespace.post_event(self._session.id, event_payload)
+            event: ServerStreamEvent
             if first_event is None:
                 try:
                     event = await first_event_task

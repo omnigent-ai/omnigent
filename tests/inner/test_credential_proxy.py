@@ -16,14 +16,20 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.errors import OmnigentError
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
+    CredentialProxyRuntime,
+    DatabricksProfileTokenProvider,
+    _prepare_databricks_runtime,
     prepare_credential_proxy_runtime,
 )
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
+    DatabricksProfileBinding,
+    DatabricksProxySpec,
 )
 
 
@@ -236,3 +242,136 @@ def test_gh_basic_shape_injects_env_for_api_host_only() -> None:
     assert git_rule.synthetic is None
     assert git_rule.real_secret == "ghp_real"
     assert set(runtime.helper_env_updates) == {"GH_TOKEN", "GITHUB_TOKEN"}
+
+
+# ---------------------------------------------------------------------------
+# databricks_cli
+# ---------------------------------------------------------------------------
+
+
+class _FakeConfig:
+    """Stand-in for ``databricks.sdk.config.Config`` in provider tests."""
+
+    def __init__(self, host: str, tokens: list[str]) -> None:
+        self.host = host
+        self._tokens = tokens
+        self.authenticate_calls = 0
+
+    def authenticate(self) -> dict[str, str]:
+        idx = min(self.authenticate_calls, len(self._tokens) - 1)
+        self.authenticate_calls += 1
+        return {"Authorization": f"Bearer {self._tokens[idx]}"}
+
+
+def test_databricks_provider_resolves_host_and_refreshes() -> None:
+    """The provider reads the host once and re-mints past the throttle window.
+
+    Within the throttle window ``resolve()`` returns the cached token
+    (one ``authenticate()`` call); once the window elapses it re-mints,
+    which is what keeps a long session alive across OAuth expiry.
+    """
+    fake = _FakeConfig("https://ws.cloud.databricks.com/", ["tok-1", "tok-2"])
+    clock = {"now": 0.0}
+    provider = DatabricksProfileTokenProvider(
+        "prof",
+        refresh_interval=100.0,
+        config_factory=lambda _p: fake,
+        clock=lambda: clock["now"],
+    )
+    assert provider.hostname == "ws.cloud.databricks.com"
+    assert provider.workspace_url == "https://ws.cloud.databricks.com"
+
+    assert provider.resolve() == "tok-1"
+    clock["now"] = 50.0  # still inside the window -> cached, no re-mint
+    assert provider.resolve() == "tok-1"
+    assert fake.authenticate_calls == 1
+    clock["now"] = 150.0  # past the window -> re-mint
+    assert provider.resolve() == "tok-2"
+    assert fake.authenticate_calls == 2
+
+
+def test_databricks_provider_requires_host() -> None:
+    """A profile without a ``host`` fails loud rather than binding nothing."""
+    with pytest.raises(OmnigentError, match="no 'host'"):
+        DatabricksProfileTokenProvider("prof", config_factory=lambda _p: _FakeConfig("", []))
+
+
+def test_databricks_provider_missing_sdk_fails_loud() -> None:
+    """The default factory raises a clear error when the SDK is absent."""
+    try:
+        import databricks.sdk.config  # noqa: F401
+    except ImportError:
+        with pytest.raises(OmnigentError, match="requires the Databricks SDK"):
+            DatabricksProfileTokenProvider("prof")
+    else:
+        pytest.skip("databricks SDK is installed; missing-SDK path not exercisable")
+
+
+def test_databricks_runtime_materializes_placeholder_cfg() -> None:
+    """Two profiles produce two host-bound rules + a placeholder cfg file.
+
+    The materialized ``.databrickscfg`` must carry only ``oa_cred_*``
+    placeholders (never a live token) and name each profile's real host,
+    and the rewrites bind per host with a refreshing provider.
+    """
+    spec = DatabricksProxySpec(
+        profiles=[
+            DatabricksProfileBinding(profile="wsA"),
+            DatabricksProfileBinding(profile="wsB"),
+        ],
+        default="wsA",
+    )
+    hosts = {
+        "wsA": "https://a.cloud.databricks.com",
+        "wsB": "https://b.cloud.databricks.com",
+    }
+
+    def factory(profile: str) -> DatabricksProfileTokenProvider:
+        return DatabricksProfileTokenProvider(
+            profile,
+            config_factory=lambda _p, h=hosts[profile]: _FakeConfig(h, [f"live-{profile}"]),
+        )
+
+    runtime = CredentialProxyRuntime()
+    _prepare_databricks_runtime(spec, runtime, provider_factory=factory)
+
+    assert {r.host for r in runtime.rewrites} == {
+        "a.cloud.databricks.com",
+        "b.cloud.databricks.com",
+    }
+    for rule in runtime.rewrites:
+        assert rule.scheme == "bearer"
+        assert rule.synthetic and rule.synthetic.startswith(SYNTHETIC_CREDENTIAL_PREFIX)
+        # The rule resolves the live token lazily via the provider.
+        assert rule.resolve_secret().startswith("live-")
+
+    assert runtime.helper_env_updates["DATABRICKS_CONFIG_PROFILE"] == "wsA"
+
+    assert len(runtime.sandbox_files) == 1
+    cfg = runtime.sandbox_files[0]
+    assert cfg.env_var == "DATABRICKS_CONFIG_FILE"
+    assert cfg.mode == 0o600
+    assert "[wsA]" in cfg.content and "[wsB]" in cfg.content
+    assert "host = https://a.cloud.databricks.com" in cfg.content
+    # Placeholders only — no live token ever lands in the sandbox file.
+    assert "live-wsA" not in cfg.content and "live-wsB" not in cfg.content
+    assert cfg.content.count(SYNTHETIC_CREDENTIAL_PREFIX) == 2
+
+
+def test_databricks_runtime_rejects_same_host_profiles() -> None:
+    """Two profiles on the same workspace host collide in the host-keyed table."""
+    spec = DatabricksProxySpec(
+        profiles=[
+            DatabricksProfileBinding(profile="p1"),
+            DatabricksProfileBinding(profile="p2"),
+        ]
+    )
+
+    def factory(profile: str) -> DatabricksProfileTokenProvider:
+        return DatabricksProfileTokenProvider(
+            profile,
+            config_factory=lambda _p: _FakeConfig("https://same.cloud.databricks.com", ["t"]),
+        )
+
+    with pytest.raises(OmnigentError, match="resolve to workspace host"):
+        _prepare_databricks_runtime(spec, CredentialProxyRuntime(), provider_factory=factory)
