@@ -2727,8 +2727,16 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     monkeypatch: pytest.MonkeyPatch,
     session_id: str,
     routed: bool,
+    auto_harness: bool = False,
 ) -> Any:
-    """Drive the claude-native launch and return the captured terminal spec."""
+    """Drive the claude-native launch and return the captured terminal spec.
+
+    :param routed: Stamp ``cost_control_mode_override="on"``, as the create
+        path does for a session launched on Smart Routing.
+    :param auto_harness: Stamp the auto-harness label and sentinel WITHOUT the
+        cost-control field, which is the shape a sub-agent child of a routed
+        parent is created with.
+    """
     from omnigent.claude_native import ClaudeNativeUcodeConfig
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
@@ -2795,6 +2803,11 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     snapshot: dict[str, Any] = {"labels": {}}
     if routed:
         snapshot["cost_control_mode_override"] = "on"
+    if auto_harness:
+        from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+        snapshot["labels"][AUTO_HARNESS_LABEL_KEY] = "1"
+        snapshot["harness_override"] = "auto"
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
         transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
@@ -2861,3 +2874,46 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # A pinned session's spawns stay on the claude family, so it gets neither
+    # the routed-spawn note nor the pre-approvals the cross-family hop needs.
+    assert "--append-system-prompt" not in spec.args
+
+
+async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sub-agent child of a routed parent: auto-harness label, no cost stamp.
+
+    Such a child is created with ``harness_override="auto"`` and the
+    auto-harness label but no ``cost_control_mode_override``. Deriving
+    ``routing_enabled`` from the cost field alone launched it with the
+    routed-spawn note and the four pre-approved tools while starting no router
+    and pinning no arms — an argv that tells Claude to route spawns through a
+    hook nothing answers.
+    """
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f603",
+        routed=False,
+        auto_harness=True,
+    )
+
+    # The whole routed apparatus, not just the spawn note.
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # And the auto-harness extras, which only make sense alongside the router.
+    assert "--append-system-prompt" in spec.args
+    allowed = spec.args[spec.args.index("--allowedTools") + 1]
+    assert "mcp__omnigent__sys_session_create" in allowed
+
+
+def test_routed_spawn_launch_args_need_a_router() -> None:
+    """The note and pre-approvals never ship without the router that serves them."""
+    from omnigent.runner.native.orchestration import _routed_spawn_launch_args
+
+    note, tools = _routed_spawn_launch_args(True)
+    assert note and tools
+    assert _routed_spawn_launch_args(True, router_started=False) == (None, ())
+    assert _routed_spawn_launch_args(False) == (None, ())

@@ -5708,17 +5708,23 @@ _ROUTED_SPAWN_ALLOWED_TOOLS: tuple[str, ...] = (
 )
 
 
-def _routed_spawn_launch_args(auto_harness: bool) -> tuple[str | None, tuple[str, ...]]:
+def _routed_spawn_launch_args(
+    auto_harness: bool, *, router_started: bool = True
+) -> tuple[str | None, tuple[str, ...]]:
     """
     Resolve the routed-spawn additions to a Claude terminal's argv.
 
     :param auto_harness: ``True`` for a session whose spawns the router may
         move across harness families.
+    :param router_started: ``False`` when the spawn router did not come up, so
+        nothing would honour the note or need the pre-approvals. Instructing
+        Claude to hand its spawns to a router that is not there would only
+        make it argue with a hook that never answers.
     :returns: ``(append_system_prompt, allowed_tools)`` for
         :func:`augment_claude_args`. ``(None, ())`` leaves the argv exactly as
         a pinned session's, which is the point of the gate.
     """
-    if not auto_harness:
+    if not auto_harness or not router_started:
         return None, ()
     from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
@@ -5735,6 +5741,12 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    #: Both routing fields come from ``routing_class_from_snapshot``, so an
+    #: auto-harness session always reads as routing-enabled too. Deriving them
+    #: separately was the bug: a sub-agent child of a routed parent carries the
+    #: auto-harness label but no ``cost_control_mode_override``, and it launched
+    #: with the routed-spawn note and tool pre-approvals but no router, no
+    #: pinned arms and no launch-model pin.
     routing_enabled: bool = False
     #: Session started in Smart Routing's auto-harness mode, so the router may
     #: place its subagents on the counterpart harness family. Only these
@@ -5747,7 +5759,7 @@ def _claude_launch_metadata_from_envelope(
     session_init: RunnerSessionInitEnvelope,
 ) -> _ClaudeSessionLaunchMetadata:
     """Project Claude launch metadata without server callbacks."""
-    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, routing_enabled
+    from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -5755,12 +5767,14 @@ def _claude_launch_metadata_from_envelope(
 
     snapshot = session_init.snapshot
     fork_source = snapshot.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode=snapshot.cost_control_mode_override,
+        harness_override=snapshot.harness_override,
+        labels=snapshot.labels,
+    )
     return _ClaudeSessionLaunchMetadata(
-        routing_enabled=routing_enabled(snapshot.cost_control_mode_override),
-        auto_harness=(
-            snapshot.labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
-            or snapshot.harness_override == "auto"
-        ),
+        routing_enabled=routing_class.routing_enabled,
+        auto_harness=routing_class.auto_harness,
         reasoning_effort=snapshot.reasoning_effort,
         model_override=snapshot.model_override,
         terminal_launch_args=snapshot.terminal_launch_args,
@@ -5777,7 +5791,7 @@ async def _load_legacy_claude_launch_metadata(
     session_id: str,
 ) -> _ClaudeSessionLaunchMetadata:
     """Fetch Claude launch metadata for servers predating the init envelope."""
-    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, routing_enabled
+    from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -5806,13 +5820,15 @@ async def _load_legacy_claude_launch_metadata(
     labels = labels if isinstance(labels, dict) else {}
     fork_source = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
     cost_control_mode = snapshot.get("cost_control_mode_override")
+    harness_override = snapshot.get("harness_override")
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode=cost_control_mode if isinstance(cost_control_mode, str) else None,
+        harness_override=harness_override if isinstance(harness_override, str) else None,
+        labels={str(key): str(value) for key, value in labels.items()},
+    )
     metadata = _ClaudeSessionLaunchMetadata(
-        routing_enabled=routing_enabled(
-            cost_control_mode if isinstance(cost_control_mode, str) else None
-        ),
-        auto_harness=(
-            labels.get(AUTO_HARNESS_LABEL_KEY) == "1" or snapshot.get("harness_override") == "auto"
-        ),
+        routing_enabled=routing_class.routing_enabled,
+        auto_harness=routing_class.auto_harness,
         reasoning_effort=effort if isinstance(effort, str) and effort else None,
         model_override=(
             model_override if isinstance(model_override, str) and model_override else None
@@ -6350,7 +6366,10 @@ async def _auto_create_claude_terminal(
     # families, so only it needs the routed-spawn note and the pre-approval for
     # the three Omnigent tools that carry out the re-route. A pinned session's
     # argv must stay byte-identical.
-    routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(launch_metadata.auto_harness)
+    routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(
+        launch_metadata.auto_harness,
+        router_started=subagent_router_dir is not None,
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
