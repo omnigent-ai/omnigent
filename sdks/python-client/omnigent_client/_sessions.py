@@ -21,6 +21,7 @@ callers obtain it via ``client.sessions.create()``.
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -661,7 +662,7 @@ class SessionsNamespace:
         limit: int = 100,
         after: str | None = None,
         order: str = "asc",
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """
         List items in a session with cursor-based pagination.
 
@@ -688,14 +689,15 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
-        return body.get("data", [])
+        data = body.get("data", [])
+        return data if isinstance(data, list) else []
 
     async def child_sessions(
         self,
         session_id: str,
         *,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """
         List sub-agent (child) sessions under a parent session.
 
@@ -721,7 +723,8 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
-        return body.get("data", [])
+        data = body.get("data", [])
+        return data if isinstance(data, list) else []
 
     async def child_sessions_tree(
         self,
@@ -729,7 +732,7 @@ class SessionsNamespace:
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
         :meth:`child_sessions` is one level deep; this recurses it breadth-first
