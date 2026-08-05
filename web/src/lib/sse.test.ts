@@ -2,7 +2,12 @@
 
 import { describe, expect, it } from "vitest";
 import { parseEvent } from "./sse";
-import type { SessionStatusEvent, SessionSupersededEvent, TextDelta } from "./events";
+import type {
+  SessionPermissionModeEvent,
+  SessionStatusEvent,
+  SessionSupersededEvent,
+  TextDelta,
+} from "./events";
 
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {
@@ -111,6 +116,30 @@ describe("parseEvent — session.status (background_task_count)", () => {
   it("ignores a non-numeric or negative count", () => {
     expect(bgCount({ background_task_count: "2" })).toBeUndefined();
     expect(bgCount({ background_task_count: -1 })).toBeUndefined();
+  });
+});
+
+describe("parseEvent — session.permission_mode", () => {
+  it("parses a pane-observed permission-mode switch", () => {
+    const ev = parseEvent("session.permission_mode", {
+      conversation_id: "conv_a",
+      permission_mode: "auto",
+    });
+    expect(ev).toEqual({
+      type: "session_permission_mode",
+      conversationId: "conv_a",
+      permissionMode: "auto",
+    } satisfies SessionPermissionModeEvent);
+  });
+
+  it("rejects frames missing the conversation id or the mode", () => {
+    // The store keys this by conversation to ignore frames from an aborted
+    // stream, and an empty mode would blank the picker rather than move it.
+    expect(parseEvent("session.permission_mode", { permission_mode: "auto" })).toBeNull();
+    expect(parseEvent("session.permission_mode", { conversation_id: "conv_a" })).toBeNull();
+    expect(
+      parseEvent("session.permission_mode", { conversation_id: "conv_a", permission_mode: "" }),
+    ).toBeNull();
   });
 });
 

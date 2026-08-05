@@ -97,13 +97,17 @@ describe("claudePermissionMode", () => {
       ).toBe("acceptEdits");
     });
 
-    it("defaults to the prompting mode when nothing is recorded", () => {
-      expect(claudePermissionModeFromSession({})).toBe("default");
-      expect(claudePermissionModeFromSession(null)).toBe("default");
+    it("returns null when the mode cannot be determined", () => {
+      // Not "default": a `permissions.defaultMode` in a settings file boots
+      // the session into a mode that never reaches terminal_launch_args, so
+      // guessing would display a mode the session isn't in. Callers hide the
+      // picker instead.
+      expect(claudePermissionModeFromSession({})).toBeNull();
+      expect(claudePermissionModeFromSession(null)).toBeNull();
       // A trailing flag with no value must not read past the end of the args.
-      expect(claudePermissionModeFromSession({ terminalLaunchArgs: ["--permission-mode"] })).toBe(
-        "default",
-      );
+      expect(
+        claudePermissionModeFromSession({ terminalLaunchArgs: ["--permission-mode"] }),
+      ).toBeNull();
     });
   });
 });

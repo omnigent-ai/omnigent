@@ -391,7 +391,9 @@ export interface ChatState {
    * Permission mode of a running claude-native session, e.g. ``"auto"``.
    * Hydrated from ``omnigent.claude_native.permission_mode`` on bind
    * (falling back to the launch flag) and updated by the composer's mode
-   * picker. Empty string for non-Claude sessions.
+   * picker. Empty string when unknown — a non-Claude session, or a mode set
+   * via ``permissions.defaultMode`` that never reaches the launch args. The
+   * composer hides the picker rather than showing a guessed mode.
    */
   claudePermissionMode: string;
   /**
@@ -1893,7 +1895,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const session = await updateSession(conversationId, { claudePermissionMode: mode });
       if (get().conversationId !== conversationId) return;
-      set({ claudePermissionMode: claudePermissionModeFromSession(session) });
+      set({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
     } catch (err) {
       if (get().conversationId === conversationId) {
         set({ claudePermissionMode: previous });
@@ -2228,7 +2230,9 @@ function sessionBindingPatch(
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
-    claudePermissionMode: isNativeWrapper(wrapper) ? claudePermissionModeFromSession(session) : "",
+    claudePermissionMode: isNativeWrapper(wrapper)
+      ? (claudePermissionModeFromSession(session) ?? "")
+      : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
@@ -4246,6 +4250,15 @@ export function handleSessionEvent(event: StreamEvent): void {
       // cannot overwrite the effort picker for the currently-open one.
       useChatStore.setState((s) =>
         s.conversationId === event.conversationId ? { selectedEffort: event.reasoningEffort } : {},
+      );
+      return;
+    case "session_permission_mode":
+      // Pane-driven (in-TUI shift+tab) or UI-driven; either way the server
+      // has confirmed this is the session's live mode.
+      useChatStore.setState((s) =>
+        s.conversationId === event.conversationId
+          ? { claudePermissionMode: event.permissionMode }
+          : {},
       );
       return;
     case "session_collaboration_mode":

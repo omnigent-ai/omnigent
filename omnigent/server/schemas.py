@@ -2722,6 +2722,29 @@ class SessionCollaborationModeEvent(_SSEEventBase):
     mode: str
 
 
+class SessionPermissionModeEvent(_SSEEventBase):
+    """
+    Active permission-mode update from a claude-native session.
+
+    Emitted after the web UI switches the mode, and after the Claude forwarder
+    observes a different mode in the pane footer — a shift+tab pressed inside
+    the TUI, which Omnigent has no other way to see. Lets the composer's mode
+    picker track the pane without a reload.
+
+    :param type: Always ``"session.permission_mode"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param permission_mode: The active mode, e.g. ``"auto"`` or ``"plan"``.
+
+    Category: **transient** (SSE-only). The server also writes
+    ``omnigent.claude_native.permission_mode`` on the conversation labels, so
+    reconnecting clients restore the same state from the session snapshot.
+    """
+
+    type: Literal["session.permission_mode"]
+    conversation_id: str
+    permission_mode: str
+
+
 class SessionAgentChangedEvent(_SSEEventBase):
     """
     Bound-agent change on a live session.
@@ -4117,6 +4140,7 @@ ServerStreamEvent = Annotated[
     | SessionModelEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
+    | SessionPermissionModeEvent
     | SessionAgentChangedEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent

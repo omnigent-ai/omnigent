@@ -2852,10 +2852,13 @@ def _permission_mode_from_pane(pane: str) -> str | None:
     """
     Read Claude Code's current permission mode off a captured pane.
 
-    Scans the tail for the mode footer Claude renders below its input
-    box (``⏵⏵ auto mode on``, ``⏸ plan mode on``, ...). Only the tail is
-    considered so a mode name echoed earlier in the transcript can't be
-    mistaken for the live footer.
+    The footer (``⏵⏵ auto mode on``, ``⏸ plan mode on``, ...) always sits
+    below the input box's closing rule, so the scan starts there rather than
+    at a fixed offset from the bottom: the footer's height scales with
+    concurrent subagents, which a fixed window cannot bound (the same reason
+    :func:`_claude_prompt_rendered` anchors on :func:`_is_box_rule`). Anchoring
+    also excludes transcript text structurally — a mode name Claude echoed
+    while *discussing* modes sits above the box and can't be misread as live.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The ``--permission-mode`` value for the rendered footer,
@@ -2863,7 +2866,11 @@ def _permission_mode_from_pane(pane: str) -> str | None:
         pane is mid-repaint, or the mode is one with no footer).
     """
     lines = [line for line in pane.splitlines() if line.strip()]
-    for line in reversed(lines[-_PROMPT_SCAN_TAIL_LINES:]):
+    # Below the last box rule is the footer region. With no rule the input box
+    # isn't mounted; fall back to the tail so a footer still reads during boot.
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_PROMPT_SCAN_TAIL_LINES:]
+    for line in reversed(region):
         for mode, footer in _PERMISSION_MODE_FOOTERS.items():
             if footer in line:
                 return mode
@@ -4333,6 +4340,31 @@ def read_claude_context_state(bridge_dir: Path) -> _JsonObject | None:
     if not isinstance(size, int) or size <= 0:
         return None
     return parsed
+
+
+def read_permission_mode(bridge_dir: Path) -> str | None:
+    """
+    Read the permission mode currently rendered in the Claude pane.
+
+    Non-blocking and best-effort: the forwarder calls this every poll so an
+    in-pane shift+tab switch reaches the web UI, which otherwise never sees it
+    (only UI-driven switches stamp the mode label). Returns ``None`` when the
+    terminal isn't up or the pane shows no mode footer, so a caller can treat
+    "unknown" as "no fresh observation" rather than a change.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: The ``--permission-mode`` value rendered in the pane, e.g.
+        ``"auto"``, or ``None`` when it cannot be determined.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return None
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return None
+    return _permission_mode_from_pane(_capture_pane(socket_path, tmux_target))
 
 
 def read_claude_status_model(bridge_dir: Path) -> str | None:

@@ -3779,6 +3779,105 @@ def test_set_permission_mode_raises_when_tmux_target_never_published(
         )
 
 
+def test_permission_mode_from_pane_reads_the_footer_below_the_input_box() -> None:
+    """
+    The footer is found beneath the box rule, not at a fixed tail offset.
+
+    A tall footer (extra status rows, concurrent subagent lines) pushes the
+    mode line further from the bottom than a fixed window would reach, so a
+    tail-only scan would report "unknown" and the picker would hide.
+    """
+    pane = (
+        "● Working on it\n"
+        "╭──────────────╮\n"
+        "❯ \n"
+        "╰──────────────╯\n"
+        "  Opus 5 │ 0/1M (0%)\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        "  ↓ 2 subagents running\n"
+        "  ⧉ In omnigent\n"
+    )
+
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "auto"
+
+
+def test_permission_mode_from_pane_ignores_a_mode_named_in_the_transcript() -> None:
+    """
+    Transcript text above the input box can't be misread as the live mode.
+
+    Claude echoing "plan mode on" while *discussing* modes sits above the
+    box rule; only the region below it is the live footer. Without the
+    anchor the UI would flip to Plan because the agent said the words.
+    """
+    pane = (
+        "● You asked about plan mode on vs auto mode on — here's how they differ.\n"
+        "╭──────────────╮\n"
+        "❯ \n"
+        "╰──────────────╯\n"
+        "  ⏸ manual mode on\n"
+    )
+
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "default"
+
+
+def test_permission_mode_from_pane_returns_none_without_a_footer() -> None:
+    """
+    A footerless pane reads as unknown, never as a guessed default.
+
+    The forwarder treats ``None`` as "no fresh observation" so a mid-repaint
+    capture can't post a spurious switch, and the web picker hides instead
+    of showing a mode the session may not be in.
+    """
+    assert claude_native_bridge._permission_mode_from_pane("") is None
+    assert (
+        claude_native_bridge._permission_mode_from_pane(
+            "╭────────╮\n❯ \n╰────────╯\n  Opus 5 │ 0/1M (0%)\n"
+        )
+        is None
+    )
+
+
+def test_read_permission_mode_reports_the_pane_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``read_permission_mode`` captures the pane and returns its footer mode.
+
+    This is the forwarder's only window onto an in-TUI shift+tab: Claude Code
+    emits no event on a mode change, so the rendered footer is the signal.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Render a pane sitting in plan mode."""
+        del kwargs
+        if "capture-pane" in cmd:
+            pane = "╭────────╮\n❯ \n╰────────╯\n  ⏸ plan mode on (shift+tab to cycle)\n"
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    assert claude_native_bridge.read_permission_mode(bridge_dir) == "plan"
+
+
+def test_read_permission_mode_returns_none_without_a_tmux_target(tmp_path: Path) -> None:
+    """
+    No published tmux.json reads as unknown instead of raising.
+
+    The forwarder calls this every poll, including before the terminal is up.
+    Raising would have to be swallowed by the caller's poll loop; returning
+    ``None`` keeps "terminal not ready" and "no footer" on one quiet path.
+    """
+    assert claude_native_bridge.read_permission_mode(tmp_path / "bridge") is None
+
+
 def test_inject_slash_command_raises_when_tmux_target_never_published(
     tmp_path: Path,
 ) -> None:

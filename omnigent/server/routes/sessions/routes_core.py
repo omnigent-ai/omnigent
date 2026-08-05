@@ -130,6 +130,7 @@ from omnigent.server.routes._sessions.helpers import (
     _presentation_labels_for_agent,
     _prune_session_read_state,
     _publish_collaboration_mode,
+    _publish_permission_mode,
     _publish_sandbox_status,
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
@@ -1878,6 +1879,11 @@ def register_core_routes(
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        if requested_claude_permission_mode is not None:
+            _publish_permission_mode(
+                session_id,
+                labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
+            )
         if requested_codex_collaboration_mode is not None:
             _publish_collaboration_mode(
                 session_id,

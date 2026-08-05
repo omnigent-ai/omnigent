@@ -27,7 +27,6 @@ import {
   Loader2Icon,
   PaperclipIcon,
   SettingsIcon,
-  ShieldIcon,
   SquareIcon,
   WifiOffIcon,
   XIcon,
@@ -3963,7 +3962,6 @@ export function Composer({
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
-  const [permissionModeBusy, setPermissionModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -4015,7 +4013,6 @@ export function Composer({
   );
 
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   // Harness/agent identity shown in the status tray below the card, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
@@ -4191,19 +4188,6 @@ export function Composer({
       setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
     } finally {
       setPlanModeBusy(false);
-    }
-  };
-  const selectClaudePermissionMode = async (mode: string) => {
-    if (permissionModeBusy || mode === claudePermissionMode) return;
-    setCommandError(null);
-    setPermissionModeBusy(true);
-    try {
-      await useChatStore.getState().setClaudePermissionMode(mode);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setCommandError(`Could not switch to ${claudePermissionModeLabel(mode)} mode: ${message}`);
-    } finally {
-      setPermissionModeBusy(false);
     }
   };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
@@ -5077,51 +5061,6 @@ export function Composer({
               dropdown for Claude, a standalone Switch for other routable
               agents. */}
           <div className="flex min-w-0 items-center gap-0.5">
-            {showClaudePermissionMode && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  {/* Switching drives Claude's shift+tab cycle in the live
-                      pane, so the value only changes once the TUI confirms
-                      it landed there (see setClaudePermissionMode). */}
-                  <Select
-                    value={claudePermissionMode}
-                    onValueChange={(mode) => void selectClaudePermissionMode(mode)}
-                    disabled={isReadOnly || permissionModeBusy}
-                  >
-                    <SelectTrigger
-                      size="sm"
-                      className="h-9 gap-1.5 border-none px-2 text-xs shadow-none md:h-8"
-                      data-testid="claude-permission-mode-select"
-                      aria-label="Permission mode"
-                    >
-                      {permissionModeBusy ? (
-                        <Loader2Icon className="size-3.5 animate-spin" />
-                      ) : (
-                        <ShieldIcon className="size-3.5" />
-                      )}
-                      {/* Bare label, not <SelectValue> — that echoes the
-                          item's description row too, which is too wide here. */}
-                      {claudePermissionModeLabel(claudePermissionMode)}
-                    </SelectTrigger>
-                    <SelectContent>
-                      {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
-                        <SelectItem key={mode.value} value={mode.value}>
-                          <span className="flex flex-col items-start">
-                            <span>{mode.label}</span>
-                            <span className="text-muted-foreground text-xs">
-                              {mode.description}
-                            </span>
-                          </span>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {`Permission mode: ${claudePermissionModeLabel(claudePermissionMode)}`}
-                </TooltipContent>
-              </Tooltip>
-            )}
             {showCodexPlanMode && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -5192,6 +5131,7 @@ export function Composer({
               harnessLabel={harnessLabel}
               showModels={showModels}
               showEffort={showEffort}
+              showClaudePermissionMode={showClaudePermissionMode}
               effortLevels={effortLevels}
               modelPickerKind={modelPickerKind}
               codexModelOptions={codexModelOptions}
@@ -5628,6 +5568,7 @@ function SessionConfigModal({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -5638,12 +5579,14 @@ function SessionConfigModal({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
 }) {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
@@ -5672,11 +5615,13 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
+    setDraftPermissionMode(claudePermissionMode);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -5734,6 +5679,10 @@ function SessionConfigModal({
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        // Same pane as /model + /effort, so this must stay in the awaited
+        // sequence rather than firing concurrently.
+        if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
+          await store.setClaudePermissionMode(draftPermissionMode);
       } catch {
         // Individual setters already roll back their optimistic state; a failed
         // PATCH shouldn't wedge the modal open.
@@ -5841,6 +5790,31 @@ function SessionConfigModal({
               </Select>
             </ConfigRow>
           )}
+          {/* Hidden when the mode is unknown — Claude only renders its mode
+              footer in some pane states, and a guess would misreport it. */}
+          {showClaudePermissionMode && claudePermissionMode !== "" && (
+            <ConfigRow label="Permissions" description="How much Claude asks before acting">
+              <Select value={draftPermissionMode} onValueChange={setDraftPermissionMode}>
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-permission-mode"
+                  aria-label="Permission mode"
+                >
+                  <SelectValue>{claudePermissionModeLabel(draftPermissionMode)}</SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
+                    <SelectItem key={mode.value} value={mode.value}>
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
         </div>
 
         <DialogFooter className="border-t-0 bg-transparent">
@@ -5875,6 +5849,7 @@ function ComposerConfigGear({
   harnessLabel,
   showModels,
   showEffort,
+  showClaudePermissionMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -5885,6 +5860,7 @@ function ComposerConfigGear({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  showClaudePermissionMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -5912,7 +5888,7 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible) return null;
+  if (!showModels && !showEffort && !costRoutingEligible && !showClaudePermissionMode) return null;
 
   return (
     <>
@@ -5963,6 +5939,7 @@ function ComposerConfigGear({
         harnessLabel={harnessLabel}
         showModels={showModels}
         showEffort={showEffort}
+        showClaudePermissionMode={showClaudePermissionMode}
         effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
@@ -5975,7 +5952,7 @@ function ComposerConfigGear({
 /**
  * Label/value rows summarizing the session's live run-config, for the gear
  * icon's hover tooltip. Mirrors the new-session summary but with in-session
- * values and no Permissions row (permission mode is launch-time only).
+ * values. The Permissions row lives in the modal itself, not this summary.
  */
 function useSessionConfigSummary({
   harnessLabel,
