@@ -878,15 +878,19 @@ html:not(.dark) .conversations-sidebar {
  * the discrete Appearance value without affecting mobile. */
 @media (width >= 48rem) {
   :root {
-    --text-xs: calc(var(--desktop-ui-font-size) * 0.75);
-    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+    /* The step factors below are Tailwind's rem ratios against a 16px base, so
+     * they need the preference on that scale. Multiplying the raw 13px shrinks
+     * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
+    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
+    --text-xs: calc(var(--ui-ramp-anchor) * 0.75);
+    --text-sm: calc(var(--ui-ramp-anchor) * 0.9);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);
-    --text-lg: calc(var(--desktop-ui-font-size) * 1.125);
-    --text-xl: calc(var(--desktop-ui-font-size) * 1.25);
-    --text-2xl: calc(var(--desktop-ui-font-size) * 1.5);
-    --text-3xl: calc(var(--desktop-ui-font-size) * 2);
-    --text-3xl--line-height: calc(var(--desktop-ui-font-size) * 2.25);
+    --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
+    --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
+    --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
+    --text-3xl: calc(var(--ui-ramp-anchor) * 2);
+    --text-3xl--line-height: calc(var(--ui-ramp-anchor) * 2.25);
   }
 
   body {

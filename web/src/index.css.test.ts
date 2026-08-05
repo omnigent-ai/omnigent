@@ -7,6 +7,8 @@ import { readFileSync } from "node:fs";
 import { transform } from "lightningcss";
 import { describe, expect, it } from "vitest";
 
+import { UI_FONT_SIZE_DEFAULT } from "./lib/uiFontPreferences";
+
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
 const cssSource = readFileSync("src/index.css", "utf8");
@@ -219,6 +221,52 @@ describe("index.css sidebar canvas", () => {
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
     expect(darkEdgeRule).toContain("border-right: 1px solid rgb(255 255 255 / 2%)");
+  });
+});
+
+/* Regression test for the "inline <code> renders at 9.75px" bug.
+ *
+ * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
+ * parent's step. Anchoring the ramp factors to the raw 13px preference instead
+ * of a 16px-equivalent shrank text-xs to 9.75px and every <code> under it.
+ */
+describe("index.css desktop typography ramp", () => {
+  const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
+
+  const anchorDivisor = Number(
+    desktopMap?.match(
+      /--ui-ramp-anchor:\s*calc\(var\(--desktop-ui-font-size\) \* \(16 \/ (\d+)\)\)/,
+    )?.[1],
+  );
+
+  it("has the ramp block this test exists to protect", () => {
+    expect(desktopMap, "the desktop typography mapping is gone from index.css").toBeDefined();
+  });
+
+  it("normalizes the preference against the 16px grid the factors assume", () => {
+    // The divisor must track the shipped default, or the default size stops
+    // landing on the design's steps.
+    expect(anchorDivisor).toBe(UI_FONT_SIZE_DEFAULT);
+  });
+
+  it.each([
+    ["--text-xs", 0.75, 12],
+    ["--text-sm", 0.9, 14.4],
+    ["--text-lg", 1.125, 18],
+  ])("scales %s off the anchor, not the raw preference", (token, factor, expectedPx) => {
+    // Multiplying --desktop-ui-font-size directly is the bug: it is the body
+    // step, not the 16px base the ratios were calibrated against.
+    expect(desktopMap).toContain(`${token}: calc(var(--ui-ramp-anchor) * ${factor})`);
+    // At the default preference the step must land back on the design value.
+    expect((UI_FONT_SIZE_DEFAULT * (16 / anchorDivisor) * factor).toFixed(2)).toBe(
+      expectedPx.toFixed(2),
+    );
+  });
+
+  it("keeps the body steps on the raw preference", () => {
+    // text-ui/text-base ARE the body step, so they must not be re-anchored.
+    expect(desktopMap).toContain("--text-ui: var(--desktop-ui-font-size)");
+    expect(desktopMap).toContain("--text-base: var(--desktop-ui-font-size)");
   });
 });
 
