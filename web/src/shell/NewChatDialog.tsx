@@ -116,6 +116,7 @@ import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
+  isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
@@ -960,18 +961,19 @@ export function AgentHarnessPicker({
   // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
   // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Split harnesses so the ready-to-use ones lead and the "needs setup" ones
-  // fold into a "More" submenu (kept discoverable, out of the primary list).
-  // The currently-selected harness always stays inline even when unconfigured,
-  // so the active pick is never buried. With the hide-unconfigured preference
-  // on, unconfigured harnesses are dropped entirely (no "More").
+  // Split harnesses by support level: only the fully supported ones lead the
+  // primary list, and every other harness folds into "More" whether or not it
+  // is configured here. The selected harness always stays inline.
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     const more: AvailableAgent[] = [];
     for (const a of harnessEntries) {
-      const unconfigured = harnessUnconfiguredOnHost(a.harness, host);
-      if (!unconfigured || a.id === effectiveAgentId) ready.push(a);
-      else if (!hideUnconfigured) more.push(a);
+      const selected = a.id === effectiveAgentId;
+      // The preference hides harnesses that can't launch here — it outranks
+      // support level, but never buries the active pick.
+      if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(a.harness, host)) continue;
+      if (selected || isFullySupportedNativeCodingAgent(a)) ready.push(a);
+      else more.push(a);
     }
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
   }, [harnessEntries, host, hideUnconfigured, effectiveAgentId]);
