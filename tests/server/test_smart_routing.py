@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omnigent.server.routing_backend import RoutingBackends
 from omnigent.server.smart_routing import (
     _AUTO_ROUTING_HARNESSES,
     LLMRoutingClient,
@@ -2444,3 +2445,191 @@ async def test_route_session_harness_keeps_the_rationale_off_info(
         harness, _model, _verdict, _error = await route_session_harness("hello")
     assert harness is not None
     assert "secret prompt paraphrase" not in caplog.text
+
+
+# ── Router source selection ─────────────────────────────────────────────────
+#
+# Gateway backing selects WHICH router answers, not whether Smart Routing is
+# offered. Off the gateway the external client's ``databricks-*`` picks are
+# unreachable from the pane, so the built-in judge answers instead — and the
+# static ``infer_models`` table, which is nothing but ``databricks-*`` ids, must
+# not be offered as candidates at all.
+
+
+def _both_backends(external: FakeRoutingClient, local: FakeRoutingClient) -> RoutingBackends:
+    return RoutingBackends(external=external, local=local)
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_declines_rather_than_offer_gateway_ids_off_gateway() -> None:
+    local = FakeRoutingClient(
+        RoutingResult(model="databricks-claude-opus-4-8", rationale="big", harness="claude-native")
+    )
+    caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, verdict, error = await route_session_harness(
+            "refactor everything",
+            harness_candidates=("claude-native", "codex-native"),
+            catalog={},
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert (harness, model, verdict) == (None, None, None)
+    assert error is not None
+    # The router was never called, so no databricks-* id could have been offered.
+    assert local.offered == []
+
+
+@pytest.mark.asyncio
+async def test_route_turn_declines_rather_than_offer_gateway_ids_off_gateway() -> None:
+    local = FakeRoutingClient(RoutingResult(model="databricks-claude-opus-4-8", rationale="big"))
+    caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, verdict = await route_turn(
+            "claude-native",
+            "refactor everything",
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert (model, verdict) == (None, None)
+    assert local.offered == []
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_skips_the_static_top_up_off_gateway() -> None:
+    """A partial pre-session catalog is offered as-is, not topped up."""
+    local = FakeRoutingClient(
+        RoutingResult(model="claude-sonnet-4-6", rationale="mid", harness="claude-native")
+    )
+    caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict, error = await route_session_harness(
+            "hello",
+            harness_candidates=("claude-native", "codex-native"),
+            catalog={"claude-native": ["claude-sonnet-4-6", "claude-opus-4-8"]},
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert error is None
+    assert (harness, model) == ("claude-native", "claude-sonnet-4-6")
+    # Only the harness the caller could answer for; codex-native was NOT topped
+    # up from the static table.
+    assert list(local.offered[0]) == ["claude-native"]
+    assert not any(m.startswith("databricks-") for m in local.offered[0]["claude-native"])
+
+
+@pytest.mark.asyncio
+async def test_route_turn_skips_the_static_table_off_gateway_but_takes_the_catalog() -> None:
+    local = FakeRoutingClient(RoutingResult(model="claude-sonnet-4-6", rationale="mid"))
+    caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, verdict = await route_turn(
+            "claude-native",
+            "hello",
+            catalog=["claude-sonnet-4-6", "claude-opus-4-8"],
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert model == "claude-sonnet-4-6"
+    assert verdict is not None
+    assert local.offered == [{"claude-native": ["claude-sonnet-4-6", "claude-opus-4-8"]}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gateway_backed", "expected_source"),
+    [(True, "databricks-aigw"), (False, "oss-llm")],
+)
+async def test_route_turn_picks_the_router_gateway_backing_allows(
+    gateway_backed: bool, expected_source: str
+) -> None:
+    external = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-4", rationale="external"))
+    local = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-5", rationale="local"))
+    caps = FakeCaps(routing_client=external, routing_backends=_both_backends(external, local))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, verdict = await route_turn("codex", "hello", gateway_backed=gateway_backed)
+    assert verdict is not None
+    assert verdict["router_source"] == expected_source
+    if gateway_backed:
+        assert (model, local.offered) == ("databricks-gpt-5-4", [])
+    else:
+        assert (model, external.offered) == ("databricks-gpt-5-5", [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gateway_backed", "expected_source"),
+    [(True, "databricks-aigw"), (False, "oss-llm")],
+)
+async def test_route_session_harness_picks_the_router_gateway_backing_allows(
+    gateway_backed: bool, expected_source: str
+) -> None:
+    external = FakeRoutingClient(
+        RoutingResult(model="databricks-gpt-5-4", rationale="external", harness="codex")
+    )
+    local = FakeRoutingClient(
+        RoutingResult(model="databricks-gpt-5-5", rationale="local", harness="codex")
+    )
+    caps = FakeCaps(routing_client=external, routing_backends=_both_backends(external, local))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        _harness, model, verdict, error = await route_session_harness(
+            "hello", gateway_backed=gateway_backed
+        )
+    assert error is None
+    assert verdict is not None
+    assert verdict["router_source"] == expected_source
+    assert model == ("databricks-gpt-5-4" if gateway_backed else "databricks-gpt-5-5")
+
+
+@pytest.mark.asyncio
+async def test_routing_is_unavailable_when_neither_backend_is_configured() -> None:
+    caps = FakeCaps(routing_client=None, routing_backends=RoutingBackends())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        assert await route_turn("codex", "hello") == (None, None)
+        harness, model, verdict, error = await route_session_harness("hello")
+    assert (harness, model, verdict) == (None, None, None)
+    assert error == "Smart routing is not configured on this server."
+
+
+@pytest.mark.asyncio
+async def test_external_only_deployment_cannot_route_off_the_gateway() -> None:
+    """No built-in judge means an off-gateway harness has no source at all."""
+    external = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-4", rationale="x"))
+    caps = FakeCaps(routing_client=external, routing_backends=RoutingBackends(external=external))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        assert await route_turn("codex", "hello", gateway_backed=False) == (None, None)
+    assert external.offered == []
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_single_routing_client_is_classified_as_the_oss_judge() -> None:
+    """``routing_backends`` unset derives the pair from ``routing_client``."""
+    client = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-4", rationale="x"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
+        _model, verdict = await route_turn("codex", "hello", gateway_backed=True)
+    assert verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_serves_a_cross_harness_verdict_without_a_raw_model() -> None:
+    """The built-in judge picks from the menu, so its pick needs no resolution."""
+    llm = _FakeLLMClient({"model": "databricks-gpt-5-5", "harness": "codex-native"})
+    client = LLMRoutingClient(llm)
+    caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, verdict, error = await route_session_harness(
+            "hello",
+            harness_candidates=("claude-native", "codex-native"),
+            catalog={
+                "claude-native": ["databricks-claude-sonnet-5"],
+                "codex-native": ["databricks-gpt-5-5"],
+            },
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert error is None
+    assert (harness, model) == ("codex-native", "databricks-gpt-5-5")
+    assert verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+    assert "raw_model" not in verdict

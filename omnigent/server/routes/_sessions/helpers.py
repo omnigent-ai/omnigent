@@ -5635,6 +5635,8 @@ async def _emit_server_routing_decision(
     applied = verdict.get("applied", True)
     resolved_decision_id = decision_id or str(uuid.uuid4())
     raw_model = verdict.get("raw_model")
+    # Which router answered, so the chip can mark an AI-Gateway-routed decision.
+    router_source = verdict.get("router_source")
     item_data: dict[str, Any] = {
         "model": model,
         "applied": bool(applied),
@@ -5644,6 +5646,9 @@ async def _emit_server_routing_decision(
         "decision_id": resolved_decision_id,
         "raw_model": raw_model if isinstance(raw_model, str) and raw_model else None,
         "attempted_override": attempted_override,
+        "router_source": (
+            router_source if isinstance(router_source, str) and router_source else None
+        ),
     }
     if agent is not None:
         item_data["agent"] = agent

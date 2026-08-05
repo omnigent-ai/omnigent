@@ -19,7 +19,7 @@ import json
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -117,16 +117,36 @@ async def _native_wrappers(client: httpx.AsyncClient, db_uri: str) -> dict[str, 
     return wrappers
 
 
+def _caps_with(routing_client: FakeRoutingClient | None, *, oss: bool) -> FakeCaps:
+    """Caps whose external side is *routing_client*, with the judge on iff *oss*.
+
+    The gateway checks only decide WHICH router answers, so a deployment with no
+    built-in judge is the only one an ungatewayed harness can take away.
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    return FakeCaps(
+        routing_client=routing_client,
+        routing_backends=RoutingBackends(
+            external=routing_client,
+            local=routing_client if oss else None,
+        ),
+    )
+
+
 async def _create_smart_routing_session(
     client: httpx.AsyncClient,
     wrappers: dict[str, str],
     routing_client: FakeRoutingClient | None,
+    *,
+    oss: bool = False,
 ) -> httpx.Response:
     """POST the landing screen's Smart Routing create payload.
 
     :param client: Test HTTP client.
     :param wrappers: Registered wrapper ids from :func:`_native_wrappers`.
     :param routing_client: Stub router, or ``None`` to leave routing unconfigured.
+    :param oss: Whether the server also has the built-in judge configured.
     :returns: The raw create response.
     """
     body = {
@@ -136,7 +156,7 @@ async def _create_smart_routing_session(
         "cost_control_mode_override": "on",
         "smart_routing_message": ROUTING_MESSAGE,
     }
-    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=oss)):
         return await client.post("/v1/sessions", json=body)
 
 
@@ -144,6 +164,8 @@ async def _create_fixed_harness_session(
     client: httpx.AsyncClient,
     agent_id: str,
     routing_client: FakeRoutingClient | None,
+    *,
+    oss: bool = False,
     **extra: Any,  # type: ignore[explicit-any]
 ) -> httpx.Response:
     """POST a Smart Routing create for a session pinned to one harness.
@@ -155,6 +177,7 @@ async def _create_fixed_harness_session(
     :param client: Test HTTP client.
     :param agent_id: Agent to bind.
     :param routing_client: Stub router, or ``None`` to leave routing unconfigured.
+    :param oss: Whether the server also has the built-in judge configured.
     :param extra: Extra create-body fields, merged last.
     :returns: The raw create response.
     """
@@ -164,7 +187,7 @@ async def _create_fixed_harness_session(
         "smart_routing_message": ROUTING_MESSAGE,
         **extra,
     }
-    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=oss)):
         return await client.post("/v1/sessions", json=body)
 
 
@@ -896,15 +919,16 @@ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
         ({"claude-native": False, "codex-native": False}, "Claude and Codex"),
     ],
 )
-async def test_auto_routing_is_refused_when_an_arm_is_off_the_gateway(
+async def test_auto_routing_is_refused_when_no_router_can_serve_an_off_gateway_arm(
     gateway: dict[str, bool],
     named: str,
 ) -> None:
+    """Only fatal with no built-in judge: nothing is left to answer with."""
     from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
-    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=False)):
         agent_name, model, verdict, error = await _resolve_native_smart_routing(
             cast("Any", body),
             cast("Any", _routing_request(_host(None, gateway))),
@@ -917,6 +941,76 @@ async def test_auto_routing_is_refused_when_an_arm_is_off_the_gateway(
     assert named in error
     assert "not AI-Gateway-backed" in error
     # The router is never asked to pick between arms it cannot apply to.
+    assert routing_client.offered == []
+
+
+# The candidate set an ungatewayed host answers with: the pane's own provider
+# spelling, never the static table's ``databricks-*`` ids.
+_OFF_GATEWAY_CATALOG = {
+    "claude-native": ["claude-opus-4-8"],
+    "codex-native": ["gpt-5-5"],
+}
+
+
+@pytest.mark.parametrize(
+    "gateway",
+    [
+        {"claude-native": True, "codex-native": False},
+        {"claude-native": False, "codex-native": False},
+    ],
+)
+async def test_auto_routing_falls_back_to_the_built_in_judge_off_the_gateway(
+    gateway: dict[str, bool],
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    routing_client = FakeRoutingClient(
+        RoutingResult(model="gpt-5-5", rationale="narrow change", harness="codex-native")
+    )
+    with (
+        patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=True)),
+        patch.object(
+            orchestration,
+            "_pre_session_model_catalog",
+            AsyncMock(return_value=dict(_OFF_GATEWAY_CATALOG)),
+        ),
+    ):
+        agent_name, model, verdict, error = await orchestration._resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host(None, gateway))),
+            "alice@example.com",
+        )
+
+    assert error is None
+    assert (agent_name, model) == ("codex-native-ui", "gpt-5-5")
+    assert verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+    # The host's own catalog is the whole offer: no static databricks-* top-up.
+    assert routing_client.offered[0] == _OFF_GATEWAY_CATALOG
+
+
+async def test_auto_routing_declines_off_the_gateway_when_the_host_answers_nothing() -> None:
+    """No provider-accurate candidates means decline, not a databricks-* offer.
+
+    The static table is every ``databricks-*`` endpoint, so offering it here
+    would land the session on a model the ungatewayed pane cannot reach.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=True)):
+        agent_name, model, verdict, error = await orchestration._resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host(None, {"codex-native": False}))),
+            "alice@example.com",
+        )
+
+    # The session still lands on a terminal; it just keeps the CLI's own model.
+    assert agent_name == "claude-native-ui"
+    assert (model, verdict) == (None, None)
+    assert error is not None
     assert routing_client.offered == []
 
 
@@ -936,7 +1030,7 @@ async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() ->
     assert (agent_name, model) == ("codex-native-ui", GPT_MODEL)
 
 
-async def test_top_level_smart_routing_create_is_rejected_off_the_gateway(
+async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_serve(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
@@ -945,18 +1039,45 @@ async def test_top_level_smart_routing_create_is_rejected_off_the_gateway(
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
     ungatewayed = _host(None, {"claude-native": True, "codex-native": False})
-    with patch.object(
-        orchestration, "_routing_host_for_create", return_value=ungatewayed
-    ) as _resolved:
-        created = await _create_smart_routing_session(client, wrappers, routing_client)
+    with patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed):
+        created = await _create_smart_routing_session(client, wrappers, routing_client, oss=False)
 
     assert created.status_code == 400, created.text
     assert "not AI-Gateway-backed" in created.text
     assert routing_client.offered == []
 
 
+async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_judge(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(
+        RoutingResult(model="gpt-5-5", rationale="narrow change", harness="codex-native")
+    )
+    ungatewayed = _host(None, {"claude-native": True, "codex-native": False})
+    with (
+        patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed),
+        patch.object(
+            orchestration,
+            "_pre_session_model_catalog",
+            AsyncMock(return_value=dict(_OFF_GATEWAY_CATALOG)),
+        ),
+    ):
+        created = await _create_smart_routing_session(client, wrappers, routing_client, oss=True)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["model_override"] == "gpt-5-5"
+    # The chip records which router answered.
+    items = (await client.get(f"/v1/sessions/{created.json()['id']}/items")).json()["data"]
+    decisions = [i for i in items if i["type"] == "routing_decision"]
+    assert decisions and decisions[0]["router_source"] == "oss-llm"
+
+
 @pytest.mark.parametrize("harness", list(AUTO_NATIVE_ROUTING_HARNESSES))
-async def test_fixed_harness_routing_create_is_rejected_off_the_gateway(
+async def test_fixed_harness_routing_create_is_rejected_when_no_router_can_serve(
     client: httpx.AsyncClient,
     db_uri: str,
     harness: str,
@@ -967,12 +1088,45 @@ async def test_fixed_harness_routing_create_is_rejected_off_the_gateway(
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
     ungatewayed = _host(None, {harness: False})
     with patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed):
-        created = await _create_fixed_harness_session(client, wrappers[harness], routing_client)
+        created = await _create_fixed_harness_session(
+            client, wrappers[harness], routing_client, oss=False
+        )
 
     assert created.status_code == 400, created.text
     assert harness in created.json()["error"]["message"]
-    assert "not backed by the AI Gateway" in created.json()["error"]["message"]
+    assert "not AI-Gateway-backed" in created.json()["error"]["message"]
     assert routing_client.offered == []
+
+
+@pytest.mark.parametrize("harness", list(AUTO_NATIVE_ROUTING_HARNESSES))
+async def test_fixed_harness_routing_create_succeeds_off_the_gateway_with_the_judge(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    pick = _OFF_GATEWAY_CATALOG[harness][0]
+    routing_client = FakeRoutingClient(RoutingResult(model=pick, rationale="sized task"))
+    ungatewayed = _host(None, {harness: False})
+    with (
+        patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed),
+        patch.object(
+            orchestration,
+            "_pre_session_model_catalog",
+            AsyncMock(return_value={harness: [pick]}),
+        ),
+    ):
+        created = await _create_fixed_harness_session(
+            client, wrappers[harness], routing_client, oss=True
+        )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["model_override"] == pick
+    items = (await client.get(f"/v1/sessions/{created.json()['id']}/items")).json()["data"]
+    decisions = [i for i in items if i["type"] == "routing_decision"]
+    assert decisions and decisions[0]["router_source"] == "oss-llm"
 
 
 @pytest.mark.parametrize(

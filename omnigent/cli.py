@@ -330,6 +330,46 @@ def _build_local_llm_routing_client(
     return LLMRoutingClient(policy_client)
 
 
+def _build_routing_backends(
+    cfg: Any,  # type: ignore[explicit-any]  # parsed server config
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+    settings: Any,  # type: ignore[explicit-any]  # RoutingSettings
+) -> Any:  # type: ignore[explicit-any]  # RoutingBackends
+    """Build BOTH routing backends from configuration alone — no opt-in env needed.
+
+    They are not alternatives. The external client's picks are AI Gateway catalog
+    ids, so a harness whose inference runs off something else is served by the
+    built-in judge instead (see :mod:`omnigent.server.routing_backend`).
+
+    An explicit ``routing:`` block chooses the external side by ``provider``:
+
+    * ``external`` — call an external ``routes:select`` service.
+    * ``none`` — opt out of routing entirely; neither backend.
+    * anything else — no external side, the built-in judge only.
+
+    With no ``routing:`` block at all, a Databricks-backed deployment gets its
+    own workspace AI Gateway as the external side. Managed deployments override
+    ``RuntimeCaps.routing_backends`` themselves.
+
+    :param cfg: The parsed server ``--config`` mapping.
+    :param server_llm: The parsed server-level ``LLMConfig``, or ``None``.
+    :param settings: The parsed routing settings.
+    :returns: The pair; both sides may be ``None`` (routing off).
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    routing_cfg = cfg.get("routing")
+    provider = routing_cfg.get("provider") if isinstance(routing_cfg, dict) else None
+    if provider == "none":
+        return RoutingBackends()
+    external: Any = None  # type: ignore[explicit-any]
+    if provider == "external":
+        external = _build_external_routing_client(routing_cfg, settings)
+    elif not isinstance(routing_cfg, dict):
+        external = _build_default_databricks_routing_client(cfg, settings)
+    return RoutingBackends(external=external, local=_build_local_llm_routing_client(server_llm))
+
+
 def _server_uvicorn_log_config(
     log_path: Path | None = None,
     *,
@@ -3694,35 +3734,17 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the routing client from configuration alone — no opt-in env needed.
-    # An explicit ``routing:`` block always wins, chosen by its ``provider``:
-    #   - ``external``: call an external ``routes:select`` service.
-    #   - ``none``: opt out of routing entirely.
-    #   - anything else (default): the built-in judge from the ``llm:`` block.
-    # With no ``routing:`` block, a Databricks-backed deployment routes through
-    # its own workspace AI Gateway; other deployments fall back to the judge.
-    # Managed deployments override RuntimeCaps.routing_client themselves.
-    routing_cfg = cfg.get("routing")
-    routing_settings = parse_routing_settings(routing_cfg)
-    routing_client: ExternalRoutingClient | LLMRoutingClient | None
-    if isinstance(routing_cfg, dict):
-        provider = routing_cfg.get("provider")
-        if provider == "external":
-            routing_client = _build_external_routing_client(routing_cfg, routing_settings)
-        elif provider == "none":
-            routing_client = None
-        else:
-            routing_client = _build_local_llm_routing_client(server_llm)
-    else:
-        routing_client = _build_default_databricks_routing_client(
-            cfg, routing_settings
-        ) or _build_local_llm_routing_client(server_llm)
+    routing_settings = parse_routing_settings(cfg.get("routing"))
+    routing_backends = _build_routing_backends(cfg, server_llm, routing_settings)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
-        routing_client=routing_client,
+        # The primary stays the single "is routing configured" answer for every
+        # legacy consumer; the pair is what a per-call selection reads.
+        routing_client=routing_backends.any(),
+        routing_backends=routing_backends,
         routing_settings=routing_settings,
     )
     init_runtime(

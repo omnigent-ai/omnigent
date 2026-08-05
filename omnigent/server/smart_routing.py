@@ -1,12 +1,13 @@
 """Server-side intelligent model routing.
 
 Infers available models from the session's harness type and delegates
-the routing decision to the :class:`RoutingClient` on
-:attr:`RuntimeCaps.routing_client`.  The default implementation
-(:class:`LLMRoutingClient`) calls the server-level LLM with a prompt
-that describes each model's capabilities directly — no tier abstraction.
-Managed deployments can swap in a different implementation via
-``RuntimeCaps``.
+the routing decision to a :class:`RoutingClient`.  Which one is picked
+per call by :func:`omnigent.server.routing_backend.select_router`: the
+external :class:`ExternalRoutingClient` when the call's harnesses are
+AI-Gateway-backed, else the built-in :class:`LLMRoutingClient`, which
+calls the server-level LLM with a prompt that describes each model's
+capabilities directly — no tier abstraction.  Managed deployments can
+swap in a different implementation via ``RuntimeCaps``.
 """
 
 from __future__ import annotations
@@ -1503,6 +1504,8 @@ async def route_session_harness(
     allowed_family: str | None = None,
     harness_candidates: Sequence[str] | None = None,
     catalog: Mapping[str, Sequence[str]] | None = None,
+    gateway_backed: bool = True,
+    allow_static_fallback: bool = True,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -1532,6 +1535,14 @@ async def route_session_harness(
         host's pre-launch model options during a session create. Used when no
         live runner catalog is in reach; the static table then only tops up the
         candidates it could not answer for.
+    :param gateway_backed: Whether every candidate harness resolves
+        AI-Gateway-backed inference on the target host. ``False`` takes the
+        external router out of play (its picks are gateway catalog ids the pane
+        cannot reach) and the built-in judge answers instead.
+    :param allow_static_fallback: Whether the static :func:`infer_models` table
+        may supply or top up candidates. Callers pass ``gateway_backed``: that
+        table is all ``databricks-*`` ids, so off the gateway it would offer
+        models the pane cannot run. ``False`` declines instead.
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
         and ``error`` carries a human-readable reason shown in the UI.
@@ -1543,7 +1554,10 @@ async def route_session_harness(
     except ImportError:
         return None, None, None, "Smart routing is not available."
 
-    if _caps is None or _caps.routing_client is None:
+    from omnigent.server.routing_backend import backends_from_caps, select_router
+
+    router = select_router(backends_from_caps(_caps), gateway_backed=gateway_backed)
+    if router is None:
         return None, None, None, "Smart routing is not configured on this server."
 
     # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
@@ -1592,8 +1606,14 @@ async def route_session_harness(
     # Fall back to the static table when neither catalog produced routable
     # candidates (e.g. a child session whose catalog only lists "self" under an
     # unrecognized worker name, or the runner was unreachable), and to top up
-    # candidates a pre-session catalog could not answer for.
-    if not harness_models or (catalog and len(harness_models) < len(candidate_harnesses)):
+    # candidates a pre-session catalog could not answer for. Off the gateway
+    # that table is unusable: every id in it is a ``databricks-*`` endpoint the
+    # pane cannot reach, so offering one would route the session onto a model
+    # the launch silently drops. Decline instead — the provider-accurate
+    # sources are the pre-session catalog and the runner catalog's "self" row.
+    if allow_static_fallback and (
+        not harness_models or (catalog and len(harness_models) < len(candidate_harnesses))
+    ):
         for h in candidate_harnesses:
             if h in harness_models:
                 continue
@@ -1605,7 +1625,7 @@ async def route_session_harness(
         return None, None, None, "No routable harnesses are available on this runner."
 
     try:
-        result = await _caps.routing_client.route(user_message, harness_models)
+        result = await router.client.route(user_message, harness_models)
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
         return None, None, None, f"Routing call failed: {exc}"
@@ -1613,7 +1633,7 @@ async def route_session_harness(
     if result is None:
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
-        detail = routing_last_error(_caps.routing_client)
+        detail = routing_last_error(router.client)
         reason = (
             f"Routing unavailable: {detail}"
             if detail
@@ -1668,7 +1688,11 @@ async def route_session_harness(
 
     # The UI shows what the router said, not only what we could run — but only
     # when they are genuinely different models, not the same one spelled bare.
-    verdict: dict[str, Any] = {"model": chosen_model, "rationale": result.rationale}
+    verdict: dict[str, Any] = {
+        "model": chosen_model,
+        "rationale": result.rationale,
+        "router_source": router.source,
+    }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
         verdict["raw_model"] = raw_model
 
@@ -1689,8 +1713,10 @@ async def route_turn(
     session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
     catalog: Sequence[str] | None = None,
+    gateway_backed: bool = True,
+    allow_static_fallback: bool = True,
 ) -> tuple[str | None, dict[str, Any] | None]:
-    """Pick the best model for a turn via :attr:`RuntimeCaps.routing_client`.
+    """Pick the best model for a turn via the deployment's routing backends.
 
     When *session_id* and *runner_client* are provided, fetches live model
     availability from the runner's ``/v1/sessions/{id}/models`` endpoint.
@@ -1702,13 +1728,23 @@ async def route_turn(
         vocabulary. Authoritative: its gateway serves more models than the
         running CLI can be switched to, and offering those routes the turn
         onto a model the switch would silently drop.
+    :param gateway_backed: Whether this session's harness resolves
+        AI-Gateway-backed inference on its host. ``False`` takes the external
+        router out of play and the built-in judge answers instead.
+    :param allow_static_fallback: Whether the static :func:`infer_models` table
+        may supply candidates. Callers pass ``gateway_backed``: that table is
+        all ``databricks-*`` ids, so off the gateway it would route the turn
+        onto a model the pane cannot switch to. ``False`` declines instead.
     """
     try:
         from omnigent.runtime._globals import _caps
     except ImportError:
         return None, None
 
-    if _caps is None or _caps.routing_client is None:
+    from omnigent.server.routing_backend import backends_from_caps, select_router
+
+    router = select_router(backends_from_caps(_caps), gateway_backed=gateway_backed)
+    if router is None:
         _logger.info(
             "smart_routing: route_turn skipped for session=%s: no routing client configured",
             session_id,
@@ -1734,7 +1770,10 @@ async def route_turn(
             if in_family:
                 available = {harness or "self": in_family}
     if not available:
-        models = infer_models(harness)
+        # The static table is every ``databricks-*`` id, so off the gateway it
+        # names models this pane cannot be switched to. Decline the turn rather
+        # than route it onto an unreachable endpoint.
+        models = infer_models(harness) if allow_static_fallback else None
         if models is None:
             _logger.info(
                 "smart_routing: route_turn skipped for session=%s: "
@@ -1768,7 +1807,7 @@ async def route_turn(
             )
             return None, None
 
-    result = await _caps.routing_client.route(user_message, available)
+    result = await router.client.route(user_message, available)
     if result is None:
         return None, None
 
@@ -1799,7 +1838,11 @@ async def route_turn(
     _logger.info("smart_routing: session=%s model=%s", session_id, model)
     # The rationale paraphrases the user's prompt, so it stays off INFO.
     _logger.debug("smart_routing: session=%s rationale=%s", session_id, result.rationale)
-    verdict: dict[str, Any] = {"model": model, "rationale": result.rationale}
+    verdict: dict[str, Any] = {
+        "model": model,
+        "rationale": result.rationale,
+        "router_source": router.source,
+    }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
     return model, verdict

@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { useMemo } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
+import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
@@ -170,7 +171,7 @@ export function RoutingDecisionCard({
   agent,
   routing,
 }: RoutingDecisionCardProps) {
-  const { harness, scope, decisionId, rawModel, attemptedOverride } = routing ?? {};
+  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
@@ -189,11 +190,23 @@ export function RoutingDecisionCard({
           ...(decisionId ? { decision_id: decisionId } : {}),
           ...(rawModel ? { raw_model: rawModel } : {}),
           ...(attemptedOverride ? { attempted_override: attemptedOverride } : {}),
+          ...(routerSource ? { router_source: routerSource } : {}),
         },
         null,
         2,
       ),
-    [model, applied, rationale, agent, harness, scope, decisionId, rawModel, attemptedOverride],
+    [
+      model,
+      applied,
+      rationale,
+      agent,
+      harness,
+      scope,
+      decisionId,
+      rawModel,
+      attemptedOverride,
+      routerSource,
+    ],
   );
   return (
     <Collapsible
@@ -208,6 +221,17 @@ export function RoutingDecisionCard({
       <div className="flex items-center gap-1.5 text-sm">
         <BrainCircuitIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="font-medium">Smart routing</span>
+        {routerSource === "databricks-aigw" ? (
+          <span
+            className="text-muted-foreground"
+            title="Routed by the Databricks AI Gateway"
+            aria-label="Routed by the Databricks AI Gateway"
+            role="img"
+            data-testid="routing-decision-source-databricks"
+          >
+            <DatabricksIcon className="size-3 shrink-0" />
+          </span>
+        ) : null}
         <span className="text-muted-foreground">{applied ? "· applied" : "· advisory"}</span>
         {harness ? (
           <span className="text-muted-foreground" data-testid="routing-decision-harness">

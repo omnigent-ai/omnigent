@@ -3248,7 +3248,7 @@
                 "type": "null"
               }
             ],
-            "description": "Model an LLM-supplied `args.model` asked for and the router overrode, e.g. `\"databricks-gpt-5-5\"`. `None` when nothing was attempted.",
+            "description": "Model the spawning agent asked for and the router overrode, e.g. `\"databricks-gpt-5-5\"` \u2014 an LLM-supplied `args.model` on a child session, or a native spawn's own `requested_model`. `None` when nothing was asked for, or when the router's pick names the same arm as the ask.",
             "title": "Attempted Override"
           },
           "decision_id": {
@@ -3296,6 +3296,18 @@
             ],
             "description": "The router-vocabulary pick before resolution to a servable catalog id, e.g. `\"gpt-5-6-sol\"`. `None` when the pick needed no resolution.",
             "title": "Raw Model"
+          },
+          "router_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which router produced the decision \u2014 `\"databricks-aigw\"` for the external AI-Gateway `task_v1` service, `\"oss-llm\"` for the built-in judge. Deliberately a plain `str` rather than a `Literal`: a source added later must still round-trip through stored rows and the wire instead of failing validation. `None` on rows written before the field existed.",
+            "title": "Router Source"
           },
           "scope": {
             "default": "turn",
@@ -5300,7 +5312,7 @@
                 "type": "null"
               }
             ],
-            "description": "Per-session subagent-routing switch: `\"on\"` routes subagent spawns, `\"off\"` leaves them unrouted. `None` means the session inherits its main routing state (own or parent `cost_control_mode_override == \"on\"`) \u2014 the value the in-session \"Subagent routing\" row renders as \"Default\". Set via `PATCH /v1/sessions/{id}`.",
+            "description": "Per-session subagent-routing switch, two-state: `\"on\"` routes subagent spawns, and `\"off\"` or `None` (unset) both leave them unrouted \u2014 the in-session \"Subagent routing\" row renders either as \"Default\". `None` on a row created before this became explicit inherits nothing. Stamped `\"on\"` at create for Smart Routing sessions; also set via `PATCH /v1/sessions/{id}`.",
             "title": "Subagent Routing Override"
           },
           "terminal_launch_args": {
@@ -5383,14 +5395,6 @@
             ],
             "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on.",
             "title": "Usage By Model"
-          },
-          "warnings": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Warnings",
-            "type": "array"
           },
           "workspace": {
             "anyOf": [
@@ -6681,7 +6685,7 @@
                 "type": "null"
               }
             ],
-            "description": "Per-session subagent-routing switch: `\"on\"` routes subagent spawns, `\"off\"` leaves them unrouted. Explicit JSON `null` clears the override so the session inherits its main routing state again; omitting the field leaves it unchanged (same presence-is-the-clear-signal rule as `cost_control_mode_override`). Effective on the next spawn, so it can be changed at any point in a session.",
+            "description": "Per-session subagent-routing switch: `\"on\"` routes subagent spawns, `\"off\"` leaves them unrouted. Explicit JSON `null` clears the override, which lands the session on Default (the same behavior as `\"off\"` \u2014 nothing is inherited); omitting the field leaves it unchanged (same presence-is-the-clear-signal rule as `cost_control_mode_override`). Effective on the next spawn, so it can be changed at any point in a session.",
             "title": "Subagent Routing Override"
           },
           "terminal_launch_args": {
@@ -7942,6 +7946,12 @@
                           "type": "string"
                         },
                         "type": "array"
+                      },
+                      {
+                        "additionalProperties": {
+                          "type": "boolean"
+                        },
+                        "type": "object"
                       },
                       {
                         "type": "null"

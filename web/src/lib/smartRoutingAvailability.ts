@@ -27,17 +27,47 @@ export type SmartRoutingUnavailableCause =
   | { kind: "harnesses-unready"; harnesses: string[] }
   /**
    * Arms whose family the host doesn't back with the workspace AI gateway. The
-   * routing apply layer rewrites the model through the gateway, so a CLI
-   * pointed anywhere else can't be routed even with the CLI installed.
+   * external router's apply layer rewrites the model through the gateway, so a
+   * CLI pointed anywhere else can't be routed by it even with the CLI
+   * installed. Only fires when the built-in judge can't answer instead.
    */
   | { kind: "not-gateway-backed"; harnesses: string[] };
+
+/** The routers that can answer a Smart Routing pick. */
+export type RouterSource = "databricks-aigw" | "oss-llm";
+
+/**
+ * Which router would answer a pick for one harness family — the browser-side
+ * mirror of the server's ``select_router`` seam.
+ *
+ * The external AI-Gateway router can only answer for a family the host runs
+ * through the gateway, because the apply layer rewrites the model there. The
+ * built-in judge has no such requirement, so it covers the off-gateway arms.
+ *
+ * @param inputs - The server's two configured sources plus whether the host
+ *   backs this family's inference with the workspace AI gateway.
+ * @returns The router that answers, or ``null`` when neither can.
+ */
+export function smartRoutingSourceFor(inputs: {
+  externalConfigured: boolean;
+  ossConfigured: boolean;
+  gatewayBacked: boolean;
+}): RouterSource | null {
+  if (inputs.externalConfigured && inputs.gatewayBacked) return "databricks-aigw";
+  if (inputs.ossConfigured) return "oss-llm";
+  return null;
+}
 
 /**
  * Classify why Smart Routing can't be offered, most-fundamental cause first —
  * routing being off makes the host's CLIs irrelevant, and a CLI that isn't
  * installed makes its inference config irrelevant.
  *
- * @param inputs - The four independent conditions, read off the server flags,
+ * An off-gateway arm is only a loss when the external router is the only one
+ * that can answer: with the built-in judge available it routes that arm
+ * instead, so ``not-gateway-backed`` stops firing.
+ *
+ * @param inputs - The independent conditions, read off the server flags,
  *   the agent list, and the selected host.
  * @returns The cause, or ``null`` when Smart Routing is available.
  */
@@ -46,6 +76,7 @@ export function smartRoutingUnavailableReason(inputs: {
   wrappersRegistered: boolean;
   unreadyHarnesses: readonly string[];
   notGatewayBackedHarnesses?: readonly string[];
+  ossRoutingAvailable?: boolean;
 }): SmartRoutingUnavailableCause | null {
   if (!inputs.routingEnabled) return { kind: "routing-disabled" };
   if (!inputs.wrappersRegistered) return { kind: "wrappers-missing" };
@@ -53,7 +84,7 @@ export function smartRoutingUnavailableReason(inputs: {
     return { kind: "harnesses-unready", harnesses: [...inputs.unreadyHarnesses] };
   }
   const notBacked = inputs.notGatewayBackedHarnesses ?? [];
-  if (notBacked.length > 0) {
+  if (notBacked.length > 0 && inputs.ossRoutingAvailable !== true) {
     return { kind: "not-gateway-backed", harnesses: [...notBacked] };
   }
   return null;

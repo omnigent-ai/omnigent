@@ -1363,6 +1363,7 @@ def register_hooks_routes(
             store_persister,
             subagent_routing_enabled,
         )
+        from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
 
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
@@ -1421,6 +1422,14 @@ def register_hooks_routes(
         # harness families; everyone else is offered their own family, so a
         # Claude Code session never gets a Codex suggestion.
         cross_harness = auto_harness_session(conv, parent)
+        # Which families the spawn may land on decides which router can serve it:
+        # off the AI Gateway the built-in judge answers, from the live catalog
+        # alone (the static table's databricks-* ids are unreachable there).
+        gateway_backed = await _spawn_gateway_backed(
+            request,
+            conv,
+            (AUTO_NATIVE_ROUTING_HARNESSES if cross_harness else (route_request.harness,)),
+        )
         # Offer the live catalog: the static table lags model generations, and
         # a pick the workspace serves must not look unservable and get
         # substituted down a tier.
@@ -1431,6 +1440,8 @@ def register_hooks_routes(
             caps=get_caps(),
             catalog=catalog,
             cross_harness=cross_harness,
+            gateway_backed=gateway_backed,
+            allow_static_fallback=gateway_backed,
             persist=store_persister(session_id, conversation_store),
         )
         return Response(
@@ -1524,6 +1535,15 @@ def register_hooks_routes(
                     exc_info=True,
                 )
 
+        # This pane's own family decides which router can serve its first turn.
+        # A create off the AI Gateway now succeeds (the built-in judge answers),
+        # so this hook must make the same choice the composer path does.
+        turn_gateway_backed = (
+            await _spawn_gateway_backed(request, conv, (route_request.harness,))
+            if conv is not None
+            else True
+        )
+
         async def _route(
             harness: str | None, prompt: str
         ) -> tuple[str | None, dict[str, Any] | None]:
@@ -1533,6 +1553,8 @@ def register_hooks_routes(
                 session_id=session_id,
                 runner_client=runner_client,
                 catalog=catalog,
+                gateway_backed=turn_gateway_backed,
+                allow_static_fallback=turn_gateway_backed,
             )
 
         async def _pin(model: str) -> bool:

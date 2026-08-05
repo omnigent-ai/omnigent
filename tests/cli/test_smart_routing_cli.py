@@ -50,10 +50,27 @@ def _mock_local_gateway(monkeypatch: pytest.MonkeyPatch, gateway: dict[str, bool
     )
 
 
-def _mock_info(*, enabled: bool = True) -> None:
-    respx.get(f"{_BASE}/v1/info").mock(
-        return_value=httpx.Response(200, json={"smart_routing_enabled": enabled})
-    )
+def _mock_info(
+    *,
+    enabled: bool = True,
+    external: bool | None = None,
+    oss: bool = False,
+    omit_sources: bool = False,
+) -> None:
+    """Mock ``GET /v1/info``: whether routing is on, and which sources serve it.
+
+    The default is the shape a gateway workspace reports — the external
+    AI-Gateway router and no built-in judge — so a family off the gateway is a
+    hard error. ``omit_sources`` reproduces a server from before the field
+    existed.
+    """
+    payload: dict[str, Any] = {"smart_routing_enabled": enabled}
+    if not omit_sources:
+        payload["smart_routing_sources"] = {
+            "external": enabled if external is None else external,
+            "oss": oss,
+        }
+    respx.get(f"{_BASE}/v1/info").mock(return_value=httpx.Response(200, json=payload))
 
 
 def _mock_hosts(gateway: dict[str, Any] | None) -> None:
@@ -182,31 +199,78 @@ _LOCAL_GATEWAY_STATES: list[tuple[str, dict[str, bool], str | None]] = [
 ]
 
 
+def _assert_downgrade_notice(
+    capsys: pytest.CaptureFixture[str], *, expected: tuple[str, ...]
+) -> None:
+    """Assert the built-in-router line was printed for exactly *expected*."""
+    err = capsys.readouterr().err
+    named = tuple(h for h in ("claude-native", "codex-native") if h in err)
+    assert named == expected, err
+    assert err.count("routing with the built-in router instead") == len(expected), err
+
+
 @respx.mock
+@pytest.mark.parametrize("oss", [False, True], ids=["no-built-in-judge", "built-in-judge"])
 @pytest.mark.parametrize(("state", "local", "routable"), _LOCAL_GATEWAY_STATES)
 def test_preflight_gates_each_harness_on_the_local_gateway_answer(
-    monkeypatch: pytest.MonkeyPatch, state: str, local: dict[str, bool], routable: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: str,
+    local: dict[str, bool],
+    routable: str | None,
+    oss: bool,
 ) -> None:
-    """Each arm gates on its OWN inference; the auto route needs both."""
-    _mock_info()
+    """Off-gateway selects the source: the built-in judge serves it, or it fails."""
+    _mock_info(oss=oss)
     # No host row at all — the local answer must gate on its own.
     _mock_hosts(None)
     _mock_local_gateway(monkeypatch, local)
 
     for harness in ("claude-native", "codex-native"):
-        allowed = routable in (harness, "both")
-        if allowed:
-            check_smart_routing_available(base_url=_BASE, harnesses=(harness,), host_id=None)
-        else:
+        gatewayed = routable in (harness, "both")
+        if not gatewayed and not oss:
             with pytest.raises(ClickException, match=f"unavailable for {harness}"):
                 check_smart_routing_available(base_url=_BASE, harnesses=(harness,), host_id=None)
-    # The auto route picks across both arms, so one arm off the gateway takes it.
+            continue
+        check_smart_routing_available(base_url=_BASE, harnesses=(harness,), host_id=None)
+        _assert_downgrade_notice(capsys, expected=() if gatewayed else (harness,))
+    # The auto route picks across both arms, so one arm off the gateway takes
+    # it — unless the built-in judge can answer for that arm instead.
     auto = smart_routing_families(None)
-    if routable == "both":
-        check_smart_routing_available(base_url=_BASE, harnesses=auto, host_id=None)
-    else:
+    off_gateway = tuple(harness for harness in auto if local[harness] is False)
+    if off_gateway and not oss:
         with pytest.raises(ClickException, match="not AI-Gateway-backed"):
             check_smart_routing_available(base_url=_BASE, harnesses=auto, host_id=None)
+    else:
+        check_smart_routing_available(base_url=_BASE, harnesses=auto, host_id=None)
+        _assert_downgrade_notice(capsys, expected=off_gateway)
+
+
+@respx.mock
+def test_preflight_degrades_an_older_servers_missing_sources_field_to_both(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A server reporting no sources at all, but able to route, is assumed able to
+    # serve either one — so an off-gateway family downgrades instead of failing.
+    _mock_info(omit_sources=True)
+    _mock_local_gateway(monkeypatch, {"codex-native": False})
+
+    check_smart_routing_available(base_url=_BASE, harnesses=("codex-native",), host_id=None)
+
+    _assert_downgrade_notice(capsys, expected=("codex-native",))
+
+
+@respx.mock
+def test_preflight_rejects_when_neither_source_can_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Availability is the sources, not the legacy flag: with both false there is
+    # nothing to route with, whatever smart_routing_enabled claims.
+    _mock_info(enabled=True, external=False, oss=False)
+    _mock_local_gateway(monkeypatch, {"claude-native": True})
+
+    with pytest.raises(ClickException, match="no routing model configured"):
+        check_smart_routing_available(base_url=_BASE, harnesses=("claude-native",), host_id=None)
 
 
 @respx.mock

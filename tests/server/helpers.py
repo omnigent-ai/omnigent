@@ -1006,9 +1006,15 @@ class FakeRoutingClient:
 
 @dataclass
 class FakeCaps:
-    """Caps double carrying only what the routing code reads off it."""
+    """Caps double carrying only what the routing code reads off it.
+
+    ``routing_backends`` left ``None`` makes the routing seam derive the pair
+    from ``routing_client``, which classifies any non-``ExternalRoutingClient``
+    as the built-in judge — the shape most tests want.
+    """
 
     routing_client: Any = None  # type: ignore[explicit-any]
+    routing_backends: Any = None  # type: ignore[explicit-any]
     routing_settings: Any = field(default_factory=RoutingSettings)  # type: ignore[explicit-any]
 
 

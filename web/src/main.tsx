@@ -101,6 +101,7 @@ const bootProbe: Promise<ServerInfo> = Promise.race([
           public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          smart_routing_sources: { external: false, oss: false },
           harness_install_enabled: false,
           installable_harnesses: [],
           dictation_available: false,

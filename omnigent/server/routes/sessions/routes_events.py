@@ -1490,6 +1490,9 @@ def register_events_routes(
             author_attribution_required=(access.level is not None and access.level < LEVEL_OWNER),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            # Read only for the gateway-backing check that decides which router
+            # serves this turn; absent, routing keeps its default posture.
+            host_store=getattr(request.app.state, "host_store", None),
         )
         if pending_background_title is not None:
             pending_background_title.schedule()

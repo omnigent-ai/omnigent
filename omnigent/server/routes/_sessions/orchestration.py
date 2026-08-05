@@ -4123,6 +4123,7 @@ async def _forward_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     author_attribution_required: bool = False,
+    host_store: HostStore | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -4153,6 +4154,9 @@ async def _forward_event_to_runner(
         recorded on the persisted item for attribution.
     :param author_attribution_required: Whether the posting actor is a
         shared-session collaborator.
+    :param host_store: Host registrations, read only to learn whether this
+        session's harness is AI-Gateway-backed (which router may route it).
+        ``None`` reads as unknown, which counts as backed.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -4287,11 +4291,20 @@ async def _forward_event_to_runner(
     _auto_card_model: str | None = None
     _auto_card_verdict: dict[str, Any] | None = None
     if conv.harness_override == "auto" and body.type == "message":
-        from omnigent.server.smart_routing import route_session_harness
+        from omnigent.server.smart_routing import (
+            _AUTO_ROUTING_HARNESSES,
+            route_session_harness,
+        )
 
         _auto_text = _extract_user_text_for_routing(body)
         if _auto_text:
             _auto_resolved_this_turn = True
+            # The router may land this session on any auto-routing harness, so
+            # every one of them must be gateway-backed for the workspace router
+            # to serve the pick; otherwise the built-in judge does.
+            _auto_backed = _gateway_backed(
+                await _session_routing_host(conv, host_store), _AUTO_ROUTING_HARNESSES
+            )
             # For a forced-auto child, route against the parent's catalog (full
             # spawnable-worker map) rather than the child's leaf "self" catalog.
             _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
@@ -4299,6 +4312,8 @@ async def _forward_event_to_runner(
                 session_id=session_id,
                 catalog_session_id=conv.parent_conversation_id,
                 runner_client=runner_client,
+                gateway_backed=_auto_backed,
+                allow_static_fallback=_auto_backed,
             )
             try:
                 # Always clear the "auto" sentinel even when routing
@@ -4382,7 +4397,10 @@ async def _forward_event_to_runner(
                 # Child sessions: use route_session_harness to pick both harness
                 # and model, overriding whatever the orchestrator specified in
                 # sys_session_send.
-                from omnigent.server.smart_routing import route_session_harness
+                from omnigent.server.smart_routing import (
+                    AUTO_NATIVE_ROUTING_HARNESSES,
+                    route_session_harness,
+                )
 
                 # A child may only leave its parent's harness family when the
                 # parent is in Smart Routing (auto) harness mode; otherwise the
@@ -4394,6 +4412,18 @@ async def _forward_event_to_runner(
                     if auto_harness_session(conv, _parent_conv)
                     else harness_family(_resolve_harness(_parent_conv))
                 )
+                # Which families the pick may land on decides whose gateway
+                # backing must hold: a cross-harness child can go either way, a
+                # family-restricted one only where its parent already runs.
+                _child_gateway_harnesses = (
+                    AUTO_NATIVE_ROUTING_HARNESSES
+                    if _child_family is None
+                    else (_resolve_harness(_parent_conv) or "",)
+                )
+                _child_host = await _session_routing_host(conv, host_store)
+                if _child_host is None and _parent_conv is not None:
+                    _child_host = await _session_routing_host(_parent_conv, host_store)
+                _child_backed = _gateway_backed(_child_host, _child_gateway_harnesses)
                 # Route against the PARENT's catalog: it enumerates the
                 # spawnable workers (claude_code/codex/pi) with full model
                 # lists, whereas this child's own leaf catalog is "self"-only
@@ -4404,6 +4434,8 @@ async def _forward_event_to_runner(
                     catalog_session_id=conv.parent_conversation_id,
                     runner_client=runner_client,
                     allowed_family=_child_family,
+                    gateway_backed=_child_backed,
+                    allow_static_fallback=_child_backed,
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
@@ -4435,12 +4467,19 @@ async def _forward_event_to_runner(
                 from omnigent.server.smart_routing import route_turn
 
                 _harness = _resolve_harness(conv)
+                # A turn cannot change harness, so only this session's own
+                # family has to be gateway-backed for the workspace router.
+                _turn_backed = _gateway_backed(
+                    await _session_routing_host(conv, host_store), (_harness or "",)
+                )
                 _routed_model, _verdict = await route_turn(
                     _harness,
                     _user_text,
                     session_id=session_id,
                     runner_client=runner_client,
                     catalog=await _native_turn_catalog(session_id, conv, runner_client),
+                    gateway_backed=_turn_backed,
+                    allow_static_fallback=_turn_backed,
                 )
                 if _routed_model is not None:
                     # Whether the session can actually be switched onto the
@@ -4627,6 +4666,7 @@ async def _dispatch_session_event_to_runner_impl(
     author_attribution_required: bool = False,
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
+    host_store: HostStore | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -4697,6 +4737,10 @@ async def _dispatch_session_event_to_runner_impl(
     :param native_terminal_ready: A current initialization response already
         proved the terminal and forwarder ready, so the immediate duplicate
         ensure can be skipped.
+    :param host_store: Host registrations, read only to learn whether this
+        session's harness is AI-Gateway-backed (which router may route it).
+        ``None`` reads as unknown, which counts as backed — the same posture
+        an older host row gets.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -4771,12 +4815,20 @@ async def _dispatch_session_event_to_runner_impl(
             _user_text = _extract_user_text_for_routing(body)
             if _user_text:
                 _native_runner_client = await _get_runner_client(session_id, runner_router)
+                # This pane's own family decides which router can serve it: off
+                # the gateway the built-in judge routes off the pane's picker
+                # vocabulary, which is the only reachable candidate set anyway.
+                _native_backed = _gateway_backed(
+                    await _session_routing_host(conv, host_store), (_harness or "",)
+                )
                 _native_routed_model, _native_verdict = await route_turn(
                     _harness,
                     _user_text,
                     session_id=session_id,
                     runner_client=_native_runner_client,
                     catalog=await _native_turn_catalog(session_id, conv, _native_runner_client),
+                    gateway_backed=_native_backed,
+                    allow_static_fallback=_native_backed,
                 )
                 if _native_routed_model is not None:
                     # A pane that already took a routed turn can only be moved
@@ -4875,6 +4927,7 @@ async def _dispatch_session_event_to_runner_impl(
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
         author_attribution_required=author_attribution_required,
+        host_store=host_store,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -6070,10 +6123,11 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
 def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -> list[str]:
     """Which of *harnesses* this host does not back with the workspace AI gateway.
 
-    Routing rewrites the launch model to a gateway catalog id, so a CLI pointed
-    at Bedrock, a personal subscription, or any other provider cannot run the
-    pick even with the binary installed. Reads the host's ``gateway_inference``
-    map; unknown (an older host, or none bound) keeps every option.
+    The external router's picks are gateway catalog ids, so a CLI pointed at
+    Bedrock, a personal subscription, or any other provider cannot run one even
+    with the binary installed — those harnesses are served by the built-in judge
+    instead. Reads the host's ``gateway_inference`` map; unknown (an older host,
+    or none bound) counts as backed.
 
     :param host: The session's target host, or ``None`` (e.g. a sandbox).
     :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
@@ -6083,6 +6137,77 @@ def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -
 
     gateway = getattr(host, "gateway_inference", None) if host is not None else None
     return not_gateway_backed(gateway, harnesses)
+
+
+def _gateway_backed(host: Host | None, harnesses: Sequence[str]) -> bool:
+    """Whether the external router can serve a call over *harnesses* on *host*.
+
+    :param host: The session's target host, or ``None``.
+    :param harnesses: Every harness family the call may land on.
+    :returns: ``True`` unless the host explicitly reports one as not backed.
+    """
+    return not _ungatewayed_native_harnesses(host, harnesses)
+
+
+def _oss_routing_available(caps: Any = None) -> bool:  # type: ignore[explicit-any]
+    """Whether the built-in judge can answer for a harness off the gateway.
+
+    The fallback source: with it configured, an ungatewayed pane still routes
+    (with a smaller candidate set), so the refusals below only fire when this
+    is unavailable too.
+
+    :param caps: A ``RuntimeCaps``-shaped object. ``None`` reads the globals.
+    :returns: ``True`` when a built-in routing client is configured.
+    """
+    from omnigent.server.routing_backend import backends_from_caps
+
+    if caps is None:
+        try:
+            from omnigent.runtime._globals import _caps
+        except ImportError:
+            return False
+        caps = _caps
+    return backends_from_caps(caps).local is not None
+
+
+async def _session_routing_host(
+    conv: Conversation,
+    host_store: HostStore | None,
+) -> Host | None:
+    """Read the host a live session is bound to, for the gateway-backing check.
+
+    Never raises and never blocks the turn: no host store, no ``host_id``, or a
+    store error all read as "unknown", which counts as gateway-backed.
+
+    :param conv: The session row.
+    :param host_store: Persistent host registrations, or ``None``.
+    :returns: The host row, or ``None`` when it cannot be read.
+    """
+    if host_store is None or conv.host_id is None:
+        return None
+    try:
+        return await asyncio.to_thread(host_store.get_host, conv.host_id)
+    except Exception:  # noqa: BLE001 — an unreadable host row is just unknown
+        _logger.debug(
+            "routing: could not read host %r for session=%s", conv.host_id, conv.id, exc_info=True
+        )
+        return None
+
+
+async def _spawn_gateway_backed(
+    request: Request,
+    conv: Conversation,
+    harnesses: Sequence[str],
+) -> bool:
+    """Whether the workspace router can serve a spawn over *harnesses*.
+
+    :param request: Used to reach the app's host store.
+    :param conv: The parent session row.
+    :param harnesses: Every harness family the spawn may land on.
+    :returns: ``True`` unless the host explicitly reports one as not backed.
+    """
+    host_store = getattr(request.app.state, "host_store", None)
+    return _gateway_backed(await _session_routing_host(conv, host_store), harnesses)
 
 
 def _harness_labels(harnesses: Sequence[str]) -> str:
@@ -6101,38 +6226,41 @@ def _harness_labels(harnesses: Sequence[str]) -> str:
 
 
 def _ungatewayed_auto_routing_error(ungatewayed: Sequence[str]) -> str:
-    """Message for a top-level Smart Routing create the gateway cannot back.
+    """Message for a top-level Smart Routing create no router can serve.
 
-    Both arms are on the menu, so one arm off the gateway takes the whole
-    top-level pick away — the router would be free to land the session on a
-    pane that cannot run its own routed model.
+    Both arms are on the menu, so one arm off the gateway takes the AI Gateway's
+    router off the table for the whole pick. That is only fatal when the server
+    has no built-in router either — otherwise the built-in one answers.
 
     :param ungatewayed: The arms the host does not back, e.g.
         ``["codex-native"]``.
     :returns: One sentence naming the arms and the way out.
     """
-    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
-
     verb = "is" if len(ungatewayed) == 1 else "are"
     return (
-        f"Smart Routing needs {_harness_labels(AUTO_NATIVE_ROUTING_HARNESSES)} on the "
-        f"workspace AI Gateway: {_harness_labels(ungatewayed)} {verb} not AI-Gateway-backed "
-        "on this host, so a routed model would not be reachable. Pick a harness directly, "
-        "or point it at the workspace AI Gateway (`omnigent configure harnesses`)."
+        f"Smart Routing has no router available on this host: {_harness_labels(ungatewayed)} "
+        f"{verb} not AI-Gateway-backed, so the workspace router's picks would not be "
+        "reachable, and this server has no built-in routing model to fall back on. Pick a "
+        "harness directly, configure a server `llm:` block, or point the harness at the "
+        "workspace AI Gateway (`omnigent configure harnesses`)."
     )
 
 
 def _ungatewayed_model_routing_error(harness: str) -> str:
-    """Message for a routing-on create whose own harness is off the gateway.
+    """Message for a routing-on create no router can serve.
+
+    Only reached when the harness is off the AI Gateway AND the server has no
+    built-in routing model — either one alone still routes.
 
     :param harness: The session's native harness, e.g. ``"codex-native"``.
     :returns: One sentence naming the harness and the way out.
     """
     return (
-        f"Smart Routing is unavailable for {harness} on this host: "
-        f"{_harness_labels([harness])} is not backed by the AI Gateway, so a routed model "
-        "would not be reachable from the pane. Create the session without "
-        'cost_control_mode_override="on", or point the harness at the workspace AI Gateway '
+        f"Smart Routing has no router available for {harness} on this host: "
+        f"{_harness_labels([harness])} is not AI-Gateway-backed, so the workspace router's "
+        "picks would not be reachable from the pane, and this server has no built-in routing "
+        'model to fall back on. Create the session without cost_control_mode_override="on", '
+        "configure a server `llm:` block, or point the harness at the workspace AI Gateway "
         "(`omnigent configure harnesses`)."
     )
 
@@ -6144,12 +6272,12 @@ async def _reject_ungatewayed_model_routing(
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> None:
-    """Reject a routing-on create pinned to a harness the gateway cannot back.
+    """Reject a routing-on create no router can serve.
 
-    Smart Routing as a Model choice only exists on the two native panes, and it
-    is applied by rewriting their launch/turn model to a gateway catalog id. A
-    caller who asks for it on a pane running off a personal subscription gets a
-    clear error rather than a session whose routing silently never applies.
+    A pane off the AI Gateway cannot run the workspace router's picks, but the
+    built-in judge names models from the pane's own catalog, so it can. This
+    only refuses when neither source is available — otherwise the create
+    proceeds and the built-in judge answers.
 
     Children and sub-agent sessions are routed by the spawn/turn paths in their
     parent's family, so they are left to those gates.
@@ -6160,7 +6288,8 @@ async def _reject_ungatewayed_model_routing(
     :param agent: The bound agent row.
     :param agent_cache: Cache for loading the agent's parsed spec.
     :returns: None when the create may proceed.
-    :raises OmnigentError: 400 when the harness is not AI-Gateway-backed.
+    :raises OmnigentError: 400 when the harness is not AI-Gateway-backed AND
+        the server has no built-in routing model to fall back on.
     :raises HTTPException: 404/403 from resolving ``body.host_id``.
     """
     from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
@@ -6173,6 +6302,10 @@ async def _reject_ungatewayed_model_routing(
         _create_resolved_harness, agent, body.harness_override, agent_cache
     )
     if harness not in AUTO_NATIVE_ROUTING_HARNESSES:
+        return
+    # The built-in judge routes off the pane's own catalog, so it reaches an
+    # ungatewayed harness the workspace router cannot. Check it before refusing.
+    if _oss_routing_available():
         return
     host = await _routing_host_for_create(body, request, user_id)
     if not _ungatewayed_native_harnesses(host, (harness,)):
@@ -6445,10 +6578,16 @@ async def _resolve_fixed_native_model_routing(
     from omnigent.server.smart_routing import models_in_family, route_session_harness
 
     host = await _routing_host_for_create(body, request, user_id)
+    # Off the gateway the built-in judge answers, and the static table's
+    # ``databricks-*`` ids are unreachable — the host's pre-launch catalog is the
+    # only provider-accurate candidate source.
+    backed = _gateway_backed(host, (harness,))
     _harness, model, verdict, error = await route_session_harness(
         body.smart_routing_message or "",
         harness_candidates=(harness,),
         catalog=await _pre_session_model_catalog(request, host, (harness,)),
+        gateway_backed=backed,
+        allow_static_fallback=backed,
     )
     if model is None or verdict is None:
         return None, None, error or "Routing unavailable; using the harness default model."
@@ -6503,12 +6642,15 @@ async def _resolve_native_smart_routing(
     from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES, route_session_harness
 
     host = await _routing_host_for_create(body, request, user_id)
-    # Both arms must be gateway-backed before the router may choose between
-    # them: an arm off the gateway cannot run a routed model, and the pick is
-    # made after the create commits, so there is no safe half-menu.
+    # Both arms must be gateway-backed before the WORKSPACE router may choose
+    # between them: an arm off the gateway cannot run its picks, and the pick is
+    # made after the create commits, so there is no safe half-menu. That only
+    # ends the create when the built-in judge is unavailable too — it names
+    # models from each arm's own pre-launch catalog, which every arm can run.
     ungatewayed = _ungatewayed_native_harnesses(host, AUTO_NATIVE_ROUTING_HARNESSES)
-    if ungatewayed:
+    if ungatewayed and not _oss_routing_available():
         return None, None, None, _ungatewayed_auto_routing_error(ungatewayed)
+    backed = not ungatewayed
     installed = _installed_native_harnesses(host)
     if not installed:
         return None, None, None, "No native CLI is installed on this host."
@@ -6517,6 +6659,8 @@ async def _resolve_native_smart_routing(
         body.smart_routing_message or "",
         harness_candidates=installed,
         catalog=await _pre_session_model_catalog(request, host, installed),
+        gateway_backed=backed,
+        allow_static_fallback=backed,
     )
     native_agent = native_coding_agent_for_harness(harness) if harness is not None else None
     if native_agent is None:
@@ -7188,6 +7332,7 @@ async def _create_session_from_existing_agent(
                     artifact_store=artifact_store,
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
+                    host_store=getattr(request.app.state, "host_store", None),
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule()
@@ -8196,6 +8341,7 @@ __all__ = [
     "_forward_event_to_runner",
     "_forward_native_subagent_terminal_failure",
     "_forward_native_terminal_message",
+    "_gateway_backed",
     "_get_session_snapshot",
     "_handle_mcp_tools_call",
     "_heal_subagent_runner_binding_via_parent",
@@ -8228,6 +8374,7 @@ __all__ = [
     "_run_managed_wake",
     "_schedule_deferred_elicitation_clear",
     "_spawn_archive_stop",
+    "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
     "_wait_for_host_bound_runner_client",

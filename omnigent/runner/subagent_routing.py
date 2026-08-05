@@ -47,7 +47,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -252,6 +252,9 @@ class SubagentRouteDecision:
     :param rationale: One-line explanation, surfaced to the model and UI.
     :param decision_id: Identity shared by the response and the transcript
         item.
+    :param router_source: Which router answered — ``"databricks-aigw"`` or
+        ``"oss-llm"``. ``None`` when nothing was routed (a fail-open allow) or
+        on a payload written before the field existed.
     """
 
     action: Literal["allow", "rewrite", "redirect", "deny"]
@@ -260,6 +263,7 @@ class SubagentRouteDecision:
     harness: str | None = None
     raw_model: str | None = None
     decision_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    router_source: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize to the frozen response shape.
@@ -273,6 +277,7 @@ class SubagentRouteDecision:
             "raw_model": self.raw_model,
             "rationale": self.rationale,
             "decision_id": self.decision_id,
+            "router_source": self.router_source,
         }
 
     @classmethod
@@ -294,6 +299,7 @@ class SubagentRouteDecision:
             harness=_opt_str(payload.get("harness")),
             raw_model=_opt_str(payload.get("raw_model")),
             decision_id=decision_id if isinstance(decision_id, str) else str(uuid.uuid4()),
+            router_source=_opt_str(payload.get("router_source")),
         )
 
 
@@ -326,6 +332,7 @@ def decision_record(
         agent=req.task_name or None,
         scope=_SCOPE,
         attempted_override=attempted,
+        router_source=decision.router_source,
     )
 
 
@@ -406,6 +413,7 @@ def candidate_models(
     *,
     cross_harness: bool = False,
     catalog: Mapping[str, list[str]] | None = None,
+    allow_static_fallback: bool = True,
 ) -> dict[str, list[str]]:
     """Build the harness → models map offered to the router.
 
@@ -423,6 +431,10 @@ def candidate_models(
         over the static table so a model generation the workspace serves today
         isn't treated as unservable; the static table fills any harness the
         catalog has no row for.
+    :param allow_static_fallback: Whether the static :func:`infer_models` table
+        may fill a harness the catalog has no row for. Off the AI Gateway it may
+        not: every id in that table is a ``databricks-*`` endpoint the spawn
+        could not reach, so the catalog is the only provider-accurate source.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
     from omnigent.server.smart_routing import (
@@ -436,9 +448,11 @@ def candidate_models(
     for candidate in offered:
         if candidate is None or candidate in result:
             continue
-        models = catalog_models_for_harness(
+        from_catalog = catalog_models_for_harness(
             catalog, candidate, allow_self=candidate == harness
-        ) or infer_models(candidate)
+        )
+        static = infer_models(candidate) if allow_static_fallback else None
+        models = from_catalog or static or []
         # A catalog row can hold models the harness cannot speak (a codex
         # ``"self"`` row lists Claude ids too), which earn a hard
         # ``model_family_mismatch`` at dispatch.
@@ -532,6 +546,8 @@ async def resolve_subagent_route(
     available_models: dict[str, list[str]] | None = None,
     catalog: Mapping[str, list[str]] | None = None,
     cross_harness: bool = False,
+    gateway_backed: bool = True,
+    allow_static_fallback: bool = True,
     persist: Callable[[RoutingDecisionData], Awaitable[None]] | None = None,
 ) -> SubagentRouteDecision:
     """Decide what happens to one native-subagent spawn.
@@ -548,6 +564,12 @@ async def resolve_subagent_route(
     :param cross_harness: ``True`` when the session may move a subagent to
         the counterpart harness family (auto-harness sessions only).
         Ignored when *available_models* is given.
+    :param gateway_backed: Whether every harness family on offer resolves
+        AI-Gateway-backed inference on the parent's host. ``False`` takes the
+        external router out of play and the built-in judge answers instead.
+    :param allow_static_fallback: Whether the static :func:`infer_models` table
+        may supply candidates. Callers pass ``gateway_backed``: off the gateway
+        its ``databricks-*`` ids are unreachable from the spawn.
     :param persist: Coroutine that records the decision in the
         transcript. ``None`` skips persistence (unit tests, dry runs).
     :returns: The verdict the hook script enforces.
@@ -557,7 +579,16 @@ async def resolve_subagent_route(
 
         caps = get_caps()
 
-    decision = await _decide(session_id, req, caps, available_models, catalog, cross_harness)
+    decision = await _decide(
+        session_id,
+        req,
+        caps,
+        available_models,
+        catalog,
+        cross_harness,
+        gateway_backed=gateway_backed,
+        allow_static_fallback=allow_static_fallback,
+    )
     if persist is not None:
         try:
             await persist(decision_record(req, decision))
@@ -573,6 +604,9 @@ async def _decide(
     available_models: dict[str, list[str]] | None,
     catalog: Mapping[str, list[str]] | None,
     cross_harness: bool,
+    *,
+    gateway_backed: bool = True,
+    allow_static_fallback: bool = True,
 ) -> SubagentRouteDecision:
     if req.fork:
         return SubagentRouteDecision(
@@ -590,14 +624,22 @@ async def _decide(
     # ``raw_model`` / ``applied`` stay truthful to whatever the router picks.
     task = _routing_task(req)
 
-    client = getattr(caps, "routing_client", None)
-    if client is None:
+    from omnigent.server.routing_backend import backends_from_caps, select_router
+
+    router = select_router(backends_from_caps(caps), gateway_backed=gateway_backed)
+    if router is None:
         return _unavailable_decision("no routing client configured")
+    client = router.client
 
     candidates = (
         available_models
         if available_models is not None
-        else candidate_models(req.harness, cross_harness=cross_harness, catalog=catalog)
+        else candidate_models(
+            req.harness,
+            cross_harness=cross_harness,
+            catalog=catalog,
+            allow_static_fallback=allow_static_fallback,
+        )
     )
     if not candidates:
         return _unavailable_decision(f"no candidate models for harness {req.harness}")
@@ -618,7 +660,7 @@ async def _decide(
         detail = _opt_str(getattr(client, "last_error", None)) or "router returned no verdict"
         return _unavailable_decision(detail)
 
-    return _decision_from_result(req, result, candidates)
+    return replace(_decision_from_result(req, result, candidates), router_source=router.source)
 
 
 def _requested_match(req: SubagentRouteRequest, model: str | None) -> bool:

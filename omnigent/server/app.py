@@ -1691,7 +1691,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | None]:
+    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1782,14 +1782,30 @@ def create_app(
         # routing.provider=external block) or the managed deployment registered
         # a policy_llm_connection_factory (which means it has LLM capability
         # and will supply its own RoutingClient).
+        # smart_routing_sources names WHICH router can answer: "external" is the
+        # workspace AI-Gateway task_v1 client, "oss" the built-in judge. A
+        # harness whose inference is not gateway-backed can only be served by
+        # the built-in one, so the SPA and the CLI read this to pick a source
+        # instead of hiding the surface.
         try:
             from omnigent.runtime._globals import _caps
 
             smart_routing_enabled = _caps is not None and (
                 _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
             )
+            from omnigent.server.routing_backend import backends_from_caps
+
+            _routing_backends = backends_from_caps(_caps)
+            smart_routing_sources = {
+                "external": _routing_backends.external is not None,
+                # The managed factory means LLM capability and a client supplied
+                # later — the same branch smart_routing_enabled honours.
+                "oss": _routing_backends.local is not None
+                or (_caps is not None and _caps.policy_llm_connection_factory is not None),
+            }
         except ImportError:
             smart_routing_enabled = False
+            smart_routing_sources = {"external": False, "oss": False}
         # harness_install_enabled gates the web UI's "Install" action for a
         # missing, npm-installable harness on a connected host. Off by default
         # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
@@ -1830,6 +1846,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "smart_routing_sources": smart_routing_sources,
             "harness_install_enabled": harness_install_enabled,
             "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,

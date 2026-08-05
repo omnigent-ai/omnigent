@@ -184,6 +184,98 @@ async def test_info_smart_routing_enabled_tracks_the_servers_routing_capability(
     assert resp.json()["smart_routing_enabled"] is expected
 
 
+# ── GET /v1/info: smart_routing_sources ──────────────────
+#
+# Which router can answer, not whether routing exists. A harness whose inference
+# is not AI-Gateway-backed can only be served by the built-in judge, so the SPA
+# and the CLI read this to pick a source instead of hiding the surface.
+# ``smart_routing_enabled`` is unchanged and stays the "is routing configured at
+# all" answer.
+
+
+def _external_client() -> object:
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    return ExternalRoutingClient(base_url="https://ws.example.invalid", router_name="task_v1")
+
+
+def _sources_caps(*, external: bool, local: bool, factory: bool) -> object:
+    from omnigent.server.routing_backend import RoutingBackends
+
+    backends = RoutingBackends(
+        external=_external_client() if external else None,
+        local=object() if local else None,
+    )
+    return SimpleNamespace(
+        routing_client=backends.any(),
+        routing_backends=backends,
+        policy_llm_connection_factory=(lambda: None) if factory else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("caps", "expected"),
+    [
+        # Nothing configured at all.
+        (
+            _sources_caps(external=False, local=False, factory=False),
+            {"external": False, "oss": False},
+        ),
+        # The workspace AI Gateway alone: no fallback for an ungatewayed harness.
+        (
+            _sources_caps(external=True, local=False, factory=False),
+            {"external": True, "oss": False},
+        ),
+        # The built-in judge alone.
+        (
+            _sources_caps(external=False, local=True, factory=False),
+            {"external": False, "oss": True},
+        ),
+        # Both — the normal Databricks posture, and the only one that can serve
+        # a gateway-backed AND an ungatewayed harness.
+        (_sources_caps(external=True, local=True, factory=False), {"external": True, "oss": True}),
+        # A managed deployment supplies its own client from the factory; that
+        # counts as an OSS source, exactly as smart_routing_enabled treats it.
+        (
+            _sources_caps(external=False, local=False, factory=True),
+            {"external": False, "oss": True},
+        ),
+    ],
+)
+async def test_info_reports_which_routers_can_answer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caps: object,
+    expected: dict[str, bool],
+) -> None:
+    monkeypatch.setattr("omnigent.runtime._globals._caps", caps, raising=False)
+
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["smart_routing_sources"] == expected
+
+
+async def test_info_classifies_a_legacy_single_routing_client_as_the_oss_judge(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``routing_backends`` derives the pair from ``routing_client`` by type."""
+    monkeypatch.setattr(
+        "omnigent.runtime._globals._caps",
+        SimpleNamespace(
+            routing_client=object(),
+            routing_backends=None,
+            policy_llm_connection_factory=None,
+        ),
+        raising=False,
+    )
+
+    resp = await client.get("/v1/info")
+    data = resp.json()
+    assert data["smart_routing_enabled"] is True
+    assert data["smart_routing_sources"] == {"external": False, "oss": True}
+
+
 # ── GET /v1/me ───────────────────────────────────────────
 
 

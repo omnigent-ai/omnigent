@@ -714,6 +714,11 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    // Default stub: the external AI-Gateway router alone, which is the world the
+    // gateway-gating cases below were written against (off-gateway family → no
+    // routing). Cases that exercise the built-in judge pass the field
+    // explicitly.
+    smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -3204,6 +3209,61 @@ describe("NewChatLandingScreen smart routing", () => {
     },
   );
 
+  // The gateway only gates the EXTERNAL router. With the built-in judge
+  // configured it answers for the off-gateway family instead, so the option the
+  // cases above hid comes back.
+  it.each([
+    ["Claude Code", "a1", { "claude-native": false }],
+    ["Codex", "a2", { "codex-native": false }],
+  ] as const)(
+    "%s Model dropdown offers Smart Routing off the gateway when the built-in judge can answer",
+    (_label, agentId, gateway) => {
+      mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+      renderLanding({
+        smart_routing_enabled: true,
+        smart_routing_sources: { external: true, oss: true },
+      });
+      openAgentConfig(agentId);
+      openSelect("new-chat-landing-config-model");
+      expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
+    },
+  );
+
+  // No external router at all: the judge alone still routes both families,
+  // gateway backing or not.
+  it.each([
+    ["a family the host keeps off the gateway", { "claude-native": false }],
+    ["a host that reports nothing", undefined],
+  ] as const)("offers Smart Routing from the built-in judge alone with %s", (_case, gateway) => {
+    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: false, oss: true },
+    });
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
+  });
+
+  // Neither source can answer, so the option goes even on a gateway-backed
+  // host — the row follows the sources, not the gateway map.
+  it("offers no Smart Routing when the server reports neither source", () => {
+    mockHosts([
+      {
+        ...host("online"),
+        gateway_inference: { "claude-native": true, "codex-native": true },
+      } as Host,
+    ]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: false, oss: false },
+    });
+    openAgentConfig("a1");
+    openSelect("new-chat-landing-config-model");
+    expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
+    expect(screen.getByRole("option", { name: "Opus 4.8" })).toBeTruthy();
+  });
+
   it("offers Smart Routing on a host that reports no gateway_inference at all", () => {
     // Older host / server: unknown must not gate the option away.
     renderLanding({ smart_routing_enabled: true });
@@ -3650,6 +3710,31 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     openPicker();
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
   });
+
+  // The gateway is the EXTERNAL router's requirement. With the built-in judge
+  // configured it covers the off-gateway arm, so the row the cases above hid
+  // stays — including with no external router at all.
+  it.each([
+    ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }, true],
+    ["claude isn't gateway-backed", { "claude-native": false, "codex-native": true }, true],
+    ["neither is gateway-backed", { "claude-native": false, "codex-native": false }, true],
+    [
+      "neither is gateway-backed and there's no external router",
+      { "claude-native": false, "codex-native": false },
+      false,
+    ],
+  ] as const)(
+    "keeps the row when the built-in judge can answer and %s",
+    (_case, gateway, external) => {
+      mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+      renderLanding({
+        smart_routing_enabled: true,
+        smart_routing_sources: { external, oss: true },
+      });
+      openPicker();
+      expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
+    },
+  );
 
   it("announces the gateway as the cause when a host switch takes the row away", async () => {
     mockHosts([
@@ -4151,6 +4236,45 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     openAgentConfig("ag_debby");
     openSelect("new-chat-landing-config-harness");
     expect(screen.getByTestId("new-chat-landing-harness-auto")).toBeTruthy();
+  });
+
+  // The split-credential states — one family on the workspace gateway, the other
+  // on a personal subscription. The external router can't reach the off-gateway
+  // arm, but the built-in judge can, so the fully-auto brain survives both.
+  it.each([
+    ["codex is off the gateway", { "claude-native": true, "codex-native": false }],
+    ["claude is off the gateway", { "claude-native": false, "codex-native": true }],
+  ])(
+    "keeps the Smart Routing brain when %s and the built-in judge can answer",
+    (_case, gateway) => {
+      mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+      renderLanding({
+        smart_routing_enabled: true,
+        smart_routing_sources: { external: true, oss: true },
+      });
+      openAgentConfig("ag_debby");
+      openSelect("new-chat-landing-config-harness");
+      expect(screen.getByTestId("new-chat-landing-harness-auto")).toBeTruthy();
+    },
+  );
+
+  // Sources decide, not the gateway map: with neither router configured the
+  // fully-auto brain goes even on a fully gateway-backed host.
+  it("offers no Smart Routing brain when the server reports neither source", () => {
+    mockHosts([
+      {
+        ...host("online"),
+        gateway_inference: { "claude-native": true, "codex-native": true },
+      } as Host,
+    ]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: false, oss: false },
+    });
+    openAgentConfig("ag_debby");
+    openSelect("new-chat-landing-config-harness");
+    expect(screen.queryByTestId("new-chat-landing-harness-auto")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-harness-claude-sdk")).toBeTruthy();
   });
 
   it.each(BOTH_BUNDLES)(

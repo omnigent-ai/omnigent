@@ -124,6 +124,7 @@ import {
   SMART_ROUTING_ARMS,
   hostBacksHarnessWithGateway,
   smartRoutingDroppedMessage,
+  smartRoutingSourceFor,
   smartRoutingUnavailableReason,
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
@@ -1891,6 +1892,12 @@ export function NewChatLandingScreen() {
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
+  // Which router can answer a pick. The external AI-Gateway router only covers
+  // a family the host runs through the gateway; the built-in judge covers any
+  // family. Read once here and reused by every routing gate below. "loading"
+  // reads as neither, so no routing surface flashes in before the probe lands.
+  const externalRoutingConfigured = info !== "loading" && info.smart_routing_sources.external;
+  const ossRoutingConfigured = info !== "loading" && info.smart_routing_sources.oss;
   // Gates the whole UI-driven setup experience (Set up affordance + dialog +
   // collapsed badge). OFF → the composer/picker fall back to the original
   // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
@@ -2392,15 +2399,20 @@ export function NewChatLandingScreen() {
   // whose running CLI accepts a per-turn model switch (the server injects
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
   // via the fully-auto harness instead, which picks harness + model up front.
-  // Each family gates on its OWN inference: the apply layer rewrites the model
-  // through the workspace AI gateway, so a host whose Claude Code runs off
-  // something else can still offer routing on Codex, and vice versa.
+  // Each family gates on its OWN source: the external router's apply layer
+  // rewrites the model through the workspace AI gateway, so a host whose Claude
+  // Code runs off something else falls back to the built-in judge for that
+  // family instead of losing the row — and loses it only when neither router
+  // can answer.
   const smartRoutingEligible =
     smartRoutingEnabled &&
-    ((selectedNativeHarness === "claude-native" &&
-      hostBacksHarnessWithGateway(harnessWarningHost, "claude-native")) ||
-      (selectedNativeHarness === "codex-native" &&
-        hostBacksHarnessWithGateway(harnessWarningHost, "codex-native")));
+    selectedNativeHarness !== null &&
+    SMART_ROUTING_ARMS.some((harness) => harness === selectedNativeHarness) &&
+    smartRoutingSourceFor({
+      externalConfigured: externalRoutingConfigured,
+      ossConfigured: ossRoutingConfigured,
+      gatewayBacked: hostBacksHarnessWithGateway(harnessWarningHost, selectedNativeHarness),
+    }) !== null;
   // Top-level Smart Routing (the "Harnesses" row, no bundle agent): the router
   // picks native Claude Code or Codex per task. It rides a placeholder wrapper
   // agent for the create call, so the pick lives in pickedHarness alone.
@@ -2668,29 +2680,37 @@ export function NewChatLandingScreen() {
           harnessUnconfiguredOnHost(harness, harnessWarningHost),
         ),
         // The five-arm menu the top-level row drives needs BOTH families on the
-        // gateway, so either one the host doesn't back takes the row away.
+        // gateway for the external router, so either one the host doesn't back
+        // takes the row away — unless the built-in judge can route it instead.
         notGatewayBackedHarnesses: SMART_ROUTING_ARMS.filter(
           (harness) => !hostBacksHarnessWithGateway(harnessWarningHost, harness),
         ),
+        ossRoutingAvailable: ossRoutingConfigured,
       }),
-    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost],
+    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, ossRoutingConfigured],
   );
   const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
-  // The fully-auto brain needs both model families on the workspace AI
-  // gateway — the router may land the session's work on either, and an arm
-  // running off a personal subscription cannot run a routed pick. Gateway
-  // backing ONLY: unlike the top-level row, the bundle brain routes across
-  // SDK harnesses, so the native wrappers/CLIs are deliberately not required
-  // here. Gates the OPTIONS map only — membership checks and the summary
-  // label for an existing pick keep reading `brainHarnessLabelsAll`.
-  const brainGatewayBacked = SMART_ROUTING_ARMS.every((harness) =>
-    hostBacksHarnessWithGateway(harnessWarningHost, harness),
+  // The fully-auto brain needs SOME router able to answer for both model
+  // families — the router may land the session's work on either, and an arm the
+  // external router can't reach (off the workspace AI gateway) is only a loss
+  // when the built-in judge can't cover it either. Source availability ONLY:
+  // unlike the top-level row, the bundle brain routes across SDK harnesses, so
+  // the native wrappers/CLIs are deliberately not required here. Gates the
+  // OPTIONS map only — membership checks and the summary label for an existing
+  // pick keep reading `brainHarnessLabelsAll`.
+  const brainRoutable = SMART_ROUTING_ARMS.every(
+    (harness) =>
+      smartRoutingSourceFor({
+        externalConfigured: externalRoutingConfigured,
+        ossConfigured: ossRoutingConfigured,
+        gatewayBacked: hostBacksHarnessWithGateway(harnessWarningHost, harness),
+      }) !== null,
   );
   const brainHarnessLabels = useMemo(() => {
-    if (brainGatewayBacked) return brainHarnessLabelsAll;
+    if (brainRoutable) return brainHarnessLabelsAll;
     const { [AUTO_HARNESS_ID]: _dropped, ...rest } = brainHarnessLabelsAll;
     return rest;
-  }, [brainHarnessLabelsAll, brainGatewayBacked]);
+  }, [brainHarnessLabelsAll, brainRoutable]);
   // Whether we know enough to judge availability: before the agent list, the
   // server flags, and the target (host or sandbox) land, "unavailable" only
   // means "not loaded yet". The target matters as much as the rest — with no

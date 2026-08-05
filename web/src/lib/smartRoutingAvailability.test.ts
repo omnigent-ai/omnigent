@@ -3,6 +3,7 @@ import {
   SMART_ROUTING_ARMS,
   hostBacksHarnessWithGateway,
   smartRoutingDroppedMessage,
+  smartRoutingSourceFor,
   smartRoutingUnavailableReason,
 } from "./smartRoutingAvailability";
 
@@ -59,6 +60,65 @@ describe("smartRoutingUnavailableReason", () => {
     ).toEqual({ kind: "not-gateway-backed", harnesses: ["codex-native"] });
   });
 
+  // Off the gateway is only a loss for the external router. With the built-in
+  // judge configured it answers for that arm instead, so routing proceeds.
+  it("is null for an off-gateway arm when the built-in judge can answer", () => {
+    expect(
+      smartRoutingUnavailableReason({
+        routingEnabled: true,
+        wrappersRegistered: true,
+        unreadyHarnesses: [],
+        notGatewayBackedHarnesses: SMART_ROUTING_ARMS,
+        ossRoutingAvailable: true,
+      }),
+    ).toBeNull();
+  });
+
+  // Omitting the field keeps the pre-source behaviour, and an explicit false
+  // reads the same — only the judge being available lifts the cause.
+  it.each([
+    [undefined, { kind: "not-gateway-backed", harnesses: ["codex-native"] }],
+    [false, { kind: "not-gateway-backed", harnesses: ["codex-native"] }],
+    [true, null],
+  ] as const)("ossRoutingAvailable %s yields %j", (ossRoutingAvailable, expected) => {
+    expect(
+      smartRoutingUnavailableReason({
+        routingEnabled: true,
+        wrappersRegistered: true,
+        unreadyHarnesses: [],
+        notGatewayBackedHarnesses: ["codex-native"],
+        ...(ossRoutingAvailable === undefined ? {} : { ossRoutingAvailable }),
+      }),
+    ).toEqual(expected);
+  });
+
+  // The judge lifts only the gateway cause; the more fundamental ones stand.
+  it.each([
+    [
+      "routing is off",
+      { routingEnabled: false, wrappersRegistered: true, unreadyHarnesses: [] },
+      { kind: "routing-disabled" },
+    ],
+    [
+      "a wrapper agent is missing",
+      { routingEnabled: true, wrappersRegistered: false, unreadyHarnesses: [] },
+      { kind: "wrappers-missing" },
+    ],
+    [
+      "an arm isn't ready",
+      { routingEnabled: true, wrappersRegistered: true, unreadyHarnesses: ["claude-native"] },
+      { kind: "harnesses-unready", harnesses: ["claude-native"] },
+    ],
+  ] as const)("still reports %s with the judge available", (_case, inputs, expected) => {
+    expect(
+      smartRoutingUnavailableReason({
+        ...inputs,
+        notGatewayBackedHarnesses: ["codex-native"],
+        ossRoutingAvailable: true,
+      }),
+    ).toEqual(expected);
+  });
+
   // An arm that isn't installed can't have an inference config to judge, so
   // "set up the CLI" is the actionable line.
   it("reports an unready arm ahead of a non-gateway-backed one", () => {
@@ -88,6 +148,29 @@ describe("smartRoutingUnavailableReason", () => {
     expect(smartRoutingUnavailableReason({ ...inputs, notGatewayBackedHarnesses: [] })).toBeNull();
     expect(smartRoutingUnavailableReason(inputs)).toBeNull();
   });
+});
+
+describe("smartRoutingSourceFor", () => {
+  // The full truth table of the three booleans. The external AI-Gateway router
+  // wins whenever it can answer (the family is on the gateway); the built-in
+  // judge is the fallback and needs no gateway backing at all.
+  it.each([
+    [true, true, true, "databricks-aigw"],
+    [true, false, true, "databricks-aigw"],
+    [true, true, false, "oss-llm"],
+    [true, false, false, null],
+    [false, true, true, "oss-llm"],
+    [false, true, false, "oss-llm"],
+    [false, false, true, null],
+    [false, false, false, null],
+  ] as const)(
+    "external %s + oss %s + gatewayBacked %s routes via %s",
+    (externalConfigured, ossConfigured, gatewayBacked, expected) => {
+      expect(smartRoutingSourceFor({ externalConfigured, ossConfigured, gatewayBacked })).toBe(
+        expected,
+      );
+    },
+  );
 });
 
 describe("hostBacksHarnessWithGateway", () => {

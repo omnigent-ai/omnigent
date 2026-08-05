@@ -17,6 +17,7 @@ describe("routingExtrasFromWire", () => {
         decision_id: "dec_1",
         raw_model: "gpt-5-6-sol",
         attempted_override: "databricks-claude-opus-4-8",
+        router_source: "databricks-aigw",
       }),
     ).toEqual({
       harness: "codex-native",
@@ -24,7 +25,26 @@ describe("routingExtrasFromWire", () => {
       decisionId: "dec_1",
       rawModel: "gpt-5-6-sol",
       attemptedOverride: "databricks-claude-opus-4-8",
+      routerSource: "databricks-aigw",
     });
+  });
+
+  // Kept a plain string on purpose: a source this build has never heard of must
+  // survive the hop rather than be dropped.
+  it("carries an unknown router source through verbatim", () => {
+    expect(routingExtrasFromWire({ router_source: "some-future-router" })).toEqual({
+      routerSource: "some-future-router",
+    });
+  });
+
+  it.each([
+    ["a blank string", ""],
+    ["null", null],
+    ["a non-string", 7],
+  ] as const)("drops %s router_source rather than keying it undefined", (_case, routerSource) => {
+    const extras = routingExtrasFromWire({ router_source: routerSource });
+    expect(extras).toEqual({});
+    expect("routerSource" in extras).toBe(false);
   });
 
   it("returns nothing for a legacy payload", () => {
@@ -46,6 +66,19 @@ describe("routingExtras", () => {
       harness: "codex",
       rawModel: "gpt-5-6-sol",
     });
+  });
+
+  it("copies the router source through the camelCase hops", () => {
+    expect(routingExtras({ routerSource: "oss-llm" })).toEqual({ routerSource: "oss-llm" });
+  });
+
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+  ] as const)("drops a %s router source rather than keying it", (_case, routerSource) => {
+    const extras = routingExtras({ harness: "codex", routerSource });
+    expect(extras).toEqual({ harness: "codex" });
+    expect("routerSource" in extras).toBe(false);
   });
 });
 

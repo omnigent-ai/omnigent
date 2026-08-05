@@ -29,6 +29,7 @@ def test_legacy_row_deserializes_with_defaults() -> None:
     assert data.decision_id is None
     assert data.raw_model is None
     assert data.attempted_override is None
+    assert data.router_source is None
 
 
 @pytest.mark.parametrize(
@@ -47,12 +48,14 @@ def test_legacy_row_deserializes_with_defaults() -> None:
                 "decision_id": "dec_abc123",
                 "raw_model": "gpt-5-6-sol",
                 "attempted_override": "databricks-gpt-5-5",
+                "router_source": "databricks-aigw",
             },
             {
                 "harness": "codex",
                 "scope": "native_subagent",
                 "decision_id": "dec_abc123",
                 "raw_model": "gpt-5-6-sol",
+                "router_source": "databricks-aigw",
             },
         ),
         # An unapplied advisory decision: the unset optional stays null in the
@@ -71,6 +74,7 @@ def test_legacy_row_deserializes_with_defaults() -> None:
                 "scope": "session",
                 "decision_id": "dec_1",
                 "raw_model": None,
+                "router_source": None,
             },
         ),
     ],
@@ -104,3 +108,31 @@ def test_unknown_scope_rejected() -> None:
             rationale="ok",
             scope="galaxy",  # type: ignore[arg-type]
         )
+
+
+# ── router_source ───────────────────────────────────────────────────────────
+#
+# Which router produced the decision. A plain ``str``, not a ``Literal``: a
+# source added later must round-trip through stored rows and the wire rather
+# than failing validation on the way back in.
+
+
+@pytest.mark.parametrize("source", ["databricks-aigw", "oss-llm", "some-future-router"])
+def test_any_router_source_round_trips(source: str) -> None:
+    original = RoutingDecisionData(
+        model="databricks-claude-sonnet-5",
+        applied=True,
+        rationale="ok",
+        router_source=source,
+    )
+    dumped = original.model_dump()
+    assert dumped["router_source"] == source
+    assert RoutingDecisionData(**dumped) == original
+
+
+def test_an_omitted_router_source_parses_as_none() -> None:
+    data = parse_item_data("routing_decision", dict(_LEGACY_ROW))
+    assert isinstance(data, RoutingDecisionData)
+    assert data.router_source is None
+    # The field still rides the wire as an explicit null rather than vanishing.
+    assert data.model_dump()["router_source"] is None

@@ -19,6 +19,8 @@ export interface RoutingDecisionExtras {
   rawModel?: string | null;
   /** Model the spawn asked for and the router overrode, when there was one. */
   attemptedOverride?: string | null;
+  /** Which router answered — `"databricks-aigw"` or `"oss-llm"`; absent on legacy rows. */
+  routerSource?: string | null;
 }
 
 const SCOPES = new Set<string>(["session", "turn", "child_session", "native_subagent"]);
@@ -51,6 +53,7 @@ export function routingExtrasFromWire(rec: Record<string, unknown>): RoutingDeci
     ...(str(rec.attempted_override) !== undefined && {
       attemptedOverride: str(rec.attempted_override),
     }),
+    ...(str(rec.router_source) !== undefined && { routerSource: str(rec.router_source) }),
   };
 }
 
@@ -71,6 +74,7 @@ export function routingExtras(
     ...(source.decisionId != null && { decisionId: source.decisionId }),
     ...(source.rawModel != null && { rawModel: source.rawModel }),
     ...(source.attemptedOverride != null && { attemptedOverride: source.attemptedOverride }),
+    ...(source.routerSource != null && { routerSource: source.routerSource }),
   };
 }
 

@@ -20,9 +20,11 @@ user types.
 
 Two rules shape everything here:
 
-* **Preflight is a hard error.** Routing that the server cannot do, or a host
-  whose inference is not AI-Gateway-backed, means the pick could not be
-  applied — say so and stop (designs/INTELLIGENT_ROUTING_PLAN.md §10).
+* **Preflight is a hard error.** Routing that no source on the server can
+  serve means the pick could not be applied — say so and stop
+  (designs/INTELLIGENT_ROUTING_PLAN.md §10). A family whose inference is not
+  AI-Gateway-backed is not that case: it downgrades to the server's built-in
+  router, and only fails when there is no built-in router either.
 * **Routing itself fails open.** Once preflight passes, any router failure
   (missing verdict, HTTP error, unreachable server) returns a decision with a
   one-line notice and no pick. The launch always happens.
@@ -127,20 +129,24 @@ def check_smart_routing_available(
     """
     Fail loud when Smart Routing cannot be applied for *harnesses*.
 
-    Three gates, all config-level (no liveness probing):
+    Gate 1 is availability: the server must have at least one routing source
+    (``GET /v1/info`` ``smart_routing_sources``) — the external AI-Gateway
+    router, the built-in one, or both. With neither, nothing can produce a pick.
 
-    1. the server must have a routing client (``GET /v1/info``
-       ``smart_routing_enabled``);
-    2. this machine's own inference for each harness family must be
-       AI-Gateway-backed (:func:`local_gateway_inference`) — the launch happens
-       here, so the local answer is authoritative and needs no host row;
-    3. failing a local answer, the host row the server holds for this machine
-       (``GET /v1/hosts`` ``gateway_inference``), which is what an older CLI
-       had to rely on.
+    Gates 2 and 3 are *source selection*, not availability. A family whose
+    inference is not AI-Gateway-backed cannot run a gateway-routed pick, so it
+    downgrades to the server's built-in router (one informational line, then
+    proceed) and only fails when the server has no built-in router either. The
+    answer comes from this machine's own config first
+    (:func:`local_gateway_inference`) — the launch happens here, so the local
+    answer is authoritative and needs no host row — and failing that from the
+    host row the server holds for this machine (``GET /v1/hosts``
+    ``gateway_inference``), which is what an older CLI had to rely on.
 
     An absent ``gateway_inference`` map — or an absent entry in it — is
-    *unknown*, not unavailable: a family whose check could not run keeps every
-    option.
+    *unknown*, not off-gateway: a family whose check could not run keeps every
+    option. An older server that omits ``smart_routing_sources`` degrades to its
+    ``smart_routing_enabled`` answer for both sources, so it blocks nothing new.
 
     :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
     :param harnesses: Harness ids the route may pick, e.g.
@@ -151,7 +157,8 @@ def check_smart_routing_available(
     :raises click.ClickException: When routing is unavailable, naming why.
     """
     info = _get_json(base_url=base_url, path="/v1/info")
-    if not (isinstance(info, dict) and info.get("smart_routing_enabled") is True):
+    sources = _routing_sources(info)
+    if not (sources["external"] or sources["oss"]):
         raise click.ClickException(
             f"Smart Routing is not enabled on {base_url}: the server has no routing "
             "model configured. Re-run without --smart-routing, or pass --model to "
@@ -169,6 +176,15 @@ def check_smart_routing_available(
             state = _gateway_state(remote or {}, harness)
         if state is None or state is True:
             continue
+        if sources["oss"]:
+            # Off the gateway the AI Gateway's router cannot be applied here,
+            # but the server's built-in one still answers.
+            click.echo(
+                f"{harness} is not AI-Gateway-backed on this host — routing with the "
+                "built-in router instead",
+                err=True,
+            )
+            continue
         reason = state if isinstance(state, str) else "not gateway-backed"
         raise click.ClickException(
             f"Smart Routing is unavailable for {harness} on this host: its inference "
@@ -176,6 +192,25 @@ def check_smart_routing_available(
             "reachable from the pane. Re-run without --smart-routing, or point the "
             "harness at the workspace AI Gateway (`omnigent configure harnesses`)."
         )
+
+
+def _routing_sources(info: dict[str, Any]) -> dict[str, bool]:
+    """
+    Which routing sources the server can serve, from ``GET /v1/info``.
+
+    :param info: The decoded ``/v1/info`` payload, possibly ``{}``.
+    :returns: ``{"external": bool, "oss": bool}`` — the AI-Gateway router and
+        the built-in one. A server that omits (or garbles) the field degrades to
+        its ``smart_routing_enabled`` answer for both: a server that can route
+        is assumed able to serve either source, so nothing new is blocked. The
+        web parser degrades the same way, so both surfaces read one older server
+        alike.
+    """
+    enabled = info.get("smart_routing_enabled") is True
+    raw = info.get("smart_routing_sources")
+    if not isinstance(raw, dict):
+        return {"external": enabled, "oss": enabled}
+    return {"external": raw.get("external") is True, "oss": raw.get("oss") is True}
 
 
 def create_smart_routing_session(

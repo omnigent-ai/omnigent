@@ -1077,3 +1077,105 @@ def test_ensure_session_router_quietly_swallows_a_bind_failure(
 def test_relayed_decisions_start_empty() -> None:
     assert relayed_decisions("conv_never_routed") == ()
     assert routed_models("conv_never_routed") == frozenset()
+
+
+# ── Router source ───────────────────────────────────────────────────
+#
+# Gateway backing selects WHICH router answers a spawn, and the verdict records
+# it so the chip can say so. Off the gateway the static ``infer_models`` table is
+# unusable (all ``databricks-*`` ids), so only the live catalog may supply
+# candidates.
+
+
+async def test_an_off_gateway_spawn_is_routed_by_the_built_in_judge() -> None:
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="external"))
+    local = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="local"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+    decision = await resolve_subagent_route(
+        "conv_oss", _request(), caps=caps, gateway_backed=False
+    )
+    assert decision.router_source == "oss-llm"
+    assert decision.rationale == "local"
+    assert external.calls == []
+
+
+async def test_a_gateway_backed_spawn_is_routed_by_the_external_router() -> None:
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="external"))
+    local = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="local"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+    decision = await resolve_subagent_route(
+        "conv_aigw", _request(), caps=caps, gateway_backed=True
+    )
+    assert decision.router_source == "databricks-aigw"
+    assert local.calls == []
+
+
+async def test_an_external_only_deployment_cannot_route_an_off_gateway_spawn() -> None:
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="external"))
+    caps = FakeCaps(routing_client=external, routing_backends=RoutingBackends(external=external))
+    decision = await resolve_subagent_route(
+        "conv_no_source", _request(), caps=caps, gateway_backed=False
+    )
+    assert decision.action == "allow"
+    assert decision.model is None
+    assert decision.router_source is None
+    assert external.calls == []
+
+
+def test_candidate_models_skips_the_static_table_when_it_is_unreachable() -> None:
+    # No catalog and no static fallback leaves nothing to offer.
+    assert candidate_models("claude-native", allow_static_fallback=False) == {}
+    # The live catalog still supplies candidates, in the pane's own spelling.
+    offered = candidate_models(
+        "claude-native",
+        catalog={"self": ["claude-opus-4-8"]},
+        allow_static_fallback=False,
+    )
+    assert offered == {"claude-native": ["claude-opus-4-8"]}
+
+
+async def test_router_source_survives_the_payload_round_trip() -> None:
+    decision = SubagentRouteDecision(
+        action="rewrite",
+        rationale="deep reasoning",
+        model=CLAUDE_MODEL,
+        router_source="databricks-aigw",
+    )
+    payload = decision.to_payload()
+    assert payload["router_source"] == "databricks-aigw"
+    assert SubagentRouteDecision.from_payload(payload).router_source == "databricks-aigw"
+
+
+def test_a_payload_without_a_router_source_parses_as_none() -> None:
+    parsed = SubagentRouteDecision.from_payload(
+        {"action": "rewrite", "rationale": "x", "model": CLAUDE_MODEL}
+    )
+    assert parsed.router_source is None
+    # A blank string is no source at all, not an empty one.
+    assert SubagentRouteDecision.from_payload({"router_source": ""}).router_source is None
+
+
+def test_decision_record_copies_the_router_source() -> None:
+    req = _request()
+    decision = SubagentRouteDecision(
+        action="rewrite",
+        rationale="deep reasoning",
+        model=CLAUDE_MODEL,
+        router_source="oss-llm",
+    )
+    assert decision_record(req, decision).router_source == "oss-llm"
+    # A fail-open allow routed nothing, so it names no source.
+    unrouted = SubagentRouteDecision(action="allow", rationale="Routing unavailable")
+    assert decision_record(req, unrouted).router_source is None

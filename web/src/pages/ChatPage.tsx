@@ -208,6 +208,9 @@ type ServerInfoValue = ServerInfo | "loading";
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
  * probe still in flight) reads as off, so no routing control flashes in and
  * then disappears on a server that has none.
+ *
+ * Source-agnostic: the gates below key on `smart_routing_enabled` alone because
+ * which router answers doesn't change whether a session can be routed.
  */
 function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
   return serverInfo !== "loading" && serverInfo.smart_routing_enabled;

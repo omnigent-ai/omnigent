@@ -561,6 +561,13 @@ class RoutingDecisionData(BaseModel):
         ``args.model`` on a child session, or a native spawn's own
         ``requested_model``. ``None`` when nothing was asked for, or when
         the router's pick names the same arm as the ask.
+    :param router_source: Which router produced the decision —
+        ``"databricks-aigw"`` for the external AI-Gateway ``task_v1``
+        service, ``"oss-llm"`` for the built-in judge. Deliberately a
+        plain ``str`` rather than a ``Literal``: a source added later
+        must still round-trip through stored rows and the wire instead
+        of failing validation. ``None`` on rows written before the
+        field existed.
     """
 
     model: str
@@ -575,6 +582,7 @@ class RoutingDecisionData(BaseModel):
     decision_id: str | None = None
     raw_model: str | None = None
     attempted_override: str | None = None
+    router_source: str | None = None
 
     @field_validator("model")
     @classmethod

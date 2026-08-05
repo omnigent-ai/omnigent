@@ -9,12 +9,14 @@ fail-mode knob, and the decision cache.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
+from omnigent.runner import subagent_routing
 from omnigent.runner.subagent_routing import (
     AUTO_HARNESS_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
@@ -213,7 +215,111 @@ async def test_routed_model_publishes_session_model_event(
     assert model_events[0]["model"] == ROUTED_MODEL
 
 
+async def test_the_router_source_reaches_the_transcript_item_and_the_sse(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The chip needs to know which router answered, live and on reload."""
+    from omnigent.server.routing_backend import RoutingBackends
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    _parent, child, conv_store = await _parent_and_child(
+        client, db_uri, agent_name="routing-source"
+    )
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+    )
+    # Classified as the external client by type, so a gateway-backed route is
+    # stamped "databricks-aigw" rather than the judge's source.
+    external = ExternalRoutingClient(base_url="https://ws.example.invalid", router_name="task_v1")
+    external.route = routing_client.route  # type: ignore[method-assign]
+    caps = FakeCaps(routing_client=external, routing_backends=RoutingBackends(external=external))
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        patch.object(
+            orchestration_module.session_stream,
+            "publish",
+            side_effect=lambda sid, payload: published.append((sid, payload)),
+        ),
+    ):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id,
+                child,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    decisions = _routing_decisions(conv_store, child.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.router_source == "databricks-aigw"
+    chips = [
+        payload
+        for sid, payload in published
+        if sid == child.id and payload.get("item", {}).get("type") == "routing_decision"
+    ]
+    assert chips and chips[0]["item"]["router_source"] == "databricks-aigw"
+
+
 # ── 2. Native-subagent relay: transcript item + child join ──────────
+
+
+async def test_the_subagent_relay_falls_back_to_the_judge_off_the_gateway(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An ungatewayed parent still routes its spawns, with the built-in judge."""
+    from omnigent.server.routing_backend import RoutingBackends
+
+    parent, _child, conv_store = await _parent_and_child(
+        client, db_uri, agent_name="routing-subagent-source"
+    )
+    external = FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="external"))
+    local = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="local", harness="claude_code")
+    )
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+    ungatewayed = SimpleNamespace(gateway_inference={"claude-native": False})
+    # No runner is bound here, so stand in for the pane's live catalog — the only
+    # provider-accurate candidate source once the static table is off the table.
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        patch.object(
+            orchestration_module,
+            "_session_routing_host",
+            AsyncMock(return_value=ungatewayed),
+        ),
+        patch.object(
+            subagent_routing,
+            "candidate_models",
+            lambda harness, **kwargs: {harness: [ROUTED_MODEL]},
+        ),
+    ):
+        resp = await client.post(
+            f"/v1/sessions/{parent['id']}/hooks/route-subagent",
+            json={
+                "harness": "claude-native",
+                "task_name": "code-reviewer",
+                "prompt": "review the auth module",
+                "parent_model": LLM_PICKED_MODEL,
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["router_source"] == "oss-llm"
+    # The workspace router's picks are unreachable from this pane; never asked.
+    assert external.calls == []
+    decisions = _routing_decisions(conv_store, parent["id"])
+    assert decisions[-1].data.router_source == "oss-llm"
 
 
 async def test_native_subagent_relay_persists_decision_and_joins_child_row(

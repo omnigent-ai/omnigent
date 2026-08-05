@@ -199,4 +199,52 @@ describe("routing decision — harness / scope / raw pick", () => {
     expect(screen.queryByText(/"harness"/)).toBeNull();
     expect(screen.queryByText(/"raw_model"/)).toBeNull();
   });
+
+  // Only an AI-Gateway-routed decision is marked: the built-in judge is the
+  // plain case, and a legacy row predates the field entirely.
+  const AIGW_MARK = "routing-decision-source-databricks";
+  const AIGW_NAME = "Routed by the Databricks AI Gateway";
+
+  it("card: marks a decision the Databricks AI Gateway answered", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={{ routerSource: "databricks-aigw" }}
+      />,
+    );
+    expect(screen.getByTestId(AIGW_MARK)).toBeTruthy();
+    // The wrapper carries the name — the brand mark itself is aria-hidden, and
+    // it must never announce as the model family ("DBRX").
+    expect(screen.getByRole("img", { name: AIGW_NAME })).toBeTruthy();
+    expect(screen.queryByTitle(/DBRX/i)).toBeNull();
+    expect(screen.queryByLabelText(/DBRX/i)).toBeNull();
+    expect(screen.queryByText(/DBRX/i)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"router_source"/)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["the built-in judge answered", { routerSource: "oss-llm" }],
+    ["the field is absent", {}],
+  ] as const)("card: leaves the mark off when %s", (_case, routing) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={routing}
+      />,
+    );
+    expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
+    expect(screen.queryByRole("img", { name: AIGW_NAME })).toBeNull();
+  });
+
+  it("card: leaves the mark off a legacy row with no routing at all", () => {
+    render(<RoutingDecisionCard model="databricks-claude-sonnet-5" applied rationale="x" />);
+    expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.queryByText(/"router_source"/)).toBeNull();
+  });
 });
