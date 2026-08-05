@@ -5,10 +5,10 @@ name: PR Hygiene
 #   1. Demo check -- comment on PRs that check "Bug fix" / "Feature" /
 #      "UI / frontend change" but provide no demo (screenshot / video).
 #      See demo-check.js.
-#   2. Issue-link check -- comment on PRs that link no issue. Forward-only (nothing
-#      opened before its effective date is considered, so the backlog is
-#      untouched) and dry-run by default: it writes the verdict list to the step
-#      summary and changes nothing until ENFORCE is "true". See pr-issue-link.js.
+#   2. Issue-link check -- comment on PRs that reference no issue. Forward-only:
+#      nothing opened before its effective date is considered, so the backlog is
+#      untouched. Enforcing, capped at LIMIT comments per run. See
+#      pr-issue-link.js.
 #
 # Both skip drafts and PRs they've already flagged -- the demo check dedupes on
 # its `needs-demo` label, the issue-link check on a marker in its own comment.
@@ -53,16 +53,17 @@ jobs:
           script: |
             const script = require(".github/workflows/demo-check.js");
             await script({ context, github, core });
-      # Dry run: resolves every verdict into the step summary without
-      # commenting or labeling. Flip ENFORCE to "true" once the verdict list has
-      # been reviewed; LIMIT then caps how many PRs one run may flag (it does not
-      # truncate a dry run, whose job is to show the complete list).
+      # LIMIT bounds how many contributors a single run may comment on. It is
+      # deliberately low while the wording gets its first real-world read, and can
+      # be raised once the first live comments look right. Setting ENFORCE back to
+      # "false" returns to a dry run, which enumerates every verdict into the step
+      # summary and writes nothing.
       - name: Issue-link check
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
-          ENFORCE: "false"
-          LIMIT: "25"
+          ENFORCE: "true"
+          LIMIT: "3"
         with:
           retries: 3
           script: |
