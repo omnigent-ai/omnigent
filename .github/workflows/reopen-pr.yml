@@ -24,7 +24,7 @@ jobs:
     if: >-
       github.repository == 'omnigent-ai/omnigent'
       && github.event.issue.pull_request
-      && startsWith(github.event.comment.body, '/reopen')
+      && contains(github.event.comment.body, '/reopen')
       && !endsWith(github.event.comment.user.login, '[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 5

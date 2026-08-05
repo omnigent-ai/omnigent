@@ -11,7 +11,15 @@
 // ignored. Reopening also requires the head branch to still exist; if it is
 // gone, say so instead of failing silently.
 
-const BOT_CLOSERS = ["github-actions[bot]"];
+// Any bot close is undoable. Matched by suffix rather than an allowlist so a
+// close from a GitHub App (its own `[bot]` login) isn't mistaken for a
+// maintainer's deliberate close, which `/reopen` would then refuse.
+const isBotCloser = (login) => login.endsWith("[bot]");
+
+// `/reopen` as a command: first non-space token on a line. The workflow `if:`
+// only prefilters on the substring, so "see /reopened elsewhere" reaches here
+// and must not trigger.
+const COMMAND = /^[ \t]*\/reopen[ \t]*$/m;
 
 const notAuthor = () =>
   "Only the PR author can use `/reopen`. A maintainer can reopen this PR directly.";
@@ -43,6 +51,11 @@ module.exports = async ({ github, context, core }) => {
   const number = context.payload.issue.number;
   const commenter = context.payload.comment.user.login;
 
+  if (!COMMAND.test(context.payload.comment.body ?? "")) {
+    core.info(`Comment on #${number} mentions /reopen but not as a command; ignoring.`);
+    return;
+  }
+
   const comment = async (body) =>
     github.rest.issues.createComment({ owner, repo, issue_number: number, body });
 
@@ -62,7 +75,9 @@ module.exports = async ({ github, context, core }) => {
   }
 
   const closer = await lastCloser({ github, owner, repo, number });
-  if (closer && !BOT_CLOSERS.includes(closer) && closer !== pr.user.login) {
+  // A null closer (closed with no `closed` timeline event) falls through to the
+  // reopen: there's no maintainer decision on record to preserve.
+  if (closer && !isBotCloser(closer) && closer !== pr.user.login) {
     await comment(closedByMaintainer(closer));
     return;
   }

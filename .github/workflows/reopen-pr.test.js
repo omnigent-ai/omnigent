@@ -14,6 +14,7 @@ async function run({
   closer = "github-actions[bot]",
   headRepo = { owner: { login: "ext" }, name: "omnigent" },
   branchExists = true,
+  body = "/reopen",
 }) {
   const reopens = [];
   const comments = [];
@@ -42,7 +43,10 @@ async function run({
   };
   const context = {
     repo: { owner: "omnigent-ai", repo: "omnigent" },
-    payload: { issue: { number: 7, pull_request: {} }, comment: { user: { login: commenter } } },
+    payload: {
+      issue: { number: 7, pull_request: {} },
+      comment: { user: { login: commenter }, body },
+    },
   };
   await script({ github, context, core: { info: () => {} } });
   return { reopens, comments };
@@ -64,6 +68,16 @@ async function run({
   assert.deepStrictEqual(r.reopens, []);
   assert.match(r.comments[0], /closed by @maintainer1/);
 
+  // Closed by a GitHub App bot (not github-actions): still an automated close,
+  // so it reopens -- suffix match, not an allowlist.
+  r = await run({ closer: "omnigent-ci[bot]" });
+  assert.deepStrictEqual(r.reopens, [{ pull_number: 7, state: "open" }]);
+  assert.match(r.comments[0], /Reopened/);
+
+  // No `closed` event on record: nothing to preserve, so reopen.
+  r = await run({ closer: null });
+  assert.deepStrictEqual(r.reopens, [{ pull_number: 7, state: "open" }]);
+
   // Author closed it themselves: reopened (Read-only authors can't undo even
   // their own close).
   r = await run({ closer: "ext" });
@@ -79,6 +93,13 @@ async function run({
   r = await run({ headRepo: null });
   assert.deepStrictEqual(r.reopens, []);
   assert.match(r.comments[0], /no longer exists/);
+
+  // `/reopen` must be a command, not a mention: prose about it does nothing,
+  // but a trailing newline or leading indent still counts.
+  r = await run({ body: "see /reopened elsewhere" });
+  assert.deepStrictEqual([r.reopens, r.comments], [[], []]);
+  r = await run({ body: "  /reopen\n\nthanks!" });
+  assert.deepStrictEqual(r.reopens, [{ pull_number: 7, state: "open" }]);
 
   // Already open, and merged: both silently ignored.
   r = await run({ state: "open" });

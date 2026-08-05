@@ -4,12 +4,14 @@ name: Reopen notice on PR close
 # back (`/reopen`, handled by reopen-pr.yml). Logic + safety notes live in
 # reopen-notice.js (offline unit test: reopen-notice.test.js).
 #
-# `pull_request` (not _target) is enough: this reads only event metadata and the
-# comment list, never PR code, and the default GITHUB_TOKEN on a fork PR still
-# grants issues: write for commenting on the base repo.
+# `pull_request_target`, because a fork PR's `pull_request` token is read-only no
+# matter what `permissions:` asks for -- commenting would 403 on exactly the fork
+# PRs this notice exists for. `_target` runs in the base-repo context with a
+# grantable token; safe here since the job reads only event metadata and the
+# comment list, checks out the default branch's `.github`, and runs no PR code.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
 
 permissions:
