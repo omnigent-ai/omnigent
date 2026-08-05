@@ -52,7 +52,7 @@ function ExecutionLogsCard({ childSessions, onExpand }: ExecutionLogsCardProps) 
   return (
     <Card size="sm" data-testid="execution-logs-card">
       <CardHeader>
-        <CardTitle className="text-ui">Execution logs</CardTitle>
+        <CardTitle className="text-ui truncate min-w-0">Execution logs</CardTitle>
         <CardAction>
           <button
             type="button"
