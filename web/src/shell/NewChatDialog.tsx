@@ -3455,7 +3455,7 @@ export function NewChatLandingScreen() {
                   title="Attach files"
                   data-testid="new-chat-landing-attach"
                 >
-                  <PaperclipIcon className="size-4" />
+                  <PaperclipIcon className="size-4" data-icon-size="16" />
                   <span className="sr-only">Attach files</span>
                 </Button>
                 <ComposerMicButton
@@ -3469,62 +3469,78 @@ export function NewChatLandingScreen() {
                   onInterim={dictation.replaceInterim}
                 />
               </div>
-              <div className="flex items-center gap-0.5">
-                {/* Agent / harness picker — selects the agent or harness only.
-                  Its run-config knobs (model / effort / permission mode for
-                  Claude Code, approval mode for Codex/OpenCode, exec mode for
-                  Cursor, brain-harness override for bundle agents) live in the
-                  gear-icon config modal beside it. */}
-                <AgentHarnessPicker
-                  agentEntries={agentEntries}
-                  harnessEntries={harnessEntries}
-                  effectiveAgentId={effectiveAgentId}
-                  agentLabel={agentLabel}
-                  hasAgents={agentList.length > 0}
-                  host={harnessWarningHost}
-                  onSelectAgent={handleSelectAgent}
-                  pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
-                  pendingAgentId={PENDING_AGENT_ID}
-                  onSelectPending={handleSelectPending}
-                  onCreateCustomAgent={() => setCreateAgentOpen(true)}
-                  sandboxSelected={sandboxSelected}
-                />
-                {/* Gear — opens the selected agent's run-config modal. Hidden
-                  when the selected agent has no knobs to configure. Hovering
-                  shows the current settings so they're readable without
-                  opening the modal. */}
-                {selectedAgent && selectedAgentHasKnobs && (
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          size="icon"
-                          variant="ghost"
-                          className="size-9 text-muted-foreground md:size-8"
-                          disabled={creating}
-                          onClick={() => setConfigOpen(true)}
-                          data-testid="new-chat-landing-config-gear"
-                        >
-                          <SettingsIcon className="size-4" />
-                          <span className="sr-only">Configure {selectedAgent.display_name}</span>
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent
-                        side="top"
-                        className="flex-col items-start gap-0.5 px-3 py-2"
-                        data-testid="new-chat-landing-config-gear-tooltip"
-                      >
-                        {configSummary.map((row) => (
-                          <span key={row.label} className="text-muted-foreground">
-                            {row.label}:{" "}
-                            <span className="text-popover-foreground">{row.value}</span>
-                          </span>
-                        ))}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                )}
+              <div className="flex items-center gap-0.5 md:gap-2">
+                <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
+                  {/* Agent / harness picker — selects the agent or harness only.
+                    Its run-config knobs (model / effort / permission mode for
+                    Claude Code, approval mode for Codex/OpenCode, exec mode for
+                    Cursor, brain-harness override for bundle agents) live in the
+                    gear-icon config modal beside it. */}
+                  <AgentHarnessPicker
+                    agentEntries={agentEntries}
+                    harnessEntries={harnessEntries}
+                    effectiveAgentId={effectiveAgentId}
+                    agentLabel={agentLabel}
+                    hasAgents={agentList.length > 0}
+                    host={harnessWarningHost}
+                    onSelectAgent={handleSelectAgent}
+                    pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
+                    pendingAgentId={PENDING_AGENT_ID}
+                    onSelectPending={handleSelectPending}
+                    onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                    sandboxSelected={sandboxSelected}
+                    // Match the gear's touch-target height so both halves fill
+                    // the shared pill; pr-2 equals the gear icon's own centering
+                    // inset (8px) so the divider sits evenly between them.
+                    triggerClassName="h-9 pr-2 md:h-8"
+                  />
+                  {/* Gear — opens the selected agent's run-config modal, behind
+                    a hairline divider. Both are hidden when the selected agent
+                    has no knobs to configure, leaving a plain single-segment
+                    pill. Hovering shows the current settings so they're readable
+                    without opening the modal. */}
+                  {selectedAgent && selectedAgentHasKnobs && (
+                    <>
+                      {/* The segments' own padding (trigger pr-2, gear icon
+                        centering) supplies the gap on either side. */}
+                      <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              className="size-9 text-muted-foreground md:size-8"
+                              disabled={creating}
+                              onClick={() => setConfigOpen(true)}
+                              data-testid="new-chat-landing-config-gear"
+                            >
+                              <SettingsIcon className="size-4" data-icon-size="16" />
+                              <span className="sr-only">
+                                Configure {selectedAgent.display_name}
+                              </span>
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent
+                            side="top"
+                            className="flex-col items-start gap-0.5 px-3 py-2"
+                            data-testid="new-chat-landing-config-gear-tooltip"
+                          >
+                            {configSummary.map((row) => (
+                              <span key={row.label} className="text-muted-foreground">
+                                {row.label}:{" "}
+                                <span className="text-background dark:text-popover-foreground">
+                                  {row.value}
+                                </span>
+                              </span>
+                            ))}
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </>
+                  )}
+                </div>
                 {selectedAgent && selectedAgentHasKnobs && (
                   <HarnessConfigModal
                     open={configOpen}
@@ -3574,7 +3590,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-lg bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
+                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />

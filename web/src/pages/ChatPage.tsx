@@ -5077,7 +5077,7 @@ export function Composer({
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
             >
-              <PaperclipIcon className="size-4" />
+              <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
             </Button>
             <ComposerMicButton
@@ -5167,30 +5167,32 @@ export function Composer({
                 backendLabel="Codex"
               />
             )}
-            <ComposerModelEffortLabel
-              showModels={showModels}
-              showEffort={showEffort}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              harnessLabel={harnessLabel}
-            />
-            <ComposerConfigGear
-              harnessLabel={harnessLabel}
-              showModels={showModels}
-              showEffort={showEffort}
-              effortLevels={effortLevels}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              // Config changes persist server-side and apply on the next
-              // wake/turn (the runner forward is best-effort), so the gear
-              // stays live wherever a message could be sent — including
-              // asleep/starting/unknown. Only read-only viewers and sessions
-              // no message can wake (unreachable) get an inert gear.
-              disabled={isReadOnly || unreachable}
-              openNonce={pickerOpenNonce}
-            />
+            <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
+              <ComposerModelEffortLabel
+                showModels={showModels}
+                showEffort={showEffort}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                harnessLabel={harnessLabel}
+              />
+              <ComposerConfigGear
+                harnessLabel={harnessLabel}
+                showModels={showModels}
+                showEffort={showEffort}
+                effortLevels={effortLevels}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                // Config changes persist server-side and apply on the next
+                // wake/turn (the runner forward is best-effort), so the gear
+                // stays live wherever a message could be sent — including
+                // asleep/starting/unknown. Only read-only viewers and sessions
+                // no message can wake (unreachable) get an inert gear.
+                disabled={isReadOnly || unreachable}
+                openNonce={pickerOpenNonce}
+              />
+            </div>
             <Button
               type="submit"
               size="icon"
@@ -5201,7 +5203,8 @@ export function Composer({
               // reads as "waiting for input", not "almost active".
               className={cn(
                 "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
+                !showInterruptButton &&
+                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
               )}
               // Interrupt stays live during a pending elicitation —
               // cancelling the turn is the other legitimate way out.
@@ -5898,8 +5901,12 @@ function ComposerConfigGear({
               // read-only config summary) still shows, but block the click and
               // dim it. A native `disabled` button swallows pointer events, so
               // the tooltip would never fire.
+              // The ::before hairline is this gear's divider from the
+              // model/effort label in the composer's split pill. It's drawn
+              // here rather than as a sibling node because the label renders
+              // nothing for some sessions — `first:` then drops the divider.
               className={cn(
-                "size-9 shrink-0 text-muted-foreground hover:text-foreground md:size-8",
+                "size-9 shrink-0 text-muted-foreground before:absolute before:top-1/2 before:left-0 before:h-4 before:w-px before:-translate-y-1/2 before:bg-border hover:text-foreground first:before:hidden md:size-8",
                 disabled && "cursor-default opacity-50 hover:text-muted-foreground",
               )}
               aria-disabled={disabled}
@@ -5910,7 +5917,7 @@ function ComposerConfigGear({
               data-testid="composer-config-gear"
               aria-label="Configure session"
             >
-              <SettingsIcon className="size-4" />
+              <SettingsIcon className="size-4" data-icon-size="16" />
             </Button>
           </TooltipTrigger>
           {summary.length > 0 && (
@@ -5921,7 +5928,8 @@ function ComposerConfigGear({
             >
               {summary.map((row) => (
                 <span key={row.label} className="text-muted-foreground">
-                  {row.label}: <span className="text-popover-foreground">{row.value}</span>
+                  {row.label}:{" "}
+                  <span className="text-background dark:text-popover-foreground">{row.value}</span>
                 </span>
               ))}
             </TooltipContent>
@@ -6135,7 +6143,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">Smart Routing</span>
       </span>
@@ -6159,7 +6167,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{harnessLabel}</span>
       </span>
@@ -6169,7 +6177,7 @@ function ComposerModelEffortLabel({
   return (
     <span
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+      className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
     >
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}
