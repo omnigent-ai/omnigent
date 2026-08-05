@@ -1011,6 +1011,21 @@ def test_turn_routing_enabled_requires_a_client_when_caps_are_given(
     assert routing_enabled("on", caps=FakeCaps(routing_client=routing_client)) is expected
 
 
+def test_turn_routing_enabled_counts_a_managed_policy_llm_factory() -> None:
+    """A managed deployment supplies its routing client later, so it can route.
+
+    Reading the backends directly missed this arm and reported routing off for
+    a deployment the server would have routed.
+    """
+
+    class _ManagedCaps:
+        routing_client = None
+        routing_backends = None
+        policy_llm_connection_factory = object()
+
+    assert routing_enabled("on", caps=_ManagedCaps()) is True
+
+
 @pytest.mark.parametrize(
     ("override", "expected"),
     [

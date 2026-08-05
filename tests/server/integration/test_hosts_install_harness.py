@@ -262,6 +262,38 @@ async def test_install_harness_returns_refreshed_readiness(
     assert body["configured_harnesses"]["claude"] is True
 
 
+async def test_install_harness_tolerates_a_garbled_gateway_inference(
+    install_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """
+    A host that answers with a non-mapping ``gateway_inference`` must not 500.
+
+    The reply is host-supplied, so it goes through the same tolerant decode the
+    tunnel path uses: anything that isn't a string→bool object reads as
+    "unknown". Recording it straight would have blown up in ``dict(...)``.
+    """
+    app, registry, _comm, replies, _drain = install_setup
+    replies["claude"] = {
+        "status": "ok",
+        "configured_harnesses": {"claude": True},
+        # Garbled: a newer/broken host, or a list where a map belongs.
+        "gateway_inference": ["claude-native"],
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["gateway_inference"] is None
+    assert registry.gateway_inference(_HOST_ID) is None
+
+
 async def test_install_harness_codex_reports_needs_auth_not_ready(
     install_setup: tuple[
         FastAPI,

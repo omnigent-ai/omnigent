@@ -1308,7 +1308,7 @@ def extended_model_catalog(
 # Cached ``codex debug models`` result, keyed by (binary, CODEX_HOME). The
 # catalog is a property of the installed CLI, not of a session, so a successful
 # probe is paid once per host process rather than once per session.
-_MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_MODEL_CATALOG_CACHE: dict[tuple[str, str, int, int], dict[str, Any]] = {}
 
 # Failures are cached only briefly, keyed the same way and holding the
 # monotonic time the negative expires. Caching them forever turned one
@@ -1317,7 +1317,7 @@ _MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 # from every later session's ``spawn_agent``. Caching them not at all would pay
 # the full timeout per session on a genuinely broken CLI.
 _MODEL_CATALOG_FAILURE_TTL_S = 60.0
-_MODEL_CATALOG_FAILURES: dict[tuple[str, str], float] = {}
+_MODEL_CATALOG_FAILURES: dict[tuple[str, str, int, int], float] = {}
 
 # Both caches are host-process globals reached from worker threads (every
 # caller populates a codex home through ``asyncio.to_thread``), and the probe
@@ -1325,6 +1325,27 @@ _MODEL_CATALOG_FAILURES: dict[tuple[str, str], float] = {}
 # booting together pay it once: the loser waits for the winner's result instead
 # of shelling out again, which is also what keeps the dict mutations atomic.
 _MODEL_CATALOG_LOCK = threading.Lock()
+
+
+def _model_catalog_cache_key(codex_path: str, source_home: Path) -> tuple[str, str, int, int]:
+    """
+    Key the catalog cache so an in-place codex upgrade re-probes.
+
+    The catalog IS the installed binary's, and `npm i -g @openai/codex` (or a
+    Homebrew upgrade) replaces it at the same path — so path plus home alone
+    served the old codex's models for the rest of the host process. The
+    binary's mtime and size are in the key too; an unreadable path degrades to
+    a sentinel, which just means "cache as before".
+
+    :param codex_path: The codex binary.
+    :param source_home: ``CODEX_HOME`` the probe resolves config from.
+    :returns: The cache key.
+    """
+    try:
+        stat = os.stat(codex_path)
+    except OSError:
+        return (codex_path, str(source_home), -1, -1)
+    return (codex_path, str(source_home), stat.st_mtime_ns, stat.st_size)
 
 
 def _valid_model_catalog(catalog: object) -> bool:
@@ -1375,7 +1396,7 @@ def read_codex_model_catalog(
     :param timeout: Seconds to wait; a slow probe must not delay session boot.
     :returns: ``{"models": [...]}``, or ``None`` on any failure.
     """
-    cache_key = (codex_path, str(source_home))
+    cache_key = _model_catalog_cache_key(codex_path, source_home)
     with _MODEL_CATALOG_LOCK:
         cached = _MODEL_CATALOG_CACHE.get(cache_key)
         if cached is not None:

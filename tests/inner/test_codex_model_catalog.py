@@ -140,6 +140,41 @@ def test_the_cli_is_probed_once_per_host_process(
     assert calls == ["/bin/codex"]
 
 
+def test_an_in_place_codex_upgrade_is_re_probed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The catalog is the INSTALLED binary's, and an upgrade replaces it in place.
+
+    ``npm i -g @openai/codex`` keeps the same path, so a path-only cache key
+    served the old codex's models for the rest of the host process — including
+    the arms a newer codex added.
+    """
+    calls: list[str] = []
+
+    def _probe(codex_path: str, source_home: Path, *, timeout: float) -> dict[str, Any]:  # type: ignore[explicit-any]
+        del source_home, timeout
+        calls.append(codex_path)
+        return _catalog()
+
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
+    monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", _probe)
+
+    binary = tmp_path / "codex"
+    binary.write_text("v1")
+    home = tmp_path / "home"
+    assert codex_executor.read_codex_model_catalog(str(binary), home) is not None
+    assert codex_executor.read_codex_model_catalog(str(binary), home) is not None
+    assert len(calls) == 1
+
+    # Upgraded in place: same path, different bytes.
+    binary.write_text("v2-and-then-some")
+    assert codex_executor.read_codex_model_catalog(str(binary), home) is not None
+    assert len(calls) == 2
+
+
 def test_a_cli_that_cannot_answer_is_not_re_probed_within_the_ttl(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -192,7 +227,9 @@ def test_a_transient_probe_failure_is_retried_after_the_ttl(
 
     # The TTL lapses.
     monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURE_TTL_S", 0.0)
-    codex_executor._MODEL_CATALOG_FAILURES[("/bin/codex", str(tmp_path))] = time.monotonic() - 1.0
+    codex_executor._MODEL_CATALOG_FAILURES[
+        codex_executor._model_catalog_cache_key("/bin/codex", tmp_path)
+    ] = time.monotonic() - 1.0
 
     assert codex_executor.read_codex_model_catalog("/bin/codex", tmp_path) is not None
     assert len(calls) == 2

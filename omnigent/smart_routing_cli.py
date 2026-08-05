@@ -21,9 +21,8 @@ user types.
 Two rules shape everything here:
 
 * **Preflight is a hard error.** Routing that no source on the server can
-  serve means the pick could not be applied — say so and stop
-  (designs/INTELLIGENT_ROUTING_PLAN.md §10). A family whose inference is not
-  AI-Gateway-backed is not that case: it downgrades to the server's built-in
+  serve means the pick could not be applied — say so and stop. A family
+  whose inference is not AI-Gateway-backed is not that case: it downgrades to the server's built-in
   router, and only fails when there is no built-in router either.
 * **Routing itself fails open.** Once preflight passes, any router failure
   (missing verdict, HTTP error, unreachable server) returns a decision with a

@@ -1,9 +1,8 @@
 """CUJ 5 — the auto harness: routing picks the family, and a spawn crosses it.
 
 The web UI's top-level "Smart Routing" harness row, driven over the API. This
-is the only scenario where cross-harness spawns are legal
-(``designs/INTELLIGENT_ROUTING_PLAN.md`` §11.2 D3), so it is the only place the
-redirect can be exercised end to end:
+is the only scenario where cross-harness spawns are legal, so it is the only
+place the redirect can be exercised end to end:
 
 1. ``harness_override="auto"`` + ``cost_control_mode_override="on"`` +
    ``smart_routing_message``. The terminal launches with the session row, so a

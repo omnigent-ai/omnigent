@@ -3,8 +3,7 @@
 A bare ``omnigent claude`` / bare web session starts with no prompt, so there is
 nothing to route at create time. The first real user message triggers exactly
 one routing call from inside the harness — a ``UserPromptSubmit`` hook — and the
-routed model is applied *before* that message runs
-(``designs/IN_HARNESS_ROUTING_PLAN.md``).
+routed model is applied *before* that message runs.
 
 The prompt is **typed into the pane**, never POSTed. A posted message enters
 through the server's composer path, which routes on a different gate entirely;

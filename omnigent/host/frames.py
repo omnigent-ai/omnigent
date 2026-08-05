@@ -1370,7 +1370,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
-        gateway_inference=_optional_str_bool_map(msg, "gateway_inference"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
@@ -1390,7 +1390,7 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
         raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
     return HostHarnessReadinessFrame(
         configured_harnesses=configured_harnesses,
-        gateway_inference=_optional_str_bool_map(msg, "gateway_inference"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
     )
 
 
@@ -1732,7 +1732,7 @@ def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResult
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
-        gateway_inference=_optional_str_bool_map(msg, "gateway_inference"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
     )
 
@@ -1765,7 +1765,7 @@ def _decode_store_secret_result(msg: _JsonObject) -> HostStoreSecretResultFrame:
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
-        gateway_inference=_optional_str_bool_map(msg, "gateway_inference"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
     )
 
@@ -1953,13 +1953,17 @@ def _optional_str_availability_map(
     return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
-def _optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:
+def optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:
     """Return an optional string→bool mapping field.
 
     Tolerant like :func:`_optional_str_availability_map`: absent, null, or
     non-mapping values decode to ``None`` ("unknown"), and entries whose key
     isn't a string or whose value isn't a bool are dropped, so a garbled or
     newer peer's payload never breaks the tunnel.
+
+    Public because the install / credential HTTP routes read the same field
+    straight off an RPC reply body rather than a decoded frame, and a host that
+    answers with a non-mapping must not 500 them either.
 
     :param msg: Decoded frame object.
     :param key: Field name, e.g. ``"gateway_inference"``.

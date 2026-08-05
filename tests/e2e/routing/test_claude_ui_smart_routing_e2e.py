@@ -4,8 +4,7 @@ The web UI's "Claude Code + Model = Smart Routing" path, driven over the API:
 
 1. ``POST /v1/sessions`` with ``cost_control_mode_override="on"``, a
    ``smart_routing_message`` and **no** model pin — exactly what the UI sends
-   (``designs/INTELLIGENT_ROUTING_PLAN.md`` §10 decision 1; a pin silently
-   disables routing). A ``claude-native`` session's turns originate in the TUI,
+   (a pin silently disables routing). A ``claude-native`` session's turns originate in the TUI,
    so the server has to route the model during the create or not at all.
 2. Score the create: one ``session``-scope decision whose ``router_source`` is
    ``databricks-aigw`` (the external client answered — this deployment has no

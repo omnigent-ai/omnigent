@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostListDirFrame,
     HostStoreSecretFrame,
     encode_host_frame,
+    optional_str_bool_map,
 )
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
@@ -1313,7 +1314,10 @@ def create_hosts_router(
         # An install can flip gateway backing (a freshly installed CLI now
         # resolves the workspace gateway), so take the map the host just
         # recomputed instead of waiting for its next readiness push.
-        installed_gateway = result.get("gateway_inference")
+        # Decoded through the same tolerant reader the tunnel path uses: this
+        # is a host-supplied reply body, so a non-mapping is "unknown", not a
+        # 500 out of ``dict(...)``.
+        installed_gateway = optional_str_bool_map(result, "gateway_inference")
         if installed_gateway is not None:
             host_registry.record_gateway_inference(host.host_id, installed_gateway)
 
@@ -1423,7 +1427,8 @@ def create_hosts_router(
         # Pointing a family at the workspace gateway is exactly what this write
         # does, so record the recomputed map now rather than on the host's next
         # readiness push.
-        written_gateway = result.get("gateway_inference")
+        # Same tolerant decode as the install route above.
+        written_gateway = optional_str_bool_map(result, "gateway_inference")
         if written_gateway is not None:
             host_registry.record_gateway_inference(host.host_id, written_gateway)
 

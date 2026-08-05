@@ -952,8 +952,8 @@ _MULTI_MODEL_FAMILY = "pi"
 
 # (harness, model) pairs the harness's own gateway 400s on: under pi, Claude
 # models on its ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models
-# on its openai-completions default ``reasoning_effort``. See
-# designs/LIVE_MODEL_STATE.md.
+# on its openai-completions default ``reasoning_effort``. Probed against a
+# live gateway; tests/e2e/routing/ exercises the exclusions.
 _HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {"pi": SMART_ROUTING_PI_EXCLUDED}
 
 

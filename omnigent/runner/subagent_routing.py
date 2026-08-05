@@ -161,19 +161,22 @@ def routing_enabled(
         e.g. ``"on"``.
     :param parent_cost_control_mode: The parent session's value for a
         spawned child. ``None`` for a top-level session.
-    :param caps: ``RuntimeCaps``-shaped object that must carry a routing
-        backend. ``None`` skips that check — the runner process holds no
-        routing client (the server relay owns the policy), so runner-side
-        callers pass nothing.
+    :param caps: ``RuntimeCaps``-shaped object that must be able to route.
+        ``None`` skips that check — the runner process holds no routing
+        client (the server relay owns the policy), so runner-side callers
+        pass nothing.
     :returns: ``True`` when routing applies to this session.
     """
     if cost_control_mode != "on" and parent_cost_control_mode != "on":
         return False
     if caps is None:
         return True
-    from omnigent.server.routing_backend import backends_from_caps
+    # Through ``routing_available`` rather than the backends directly, so a
+    # managed deployment that registers only its policy-LLM factory (its
+    # routing client arrives later) is not read as "cannot route".
+    from omnigent.server.routing_backend import routing_available
 
-    return backends_from_caps(caps).any() is not None
+    return routing_available(caps)
 
 
 @dataclass(frozen=True)

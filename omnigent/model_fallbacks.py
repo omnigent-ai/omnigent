@@ -153,7 +153,7 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
             "databricks-gpt-5-6-sol",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="probed: pi's own gateway 400s on each of these (designs/LIVE_MODEL_STATE.md)",
+        provenance="probed: pi's own gateway 400s on each of these",
         discovery_gap="a gateway listing advertises these without pi's request-shape limits",
     ),
     "codex_catalog_clone_source": StaticModelFallback(

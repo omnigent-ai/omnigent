@@ -4,8 +4,7 @@ Replaces the Databricks AI-Gateway ``task_v1`` router for the e2e routing CUJs.
 It speaks the exact wire contract :class:`~omnigent.server.smart_routing.ExternalRoutingClient`
 speaks — the ``omnigent.api.routing.v1`` protos, snake_case JSON, one
 ``route_selection`` entry plus a ``rationale`` — and reproduces the observed
-task_v1 behaviour the CUJ matrix is scored against
-(``designs/INTELLIGENT_ROUTING_PLAN.md`` §1, §11.1):
+task_v1 behaviour the CUJ matrix in this directory is scored against:
 
 * **Scenario inference from the arms present**, not the harness tags: Claude
   arms only → ``cc``, Codex arms only → ``codex``, both → ``both``.

@@ -452,8 +452,7 @@ def create_routed_session(
     """Create a Smart Routing session the way the web UI's create does.
 
     The routing contract is ``cost_control_mode_override="on"`` plus **no**
-    model or effort pin — a pin silently disables routing
-    (``designs/INTELLIGENT_ROUTING_PLAN.md`` §11.3 step 1). A
+    model or effort pin — a pin silently disables routing. A
     ``smart_routing_message`` routes at create time; omitting it leaves the
     pick to the harness's own first-message hook.
 
@@ -528,8 +527,8 @@ def trusted_workspace(root: Path, name: str) -> Path:
 def prompts() -> dict[str, str]:
     """Return the canonical CUJ prompts, keyed by handle.
 
-    Verbatim from ``designs/INTELLIGENT_ROUTING_PLAN.md`` §11.1 — the prompt IS
-    the whole routing signal, so any wrapper or paraphrase changes the answer.
+    Held verbatim: the prompt IS the whole routing signal, so any wrapper or
+    paraphrase changes the answer.
 
     :returns: ``{"trivial": ..., "delegate": ..., "crosscutting": ...}``.
     """
