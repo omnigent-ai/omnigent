@@ -14,6 +14,7 @@ class Area:
     key: str
     label: str
     weight: Decimal
+    definition: str = ""
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class AreaCatalog:
                     key=str(raw_area["key"]),
                     label=str(raw_area["label"]),
                     weight=Decimal(str(raw_area["weight"])),
+                    definition=str(raw_area.get("definition", "")),
                 )
             )
 

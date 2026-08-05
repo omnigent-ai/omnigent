@@ -1,0 +1,35 @@
+resources:
+  jobs:
+    issue_prioritization:
+      name: "[${bundle.target}] Omnigent issue prioritization"
+      max_concurrent_runs: 1
+      trigger:
+        pause_status: PAUSED
+        periodic:
+          interval: 6
+          unit: HOURS
+      parameters:
+        - name: mode
+          default: dry_run
+      tasks:
+        - task_key: score_open_issues
+          python_wheel_task:
+            package_name: omnigent_issue_prioritization
+            entry_point: issue-priority-job
+            named_parameters:
+              mode: "{{job.parameters.mode}}"
+              run-id: "{{job.run_id}}"
+              source-table: ${var.catalog}.${var.schema}.${var.source_table}
+              classifications-table: ${var.catalog}.${var.schema}.${var.classifications_table}
+              scores-table: ${var.catalog}.${var.schema}.${var.scores_table}
+              artifact-dir: /Volumes/${var.catalog}/${var.schema}/${var.artifact_volume_name}
+              model-endpoint: ${var.model_endpoint}
+              areas-path: ${workspace.file_path}/.github/areas.json
+              maintainers-path: ${workspace.file_path}/.github/MAINTAINER
+          environment_key: default
+          libraries:
+            - whl: ../dist/*.whl
+      environments:
+        - environment_key: default
+          spec:
+            client: "4"

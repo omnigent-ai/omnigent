@@ -1,0 +1,43 @@
+bundle:
+  name: omnigent-issue-prioritization
+
+include:
+  - resources/*.yml
+
+sync:
+  paths:
+    - .
+    - ../../.github
+  include:
+    - .github/areas.json
+    - .github/MAINTAINER
+
+artifacts:
+  default:
+    type: whl
+    path: .
+    build: uv build --wheel
+
+variables:
+  catalog:
+    default: main
+  schema:
+    default: team_eng_omnigent
+  source_table:
+    default: github_issues_bronze
+  classifications_table:
+    default: issue_classifications
+  scores_table:
+    default: issue_scores
+  artifact_volume_name:
+    default: issue_priority_artifacts
+  model_endpoint:
+    description: Model Serving endpoint used for S0-S3 classification.
+    default: ""
+
+targets:
+  dev:
+    default: true
+    mode: development
+  prod:
+    mode: production
