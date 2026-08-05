@@ -1076,7 +1076,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
 @pytest.mark.parametrize(
     "key,min_version,max_version_exclusive",
     [
-        (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
+        (hi.OPENCODE_KEY, "1.17.7", "1.19.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "1.47.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
@@ -1084,7 +1084,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.PI_KEY, "0.79.0", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
-        (hi.HERMES_KEY, "2026.06.05", None),
+        (hi.HERMES_KEY, "0.17.0", None),
         (hi.KIRO_KEY, "2.10.0", None),
     ],
 )
@@ -1102,9 +1102,10 @@ def test_versioned_specs_declare_bounds(
     "version,expected",
     [
         ("1.17.6", False),  # below min
-        ("1.18.0", False),  # at max exclusive
+        ("1.19.0", False),  # at max exclusive
         ("2.0.0", False),  # above max
         ("1.17.8", True),  # inside range
+        ("1.18.3", True),  # inside range (1.18.x now accepted)
     ],
 )
 def test_harness_cli_installed_checks_version_for_versioned_specs(
@@ -1116,7 +1117,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's supported range is [1.17.7, 1.18.0).
+            # OpenCode's supported range is [1.17.7, 1.19.0).
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )
@@ -1207,7 +1208,6 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     [
         (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
         (hi.KIMI_KEY, "1.46.0", "1.48.0"),
-        (hi.HERMES_KEY, "2026.05.29", "2026.06.19"),
     ],
 )
 def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
@@ -1238,6 +1238,32 @@ def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
 
     monkeypatch.setattr(hi.subprocess, "run", _run_ok)
     assert hi.harness_cli_installed(key) is True
+
+
+@pytest.mark.parametrize(
+    "reported,installed",
+    [
+        ("0.16.0", False),  # below the 0.17.0 parent_session_id feature floor
+        ("0.17.0", True),  # at the floor
+        ("0.19.0", True),  # above the floor
+    ],
+)
+def test_harness_cli_installed_enforces_hermes_semver_floor(
+    monkeypatch: pytest.MonkeyPatch, reported: str, installed: bool
+) -> None:
+    """Hermes gates on the agent SEMVER that ``hermes --version`` reports (e.g.
+    ``0.19.0``), not a YYYY.MM.DD date, so ``0.17.0`` is the effective floor."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{reported}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.HERMES_KEY) is installed
 
 
 def test_harness_cli_installed_false_when_version_unparseable(

@@ -864,15 +864,38 @@ def _build_models_json(
 # parser only consumes that channel when the model entry declares
 # ``reasoning: true``; without it the stream carries no ``content`` and the
 # turn dies with "Stream ended without finish_reason".
+# gpt-5-6 also needs it: pi 0.80.7 hardcodes ``store: false`` and then replays a
+# prior reasoning-item id (``rs_...``) on a later tool-loop turn, which CST
+# cannot resolve because ``store: false`` means items are never persisted.
+# Declaring reasoning here makes pi request portable ``reasoning.encrypted_content``,
+# the stateless fix. The real ids use dashes (``databricks-gpt-5-6-sol``,
+# ``system.ai.gpt-5-6-sol``), so the fragment is dash-form, not the dotted prose.
 # Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
 # so they no longer need this flag.
-_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
+_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek", "gpt-5-6")
 
 
 def _pi_model_is_reasoning(model: str) -> bool:
     """Return whether *model* needs Pi's ``reasoning: true`` model flag."""
     lower = model.lower()
-    return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
+    return any(_fragment_matches(fragment, lower) for fragment in _PI_REASONING_MODEL_FRAGMENTS)
+
+
+def _fragment_matches(fragment: str, text: str) -> bool:
+    """True if *fragment* occurs in *text* and is not immediately followed by a digit.
+
+    A plain substring test would let a version-bearing fragment like ``gpt-5-6``
+    also match a longer, unrelated token such as ``gpt-5-60`` and mis-classify it
+    as a reasoning model. Requiring a non-digit after the match keeps ``gpt-5-6``
+    and ``gpt-5-6-sol`` matching while rejecting ``gpt-5-60``.
+    """
+    start = text.find(fragment)
+    while start != -1:
+        end = start + len(fragment)
+        if end == len(text) or not text[end].isdigit():
+            return True
+        start = text.find(fragment, start + 1)
+    return False
 
 
 def _pi_needs_responses_api(model: str) -> bool:

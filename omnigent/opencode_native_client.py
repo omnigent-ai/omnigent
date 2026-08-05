@@ -28,9 +28,9 @@ import httpx
 _logger = logging.getLogger(__name__)
 
 # Pinned OpenCode CLI/API version range. The source monorepo reports
-# 1.17.7; we accept 1.17.x and refuse 1.18+ until validated.
+# 1.17.7; we accept 1.17.x and 1.18.x and refuse 1.19+ until validated.
 OPENCODE_MIN_VERSION = "1.17.7"
-OPENCODE_MAX_VERSION_EXCLUSIVE = "1.18.0"
+OPENCODE_MAX_VERSION_EXCLUSIVE = "1.19.0"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 

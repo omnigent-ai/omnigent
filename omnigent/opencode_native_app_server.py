@@ -98,7 +98,7 @@ _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Escape hatch: set truthy to bypass the OpenCode CLI version gate (e.g. to
-# try an as-yet-unvalidated 1.18+/v2 release). Mirrors OMNIGENT_NO_UPDATE_CHECK.
+# try an as-yet-unvalidated 1.19+/v2 release). Mirrors OMNIGENT_NO_UPDATE_CHECK.
 _SKIP_VERSION_CHECK_ENV = "OMNIGENT_OPENCODE_SKIP_VERSION_CHECK"
 
 
