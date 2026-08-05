@@ -166,6 +166,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
+    _host_launch_tasks,
     _logger,
     _managed_launch_tasks,
     _model_options_cache,
@@ -4249,9 +4250,10 @@ async def _launch_runner_on_host_impl(
     return _HostLaunchAttempt(runner_id=new_runner_id)
 
 
-async def cancel_managed_launch_tasks() -> None:
+async def cancel_background_launch_tasks() -> None:
     """
-    Cancel and await every in-flight background managed launch.
+    Cancel and await every in-flight background launch — managed sandbox
+    provisions and direct-host runner launches alike.
 
     Lifespan-teardown hook: without it, a slow provision outlives the
     ASGI shutdown and dies wherever the loop teardown happens to kill
@@ -4264,7 +4266,7 @@ async def cancel_managed_launch_tasks() -> None:
     :returns: None once every task has settled (cancellations and any
         in-flight failures are absorbed via ``return_exceptions``).
     """
-    tasks = list(_managed_launch_tasks)
+    tasks = list(_managed_launch_tasks) + list(_host_launch_tasks)
     if not tasks:
         return
     for task in tasks:
@@ -8910,5 +8912,5 @@ __all__ = [
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
     "announce_hosts_changed",
-    "cancel_managed_launch_tasks",
+    "cancel_background_launch_tasks",
 ]

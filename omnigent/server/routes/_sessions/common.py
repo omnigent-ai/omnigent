@@ -579,6 +579,12 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 
+# Background tasks awaiting a direct-host runner launch started by
+# ``POST /v1/sessions``. Held here so the loop can't garbage-collect a task
+# that nothing else references.
+_host_launch_tasks: set[asyncio.Task[None]] = set()
+
+
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
 
 
@@ -835,6 +841,7 @@ __all__ = [
     "_browser_action_owners",
     "_browser_action_registry",
     "_deferred_elicitation_clear_tasks",
+    "_host_launch_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
     "_logger",

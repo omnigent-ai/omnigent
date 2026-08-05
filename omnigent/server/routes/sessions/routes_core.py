@@ -103,6 +103,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _host_launch_tasks,
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
@@ -493,12 +494,16 @@ def register_core_routes(
                     )
                 )
                 host_registry.send_text(conn, launch_frame)
-                try:
-                    launch_result = await asyncio.wait_for(future, timeout=30.0)
-                except asyncio.TimeoutError:
-                    conn.pending_launches.pop(request_id, None)
-                    launch_result = {"status": "failed", "error": "host launch timed out"}
-                if launch_result.get("status") == "failed":
+
+                async def _settle_host_launch(session_id: str = resp.id) -> None:
+                    """Absorb the host's launch verdict off the create."""
+                    try:
+                        launch_result = await asyncio.wait_for(future, timeout=30.0)
+                    except asyncio.TimeoutError:
+                        conn.pending_launches.pop(request_id, None)
+                        launch_result = {"status": "failed", "error": "host launch timed out"}
+                    if launch_result.get("status") != "failed":
+                        return
                     # Lenient on every create-time launch failure, including
                     # an unconfigured harness: the picker's readiness data
                     # can be stale (the user may have run `omnigent setup`
@@ -511,7 +516,7 @@ def register_core_routes(
                     _logger.warning(
                         "Host %s failed to launch runner for session %s: %s",
                         launch_host_id,
-                        resp.id,
+                        session_id,
                         launch_result.get("error"),
                     )
                     # The runner never booted, so its pending=False clear
@@ -519,7 +524,21 @@ def register_core_routes(
                     # failed launch doesn't strand the Terminal-pill
                     # spinner. No-op when we never set it.
                     if _terminal_first_create:
-                        _publish_terminal_pending(resp.id, False)
+                        _publish_terminal_pending(session_id, False)
+
+                # Spawning a runner on the host takes seconds — a Python
+                # process boot, not a round-trip — and the session is already
+                # created and bound by here. Waiting for the verdict would
+                # hold the response (and so the Web UI's navigation into the
+                # session) for that whole time, for a result no caller acts
+                # on: the failure path is lenient either way. So settle it in
+                # the background, the same shape the managed-sandbox launch
+                # above uses. A first message racing the boot is expected and
+                # handled — it parks on post_event's host-bound connect grace
+                # until the runner registers.
+                launch_task = asyncio.create_task(_settle_host_launch())
+                _host_launch_tasks.add(launch_task)
+                launch_task.add_done_callback(_host_launch_tasks.discard)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 

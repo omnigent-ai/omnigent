@@ -256,6 +256,60 @@ async def _serve_one_launch(
     raise AssertionError("host never received a launch frame from the inline path")
 
 
+async def _serve_stat_then_hold_launch(
+    comm: ApplicationCommunicator,
+    release: asyncio.Event,
+) -> HostLaunchRunnerFrame:
+    """Answer the workspace stat, then sit on the launch until released.
+
+    Stands in for the real cost of a launch: the host has to spawn a runner
+    process, which takes seconds. Holding the reply lets a test observe what
+    the create does while the host is still silent.
+
+    :param comm: The connected host communicator.
+    :param release: Set by the test once it has asserted on the create; the
+        launch is answered ``launched`` after that, so the server's
+        background settle task finishes instead of being left pending.
+    :returns: The ``host.launch_runner`` frame the server sent.
+    """
+    for _ in range(40):
+        output = await comm.receive_output(timeout=3.0)
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStatFrame):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostStatResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            exists=True,
+                            type="directory",
+                            canonical_path=frame.path,
+                        )
+                    ),
+                }
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            await release.wait()
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostLaunchRunnerResultFrame(
+                            request_id=frame.request_id,
+                            status="launched",
+                            runner_id="runner_from_host",
+                        )
+                    ),
+                }
+            )
+            return frame
+    raise AssertionError("host never received a launch frame from the inline path")
+
+
 async def _serve_one_stop(comm: ApplicationCommunicator) -> str:
     """Answer the host's ``host.stop_runner`` round-trip for one Stop.
 
@@ -442,6 +496,56 @@ async def test_inline_launch_binds_runner_and_returns_host(
     assert conv.runner_id == body["runner_id"]
     assert conv.host_id == _HOST_ID
     assert conv.workspace == _WORKSPACE
+
+
+async def test_inline_launch_does_not_hold_the_create(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """The create returns while the host is still launching the runner.
+
+    Spawning a runner is a process boot on the host — seconds — and the
+    session exists and is bound before the launch frame goes out. Holding
+    the response for the verdict makes the user wait through that boot
+    before the Web UI can navigate into the session, for a result no caller
+    acts on (the failure path is lenient either way). Here the host never
+    answers the launch until the assertions are done, so a create that
+    waited would sit until the 30 s launch timeout and blow the wait_for.
+
+    :param client: ASGI test client.
+    :param app: The FastAPI app the fake host connects to.
+    :param db_uri: Conversation store URI for asserting the persisted row.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    release = asyncio.Event()
+    responder = asyncio.create_task(_serve_stat_then_hold_launch(comm, release))
+    resp = await asyncio.wait_for(
+        client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        ),
+        timeout=10.0,
+    )
+
+    # The binding is written before the frame is sent, so the response
+    # carries it even though the host hasn't reported back yet — that's what
+    # lets the UI route to the runner immediately.
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["host_id"] == _HOST_ID
+    assert body["runner_id"].startswith("runner_token_"), (
+        f"runner should be bound before the launch settles, got {body['runner_id']!r}"
+    )
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.runner_id == body["runner_id"]
+
+    # Let the launch finish so the background settle task isn't left pending.
+    release.set()
+    await responder
 
 
 async def test_inline_launch_failure_still_returns_bound_session(

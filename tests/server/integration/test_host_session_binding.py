@@ -1331,14 +1331,14 @@ async def test_managed_launch_fails_when_runner_never_connects(
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
-async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
+async def test_cancel_background_launch_tasks_returns_while_provision_parked(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Shutdown teardown does not hang on an in-flight managed provision.
 
-    The lifespan teardown calls ``cancel_managed_launch_tasks`` to
+    The lifespan teardown calls ``cancel_background_launch_tasks`` to
     stop background launches; with a provision parked on the fake's
     gate (a slow provider call), the cancel must settle the task and
     return promptly rather than waiting the provision out — a rolling
@@ -1347,7 +1347,7 @@ async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
     """
     import threading
 
-    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+    from omnigent.server.routes.sessions import cancel_background_launch_tasks
 
     env = managed_session_env
     gate = threading.Event()
@@ -1364,7 +1364,7 @@ async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
     # The launch is gate-held mid-provision. The teardown hook must
     # return well inside the provision's duration (the gate would hold
     # it 30s) — 5s is the generosity bound, not an expectation.
-    await asyncio.wait_for(cancel_managed_launch_tasks(), timeout=5.0)
+    await asyncio.wait_for(cancel_background_launch_tasks(), timeout=5.0)
 
     # Release the gate so the provision worker thread exits cleanly.
     gate.set()

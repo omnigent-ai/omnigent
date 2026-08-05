@@ -2501,7 +2501,7 @@ async def _run_managed_launch(
     step and the fresh sandbox is torn down.
 
     Server shutdown cancels this task (the lifespan teardown calls
-    :func:`cancel_managed_launch_tasks`); an already-provisioned
+    :func:`cancel_background_launch_tasks`); an already-provisioned
     sandbox then leaks until the provider's lifetime cap reaps it
     (the armed launch token expires with the same cap).
 
