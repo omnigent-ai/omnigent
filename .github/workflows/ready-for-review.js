@@ -1,0 +1,194 @@
+// Put a fresh PR into `waiting-for-review` once it clears the minimum bar, so
+// maintainers have a queue of PRs that are actually reviewable rather than the
+// whole open list.
+//
+// Until now `waiting-for-review` had exactly one entrance: the handoff that fires
+// when an author replies to feedback. A PR nobody had touched yet sat in neither
+// state, which is why almost every open PR carries no review-state label.
+//
+// The bar today is deliberately just "references an issue". It is meant to rise:
+// CI green, demo present, Polly clean. Each is a predicate added to `meetsBar`,
+// and the rest of this file stays the same.
+//
+// Never applied when:
+//   - the PR is a draft (the author is telling us it is not ready)
+//   - `waiting-on-author` is set (the ball is in the author's court; applying
+//     both would break the mutual exclusion the two labels rely on)
+//   - the label is already there (idempotent, and it must not fight a maintainer
+//     who removed it on purpose -- see REMOVED_BY_HUMAN below)
+//
+// Forward-only, sharing pr-issue-link.js's effective date: labelling 478 backlog
+// PRs in one sweep would bury the signal it exists to create.
+
+const issueLink = require("./pr-issue-link.js");
+
+const MS_PER_HOUR = 60 * 60 * 1000;
+const HOURS_TO_SCAN = 24;
+const REVIEW_LABEL = "waiting-for-review";
+const WAITING_LABEL = "waiting-on-author";
+
+const QUERY = `
+  query($cursor: String, $searchQuery: String!) {
+    rateLimit { remaining resetAt }
+    search(query: $searchQuery, type: ISSUE, first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        ... on PullRequest {
+          number
+          isDraft
+          labels(first: 30) { nodes { name } }
+          body
+          timelineItems(last: 50, itemTypes: [UNLABELED_EVENT]) {
+            nodes {
+              ... on UnlabeledEvent {
+                label { name }
+                actor { login }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const LINK_QUERY = `
+  query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        closingIssuesReferences(first: 1) { totalCount }
+      }
+    }
+  }
+`;
+
+// True when someone removed this label before. A maintainer who takes it off is
+// saying "not ready", and a sweep that reapplies it every hour would be arguing
+// with them.
+function removedBefore(pr) {
+  const events = pr.timelineItems?.nodes ?? [];
+  return events.some((e) => e?.label?.name === REVIEW_LABEL);
+}
+
+// Does this PR reference an issue? Reuses the same resolution as the nudge, so
+// the gate and the nudge can never disagree about what counts.
+async function referencesIssue({ github, core, owner, repo, pr }) {
+  try {
+    const resp = await github.graphql(LINK_QUERY, { owner, repo, number: pr.number });
+    if (resp.repository.pullRequest.closingIssuesReferences.totalCount > 0) return true;
+  } catch (err) {
+    // Unverifiable: say no rather than labelling on a guess.
+    core.warning(`Could not resolve links for #${pr.number}: ${err.message}`);
+    return false;
+  }
+  for (const candidate of issueLink.trackingReferences(pr.body)) {
+    try {
+      const { data } = await github.rest.issues.get({ owner, repo, issue_number: candidate });
+      if (!data.pull_request) return true;
+    } catch {
+      // A number that does not resolve proves nothing; try the next.
+    }
+  }
+  return false;
+}
+
+// Returns null when the PR is ready, or the reason it is not.
+async function belowBar(ctx) {
+  if (!(await referencesIssue(ctx))) return "no issue referenced";
+  return null;
+}
+
+module.exports = async ({ context, github, core }) => {
+  const { owner, repo } = context.repo;
+  const enforce = process.env.ENFORCE === "true";
+
+  try {
+    const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+    const cutoff = new Date(
+      Math.max(windowStart.getTime(), new Date(issueLink.EFFECTIVE_FROM).getTime())
+    );
+    const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
+    console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
+
+    let cursor = null;
+    let hasNextPage = true;
+    const allPRs = [];
+    while (hasNextPage) {
+      const response = await github.graphql(QUERY, { cursor, searchQuery });
+      const { remaining, resetAt } = response.rateLimit;
+      console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
+      const { nodes, pageInfo } = response.search;
+      hasNextPage = pageInfo.hasNextPage;
+      cursor = pageInfo.endCursor;
+      allPRs.push(...nodes);
+    }
+    console.log(`Found ${allPRs.length} open PRs in the window`);
+
+    const verdicts = [];
+    for (const pr of allPRs) {
+      const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
+      let skip = null;
+      if (pr.isDraft) skip = "draft";
+      else if (labels.includes(REVIEW_LABEL)) skip = "already labelled";
+      else if (labels.includes(WAITING_LABEL)) skip = "waiting on author";
+      else if (removedBefore(pr)) skip = "label was removed by hand";
+      if (skip) {
+        verdicts.push({ pr: pr.number, verdict: "skip", reason: skip });
+        continue;
+      }
+
+      const reason = await belowBar({ github, core, owner, repo, pr });
+      if (reason) {
+        verdicts.push({ pr: pr.number, verdict: "below bar", reason });
+        continue;
+      }
+
+      verdicts.push({ pr: pr.number, verdict: "READY", reason: "meets the bar" });
+      if (!enforce) continue;
+      await github.rest.issues.addLabels({
+        owner,
+        repo,
+        issue_number: pr.number,
+        labels: [REVIEW_LABEL],
+      });
+      console.log(`Added ${REVIEW_LABEL} to #${pr.number}`);
+    }
+
+    const counts = verdicts.reduce((acc, v) => {
+      acc[v.verdict] = (acc[v.verdict] || 0) + 1;
+      return acc;
+    }, {});
+    const summary = Object.entries(counts)
+      .map(([k, n]) => `${k}=${n}`)
+      .join(" ");
+    console.log(`Done (enforce=${enforce}). ${summary}`);
+
+    if (core.summary) {
+      core.summary
+        .addHeading(
+          `Ready-for-review gate ${enforce ? "(enforcing)" : "(dry run, nothing changed)"}`,
+          3
+        )
+        .addRaw(`\n${summary}\n\n`)
+        .addTable([
+          [
+            { data: "PR", header: true },
+            { data: "Verdict", header: true },
+            { data: "Reason", header: true },
+          ],
+          ...verdicts.map((v) => [`#${v.pr}`, v.verdict, v.reason]),
+        ]);
+      await core.summary.write();
+    }
+  } catch (error) {
+    if (error.status === 429 || error.message?.includes("rate limit")) {
+      console.log("Rate limit hit. Exiting gracefully.");
+      return;
+    }
+    throw error;
+  }
+};
+
+module.exports.removedBefore = removedBefore;
+module.exports.REVIEW_LABEL = REVIEW_LABEL;
