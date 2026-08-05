@@ -6067,6 +6067,18 @@ _MODEL_PICKER_PANE = """\
   Enter to set as default · s to use this session only · Esc to cancel
 """
 
+# The ``/effort`` confirmation: a framed two-choice menu with no title this
+# module can match, which is why ``confirm_hint`` is ``None`` for it.
+_EFFORT_DIALOG_PANE = """\
+  ⎿  Running /effort high
+╭────────────────────────────────────────────╮
+│ Changing effort resets the prompt cache.   │
+│                                            │
+│ ❯ 1. Yes, change it                        │
+│   2. No, keep the current effort           │
+╰────────────────────────────────────────────╯
+"""
+
 _IDLE_PANE = """\
   ⎿  Set model to Sonnet 5 and saved as your default for new sessions
 ──────────────────────────────
@@ -6090,6 +6102,26 @@ def _picker_bridge_dir(tmp_path: Path) -> Path:
         tmux_target="claude:0.0",
     )
     return bridge_dir
+
+
+class _VirtualClock:
+    """Clock whose ``sleep`` advances ``monotonic`` instead of blocking.
+
+    The dialog-confirm poll runs off ``monotonic``, so a no-op ``sleep``
+    alone would leave it spinning for its whole real-time budget.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
 
 
 def _fake_tmux(
@@ -6116,7 +6148,7 @@ def _fake_tmux(
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
-    monkeypatch.setattr(claude_native_bridge.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     return sends
 
 
@@ -6235,30 +6267,75 @@ def test_an_unrecognised_dialog_is_still_confirmed_by_the_blind_fallback(
     assert [args[-1] for args in sends] == ["Enter"]
 
 
-def test_a_command_with_no_known_dialog_text_confirms_without_polling(
+def test_a_command_with_no_known_dialog_text_confirms_blind_then_watches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``hint=None`` settles and confirms — it never burns the poll budget.
+    """``hint=None`` Enters at the settle, then keeps watching for a dialog.
 
-    This is the ``/effort`` call site: with no recognisable dialog title,
-    polling for one would cost ~4s of ``capture-pane`` on every effort change
-    and still end in the same blind Enter.
+    This is the ``/effort`` call site. When no dialog ever pops, the blind
+    Enter is the whole story and the watch just times out — one Enter total,
+    same as the pane saw before.
     """
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is False
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
+def test_a_dialog_already_showing_at_the_settle_needs_no_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The blind Enter answered it, so the poll budget is not burned."""
     captures: list[int] = []
 
     def _fake_capture(socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
         captures.append(1)
-        return _IDLE_PANE
+        return _EFFORT_DIALOG_PANE
 
     sends: list[list[str]] = []
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda _s, *a: sends.append(list(a)))
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
-    monkeypatch.setattr(claude_native_bridge.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
 
-    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is False
-    assert captures == []
+    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is True
+    assert captures == [1]
     assert [args[-1] for args in sends] == ["Enter"]
+
+
+def test_a_late_unrecognised_dialog_is_still_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warm-session race: the dialog renders long after the blind Enter.
+
+    The 0.3s Enter fired into an idle pane, and the dialog that arrived at
+    ~1.9s stayed open — the person's next message was typed into the modal and
+    swallowed. The watch has to outlive the blind Enter.
+    """
+    sends = _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE, _IDLE_PANE, _EFFORT_DIALOG_PANE, _IDLE_PANE],
+    )
+
+    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is True
+    # The blind fast-path Enter, then the one that actually answered the dialog.
+    assert [args[-1] for args in sends] == ["Enter", "Enter"]
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_IDLE_PANE, False),
+        (_EFFORT_DIALOG_PANE, True),
+        (_MODEL_PICKER_PANE, True),
+        ("  Switch model?\n", True),
+        # A restored composer draft that happens to start with a numbered
+        # line: one "choice" is not a menu.
+        ("──────────\n❯ 2. buy milk\n──────────\n", False),
+    ],
+)
+def test_pane_dialog_detection(pane: str, expected: bool) -> None:
+    assert claude_native_bridge._pane_shows_dialog(pane) is expected
 
 
 def test_an_effort_injection_with_no_dialog_completes_without_hanging(

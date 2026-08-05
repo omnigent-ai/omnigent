@@ -135,6 +135,12 @@ _CLAUDE_PROMPT_GLYPH = "❯"
 # followed by a numbered choice, which the chat input never renders. Used to
 # exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
 _SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
+# Matches any numbered choice row of a menu, selected or not (``2. No``).
+# Counting them is what separates a real dialog from a composer draft that
+# merely starts with ``2. `` — a dialog always offers at least two options.
+_NUMBERED_MENU_ROW_RE = re.compile(rf"(?:{_CLAUDE_PROMPT_GLYPH}\s*)?\d+\.\s")
+# Minimum numbered choices a menu must offer to count as a dialog.
+_MENU_MIN_CHOICES = 2
 # Box-drawing glyphs Claude Code's input-box frame is made of. A line of
 # these below ``❯`` marks the live input box (see ``_is_box_rule``),
 # distinguishing it from a bare prompt echoed into scrollback.
@@ -3038,8 +3044,9 @@ def inject_slash_command(
         :data:`SWITCH_MODEL_DIALOG_HINT`. When given, the dialog is polled
         for so a late render (~1.9s on a session with cached history) still
         gets its Enter. ``None`` — the command's dialog text is unknown —
-        settles briefly and confirms blind, and every path confirms blind on
-        a poll timeout rather than leaving an unrecognised dialog open.
+        confirms blind after a short settle and then keeps watching for any
+        dialog, so a late render still gets confirmed; every path confirms
+        blind on a poll timeout rather than leaving a dialog open.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, or contains a newline.
     :raises RuntimeError: If the tmux target is not advertised in
@@ -3072,35 +3079,108 @@ def _confirm_tui_dialog(
     """
     Accept a TUI confirmation dialog, watching for *hint* when one is known.
 
-    A recognised dialog is polled for rather than slept past, because a fixed
-    sleep dropped the Enter on a warm session and left the dialog open. But a
-    poll is only as good as its hint: ``/effort``'s dialog is not titled
-    "Switch model?", so a hint-only confirm would hang the pane forever. The
-    blind Enter below is therefore the floor for every path — on the
-    no-dialog case (a fresh session pops none) it lands on an empty prompt
-    and is a no-op, which is what the unconditional confirm did before.
+    A dialog is polled for rather than slept past, because a fixed sleep
+    dropped the Enter on a warm session and left the dialog open. Without a
+    hint the poll falls back to the structural :func:`_pane_shows_dialog`
+    check, and the blind Enter is sent first so the common no-dialog case
+    still costs only the settle: on a warm session the dialog renders ~1.9s
+    after the command, long after a 0.3s Enter has landed on the empty prompt,
+    so the watch has to outlive that Enter or the dialog stays open and eats
+    the person's next message.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param hint: Text the dialog renders, e.g. ``"Switch model?"``, or
-        ``None`` to skip the poll and confirm blind.
+        ``None`` to watch for any dialog instead.
     :param timeout_s: Seconds to watch for the dialog, e.g. ``4.0``.
-    :returns: ``True`` when *hint* was matched, ``False`` on the blind
-        confirm.
+    :returns: ``True`` when a dialog was seen and confirmed, ``False`` when
+        the watch timed out on the blind confirm alone.
     """
     if hint is None:
-        time.sleep(_BLIND_CONFIRM_SETTLE_S)
-    else:
-        deadline = time.monotonic() + timeout_s
-        while True:
-            if hint in _capture_pane(socket_path, tmux_target):
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-                return True
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        return _confirm_unrecognised_dialog(socket_path, tmux_target, timeout_s=timeout_s)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if hint in _capture_pane(socket_path, tmux_target):
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
+
+
+def _confirm_unrecognised_dialog(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    timeout_s: float,
+) -> bool:
+    """
+    Confirm a dialog whose text we cannot recognise, e.g. ``/effort``'s.
+
+    Enters once after the settle — the fast path, and a no-op on the empty
+    prompt when no dialog pops — then keeps watching for one until *timeout_s*
+    and Enters again if it turns up. Watching only until the settle was the
+    bug: a warm session renders the dialog ~1.9s in, so the single Enter fired
+    into nothing and the person's next message was typed into the modal.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param timeout_s: Seconds to keep watching after the blind Enter.
+    :returns: ``True`` when a dialog was seen and confirmed.
+    """
+    time.sleep(_BLIND_CONFIRM_SETTLE_S)
+    # Already up: the blind Enter answers it, and there is nothing left to wait
+    # for — the poll below would just burn its whole budget on an idle pane.
+    already_showing = _pane_shows_dialog(_capture_pane(socket_path, tmux_target))
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    if already_showing:
+        return True
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _pane_shows_dialog(_capture_pane(socket_path, tmux_target)):
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _pane_shows_dialog(pane: str) -> bool:
+    """
+    Report whether a pane renders a TUI dialog or menu over the input box.
+
+    Used where the dialog's own text is unknown, so the signal is structural:
+    a menu offering at least :data:`_MENU_MIN_CHOICES` numbered rows with one
+    of them selected by ``❯``. The two-choice floor is what keeps a restored
+    composer draft that happens to start ``2. buy milk`` from reading as a
+    dialog. Box-frame glyphs are stripped first — a confirmation renders its
+    rows inside a ``│ … │`` frame, the ``/model`` picker does not.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a dialog or menu appears to be open.
+    """
+    if _MODEL_PICKER_OPEN_HINT in pane or _SWITCH_MODEL_DIALOG_HINT in pane:
+        return True
+    rows = [_strip_box_frame(line) for line in pane.splitlines()]
+    if not any(_SELECTED_MENU_ROW_RE.match(row) for row in rows):
+        return False
+    choices = sum(1 for row in rows if _NUMBERED_MENU_ROW_RE.match(row))
+    return choices >= _MENU_MIN_CHOICES
+
+
+def _strip_box_frame(line: str) -> str:
+    """
+    Strip surrounding whitespace and box-frame glyphs off a pane line.
+
+    ``"│ ❯ 1. Yes      │"`` becomes ``"❯ 1. Yes"`` so the menu-row patterns,
+    which anchor at the start of the line, still see the row.
+
+    :param line: A single pane line.
+    :returns: The line's content without its frame.
+    """
+    return line.strip().strip("".join(_BOX_RULE_CHARS)).strip()
 
 
 def display_cost_approval_popup(
