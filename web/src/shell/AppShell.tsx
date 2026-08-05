@@ -417,8 +417,7 @@ export function AppShell() {
     !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 1);
   // Agent tools/policies exist to show.
   const hasAgentInfo = !!conversationId && agentHasInfo(boundAgent, conversationId);
-  // Whether the mobile three-dot menu has any entry to offer. Copy-resume
-  // needs only a session, so any open session keeps the menu populated.
+  // Any open session keeps the mobile menu populated (copy-resume needs only a session id).
   const hasHeaderMenu = canShare || hasAgentInfo || !!conversationId;
   // Claude-native sub-agents have no terminal of their own — the parent
   // owns the tmux pane.

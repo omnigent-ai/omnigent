@@ -11,14 +11,8 @@ import { showToast } from "@/components/ui/toast";
 /** How long the affordance holds its confirmed (check icon) state. */
 const COPIED_RESET_MS = 2000;
 
-/**
- * Copy this session's `omnigent resume` command to the clipboard.
- *
- * Shared by the desktop header button and the mobile session menu so the
- * two entry points can't drift apart. Returns `copied` for the
- * confirmed-state icon swap; the toast names the command that landed on
- * the clipboard, which the icon alone can't convey.
- */
+// Shared by the desktop header button and the mobile menu so the two entry
+// points can't drift apart.
 export function useCopyResumeCommand(conversationId: string): {
   copied: boolean;
   copyResumeCommand: () => Promise<void>;
@@ -59,13 +53,8 @@ export function useCopyResumeCommand(conversationId: string): {
   return { copied, copyResumeCommand };
 }
 
-/**
- * Header action that copies this session's `omnigent resume` command, so
- * a session opened in the browser can be picked back up in a terminal.
- *
- * Copy-only: the browser can't launch a local terminal, so handing the
- * user the exact command is the whole affordance.
- */
+// Copy-only: the browser can't launch a local terminal, so handing the
+// user the exact command is the whole affordance.
 export function ResumeSessionButton({ conversationId }: { conversationId: string }) {
   const { copied, copyResumeCommand } = useCopyResumeCommand(conversationId);
   const label = copied ? "Resume command copied" : "Copy resume command";
@@ -84,8 +73,6 @@ export function ResumeSessionButton({ conversationId }: { conversationId: string
           {copied ? <CheckIcon className="size-4" /> : <TerminalIcon className="size-4" />}
         </Button>
       </TooltipTrigger>
-      {/* Bottom placement matches the header's other tooltips, keeping
-          clear of the Electron shell's title-bar strip. */}
       <TooltipContent side="bottom">
         {copied ? label : "Copy `omnigent resume` command"}
       </TooltipContent>
@@ -93,13 +80,9 @@ export function ResumeSessionButton({ conversationId }: { conversationId: string
   );
 }
 
-/**
- * Mobile three-dot menu counterpart of {@link ResumeSessionButton}.
- *
- * A phone rarely has the terminal that would consume the command, but it
- * may well be the device the user is reading the session on — copying
- * here lets them paste it into a note or a remote shell app.
- */
+// Mobile three-dot menu counterpart of ResumeSessionButton; a phone may not
+// have a terminal handy but can still paste the command into a note or
+// remote shell.
 export function ResumeSessionMenuItem({ conversationId }: { conversationId: string }) {
   const { copyResumeCommand } = useCopyResumeCommand(conversationId);
   return (

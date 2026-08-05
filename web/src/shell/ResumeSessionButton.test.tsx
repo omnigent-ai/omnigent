@@ -20,11 +20,7 @@ describe("buildResumeCommand", () => {
       conversationId: "conv-abc123",
       serverUrl: "https://example.databricksapps.com",
     });
-    // One line: the string is copied straight into a shell, never rendered
-    // in a narrow box, so it must not carry backslash continuations.
-    expect(command).toBe(
-      "omnigent resume conv-abc123 --server https://example.databricksapps.com",
-    );
+    expect(command).toBe("omnigent resume conv-abc123 --server https://example.databricksapps.com");
     expect(command).not.toContain("\n");
     expect(command).not.toContain("\\");
   });
@@ -49,9 +45,6 @@ describe("ResumeSessionButton", () => {
     screen.getByTestId("copy-resume-command").click();
 
     await waitFor(() => {
-      // The window origin is the CLI server URL in tests (no suffix
-      // configured), so the command resumes against the same server the
-      // browser is talking to.
       expect(writeText).toHaveBeenCalledWith(
         `omnigent resume conv-abc123 --server ${window.location.origin}`,
       );
@@ -64,8 +57,6 @@ describe("ResumeSessionButton", () => {
     const button = screen.getByRole("button", { name: "Copy resume command" });
     button.click();
 
-    // The icon swap alone doesn't say *which* command landed on the
-    // clipboard — the accessible name and the toast both must.
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Resume command copied" })).toBeInTheDocument();
     });
@@ -80,8 +71,6 @@ describe("ResumeSessionButton", () => {
 
     screen.getByTestId("copy-resume-command").click();
 
-    // A rejected clipboard write must not flip the button to its
-    // confirmed state — that would tell the user a lie.
     await waitFor(() => {
       expect(screen.getByTestId("toast")).toHaveTextContent("Couldn't copy the resume command");
     });

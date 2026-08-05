@@ -271,14 +271,10 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
 describe("ChatHeader — copy-resume-command placement", () => {
   it("offers the resume action for an open session", () => {
     renderHeaderWithSession(makeTerminalFirstCtx());
-    // The affordance needs only a session id, so it rides along with any
-    // open conversation regardless of share/agent-info gating.
     expect(screen.getByTestId("copy-resume-command")).toBeInTheDocument();
   });
 
   it("omits the resume action on the landing composer", () => {
-    // No conversationId: there is no session to resume, so the button
-    // must not render (it would copy a command naming nothing).
     renderHeader({ sidebarOpen: true });
     expect(screen.queryByTestId("copy-resume-command")).toBeNull();
   });

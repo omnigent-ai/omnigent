@@ -1,17 +1,5 @@
-/**
- * Build the `omnigent resume` command that reattaches a terminal to a
- * session opened in the browser.
- *
- * `omnigent resume <id>` looks the conversation up, reads its
- * `omnigent.wrapper` label, and hands off to the matching native
- * wrapper. `--server` is carried explicitly — the browser already knows
- * which server it is talking to, and naming it resumes against that
- * same server whether it is local or deployed.
- *
- * Emitted as ONE line: unlike the reconnect dialog's backslash-wrapped
- * form, this string is only ever copied (never rendered in a narrow
- * box), so it should paste into a shell as a single command.
- */
+// One line so it pastes straight into a shell; `--server` is explicit so the
+// command resumes against whichever server the browser is talking to.
 export function buildResumeCommand({
   conversationId,
   serverUrl,
