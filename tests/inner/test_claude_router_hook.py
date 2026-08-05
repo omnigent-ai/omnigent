@@ -431,7 +431,28 @@ def test_rejected_advertisements_explain_themselves_on_stderr(
 ) -> None:
     advertise_router(tmp_path, url="http://10.0.0.5:9000")
     assert subagent_router.read_router_endpoint(tmp_path) is None
-    assert "not plain http on loopback" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "not plain http on loopback" in err
+    assert subagent_router.ADVERTISEMENT_FILE in err
+
+
+@pytest.mark.parametrize(
+    ("url", "pid"),
+    [
+        ("http://10.0.0.5:9000", None),
+        ("http://127.0.0.1:9000/", 2**22 - 1),
+    ],
+)
+def test_rejection_diagnostics_never_echo_the_advertisement(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], url: str, pid: object
+) -> None:
+    """The advertisement holds a bearer token, so nothing off it is logged."""
+    advertise_router(tmp_path, url=url, pid=pid, token="s3cr3t-bearer-value")
+    assert subagent_router.read_router_endpoint(tmp_path) is None
+    err = capsys.readouterr().err
+    assert err.strip()
+    assert "s3cr3t-bearer-value" not in err
+    assert url not in err
 
 
 def test_other_tools_are_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

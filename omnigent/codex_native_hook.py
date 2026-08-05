@@ -307,7 +307,9 @@ def _main_route_turn(argv: list[str]) -> int:
     )
     decision = _post_json(url, endpoint.token, body, HOOK_REQUEST_TIMEOUT_S)
     if decision is None:
-        trace_turn_routing(bridge_dir, "fail-open", f"no verdict from {endpoint.url}")
+        # Not the endpoint URL: it comes out of the advertisement that also
+        # holds the bearer token, and this trace is world-readable stderr.
+        trace_turn_routing(bridge_dir, "fail-open", "no verdict from the turn router")
         return 0
     model = decision.get("model")
     if decision.get("action") != "route" or not isinstance(model, str) or not model:

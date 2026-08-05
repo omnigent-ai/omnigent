@@ -183,11 +183,14 @@ def read_router_endpoint(
     token = payload.get("token")
     if not isinstance(url, str) or not url or not isinstance(token, str) or not token:
         return None
+    # The rejected URL itself is never echoed: the advertisement it came from
+    # also carries the bearer token, so anything derived from it stays out of
+    # logs. The file name plus the reason is enough to find it on disk.
     if not _is_loopback_url(url):
-        _diagnose(f"ignoring advertised router at {url!r}: not plain http on loopback")
+        _diagnose(f"ignoring the router advertised in {filename}: not plain http on loopback")
         return None
     if not _advertiser_alive(payload.get("pid")):
-        _diagnose(f"ignoring advertised router at {url!r}: advertiser pid not alive")
+        _diagnose(f"ignoring the router advertised in {filename}: advertiser pid not alive")
         return None
     session_id = payload.get("session_id")
     return RouterEndpoint(

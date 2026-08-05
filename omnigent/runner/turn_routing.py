@@ -1461,9 +1461,9 @@ def ensure_session_turn_router(
             exc_info=True,
         )
         return None
-    _logger.info(
-        "turn router started: session=%s url=%s dir=%s", session_id, router.url, bridge_dir
-    )
+    # The URL is not logged: it is a field of the same handle that holds the
+    # bearer token, and the advertisement on disk already names both.
+    _logger.info("turn router started: session=%s dir=%s", session_id, bridge_dir)
     return router
 
 

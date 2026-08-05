@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -1131,6 +1132,33 @@ def test_ensure_session_router_is_idempotent_and_advertises_everywhere(
         assert env["OMNIGENT_CODEX_SUBAGENT_ROUTER_DIR"] == str(first_dir)
         shutdown_session_router("conv_lifecycle")
         assert session_router_env("conv_lifecycle") == {}
+
+    asyncio.run(_run())
+
+
+def test_router_startup_log_omits_the_rendezvous(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The handle carries the bearer token, so neither url nor token is logged."""
+
+    class _DeadClient:
+        async def post(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("server down")
+
+    async def _run() -> None:
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.subagent_routing"):
+            router = ensure_session_router(
+                "conv_log_redaction",
+                bridge_dir=tmp_path,
+                server_client=_DeadClient(),
+            )
+        try:
+            text = caplog.text
+            assert "subagent router started" in text
+            assert router.token not in text
+            assert router.url not in text
+        finally:
+            shutdown_session_router("conv_log_redaction")
 
     asyncio.run(_run())
 
