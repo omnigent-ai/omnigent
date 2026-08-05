@@ -26,6 +26,8 @@ reply still follows.
 
 from __future__ import annotations
 
+import time
+
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
@@ -60,6 +62,31 @@ _PROBE = """() => {
 }"""
 
 
+def _settled_geometry(page: Page, timeout_s: float = 15.0) -> dict:
+    """Read :data:`_PROBE` once two consecutive reads agree.
+
+    The layout settles through several passes — the composer's measurement, the
+    trailing spacer's ResizeObserver, then stick-to-bottom — and how long that
+    takes varies with CI load. Polling for a stable read beats sleeping a fixed
+    guess: it can't return mid-settle, and it doesn't pay a fixed cost once the
+    layout is already quiet.
+
+    :param page: Playwright page on the chat surface.
+    :param timeout_s: How long to keep polling before giving up.
+    :returns: The probe reading, once stable.
+    :raises AssertionError: If the layout never stops changing.
+    """
+    previous = page.evaluate(_PROBE)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(100)
+        current = page.evaluate(_PROBE)
+        if current == previous:
+            return current
+        previous = current
+    raise AssertionError(f"layout never settled; last reading: {previous}")
+
+
 def test_composer_growth_does_not_shift_transcript(
     page: Page,
     seeded_session: tuple[str, str],
@@ -83,12 +110,10 @@ def test_composer_growth_does_not_shift_transcript(
     expect(sections).to_have_count(6, timeout=30_000)
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
-    # Let the initial scroll-to-bottom and the trailing spacer's measurement
-    # settle, so the baseline is the resting layout.
-    page.wait_for_timeout(1500)
-
     composer.click()
-    baseline = page.evaluate(_PROBE)
+    # The baseline is the resting layout: the initial scroll-to-bottom and the
+    # trailing spacer's measurement have both landed.
+    baseline = _settled_geometry(page)
     assert baseline["distanceFromBottom"] <= 1, baseline
     assert baseline["railTicks"], baseline
 
@@ -101,22 +126,19 @@ def test_composer_growth_does_not_shift_transcript(
     # Grow: three Shift+Enter newlines, one line taller each.
     for _ in range(3):
         composer.press("Shift+Enter")
-    page.wait_for_timeout(500)
-    grown = page.evaluate(_PROBE)
+    grown = _settled_geometry(page)
     assert grown["composerHeight"] > baseline["composerHeight"], grown
     assert_transcript_idle(grown, "after newlines")
 
     # Type into the now-multi-line composer: the height doesn't change, but the
     # hook re-measures — and used to clamp the transcript on every keystroke.
     composer.type("hello", delay=30)
-    page.wait_for_timeout(500)
-    assert_transcript_idle(page.evaluate(_PROBE), "after typing")
+    assert_transcript_idle(_settled_geometry(page), "after typing")
 
     # Shrink back: deleting the newlines returns the composer to one row and
     # still leaves the transcript untouched.
     for _ in range(len("hello") + 3):
         composer.press("Backspace")
-    page.wait_for_timeout(500)
-    shrunk = page.evaluate(_PROBE)
+    shrunk = _settled_geometry(page)
     assert shrunk["composerHeight"] == baseline["composerHeight"], (baseline, shrunk)
     assert_transcript_idle(shrunk, "after deleting")
