@@ -63,6 +63,22 @@ databricks bundle run issue_prioritization --target dev --profile <profile> \
 priorities were adopted. Human-authored priority events remain blocked in
 `mutations.json`.
 
+## Dashboard draft
+
+Prepare an idempotent local dashboard draft after a complete scoring run:
+
+```bash
+databricks api get /api/2.0/lakeview/dashboards/<dashboard-id> \
+  --profile <profile> > /tmp/issue-dashboard.json
+uv run --project deploy/issue_prioritization issue-priority-dashboard-draft \
+  --input /tmp/issue-dashboard.json \
+  --output /tmp/issue-dashboard-draft.json
+```
+
+The draft adds a top-200 ranking table backed by `issue_scores_latest`. The
+command only writes the local output file; it never updates or publishes a
+dashboard.
+
 ## GitHub apply gate
 
 The schedule is paused. GitHub writes additionally require `mode=apply`, the

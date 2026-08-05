@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 
 [project.scripts]
 issue-priority = "issue_prioritization.cli:main"
+issue-priority-dashboard-draft = "issue_prioritization.dashboard:main"
 issue-priority-job = "issue_prioritization.job:main"
 
 [dependency-groups]
