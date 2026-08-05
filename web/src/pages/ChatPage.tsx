@@ -4005,7 +4005,6 @@ export function Composer({
   subAgentLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
-  const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4033,6 +4032,8 @@ export function Composer({
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useDictationInsert(value, setValue, textareaRef);
+  const resetDictation = dictation.reset;
   const isComposingRef = useRef(false);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
@@ -4138,7 +4139,7 @@ export function Composer({
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
-  const voiceSnapshotRef = useRef("");
+  const voiceSnapshotRef = useRef({ text: "", start: 0, end: 0 });
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
@@ -4156,6 +4157,7 @@ export function Composer({
 
   useEffect(() => {
     const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
+    resetDictation();
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -4172,7 +4174,7 @@ export function Composer({
       }
       saveDraftsToStorage(sessionDrafts);
     };
-  }, [conversationId]);
+  }, [conversationId, resetDictation]);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only
@@ -4310,6 +4312,7 @@ export function Composer({
     mentionEntries,
     text: value,
     setText: (next) => {
+      dictation.reset();
       setValue(next);
       dirtyRef.current = true;
     },
@@ -4364,6 +4367,7 @@ export function Composer({
           return true;
         }
         dirtyRef.current = true;
+        dictation.reset();
         setValue("");
         setCommandError(null);
         void useChatStore
@@ -4382,6 +4386,7 @@ export function Composer({
         }
         const level = arg.toLowerCase() === "default" ? null : arg.toLowerCase();
         dirtyRef.current = true;
+        dictation.reset();
         setValue("");
         setCommandError(null);
         void useChatStore
@@ -4410,6 +4415,7 @@ export function Composer({
         // ``setModel(null)`` sends the server's "default" clear sentinel.
         const clear = ["default", "off", "reset"].includes(target.toLowerCase());
         dirtyRef.current = true;
+        dictation.reset();
         setValue("");
         setCommandError(null);
         // Confirmation is a durable `[System: model changed to X]` note the
@@ -4472,11 +4478,13 @@ export function Composer({
     setMenuIndex(-1);
     if (slashCommandsWithArgs.has(cmd)) {
       // Fill in "cmd " and let the user type the argument.
+      dictation.reset();
       setValue(cmd + " ");
       dirtyRef.current = true;
       textareaRef.current?.focus();
     } else {
       // Execute immediately — no argument needed.
+      dictation.reset();
       setValue("");
       setCommandError(null);
       executeSlashCommand(cmd, "");
@@ -4583,6 +4591,7 @@ export function Composer({
       const canOpenModelPicker = codexModelOptions.length > 0;
       if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         dirtyRef.current = true;
+        dictation.reset();
         setValue("");
         setCommandError(null);
         setPickerOpenNonce((n) => n + 1);
@@ -4605,6 +4614,7 @@ export function Composer({
         appendEntry(trimmed);
         onSendSlashCommand(parts[0].slice(1), skillArgs);
         dirtyRef.current = true;
+        dictation.reset();
         setValue("");
         setCommandError(null);
         onClearAllQuotes();
@@ -4613,6 +4623,7 @@ export function Composer({
     }
 
     setCommandError(null);
+    dictation.reset();
     // Prepend all active reply quotes as Markdown blockquotes.
     const quotePreamble =
       replyQuotes.length > 0
@@ -4659,6 +4670,7 @@ export function Composer({
 
   const applyRecall = (ta: HTMLTextAreaElement, recalled: string) => {
     recallingRef.current = true;
+    dictation.reset();
     setValue(recalled);
     dirtyRef.current = true;
     // Move the caret to the end after React applies the new value. Without
@@ -4701,6 +4713,7 @@ export function Composer({
       if (e.key === "Escape") {
         e.preventDefault();
         // Dismiss the menu by clearing the input so the user can start fresh.
+        dictation.reset();
         setValue("");
         setMenuIndex(-1);
         return;
@@ -4808,6 +4821,7 @@ export function Composer({
           // Re-sending re-queues it (busy) or sends it (idle).
           const target = queuedMessages.find((m) => m.queueId === queueId);
           if (!target) return;
+          dictation.reset();
           setValue(target.text);
           setFiles(target.files ?? []);
           dequeueMessage(queueId);
@@ -4922,6 +4936,7 @@ export function Composer({
             ref={textareaRef}
             value={value}
             onChange={(e) => {
+              dictation.reconcileUserEdit(e.target.value);
               setValue(e.target.value);
               dirtyRef.current = true;
               if (commandError !== null) setCommandError(null);
@@ -5084,12 +5099,20 @@ export function Composer({
               enableHotkey
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onVoiceStart={() => {
-                voiceSnapshotRef.current = value;
+                const selection = dictation.begin();
+                voiceSnapshotRef.current = { text: value, ...selection };
               }}
               onVoiceDiscard={() => {
-                setValue(voiceSnapshotRef.current);
+                const snapshot = voiceSnapshotRef.current;
+                dictation.reset();
+                setValue(snapshot.text);
+                queueMicrotask(() => {
+                  textareaRef.current?.focus();
+                  textareaRef.current?.setSelectionRange(snapshot.start, snapshot.end);
+                });
               }}
               onTranscript={(text) => {
+                dismissMention();
                 dictation.appendFinal(text);
                 dirtyRef.current = true;
                 // Dictation is a user-driven edit — exit prompt-recall mode
@@ -5098,6 +5121,7 @@ export function Composer({
                 if (commandError !== null) setCommandError(null);
               }}
               onInterim={(text) => {
+                dismissMention();
                 dictation.replaceInterim(text);
                 dirtyRef.current = true;
                 resetCursor();
