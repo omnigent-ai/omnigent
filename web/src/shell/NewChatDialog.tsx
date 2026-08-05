@@ -2103,12 +2103,31 @@ export function NewChatLandingScreen() {
   // once per settled workspace (and can't loop once it sets a branch name).
   const worktreeSeededForRef = useRef<string | null>(null);
 
+  // Signature of the stored config the machine last settled from. Lets a later
+  // save be noticed even when the pencil re-opens the SAME project — the config
+  // content changes while `projectParam` does not. `null` = not yet seeded.
+  const seededConfigSigRef = useRef<string | null>(null);
+  const prefillConfigSig = useMemo(
+    () => (prefillConfig === undefined ? null : JSON.stringify(prefillConfig)),
+    [prefillConfig],
+  );
+
   // The landing screen stays mounted while `?project=` changes (clicking
   // another project's pencil), so re-create a fresh visit by hand: clear
   // every seedable slot and restart the machine. Values the user set are
-  // reset too — a pencil click means "set me up for this project".
+  // reset too — a pencil click means "set me up for this project". Also
+  // restart when the SAME project's stored defaults change (the user edited
+  // its settings, then re-opened its composer): `projectParam` stays put, so
+  // without this the already-settled machine would keep the stale seeds.
   useEffect(() => {
-    if (prefill.project === projectParam) return;
+    const projectChanged = prefill.project !== projectParam;
+    const configChanged =
+      !projectChanged &&
+      projectParam !== "" &&
+      prefillConfigSig !== null &&
+      seededConfigSigRef.current !== null &&
+      prefillConfigSig !== seededConfigSigRef.current;
+    if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
@@ -2116,8 +2135,19 @@ export function NewChatLandingScreen() {
     setBranchName("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
+    seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project]);
+  }, [projectParam, prefill.project, prefillConfigSig]);
+
+  // Record the config the machine settled from, once it's loaded and the
+  // machine is done, so the reseed effect above can spot a later change to it
+  // (the reseed on a project switch runs before the config has loaded, leaving
+  // the signature `null` until this fills it in).
+  useEffect(() => {
+    if (prefill.project !== projectParam) return;
+    if (prefillConfigSig === null || !prefillDone(prefill)) return;
+    seededConfigSigRef.current = prefillConfigSig;
+  }, [prefill, projectParam, prefillConfigSig]);
 
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
