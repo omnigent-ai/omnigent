@@ -77,7 +77,7 @@ class GitHubAPI:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read()
             return json.loads(raw.decode()) if raw else None
 
@@ -89,15 +89,15 @@ class GitHubAPI:
         result = self._request("https://api.github.com/graphql", payload, "POST")
         if result and result.get("errors"):
             raise RuntimeError(f"GraphQL error: {result['errors']}")
-        nodes = (
-            result.get("data", {})
-            .get("repository", {})
-            .get("pullRequest", {})
-            .get("closingIssuesReferences", {})
-            .get("nodes", [])
-        )
+        # GitHub may return null for data or any intermediate node (e.g. an
+        # unknown PR number), so treat each missing level as empty.
+        data = (result or {}).get("data") or {}
+        repository = data.get("repository") or {}
+        pull_request = repository.get("pullRequest") or {}
+        nodes = (pull_request.get("closingIssuesReferences") or {}).get("nodes") or []
         return [
-            [label["name"] for label in node.get("labels", {}).get("nodes", [])] for node in nodes
+            [label["name"] for label in (node.get("labels") or {}).get("nodes") or []]
+            for node in nodes
         ]
 
     def pull_labels(self, pull_number: int) -> list[str]:
@@ -158,7 +158,12 @@ def main() -> int:
     if not pull_number:
         print("PR_NUMBER is required", file=sys.stderr)
         return 1
-    run(repo, int(pull_number), GitHubAPI(token, repo))
+    try:
+        pull_number_int = int(pull_number)
+    except ValueError:
+        print(f"PR_NUMBER must be an integer, got {pull_number!r}", file=sys.stderr)
+        return 1
+    run(repo, pull_number_int, GitHubAPI(token, repo))
     return 0
 
 

@@ -101,5 +101,44 @@ class SyncPullTest(unittest.TestCase):
         self.assertEqual(api.removed, [])
 
 
+class ClosingIssueLabelsParseTest(unittest.TestCase):
+    """GraphQL response parsing tolerates null nodes and surfaces errors."""
+
+    def _api_returning(self, response: object) -> sync_pr_priority.GitHubAPI:
+        api = sync_pr_priority.GitHubAPI("token", "owner/name")
+
+        def stub_request(*_args: object, **_kwargs: object) -> object:
+            return response
+
+        api._request = stub_request  # type: ignore[method-assign]
+        return api
+
+    def test_parses_labels(self) -> None:
+        response = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "closingIssuesReferences": {
+                            "nodes": [{"labels": {"nodes": [{"name": "P1-high"}]}}]
+                        }
+                    }
+                }
+            }
+        }
+        self.assertEqual(self._api_returning(response).closing_issue_labels(1), [["P1-high"]])
+
+    def test_null_data_yields_empty(self) -> None:
+        self.assertEqual(self._api_returning({"data": None}).closing_issue_labels(1), [])
+
+    def test_null_pull_request_yields_empty(self) -> None:
+        response = {"data": {"repository": {"pullRequest": None}}}
+        self.assertEqual(self._api_returning(response).closing_issue_labels(1), [])
+
+    def test_errors_raise(self) -> None:
+        response = {"data": None, "errors": [{"message": "boom"}]}
+        with self.assertRaises(RuntimeError):
+            self._api_returning(response).closing_issue_labels(1)
+
+
 if __name__ == "__main__":
     unittest.main()

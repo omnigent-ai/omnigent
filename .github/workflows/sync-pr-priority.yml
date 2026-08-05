@@ -74,7 +74,9 @@ jobs:
 
           if [[ "${EVENT_NAME}" == "issues" ]]; then
             # Only relevant when a priority label was (un)set on the issue.
-            prs=$(
+            # On lookup failure, warn and treat as no PRs rather than failing
+            # the whole workflow.
+            if ! prs=$(
               gh api graphql -f query='
                 query($owner:String!,$name:String!,$number:Int!){
                   repository(owner:$owner,name:$name){
@@ -86,9 +88,11 @@ jobs:
                   }
                 }' \
                 -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="${ISSUE_NUMBER}" \
-                --jq '.data.repository.issue.closedByPullRequestsReferences.nodes[].number' \
-              || true
-            )
+                --jq '.data.repository.issue.closedByPullRequestsReferences.nodes[].number'
+            ); then
+              echo "::warning::Failed to resolve PRs closing issue #${ISSUE_NUMBER}; skipping sync."
+              prs=""
+            fi
           elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             prs="${PR_FROM_DISPATCH}"
           else
@@ -104,10 +108,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          PRS: ${{ steps.resolve.outputs.prs }}
         run: |
           set -euo pipefail
           while read -r pr; do
             [[ -z "${pr}" ]] && continue
             echo "Syncing PR #${pr}"
             PR_NUMBER="${pr}" python3 .github/scripts/sync_pr_priority.py
-          done <<< "${{ steps.resolve.outputs.prs }}"
+          done <<< "${PRS}"
