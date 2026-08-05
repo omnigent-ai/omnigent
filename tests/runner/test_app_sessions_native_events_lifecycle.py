@@ -2802,9 +2802,10 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, command, timeout_s))
+        captured.append((bridge_dir, command, timeout_s, confirm_hint))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -2871,8 +2872,12 @@ async def test_events_effort_change_on_native_session_types_slash_command(
     assert len(captured) == 1, (
         f"Expected one inject_slash_command call from native effort_change, got {len(captured)}."
     )
-    bridge_dir, command, timeout_s = captured[0]
+    bridge_dir, command, timeout_s, confirm_hint = captured[0]
     assert bridge_dir == bridge_dir_for_conversation_id("c7e9584b9bb34910a0068521106c1abc")
+    # No ``confirm_hint``: the effort dialog is not the "Switch model?" one, so
+    # watching for that text would never match and the pane would stay wedged
+    # behind an unconfirmed modal. The blind confirm covers it.
+    assert confirm_hint is None
     # Body contract: ``/effort high`` is the literal Claude Code's TUI
     # accepts. A regression in shape (``/efforthigh``, ``effort high``,
     # missing leading slash) would either 404 on the slash router or

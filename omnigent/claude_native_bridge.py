@@ -179,12 +179,18 @@ _MODEL_PICKER_OPEN_HINT = "use this session only"
 # Title of the confirmation dialog Claude Code pops when switching models
 # invalidates the prompt cache. It only appears on a session with history,
 # and it took ~1.9s to render on a warm session, so it is polled for rather
-# than slept past.
-_SWITCH_MODEL_DIALOG_HINT = "Switch model?"
+# than slept past. Public because the ``/model`` injection sites live in other
+# modules and pass it as their ``confirm_hint``.
+SWITCH_MODEL_DIALOG_HINT = "Switch model?"
+_SWITCH_MODEL_DIALOG_HINT = SWITCH_MODEL_DIALOG_HINT
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
 _CONFIRM_DIALOG_TIMEOUT_S = 4.0
+# Settle before the blind confirm Enter of a command whose dialog text we
+# cannot recognise (e.g. ``/effort``). Long enough that the command itself is
+# consumed first, so the Enter lands on the dialog and not the input box.
+_BLIND_CONFIRM_SETTLE_S = 0.3
 # When Claude Code's input prompt never renders (it failed to boot), the
 # readiness gate attaches the tail of the captured pane to its error so
 # the real cause — often Claude Code's own startup crash, e.g. a
@@ -3011,6 +3017,7 @@ def inject_slash_command(
     command: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     auto_confirm: bool = False,
+    confirm_hint: str | None = None,
 ) -> None:
     """
     Type a Claude Code slash command into the tmux pane and submit it.
@@ -3025,11 +3032,14 @@ def inject_slash_command(
         switching invalidates the prompt cache). HACK — the chat UI has no
         way to render the CLI's TUI dialog, so without this the command
         silently stalls. Assumes the default option is "accept" (true today
-        for effort + model). The dialog is polled for rather than slept
-        past: on a session with cached history it took ~1.9s to render, so
-        a fixed sleep dropped the Enter and left the dialog open, wedging
-        the next injection. Callers that don't trigger confirmations should
+        for effort + model). Callers that don't trigger confirmations should
         leave this ``False``.
+    :param confirm_hint: Text this command's dialog renders, e.g.
+        :data:`SWITCH_MODEL_DIALOG_HINT`. When given, the dialog is polled
+        for so a late render (~1.9s on a session with cached history) still
+        gets its Enter. ``None`` — the command's dialog text is unknown —
+        settles briefly and confirms blind, and every path confirms blind on
+        a poll timeout rather than leaving an unrecognised dialog open.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, or contains a newline.
     :raises RuntimeError: If the tmux target is not advertised in
@@ -3049,37 +3059,48 @@ def inject_slash_command(
     _run_tmux(info["socket_path"], "send-keys", "-l", "-t", info["tmux_target"], command)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
     if auto_confirm:
-        _confirm_tui_dialog(info["socket_path"], info["tmux_target"])
+        _confirm_tui_dialog(info["socket_path"], info["tmux_target"], hint=confirm_hint)
 
 
 def _confirm_tui_dialog(
     socket_path: str,
     tmux_target: str,
     *,
-    hint: str = _SWITCH_MODEL_DIALOG_HINT,
+    hint: str | None = None,
     timeout_s: float = _CONFIRM_DIALOG_TIMEOUT_S,
 ) -> bool:
     """
-    Accept a TUI confirmation dialog once it is actually on screen.
+    Accept a TUI confirmation dialog, watching for *hint* when one is known.
 
-    Polls ``capture-pane`` for *hint* instead of sleeping a fixed interval.
-    A dialog that never renders is the normal case (a fresh session has no
-    prompt cache to invalidate), so a miss is reported rather than raised.
+    A recognised dialog is polled for rather than slept past, because a fixed
+    sleep dropped the Enter on a warm session and left the dialog open. But a
+    poll is only as good as its hint: ``/effort``'s dialog is not titled
+    "Switch model?", so a hint-only confirm would hang the pane forever. The
+    blind Enter below is therefore the floor for every path — on the
+    no-dialog case (a fresh session pops none) it lands on an empty prompt
+    and is a no-op, which is what the unconditional confirm did before.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param hint: Text the dialog renders, e.g. ``"Switch model?"``.
+    :param hint: Text the dialog renders, e.g. ``"Switch model?"``, or
+        ``None`` to skip the poll and confirm blind.
     :param timeout_s: Seconds to watch for the dialog, e.g. ``4.0``.
-    :returns: ``True`` when a dialog was seen and confirmed.
+    :returns: ``True`` when *hint* was matched, ``False`` on the blind
+        confirm.
     """
-    deadline = time.monotonic() + timeout_s
-    while True:
-        if hint in _capture_pane(socket_path, tmux_target):
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if hint is None:
+        time.sleep(_BLIND_CONFIRM_SETTLE_S)
+    else:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if hint in _capture_pane(socket_path, tmux_target):
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    return False
 
 
 def display_cost_approval_popup(

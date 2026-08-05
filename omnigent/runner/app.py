@@ -4024,6 +4024,10 @@ def create_runner_app(
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         command = f"/effort {effort}"
         try:
+            # No ``confirm_hint``: the effort dialog is not titled
+            # "Switch model?", so watching for that text would never match and
+            # the dialog would sit open with the pane wedged. The blind confirm
+            # covers it.
             await asyncio.to_thread(
                 inject_slash_command,
                 bridge_dir,
@@ -4051,6 +4055,7 @@ def create_runner_app(
             resolve_claude_native_model_selection,
         )
         from omnigent.claude_native_bridge import (
+            SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -4079,6 +4084,7 @@ def create_runner_app(
                 command=command,
                 timeout_s=1.0,
                 auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(

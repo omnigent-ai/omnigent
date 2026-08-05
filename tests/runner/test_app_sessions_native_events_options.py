@@ -66,6 +66,7 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if the runner reaches inject for an unsupported level."""
         del bridge_dir, command, timeout_s
@@ -141,6 +142,7 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s
@@ -216,6 +218,7 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if a non-native session reaches the injector."""
         del bridge_dir, command, timeout_s
@@ -301,6 +304,7 @@ async def test_events_compact_on_native_session_types_slash_command(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the call (including auto_confirm) without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, auto_confirm))
@@ -408,6 +412,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s, auto_confirm
@@ -1648,6 +1653,7 @@ async def test_events_compact_on_non_native_session_is_204_noop(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if a non-native session reaches the injector."""
         del bridge_dir, command, timeout_s, auto_confirm
@@ -1847,9 +1853,10 @@ async def test_events_model_change_on_native_session_types_slash_command(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, command, timeout_s))
+        captured.append((bridge_dir, command, timeout_s, confirm_hint))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -1909,11 +1916,14 @@ async def test_events_model_change_on_native_session_types_slash_command(
     assert len(captured) == 1, (
         f"Expected one inject_slash_command call from native model_change, got {len(captured)}."
     )
-    _bridge_dir, command, timeout_s = captured[0]
+    _bridge_dir, command, timeout_s, confirm_hint = captured[0]
     assert command == "/model claude-opus-4-7", (
         f"Expected '/model claude-opus-4-7' literal, got {command!r}."
     )
     assert timeout_s == 1.0
+    # The model dialog's title is known, so it is polled for rather than
+    # confirmed blind after a fixed settle.
+    assert confirm_hint == claude_native_bridge.SWITCH_MODEL_DIALOG_HINT
     assert queued_events == [], (
         f"model_change must not publish session events; got {queued_events!r}."
     )
@@ -2017,6 +2027,7 @@ async def test_events_model_change_on_native_session_skips_inject_for_empty_or_n
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if the runner reaches inject for an empty value."""
         del bridge_dir, command, timeout_s
@@ -2088,6 +2099,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s
@@ -2159,6 +2171,7 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if a non-native session reaches the injector."""
         del bridge_dir, command, timeout_s

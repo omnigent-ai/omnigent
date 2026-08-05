@@ -1259,6 +1259,7 @@ async def _apply_routed_model(
         return True
     from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
     from omnigent.claude_native_bridge import (
+        SWITCH_MODEL_DIALOG_HINT,
         inject_slash_command,
         read_claude_status_model,
         read_model_env,
@@ -1289,6 +1290,7 @@ async def _apply_routed_model(
             bridge_dir,
             command=f"/model {arg}",
             auto_confirm=True,
+            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
         )
     except (RuntimeError, ValueError):
         _logger.warning(

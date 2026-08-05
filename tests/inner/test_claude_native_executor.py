@@ -846,6 +846,7 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
         command: str,
         timeout_s: float = 30.0,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the ``/model`` switch keystroke and its auto_confirm flag."""
         del bridge_dir_arg, timeout_s
@@ -902,9 +903,14 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
     slash_calls: list[str] = []
 
     def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
 
     monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
@@ -954,9 +960,14 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
     msg_calls: list[str] = []
 
     def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
 
     def fake_inject_user_message(
@@ -1016,8 +1027,8 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
     monkeypatch.setattr(
         claude_native_executor,
         "inject_slash_command",
-        lambda bridge_dir_arg, *, command, timeout_s=30.0, auto_confirm=False: slash_calls.append(
-            command
+        lambda bridge_dir_arg, *, command, timeout_s=30.0, auto_confirm=False, confirm_hint=None: (
+            slash_calls.append(command)
         ),
     )
     monkeypatch.setattr(
@@ -1059,9 +1070,14 @@ async def test_run_turn_without_model_override_injects_message_only(
     msg_calls: list[str] = []
 
     def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
 
     def fake_inject_user_message(
@@ -1108,9 +1124,14 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
     msg_calls: list[str] = []
 
     def fake_inject_slash_command(
-        bridge_dir_arg: Path, *, command: str, timeout_s: float = 30.0, auto_confirm: bool = False
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
-        del bridge_dir_arg, timeout_s, auto_confirm
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
 
     def fake_inject_user_message(

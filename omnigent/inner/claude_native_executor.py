@@ -12,6 +12,7 @@ from omnigent.claude_model_vocabulary import claude_model_command_arg
 from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
+    SWITCH_MODEL_DIALOG_HINT,
     inject_slash_command,
     inject_user_message,
     read_active_session_id,
@@ -179,6 +180,7 @@ class ClaudeNativeExecutor(Executor):
                             self._bridge_dir,
                             command=f"/model {wanted_model_arg}",
                             auto_confirm=True,
+                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
                         )
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.

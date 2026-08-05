@@ -6139,6 +6139,7 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
         bridge_dir,
         command="/model databricks-claude-sonnet-5",
         auto_confirm=True,
+        confirm_hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
     )
 
     assert [args[-1] for args in sends] == [
@@ -6170,20 +6171,111 @@ def test_confirm_tui_dialog_polls_instead_of_sleeping_a_fixed_interval(
     dialog = "  Switch model?\n"
     sends = _fake_tmux(monkeypatch, ["", "", dialog])
 
-    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is True
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+        )
+        is True
+    )
+    # Exactly one Enter: the fast path must not also send the blind fallback.
     assert [args[-1] for args in sends] == ["Enter"]
 
 
-def test_confirm_tui_dialog_reports_a_dialog_that_never_renders(
+def test_a_matched_hint_confirms_before_the_poll_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+    """The fast path stops capturing the moment the dialog is on screen."""
+    captures: list[int] = []
+    dialog = "  Switch model?\n"
+    frames = ["", dialog, dialog]
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        captures.append(1)
+        return frames[min(len(captures) - 1, len(frames) - 1)]
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *a: None)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge.time, "sleep", lambda _s: None)
 
     assert (
-        claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0", timeout_s=0.0)
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+        )
+        is True
+    )
+    assert len(captures) == 2
+
+
+def test_an_unrecognised_dialog_is_still_confirmed_by_the_blind_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hint that never matches must not leave the dialog open forever.
+
+    ``/effort``'s confirmation is not titled "Switch model?", so a poll-only
+    confirm hung the pane: the change never committed and the next injection
+    landed in a modal.
+    """
+    effort_dialog = "  Change reasoning effort?\n  This invalidates the cache.\n"
+    sends = _fake_tmux(monkeypatch, [effort_dialog])
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+            timeout_s=0.0,
+        )
         is False
     )
-    assert sends == []
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
+def test_a_command_with_no_known_dialog_text_confirms_without_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hint=None`` settles and confirms — it never burns the poll budget.
+
+    This is the ``/effort`` call site: with no recognisable dialog title,
+    polling for one would cost ~4s of ``capture-pane`` on every effort change
+    and still end in the same blind Enter.
+    """
+    captures: list[int] = []
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        captures.append(1)
+        return _IDLE_PANE
+
+    sends: list[list[str]] = []
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda _s, *a: sends.append(list(a)))
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge.time, "sleep", lambda _s: None)
+
+    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is False
+    assert captures == []
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
+def test_an_effort_injection_with_no_dialog_completes_without_hanging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-dialog case: the extra Enter lands on an empty prompt, harmlessly."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    claude_native_bridge.inject_slash_command(
+        bridge_dir,
+        command="/effort high",
+        auto_confirm=True,
+    )
+
+    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter", "Enter"]
 
 
 def test_claude_pane_ready_is_true_only_at_an_idle_input_box(

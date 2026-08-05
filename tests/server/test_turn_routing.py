@@ -888,7 +888,13 @@ async def test_replay_switches_the_claude_pane_before_delivering(
     switched: list[tuple[Path, str, bool]] = []
     client = _FakeServerClient()
 
-    def _inject(bridge_dir: Path, *, command: str, auto_confirm: bool = False) -> None:
+    def _inject(
+        bridge_dir: Path,
+        *,
+        command: str,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
         assert not client.posts, "the pane must be switched before the prompt lands"
         switched.append((bridge_dir, command, auto_confirm))
 
@@ -927,8 +933,14 @@ async def test_replay_still_delivers_when_the_claude_switch_fails(
     _mark(tmp_path)
     client = _FakeServerClient()
 
-    def _boom(_bridge_dir: Path, *, command: str, auto_confirm: bool = False) -> None:
-        del command, auto_confirm
+    def _boom(
+        _bridge_dir: Path,
+        *,
+        command: str,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del command, auto_confirm, confirm_hint
         raise RuntimeError("tmux target is not advertised")
 
     monkeypatch.setattr("omnigent.claude_native_bridge.inject_slash_command", _boom, raising=False)
