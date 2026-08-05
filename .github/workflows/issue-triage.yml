@@ -457,6 +457,7 @@ jobs:
               "ranked_owners": ranked_owners,
               "duplicate_of": dup if isinstance(dup, int) else None,
               "priority": result.get("priority") if result.get("priority") in ALLOWED_PRIORITIES else None,
+              "needs_info": bool(result.get("needs_info")),
               "reasoning": result.get("reasoning", ""),
           }
           pathlib.Path("/tmp/triage_result.json").write_text(json.dumps(output))
@@ -509,12 +510,14 @@ jobs:
             maintainer_assigned=true
           fi
 
-          # Otherwise, assign an owner for P0/P1 issues: the least-loaded area
-          # owner, with LLM rank as a tiebreaker (load primary, rank secondary).
-          # Symmetric with the PR reviewer path. Skipped if the maintainer-author
-          # was already assigned above.
-          priority=$(jq -r '.priority // empty' /tmp/triage_result.json)
-          if [ "$maintainer_assigned" = "false" ] && { [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; }; then
+          # Otherwise, assign an owner: the least-loaded area owner, with LLM
+          # rank as a tiebreaker (load primary, rank secondary). Symmetric with
+          # the PR reviewer path. Skipped if the maintainer-author was already
+          # assigned above. Every triaged issue gets an owner — the only issues
+          # left unassigned are needs_info ones (too vague to route until the
+          # reporter adds detail).
+          needs_info=$(jq -r '.needs_info // false' /tmp/triage_result.json)
+          if [ "$maintainer_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
             # Open-issue load per candidate (fewest assigned open issues wins ties).
             # One trusted query; the LLM never sees GH_TOKEN.
             gh issue list --repo "$REPO" --state open --limit 500 \
@@ -526,8 +529,8 @@ jobs:
           owners = json.loads(pathlib.Path("/tmp/owners.json").read_text())
 
           # Candidates: the validated ranked owners (LLM preference order). If the
-          # LLM gave none, fall back to the full owner pool so a P0/P1 is never
-          # left unassigned — load then picks the least-loaded owner.
+          # LLM gave none, fall back to the full owner pool so a triaged issue is
+          # never left unassigned — load then picks the least-loaded owner.
           ranked = triage.get("ranked_owners") or []
           candidates = ranked if ranked else owners
           rank_of = {u: i for i, u in enumerate(ranked)}  # unranked -> +inf below

@@ -174,6 +174,7 @@ _DRAFT_NEEDLE_MAX_CHARS = 24
 # surfaces in the web UI error banner instead of only in the terminal.
 _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
+_INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -198,8 +199,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse the
-    relay/MCP implementation but keep bridge files below their own bridge roots.
+    Codex-, Pi-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse
+    the relay/MCP implementation but keep bridge files below their own bridge roots.
     All roots use the same owner-only ancestor validation; only the trusted
     anchor differs.
 
@@ -223,6 +224,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         trusted_parent = codex_root.parent
         if codex_root.name == "codex-native" and codex_root.parent.name == ".omnigent":
             trusted_parent = codex_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
+    from omnigent.pi_native_bridge import bridge_root as pi_bridge_root
+
+    pi_root = _absolute_syntactic_path(pi_bridge_root())
+    if target.is_relative_to(pi_root):
+        # Pi-native uses the same $HOME/.omnigent/<harness>-native layout as
+        # Codex-native. Trust $HOME in production, while allowing tests to
+        # monkeypatch the bridge root to a different shape.
+        trusted_parent = pi_root.parent
+        if pi_root.name == "pi-native" and pi_root.parent.name == ".omnigent":
+            trusted_parent = pi_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
     from omnigent.cursor_native_bridge import bridge_root as cursor_bridge_root
@@ -297,7 +310,7 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
 
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
+        f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
         f"{kiro_root!s}, {acp_root!s})"
     )
@@ -1413,6 +1426,9 @@ def augment_claude_args(
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
 
+    Invocation settings are written into the owner-only bridge directory so
+    credential-bearing ``apiKeyHelper`` commands never appear in child argv.
+
     :param claude_args: User-provided Claude Code args, e.g.
         ``("--resume", "abc")``.
     :param bridge_dir: Bridge directory path.
@@ -1460,12 +1476,14 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
+    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    _write_json_file(settings_path, hook_settings)
     args.extend(
         [
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
-            json.dumps(hook_settings, separators=(",", ":")),
+            str(settings_path),
         ]
     )
     if append_system_prompt:
@@ -2726,6 +2744,52 @@ def inject_interrupt(
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
 
+# Option-1 label in Claude Code's plan-review dialog: proof that dialog is
+# what's on screen before a verdict is keyed into it.
+_PLAN_DIALOG_MARKER = "Yes, and use auto mode"
+
+_PLAN_VERDICT_KEYS = {"auto": "1", "manual": "2", "reject": "Escape"}
+
+
+def inject_plan_verdict(
+    bridge_dir: Path,
+    *,
+    verdict: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> bool:
+    """
+    Answer Claude Code's plan-review dialog by keystroke.
+
+    Claude Code ignores a ``PermissionRequest`` hook's ``allow`` for
+    ``ExitPlanMode`` — that dialog is answerable only from the TUI — so a
+    web-UI plan verdict has to be keyed in the way a local user would.
+    Every other gated tool honors the hook decision instead.
+
+    The pane check is the only guard available (the verdict carries no tool
+    identity), and it doubles as the "already answered in the terminal" case.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :param verdict: ``"auto"`` (approve + auto mode), ``"manual"``
+        (approve, keep approving edits), or ``"reject"``.
+    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``1.0``.
+    :returns: ``True`` when the keystroke was sent, ``False`` when the
+        plan dialog was not showing.
+    :raises ValueError: If *verdict* is not a known option.
+    :raises RuntimeError: If the tmux target is not advertised in time,
+        or if the ``tmux send-keys`` invocation fails.
+    """
+    key = _PLAN_VERDICT_KEYS.get(verdict)
+    if key is None:
+        raise ValueError(f"unknown plan verdict {verdict!r}")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    if _PLAN_DIALOG_MARKER not in _capture_pane(info["socket_path"], info["tmux_target"]):
+        return False
+    # No ``-l``: tmux must read ``Escape`` as a key name, not literal text.
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
+    return True
+
+
 def kill_session(
     bridge_dir: Path,
     *,
@@ -3442,7 +3506,7 @@ def _start_http_ingress(
     handler_cls = _handler_factory(token, notification_queue)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = _http_server_host_port(httpd)
-    server_info = {
+    server_info: _JsonObject = {
         "url": f"http://{host}:{port}",
         "token": token,
         "pid": os.getpid(),

@@ -764,6 +764,7 @@ class ConversationItem(BaseModel):
 
             {"id": "msg_abc", "response_id": "resp_xyz",
              "type": "message", "status": "completed",
+             "created_at": 1753900000,
              "role": "assistant",
              "content": [{"type": "output_text", "text": "hi"}],
              "model": "databricks-gpt-5-4"}
@@ -773,6 +774,7 @@ class ConversationItem(BaseModel):
             "response_id": self.response_id,
             "type": self.type,
             "status": self.status,
+            "created_at": self.created_at,
             **self.data.model_dump(exclude_none=True, by_alias=True),
             # created_by is present only for human-authored items;
             # omitted (not null) for agent/tool/system messages so the

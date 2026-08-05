@@ -148,6 +148,8 @@ describe("bulk-action bar layout", () => {
     // neighbours (the mobile-overflow bug this guards against).
     const pill = actionGroup.parentElement as HTMLElement;
     expect(pill).toContainElement(exitBtn);
+    expect(pill).toHaveClass("bg-transparent");
+    expect(pill).not.toHaveClass("bg-background");
     for (const el of [exitBtn, deleteBtn, archiveBtn, actionGroup, pill]) {
       expect(el.className).not.toMatch(/\babsolute\b/);
     }

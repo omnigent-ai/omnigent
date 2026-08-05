@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
@@ -769,6 +770,11 @@ def _build_models_json(
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
+                # Generic (non-Databricks) OpenAI-compatible gateways expect
+                # ``Authorization: Bearer <token>``; the Databricks workspace
+                # endpoint uses a different auth scheme so authHeader is omitted
+                # on the native path.
+                **({"authHeader": True} if is_generic_provider else {}),
                 "compat": _openai_responses_compat,
                 "models": provider_models["databricks"],
             },
@@ -802,6 +808,8 @@ def _build_models_json(
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
+                # Same rationale as the "databricks" entry above.
+                **({"authHeader": True} if is_generic_provider else {}),
                 "compat": {
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
@@ -1983,6 +1991,10 @@ class PiExecutor(Executor):
             if not isinstance(model_id, str):
                 raise TypeError("Databricks model resolution returned a non-string model id")
             return model_id
+        # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
+        # by the direct Anthropic API but not by the Databricks AI Gateway.
+        if model and self._gateway:
+            model = re.sub(r"\[.*?\]$", "", model)
         return model
 
     def _generic_openai_wire_api(self) -> str | None:

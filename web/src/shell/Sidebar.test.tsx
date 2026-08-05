@@ -269,6 +269,28 @@ function seedPins(ids: string[]) {
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it("uses the interface text token for the empty session-list state", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    expect(screen.getByText("No active sessions")).toHaveClass("text-ui");
+    expect(screen.getByText("No active sessions")).not.toHaveClass("text-xs");
+  });
+
+  it("uses the interface text token for session-list errors", () => {
+    conversationsRef.current = [];
+    useConvMock.mockReturnValue({
+      isLoading: false,
+      isError: true,
+      error: new Error("boom"),
+    } as unknown as ReturnType<typeof useConversations>);
+    renderSidebar();
+
+    const error = screen.getByText("Failed to load: boom");
+    expect(error).toHaveClass("text-ui");
+    expect(error).not.toHaveClass("text-xs");
+  });
+
   it("keeps the session list scrollable without visible scrollbar chrome", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -326,7 +348,7 @@ describe("Sidebar session list", () => {
     // The same card now shows the settings nav (Back to app + sections),
     // not the conversation search/list.
     expect(screen.queryByTestId("sidebar-search-button")).toBeNull();
-    expect(screen.getByRole("link", { name: /Back to Omnigent/ })).toHaveAttribute("href", "/");
+    expect(screen.getByRole("link", { name: "Back" })).toHaveAttribute("href", "/");
     expect(screen.getByTestId("settings-nav-appearance")).toHaveAttribute(
       "href",
       "/settings/appearance",
@@ -342,19 +364,23 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
-    expect(headerActions.parentElement).toHaveClass("h-12");
+    expect(headerActions.parentElement).toHaveClass("h-12", "pl-5", "pr-3");
+    expect(headerActions.parentElement).not.toHaveClass("px-4");
     const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
 
     expect(search).toHaveAttribute("aria-label", "Search");
     expect(search).toHaveAttribute("data-size", "icon-xs");
-    expect(search).toHaveClass("size-6");
+    expect(search).toHaveClass("size-6", "rounded-[var(--radius-md)]");
+    expect(search).not.toHaveClass("rounded-sm");
+    expect(search.querySelector("svg")).toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6");
+    expect(settings).toHaveClass("size-6", "rounded-[var(--radius-md)]");
+    expect(settings.querySelector("svg")).toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
-    expect(collapse).toHaveClass("size-6");
+    expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
   });
 
@@ -364,11 +390,27 @@ describe("Sidebar session list", () => {
 
     const primaryNav = screen.getByTestId("sidebar-primary-nav");
     const inbox = within(primaryNav).getByTestId("inbox-button");
+    const newChat = within(primaryNav).getByTestId("new-chat-button");
 
-    expect(primaryNav).toHaveClass("px-2", "pt-0", "pb-3");
+    expect(primaryNav).toHaveClass("px-3", "pt-2", "pb-0");
     expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
-    expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
+    expect(inbox).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "w-full",
+      "justify-start",
+      "gap-2",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+    );
+    expect(inbox).toHaveClass("hover:bg-muted", "hover:text-foreground", "dark:hover:bg-muted/50");
+    expect(inbox.className).not.toContain("sidebar-hover");
+    expect(inbox).not.toHaveClass("h-8");
+    expect(newChat.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
+    expect(inbox.querySelector("svg")).toHaveClass("text-muted-foreground");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
@@ -385,6 +427,7 @@ describe("Sidebar session list", () => {
     });
     expect(selectSessions).toHaveAttribute("data-testid", "toggle-selection-mode");
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
+    expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
       "md:opacity-0",
@@ -430,8 +473,10 @@ describe("Sidebar session list", () => {
     // Active/selected state uses the SAME shared active-highlight as the sibling
     // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
     // ad-hoc bg-muted.
-    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
+    expect(screen.getByTestId("scheduled-tasks-nav")).toHaveClass(
       "bg-[var(--sidebar-active)]",
+      "dark:hover:bg-[var(--sidebar-active)]",
+      "dark:hover:text-[var(--sidebar-active-foreground)]",
     );
   });
 
@@ -583,8 +628,8 @@ describe("Sidebar session list", () => {
       // (bg-popover surface), not the old wide card.
       expect(tooltip.className).toContain("bg-popover");
       expect(tooltip.className).not.toContain("bg-card-solid");
-      // The title is sized to match the sidebar row name
-      // (`sidebar-compact-text`, 13px at the default), not the larger text-sm.
+      // The title matches sidebar row names through the shared compact class,
+      // which resolves to the same text-ui step as Appearance content.
       const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
       expect(tooltipTitle).not.toBeNull();
       expect(tooltipTitle).toHaveTextContent(title);
@@ -609,8 +654,8 @@ describe("Sidebar session list", () => {
     const plainRow = screen.getByText("Plain session").closest("a")!;
     const worktreeRow = screen.getByText("Worktree session").closest("a")!;
 
-    expect(plainRow).toHaveClass("h-7", "justify-center");
-    expect(worktreeRow).toHaveClass("h-7", "justify-center");
+    expect(plainRow).toHaveClass("sidebar-row", "h-auto", "min-h-0", "justify-center");
+    expect(worktreeRow).toHaveClass("sidebar-row", "h-auto", "min-h-0", "justify-center");
     expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
   });
 

@@ -191,6 +191,35 @@ def test_unfile_unknown_session_404(db_uri: str) -> None:
     assert resp.status_code == 404
 
 
+def test_fork_inherits_source_project(db_uri: str) -> None:
+    """A fork of a filed session lands in the same project as its source."""
+    _ensure_agent(db_uri)
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
+    client = TestClient(_single_user_app(db_uri))
+    project = client.post("/v1/projects", json={"name": "Work"}).json()
+    client.patch(f"/v1/sessions/{conv.id}", json={"project_id": project["id"]})
+
+    resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
+    assert resp.status_code == 201
+    fork = resp.json()
+    assert fork["project_id"] == project["id"]
+
+    # The project folder lists both the source and the fork.
+    listed = client.get("/v1/sessions?project=Work")
+    assert {s["id"] for s in listed.json()["data"]} == {conv.id, fork["id"]}
+
+
+def test_fork_of_unfiled_session_stays_unfiled(db_uri: str) -> None:
+    """Forking a session outside any project must not invent a filing."""
+    _ensure_agent(db_uri)
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
+    client = TestClient(_single_user_app(db_uri))
+
+    resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
+    assert resp.status_code == 201
+    assert resp.json()["project_id"] is None
+
+
 def test_project_filter_excludes_other_projects(db_uri: str) -> None:
     """?project=<name> returns only that project's members, not another's."""
     _ensure_agent(db_uri)
@@ -305,6 +334,47 @@ def test_cannot_file_into_another_owners_project(db_uri: str) -> None:
     # Still unfiled — the rejected filing had no side effect.
     snap = client.get(f"/v1/sessions/{conv_id}", headers=_hdr(ALICE))
     assert snap.json()["project_id"] is None
+
+
+def test_fork_of_shared_session_in_foreign_project_stays_unfiled(db_uri: str) -> None:
+    """Alice forks Bob's shared session filed in Bob's project. Projects are
+    owner-private, so her fork must not carry Bob's project id — a foreign id
+    would surface in no folder view of hers."""
+    _ensure_agent(db_uri)
+    conv_id = _seed_owned_session(db_uri, BOB)
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(ALICE)
+    perms.grant(ALICE, conv_id, LEVEL_EDIT)
+    client = TestClient(_multi_user_app(db_uri))
+    bob_project = client.post("/v1/projects", json={"name": "Bob"}, headers=_hdr(BOB)).json()
+    filed = client.patch(
+        f"/v1/sessions/{conv_id}",
+        json={"project_id": bob_project["id"]},
+        headers=_hdr(BOB),
+    )
+    assert filed.status_code == 200
+
+    resp = client.post(f"/v1/sessions/{conv_id}/fork", json={}, headers=_hdr(ALICE))
+    assert resp.status_code == 201
+    assert resp.json()["project_id"] is None
+
+
+def test_fork_keeps_own_project_multi_user(db_uri: str) -> None:
+    """Under header auth, Bob's fork of his own filed session stays in his
+    project (the ownership check resolves against the forker's id)."""
+    _ensure_agent(db_uri)
+    conv_id = _seed_owned_session(db_uri, BOB)
+    client = TestClient(_multi_user_app(db_uri))
+    bob_project = client.post("/v1/projects", json={"name": "Bob"}, headers=_hdr(BOB)).json()
+    client.patch(
+        f"/v1/sessions/{conv_id}",
+        json={"project_id": bob_project["id"]},
+        headers=_hdr(BOB),
+    )
+
+    resp = client.post(f"/v1/sessions/{conv_id}/fork", json={}, headers=_hdr(BOB))
+    assert resp.status_code == 201
+    assert resp.json()["project_id"] == bob_project["id"]
 
 
 def test_editor_cannot_file_shared_session(db_uri: str) -> None:

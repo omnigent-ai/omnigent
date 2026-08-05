@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 from collections.abc import Callable
@@ -251,6 +252,7 @@ class PiProviderConfig:
 
     def to_models_config(self) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
+        models: list[_PiModelEntry]
         if self.extra_models:
             # Include all known models, ensuring the selected model is present.
             # The selected model may be a newer id not yet in the static list.
@@ -808,6 +810,9 @@ def _inline_family_pi_provider(
         # ``zai-org/GLM-4.7``) and already-bare ids through unchanged. Family
         # defaults are bare, so the no-override path is unaffected.
         resolved_model = normalize_model_for_provider(resolved_model, KEY_KIND)
+        # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
+        # Anthropic API but rejected by the Databricks AI Gateway.
+        resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,
@@ -969,7 +974,15 @@ def pi_native_provider_launch(
         if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
             model_provider_id = extra_id
             break
-    args = ["--provider", model_provider_id, "--model", provider.model]
+    # When the model id contains a "/" Pi's arg parser splits on the first
+    # slash and treats the left part as a provider name, overriding
+    # --provider. Pass the fully-qualified "provider/model" reference so Pi's
+    # findExactModelReferenceMatch matches the canonical form exactly and
+    # routes to our custom provider, not a builtin with the same model id.
+    model_arg = (
+        f"{model_provider_id}/{provider.model}" if "/" in provider.model else provider.model
+    )
+    args = ["--provider", model_provider_id, "--model", model_arg]
     # For non-Claude models on openai-completions/responses, disable thinking.
     # Gemini and other Databricks models return reasoning_tokens in their
     # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null

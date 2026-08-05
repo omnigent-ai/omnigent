@@ -91,8 +91,6 @@ class FunctionPolicy(Policy):
         (dict-form spec).
     """
 
-    spec: FunctionPolicySpec
-
     def __init__(
         self,
         spec: FunctionPolicySpec,

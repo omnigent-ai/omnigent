@@ -218,29 +218,43 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("host-badge").textContent).toBe("mac-laptop, status unknown");
   });
 
-  it("renders a clickable reconnect affordance in the badge slot when onReconnect is set", () => {
-    // host_offline moves the reconnect prompt up into the host badge: the
-    // passive name + dot is replaced by a button carrying the host-offline
-    // copy, and clicking it opens the reconnect help.
-    useHostsMock.mockReturnValue({
-      data: [
-        {
-          host_id: "host_a1b2",
-          name: "mac-laptop",
-          owner: "alice",
-          status: "offline",
-          sandbox_provider: null,
-        },
-      ],
-    });
+  it("keeps the host name while making an offline host clickable to reconnect", () => {
+    // The one disconnect shape: name + red dot, never swapped for generic
+    // "Host is offline" copy — the user must still read WHICH host dropped —
+    // and clicking it opens the reconnect help.
     useSessionHostOnlineMock.mockReturnValue(false);
     const onReconnect = vi.fn();
     render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
     const badge = screen.getByTestId("host-badge");
     expect(badge.tagName).toBe("BUTTON");
-    expect(badge.textContent).toMatch(/Host is offline/);
+    expect(badge.textContent).toBe("mac-laptop, offline — click to reconnect");
+    expect(badge.getAttribute("title")).toBe("Host mac-laptop, offline — click to reconnect");
     fireEvent.click(badge);
     expect(onReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays passive for an online host even when onReconnect is set", () => {
+    // onReconnect is wired for every host-bound session; a reachable host has
+    // nothing to reconnect, so the badge must not become a button.
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).not.toBe("BUTTON");
+    expect(badge.textContent).toBe("mac-laptop, online");
+  });
+
+  it("stays passive for a dormant resumable managed host", () => {
+    // A resumable sandbox host reads offline while idle-stopped, but the next
+    // message wakes it — offering `omnigent host` there would be wrong.
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_a1b2", hostResumable: true },
+      isLoading: false,
+      error: null,
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).not.toBe("BUTTON");
+    expect(badge.textContent).toBe("mac-laptop, offline");
   });
 
   it("renders nothing when onReconnect is set but the session isn't host-bound", () => {

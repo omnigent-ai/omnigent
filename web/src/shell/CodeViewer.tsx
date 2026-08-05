@@ -175,7 +175,6 @@ const MARKDOWN_COMPONENTS: Components = {
       width: px(width) ?? style?.width,
       height: px(height) ?? style?.height,
     };
-    // eslint-disable-next-line jsx-a11y/alt-text -- alt is forwarded via props
     return <img {...props} style={sized} />;
   },
 };
@@ -302,7 +301,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
   const filename = path.split("/").pop() ?? path;
 
   const body = errored ? (
-    <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
       {data.truncated
         ? "Image is too large to preview (truncated by the server)."
         : "Unable to render image."}
@@ -537,7 +536,7 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]);
 
   // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
   // native find widget to `searchOpen` (open when set, close when cleared). This
@@ -601,7 +600,7 @@ export function CodeViewer({
     };
     container.addEventListener("mouseup", handleMouseUp);
     return () => container.removeEventListener("mouseup", handleMouseUp);
-  }, [rawLines]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [rawLines]);
 
   // Dismiss the floating buttons on any mousedown outside of them, or on any
   // scroll. Both the "Add comment" and "Attach to agent" buttons must be
@@ -659,14 +658,14 @@ export function CodeViewer({
 
   if (fileQuery.isLoading) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Loading…
       </div>
     );
   }
   if (fileQuery.isError) {
     return (
-      <div className="p-8 text-destructive text-sm">
+      <div className="p-8 text-destructive text-ui">
         Error loading file:{" "}
         {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
       </div>
@@ -679,7 +678,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }
@@ -698,7 +697,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading 3D preview…
           </div>
         }
@@ -709,7 +708,7 @@ export function CodeViewer({
   }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Preview not available for binary files.
       </div>
     );
@@ -770,7 +769,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }

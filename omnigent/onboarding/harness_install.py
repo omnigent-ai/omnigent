@@ -47,6 +47,7 @@ from typing import NamedTuple
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.opencode_native_client import (
@@ -224,15 +225,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
     # npm). ``kimi login`` is the interactive provider login (OAuth or a
     # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
     # no first-class "am I logged in?" exit-code probe — login state is
-    # only inspected interactively. With ``None`` the login path runs every
-    # time the operator asks for it (interactive, so they can cancel if
-    # already authenticated).
+    # inspected file-based via ``kimi_auth.kimi_login_detected`` instead. With
+    # ``None`` the login path runs every time the operator asks for it
+    # (interactive, so they can cancel if already authenticated).
+    # ``logout_args`` is ``None`` because kimi has no ``kimi logout`` subcommand
+    # (verified against kimi CLI v0.29.1 — ``kimi logout`` errors "unknown
+    # command"), so ``harness_logout`` is a no-op for it (same as Qwen / agy).
     KIMI_KEY: HarnessInstallSpec(
         "Kimi",
         "kimi",
         package=None,
         login_args=("login",),
-        logout_args=("logout",),
         install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         # First kimi-cli release after 2026-06-01. Older builds may lack
         # newer TUI/session wiring needed by the native harness.
@@ -359,6 +362,14 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     OPENCODE_KEY: OPENCODE_KEY,
     QWEN_KEY: QWEN_KEY,
 }
+
+# Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) with an npm package
+# are one-click installable; rows shipping via curl/shell installers stay out,
+# like cursor/kimi above.
+for _acp_name, _acp_row in ACP_CLI_HARNESSES.items():
+    if _acp_row.install.package is not None:
+        for _acp_spelling in (_acp_name, *_acp_row.aliases):
+            _UI_INSTALLABLE_HARNESS_TO_KEY[_acp_spelling] = _acp_name
 
 
 # Family keys the UI may install, derived once from the allowlist so the
@@ -510,6 +521,20 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
         status_key=None,
     ),
 }
+
+# Builtin ACP CLI harnesses own their credentials (vendor CLI login), so each
+# row with a login command gets a run-on-host auth step, untracked like qwen's.
+for _acp_name, _acp_row in ACP_CLI_HARNESSES.items():
+    _acp_login = _acp_row.login_command
+    if _acp_login is not None:
+        _UI_AUTH_STEP_BY_KEY[_acp_name] = SetupStep(
+            kind="auth",
+            title=f"Sign in to {_acp_row.label}",
+            detail=f"{_acp_row.label} manages its own credentials; sign in on the host.",
+            action="command",
+            command=_acp_login,
+            status_key=None,
+        )
 
 
 def ui_setup_steps(harness: str) -> list[SetupStep]:

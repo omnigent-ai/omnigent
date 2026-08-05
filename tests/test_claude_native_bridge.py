@@ -64,6 +64,11 @@ def _trust_tmp_bridge_parent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
 
 
+def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
+    settings_path = Path(args[args.index("--settings") + 1])
+    return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
 @pytest.fixture
 def subprocess_bridge_root() -> Iterator[Path]:
     """
@@ -2175,7 +2180,7 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # capability is blocked at the org level. The wrapper must not
     # pass the development-channels flag.
     assert "--dangerously-load-development-channels" not in args
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     assert "omnigent.claude_native_hook" in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
     # ``PreCompact`` must be wired so the forwarder can surface
     # ``response.compaction.in_progress`` while Claude compacts in the
@@ -2192,6 +2197,34 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # through the standard PermissionRequest elicitation card, so the
     # wrapper must not inject a ``--disallowedTools`` flag of its own.
     assert "--disallowedTools" not in args
+
+
+@pytest.mark.parametrize(
+    "api_key_helper",
+    (
+        "printf %s sk-sentinel-do-not-use",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ),
+)
+def test_augment_claude_args_materializes_api_key_helper(
+    tmp_path: Path,
+    api_key_helper: str,
+) -> None:
+    bridge_dir = tmp_path / "session"
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        api_key_helper=api_key_helper,
+    )
+
+    settings_path = Path(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
+    assert all("sk-sentinel-do-not-use" not in arg for arg in args)
+    assert settings["apiKeyHelper"] == api_key_helper
+    assert settings_path.parent == bridge_dir
+    assert bridge_dir.stat().st_mode & 0o777 == 0o700
+    assert settings_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_augment_claude_args_mirrors_launch_overrides_into_settings(
@@ -2213,7 +2246,7 @@ def test_augment_claude_args_mirrors_launch_overrides_into_settings(
         python_executable="/venv/bin/python",
     )
 
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-fable-5"
     assert settings["permissions"] == {"defaultMode": "auto"}
     assert settings["effortLevel"] == "xhigh"
@@ -2229,7 +2262,7 @@ def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
         python_executable="/venv/bin/python",
     )
 
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-sonnet-5"
     assert "permissions" not in settings
     assert "effortLevel" not in settings
@@ -2256,7 +2289,7 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
         python_executable="/venv/bin/python",
     )
 
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-new"
     assert settings["permissions"] == {"defaultMode": "auto"}
     assert settings["effortLevel"] == "high"
@@ -2389,7 +2422,7 @@ def test_augment_claude_args_omits_permission_hook_without_omnigent_server(
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
     )
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     assert "PermissionRequest" not in settings["hooks"]
 
 
@@ -2412,7 +2445,7 @@ def test_augment_claude_args_registers_permission_command_hook(
         ap_server_url="http://127.0.0.1:8787/",
         ap_auth_headers={"Authorization": "Bearer xyz"},
     )
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     permission = settings["hooks"]["PermissionRequest"]
     assert len(permission) == 1
     hooks = permission[0]["hooks"]
@@ -2463,7 +2496,7 @@ def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
         ap_server_url="http://127.0.0.1:8787/",
         ap_auth_headers={"Authorization": "Bearer xyz"},
     )
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     entries = settings["hooks"]["UserPromptSubmit"]
     commands = [h["command"] for entry in entries for h in entry["hooks"]]
     # The forwarder status hook stays; the policy hook is appended.
@@ -2491,7 +2524,7 @@ def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
     )
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     entries = settings["hooks"]["UserPromptSubmit"]
     commands = [h["command"] for entry in entries for h in entry["hooks"]]
     assert all("evaluate-policy" not in command for command in commands)
@@ -2512,7 +2545,7 @@ def test_augment_claude_args_keeps_permission_hook_without_launch_session_id(
         bridge_dir=tmp_path,
         ap_server_url="http://127.0.0.1:8787",
     )
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
     assert settings["hooks"]["PermissionRequest"][0]["hooks"][0]["type"] == "command"
     session_start_command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert "--conversation-url" not in session_start_command
@@ -3870,6 +3903,48 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_pi_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay startup accepts Pi-native's persistent bridge root."""
+    from omnigent import pi_native_bridge
+
+    pi_root = tmp_path / ".omnigent" / "pi-native"
+    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", pi_root)
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_pi")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Return an empty result for the unused relay tool callback."""
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_list",
+                    "description": "List Omnigent sessions.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        assert relay_file.exists(), (
+            "Pi-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_list"
+    finally:
+        if relay is not None:
+            relay.close()
 
 
 @pytest.mark.asyncio

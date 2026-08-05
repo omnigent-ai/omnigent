@@ -15,7 +15,7 @@ import psutil
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import _ensure_host_daemon, _host_daemon_alive, cli
+from omnigent.cli import _add_daemon_host_status, _ensure_host_daemon, _host_daemon_alive, cli
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -576,3 +576,34 @@ def test_host_stop_treats_zombie_daemon_as_dead(
         "stale daemon record survived stop — a subsequent host start "
         "would be blocked by an 'already running' conflict"
     )
+
+
+def test_add_daemon_host_status_skips_http_for_dead_process() -> None:
+    """Dead processes must not trigger a network round-trip.
+
+    ``_add_daemon_host_status`` is called for every daemon record, including
+    the many stale records accumulated over development sessions. Before this
+    fix each dead record caused a ``GET /v1/hosts/{id}`` call that hit
+    ConnectError or a remote timeout, making ``omni host status`` slow.
+    A dead process cannot have an online tunnel, so the correct answer is
+    ``host_status = "offline"`` with no HTTP request made.
+    """
+    http_calls: list[str] = []
+
+    def _fake_http(*args: object, **kwargs: object) -> object:
+        http_calls.append(str(kwargs))
+        raise AssertionError("HTTP must not be called for a dead process")
+
+    payload = {
+        "process": "offline",
+        "server_url": "https://example.com",
+        "host_id": "host_abc123",
+        "host_status": None,
+        "error": None,
+    }
+    with patch("omnigent.cli._host_http_json", _fake_http):
+        _add_daemon_host_status(payload)
+
+    assert payload["host_status"] == "offline"
+    assert payload["error"] is None
+    assert http_calls == [], "No HTTP calls expected for a dead process"

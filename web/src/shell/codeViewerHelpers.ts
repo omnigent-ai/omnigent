@@ -238,10 +238,10 @@ const MODEL_VIEWER_THEMES: Record<ResolvedThemeMode, ModelViewerTheme> = {
     ambientIntensity: 1.0,
     keyIntensity: 1.2,
   },
-  // Dark: the app's dark panel color (`--background: #0d1218`), a lighter grey
+  // Dark: the app's dark panel color (`--background: #0e1013`), a lighter grey
   // surface, and brighter lights so the mesh doesn't sink into the background.
   dark: {
-    background: 0x0d1218,
+    background: 0x0e1013,
     stlMaterial: 0xc4c9ce,
     ambientIntensity: 1.5,
     keyIntensity: 1.6,

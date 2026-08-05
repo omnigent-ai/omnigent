@@ -2101,6 +2101,16 @@ function registerIpc() {
     return Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [];
   });
 
+  ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("copy-setup-text is only available to the setup page");
+    }
+    if (typeof text !== "string") {
+      throw new TypeError("copy-setup-text requires a string");
+    }
+    clipboard.writeText(text);
+  });
+
   // SPA title-bar server picker → the sender window's pinned origin plus the
   // persisted recent-servers list, so the picker can render "current server"
   // and the switch targets. Foreign pages get null (nothing to fingerprint).

@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlProject, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
-    make_managed_session_maker,
+    make_named_managed_session_maker,
     now_epoch,
 )
 from omnigent.entities import Project
@@ -118,7 +118,10 @@ class SqlAlchemyProjectStore(ProjectStore):
         """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.project_store",
+        )
 
     def _name_taken(
         self,
@@ -166,7 +169,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         and maps to the same ``ALREADY_EXISTS``; any other integrity failure is
         re-raised untranslated.
         """
-        with self._session() as session:
+        with self._session("insert_project") as session:
             if self._name_taken(session, owner_user_id=owner_user_id, name=name, exclude_id=None):
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
@@ -194,7 +197,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     def get(self, project_id: str, *, owner_user_id: str | None) -> Project | None:
         """Return an owned project by id, or ``None`` if not found."""
-        with self._session() as session:
+        with self._session("select_project_by_id") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.owner_user_id != owner_user_id:
                 return None
@@ -202,7 +205,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     def list(self, *, owner_user_id: str | None) -> list[Project]:
         """List the owner's projects ordered by ``created_at ASC, id ASC``."""
-        with self._session() as session:
+        with self._session("list_projects") as session:
             stmt = (
                 select(SqlProject)
                 .where(SqlProject.workspace_id == current_workspace_id())
@@ -226,7 +229,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         not exist or is not owned by ``owner_user_id``. A ``config`` of ``{}``
         clears the stored defaults (distinct from ``None`` = leave unchanged).
         """
-        with self._session() as session:
+        with self._session("update_project") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.owner_user_id != owner_user_id:
                 return None
@@ -263,7 +266,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     def delete(self, project_id: str, *, owner_user_id: str | None) -> bool:
         """Delete an owned project. Idempotent; returns ``False`` if not found."""
-        with self._session() as session:
+        with self._session("delete_project") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.owner_user_id != owner_user_id:
                 return False

@@ -2269,8 +2269,10 @@ class _StubTerminalInstance:
         on_idle: Callable[[], None] | None = None,
         *,
         on_activity: Callable[[], None] | None = None,
+        **kwargs: object,
     ) -> None:
         """Record the activity callback instead of polling real tmux."""
+        del kwargs
         if on_activity is not None:
             self.activity_watchers.append(on_activity)
 
@@ -5059,7 +5061,10 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:done",
                         "tool": "researcher",
                         "session_name": "done",
-                        "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                        "labels": {
+                            CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE,
+                            "attempt": 1,
+                        },
                     },
                     {
                         "id": "c5",
@@ -5083,7 +5088,8 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed), c5 (legacy title tombstone), and c4
+    # c3 (explicitly closed despite its mixed-type label map), c5
+    # (legacy title tombstone), and c4
     # (no colon) dropped; the ui:-added child surfaces under its bound
     # agent + label.
     assert out["sub_agents"] == [
@@ -6405,6 +6411,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         requested_paths.append(request.url.path)
         if request.url.path == "/v1/sessions/conv_caller":
+            assert request.url.params["include_items"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6413,6 +6420,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
                     "agent_name": "main",
                     "status": "idle",
                     "created_at": 1,
+                    "updated_at": 42,
                     "runner_id": None,
                     "pending_elicitations": [],
                 },
@@ -6436,6 +6444,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     # never queried (a stray /v1/runners call would mean the None-runner
     # short-circuit regressed).
     assert info["runner_online"] is None
+    assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
@@ -6810,6 +6819,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            assert request.url.params["include_items"] == "false"
+            assert request.url.params["include_liveness"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6818,6 +6829,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_name": "researcher",
                     "status": "running",
                     "created_at": 1,
+                    "updated_at": 84,
                     "title": "auth flow",
                     "runner_id": "runner_1",
                     "host_id": None,
@@ -6849,6 +6861,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
     assert info["agent_name"] == "researcher"
