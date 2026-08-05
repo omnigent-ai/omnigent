@@ -362,6 +362,16 @@ dev = [
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
 
+[tool.uv]
+# Temporary cap-lift: mlflow (transitive via the `databricks` extra's
+# databricks-mcp -> databricks-ai-bridge chain) declares cryptography<50 even at
+# its latest release (3.15.1, 2026-08-03), which blocks the ONLY release fixing
+# PYSEC-2026-3552 / CVE-2026-69247 (cryptography 50.0.0 — the OSV scan fails
+# the lock on it). mlflow's cryptography use has no known 50.x break; the cap
+# is the usual precautionary major-version pin. Drop this override once mlflow
+# ships a release allowing cryptography>=50.
+override-dependencies = ["cryptography>=43.0.0,<51"]
+
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
 omnigent-client = { path = "sdks/python-client", editable = true }
