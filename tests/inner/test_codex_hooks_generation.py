@@ -218,19 +218,32 @@ class _HomeSnapshot:
         )
 
 
+class _FakeVersionProc:
+    """Answers the routing gate's ``codex --version`` probe."""
+
+    def __init__(self, version: str) -> None:
+        self._stdout = f"codex-cli {version}\n".encode()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, b""
+
+
 def _start_app_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     env: dict[str, str],
     probes: list[str] | None = None,
+    codex_version: str = "0.145.0",
 ) -> tuple[tuple[str, ...], _HomeSnapshot]:
     source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
     workspace = tmp_path / "work"
     workspace.mkdir()
     captured: list[tuple[tuple[str, ...], _HomeSnapshot]] = []
 
-    async def fake_exec(*argv: str, **kwargs: Any) -> None:  # type: ignore[explicit-any]
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        if argv[1:2] == ("--version",):
+            return _FakeVersionProc(codex_version)
         # The session deletes its private CODEX_HOME on the launch failure
         # below, so snapshot the home while codex would have read it.
         home = Path(kwargs["env"]["CODEX_HOME"])
@@ -368,6 +381,116 @@ def test_an_auto_harness_codex_session_gets_the_catalog_and_the_spawn_gate(
     assert home.payload is not None
     matchers = [entry.get("matcher") for entry in home.payload["hooks"]["PreToolUse"]]
     assert matchers == [r".*spawn_agent", None]
+
+
+# ── The routing hook's own CLI floor ────────────────────────────────
+#
+# The spawn gate matches a flattened ``spawn_agent`` tool name codex only
+# spells that way from 0.145.0 on. Below that the hook can never fire, so
+# registering it would leave the session paying for a gate that does nothing
+# *and* replace the user's symlinked hooks.json. The floor lives here rather
+# than in the launch check so an older codex still launches.
+
+
+def test_an_old_codex_cli_registers_no_spawn_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+
+    with caplog.at_level("WARNING"):
+        _argv, home = _start_app_server(
+            tmp_path,
+            monkeypatch,
+            env={
+                CODEX_ROUTER_DIR_ENV_VAR: str(bridge),
+                CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+            },
+            codex_version="0.139.0",
+        )
+
+    # Routing no-ops: the user's own hooks file is still the live one.
+    assert home.is_symlink
+    assert home.payload == _USER_HOOKS
+    assert "smart routing spawn gate disabled" in caplog.text
+
+
+def test_a_new_enough_codex_cli_registers_the_spawn_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+
+    _argv, home = _start_app_server(
+        tmp_path,
+        monkeypatch,
+        env={
+            CODEX_ROUTER_DIR_ENV_VAR: str(bridge),
+            CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+        },
+        codex_version="0.145.0",
+    )
+
+    assert not home.is_symlink
+    assert home.payload is not None
+    matchers = [entry.get("matcher") for entry in home.payload["hooks"]["PreToolUse"]]
+    assert r".*spawn_agent" in matchers
+
+
+@pytest.mark.parametrize(
+    ("version", "skipped"),
+    [
+        ((0, 144, 9), True),
+        ((0, 145, 0), False),
+        ((0, 146, 0), False),
+        # An unparseable probe must not silently drop routing.
+        (None, False),
+    ],
+)
+def test_the_routing_hook_floor_reads_the_probed_version(
+    version: tuple[int, int, int] | None, skipped: bool
+) -> None:
+    reason = codex_executor.codex_routing_hook_skip_reason(version)
+    assert (reason is not None) is skipped
+    if reason is not None:
+        assert "smart routing spawn gate disabled" in reason
+
+
+def test_an_old_codex_cli_keeps_the_sdk_harness_hooks_symlinked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wrapped (SDK) codex harness shares the floor with the native one."""
+    source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    seen: list[_HomeSnapshot] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        if argv[1:2] == ("--version",):
+            return _FakeVersionProc("0.139.0")
+        seen.append(_HomeSnapshot(Path(kwargs["env"]["CODEX_HOME"])))
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(codex_executor, "populate_codex_skills_from_bundle", lambda *a, **k: None)
+    monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(codex_executor, "_create_subprocess_exec", fake_exec)
+    session = codex_executor._CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(workspace),
+        env={
+            CODEX_ROUTER_DIR_ENV_VAR: str(bridge),
+            CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+        },
+        tool_executor=None,
+    )
+    with contextlib.suppress(RuntimeError):
+        asyncio.run(session.start())
+
+    assert seen, "the app-server was never launched"
+    assert seen[0].is_symlink
+    assert seen[0].payload == _USER_HOOKS
 
 
 def test_router_hook_commands_run_python_isolated(tmp_path: Path) -> None:

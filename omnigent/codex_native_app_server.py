@@ -54,6 +54,7 @@ from omnigent.inner.codex_executor import (
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
+    codex_routing_hook_skip_reason,
     materialize_codex_provider_config,
     write_codex_hooks_file,
 )
@@ -906,6 +907,15 @@ class CodexNativeAppServer:
         # Routing sessions only, so its presence is also this session class's
         # signature — see ``ensure_session_router_quietly``.
         router_bridge_dir = codex_router_bridge_dir(self.env)
+        if router_bridge_dir is not None:
+            # A CLI too old for the spawn gate gets no routing hooks at all, so
+            # routing no-ops instead of blocking the launch. Everything keyed
+            # off the advertisement below (generated hooks.json, the routed-spawn
+            # tool pre-approvals) then falls back to the plain shape.
+            skip_reason = codex_routing_hook_skip_reason(codex_version)
+            if skip_reason is not None:
+                _logger.warning("%s", skip_reason)
+                router_bridge_dir = None
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
         config_source = _codex_home_config_source_from_env()

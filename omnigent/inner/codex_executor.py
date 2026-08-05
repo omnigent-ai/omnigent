@@ -922,6 +922,33 @@ _CODEX_SPAWN_AGENT_MATCHER = r".*spawn_agent"
 # outermost bound: the hook fails open on its timeout, codex only steps in
 # if the hook itself wedged.
 _CODEX_ROUTER_HOOK_TIMEOUT_SECONDS = int(_ROUTER_REQUEST_TIMEOUT_S) + 10
+# Codex release the ``PreToolUse`` spawn gate is verified against. Older CLIs
+# spell the flattened spawn tool name differently (or lack ``PreToolUse``
+# entirely), so the matcher above never fires and routing silently no-ops.
+# Checked here, at the registration site, rather than as a launch floor: an
+# older codex must still launch, just without the spawn gate.
+_CODEX_ROUTING_HOOK_MIN_VERSION = (0, 145, 0)
+
+
+def codex_routing_hook_skip_reason(codex_cli_version: tuple[int, int, int] | None) -> str | None:
+    """
+    Explain why the routing spawn gate cannot be registered, if it cannot.
+
+    An unparseable version (``None``) counts as supported, matching the
+    policy-hook gate: a flaky ``codex --version`` probe must not silently
+    drop routing when the CLI is probably new enough.
+
+    :param codex_cli_version: Parsed ``codex --version``, e.g. ``(0, 139, 0)``.
+    :returns: A log-ready reason, or ``None`` when the hook may be registered.
+    """
+    if codex_cli_version is None or codex_cli_version >= _CODEX_ROUTING_HOOK_MIN_VERSION:
+        return None
+    spelled = ".".join(str(part) for part in codex_cli_version)
+    minimum = ".".join(str(part) for part in _CODEX_ROUTING_HOOK_MIN_VERSION)
+    return (
+        f"codex {spelled} predates PreToolUse hooks (need >= {minimum}); "
+        "smart routing spawn gate disabled"
+    )
 
 
 def _codex_router_hook_command(
@@ -2062,6 +2089,16 @@ class _CodexAppServerSession:
         # Smart Routing session gets that endpoint, so a plain or pinned session
         # keeps the symlink — and with it mid-session edits to the user's file.
         router_bridge_dir = codex_router_bridge_dir(self._env)
+        if router_bridge_dir is not None:
+            # Probed only on the routing path so a plain session never pays the
+            # subprocess. A CLI too old for the spawn gate drops the hooks and
+            # keeps the symlinked home, so routing no-ops instead of blocking.
+            skip_reason = codex_routing_hook_skip_reason(
+                await _codex_cli_version(self._codex_path)
+            )
+            if skip_reason is not None:
+                logger.warning("%s", skip_reason)
+                router_bridge_dir = None
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
         # stalled every other session sharing this event loop for that long.

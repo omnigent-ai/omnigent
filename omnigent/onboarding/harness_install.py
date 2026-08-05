@@ -98,18 +98,19 @@ KIRO_KEY = "kiro"
 # - claude: `--mcp-config` (required by the native bridge) introduced long
 #   before 2026-06-01. The first Claude Code release after the cutoff is
 #   2.1.161, so use that as the supported floor.
-# - codex: native policy hook requires >= 0.129.0 and the hook-trust bypass
-#   >= 0.131.0, but both shipped before 2026-06-01. The floor is 0.145.0 — the
-#   version the subagent-router ``PreToolUse`` hook (``spawn_agent``
-#   rewrite/deny) is verified against; on older CLIs the flattened spawn tool
-#   name differs and routing silently no-ops.
+# - codex: native policy hook requires >= 0.129.0, but that shipped before
+#   2026-06-01. The first Codex release after the cutoff is 0.137.0. The
+#   subagent-router ``PreToolUse`` hook needs 0.145.0, but that is enforced
+#   where the hook is registered
+#   (``codex_native_app_server._CODEX_ROUTING_HOOK_MIN_VERSION``) so an older
+#   CLI loses only smart-routing spawn gating, not the ability to launch.
 # - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
 # - kimi: first ``kimi-cli`` release after 2026-06-01 is 1.47.0
 #   (https://github.com/MoonshotAI/kimi-cli/blob/main/CHANGELOG.md).
 # - hermes: parent_session_id schema was introduced in v0.17.0, but Hermes now
 #   ships date-tagged releases; the first one after 2026-06-01 is 2026.06.05.
-_CODEX_MIN_VERSION = "0.145.0"
+_CODEX_MIN_VERSION = "0.137.0"
 _PI_MIN_VERSION = "0.79.0"
 _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
@@ -170,10 +171,11 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         login_args=("login",),
         logout_args=("logout",),
         status_args=("login", "status"),
-        # The native Codex policy hook requires ``codex >= 0.129.0`` and the
-        # hook-trust bypass ``>= 0.131.0``; anything older silently disables
-        # tool-call enforcement. The subagent-router hook is verified on
-        # 0.145.0, which sets the floor. Setup enforces it up-front.
+        # The native Codex policy hook requires ``codex >= 0.129.0``;
+        # anything older silently disables tool-call enforcement. Setup
+        # enforces the same floor up-front. Smart Routing's spawn hook wants
+        # 0.145.0, but it is gated at its own registration site so it degrades
+        # to "no spawn gate" instead of blocking every codex launch.
         min_version=_CODEX_MIN_VERSION,
     ),
     PI_KEY: HarnessInstallSpec(
