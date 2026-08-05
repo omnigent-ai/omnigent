@@ -6698,6 +6698,113 @@ def test_local_run_prints_resume_hint_after_attach(
     assert opened == [("http://127.0.0.1:23456", "conv_codex_fresh", True)]
 
 
+def test_local_run_resume_hint_follows_native_new_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The resume hint names the session a native ``/new`` rotated into.
+
+    Codex ``/new`` starts a fresh thread and the forwarder rotates
+    Omnigent ownership to a new conversation, recording it in bridge
+    state. A regression that echoes the launch-time ``prepared`` id
+    instead hands the user a command that resumes the session they
+    already cleared away from.
+    """
+    spec_path = tmp_path / "codex.yaml"
+    spec_path.write_text("name: codex-native-ui\nprompt: hi\n", encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+
+    class _Proc:
+        """Stub for the local server subprocess."""
+
+        def poll(self) -> None:
+            """
+            Pretend the fake local server is alive.
+
+            :returns: None.
+            """
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        """
+        Return a minimal server handle without starting a process.
+
+        :param args: Positional startup arguments.
+        :param kwargs: Keyword startup arguments.
+        :returns: Fake local server handle.
+        """
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def fake_prepare(**kwargs: object) -> codex_native.PreparedCodexTerminal:
+        """
+        Return prepared Codex terminal details without launching Codex.
+
+        :param kwargs: Terminal preparation keyword arguments.
+        :returns: Prepared fake terminal.
+        """
+        del kwargs
+        return codex_native.PreparedCodexTerminal(
+            session_id="conv_codex_first",
+            terminal_id=codex_native.codex_terminal_resource_id(),
+            tmux_socket=None,
+            tmux_target=None,
+            bridge_dir=bridge_dir,
+            thread_id="thread_first",
+            app_server_url="ws://127.0.0.1:9876",
+            app_server=None,
+            event_client=None,
+            reattached=False,
+        )
+
+    async def fake_attach_with_forwarder(**kwargs: object) -> None:
+        """
+        Simulate a session where the user ran a native ``/new``.
+
+        :param kwargs: Attach keyword arguments.
+        :returns: None.
+        """
+        del kwargs
+        write_bridge_state(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id="conv_codex_rotated",
+                socket_path="ws://127.0.0.1:9876",
+                thread_id="thread_rotated",
+                codex_home=str(bridge_dir / "codex-home"),
+            ),
+        )
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 23456)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(codex_native, "_prepare_codex_terminal", fake_prepare)
+    monkeypatch.setattr(codex_native, "_attach_with_forwarder", fake_attach_with_forwarder)
+    monkeypatch.setattr(
+        codex_native,
+        "open_conversation_link_if_enabled",
+        lambda **kwargs: None,
+    )
+
+    codex_native._run_with_local_server(
+        spec_path,
+        session_id=None,
+        resume_picker=False,
+        codex_args=(),
+        command="codex",
+        model=None,
+        prompt=None,
+        auto_open_conversation=False,
+    )
+
+    captured = capsys.readouterr()
+    assert "Resume with: omnigent codex --resume conv_codex_rotated" in captured.err
+    assert "--resume conv_codex_first" not in captured.err
+
+
 def test_local_resume_does_not_print_redundant_resume_hint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
