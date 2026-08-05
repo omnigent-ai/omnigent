@@ -405,6 +405,14 @@ attempt controller.
    the new complexity. This is the failure mode that looks like success in
    manual testing, because a freshly-opened conversation works fine and only a
    backgrounded one goes stale after ~5 minutes.
+
+   *Confirmed during phase 1.* An attempt to test two concurrent pumps could not
+   even reach its assertion: the second `startStreamPump` exits at
+   `get().conversationId !== id` the moment the other conversation becomes
+   active (`chatStore.ts:3312`, `:3317`, `:3323`). Until this split lands, no
+   test can exercise more than one live stream, which is why the phase-1 presence
+   fan-out is pinned as a unit test against the contract rather than end-to-end
+   through two pumps. Treat the split as the gate for every multi-stream test.
 3. **Reconnect/dedupe interaction.** The invariants in those long comments —
    itemId dedupe across snapshot and buffer, live-preview stamping, elicitation
    revival — are real and load-bearing. They must hold per-entry, and now also
@@ -431,11 +439,20 @@ Each phase ships independently. Phases 0-2 are behaviour-preserving by design,
 so the existing 328 tests are the regression net; only phase 3 changes semantics.
 
 - **Phase 0** — split the `ChatState` type into `ConversationState` + app-global
-  state. Types only, no behaviour change.
+  state. Types only, no behaviour change. ✅ `7dfdf0cf`
 - **Phase 1** — add `createConversationStore` and move the already-threaded
   stream machinery onto it. Registry capacity 1. Root store mirrors the active
   entry. Deliberately a no-op refactor; the risky commit, validated against the
   current suite.
+
+  Runtime singletons that must become per-entry are being converted first, since
+  each is independently shippable and green against the current suite:
+  - send-ordering chain, keyed per conversation ✅ `4eb347f9` (also removes a
+    cross-conversation head-of-line block)
+  - presence attempt controllers, one per live stream ✅ `9c44023a`
+  - remaining: `retiredLiveMessages`, `liveLastIndex`, the rAF scheduler and
+    `BlockStream` reducer (already per-pump locals — they move with the pump),
+    and `racedNativeModelOptions` (already keyed by id; verify only)
 - **Phase 2** — convert `handleSessionEvent` and its helpers into entry methods;
   delete the ad-hoc guards. Still capacity 1.
 - **Phase 3** — raise `MAX_LIVE` to its real value (30 prod / 3 dev), split the
