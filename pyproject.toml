@@ -432,6 +432,7 @@ markers = [
     "min_runner_version(version): skip this test when the pinned runner/host under test is older than `version` (PEP 440 release-tuple comparison, so a `.devN` of X satisfies X). Used by the runner/host backwards-compat CI (Config 2); inert in normal runs (no OMNIGENT_COMPAT_RUNNER_VERSION set).",
     "mock_only: tests/integration test that only works in mock-LLM mode (no --llm-api-key). Skipped by tests/integration/conftest.py when a real --llm-api-key is supplied (the real-LLM Integration jobs). Use for tests whose mock LLM is scripted with a fixed tool-call sequence — a real LLM cannot reproduce the scripted markers.",
     "visual: UI diff visual-regression snapshot (pytest-playwright-visual-snapshot). Runs only in the pinned-runner gate (.github/workflows/ui-snapshot.yml); the main e2e_ui suite excludes it via -m 'not visual' since it runs on the unpinned ubuntu-latest.",
+    "smart_routing: end-to-end Smart Routing CUJ (tests/e2e/routing). Opt-in via OMNIGENT_E2E_SMART_ROUTING=1: launches a real omnigent host plus real claude/codex TUIs against a gateway. The routing service itself is an in-test mock, so no AI-Gateway task_v1 deployment is needed.",
     "posix_only: test relies on POSIX-only behaviour (fork, PTY, tmux, Unix sockets, signals); auto-skipped on Windows by tests/conftest.py.",
     "windows_only: test relies on Windows-only behaviour (Job Objects, cmd.exe); auto-skipped on POSIX by tests/conftest.py.",
 ]
