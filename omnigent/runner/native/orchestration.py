@@ -412,10 +412,14 @@ class _CodexNativeLaunchConfig:
         auto-harness mode (``omnigent.routing.auto_harness`` label or a
         ``harness_override`` of ``"auto"``), so the router may re-route its
         spawns onto the Claude family. Only then are the routed-spawn developer
-        instructions installed.
+        instructions installed, the spawn-routing endpoint started, and the
+        redirect tools pre-approved — a pinned or plain codex session gets none
+        of it.
     :param routing_enabled: ``True`` when the session launched with Smart
-        Routing on. Gates the first-message turn-routing endpoint, whose
-        advertisement in turn gates the ``UserPromptSubmit`` routing hook.
+        Routing on (pinned or auto-harness). Gates the first-message
+        turn-routing endpoint, whose advertisement in turn gates the
+        ``UserPromptSubmit`` routing hook, and the extended model catalog a
+        routed turn may need.
     """
 
     workspace: Path
@@ -501,21 +505,29 @@ def _start_subagent_router_for_native_session(
     bridge_dir: Path,
     harness: str,
     server_client: httpx.AsyncClient | None,
+    auto_harness: bool,
 ) -> _NativeRouterLaunch:
     """Start the subagent-routing endpoint for a native session.
 
     Native harnesses enforce routing through hooks configured at terminal
     launch, so the endpoint has to be live (and advertised in the bridge
-    dir the hooks read) before the CLI starts. Installed for every
-    session, routed or not: the server re-reads the session's
-    subagent-routing setting on each spawn, so a session that starts
-    unrouted can still be toggled on mid-flight.
+    dir the hooks read) before the CLI starts.
+
+    On the Claude family this is installed for every session, routed or
+    not: the server re-reads the session's subagent-routing setting on
+    each spawn, so a session that starts unrouted can still be toggled on
+    mid-flight. On the codex family the advertisement additionally turns
+    on a generated ``hooks.json`` and the routed-spawn tool pre-approvals,
+    so it is installed for auto-harness sessions only — see
+    ``ensure_session_router_quietly``.
 
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Session bridge directory the hooks discover.
     :param harness: Harness the router is being installed for; logged on
         failure.
     :param server_client: Runner→server client the relay forwards on.
+    :param auto_harness: Whether Smart Routing owns this session's harness.
+        Gates the codex family only.
     :returns: The advertisement directory to point hooks at (``None`` when
         the endpoint could not start) paired with the router handle.
     """
@@ -526,6 +538,7 @@ def _start_subagent_router_for_native_session(
         bridge_dir=bridge_dir,
         server_client=server_client,
         harness=harness,
+        auto_harness=auto_harness,
     )
     return _NativeRouterLaunch(bridge_dir if router is not None else None, router)
 
@@ -940,7 +953,7 @@ async def _codex_native_launch_config(
     # Fork directives stamped on a clone at fork time. Only consulted when
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
-    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, routing_enabled
+    from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
@@ -951,7 +964,7 @@ async def _codex_native_launch_config(
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
-    auto_harness = snapshot.get("harness_override") == "auto"
+    _harness_override = snapshot.get("harness_override")
     _cost_control = snapshot.get("cost_control_mode_override")
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
     # conversation label ("1" to enable). Read here so the runner applies
@@ -967,7 +980,13 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
-        auto_harness = auto_harness or labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+    # One derivation of the session's Smart Routing class, shared with the SDK
+    # codex path, so "pinned" and "auto-harness" mean the same on both.
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode=_cost_control if isinstance(_cost_control, str) else None,
+        harness_override=_harness_override if isinstance(_harness_override, str) else None,
+        labels=labels if isinstance(labels, dict) else None,
+    )
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -978,8 +997,8 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
-        auto_harness=auto_harness,
-        routing_enabled=routing_enabled(_cost_control if isinstance(_cost_control, str) else None),
+        auto_harness=routing_class.auto_harness,
+        routing_enabled=routing_class.routing_enabled,
     )
 
 
@@ -3670,6 +3689,7 @@ async def _auto_create_codex_terminal(
         prepare_bridge_dir,
         socket_path_for_bridge_dir,
     )
+    from omnigent.inner.codex_executor import codex_extended_catalog_env
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     launch_config = await _codex_native_launch_config(
@@ -3933,17 +3953,25 @@ async def _auto_create_codex_terminal(
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
-    # the server decides per spawn whether to route.
+    # the server decides per spawn whether to route. Auto-harness only — the
+    # advertisement is also what makes this session's codex-home diverge from a
+    # plain one (generated hooks.json, routed-spawn tool pre-approvals).
     _codex_router_dir, _codex_router = _start_subagent_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
         harness="codex-native",
         server_client=server_client,
+        auto_harness=launch_config.auto_harness,
     )
     if _codex_router_dir is not None:
         from omnigent.runner.subagent_routing import router_env
 
         app_server.env.update(router_env(session_id, _codex_router_dir, harness="codex-native"))
+    # A routed turn can land on an arm codex's bundled catalog has no entry for
+    # (GLM), which its own client-side validation then refuses — so a Smart
+    # Routing session (pinned or auto) gets the extended catalog. A plain
+    # session keeps codex's bundled catalog and never pays the probe.
+    app_server.env.update(codex_extended_catalog_env(launch_config.routing_enabled))
     # First-message model routing. Advertised in the same bridge dir the
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
     # its own), and live before the app-server starts because the hook can
@@ -6276,12 +6304,14 @@ async def _auto_create_claude_terminal(
     # ``api_key_helper`` (ucode) registers Claude's gateway token command.
     # Gate natively spawned subagents (the Task/Agent tool): start the loopback
     # endpoint in the bridge dir the PreToolUse hook already discovers. Always
-    # installed — the server decides per spawn whether to route.
+    # installed on the Claude family — the server decides per spawn whether to
+    # route, so the gear's toggle keeps working mid-session.
     subagent_router_dir, _subagent_router = _start_subagent_router_for_native_session(
         session_id,
         bridge_dir=bridge_dir,
         harness="claude-native",
         server_client=server_client,
+        auto_harness=True,
     )
     # First-message model routing. Advertised in the same bridge dir the
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its

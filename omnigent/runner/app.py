@@ -54,6 +54,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
 from omnigent.json_types import JsonObject as _JsonObject
@@ -134,6 +135,14 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
+)
+from omnigent.runner.subagent_routing import (
+    PLAIN_SESSION,
+    SessionRoutingClass,
+    forget_session_routing_class,
+    remember_session_routing_class,
+    routing_class_from_snapshot,
+    session_routing_class,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
@@ -613,6 +622,23 @@ class _SessionInitContext:
     def labels(self) -> Mapping[str, str] | None:
         """Return server-supplied labels, or ``None`` on the legacy path."""
         return self.envelope.snapshot.labels if self.envelope is not None else None
+
+    @property
+    def routing_class(self) -> SessionRoutingClass:
+        """Return the session's Smart Routing class.
+
+        The legacy path carries no snapshot, so it reads as plain — a
+        session whose routing state cannot be established must not pay any
+        routing-path cost.
+        """
+        if self.envelope is None:
+            return PLAIN_SESSION
+        snapshot = self.envelope.snapshot
+        return routing_class_from_snapshot(
+            cost_control_mode=snapshot.cost_control_mode_override,
+            harness_override=snapshot.harness_override,
+            labels=snapshot.labels,
+        )
 
 
 # Language constant the omnigent YAML translator stamps on callable-backed
@@ -2600,6 +2626,14 @@ def create_runner_app(
                 },
             )
 
+        # Stamp the session's Smart Routing class before anything reads it: the
+        # spawn env is rebuilt on every harness respawn, long after this
+        # envelope is gone, and on the codex family the class decides whether
+        # the session gets the extended model catalog and the spawn-routing
+        # endpoint at all.
+        _routing_class = init_context.routing_class
+        remember_session_routing_class(session_id, _routing_class)
+
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
         if spec_resolver is not None:
@@ -2650,6 +2684,7 @@ def create_runner_app(
                 session_id,
                 harness_name,
                 server_client=server_client,
+                routing_class=_routing_class,
             )
             spawn_env = _build_spawn_env_from_spec(
                 spec,
@@ -3205,6 +3240,7 @@ def create_runner_app(
         from omnigent.runner.subagent_routing import shutdown_session_router
 
         await asyncio.to_thread(shutdown_session_router, session_id)
+        forget_session_routing_class(session_id)
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
@@ -8772,14 +8808,19 @@ async def _ensure_session_subagent_router(
     harness: str | None,
     *,
     server_client: httpx.AsyncClient | None,
+    routing_class: SessionRoutingClass | None = None,
 ) -> None:
     """Start this session's subagent-routing endpoint.
 
     Only for the SDK harness families: the native terminals know their own
     bridge directory and start the router from their launch paths, where
-    the harness's hooks are also pointed at it. Started for every session
-    regardless of its routing state — the server gates each spawn on the
-    session's (mid-session togglable) subagent-routing setting.
+    the harness's hooks are also pointed at it.
+
+    On the Claude family it is started for every session regardless of its
+    routing state — the server gates each spawn on the session's
+    (mid-session togglable) subagent-routing setting. On the codex family
+    the advertisement is what turns generated hooks and the routed-spawn
+    tool pre-approvals on, so it is limited to auto-harness sessions.
 
     Never raises: ``ensure_session_router_quietly`` owns the bridge-dir
     resolution too, so a hostile or pre-existing ``$TMPDIR`` root cannot
@@ -8789,15 +8830,20 @@ async def _ensure_session_subagent_router(
     :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
     :param server_client: Runner→server client the relay forwards on.
         ``None`` (in-process tests) skips the start.
+    :param routing_class: The session's Smart Routing class. ``None``
+        reads whatever was stamped at session init, which for an unknown
+        session is the plain class.
     """
     from omnigent.runner.subagent_routing import ensure_session_router_quietly
 
     if is_native_harness(harness):
         return
+    resolved = routing_class if routing_class is not None else session_routing_class(session_id)
     ensure_session_router_quietly(
         session_id,
         server_client=server_client,
         harness=harness,
+        auto_harness=resolved.auto_harness,
     )
 
 
@@ -8912,6 +8958,16 @@ def _build_spawn_env_from_spec(
         from omnigent.runner.subagent_routing import session_router_env
 
         env.update(session_router_env(session_id, harness))
+        if harness in CODEX_CANONICAL_HARNESSES:
+            # A Smart Routing turn or spawn can land on a gateway arm codex's
+            # bundled catalog has no entry for, so the session replaces that
+            # catalog. Plain sessions get nothing here and never pay the
+            # ``codex debug models`` probe.
+            from omnigent.inner.codex_executor import codex_extended_catalog_env
+
+            env.update(
+                codex_extended_catalog_env(session_routing_class(session_id).routing_enabled)
+            )
 
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the

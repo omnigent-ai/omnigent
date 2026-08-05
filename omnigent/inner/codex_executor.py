@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import (
     AsyncIterator,
@@ -32,7 +33,7 @@ from collections.abc import (
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Protocol, TypeAlias, cast
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
@@ -412,6 +413,11 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     auth (``auth.json``) rather than a developer API key that would charge
     separately.
 
+    The filtered dict is also the executor's own view of its launch, not just
+    the subprocess env: the app-server session reads Omnigent's per-session
+    codex signals back out of it, so those names have to survive the filter
+    (see :data:`_CODEX_OMNIGENT_LAUNCH_ENV_VARS`).
+
     :returns: Filtered environment dict.
     """
     return clean_agent_env(
@@ -420,6 +426,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
             "PYTHONUTF8",
             "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
             "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+            *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
@@ -703,7 +710,8 @@ def _populate_codex_home_config(
     source_dir: Path,
     *,
     minimal_config: bool | None = None,
-    subagent_routing: bool = False,
+    inject_hooks: bool = False,
+    extend_model_catalog: bool = False,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -736,9 +744,15 @@ def _populate_codex_home_config(
         skipped.
     :param minimal_config: Copy only auth and provider-routing config when
         ``True``. ``None`` preserves the environment-controlled behavior.
-    :param subagent_routing: Skip the ``hooks.json`` symlink because
-        :func:`write_codex_router_hooks_file` generates a merged file (user
-        hooks + Omnigent routing hooks) at that path instead.
+    :param inject_hooks: Skip the ``hooks.json`` symlink because the caller
+        generates a merged regular file (user hooks + Omnigent hooks) at that
+        path instead — see :func:`write_codex_hooks_file`. Left ``False`` when
+        no hooks are injected, so the user's file stays symlinked and a
+        mid-session edit to it still takes effect.
+    :param extend_model_catalog: Replace codex's bundled model catalog with
+        its own catalog plus the gateway-only arms. Costs a ``codex debug
+        models`` probe, so it is reserved for Smart Routing sessions whose
+        turns/spawns can land on such an arm.
     """
     if not source_dir.is_dir():
         return
@@ -752,7 +766,7 @@ def _populate_codex_home_config(
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
-    if subagent_routing:
+    if inject_hooks:
         # The generated hooks file owns this path — a symlink to the user's
         # home would either shadow it or (worse) be written through.
         symlink_files = tuple(name for name in symlink_files if name != _CODEX_HOOKS_FILENAME)
@@ -819,9 +833,9 @@ def _populate_codex_home_config(
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path)
-            if subagent_routing:
-                # Routed spawns can land on an arm codex's bundled catalog
-                # has no entry for, which its spawn tool rejects client-side.
+            if extend_model_catalog:
+                # Routed turns and spawns can land on an arm codex's bundled
+                # catalog has no entry for, which it then refuses client-side.
                 catalog_path = write_codex_model_catalog(
                     target_dir, codex_path=_find_codex_cli(), source_home=source_dir
                 )
@@ -1155,6 +1169,48 @@ def codex_router_session_id(env: Mapping[str, str] | None = None) -> str | None:
     return (source.get(CODEX_ROUTER_SESSION_ID_ENV_VAR) or "").strip() or None
 
 
+# Set for a session whose turns or spawns can land on a gateway arm codex's
+# bundled catalog has no entry for, i.e. any Smart Routing session. Carried in
+# the process env (not a launch argument) so the wrapped executor and the native
+# app-server read the same signal, and absent everywhere else — a plain codex
+# session keeps codex's own catalog and never pays the probe.
+CODEX_EXTENDED_CATALOG_ENV_VAR = "OMNIGENT_CODEX_EXTENDED_MODEL_CATALOG"
+
+
+def codex_extended_catalog_env(enabled: bool) -> dict[str, str]:
+    """
+    Build the env that asks a codex process for the extended model catalog.
+
+    :param enabled: ``True`` for a Smart Routing session (pinned or
+        auto-harness).
+    :returns: Env-var overrides, empty when the catalog stays codex's own.
+    """
+    return {CODEX_EXTENDED_CATALOG_ENV_VAR: "1"} if enabled else {}
+
+
+def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bool:
+    """
+    Report whether this codex process should extend the model catalog.
+
+    :param env: Environment to read; ``None`` uses :data:`os.environ`.
+    :returns: ``True`` when the launch asked for the extended catalog.
+    """
+    source = os.environ if env is None else env
+    return (source.get(CODEX_EXTENDED_CATALOG_ENV_VAR) or "").strip() == "1"
+
+
+#: Omnigent's own per-session signals for a codex launch: the subagent-router
+#: rendezvous, its session id, and the extended-catalog request. The runner sets
+#: them in the harness process env, and the executor reads them back out of
+#: ``_clean_codex_env``'s filtered copy — so they must be allowed through it or
+#: both features silently never engage on the wrapped ``codex`` harness.
+_CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
+    CODEX_ROUTER_DIR_ENV_VAR,
+    CODEX_ROUTER_SESSION_ID_ENV_VAR,
+    CODEX_EXTENDED_CATALOG_ENV_VAR,
+)
+
+
 # Catalog file written into the private codex-home, naming the models the
 # session's ``spawn_agent`` may target. See :func:`extended_model_catalog`.
 _CODEX_MODEL_CATALOG_FILENAME = "model_catalog.json"
@@ -1235,6 +1291,40 @@ _MODEL_CATALOG_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 _MODEL_CATALOG_FAILURE_TTL_S = 60.0
 _MODEL_CATALOG_FAILURES: dict[tuple[str, str], float] = {}
 
+# Both caches are host-process globals reached from worker threads (every
+# caller populates a codex home through ``asyncio.to_thread``), and the probe
+# they memoize is a ~10 s subprocess. Held across the probe so two sessions
+# booting together pay it once: the loser waits for the winner's result instead
+# of shelling out again, which is also what keeps the dict mutations atomic.
+_MODEL_CATALOG_LOCK = threading.Lock()
+
+
+def _valid_model_catalog(catalog: object) -> bool:
+    """
+    Report whether a probe result is shaped like a codex model catalog.
+
+    ``model_catalog_json`` REPLACES codex's bundled catalog, so a
+    half-readable payload would not degrade the session — it would narrow or
+    empty the set of models codex will accept. Validated before it is allowed
+    to become that file: anything unexpected is treated as a probe failure and
+    the session keeps codex's own catalog.
+
+    :param catalog: Decoded ``codex debug models`` output.
+    :returns: ``True`` when every entry carries a usable ``slug``.
+    """
+    if not isinstance(catalog, dict):
+        return False
+    models = catalog.get("models")
+    if not isinstance(models, list) or not models:
+        return False
+    for entry in models:
+        if not isinstance(entry, dict):
+            return False
+        slug = entry.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            return False
+    return True
+
 
 def read_codex_model_catalog(
     codex_path: str,
@@ -1258,20 +1348,21 @@ def read_codex_model_catalog(
     :returns: ``{"models": [...]}``, or ``None`` on any failure.
     """
     cache_key = (codex_path, str(source_home))
-    cached = _MODEL_CATALOG_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    failed_until = _MODEL_CATALOG_FAILURES.get(cache_key)
-    if failed_until is not None:
-        if time.monotonic() < failed_until:
+    with _MODEL_CATALOG_LOCK:
+        cached = _MODEL_CATALOG_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        failed_until = _MODEL_CATALOG_FAILURES.get(cache_key)
+        if failed_until is not None:
+            if time.monotonic() < failed_until:
+                return None
+            del _MODEL_CATALOG_FAILURES[cache_key]
+        catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
+        if catalog is None:
+            _MODEL_CATALOG_FAILURES[cache_key] = time.monotonic() + _MODEL_CATALOG_FAILURE_TTL_S
             return None
-        del _MODEL_CATALOG_FAILURES[cache_key]
-    catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
-    if catalog is None:
-        _MODEL_CATALOG_FAILURES[cache_key] = time.monotonic() + _MODEL_CATALOG_FAILURE_TTL_S
-        return None
-    _MODEL_CATALOG_CACHE[cache_key] = catalog
-    return catalog
+        _MODEL_CATALOG_CACHE[cache_key] = catalog
+        return catalog
 
 
 def _probe_codex_model_catalog(
@@ -1303,7 +1394,12 @@ def _probe_codex_model_catalog(
     except ValueError as exc:
         logger.warning("could not parse the codex model catalog (%s)", exc)
         return None
-    return catalog if isinstance(catalog, dict) else None
+    if not _valid_model_catalog(catalog):
+        logger.warning(
+            "codex debug models returned an unusable catalog; keeping codex's bundled one"
+        )
+        return None
+    return cast(dict[str, Any], catalog)
 
 
 def write_codex_model_catalog(
@@ -1961,7 +2057,9 @@ class _CodexAppServerSession:
         config_source = _codex_home_config_source_from_env()
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
-        # hooks instead of being symlinked in untouched.
+        # hooks instead of being symlinked in untouched. Only an auto-harness
+        # Smart Routing session gets that endpoint, so a plain or pinned session
+        # keeps the symlink — and with it mid-session edits to the user's file.
         router_bridge_dir = codex_router_bridge_dir(self._env)
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
@@ -1970,7 +2068,8 @@ class _CodexAppServerSession:
             _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
-            subagent_routing=router_bridge_dir is not None,
+            inject_hooks=router_bridge_dir is not None,
+            extend_model_catalog=codex_extended_catalog_requested(self._env),
         )
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,

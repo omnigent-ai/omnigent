@@ -17,6 +17,8 @@ from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
     AUTO_HARNESS_LABEL_KEY,
+    PLAIN_SESSION,
+    SessionRoutingClass,
     SubagentRouteDecision,
     SubagentRouteRequest,
     auto_harness_session,
@@ -24,16 +26,20 @@ from omnigent.runner.subagent_routing import (
     decision_record,
     ensure_session_router,
     ensure_session_router_quietly,
+    forget_session_routing_class,
     harness_family,
     make_server_relay_resolver,
     model_in_family,
     persist_subagent_decision,
     relayed_decisions,
+    remember_session_routing_class,
     resolve_subagent_route,
     routed_models,
     router_dir_for_session,
+    routing_class_from_snapshot,
     routing_enabled,
     session_router_env,
+    session_routing_class,
     shutdown_session_router,
     start_subagent_router,
     subagent_routing_enabled,
@@ -1021,6 +1027,73 @@ def test_turn_routing_enabled_requires_a_client_when_caps_are_given(
 )
 def test_subagent_routing_enabled_is_two_state(override: str | None, expected: bool) -> None:
     assert subagent_routing_enabled(override) is expected
+
+
+# ── Session routing class ───────────────────────────────────────────
+#
+# The three-way distinction the codex launch paths key off. Kept as its own
+# value rather than folded into one bool: "Smart Routing is on" and "Smart
+# Routing also owns the harness" buy different things on codex, and conflating
+# them is what made a plain session pay the routing path's costs.
+
+
+@pytest.mark.parametrize(
+    ("cost_control_mode", "harness_override", "labels", "expected"),
+    [
+        # Plain: no Smart Routing anywhere.
+        (None, None, {}, SessionRoutingClass()),
+        ("off", "codex-native", {}, SessionRoutingClass()),
+        # Pinned: Smart Routing as the model, codex chosen as the harness.
+        ("on", "codex-native", {}, SessionRoutingClass(routing_enabled=True)),
+        # Auto-harness, before first-message routing replaces the sentinel.
+        (
+            "on",
+            "auto",
+            {},
+            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+        ),
+        # …and after: the sentinel is gone, the durable label is not.
+        (
+            "on",
+            "codex-native",
+            {AUTO_HARNESS_LABEL_KEY: "1"},
+            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+        ),
+        # An auto-harness session is a Smart Routing session by construction,
+        # so the label alone implies routing is on.
+        (
+            None,
+            None,
+            {AUTO_HARNESS_LABEL_KEY: "1"},
+            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+        ),
+    ],
+)
+def test_routing_class_from_snapshot(
+    cost_control_mode: str | None,
+    harness_override: str | None,
+    labels: dict[str, str],
+    expected: SessionRoutingClass,
+) -> None:
+    assert (
+        routing_class_from_snapshot(
+            cost_control_mode=cost_control_mode,
+            harness_override=harness_override,
+            labels=labels,
+        )
+        == expected
+    )
+
+
+def test_the_recorded_routing_class_survives_until_the_session_ends() -> None:
+    assert session_routing_class("conv_class") == PLAIN_SESSION
+    auto = SessionRoutingClass(routing_enabled=True, auto_harness=True)
+    remember_session_routing_class("conv_class", auto)
+    try:
+        assert session_routing_class("conv_class") == auto
+    finally:
+        forget_session_routing_class("conv_class")
+    assert session_routing_class("conv_class") == PLAIN_SESSION
 
 
 def test_router_dir_for_session_is_owner_only(tmp_path: Path) -> None:

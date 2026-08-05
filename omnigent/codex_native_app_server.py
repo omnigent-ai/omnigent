@@ -50,6 +50,7 @@ from omnigent.inner.codex_executor import (
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
+    codex_extended_catalog_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -188,15 +189,20 @@ def _remove_toml_table(text: str, table_name: str) -> str:
     return "".join(kept).rstrip()
 
 
-#: Omnigent tools the framework calls on the session's behalf, pre-approved so
-#: codex never raises an interactive prompt for them. The rename keeps a
-#: session's title current; the rest carry out a Smart Routing cross-harness
-#: redirect end to end — discover the agent, start the routed child, deliver the
-#: task, collect its result. Without the last one the redirect stalls on an
-#: approval prompt nobody is watching. Written unconditionally: a table for a
-#: tool this session's relay does not advertise is inert.
-_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
-    "sys_session_rename",
+#: Omnigent tools the framework calls on every session's behalf, pre-approved
+#: so codex never raises an interactive prompt for them. The rename keeps a
+#: session's title current, which the framework does unprompted on any session.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+
+#: Additionally pre-approved for an auto-harness Smart Routing session, whose
+#: spawns the router may move onto the counterpart harness family: these four
+#: carry out that cross-harness redirect end to end — discover the agent, start
+#: the routed child, deliver the task, collect its result. Without the last one
+#: the redirect stalls on an approval prompt nobody is watching. A plain or
+#: pinned session can never receive a redirect, so it gets none of them and its
+#: approval surface stays a plain codex session's. Mirrors the claude-native
+#: ``_ROUTED_SPAWN_ALLOWED_TOOLS`` gate.
+_ROUTED_SPAWN_APPROVED_TOOLS: tuple[str, ...] = (
     "sys_session_create",
     "sys_agent_list",
     "sys_session_send",
@@ -204,9 +210,24 @@ _FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
 )
 
 
+def framework_approved_tools(*, routed_spawns: bool) -> tuple[str, ...]:
+    """
+    Name the Omnigent tools this session pre-approves in codex.
+
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which also needs the cross-harness redirect toolkit.
+    :returns: Tool names, in the order their approval tables are written.
+    """
+    if not routed_spawns:
+        return _FRAMEWORK_APPROVED_TOOLS
+    return (*_FRAMEWORK_APPROVED_TOOLS, *_ROUTED_SPAWN_APPROVED_TOOLS)
+
+
 def _codex_mcp_server_config_section(
     bridge_dir: Path,
     python_executable: str | None = None,
+    *,
+    routed_spawns: bool = False,
 ) -> str:
     """
     Build the generated Codex MCP server TOML section.
@@ -216,6 +237,8 @@ def _codex_mcp_server_config_section(
     :param python_executable: Python executable for serve-mcp, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
         :data:`sys.executable`.
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which pre-approves the cross-harness redirect tools too.
     :returns: TOML text for ``[mcp_servers.omnigent]`` and its
         framework-managed tool approvals.
     """
@@ -231,7 +254,7 @@ def _codex_mcp_server_config_section(
     args_toml = ", ".join(json.dumps(a) for a in args)
     approvals = "\n".join(
         f'[mcp_servers.omnigent.tools.{tool}]\napproval_mode = "approve"\n'
-        for tool in _FRAMEWORK_APPROVED_TOOLS
+        for tool in framework_approved_tools(routed_spawns=routed_spawns)
     )
     return (
         f"[mcp_servers.omnigent]\n"
@@ -365,6 +388,8 @@ def _inject_mcp_server_config(
     codex_home: Path,
     bridge_dir: Path,
     python_executable: str | None = None,
+    *,
+    routed_spawns: bool = False,
 ) -> None:
     """
     Upsert Omnigent MCP server config into ``config.toml``.
@@ -380,6 +405,8 @@ def _inject_mcp_server_config(
         and ``tool_relay.json``.
     :param python_executable: Python executable for serve-mcp.
         ``None`` uses :data:`sys.executable`.
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which pre-approves the cross-harness redirect tools too.
     :returns: None.
     """
     config_path = codex_home / "config.toml"
@@ -397,7 +424,9 @@ def _inject_mcp_server_config(
     else:
         existing = ""
     updated = _remove_toml_table(existing, "mcp_servers.omnigent")
-    section = _codex_mcp_server_config_section(bridge_dir, python_executable)
+    section = _codex_mcp_server_config_section(
+        bridge_dir, python_executable, routed_spawns=routed_spawns
+    )
     rendered = f"{updated}\n\n{section}" if updated else section
     config_path.write_text(rendered, encoding="utf-8")
 
@@ -873,25 +902,35 @@ class CodexNativeAppServer:
         )
         # When the runner advertises a route-subagent endpoint, the generated
         # hooks file owns hooks.json, so the user's copy is merged in rather
-        # than symlinked over.
+        # than symlinked over. The runner advertises it for auto-harness Smart
+        # Routing sessions only, so its presence is also this session class's
+        # signature — see ``ensure_session_router_quietly``.
         router_bridge_dir = codex_router_bridge_dir(self.env)
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
+        routed_spawns = router_bridge_dir is not None
         config_source = _codex_home_config_source_from_env()
-        # Off the loop: this copies/symlinks a home AND (on the routing path)
-        # shells out to ``codex debug models`` with a 10s timeout. Run inline it
-        # stalled every other session sharing this event loop for that long.
+        # Off the loop: this copies/symlinks a home AND (on a Smart Routing
+        # session) shells out to ``codex debug models`` with a 10s timeout. Run
+        # inline it stalled every other session sharing this event loop for that
+        # long — which is also why a plain session must never reach the probe.
         await asyncio.to_thread(
             _populate_codex_home_config,
             self.codex_home,
             config_source,
-            subagent_routing=self.router_hooks_registered,
+            inject_hooks=self.router_hooks_registered,
+            extend_model_catalog=codex_extended_catalog_requested(self.env),
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
         # by `codex app-server`, so we write directly to the file.
-        _inject_mcp_server_config(self.codex_home, self.bridge_dir, self.python_executable)
+        _inject_mcp_server_config(
+            self.codex_home,
+            self.bridge_dir,
+            self.python_executable,
+            routed_spawns=routed_spawns,
+        )
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
         _sync_codex_developer_instructions(

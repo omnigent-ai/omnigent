@@ -28,6 +28,7 @@ from omnigent.codex_native_app_server import (
     _sync_codex_developer_instructions,
     build_codex_native_server,
     discover_codex_model_options,
+    framework_approved_tools,
     trust_codex_router_hooks,
     trust_native_policy_hooks,
 )
@@ -141,11 +142,31 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     _model_discovery_cache.clear()
 
 
-# Every framework-approved Omnigent tool gets its own approval table, so a
-# routed spawn's sys_session_create never raises an interactive prompt.
-_EXPECTED_FRAMEWORK_TOOL_APPROVALS = {
-    tool: {"approval_mode": "approve"} for tool in _FRAMEWORK_APPROVED_TOOLS
+# Spelled out per session class rather than derived from the constants under
+# test: a comprehension over ``_FRAMEWORK_APPROVED_TOOLS`` passes no matter what
+# is added to it, so it can never catch the approval surface growing.
+#
+# A plain (and a pinned Smart Routing) codex session pre-approves exactly the
+# one tool the framework calls unprompted on any session. An auto-harness
+# session, whose spawns the router may move onto the Claude family, additionally
+# pre-approves the four that carry out that redirect — nobody is watching for an
+# approval prompt in the middle of one.
+_PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
+_AUTO_HARNESS_TOOL_APPROVALS = {
+    "sys_session_rename": {"approval_mode": "approve"},
+    "sys_session_create": {"approval_mode": "approve"},
+    "sys_agent_list": {"approval_mode": "approve"},
+    "sys_session_send": {"approval_mode": "approve"},
+    "sys_read_inbox": {"approval_mode": "approve"},
 }
+
+
+def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
+    assert set(framework_approved_tools(routed_spawns=False)) == set(_PLAIN_TOOL_APPROVALS)
+    assert set(framework_approved_tools(routed_spawns=True)) == set(_AUTO_HARNESS_TOOL_APPROVALS)
+    # The base set is a subset of the routed one, so a routed session never
+    # loses an approval a plain session has.
+    assert set(_FRAMEWORK_APPROVED_TOOLS) <= set(_AUTO_HARNESS_TOOL_APPROVALS)
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
@@ -516,6 +537,7 @@ def _test_app_server(
     codex_home: Path,
     bridge_dir: Path,
     workspace: Path,
+    env: dict[str, str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a Codex app-server wrapper for startup unit tests.
@@ -524,13 +546,15 @@ def _test_app_server(
     :param codex_home: Private Codex home to write.
     :param bridge_dir: Bridge directory for the generated MCP args.
     :param workspace: Working directory for the subprocess.
+    :param env: Process env for the app-server, carrying the routing
+        signals the session class is read from. ``None`` is a plain session.
     :returns: Configured app-server wrapper.
     """
     return CodexNativeAppServer(
         codex_path=sys.executable,
         socket_path=tmp_path / "codex.sock",
         codex_home=codex_home,
-        env={},
+        env=dict(env or {}),
         config_overrides=[],
         cwd=workspace,
         bridge_dir=bridge_dir,
@@ -602,7 +626,7 @@ args = []
             "--bridge-dir",
             str(bridge_dir),
         ],
-        "tools": _EXPECTED_FRAMEWORK_TOOL_APPROVALS,
+        "tools": _PLAIN_TOOL_APPROVALS,
     }
 
 
@@ -644,8 +668,148 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "--bridge-dir",
             str(bridge_dir),
         ],
-        "tools": _EXPECTED_FRAMEWORK_TOOL_APPROVALS,
+        "tools": _PLAIN_TOOL_APPROVALS,
     }
+
+
+# ── The three codex-native session classes ──────────────────────────
+#
+# Everything below is a per-class snapshot of the private CODEX_HOME a
+# codex-native session boots on. A plain session must be indistinguishable from
+# a pre-Smart-Routing one: codex's bundled model catalog (no ``codex debug
+# models`` probe), no ``spawn_agent`` routing gate in hooks.json, and only the
+# one framework tool approval. A pinned Smart Routing session adds the extended
+# catalog. Only an auto-harness session adds the spawn gate and the redirect
+# toolkit's approvals.
+
+
+def _stub_model_catalog_probe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the ``codex debug models`` probe and record its calls."""
+    from omnigent.inner import codex_executor
+
+    probes: list[str] = []
+
+    def _probe(codex_path: str, source_home: Path, *, timeout: float) -> dict[str, Any]:
+        del source_home, timeout
+        probes.append(codex_path)
+        return {
+            "models": [
+                {"slug": "gpt-5.6-luna", "visibility": "list", "supported_reasoning_levels": []}
+            ]
+        }
+
+    monkeypatch.setattr(codex_executor, "_find_codex_cli", lambda: "/bin/codex")
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
+    monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", _probe)
+    return probes
+
+
+async def _start_codex_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    env: dict[str, str],
+) -> tuple[Path, list[str]]:
+    """Boot an app-server with *env* and return its home plus probe calls."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+    (real_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [{"hooks": [{"type": "command", "command": "user-pre"}]}],
+                    "Stop": [{"hooks": [{"type": "command", "command": "user-stop"}]}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    probes = _stub_model_catalog_probe(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace, env)
+    await server.start()
+    await server.close()
+    return codex_home, probes
+
+
+#: The regex the routing gate is registered under (codex flattens the tool name).
+_SPAWN_MATCHER = r".*spawn_agent"
+
+
+def _mcp_tool_approvals(codex_home: Path) -> dict[str, Any]:
+    parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    return parsed["mcp_servers"]["omnigent"]["tools"]
+
+
+def _hook_matchers(codex_home: Path, event: str) -> list[str | None]:
+    payload = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
+    return [entry.get("matcher") for entry in payload["hooks"].get(event, [])]
+
+
+async def test_a_plain_codex_native_session_looks_like_a_plain_codex_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home, probes = await _start_codex_home(tmp_path, monkeypatch, env={})
+
+    assert probes == []
+    assert not (codex_home / "model_catalog.json").exists()
+    assert "model_catalog_json" not in (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert _mcp_tool_approvals(codex_home) == _PLAIN_TOOL_APPROVALS
+    # The policy gate and the user's own hooks are a plain codex session's
+    # pre-existing PreToolUse entries; what it must not gain is a gate on the
+    # spawn tool, which stalls ~30 s on a wedged server before failing open.
+    assert _SPAWN_MATCHER not in _hook_matchers(codex_home, "PreToolUse")
+
+
+async def test_a_pinned_smart_routing_codex_native_session_gains_only_the_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.codex_executor import CODEX_EXTENDED_CATALOG_ENV_VAR
+
+    codex_home, probes = await _start_codex_home(
+        tmp_path, monkeypatch, env={CODEX_EXTENDED_CATALOG_ENV_VAR: "1"}
+    )
+
+    assert probes == ["/bin/codex"]
+    assert (codex_home / "model_catalog.json").is_file()
+    assert "model_catalog_json" in (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert _mcp_tool_approvals(codex_home) == _PLAIN_TOOL_APPROVALS
+    assert _SPAWN_MATCHER not in _hook_matchers(codex_home, "PreToolUse")
+
+
+async def test_an_auto_harness_codex_native_session_gains_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.codex_executor import (
+        CODEX_EXTENDED_CATALOG_ENV_VAR,
+        CODEX_ROUTER_DIR_ENV_VAR,
+        CODEX_ROUTER_SESSION_ID_ENV_VAR,
+    )
+
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    codex_home, probes = await _start_codex_home(
+        tmp_path,
+        monkeypatch,
+        env={
+            CODEX_EXTENDED_CATALOG_ENV_VAR: "1",
+            CODEX_ROUTER_DIR_ENV_VAR: str(router_dir),
+            CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+        },
+    )
+
+    assert probes == ["/bin/codex"]
+    assert (codex_home / "model_catalog.json").is_file()
+    assert _mcp_tool_approvals(codex_home) == _AUTO_HARNESS_TOOL_APPROVALS
+    # Omnigent's policy hook stays first, then the spawn gate, then user hooks.
+    assert _hook_matchers(codex_home, "PreToolUse") == [None, _SPAWN_MATCHER, None]
 
 
 async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(

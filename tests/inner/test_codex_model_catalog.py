@@ -225,6 +225,98 @@ def test_the_catalog_probe_runs_off_the_event_loop(
     del tmp_path, monkeypatch
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        # Not JSON at all — a codex that printed a banner or an error.
+        "not json",
+        # JSON, but not an object.
+        "[]",
+        # Right shape, empty or unusable entries: an entry with no slug cannot
+        # be matched or cloned, and codex would accept only what this file
+        # lists — so a partially-readable payload would NARROW the spawn enum.
+        '{"models": []}',
+        '{"models": [{"slug": "gpt-5.6-luna"}, {"display_name": "no slug"}]}',
+        '{"models": [{"slug": ""}]}',
+        '{"models": [{"slug": "gpt-5.6-luna"}, "a string"]}',
+    ],
+)
+def test_a_malformed_probe_result_keeps_the_bundled_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+) -> None:
+    """``model_catalog_json`` replaces codex's catalog, so a bad probe must not
+    become that file — the session keeps codex's bundled one (fail open)."""
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, out: str) -> None:
+            self.stdout = out
+
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
+    monkeypatch.setattr(
+        codex_executor.subprocess,
+        "run",
+        lambda *a, **k: _Completed(stdout),  # type: ignore[arg-type]
+    )
+
+    assert codex_executor.read_codex_model_catalog("/bin/codex", tmp_path) is None
+    written = write_codex_model_catalog(tmp_path, codex_path="/bin/codex", source_home=tmp_path)
+    assert written is None
+    assert not (tmp_path / "model_catalog.json").exists()
+
+
+def test_concurrent_populates_share_one_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two sessions booting together must not each pay the 10 s probe.
+
+    Both callers reach the catalog from a worker thread (the populate runs
+    through ``asyncio.to_thread``), so without a lock they raced the cache and
+    shelled out twice.
+    """
+    import threading
+
+    calls: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _probe(codex_path: str, source_home: Path, *, timeout: float) -> dict[str, Any]:  # type: ignore[explicit-any]
+        del source_home, timeout
+        calls.append(codex_path)
+        entered.set()
+        # Hold the probe open so the second thread is guaranteed to arrive
+        # while the first is still inside it — the race window itself.
+        release.wait(timeout=10)
+        return _catalog()
+
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
+    monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", _probe)
+
+    results: list[dict[str, Any] | None] = []  # type: ignore[explicit-any]
+
+    def _read() -> None:
+        results.append(codex_executor.read_codex_model_catalog("/bin/codex", tmp_path))
+
+    first = threading.Thread(target=_read)
+    first.start()
+    assert entered.wait(timeout=10)
+    second = threading.Thread(target=_read)
+    second.start()
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert calls == ["/bin/codex"]
+    assert all(result is not None for result in results)
+
+
 def test_the_config_key_lands_above_the_first_table(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text(

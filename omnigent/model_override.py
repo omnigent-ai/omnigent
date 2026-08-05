@@ -110,26 +110,37 @@ _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
 _DATABRICKS_GATEWAY_PREFIX = "databricks-"
 
 
-# Vendor tokens that name a codex-runnable model. GPT/codex ids are the
-# obvious case; GLM and Kimi serve on the same OpenResponses wire codex
-# speaks (see the Responses-capable listing in
-# ``omnigent/pi_native_credentials.py``), so codex can run them too.
-_CODEX_COMPATIBLE_SEGMENT_TOKENS: tuple[str, ...] = ("gpt", "codex", "glm", "kimi")
+# Vendor tokens matched anywhere in the id — the long-standing rule for the
+# OpenAI family, kept verbatim so every shape it already accepted still
+# dispatches: ``chatgpt-4o-latest`` (the token is glued to a prefix) and
+# ``gpt4o`` (glued to its generation) are real OpenAI ids that a per-segment
+# match rejects outright.
+_CODEX_SUBSTRING_TOKENS: tuple[str, ...] = ("gpt", "codex")
 
-# Ids are matched per segment (``-``/``_``/``.``/``/`` separated) with an
+# Tokens matched per segment (``-``/``_``/``.``/``/`` separated) with an
 # optional trailing generation number, so ``system.ai.glm-5-2`` and
 # ``kimi-k2-instruct`` match while an unrelated endpoint name that merely
-# contains the letters (``glmqlfit-eval``) does not.
+# contains the letters (``glmqlfit-eval``) does not. Only the families added
+# for codex-compatible routing: three letters inside an arbitrary endpoint name
+# is far likelier to be a coincidence than "gpt" is.
+_CODEX_COMPATIBLE_SEGMENT_TOKENS: tuple[str, ...] = ("glm", "kimi")
+
 _ID_SEGMENT_SPLIT = re.compile(r"[^a-z0-9]+")
 
 
 def is_codex_compatible_model(model: str) -> bool:
     """Report whether *model* can run on a codex harness.
 
+    GPT/codex ids are matched as substrings and GLM/Kimi ids per segment —
+    see the token tables above for why the two families are read differently.
+
     :param model: Model id in any vocabulary, e.g. ``"databricks-glm-5-2"``.
     :returns: ``True`` for the GPT/codex, GLM, and Kimi families.
     """
-    segments = _ID_SEGMENT_SPLIT.split(model.lower())
+    lower = model.lower()
+    if any(token in lower for token in _CODEX_SUBSTRING_TOKENS):
+        return True
+    segments = _ID_SEGMENT_SPLIT.split(lower)
     return any(
         re.fullmatch(rf"{token}\d*", segment)
         for segment in segments
@@ -189,9 +200,14 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     return None
 
 
-# Bare canonical vendor ids ("claude-opus-4-8", "gpt-5-4"); slash/colon/
-# bracket/vendor-prefixed shapes have no mechanical gateway counterpart.
-_MECHANICAL_VENDOR_ID_RE = re.compile(r"^(?:claude|gpt)-[a-z0-9][a-z0-9.-]*$")
+# Bare canonical vendor ids ("claude-opus-4-8", "gpt-5-4", "glm-5-2",
+# "kimi-k2-instruct"); slash/colon/bracket/vendor-prefixed shapes have no
+# mechanical gateway counterpart. The GLM/Kimi families belong here for the
+# same reason the others do: they are dispatchable on codex, so a caller may
+# name a bare one, and leaving them out persisted the bare id verbatim onto a
+# gateway-backed child that can only serve the prefixed spelling — an opaque
+# failure at the CLI instead of a mechanical localization.
+_MECHANICAL_VENDOR_ID_RE = re.compile(r"^(?:claude|gpt|glm|kimi)-[a-z0-9][a-z0-9.-]*$")
 
 _DATABRICKS_MODEL_PREFIX = "databricks-"
 
@@ -212,8 +228,9 @@ def canonical_model_spelling(model: str) -> str:
     :param model: A model id, e.g. ``"databricks-claude-haiku-4-5"``.
     :returns: The bare canonical id (``"claude-haiku-4-5"``) when the
         prefix is mechanical; otherwise *model* unchanged (slash/colon/
-        bracket shapes and non-claude/gpt families have no mechanical
-        gateway counterpart).
+        bracket shapes, and families outside
+        :data:`_MECHANICAL_VENDOR_ID_RE`, have no mechanical gateway
+        counterpart).
     """
     if model.startswith(_DATABRICKS_MODEL_PREFIX):
         bare = model[len(_DATABRICKS_MODEL_PREFIX) :]
@@ -237,17 +254,17 @@ def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
     order-independent — checking first keeps error text quoting exactly
     what the caller sent). Two transforms, both prefix-mechanical:
 
-    - Databricks-gateway child + bare canonical claude/gpt id →
-      prepend ``databricks-`` (``claude-opus-4-8`` →
-      ``databricks-claude-opus-4-8``).
-    - Vendor-direct child (API key / CLI subscription) +
-      ``databricks-``-prefixed claude/gpt id → strip the prefix
+    - Databricks-gateway child + a bare canonical id of a localizable
+      family (claude / gpt / glm / kimi) → prepend ``databricks-``
+      (``claude-opus-4-8`` → ``databricks-claude-opus-4-8``).
+    - Vendor-direct child (API key / CLI subscription) + a
+      ``databricks-``-prefixed id of one → strip the prefix
       (``databricks-gpt-5-4`` → ``gpt-5-4``).
 
-    Anything non-mechanical (slash/colon/bracket shapes, non-claude/gpt
-    families, gateway/local/unknown provider kinds) passes through
-    unchanged — the existing fail-loud harness/gateway error remains
-    the safety net for genuinely unroutable ids.
+    Anything non-mechanical (slash/colon/bracket shapes, families outside
+    :data:`_MECHANICAL_VENDOR_ID_RE`, gateway/local/unknown provider kinds)
+    passes through unchanged — the existing fail-loud harness/gateway error
+    remains the safety net for genuinely unroutable ids.
 
     :param model: A model id that already passed
         :func:`validate_model_override`, e.g. ``"claude-sonnet-4-6"``.

@@ -164,6 +164,65 @@ def routing_enabled(
     return backends_from_caps(caps).any() is not None
 
 
+@dataclass(frozen=True)
+class SessionRoutingClass:
+    """Which Smart Routing additions one session is entitled to.
+
+    Three classes, and the codex paths treat them differently (the product
+    ruling): a **plain** session (both flags false) must be
+    byte-for-byte a plain codex session — no catalog replacement, no
+    spawn-routing hooks, no extra tool pre-approvals. A **pinned**
+    Smart Routing session (``routing_enabled`` only) adds the extended
+    model catalog, because a routed turn can land on an arm codex's
+    bundled catalog has no entry for. An **auto-harness** session (both)
+    additionally gets the spawn-routing gate and the pre-approvals the
+    cross-harness redirect needs.
+
+    :param routing_enabled: The session launched with Smart Routing as its
+        model.
+    :param auto_harness: The session also let Smart Routing pick the
+        harness, so the router may move its spawns across families.
+    """
+
+    routing_enabled: bool = False
+    auto_harness: bool = False
+
+
+#: The class a session with no recorded routing state is treated as. Read by
+#: the codex launch paths, so "unknown" has to mean "plain".
+PLAIN_SESSION = SessionRoutingClass()
+
+
+def routing_class_from_snapshot(
+    *,
+    cost_control_mode: str | None,
+    harness_override: str | None,
+    labels: Mapping[str, str] | None,
+) -> SessionRoutingClass:
+    """Derive a session's routing class from its persisted state.
+
+    The one reader of the three fields that carry it, so the runner-side
+    launch paths agree on what "pinned" and "auto-harness" mean.
+
+    :param cost_control_mode: ``cost_control_mode_override``, e.g. ``"on"``.
+    :param harness_override: ``harness_override``; the ``"auto"`` sentinel
+        marks auto-harness until first-message routing replaces it.
+    :param labels: Conversation labels, which carry the durable
+        :data:`AUTO_HARNESS_LABEL_KEY` record.
+    :returns: The session's class.
+    """
+    auto = harness_override == "auto" or (
+        labels is not None and labels.get(AUTO_HARNESS_LABEL_KEY) == "1"
+    )
+    # An auto-harness session is a Smart Routing session by construction, so
+    # the label implies routing is on even for a row whose cost-control field
+    # was never stamped.
+    return SessionRoutingClass(
+        routing_enabled=routing_enabled(cost_control_mode) or auto,
+        auto_harness=auto,
+    )
+
+
 def subagent_routing_enabled(subagent_routing_override: str | None) -> bool:
     """Report whether subagent spawns are routed for one session.
 
@@ -1088,7 +1147,41 @@ _session_routers: dict[str, SubagentRouter] = {}
 # Models the relay actually handed back, per session — the ledger the
 # codex ``SubagentStart`` audit is reconciled against.
 _relayed: dict[str, list[dict[str, Any]]] = {}
+# Routing class per session, stamped at session init. The SDK harness paths
+# build their spawn env long after the init envelope is gone, so the class has
+# to outlive it.
+_session_routing_classes: dict[str, SessionRoutingClass] = {}
 _lifecycle_lock = threading.Lock()
+
+
+def remember_session_routing_class(session_id: str, routing_class: SessionRoutingClass) -> None:
+    """Record which Smart Routing additions *session_id* is entitled to.
+
+    :param session_id: Session/conversation identifier.
+    :param routing_class: The class derived from the session's snapshot.
+    """
+    with _lifecycle_lock:
+        _session_routing_classes[session_id] = routing_class
+
+
+def session_routing_class(session_id: str) -> SessionRoutingClass:
+    """Return the recorded routing class for *session_id*.
+
+    :param session_id: Session/conversation identifier.
+    :returns: The recorded class, or :data:`PLAIN_SESSION` when none was
+        recorded — an unknown session must not pay any routing-path cost.
+    """
+    with _lifecycle_lock:
+        return _session_routing_classes.get(session_id, PLAIN_SESSION)
+
+
+def forget_session_routing_class(session_id: str) -> None:
+    """Drop the recorded routing class for a finished session.
+
+    :param session_id: Session/conversation identifier.
+    """
+    with _lifecycle_lock:
+        _session_routing_classes.pop(session_id, None)
 
 
 def relayed_decisions(session_id: str) -> tuple[dict[str, Any], ...]:
@@ -1192,6 +1285,7 @@ def ensure_session_router_quietly(
     harness: str | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     caps: Any = None,
+    auto_harness: bool = True,
 ) -> SubagentRouter | None:
     """Start the session's router, or return ``None`` instead of failing.
 
@@ -1214,6 +1308,14 @@ def ensure_session_router_quietly(
         loop.
     :param caps: Accepted and ignored; kept so launch sites can pass the
         ``RuntimeCaps`` they already hold.
+    :param auto_harness: Whether this session let Smart Routing pick its
+        harness. Only consulted on the codex family, where the endpoint's
+        advertisement is also what turns the generated ``spawn_agent``
+        hook, the extra tool pre-approvals and the merged ``hooks.json``
+        on — costs a plain or pinned codex session must not pay. The
+        Claude family ignores it: its ``Task`` hook is registered by the
+        bridge either way and the server still gates each spawn, so
+        subagent routing stays togglable mid-session there.
     :returns: The running router handle, or ``None`` when it could not
         start.
     """
@@ -1221,6 +1323,8 @@ def ensure_session_router_quietly(
     if server_client is None:
         return None
     if harness not in _CLAUDE_HOOK_HARNESSES and harness not in _CODEX_HOOK_HARNESSES:
+        return None
+    if harness in _CODEX_HOOK_HARNESSES and not auto_harness:
         return None
     try:
         return ensure_session_router(

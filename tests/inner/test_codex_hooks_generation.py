@@ -13,10 +13,12 @@ import pytest
 
 from omnigent.inner import codex_executor
 from omnigent.inner.codex_executor import (
+    CODEX_EXTENDED_CATALOG_ENV_VAR,
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     _CodexAppServerSession,
     _populate_codex_home_config,
+    codex_extended_catalog_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -30,6 +32,14 @@ _USER_HOOKS = {
         "PreToolUse": [{"hooks": [{"type": "command", "command": "user-pre"}]}],
         "Stop": [{"hooks": [{"type": "command", "command": "user-stop"}]}],
     }
+}
+
+# Enough of a ``codex debug models`` payload for ``extended_model_catalog`` to
+# clone the GLM arm from: it needs the clone-source slug to be present.
+_MODEL_CATALOG: dict[str, Any] = {  # type: ignore[explicit-any]
+    "models": [
+        {"slug": "gpt-5.6-luna", "visibility": "list", "supported_reasoning_levels": []},
+    ]
 }
 
 
@@ -121,19 +131,19 @@ def test_write_router_hooks_file_replaces_symlink_and_merges(tmp_path: Path) -> 
     assert json.loads((source / "hooks.json").read_text()) == _USER_HOOKS
 
 
-def test_populate_skips_hooks_symlink_when_routing_on(tmp_path: Path) -> None:
+def test_populate_skips_hooks_symlink_when_hooks_are_injected(tmp_path: Path) -> None:
     source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
     codex_home = tmp_path / "private"
     codex_home.mkdir()
 
-    _populate_codex_home_config(codex_home, source, subagent_routing=True)
+    _populate_codex_home_config(codex_home, source, inject_hooks=True)
 
     assert not (codex_home / "hooks.json").exists()
     assert (codex_home / "auth.json").is_symlink()
     assert (codex_home / "config.toml").is_file()
 
 
-def test_populate_symlinks_hooks_when_routing_off(tmp_path: Path) -> None:
+def test_populate_symlinks_hooks_when_none_are_injected(tmp_path: Path) -> None:
     source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
     codex_home = tmp_path / "private"
     codex_home.mkdir()
@@ -159,6 +169,27 @@ def test_write_router_hooks_file_without_user_hooks(tmp_path: Path) -> None:
     assert len(payload["hooks"]["PreToolUse"]) == 1
 
 
+def test_the_launch_signals_survive_the_codex_env_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The executor reads its session class out of the FILTERED env.
+
+    ``_clean_codex_env`` is both the codex subprocess env and the executor's
+    own view of its launch, so a signal missing from its allowlist is dropped
+    and the feature it gates silently never engages — the routing hooks and the
+    extended catalog were both unreachable on the wrapped ``codex`` harness.
+    """
+    monkeypatch.setenv(CODEX_ROUTER_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setenv(CODEX_ROUTER_SESSION_ID_ENV_VAR, "conv_abc")
+    monkeypatch.setenv(CODEX_EXTENDED_CATALOG_ENV_VAR, "1")
+
+    filtered = codex_executor._clean_codex_env()
+
+    assert codex_router_bridge_dir(filtered) == tmp_path
+    assert codex_router_session_id(filtered) == "conv_abc"
+    assert codex_extended_catalog_requested(filtered) is True
+
+
 def test_router_env_discovery(tmp_path: Path) -> None:
     env = {
         CODEX_ROUTER_DIR_ENV_VAR: str(tmp_path),
@@ -171,12 +202,20 @@ def test_router_env_discovery(tmp_path: Path) -> None:
     assert codex_router_session_id({}) is None
 
 
-class _HooksSnapshot:
-    def __init__(self, path: Path) -> None:
-        self.is_symlink = path.is_symlink()
+class _HomeSnapshot:
+    """The private ``CODEX_HOME`` as codex would have read it at launch."""
+
+    def __init__(self, home: Path) -> None:
+        hooks = home / "hooks.json"
+        self.is_symlink = hooks.is_symlink()
         self.payload: dict[str, Any] | None = None  # type: ignore[explicit-any]
-        if path.is_file():
-            self.payload = json.loads(path.read_text())
+        if hooks.is_file():
+            self.payload = json.loads(hooks.read_text())
+        self.catalog_written = (home / "model_catalog.json").is_file()
+        config = home / "config.toml"
+        self.config_names_catalog = config.is_file() and "model_catalog_json" in config.read_text(
+            encoding="utf-8"
+        )
 
 
 def _start_app_server(
@@ -184,22 +223,35 @@ def _start_app_server(
     monkeypatch: pytest.MonkeyPatch,
     *,
     env: dict[str, str],
-) -> tuple[tuple[str, ...], _HooksSnapshot]:
+    probes: list[str] | None = None,
+) -> tuple[tuple[str, ...], _HomeSnapshot]:
     source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
     workspace = tmp_path / "work"
     workspace.mkdir()
-    captured: list[tuple[tuple[str, ...], _HooksSnapshot]] = []
+    captured: list[tuple[tuple[str, ...], _HomeSnapshot]] = []
 
     async def fake_exec(*argv: str, **kwargs: Any) -> None:  # type: ignore[explicit-any]
         # The session deletes its private CODEX_HOME on the launch failure
-        # below, so snapshot the hooks file while codex would have read it.
+        # below, so snapshot the home while codex would have read it.
         home = Path(kwargs["env"]["CODEX_HOME"])
-        captured.append((argv, _HooksSnapshot(home / "hooks.json")))
+        captured.append((argv, _HomeSnapshot(home)))
         raise RuntimeError("stop")
+
+    def fake_probe(codex_path: str, source_home: Path, *, timeout: float) -> dict[str, Any]:  # type: ignore[explicit-any]
+        del source_home, timeout
+        if probes is not None:
+            probes.append(codex_path)
+        return _MODEL_CATALOG
 
     monkeypatch.setattr(codex_executor, "populate_codex_skills_from_bundle", lambda *a, **k: None)
     monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: source)
     monkeypatch.setattr(codex_executor, "_create_subprocess_exec", fake_exec)
+    # Never shell out to a real ``codex debug models`` from a unit test, and
+    # never let one session's cached catalog answer another's probe count.
+    monkeypatch.setattr(codex_executor, "_find_codex_cli", lambda: "/bin/codex")
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
+    monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", fake_probe)
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(workspace),
@@ -242,6 +294,80 @@ def test_app_server_keeps_symlinked_hooks_when_routing_off(
 
     assert argv[:2] == ("/bin/echo", "app-server")
     assert hooks.is_symlink
+
+
+# ── The three codex session classes ─────────────────────────────────
+#
+# A plain codex session must look exactly like a pre-Smart-Routing one: no
+# ``codex debug models`` probe replacing its model catalog, no generated
+# ``hooks.json`` (so its ``spawn_agent`` never waits on a routing gate), and
+# the user's own hooks.json still symlinked so a mid-session edit takes effect.
+# A pinned Smart Routing session adds the catalog and nothing else — its routed
+# turn can land on a gateway arm codex's bundled catalog has no entry for. Only
+# an auto-harness session, whose spawns the router may move across families,
+# gets the spawn-routing hook too.
+
+
+def test_a_plain_codex_session_gets_no_probe_and_keeps_its_hooks_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes: list[str] = []
+
+    _argv, home = _start_app_server(tmp_path, monkeypatch, env={}, probes=probes)
+
+    assert probes == []
+    assert not home.catalog_written
+    assert not home.config_names_catalog
+    assert home.is_symlink
+    # The file codex reads is the user's own, byte for byte.
+    assert home.payload == _USER_HOOKS
+
+
+def test_a_pinned_smart_routing_codex_session_gets_the_catalog_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes: list[str] = []
+
+    _argv, home = _start_app_server(
+        tmp_path,
+        monkeypatch,
+        env={CODEX_EXTENDED_CATALOG_ENV_VAR: "1"},
+        probes=probes,
+    )
+
+    assert probes == ["/bin/codex"]
+    assert home.catalog_written
+    assert home.config_names_catalog
+    # No hooks were injected, so the user's file is still the live one.
+    assert home.is_symlink
+    assert home.payload == _USER_HOOKS
+
+
+def test_an_auto_harness_codex_session_gets_the_catalog_and_the_spawn_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    probes: list[str] = []
+
+    _argv, home = _start_app_server(
+        tmp_path,
+        monkeypatch,
+        env={
+            CODEX_EXTENDED_CATALOG_ENV_VAR: "1",
+            CODEX_ROUTER_DIR_ENV_VAR: str(bridge),
+            CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+        },
+        probes=probes,
+    )
+
+    assert probes == ["/bin/codex"]
+    assert home.catalog_written
+    assert home.config_names_catalog
+    assert not home.is_symlink
+    assert home.payload is not None
+    matchers = [entry.get("matcher") for entry in home.payload["hooks"]["PreToolUse"]]
+    assert matchers == [r".*spawn_agent", None]
 
 
 def test_router_hook_commands_run_python_isolated(tmp_path: Path) -> None:

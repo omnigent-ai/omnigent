@@ -10,10 +10,18 @@ from typing import Any
 
 import pytest
 
+from omnigent.inner.codex_executor import CODEX_EXTENDED_CATALOG_ENV_VAR
 from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner import subagent_routing
-from omnigent.runner.app import _ensure_session_subagent_router
+from omnigent.runner.app import _build_spawn_env_from_spec, _ensure_session_subagent_router
 from omnigent.runner.native.orchestration import _start_subagent_router_for_native_session
+from omnigent.runner.subagent_routing import SessionRoutingClass
+from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+# The three session classes the codex launch paths distinguish.
+_PLAIN = SessionRoutingClass()
+_PINNED = SessionRoutingClass(routing_enabled=True)
+_AUTO = SessionRoutingClass(routing_enabled=True, auto_harness=True)
 
 
 class _DeadClient:
@@ -30,15 +38,55 @@ def _cleanup_routers() -> Any:  # type: ignore[explicit-any]
         subagent_routing.shutdown_session_router(session_id)
 
 
-async def test_native_launch_installs_the_router_for_an_unrouted_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize("auto_harness", [True, False])
+async def test_claude_native_launch_installs_the_router_either_way(
+    tmp_path: Path, auto_harness: bool
+) -> None:
     advertised, router = _start_subagent_router_for_native_session(
         "conv_native_launch",
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        auto_harness=auto_harness,
     )
-    # No session flag consulted: the hooks are installed either way and
-    # the server decides per spawn.
+    # No session flag consulted on the Claude family: the Task hook is
+    # installed either way and the server decides per spawn, so the gear's
+    # subagent-routing toggle keeps working mid-session.
+    assert advertised == tmp_path
+    assert router is not None
+    assert read_router_endpoint(tmp_path) is not None
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
+async def test_a_plain_or_pinned_codex_session_gets_no_router(
+    tmp_path: Path, harness: str
+) -> None:
+    """The advertisement is what makes a codex home diverge from a plain one.
+
+    Its presence turns on the generated ``hooks.json`` (a ``spawn_agent``
+    PreToolUse gate that stalls ~30 s on a wedged server before failing
+    open) and the routed-spawn tool pre-approvals. A session that never
+    routes a spawn must pay none of it.
+    """
+    assert _start_subagent_router_for_native_session(
+        "conv_native_launch",
+        bridge_dir=tmp_path,
+        harness=harness,
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        auto_harness=False,
+    ) == (None, None)
+    assert read_router_endpoint(tmp_path) is None
+
+
+async def test_an_auto_harness_codex_session_gets_the_router(tmp_path: Path) -> None:
+    advertised, router = _start_subagent_router_for_native_session(
+        "conv_native_launch",
+        bridge_dir=tmp_path,
+        harness="codex-native",
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        auto_harness=True,
+    )
+
     assert advertised == tmp_path
     assert router is not None
     assert read_router_endpoint(tmp_path) is not None
@@ -50,6 +98,7 @@ async def test_native_launch_skips_without_a_server_client(tmp_path: Path) -> No
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=None,
+        auto_harness=True,
     ) == (None, None)
 
 
@@ -61,6 +110,7 @@ async def test_stale_handle_shutdown_leaves_a_relaunched_router_alive(tmp_path: 
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        auto_harness=True,
     )
     assert first is not None
     # Terminal re-create: the old router goes away and a new one binds.
@@ -70,6 +120,7 @@ async def test_stale_handle_shutdown_leaves_a_relaunched_router_alive(tmp_path: 
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        auto_harness=True,
     )
     assert second is not None and second is not first
 
@@ -90,6 +141,7 @@ async def test_unscoped_shutdown_still_tears_down_the_live_router(tmp_path: Path
         bridge_dir=tmp_path,
         harness="claude-native",
         server_client=_DeadClient(),  # type: ignore[arg-type]
+        auto_harness=True,
     )
     assert router is not None
     subagent_routing.shutdown_session_router(session_id)
@@ -97,23 +149,146 @@ async def test_unscoped_shutdown_still_tears_down_the_live_router(tmp_path: Path
     assert session_id not in subagent_routing._session_routers
 
 
-@pytest.mark.parametrize(
-    ("harness", "session_env_var"),
-    [
-        ("claude-sdk", "OMNIGENT_SUBAGENT_ROUTER_SESSION_ID"),
-        ("codex", "OMNIGENT_CODEX_SUBAGENT_ROUTER_SESSION_ID"),
-    ],
-)
-async def test_sdk_launch_installs_the_router_for_an_unrouted_session(
-    harness: str, session_env_var: str
+@pytest.mark.parametrize("routing_class", [_PLAIN, _PINNED, _AUTO])
+async def test_claude_sdk_launch_installs_the_router_for_every_session_class(
+    routing_class: SessionRoutingClass,
 ) -> None:
     await _ensure_session_subagent_router(
         "conv_sdk_launch",
-        harness,
+        "claude-sdk",
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=routing_class,
+    )
+    env = subagent_routing.session_router_env("conv_sdk_launch", "claude-sdk")
+    assert env["OMNIGENT_SUBAGENT_ROUTER_SESSION_ID"] == "conv_sdk_launch"
+
+
+@pytest.mark.parametrize("routing_class", [_PLAIN, _PINNED])
+async def test_codex_sdk_launch_skips_the_router_unless_auto_harness(
+    routing_class: SessionRoutingClass,
+) -> None:
+    await _ensure_session_subagent_router(
+        "conv_sdk_launch",
+        "codex",
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=routing_class,
+    )
+    assert "conv_sdk_launch" not in subagent_routing._session_routers
+    assert subagent_routing.session_router_env("conv_sdk_launch", "codex") == {}
+
+
+async def test_codex_sdk_launch_installs_the_router_for_an_auto_harness_session() -> None:
+    await _ensure_session_subagent_router(
+        "conv_sdk_launch",
+        "codex",
+        server_client=_DeadClient(),  # type: ignore[arg-type]
+        routing_class=_AUTO,
+    )
+    env = subagent_routing.session_router_env("conv_sdk_launch", "codex")
+    assert env["OMNIGENT_CODEX_SUBAGENT_ROUTER_SESSION_ID"] == "conv_sdk_launch"
+
+
+async def test_the_routing_class_falls_back_to_what_session_init_stamped() -> None:
+    """The env is rebuilt on every respawn, long after the init envelope."""
+    subagent_routing.remember_session_routing_class("conv_sdk_launch", _AUTO)
+    try:
+        await _ensure_session_subagent_router(
+            "conv_sdk_launch",
+            "codex",
+            server_client=_DeadClient(),  # type: ignore[arg-type]
+        )
+        assert "conv_sdk_launch" in subagent_routing._session_routers
+    finally:
+        subagent_routing.forget_session_routing_class("conv_sdk_launch")
+
+
+async def test_an_unknown_session_reads_as_plain() -> None:
+    assert subagent_routing.session_routing_class("conv_never_seen") == _PLAIN
+    await _ensure_session_subagent_router(
+        "conv_sdk_launch",
+        "codex",
         server_client=_DeadClient(),  # type: ignore[arg-type]
     )
-    env = subagent_routing.session_router_env("conv_sdk_launch", harness)
-    assert env[session_env_var] == "conv_sdk_launch"
+    assert "conv_sdk_launch" not in subagent_routing._session_routers
+
+
+@pytest.mark.parametrize(
+    ("routing_class", "expected"),
+    [
+        # A plain codex session keeps codex's bundled catalog, so it never pays
+        # the ~10 s ``codex debug models`` probe at boot.
+        (_PLAIN, None),
+        # A pinned Smart Routing session's routed turn can land on a gateway arm
+        # that catalog has no entry for, which codex then refuses client-side.
+        (_PINNED, "1"),
+        (_AUTO, "1"),
+    ],
+)
+def test_the_codex_spawn_env_carries_the_catalog_flag_per_session_class(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    routing_class: SessionRoutingClass,
+    expected: str | None,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  openai:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://api.openai.com/v1\n"
+        "      api_key: $OPENAI_API_KEY\n"
+        "      models:\n"
+        "        default: gpt-5-4\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+    )
+    subagent_routing.remember_session_routing_class("conv_spawn_env", routing_class)
+    try:
+        env = _build_spawn_env_from_spec(spec, "codex", session_id="conv_spawn_env")
+    finally:
+        subagent_routing.forget_session_routing_class("conv_spawn_env")
+
+    assert env is not None
+    assert env.get(CODEX_EXTENDED_CATALOG_ENV_VAR) == expected
+
+
+def test_the_claude_spawn_env_never_carries_the_codex_catalog_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+    subagent_routing.remember_session_routing_class("conv_spawn_env", _AUTO)
+    try:
+        env = _build_spawn_env_from_spec(spec, "claude-sdk", session_id="conv_spawn_env")
+    finally:
+        subagent_routing.forget_session_routing_class("conv_spawn_env")
+
+    assert env is not None
+    assert CODEX_EXTENDED_CATALOG_ENV_VAR not in env
 
 
 async def test_router_env_is_scoped_to_the_launching_harness(tmp_path: Path) -> None:
