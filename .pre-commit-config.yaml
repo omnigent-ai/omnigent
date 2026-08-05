@@ -24,7 +24,7 @@ repos:
         language: system
         entry: .venv/bin/pyrefly check
         pass_filenames: false
-        files: ^(omnigent/.*\.pyi?|pyproject\.toml|pyrefly\.toml|uv\.lock)$
+        files: ^(omnigent/.*\.pyi?|sdks/python-client/.*\.py|pyproject\.toml|pyrefly\.toml|uv\.lock)$
 
       # Project-specific test-quality lint rules (dev/lint/). Run on test
       # files only — the patterns never occur in production code.
