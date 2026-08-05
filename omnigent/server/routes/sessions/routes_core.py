@@ -1879,7 +1879,9 @@ def register_core_routes(
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
-        if requested_claude_permission_mode is not None:
+        # Only when the switch was forwarded: a silent PATCH writes no label,
+        # and an unconfirmed mode must not reach the picker.
+        if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:
             _publish_permission_mode(
                 session_id,
                 labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],

@@ -7747,6 +7747,37 @@ async def test_patch_permission_mode_requires_live_runner_before_persisting(
     assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
 
 
+async def test_patch_permission_mode_silent_skips_the_switch_without_crashing(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A silent PATCH skips the runner forward and publishes nothing.
+
+    ``silent`` suppresses the live forward, so no runner confirms a mode and
+    no label is written. The publish must be skipped too — reading the label
+    unconditionally would raise ``KeyError`` and 500 a request that changed
+    nothing, and any published mode would be unconfirmed by the pane.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"permission_mode": "auto", "silent": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
+
+
 @pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "nonsense"])
 async def test_patch_permission_mode_rejects_modes_the_cycle_cannot_reach(
     client: httpx.AsyncClient,
