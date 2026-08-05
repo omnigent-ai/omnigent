@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -71,6 +72,8 @@ from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins.os_env import build_os_env_tools
+
+_logger = logging.getLogger(__name__)
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
@@ -135,12 +138,6 @@ _CLAUDE_PROMPT_GLYPH = "❯"
 # followed by a numbered choice, which the chat input never renders. Used to
 # exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
 _SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
-# Matches any numbered choice row of a menu, selected or not (``2. No``).
-# Counting them is what separates a real dialog from a composer draft that
-# merely starts with ``2. `` — a dialog always offers at least two options.
-_NUMBERED_MENU_ROW_RE = re.compile(rf"(?:{_CLAUDE_PROMPT_GLYPH}\s*)?\d+\.\s")
-# Minimum numbered choices a menu must offer to count as a dialog.
-_MENU_MIN_CHOICES = 2
 # Box-drawing glyphs Claude Code's input-box frame is made of. A line of
 # these below ``❯`` marks the live input box (see ``_is_box_rule``),
 # distinguishing it from a bare prompt echoed into scrollback.
@@ -182,21 +179,29 @@ _DRAFT_NEEDLE_MAX_CHARS = 24
 # picker the person opened by hand covers the input box, so an injection would
 # be lost; the readiness gate treats it as "not ready".
 _MODEL_PICKER_OPEN_HINT = "use this session only"
-# Title of the confirmation dialog Claude Code pops when switching models
-# invalidates the prompt cache. It only appears on a session with history,
-# and it took ~1.9s to render on a warm session, so it is polled for rather
-# than slept past. Public because the ``/model`` injection sites live in other
-# modules and pass it as their ``confirm_hint``.
+# Titles of the confirmation dialog Claude Code pops when a switch invalidates
+# the prompt cache — one component, titled for what is being switched. It only
+# appears on a session with history, and it took ~1.9s to render on a warm
+# session, so it is polled for rather than slept past. Public because the
+# injection sites live in other modules and pass one as their ``confirm_hint``.
 SWITCH_MODEL_DIALOG_HINT = "Switch model?"
-_SWITCH_MODEL_DIALOG_HINT = SWITCH_MODEL_DIALOG_HINT
+EFFORT_DIALOG_HINT = "Change effort level?"
+_CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
+# Surfaces a confirm Enter must never land on: they are never a slash command's
+# own confirmation, and their default answer commits something the person did
+# not ask for — the ``/model`` picker writes a new global default into
+# ``~/.claude/settings.json``, and a tool permission prompt approves the tool.
+# Every Claude Code permission prompt is titled "Do you want to …"; the second
+# signature catches the remembered-approval row of the wider ones.
+_FOREIGN_DIALOG_HINTS = (
+    _MODEL_PICKER_OPEN_HINT,
+    "Do you want to ",
+    "Yes, and don't ask again",
+)
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
 _CONFIRM_DIALOG_TIMEOUT_S = 4.0
-# Settle before the blind confirm Enter of a command whose dialog text we
-# cannot recognise (e.g. ``/effort``). Long enough that the command itself is
-# consumed first, so the Enter lands on the dialog and not the input box.
-_BLIND_CONFIRM_SETTLE_S = 0.3
 # When Claude Code's input prompt never renders (it failed to boot), the
 # readiness gate attaches the tail of the captured pane to its error so
 # the real cause — often Claude Code's own startup crash, e.g. a
@@ -3033,7 +3038,7 @@ def inject_slash_command(
     :param command: Single-line slash command including the leading
         ``/``, e.g. ``"/effort high"``.
     :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
-    :param auto_confirm: If ``True``, accept the default option of any TUI
+    :param auto_confirm: If ``True``, accept the default option of the TUI
         confirmation dialog the command pops (e.g. ``/effort`` when
         switching invalidates the prompt cache). HACK — the chat UI has no
         way to render the CLI's TUI dialog, so without this the command
@@ -3041,14 +3046,13 @@ def inject_slash_command(
         for effort + model). Callers that don't trigger confirmations should
         leave this ``False``.
     :param confirm_hint: Text this command's dialog renders, e.g.
-        :data:`SWITCH_MODEL_DIALOG_HINT`. When given, the dialog is polled
-        for so a late render (~1.9s on a session with cached history) still
-        gets its Enter. ``None`` — the command's dialog text is unknown —
-        confirms blind after a short settle and then keeps watching for any
-        dialog, so a late render still gets confirmed; every path confirms
-        blind on a poll timeout rather than leaving a dialog open.
+        :data:`SWITCH_MODEL_DIALOG_HINT`. Required with *auto_confirm*: the
+        dialog is polled for by its own title so a late render (~1.9s on a
+        session with cached history) still gets its Enter, and so the Enter
+        cannot answer a dialog that is not ours.
     :raises ValueError: If *command* is empty, does not start with
-        ``/``, or contains a newline.
+        ``/``, contains a newline, or *auto_confirm* is set without a
+        *confirm_hint*.
     :raises RuntimeError: If the tmux target is not advertised in
         time, or if a ``tmux send-keys`` invocation fails.
     """
@@ -3056,6 +3060,11 @@ def inject_slash_command(
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
         raise ValueError("slash command must be a single line")
+    dialog_hint: str | None = None
+    if auto_confirm:
+        if not confirm_hint:
+            raise ValueError("auto_confirm needs the confirm_hint its dialog renders")
+        dialog_hint = confirm_hint
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
@@ -3065,127 +3074,60 @@ def inject_slash_command(
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(info["socket_path"], "send-keys", "-l", "-t", info["tmux_target"], command)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-    if auto_confirm:
-        _confirm_tui_dialog(info["socket_path"], info["tmux_target"], hint=confirm_hint)
+    if dialog_hint is not None:
+        _confirm_tui_dialog(info["socket_path"], info["tmux_target"], hint=dialog_hint)
 
 
 def _confirm_tui_dialog(
     socket_path: str,
     tmux_target: str,
     *,
-    hint: str | None = None,
+    hint: str,
     timeout_s: float = _CONFIRM_DIALOG_TIMEOUT_S,
 ) -> bool:
     """
-    Accept a TUI confirmation dialog, watching for *hint* when one is known.
+    Accept the TUI confirmation dialog titled *hint*.
 
-    A dialog is polled for rather than slept past, because a fixed sleep
-    dropped the Enter on a warm session and left the dialog open. Without a
-    hint the poll falls back to the structural :func:`_pane_shows_dialog`
-    check, and the blind Enter is sent first so the common no-dialog case
-    still costs only the settle: on a warm session the dialog renders ~1.9s
-    after the command, long after a 0.3s Enter has landed on the empty prompt,
-    so the watch has to outlive that Enter or the dialog stays open and eats
-    the person's next message.
+    The dialog is polled for rather than slept past: a fixed 0.3s sleep dropped
+    the Enter on a warm session, where the dialog takes ~1.9s to render, and
+    left it open to swallow the person's next message. Polling for the
+    command's own title — not for "a dialog" — is also what keeps the Enter off
+    a surface that is not ours, e.g. a ``/model`` picker the person opened by
+    hand or a permission prompt that rendered mid-turn.
+
+    On timeout the Enter is still sent, so a dialog whose title drifted in a
+    Claude Code release does not sit open forever wedging the pane. It is
+    withheld only when the pane shows a :data:`_FOREIGN_DIALOG_HINTS` surface,
+    where taking the default answer would commit something unasked-for.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param hint: Text the dialog renders, e.g. ``"Switch model?"``, or
-        ``None`` to watch for any dialog instead.
+    :param hint: Text the dialog renders, e.g.
+        :data:`SWITCH_MODEL_DIALOG_HINT`.
     :param timeout_s: Seconds to watch for the dialog, e.g. ``4.0``.
-    :returns: ``True`` when a dialog was seen and confirmed, ``False`` when
-        the watch timed out on the blind confirm alone.
+    :returns: ``True`` when the dialog was seen and confirmed, ``False`` when
+        the watch timed out.
     """
-    if hint is None:
-        return _confirm_unrecognised_dialog(socket_path, tmux_target, timeout_s=timeout_s)
     deadline = time.monotonic() + timeout_s
     while True:
-        if hint in _capture_pane(socket_path, tmux_target):
+        pane = _capture_pane(socket_path, tmux_target)
+        if hint in pane:
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             return True
         if time.monotonic() >= deadline:
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    foreign = next((text for text in _FOREIGN_DIALOG_HINTS if text in pane), None)
+    if foreign is not None:
+        _logger.warning(
+            "claude-native: %r never rendered and the pane shows another surface "
+            "(%r); withholding the confirm Enter",
+            hint,
+            foreign,
+        )
+        return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
-
-
-def _confirm_unrecognised_dialog(
-    socket_path: str,
-    tmux_target: str,
-    *,
-    timeout_s: float,
-) -> bool:
-    """
-    Confirm a dialog whose text we cannot recognise, e.g. ``/effort``'s.
-
-    Enters once after the settle — the fast path, and a no-op on the empty
-    prompt when no dialog pops — then keeps watching for one until *timeout_s*
-    and Enters again if it turns up. Watching only until the settle was the
-    bug: a warm session renders the dialog ~1.9s in, so the single Enter fired
-    into nothing and the person's next message was typed into the modal.
-
-    The extra Enter only ever answers a dialog that appeared AFTER the settle,
-    so it cannot land on some unrelated menu that was already open (a live
-    permission prompt): one already showing takes the single blind Enter this
-    seam always sent, and the watch is skipped.
-
-    :param socket_path: Absolute path to the tmux socket.
-    :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Seconds to keep watching after the blind Enter.
-    :returns: ``True`` when a dialog was seen and confirmed.
-    """
-    time.sleep(_BLIND_CONFIRM_SETTLE_S)
-    # Already up: the blind Enter answers it, and nothing later may be Entered
-    # on — see the docstring. The poll would also burn its budget on an idle pane.
-    already_showing = _pane_shows_dialog(_capture_pane(socket_path, tmux_target))
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    if already_showing:
-        return True
-    deadline = time.monotonic() + timeout_s
-    while True:
-        if _pane_shows_dialog(_capture_pane(socket_path, tmux_target)):
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-
-
-def _pane_shows_dialog(pane: str) -> bool:
-    """
-    Report whether a pane renders a TUI dialog or menu over the input box.
-
-    Used where the dialog's own text is unknown, so the signal is structural:
-    a menu offering at least :data:`_MENU_MIN_CHOICES` numbered rows with one
-    of them selected by ``❯``. The two-choice floor is what keeps a restored
-    composer draft that happens to start ``2. buy milk`` from reading as a
-    dialog. Box-frame glyphs are stripped first — a confirmation renders its
-    rows inside a ``│ … │`` frame, the ``/model`` picker does not.
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when a dialog or menu appears to be open.
-    """
-    if _MODEL_PICKER_OPEN_HINT in pane or _SWITCH_MODEL_DIALOG_HINT in pane:
-        return True
-    rows = [_strip_box_frame(line) for line in pane.splitlines()]
-    if not any(_SELECTED_MENU_ROW_RE.match(row) for row in rows):
-        return False
-    choices = sum(1 for row in rows if _NUMBERED_MENU_ROW_RE.match(row))
-    return choices >= _MENU_MIN_CHOICES
-
-
-def _strip_box_frame(line: str) -> str:
-    """
-    Strip surrounding whitespace and box-frame glyphs off a pane line.
-
-    ``"│ ❯ 1. Yes      │"`` becomes ``"❯ 1. Yes"`` so the menu-row patterns,
-    which anchor at the start of the line, still see the row.
-
-    :param line: A single pane line.
-    :returns: The line's content without its frame.
-    """
-    return line.strip().strip("".join(_BOX_RULE_CHARS)).strip()
 
 
 def display_cost_approval_popup(
@@ -3391,7 +3333,9 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return False
     pane = _capture_pane(socket_path, tmux_target)
-    if _MODEL_PICKER_OPEN_HINT in pane or _SWITCH_MODEL_DIALOG_HINT in pane:
+    if _MODEL_PICKER_OPEN_HINT in pane:
+        return False
+    if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
         return False
     return _claude_prompt_rendered(pane)
 

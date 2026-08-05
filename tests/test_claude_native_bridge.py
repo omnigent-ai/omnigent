@@ -6067,16 +6067,37 @@ _MODEL_PICKER_PANE = """\
   Enter to set as default · s to use this session only · Esc to cancel
 """
 
-# The ``/effort`` confirmation: a framed two-choice menu with no title this
-# module can match, which is why ``confirm_hint`` is ``None`` for it.
+# The ``/effort`` confirmation, as Claude Code 2.1.222 renders it: the same
+# component as "Switch model?", titled for what is being switched.
 _EFFORT_DIALOG_PANE = """\
   ⎿  Running /effort high
-╭────────────────────────────────────────────╮
-│ Changing effort resets the prompt cache.   │
-│                                            │
-│ ❯ 1. Yes, change it                        │
-│   2. No, keep the current effort           │
-╰────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Change effort level?                                     │
+│ Your next response will be slower and use more tokens    │
+│                                                          │
+│ This conversation is cached for the current effort level. │
+│ Switching to high means the full history gets re-read on  │
+│ your next message.                                       │
+│                                                          │
+│ ❯ 1. Yes, switch to high                                 │
+│   2. No, go back                                         │
+╰──────────────────────────────────────────────────────────╯
+"""
+
+# A tool permission prompt. It can render mid-turn, while a confirm watch is
+# still polling, and its default answer approves the tool — so a stray Enter
+# has to stay off it.
+_PERMISSION_PROMPT_PANE = """\
+╭──────────────────────────────────────────────────────────╮
+│ Bash command                                             │
+│                                                          │
+│ rm -rf build                                             │
+│                                                          │
+│ Do you want to proceed?                                  │
+│ ❯ 1. Yes                                                 │
+│   2. Yes, and don't ask again for rm commands in ~/repo   │
+│   3. No, and tell Claude what to do differently (esc)     │
+╰──────────────────────────────────────────────────────────╯
 """
 
 _IDLE_PANE = """\
@@ -6243,23 +6264,23 @@ def test_a_matched_hint_confirms_before_the_poll_times_out(
     assert len(captures) == 2
 
 
-def test_an_unrecognised_dialog_is_still_confirmed_by_the_blind_fallback(
+def test_a_dialog_whose_title_drifted_still_gets_the_blind_fallback_enter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A hint that never matches must not leave the dialog open forever.
+    """A hint that never matches must not leave our own dialog open forever.
 
-    ``/effort``'s confirmation is not titled "Switch model?", so a poll-only
-    confirm hung the pane: the change never committed and the next injection
-    landed in a modal.
+    Claude Code can rename a dialog between releases. Nothing recognisable is
+    on screen, so the timeout Enter is the only thing that can close it — and
+    on an idle pane it costs nothing.
     """
-    effort_dialog = "  Change reasoning effort?\n  This invalidates the cache.\n"
-    sends = _fake_tmux(monkeypatch, [effort_dialog])
+    drifted = "  Change the effort level?\n  This invalidates the cache.\n"
+    sends = _fake_tmux(monkeypatch, [drifted])
 
     assert (
         claude_native_bridge._confirm_tui_dialog(
             "/tmp/s.sock",
             "claude:0.0",
-            hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
             timeout_s=0.0,
         )
         is False
@@ -6267,97 +6288,99 @@ def test_an_unrecognised_dialog_is_still_confirmed_by_the_blind_fallback(
     assert [args[-1] for args in sends] == ["Enter"]
 
 
-def test_a_command_with_no_known_dialog_text_confirms_blind_then_watches(
+def test_an_effort_dialog_rendering_late_is_still_confirmed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``hint=None`` Enters at the settle, then keeps watching for a dialog.
+    """The warm-session race: the dialog renders seconds after the command.
 
-    This is the ``/effort`` call site. When no dialog ever pops, the blind
-    Enter is the whole story and the watch just times out — one Enter total,
-    same as the pane saw before.
-    """
-    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
-
-    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is False
-    assert [args[-1] for args in sends] == ["Enter"]
-
-
-def test_a_dialog_already_showing_at_the_settle_needs_no_watch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The blind Enter answered it, so the poll budget is not burned."""
-    captures: list[int] = []
-
-    def _fake_capture(socket_path: str, tmux_target: str) -> str:
-        del socket_path, tmux_target
-        captures.append(1)
-        return _EFFORT_DIALOG_PANE
-
-    sends: list[list[str]] = []
-    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda _s, *a: sends.append(list(a)))
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
-    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
-
-    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is True
-    assert captures == [1]
-    assert [args[-1] for args in sends] == ["Enter"]
-
-
-def test_a_late_unrecognised_dialog_is_still_confirmed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The warm-session race: the dialog renders long after the blind Enter.
-
-    The 0.3s Enter fired into an idle pane, and the dialog that arrived at
-    ~1.9s stayed open — the person's next message was typed into the modal and
-    swallowed. The watch has to outlive the blind Enter.
+    A fixed 0.3s sleep fired the Enter into an idle pane, and the dialog that
+    arrived at ~1.9s stayed open — the person's next message was typed into the
+    modal and swallowed. The watch has to outlive that settle.
     """
     sends = _fake_tmux(
         monkeypatch,
         [_IDLE_PANE, _IDLE_PANE, _EFFORT_DIALOG_PANE, _IDLE_PANE],
     )
 
-    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is True
-    # The blind fast-path Enter, then the one that actually answered the dialog.
-    assert [args[-1] for args in sends] == ["Enter", "Enter"]
-
-
-def test_a_menu_already_open_at_the_settle_gets_only_the_blind_enter(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The late-dialog Enter must not answer someone else's open menu.
-
-    A menu already on screen when the command was injected is not this
-    command's confirmation — it could be a live permission prompt. It takes the
-    single blind Enter this seam always sent, and nothing more.
-    """
-    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
-
-    assert claude_native_bridge._confirm_tui_dialog("/tmp/s.sock", "claude:0.0") is True
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is True
+    )
+    # One Enter, and only once the dialog was actually on screen.
     assert [args[-1] for args in sends] == ["Enter"]
 
 
 @pytest.mark.parametrize(
-    ("pane", "expected"),
+    ("name", "foreign_pane"),
     [
-        (_IDLE_PANE, False),
-        (_EFFORT_DIALOG_PANE, True),
-        (_MODEL_PICKER_PANE, True),
-        ("  Switch model?\n", True),
-        # A restored composer draft that happens to start with a numbered
-        # line: one "choice" is not a menu.
-        ("──────────\n❯ 2. buy milk\n──────────\n", False),
+        ("model picker", _MODEL_PICKER_PANE),
+        ("permission prompt", _PERMISSION_PROMPT_PANE),
     ],
 )
-def test_pane_dialog_detection(pane: str, expected: bool) -> None:
-    assert claude_native_bridge._pane_shows_dialog(pane) is expected
+def test_a_foreign_dialog_rendering_during_the_watch_gets_no_enter(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    foreign_pane: str,
+) -> None:
+    """Someone else's dialog must never take our confirm Enter.
+
+    Our dialog never pops, and mid-watch the person opens a ``/model`` picker
+    (whose Enter rewrites their global default) or Claude asks for a tool
+    permission (whose Enter approves it). Both stay untouched.
+    """
+    del name
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE, _IDLE_PANE, foreign_pane])
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is False
+    )
+    assert sends == []
+
+
+def test_a_foreign_dialog_already_open_at_the_start_gets_no_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same protection when the foreign surface was up all along."""
+    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            timeout_s=0.0,
+        )
+        is False
+    )
+    assert sends == []
+
+
+def test_auto_confirm_without_a_dialog_hint_is_rejected(tmp_path: Path) -> None:
+    """A confirm Enter with nothing to aim at is what hit foreign dialogs."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="confirm_hint"):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir,
+            command="/effort high",
+            auto_confirm=True,
+        )
 
 
 def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The no-dialog case: the extra Enter lands on an empty prompt, harmlessly."""
+    """The no-dialog case: the fallback Enter lands on an empty prompt, harmlessly."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
 
@@ -6365,6 +6388,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         bridge_dir,
         command="/effort high",
         auto_confirm=True,
+        confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
     )
 
     assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter", "Enter"]
@@ -6378,11 +6402,11 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     The claude-native "an injection may land now" signal, which doubles as the
     settle signal for the routing replay.
 
-    A ``/model`` picker the person opened, or a ``Switch model?`` dialog,
-    swallows typed text — so a mounted input box with neither on top of it is
-    what readiness means. A blocked ``UserPromptSubmit`` starts no turn
-    either, so there is no turn id to wait out; this is what says the replay
-    may land.
+    A ``/model`` picker the person opened, or either cache-invalidation
+    confirmation, swallows typed text — so a mounted input box with none of
+    them on top of it is what readiness means. A blocked ``UserPromptSubmit``
+    starts no turn either, so there is no turn id to wait out; this is what
+    says the replay may land.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     frames = {"pane": _IDLE_PANE}
@@ -6398,6 +6422,9 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
 
     frames["pane"] = "  Switch model?\n"
+    assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+
+    frames["pane"] = _EFFORT_DIALOG_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
 
 

@@ -4010,6 +4010,7 @@ def create_runner_app(
         effort: str | None,
     ) -> Response:
         from omnigent.claude_native_bridge import (
+            EFFORT_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -4024,16 +4025,16 @@ def create_runner_app(
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         command = f"/effort {effort}"
         try:
-            # No ``confirm_hint``: the effort dialog is not titled
-            # "Switch model?", so watching for that text would never match and
-            # the dialog would sit open with the pane wedged. The blind confirm
-            # covers it.
+            # An effort switch invalidates the prompt cache on a session with
+            # history, so Claude Code asks to confirm; the chat UI cannot render
+            # that TUI dialog, so answer it by its own title.
             await asyncio.to_thread(
                 inject_slash_command,
                 bridge_dir,
                 command=command,
                 timeout_s=1.0,
                 auto_confirm=True,
+                confirm_hint=EFFORT_DIALOG_HINT,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(

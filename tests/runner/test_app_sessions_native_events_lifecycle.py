@@ -2874,10 +2874,11 @@ async def test_events_effort_change_on_native_session_types_slash_command(
     )
     bridge_dir, command, timeout_s, confirm_hint = captured[0]
     assert bridge_dir == bridge_dir_for_conversation_id("c7e9584b9bb34910a0068521106c1abc")
-    # No ``confirm_hint``: the effort dialog is not the "Switch model?" one, so
-    # watching for that text would never match and the pane would stay wedged
-    # behind an unconfirmed modal. The blind confirm covers it.
-    assert confirm_hint is None
+    # The effort dialog's own title, not "Switch model?". Watching for the wrong
+    # one would leave the pane wedged behind an unconfirmed modal; watching for
+    # "any dialog" would answer a foreign one (a permission prompt, a picker the
+    # person opened) that rendered while the poll was running.
+    assert confirm_hint == claude_native_bridge.EFFORT_DIALOG_HINT
     # Body contract: ``/effort high`` is the literal Claude Code's TUI
     # accepts. A regression in shape (``/efforthigh``, ``effort high``,
     # missing leading slash) would either 404 on the slash router or
