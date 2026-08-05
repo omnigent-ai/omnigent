@@ -120,9 +120,15 @@ function renderSidebar() {
   );
 }
 
-/** Radix Tabs triggers activate on primary-button mousedown, not click. */
+/** Pick a scope from the Sessions heading's filter menu. */
 function switchTo(testId: "sidebar-tab-mine" | "sidebar-tab-shared") {
-  fireEvent.mouseDown(screen.getByTestId(testId), { button: 0 });
+  const value = testId === "sidebar-tab-mine" ? "mine" : "shared";
+  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  fireEvent.click(screen.getByTestId(`session-filter-${value}`));
 }
 
 beforeEach(() => {
@@ -131,21 +137,20 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-describe("scope tabs during selection mode", () => {
-  it("keeps the My sessions / Shared with me tabs visible after entering selection mode", () => {
+describe("scope filter during selection mode", () => {
+  it("keeps the filter menu reachable after entering selection mode", () => {
     renderSidebar();
 
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
 
     // In selection mode the bulk-action bar is up...
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
-    // ...and the scope tabs are still reachable, so the viewer can switch
+    // ...and the scope filter is still reachable, so the viewer can switch
     // between owned and shared sessions without leaving selection first.
-    expect(screen.getByTestId("sidebar-tab-mine")).toBeInTheDocument();
-    expect(screen.getByTestId("sidebar-tab-shared")).toBeInTheDocument();
+    expect(screen.getByTestId("session-filter")).toBeInTheDocument();
   });
 
-  it("exits selection mode when the viewer switches tabs", () => {
+  it("exits selection mode when the viewer switches scope", () => {
     renderSidebar();
 
     // Enter selection mode and pick the owned session.
@@ -164,7 +169,7 @@ describe("scope tabs during selection mode", () => {
     expect(screen.getByText("conv_shared")).toBeInTheDocument();
   });
 
-  it("starts a fresh selection after switching tabs (no rows carried over)", () => {
+  it("starts a fresh selection after switching scope (no rows carried over)", () => {
     renderSidebar();
 
     // Select on the Shared tab first.

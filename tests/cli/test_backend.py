@@ -272,6 +272,26 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
 
 
+def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator env-forwarding control var survives the remote daemon hop.
+
+    ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names extra env vars for the daemon to
+    forward on to runners. In ``--server`` mode the daemon env is allowlisted by
+    a prefix set that includes ``DATABRICKS_`` but *not* plain ``OMNIGENT_``, so
+    without an explicit allowlist entry the control var itself is stripped here —
+    and ``_build_runner_env`` never sees the names it lists, making the whole
+    passthrough a silent no-op remotely. It carries only var names, not secrets.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_TOKEN")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_TOKEN"
+
+
 def test_ensure_host_daemon_reuses_same_target(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

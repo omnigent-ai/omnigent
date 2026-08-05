@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -18,17 +19,18 @@ import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
+from typing import Any, Literal, Protocol, SupportsIndex, SupportsInt, cast
 
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -71,6 +73,8 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -92,9 +96,11 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     configure_process_logging,
+    env_truthy,
     open_process_log_file,
     process_log_dir,
 )
+from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
@@ -456,6 +462,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # host→runner intrinsically, so the setter need not also list it in
         # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
+        # The operator's env-forwarding control var itself. Without it here, the
+        # var is stripped before it reaches the daemon in --server mode (the
+        # remote daemon prefixes are DATABRICKS_ + LC_/MLFLOW_/OTEL_/OMNIGENT_OTEL_,
+        # not plain OMNIGENT_), so _build_runner_env never sees the names it lists
+        # and the whole passthrough is a no-op remotely. It carries only env var
+        # NAMES, not secrets, so allowlisting it leaks nothing on its own.
+        # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -625,6 +639,11 @@ def _build_runner_env(
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    # Bound glibc allocator RSS in the runner (no-op off Linux). Injected
+    # explicitly because the allowlist above would otherwise drop an inherited
+    # MALLOC_ARENA_MAX. setdefault so an operator override still wins.
+    for key, value in _proc.malloc_tuning_env().items():
+        env.setdefault(key, value)
     return env
 
 
@@ -697,7 +716,7 @@ class _RunnerHandle:
         connecting its tunnel.
     """
 
-    proc: subprocess.Popen[bytes]
+    proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
 
 
@@ -732,12 +751,18 @@ class HostProcess:
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
         # Set on the first accepted WS upgrade. Distinguishes a host that
-        # never authenticated (login redirects turn fatal after
-        # _LOGIN_REDIRECT_FATAL_ATTEMPTS) from a live host hit by a server
-        # restart (login redirects retry forever).
+        # never authenticated (login redirects / 401 / 403 turn fatal) from a
+        # live host hit by a transient failure — a server restart or a dropped
+        # VPN whose proxy answers 401/403 before the request reaches the
+        # server — where the same failures retry forever instead of killing a
+        # host with running sessions.
         self._ever_connected = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
+        # Consecutive 401/403 upgrade rejections on an already-connected host;
+        # reset by a successful upgrade. Gates the once-per-episode terminal
+        # notice so a VPN outage doesn't spam stderr on every retry.
+        self._auth_retry_streak = 0
         # Live tunnel connection, set by _serve_frames for the watcher
         # tasks (which outlive any single connection) to report on.
         self._ws: websockets.asyncio.client.ClientConnection | None = None
@@ -757,6 +782,22 @@ class HostProcess:
         # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
         # because both the mutation and the reaper run on the event loop.
         self._owned_subprocess_ops = 0
+        # Copy-on-write runner forkserver, on by default; set
+        # OMNIGENT_RUNNER_ZYGOTE=0 (or false/no/off) to opt out onto the direct
+        # Popen path. POSIX-only (needs os.fork + AF_UNIX fd-passing); the host
+        # daemon runs on the user's own machine, most often macOS, so gating on
+        # IS_POSIX rather than IS_LINUX lets those users share the ~120MB import
+        # floor too. Instantiated cheaply here (no process yet — start() spawns
+        # it, idempotent under its own lock). On any failure ``_zygote_disabled``
+        # latches so future launches take the direct Popen path, while
+        # ``_zygote`` is retained so a still-running zygote is reaped on daemon
+        # shutdown. The zygote is an optimization, never required.
+        _zygote_optout = os.environ.get(ZYGOTE_ENABLED_ENV_VAR)
+        self._zygote_enabled = IS_POSIX and not (
+            _zygote_optout is not None and not env_truthy(_zygote_optout)
+        )
+        self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
+        self._zygote_disabled = False
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -769,9 +810,19 @@ class HostProcess:
         exit 0 for a crash — so the reaper skips these and lets
         ``_watch_runner`` / ``_handle_stop`` own them.
 
-        :returns: Set of live tracked runner OS pids.
+        The runner zygote is included for the same reason: it is a direct
+        ``Popen`` child of the daemon whose status ``ZygoteManager._proc``
+        owns. Reaping it as an "orphan" on an unexpected crash would consume
+        its status out from under the manager, confusing ``is_running()`` /
+        ``stop()``.
+
+        :returns: Set of live tracked pids (runners + the zygote).
         """
-        return {h.proc.pid for h in self._runners.values()}
+        pids = {h.proc.pid for h in self._runners.values()}
+        zygote_pid = self._zygote.pid if self._zygote is not None else None
+        if zygote_pid is not None:
+            pids.add(zygote_pid)
+        return pids
 
     async def _orphan_reaper_loop(self) -> None:
         """Reap orphaned descendant processes reparented to this host.
@@ -1085,6 +1136,31 @@ class HostProcess:
         """
         if status in _RETRYABLE_UPGRADE_STATUSES or not (400 <= status < 500):
             return None
+        if status in (401, 403) and self._ever_connected:
+            # A host that already completed an upgrade proved its credentials
+            # and authorization are valid, so a later 401/403 is almost always
+            # a network-path artifact — a dropped VPN whose corporate proxy
+            # answers the upgrade with 401/403 before it reaches the server.
+            # Retry forever (mirrors the login-redirect path) so a live host
+            # with running sessions survives the outage and resumes when the
+            # path recovers, instead of exiting and forcing a manual restart.
+            self._auth_retry_streak += 1
+            cause = (
+                f"Connection refused (HTTP {status}): the host tunnel was "
+                "rejected after it had already connected."
+            )
+            _logger.warning("%s Retrying — check your VPN/network.", cause)
+            if self._auth_retry_streak == 1:
+                # The warning above lands only in the CLI log file; print once
+                # per outage so a foreground `omnigent host` isn't silent.
+                print(
+                    f"⚠ {cause} Retrying — this usually means the VPN or "
+                    "network dropped. It will reconnect automatically once "
+                    "connectivity returns.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return None
         if status == 401:
             return HostConnectError(
                 "Authentication failed (HTTP 401): the server rejected the "
@@ -1158,6 +1234,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="failed",
                 error=f"workspace path does not exist: {workspace}",
+                error_code=WORKSPACE_MISSING_ERROR_CODE,
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
@@ -1175,40 +1252,31 @@ class HostProcess:
             initial_auth_token=initial_auth_token,
         )
 
-        try:
-            # Embed the session id so operators can find all logs for a
-            # session with `omnigent debug logs --session <id>`. Cap at 32
-            # chars to keep filenames manageable; strip anything non-word to
-            # guard against unexpected id shapes from older servers.
-            import re
+        # Embed the session id so operators can find all logs for a session
+        # with `omnigent debug logs --session <id>`. Cap at 32 chars to keep
+        # filenames manageable; strip anything non-word to guard against
+        # unexpected id shapes from older servers.
+        import re
 
-            _session_slug = (
-                re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
-            )
-            log_path, _log_fh = open_process_log_file(
-                "runner",
-                prefix=f"runner-{_session_slug}",
-            )
-            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
-            try:
-                with child_logging_popen_kwargs(env) as logging_kwargs:
-                    proc: subprocess.Popen[bytes] = subprocess.Popen(
-                        [sys.executable, "-m", "omnigent.runner._entry"],
-                        env=env,
-                        # Runners are WS-tunnel clients with no interactive input.
-                        # Give them a clean /dev/null stdin instead of inheriting the
-                        # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
-                        # can end up with a closed or recycled stdin fd, and an
-                        # inherited bad fd makes the runner die at interpreter startup
-                        # with "init_sys_streams: Bad file descriptor" — it never
-                        # connects, so the session fails with "runner did not connect".
-                        stdin=subprocess.DEVNULL,
-                        stdout=_log_fh,
-                        stderr=_log_fh,
-                        **logging_kwargs,
-                    )
-            finally:
-                _log_fh.close()
+        _session_slug = (
+            re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
+        )
+
+        # Spawning blocks (log-file open, plus the zygote's one-time import on
+        # first launch), so run it off the event loop. Shielded so a
+        # cancellation mid-spawn cannot abandon a live runner: the handle is
+        # only registered in ``self._runners`` after this returns, so an
+        # abandoned fork would never be watched, stopped, or reaped, and the
+        # zygote would retain its exit status forever. On cancellation we let
+        # the spawn land and then tear that runner down.
+        spawn = asyncio.ensure_future(
+            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug)
+        )
+        try:
+            proc, log_path = await asyncio.shield(spawn)
+        except asyncio.CancelledError:
+            spawn.add_done_callback(self._discard_abandoned_spawn)
+            raise
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1252,7 +1320,105 @@ class HostProcess:
             runner_id=runner_id,
         )
 
-    def _handle_stop(
+    def _spawn_runner_proc(
+        self,
+        env: dict[str, str],
+        session_slug: str,
+    ) -> tuple[subprocess.Popen[bytes] | ZygoteRunnerProc, Path]:
+        """Open the session log and spawn the runner, via zygote or direct Popen.
+
+        Runs on a worker thread (blocking log open + first-launch zygote import).
+        When the zygote is enabled it forks the runner there — sharing the import
+        graph copy-on-write — and rewrites ``RUNNER_PARENT_PID`` to the zygote's
+        pid so the runner's orphan watchdog (which compares ``os.getppid()``)
+        stays correct across the extra process hop. Any zygote failure disables
+        it for the rest of the daemon's life and falls back to a direct Popen.
+
+        :param env: Runner environment from :func:`_build_runner_env` (its
+            ``RUNNER_PARENT_PID`` is the daemon pid; overridden on the zygote path).
+        :param session_slug: Sanitized session id fragment for the log filename.
+        :returns: ``(process_handle, log_path)`` — the handle quacks like Popen.
+        :raises OSError: If the log file or a direct Popen spawn fails.
+        """
+        log_path, log_fh = open_process_log_file("runner", prefix=f"runner-{session_slug}")
+        try:
+            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+
+            zygote = self._zygote
+            if zygote is not None and not self._zygote_disabled:
+                try:
+                    zygote.start()
+                    # The runner's OS parent will be the zygote, so its
+                    # getppid()-based orphan check must watch the zygote pid.
+                    zygote_env = dict(env)
+                    zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
+                    proc = zygote.fork_runner(zygote_env, str(log_path))
+                    _logger.info(
+                        "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
+                        zygote.pid,
+                        proc.pid,
+                    )
+                    return proc, log_path
+                except ZygoteUnavailable as exc:
+                    # Disable the zygote for FUTURE launches, but do NOT stop it
+                    # here: healthy runners already forked from it would see
+                    # their parent die and self-terminate via the orphan
+                    # watchdog, so one failed fork must not tear down unrelated
+                    # live sessions. The still-running zygote is retained and
+                    # reaped on daemon shutdown (see run()'s finally); this
+                    # launch falls back to a direct Popen below.
+                    _logger.warning(
+                        "Runner zygote unavailable (%s); falling back to direct spawn", exc
+                    )
+                    self._zygote_disabled = True
+
+            with child_logging_popen_kwargs(env) as logging_kwargs:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "omnigent.runner._entry"],
+                    env=env,
+                    # Runners are WS-tunnel clients with no interactive input.
+                    # Give them a clean /dev/null stdin instead of inheriting the
+                    # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
+                    # can end up with a closed or recycled stdin fd, and an
+                    # inherited bad fd makes the runner die at interpreter startup
+                    # with "init_sys_streams: Bad file descriptor" — it never
+                    # connects, so the session fails with "runner did not connect".
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_fh,
+                    stderr=log_fh,
+                    **logging_kwargs,
+                )
+            return proc, log_path
+        finally:
+            log_fh.close()
+
+    def _discard_abandoned_spawn(self, spawn: asyncio.Future[Any]) -> None:
+        """Tear down a runner whose launch was cancelled before registration.
+
+        ``_handle_launch`` shields the spawn, so a cancellation still lets the
+        fork land — but nothing registered it in ``self._runners``, so it would
+        never be watched, stopped, or reaped (and the zygote would hold its exit
+        status forever). Kill it off the loop, since for a zygote-forked runner
+        the terminate/wait round-trips are blocking control-socket exchanges.
+
+        :param spawn: The completed spawn future.
+        """
+        if spawn.cancelled():
+            return
+        if spawn.exception() is not None:
+            return  # spawn failed; nothing was created
+        proc, _log_path = spawn.result()
+        _logger.warning(
+            "Launch cancelled after runner spawn (pid=%s); terminating the orphan",
+            proc.pid,
+        )
+        with contextlib.suppress(RuntimeError):
+            # No running loop during interpreter shutdown — best effort.
+            asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(self._stop_runner_proc, proc)
+            )
+
+    async def _handle_stop(
         self,
         frame: HostStopRunnerFrame,
     ) -> HostStopRunnerResultFrame:
@@ -1270,13 +1436,11 @@ class HostProcess:
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
-        if handle.proc.poll() is None:
-            handle.proc.terminate()
-            try:
-                handle.proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                handle.proc.kill()
-                handle.proc.wait()
+        # The poll/terminate/wait round-trips are lock-free waitpid calls for a
+        # direct-Popen runner, but blocking control-socket exchanges for a
+        # zygote-forked one — run them off the loop so a wedged zygote can't
+        # freeze the daemon's control handler.
+        await asyncio.to_thread(self._stop_runner_proc, handle.proc)
         _logger.info("Stopped runner %s", frame.runner_id)
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",
@@ -1287,7 +1451,31 @@ class HostProcess:
             status="stopped",
         )
 
-    def _handle_runner_status(
+    @staticmethod
+    def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:
+        """Terminate a runner: SIGTERM, brief wait, then SIGKILL. Blocking.
+
+        Runs on a worker thread (see :meth:`_handle_stop`) because for a
+        zygote-forked runner these are blocking control-socket round-trips, not
+        lock-free waitpid calls.
+
+        :param proc: The runner process handle (Popen or zygote shim).
+        """
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            # Bounded: a bare wait() would hang if the handle can't observe the
+            # exit (e.g. a zygote-forked runner whose zygote died and whose pid
+            # probe is the only signal). The kill has been sent; give it a short
+            # window, then move on.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5.0)
+
+    async def _handle_runner_status(
         self,
         frame: HostRunnerStatusFrame,
     ) -> HostRunnerStatusResultFrame:
@@ -1309,10 +1497,13 @@ class HostProcess:
         handle = self._runners.get(frame.runner_id)
         if handle is None:
             status = "unknown"
-        elif handle.proc.poll() is None:
-            status = "alive"
         else:
-            status = "dead"
+            # poll() is a lock-free waitpid for a direct-Popen runner, but a
+            # blocking control-socket round-trip (bounded only by the 30s
+            # control timeout, and contended against a booting zygote) for a
+            # zygote-forked one — so run it off the loop, matching
+            # _watch_runner / _handle_stop, lest a slow zygote stall the daemon.
+            status = "alive" if await asyncio.to_thread(handle.proc.poll) is None else "dead"
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,
@@ -1339,7 +1530,11 @@ class HostProcess:
         handle = self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
             return
-        while handle.proc.poll() is None:
+        # poll() is a lock-free waitpid for a direct-Popen runner, but a
+        # blocking control-socket round-trip (with lock contention against a
+        # booting zygote) for a zygote-forked one — so run it off the event
+        # loop to avoid freezing the daemon on the enabled path.
+        while await asyncio.to_thread(handle.proc.poll) is None:
             await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
@@ -2272,6 +2467,12 @@ class HostProcess:
             # runners via Popen, so any of their still-orphaned tool
             # grandchildren are now reapable and no tracked pid can be stolen.
             self._reap_orphans_once()
+            # Stop the runner zygote last: its forked children were just
+            # terminated above, and closing its control socket lets it exit.
+            if self._zygote is not None:
+                with contextlib.suppress(Exception):
+                    self._zygote.stop()
+                self._zygote = None
 
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.
@@ -2330,6 +2531,7 @@ class HostProcess:
         # from here on are server restarts, not an unauthenticated host.
         self._ever_connected = True
         self._login_redirect_streak = 0
+        self._auth_retry_streak = 0
         try:
             await self._serve_frames(ws)
         finally:
@@ -2575,9 +2777,9 @@ class HostProcess:
         if isinstance(frame, HostLaunchRunnerFrame):
             await ws.send(encode_host_frame(await self._handle_launch(frame)))
         elif isinstance(frame, HostStopRunnerFrame):
-            await ws.send(encode_host_frame(self._handle_stop(frame)))
+            await ws.send(encode_host_frame(await self._handle_stop(frame)))
         elif isinstance(frame, HostRunnerStatusFrame):
-            await ws.send(encode_host_frame(self._handle_runner_status(frame)))
+            await ws.send(encode_host_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
             await ws.send(encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):

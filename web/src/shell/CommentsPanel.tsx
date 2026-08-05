@@ -114,11 +114,10 @@ export function CommentsPanel({
     const isExisting = comments.some(
       (c) => c.start_index === activeSelectionStart && c.end_index === activeSelectionEnd,
     );
-    if (!isExisting) {
-      // rAF ensures the textarea has been rendered before we try to focus it.
-      const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
-      return () => cancelAnimationFrame(id);
-    }
+    if (isExisting) return undefined;
+    // rAF ensures the textarea has been rendered before we try to focus it.
+    const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
+    return () => cancelAnimationFrame(id);
   }, [activeSelectionStart, activeSelectionEnd, comments]);
 
   // Selecting a highlighted range in the file activates its comment; if that

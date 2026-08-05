@@ -87,6 +87,96 @@ def test_deregister() -> None:
     assert registry.get("host_bbb") is None
 
 
+def test_deregister_poisons_outbound_queue() -> None:
+    """
+    Verify that deregister ends the sender loop via the None sentinel,
+    the same way register does when it replaces a stale connection.
+
+    Without it the route handler's loops keep running on a connection
+    no lookup can find: the ping loop heart-beats the host row online
+    while every get() reports it offline, so a wake driven off the
+    durable row waits for a reconnect the host was never told to make.
+    """
+    registry = HostRegistry()
+    conn = registry.register("host_poison", FakeWebSocket(), _make_hello(), owner="bob")
+
+    assert registry.deregister("host_poison") is True
+    assert conn.outbound_queue.get_nowait() is None
+
+
+def test_deregister_returns_false_for_unknown() -> None:
+    """
+    Verify that deregister reports whether it removed an entry.
+
+    Callers gate the durable set_offline write on this, so a missing
+    host must not read as a successful removal.
+    """
+    registry = HostRegistry()
+
+    assert registry.deregister("host_nonexistent") is False
+
+
+def test_deregister_guard_keeps_newer_connection() -> None:
+    """
+    Verify that a guarded deregister only removes its own generation.
+
+    A superseded route handler reaching its cleanup after a reconnect
+    replaced it would otherwise evict the live connection and mark the
+    host offline.
+    """
+    registry = HostRegistry()
+    old_conn = registry.register("host_gen", FakeWebSocket(), _make_hello(), owner="bob")
+    new_conn = registry.register("host_gen", FakeWebSocket(), _make_hello(), owner="bob")
+
+    assert registry.deregister("host_gen", conn=old_conn) is False
+    assert registry.get("host_gen") is new_conn
+
+
+def test_mark_frame_seen_refreshes_current_connection() -> None:
+    """
+    Verify that a frame on the live connection refreshes its liveness.
+
+    The ping loop reads last_frame_at to decide whether a host is
+    dead, so a real frame must move it forward.
+    """
+    registry = HostRegistry()
+    conn = registry.register("host_seen", FakeWebSocket(), _make_hello(), owner="bob")
+    conn.last_frame_at = 0.0
+
+    assert registry.mark_frame_seen(conn) is True
+    assert conn.last_frame_at > 0.0
+
+
+def test_mark_frame_seen_rejects_superseded_connection() -> None:
+    """
+    Verify that a frame on a replaced connection does not refresh it.
+
+    Mirrors TunnelRegistry.mark_frame_seen: otherwise a stale handler
+    keeps a dead generation looking alive.
+    """
+    registry = HostRegistry()
+    old_conn = registry.register("host_stale", FakeWebSocket(), _make_hello(), owner="bob")
+    registry.register("host_stale", FakeWebSocket(), _make_hello(), owner="bob")
+    old_conn.last_frame_at = 0.0
+
+    assert registry.mark_frame_seen(old_conn) is False
+    assert old_conn.last_frame_at == 0.0
+
+
+def test_mark_frame_seen_rejects_deregistered_connection() -> None:
+    """
+    Verify that a frame arriving after deregistration is ignored.
+
+    The receive loop uses the False return to stop, so cleanup runs
+    and the host redials instead of lingering unreachable.
+    """
+    registry = HostRegistry()
+    conn = registry.register("host_gone", FakeWebSocket(), _make_hello(), owner="bob")
+    registry.deregister("host_gone")
+
+    assert registry.mark_frame_seen(conn) is False
+
+
 def test_deregister_noop_for_unknown() -> None:
     """
     Verify that deregister is a no-op for an unknown host_id.

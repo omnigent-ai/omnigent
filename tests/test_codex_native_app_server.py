@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,7 @@ except ImportError:  # pragma: no cover - Python < 3.11
 from omnigent.codex_native_app_server import (
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
+    _build_native_codex_app_server_argv,
     _codex_policy_hooks_settings,
     _hooks_list_diagnostics,
     _model_discovery_cache,
@@ -28,7 +30,10 @@ from omnigent.codex_native_app_server import (
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
-from omnigent.inner.codex_executor import _populate_codex_home_config
+from omnigent.inner.codex_executor import (
+    _populate_codex_home_config,
+    _provider_codex_config_overrides,
+)
 
 
 async def test_discover_codex_model_options_strips_secrets_and_stops_process(
@@ -619,6 +624,8 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
 
     rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert rendered.startswith("[mcp_servers.omnigent]\n")
+    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+    assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
     parsed = tomllib.loads(rendered)
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
@@ -634,6 +641,92 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "sys_session_rename": {"approval_mode": "approve"},
         },
     }
+
+
+async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native app-server and remote TUI argv contain no provider secret."""
+    from omnigent import codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_providers = { existing = { name = "Existing", '
+        'base_url = "https://existing.invalid/v1", wire_api = "responses" } }\n',
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
+    server.config_overrides = [
+        *_provider_codex_config_overrides(
+            model="test-model",
+            base_url="https://provider.invalid/v1",
+            auth_command="credential-helper --token sk-sentinel-do-not-use",
+            wire_api="responses",
+        ),
+        'approval_policy="never"',
+        'sandbox_mode="danger-full-access"',
+    ]
+    await server.start()
+    await server.close()
+
+    app_server_argv = _build_native_codex_app_server_argv(
+        tagged_argv0="codex session-tag",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=server.config_overrides,
+    )
+    remote_argv = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=tuple(server.config_overrides),
+    )
+    assert all("sk-sentinel-do-not-use" not in arg for arg in app_server_argv)
+    assert all("sk-sentinel-do-not-use" not in arg for arg in remote_argv)
+    assert 'model_provider="omnigent_provider"' in app_server_argv
+    assert 'model_provider="omnigent_provider"' in remote_argv
+    assert 'approval_policy="never"' in app_server_argv
+    assert 'sandbox_mode="danger-full-access"' in app_server_argv
+
+    config_path = codex_home / "config.toml"
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    provider = config["model_providers"]["omnigent_provider"]
+    assert config["model_providers"]["existing"]["name"] == "Existing"
+    assert provider["base_url"] == "https://provider.invalid/v1"
+    assert provider["auth"]["args"] == [
+        "-c",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ]
+    assert provider["wire_api"] == "responses"
+    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
+    """Remote TUI construction fails closed on provider table overrides."""
+    from omnigent import codex_native_app_server
+
+    provider_override = _provider_codex_config_overrides(
+        model=None,
+        base_url="https://provider.invalid/v1",
+        auth_command="printf %s sk-sentinel-do-not-use",
+        wire_api="responses",
+    )[-1]
+
+    with pytest.raises(ValueError, match="must be materialized"):
+        codex_native_app_server.build_codex_remote_args(
+            codex_args=(),
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+            config_overrides=(provider_override,),
+        )
 
 
 async def test_untrusted_hook_is_trusted_via_batchwrite() -> None:

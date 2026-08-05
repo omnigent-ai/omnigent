@@ -890,12 +890,39 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       return;
     }
 
+    // ── Native turn start ────────────────────────────
+    // A native harness (claude/codex-native) emits no `response.created`,
+    // so the reducer never learns the turn id and stamps its own blocks
+    // (reasoning, streamed text) with a stale or empty one. Those blocks
+    // then group into their own bubble — the turn rendered as several
+    // fragments live but one bubble on reload, which is what kept the
+    // "Worked for" fold from forming live and made it flicker as the
+    // fragment boundaries moved. A `running` status edge carrying a turn
+    // id IS the native turn-start signal, so adopt it exactly as
+    // `startResponse` does for lifecycle-driven harnesses. Bare edges
+    // (the PTY-activity relay publishes running/idle with no id) carry no
+    // information and are ignored.
+    case "session_status": {
+      const startedId = event.responseId;
+      if (event.status !== "running" || !startedId || startedId === state.responseId) return;
+      // No id yet means this edge is only NAMING the turn already in
+      // flight — codex opens its reasoning block ~2s before the edge
+      // lands — so adopt without sealing that in-progress section. A
+      // DIFFERENT id is a genuinely new turn, so close the previous
+      // turn's open sections first, as `startResponse` does.
+      if (state.responseId !== "") {
+        yield* closeReasoning(state);
+        yield* closeText(state);
+      }
+      state.responseId = startedId;
+      return;
+    }
+
     // Events the reducer intentionally ignores, listed so a new event
     // type surfaces loudly. `session.*` are store concerns (consumed off
     // the raw stream); `compaction_failed` is a store side effect.
     case "compaction_failed":
     case "client_task_cancel":
-    case "session_status":
     case "session_usage":
     case "session_todos":
     case "session_terminal_pending":

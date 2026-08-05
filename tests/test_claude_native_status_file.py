@@ -121,14 +121,18 @@ def test_resolve_missing_pid_no_session_returns_none(tmp_path: Path) -> None:
 
 
 def test_read_status_maps_interactive_vocabulary(tmp_path: Path) -> None:
-    """``busy``/``waiting`` → running, ``idle`` → idle."""
+    """``busy``/``waiting`` → running, ``idle``/``shell`` → idle."""
     sessions = tmp_path / "sessions"
     busy = _write_session_file(sessions, pid=1, session_id="s", status="busy")
     waiting = _write_session_file(sessions, pid=2, session_id="s", status="waiting")
     idle = _write_session_file(sessions, pid=3, session_id="s", status="idle")
+    shell = _write_session_file(sessions, pid=4, session_id="s", status="shell")
     assert read_session_status(busy).runner_status == RUNNING
     assert read_session_status(waiting).runner_status == RUNNING
     assert read_session_status(idle).runner_status == IDLE
+    # Turn ended, background shell still alive → the agent loop is idle. Mapping
+    # this to running would strand the composer queueing messages.
+    assert read_session_status(shell).runner_status == IDLE
     # Raw status is preserved for future "needs input" surfacing.
     assert read_session_status(waiting).raw_status == "waiting"
 

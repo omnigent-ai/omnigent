@@ -7,14 +7,22 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
+import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { BlockRenderer } from "./BlockRenderer";
 
 afterEach(cleanup);
+
+// Stick-to-bottom lock fixture for the fold's expand snap. Module scope so
+// the provider value is a constant (jsx-no-constructed-context-values);
+// reset inside the test that uses it.
+const lockState = { isAtBottom: true, escapedFromLock: false };
+const lockStopScroll = vi.fn();
+const lockValue = { stopScroll: lockStopScroll, state: lockState };
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
@@ -199,6 +207,9 @@ describe("BlockRenderer dispatch", () => {
   });
 
   it("does not add adjacent-text spacing across tool items", () => {
+    // Rendered as a live turn ("running") so the whole trace stays
+    // expanded — a settled turn would fold "Before tool." behind the
+    // Worked row and unmount it.
     const items: RenderItem[] = [
       { kind: "text", itemId: "t1", text: "Before tool.", final: true },
       {
@@ -223,7 +234,7 @@ describe("BlockRenderer dispatch", () => {
 
     const { container } = render(
       <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-        <BlockRenderer items={items} sessionStatus="idle" />
+        <BlockRenderer items={items} sessionStatus="running" />
       </FileViewerContext.Provider>,
     );
 
@@ -275,10 +286,7 @@ describe("BlockRenderer dispatch", () => {
     expect(screen.queryByText(/tool_1/)).toBeNull();
   });
 
-  it("folds the whole run into one labeled row once the session is idle", () => {
-    // Mirrors the terminal's collapsed past turns: after a run
-    // completes, every step folds into a single expandable summary
-    // line labeled with the run's actions.
+  describe("settled-turn process fold (Worked row)", () => {
     const tool = (n: number, name = `tool_${n}`): RenderItem => ({
       kind: "tool",
       itemId: `fc_${n}`,
@@ -296,19 +304,668 @@ describe("BlockRenderer dispatch", () => {
       startedAt: null,
       duration: undefined,
     });
-    const items: RenderItem[] = [
-      tool(1, "Bash"),
-      tool(2, "Bash"),
-      tool(3),
-      tool(4),
-      tool(5),
-      { kind: "text", itemId: "m1", text: "Done.", final: true },
-    ];
-    render(<BlockRenderer items={items} sessionStatus="idle" />);
-    // The whole run folds; the label describes all five steps.
-    expect(screen.getByText("Ran 2 shell commands, called 3 other tools")).toBeDefined();
-    expect(screen.queryByText(/tool_5/)).toBeNull();
-    expect(screen.queryByText(/Bash/)).toBeNull();
+
+    it("folds narration + tool runs behind the Worked row, leaving the answer visible", () => {
+      // Codex-desktop demarcation: once the turn settles, the whole
+      // process trace collapses behind one "Worked" expander so the
+      // final answer is unambiguously where reading starts. Expanding
+      // replays the trace with the semantic tool-run labels inside.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Planning the run.", final: true },
+        tool(1, "Bash"),
+        tool(2, "Bash"),
+        tool(3),
+        tool(4),
+        tool(5),
+        { kind: "text", itemId: "m1", text: "All done here.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.getByText("Worked")).toBeDefined();
+      // The answer stays visible; the trace (narration + run labels)
+      // is unmounted until expanded.
+      expect(screen.getByText("All done here.")).toBeDefined();
+      expect(screen.queryByText("Planning the run.")).toBeNull();
+      expect(screen.queryByText(/Ran 2 shell commands/)).toBeNull();
+
+      fireEvent.click(screen.getByText("Worked"));
+      expect(screen.getByText("Planning the run.")).toBeDefined();
+      expect(screen.getByText("Ran 2 shell commands, called 3 other tools")).toBeDefined();
+      // The answer remains visible after expansion too.
+      expect(screen.getByText("All done here.")).toBeDefined();
+    });
+
+    it("labels the Worked row with the turn duration when provided", () => {
+      const items: RenderItem[] = [
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Done.", final: true },
+      ];
+      render(<BlockRenderer items={items} sessionStatus="idle" workedForS={106} />);
+      expect(screen.getByText("Worked for 1m 46s")).toBeDefined();
+    });
+
+    describe("expand scroll-into-view", () => {
+      // jsdom has no scrollIntoView — install a spy so the scroll path is
+      // observable (and its absence provable).
+      const scrollSpy = vi.fn();
+      beforeEach(() => {
+        (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView = scrollSpy;
+      });
+      afterEach(() => {
+        scrollSpy.mockReset();
+        delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+      });
+
+      const settledItems = (): RenderItem[] => [
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Done.", final: true },
+      ];
+
+      it("snaps the row into view on a user expand", () => {
+        // Growing the trace never keeps the row put on its own: the
+        // stick-to-bottom scroller re-pins the bottom on the last turn,
+        // and native scroll anchoring pins the answer elsewhere. Every
+        // user expand snaps the row to the top so the trace reads from
+        // its beginning.
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={settledItems()} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        fireEvent.click(screen.getByText("Worked"));
+        expect(screen.getByText("Called 1 tool")).toBeDefined();
+        expect(scrollSpy).toHaveBeenCalledTimes(1);
+        expect(scrollSpy).toHaveBeenCalledWith({ block: "start" });
+      });
+
+      it("releases the stick-to-bottom lock before snapping", () => {
+        // Viewing the last turn the view is pinned; without the release
+        // the library's resize-driven scrollToBottom overrides the snap
+        // (isAtBottom is still true from the pre-click view) and the
+        // click appears to do nothing.
+        lockState.isAtBottom = true;
+        lockState.escapedFromLock = false;
+        lockStopScroll.mockReset();
+        render(
+          <ConversationScrollLockContext.Provider value={lockValue}>
+            <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+              <BlockRenderer items={settledItems()} sessionStatus="idle" />
+            </FileViewerContext.Provider>
+          </ConversationScrollLockContext.Provider>,
+        );
+        fireEvent.click(screen.getByText("Worked"));
+        expect(lockStopScroll).toHaveBeenCalledTimes(1);
+        expect(lockState.isAtBottom).toBe(false);
+        expect(lockState.escapedFromLock).toBe(true);
+        expect(scrollSpy).toHaveBeenCalledWith({ block: "start" });
+      });
+
+      it("parks the scroller's scroll anchoring for the expand animation", () => {
+        // Even a fits-on-screen expand grows the trace over the 200ms
+        // height animation; with anchoring live, the browser pins the
+        // answer below and glides the row off the top. The scroller
+        // must run with overflow-anchor: none for the hold window.
+        vi.useFakeTimers();
+        try {
+          render(
+            <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+              <div style={{ overflowY: "auto" }} data-testid="scroller">
+                <BlockRenderer items={settledItems()} sessionStatus="idle" />
+              </div>
+            </FileViewerContext.Provider>,
+          );
+          const scroller = screen.getByTestId("scroller");
+          fireEvent.click(screen.getByText("Worked"));
+          expect(scroller.style.overflowAnchor).toBe("none");
+          act(() => {
+            vi.advanceTimersByTime(400);
+          });
+          expect(scroller.style.overflowAnchor).toBe("");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("never scrolls on the animateCollapse mount-close cycle", async () => {
+        // The fold appearing over a watched settle mounts OPEN and closes
+        // a frame later — programmatic, not a user expand; scrolling
+        // there would yank the reader away from the answer.
+        const { rerender } = render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={settledItems()} sessionStatus="idle" turnLifecycle="streaming" />
+          </FileViewerContext.Provider>,
+        );
+        rerender(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={settledItems()} sessionStatus="idle" turnLifecycle="completed" />
+          </FileViewerContext.Provider>,
+        );
+        await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+        await waitFor(() => expect(screen.queryByText("Called 1 tool")).toBeNull());
+        expect(scrollSpy).not.toHaveBeenCalled();
+      });
+    });
+
+    it("trusts turnLifecycle over sessionStatus for liveness", async () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Looking around.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Answer text.", final: false },
+      ];
+      // Streaming turn: stays expanded even though the session status
+      // lags (e.g. a stale snapshot said idle).
+      const { rerender } = render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" turnLifecycle="streaming" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Looking around.")).toBeDefined();
+
+      // Completed turn folds even while the SESSION is still running
+      // (a later turn is the live one, not this bubble) — after the
+      // settle debounce.
+      rerender(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="running" turnLifecycle="completed" />
+        </FileViewerContext.Provider>,
+      );
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+      // The trace collapses a frame later (it mounts open to animate away).
+      await waitFor(() => expect(screen.queryByText("Looking around.")).toBeNull());
+      expect(screen.getByText("Answer text.")).toBeDefined();
+    });
+
+    it("keeps persistent dispatch cards visible outside the fold", () => {
+      const dispatch: RenderItem = {
+        kind: "tool",
+        itemId: "fc_send",
+        execution: {
+          name: "sys_session_send",
+          arguments: { agent: "deep_thought", title: "q1" },
+          argsSummary: "",
+          callId: "c_send",
+          agentName: "nessie",
+          executedBy: "server",
+          output: "ok",
+        },
+        output: "ok",
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      };
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Dispatching.", final: true },
+        dispatch,
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Relayed.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      // The dispatch card renders outside the fold; the plain tool and
+      // the narration stay hidden inside it.
+      expect(screen.getByText(/sys_session_send/)).toBeDefined();
+      expect(screen.queryByText("Dispatching.")).toBeNull();
+      expect(screen.queryByText(/tool_1/)).toBeNull();
+      expect(screen.getByText("Relayed.")).toBeDefined();
+    });
+
+    const elicitation = (
+      status: "pending" | "responded",
+      response: { action: "accept" } | null,
+    ): RenderItem => ({
+      kind: "elicitation",
+      itemId: "el_1",
+      elicitationId: "elc_1",
+      message: "Claude wants to call Bash",
+      phase: "pre_tool",
+      policyName: "claude_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+      status,
+      response,
+    });
+
+    it("folds resolved approval cards inside the trace", () => {
+      // A responded approval is part of the work's history — it folds
+      // in document order with the rest of the trace instead of
+      // dangling between the Worked row and the answer.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Requesting approval.", final: true },
+        elicitation("responded", { action: "accept" }),
+        tool(1),
+        { kind: "text", itemId: "m1", text: "All done.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.queryByTestId("approval-card")).toBeNull();
+      expect(screen.getByText("All done.")).toBeDefined();
+
+      fireEvent.click(screen.getByText("Worked"));
+      const card = screen.getByTestId("approval-card");
+      expect(card.getAttribute("data-state")).toBe("responded");
+      expect(screen.getByText("Requesting approval.")).toBeDefined();
+    });
+
+    it("keeps a pending elicitation visible outside the fold", () => {
+      // Defensive: ChatPage normally floats pending cards to the page
+      // bottom, but if one reaches the renderer it must never be
+      // hidden behind a click — it is actionable.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Requesting approval.", final: true },
+        elicitation("pending", null),
+        tool(1),
+        { kind: "text", itemId: "m1", text: "All done.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.getByTestId("approval-card").getAttribute("data-state")).toBe("pending");
+      expect(screen.queryByText("Requesting approval.")).toBeNull();
+    });
+
+    it("does not fold a turn with no trailing answer", () => {
+      // Interrupted / tool-only turns have nothing to demarcate — the
+      // trace stays visible (runs still fold to their summary rows).
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Starting work.", final: true },
+        tool(1),
+        tool(2),
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Starting work.")).toBeDefined();
+      expect(screen.getByText("Called 2 tools")).toBeDefined();
+    });
+
+    it("folds trailing bookkeeping tools (turn_diff) instead of blocking the fold", () => {
+      // codex-native appends a `turn_diff` mirror AFTER the final
+      // message; the answer detection must look past it so codex
+      // turns still demarcate, and the diff folds as process.
+      const turnDiff: RenderItem = {
+        kind: "tool",
+        itemId: "fc_diff",
+        execution: {
+          name: "turn_diff",
+          arguments: {},
+          argsSummary: "",
+          callId: "c_diff",
+          agentName: "codex",
+          executedBy: "server",
+          output: "diff",
+        },
+        output: "diff",
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      };
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Editing the file.", final: true },
+        tool(1, "shell"),
+        { kind: "text", itemId: "m1", text: "Edit landed.", final: true },
+        turnDiff,
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.getByText("Edit landed.")).toBeDefined();
+      expect(screen.queryByText("Editing the file.")).toBeNull();
+      expect(screen.queryByText(/turn_diff/)).toBeNull();
+
+      // Expanding the Worked row reveals the trace; the diff sits in
+      // the (still-collapsed) tool-run group alongside the shell call.
+      fireEvent.click(screen.getByText("Worked"));
+      expect(screen.getByText("Editing the file.")).toBeDefined();
+      const runLabel = screen.getByText("Ran 1 shell command, called 1 other tool");
+      fireEvent.click(runLabel);
+      expect(screen.getByText(/turn_diff/)).toBeDefined();
+    });
+
+    it("folds a continued turn that yielded before answering", () => {
+      // Dispatching sub-agents ends the turn mid-task: this bubble holds
+      // narration + tool calls and NO answer (that lands in the next
+      // assistant bubble). Without the `continued` flag it stayed fully
+      // expanded — the wall of narration the fold exists to remove.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Dispatching two sub-agents.", final: true },
+        tool(1, "Agent"),
+        tool(2, "Agent"),
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" continued workedForS={42} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByText("Worked for 42s")).toBeDefined();
+      expect(screen.queryByText("Dispatching two sub-agents.")).toBeNull();
+
+      fireEvent.click(screen.getByText("Worked for 42s"));
+      expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
+    });
+
+    it("never folds the last assistant bubble while the session is running", async () => {
+      // A mid-turn (re)connect can miss the edge that names the turn, so
+      // the LIVE turn's lifecycle reads "completed" — folding it made the
+      // trace collapse and reopen as its tail alternated between text and
+      // tools (the codex flicker). While the session runs, the last
+      // bubble stays expanded; the terminal status edge folds it.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Found it.", final: true },
+      ];
+      const view = (status: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus={status}
+            turnLifecycle="completed"
+            isLastAssistant
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender } = render(view("running"));
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Checking the CLI.")).toBeDefined();
+
+      // The session's terminal edge lands → the fold forms (after the
+      // settle debounce).
+      rerender(view("idle"));
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+      await waitFor(() => expect(screen.queryByText("Checking the CLI.")).toBeNull());
+    });
+
+    it("holds the mount fold over a just-active trace so a live edge can cancel it", () => {
+      // A reload can land inside a step-wise turn's between-step gap,
+      // where the snapshot reads settled although the turn continues.
+      // Folding instantly then unfolding on the next step's running edge
+      // was the reported flash — a recent trace waits out the longer
+      // mount debounce instead.
+      vi.useFakeTimers();
+      try {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Approved; continuing.", final: true },
+        ];
+        const view = (status: "idle" | "running") => (
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer
+              items={items}
+              sessionStatus={status}
+              turnLifecycle="completed"
+              isLastAssistant
+              lastActivityAtS={Date.now() / 1000 - 2}
+            />
+          </FileViewerContext.Provider>
+        );
+        const { rerender } = render(view("idle"));
+        // No instant fold, and none 1s in — the mount debounce is holding.
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        act(() => vi.advanceTimersByTime(1_000));
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+
+        // The next step's running edge lands → the fold is cancelled.
+        rerender(view("running"));
+        act(() => vi.advanceTimersByTime(5_000));
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getByText("Checking the CLI.")).toBeDefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("folds a just-active trace after the mount debounce when nothing follows", () => {
+      vi.useFakeTimers();
+      try {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Narration.", final: true },
+          tool(1),
+          { kind: "text", itemId: "m1", text: "The answer.", final: true },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer
+              items={items}
+              sessionStatus="idle"
+              turnLifecycle="completed"
+              isLastAssistant
+              lastActivityAtS={Date.now() / 1000 - 2}
+            />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        act(() => vi.advanceTimersByTime(3_500));
+        expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("mounts an OLD settled trace already folded, with no delay", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Narration.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "The answer.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus="idle"
+            turnLifecycle="completed"
+            isLastAssistant
+            lastActivityAtS={Date.now() / 1000 - 3600}
+          />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.queryByText("Narration.")).toBeNull();
+    });
+
+    it("never folds the last bubble while an elicitation is parked, even if all else reads settled", async () => {
+      // Reload while parked on an approval: a step-wise turn's snapshot
+      // names the STEP id (not the items' thread id), so the trace's
+      // lifecycle reads "completed" AND the session status can read
+      // settled — but the pending card proves the turn is still in
+      // flight. Folding here collapsed the partial work into a
+      // premature "Worked for" row.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Need approval next.", final: true },
+      ];
+      const view = (parked: boolean) => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus="idle"
+            turnLifecycle="completed"
+            isLastAssistant
+            hasPendingElicitation={parked}
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender } = render(view(true));
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Checking the CLI.")).toBeDefined();
+
+      // Card answered and the turn settles → the fold forms.
+      rerender(view(false));
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+    });
+
+    it("folds an earlier (non-last) settled bubble even while the session runs", () => {
+      // Only the LAST bubble can be the live turn; prior turns fold as
+      // usual while a later turn streams.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Old narration.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Old answer.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus="running"
+            turnLifecycle="completed"
+            isLastAssistant={false}
+          />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+    });
+
+    it("folds a turn whose reasoning burst lands after the answer", () => {
+      // Codex opens a reasoning section as the turn ends, so the item
+      // arrives AFTER the final message. Reasoning is process, never the
+      // answer — without peeling it the turn stayed expanded live while a
+      // reload (where the transient item is absent) folded the same turn.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Server started on 8838.", final: true },
+        { kind: "reasoning", itemId: null, text: "", duration: undefined },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" turnLifecycle="completed" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      // The answer stays out; the narration folds away with the trace.
+      expect(screen.getByText("Server started on 8838.")).toBeDefined();
+      expect(screen.queryByText("Checking the CLI.")).toBeNull();
+    });
+
+    it("never folds a bubble made only of streaming artifacts", () => {
+      // Codex splits an in-flight turn into fragments: a reasoning burst
+      // (no item id yet) plus a `live:` narration preview. Their
+      // synthetic response id never matches activeResponse, so the
+      // walker labels them "completed" and this one folded mid-turn —
+      // then the fold vanished when the authoritative item replaced the
+      // preview. That flicker is what oscillated on screen.
+      const items: RenderItem[] = [
+        { kind: "reasoning", itemId: null, text: "Planning server startup", duration: 1 },
+        { kind: "text", itemId: "live:msg_1", text: "I'll check the CLI shape.", final: false },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="running" turnLifecycle="completed" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("I'll check the CLI shape.")).toBeDefined();
+    });
+
+    it("leaves a continued fragment that ran nothing expanded", () => {
+      // Streaming splits a turn into fragments (a reasoning burst, a
+      // narration preview) that are `continued` by the rest of the turn.
+      // Folding those produced a lone "Worked" row with nothing behind
+      // it — and they flipped folded/unfolded as fragments merged away.
+      const items: RenderItem[] = [
+        { kind: "reasoning", itemId: "r0", text: "Thinking it over.", duration: 1 },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" continued />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+    });
+
+    it("still leaves an unanswered, uncontinued turn expanded", () => {
+      // Nothing continues it, so folding would hide the turn's only
+      // content behind a click with no answer to demarcate.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Dispatching two sub-agents.", final: true },
+        tool(1, "Agent"),
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" continued={false} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
+    });
+
+    it("mounts the fold OPEN when the turn settles on screen, then closes it", async () => {
+      // The smooth-collapse contract: a turn that settles while the user
+      // watches keeps its trace mounted for one frame so it can animate
+      // into the row, instead of a tall block vanishing instantly.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Looking around.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "All done.", final: true },
+      ];
+      const view = (lifecycle: "streaming" | "completed") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="running" turnLifecycle={lifecycle} />
+        </FileViewerContext.Provider>
+      );
+      const { rerender } = render(view("streaming"));
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+
+      rerender(view("completed"));
+      // The fold waits out the settle debounce (absorbing transient
+      // settled reads), then appears — trace still on screen until it
+      // mounts open and closes itself.
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Looking around.")).toBeDefined();
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+      await waitFor(() => expect(screen.queryByText("Looking around.")).toBeNull());
+      expect(screen.getByText("All done.")).toBeDefined();
+    });
+
+    it("mounts settled history already collapsed (nothing to animate)", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Looking around.", final: true },
+        tool(1),
+        { kind: "text", itemId: "m1", text: "All done.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" turnLifecycle="completed" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.queryByText("Looking around.")).toBeNull();
+    });
+
+    it("does not fold an all-text turn", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Just an answer.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Just an answer.")).toBeDefined();
+    });
   });
 
   describe("math rendering", () => {

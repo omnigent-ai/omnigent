@@ -21,6 +21,7 @@ callers obtain it via ``client.sessions.create()``.
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -132,6 +133,12 @@ class Session:
     :param status: Session lifecycle status. One of ``"idle"``,
         ``"running"``, or ``"failed"``.
     :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of the last persisted session
+        activity. Advances when conversation items are appended and on session
+        metadata edits (rename, agent switch, archive), so a mid-stall rename
+        resets the clock — treat it as a session-write heartbeat, not a pure
+        item-append signal. ``None`` when connected to an older server that
+        does not return the field.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -179,6 +186,7 @@ class Session:
     agent_id: str
     status: str
     created_at: int
+    updated_at: int | None = None
     agent_name: str | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
@@ -208,11 +216,13 @@ class Session:
         labels_raw = raw.get("labels", {})
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
+        raw_updated_at = raw.get("updated_at")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
+            updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
             agent_name=raw.get("agent_name"),
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
@@ -652,7 +662,7 @@ class SessionsNamespace:
         limit: int = 100,
         after: str | None = None,
         order: str = "asc",
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """
         List items in a session with cursor-based pagination.
 
@@ -679,14 +689,15 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
-        return body.get("data", [])
+        data = body.get("data", [])
+        return data if isinstance(data, list) else []
 
     async def child_sessions(
         self,
         session_id: str,
         *,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """
         List sub-agent (child) sessions under a parent session.
 
@@ -712,7 +723,8 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
-        return body.get("data", [])
+        data = body.get("data", [])
+        return data if isinstance(data, list) else []
 
     async def child_sessions_tree(
         self,
@@ -720,7 +732,7 @@ class SessionsNamespace:
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
         :meth:`child_sessions` is one level deep; this recurses it breadth-first

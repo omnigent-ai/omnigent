@@ -21,9 +21,26 @@ const { readFileSync } = require("node:fs");
 const path = require("node:path");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+describe("setup clipboard IPC wiring", () => {
+  it("exposes a narrow copy action through the setup bridge", () => {
+    assert.match(
+      preloadSource,
+      /copyText:\s*\(text\)\s*=>\s*ipcRenderer\.invoke\("omnigent:copy-setup-text",\s*text\)/,
+    );
+  });
+
+  it("checks the setup-page sender before writing to the clipboard", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
+    );
+  });
+});
 
 describe("workspace chrome injection wiring (src/main.js)", () => {
   it("invokes registerWorkspaceChromeHide(win.webContents) as live code", () => {

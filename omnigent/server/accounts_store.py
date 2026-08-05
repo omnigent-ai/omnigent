@@ -43,7 +43,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_account_token_kind, encode_account_token_kind
-from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 
@@ -95,7 +95,10 @@ class SqlAlchemyAccountStore:
     def __init__(self, storage_location: str) -> None:
         self.storage_location = storage_location
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.account_store",
+        )
         # Immediate session: for the last-admin invariant in delete_user,
         # which must lock the current admin set before counting it. On
         # SQLite, ``BEGIN IMMEDIATE`` acquires the write lock before the
@@ -103,7 +106,11 @@ class SqlAlchemyAccountStore:
         # of reading the same stale admin count. On other dialects this is
         # a no-op — those paths lock explicitly with ``SELECT ... FOR
         # UPDATE`` instead (see ``_supports_for_update``).
-        self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.account_store",
+            immediate=True,
+        )
         self._supports_for_update = self._engine.dialect.name != "sqlite"
 
     # ── User credentials (extends rows in the `users` table) ──────
@@ -132,7 +139,7 @@ class SqlAlchemyAccountStore:
         :raises ValueError: If a user with this id already exists.
         """
         now = int(time.time())
-        with self._session() as session:
+        with self._session("create_user_with_password") as session:
             existing = session.get(SqlUser, (current_workspace_id(), user_id))
             if existing is not None:
                 raise ValueError(f"user {user_id!r} already exists")
@@ -155,7 +162,7 @@ class SqlAlchemyAccountStore:
 
     def get_user(self, user_id: str) -> Account | None:
         """Look up a user by id. Returns ``None`` if missing."""
-        with self._session() as session:
+        with self._session("select_user_by_id") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return _to_account(row) if row is not None else None
 
@@ -168,7 +175,7 @@ class SqlAlchemyAccountStore:
         just to gate admin endpoints. The two stores agree by
         construction (single source of truth: the column).
         """
-        with self._session() as session:
+        with self._session("select_user_admin_status") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row is not None and row.is_admin
 
@@ -186,7 +193,7 @@ class SqlAlchemyAccountStore:
         :param user_id: The username to update, e.g. ``"alice"``.
         :param is_admin: The flag value to set.
         """
-        with self._session() as session:
+        with self._session("set_user_admin_status") as session:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -215,7 +222,7 @@ class SqlAlchemyAccountStore:
 
         Result is unordered; UI sorts.
         """
-        with self._session() as session:
+        with self._session("list_users") as session:
             rows = (
                 session.execute(
                     select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
@@ -270,7 +277,7 @@ class SqlAlchemyAccountStore:
             user exists.
         """
         session_maker = self._session if self._supports_for_update else self._session_immediate
-        with session_maker() as session:
+        with session_maker("delete_user") as session:
             target = session.get(SqlUser, (current_workspace_id(), user_id))
             if target is None:
                 return None
@@ -295,7 +302,7 @@ class SqlAlchemyAccountStore:
         :func:`omnigent.server.passwords.verify_password` — never
         log, return, or store the value elsewhere.
         """
-        with self._session() as session:
+        with self._session("select_password_hash") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row.password_hash if row is not None else None
 
@@ -306,7 +313,7 @@ class SqlAlchemyAccountStore:
         admin-initiated reset. No-op silently if the user does
         not exist (the route should 404 first).
         """
-        with self._session() as session:
+        with self._session("update_password") as session:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -322,7 +329,7 @@ class SqlAlchemyAccountStore:
         :param when_epoch_seconds: Login timestamp. Tests pass a
             fixed value for determinism.
         """
-        with self._session() as session:
+        with self._session("mark_user_logged_in") as session:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -363,7 +370,7 @@ class SqlAlchemyAccountStore:
         """
         if kind not in ("invite", "magic"):
             raise ValueError(f"unknown token kind {kind!r}")
-        with self._session() as session:
+        with self._session("create_account_token") as session:
             row = SqlAccountToken(
                 id=token_id,
                 kind=encode_account_token_kind(kind),
@@ -393,7 +400,7 @@ class SqlAlchemyAccountStore:
         / expired tokens. Caller can't distinguish (intentional —
         opaque-to-bruteforce-guessing).
         """
-        with self._session() as session:
+        with self._session("redeem_account_token") as session:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -425,7 +432,7 @@ class SqlAlchemyAccountStore:
 
         :returns: The number of rows deleted.
         """
-        with self._session() as session:
+        with self._session("purge_expired_account_tokens") as session:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -464,7 +471,7 @@ class SqlAlchemyAccountStore:
         :returns: ``True`` if this call redeemed the token, ``False`` if
             it was missing / wrong-kind / already-redeemed / expired.
         """
-        with self._session() as session:
+        with self._session("redeem_oidc_invite") as session:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -495,7 +502,7 @@ class SqlAlchemyAccountStore:
             ``"contractor@gmail.com"``.
         :returns: ``True`` if a redeemed invite token is bound to it.
         """
-        with self._session() as session:
+        with self._session("select_email_invitation_status") as session:
             return session.execute(
                 select(
                     exists().where(

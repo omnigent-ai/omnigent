@@ -223,7 +223,7 @@ export function NotebookPreview({
 
   if (error || !notebook) {
     return (
-      <div className="p-8 text-sm">
+      <div className="p-8 text-ui">
         <div className="text-destructive">Cannot render notebook: {error}</div>
         <div className="mt-1 text-muted-foreground">
           Switch to the source view to inspect the raw file.

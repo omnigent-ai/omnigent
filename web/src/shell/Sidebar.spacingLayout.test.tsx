@@ -1,12 +1,14 @@
 // Layout regression tests for the sidebar's vertical spacing rhythm. These
 // lock in the padding/gap tuning the design pass settled on:
 //   - Primary nav group (New session / Automations / Inbox) reads as a proper
-//     section: 8px above it (to the Omnigent header) and no bottom padding of
-//     its own; the 16px gap below comes from the scrolling list.
-//   - Nav rows are 32px tall (h-8) with 4px top/bottom padding (py-1).
+//     section: 12px side gutters, 8px above it (to the Omnigent header), and no
+//     bottom padding of its own; the 16px gap below comes from the scrolling list.
+//   - The scrolling project/session list uses the same 12px side gutters.
+//   - Rows use 6px mobile and 4px desktop block padding; desktop retains its
+//     natural 28px height.
 //   - Section headers (Pinned / Projects / Sessions) carry 8px bottom padding.
-//   - Session rows are 32px tall (h-8) with 4px padding and sit flush (no
-//     inter-row gap).
+//   - Session rows share those responsive metrics and sit flush (no inter-row
+//     gap).
 //   - Project folder rows also sit flush (no inter-row gap).
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -120,13 +122,14 @@ afterEach(() => {
 });
 
 describe("sidebar vertical spacing", () => {
-  it("gives the primary nav an 8px top gap and no bottom padding", () => {
+  it("gives the primary nav 12px side gutters, an 8px top gap, and no bottom padding", () => {
     renderSidebar();
     const nav = screen.getByTestId("sidebar-primary-nav");
     // pt-2 = 8px gap to the Omnigent header; pb-0 so the 16px gap below comes
     // from the scrolling list, not the nav's own padding.
     expect(nav.className).toMatch(/\bpt-2\b/);
     expect(nav.className).toMatch(/\bpb-0\b/);
+    expect(nav.className).toMatch(/\bpx-3\b/);
     expect(nav.className).not.toMatch(/\bpb-3\b/);
   });
 
@@ -137,6 +140,8 @@ describe("sidebar vertical spacing", () => {
     const list = screen.getByTestId("sidebar-conversation-list");
     const scroller = list.closest("nav") as HTMLElement;
     expect(scroller.className).toMatch(/\bpt-4\b/);
+    expect(scroller.className).toMatch(/\bpx-3\b/);
+    expect(list).not.toHaveClass("pr-1");
   });
 
   it("keeps the 16px inter-section gap between Pinned / Projects / Sessions", () => {
@@ -145,12 +150,20 @@ describe("sidebar vertical spacing", () => {
     expect(list.className).toMatch(/\bgap-4\b/);
   });
 
-  it("sizes nav rows at 32px (h-8) with 4px vertical padding (py-1)", () => {
+  it("uses the shared natural-height container for nav rows", () => {
     renderSidebar();
     const newChat = screen.getByTestId("new-chat-button");
-    expect(newChat.className).toMatch(/\bh-8\b/);
-    expect(newChat.className).toMatch(/\bpy-1\b/);
-    expect(newChat.className).not.toMatch(/\bh-7\b/);
+    expect(newChat).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "gap-2",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+      "rounded-[var(--radius-otto-button)]",
+    );
+    expect(newChat).not.toHaveClass("h-8");
   });
 
   it("gives section headers 8px bottom padding", () => {
@@ -160,12 +173,20 @@ describe("sidebar vertical spacing", () => {
     expect(sessions.className).not.toMatch(/\bpb-1\b/);
   });
 
-  it("sizes session rows at 32px (h-8) with 4px vertical padding (py-1)", () => {
+  it("uses the shared natural-height container for session rows", () => {
     renderSidebar();
     const row = screen.getByRole("link", { name: /My Session/ });
-    expect(row.className).toMatch(/\bh-8\b/);
-    expect(row.className).toMatch(/\bpy-1\b/);
-    expect(row.className).not.toMatch(/\bpy-0\.5\b/);
+    expect(row).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "gap-2",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+      "rounded-[var(--radius-otto-button)]",
+    );
+    expect(row).not.toHaveClass("h-8");
   });
 
   it("stacks session rows flush with no inter-row gap", () => {

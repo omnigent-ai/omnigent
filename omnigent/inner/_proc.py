@@ -29,9 +29,52 @@ from typing import Protocol, TypedDict
 
 import psutil  # type: ignore[import-untyped]
 
-from omnigent._platform import IS_POSIX
+from omnigent._platform import IS_LINUX, IS_POSIX
 
 logger = logging.getLogger(__name__)
+
+# glibc allocator defaults for spawned children. glibc creates up to 8*ncpu
+# malloc arenas by default; on a many-core host a threaded child (the runner
+# uses asyncio.to_thread heavily) multiplies RSS across arenas that never
+# return to the OS. Capping arenas and setting a trim threshold bounds that
+# growth. Both are read by the C runtime at startup, so the parent must set
+# them in the child env before exec.
+_DEFAULT_MALLOC_ARENA_MAX = "2"
+_DEFAULT_MALLOC_TRIM_THRESHOLD = "134217728"  # 128 MiB
+
+
+def malloc_tuning_env() -> dict[str, str]:
+    """Env vars that bound glibc allocator RSS for a spawned child.
+
+    Arena multiplication is specific to glibc's allocator. macOS libmalloc uses
+    per-CPU magazines with madvise-based reclaim and exposes no equivalent knob
+    (``MALLOC_ARENA_MAX`` is simply ignored there), so macOS hosts get their
+    reduction from the threadpool cap instead — see ``_entry`` — not from here.
+
+    Returns an empty dict off Linux (macOS has no ``mallopt``; Windows and musl
+    ignore these), so callers can merge unconditionally without a platform
+    branch. Honors operator overrides ``OMNIGENT_RUNNER_MALLOC_ARENA_MAX``
+    (default ``"2"``; ``"0"`` disables the cap) and
+    ``OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD`` (default 128 MiB).
+
+    :returns: Mapping to merge into a child ``env`` dict, e.g.
+        ``{"MALLOC_ARENA_MAX": "2", "MALLOC_TRIM_THRESHOLD_": "134217728"}``.
+    """
+    if not IS_LINUX:
+        return {}
+    out: dict[str, str] = {}
+    arena_max = os.environ.get(
+        "OMNIGENT_RUNNER_MALLOC_ARENA_MAX", _DEFAULT_MALLOC_ARENA_MAX
+    ).strip()
+    if arena_max and arena_max != "0":
+        out["MALLOC_ARENA_MAX"] = arena_max
+    trim = os.environ.get(
+        "OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", _DEFAULT_MALLOC_TRIM_THRESHOLD
+    ).strip()
+    if trim:
+        out["MALLOC_TRIM_THRESHOLD_"] = trim
+    return out
+
 
 # Resolved via getattr so this module type-checks and imports on Windows, where
 # process groups and SIGKILL do not exist. None on non-POSIX hosts.
