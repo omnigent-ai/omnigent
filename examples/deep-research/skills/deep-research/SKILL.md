@@ -12,8 +12,7 @@ backed by a source you actually read.
 ## Tools
 - `search_web_pages(query, [site], [published_after], [published_before], [mode])`
   — discover candidate sources. Write the `query` as a natural-language
-  description of the ideal page, not keywords. Use `mode: pro` for quality,
-  `realtime` when latency matters.
+  description of the ideal page, not keywords. Use `mode: pro` (default).
 - `fetch_page_content(url, [max_chars])` — read the full page (markdown). A
   search snippet is NEVER sufficient evidence — fetch before you cite.
 
