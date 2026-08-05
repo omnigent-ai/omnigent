@@ -15,7 +15,7 @@ artifacts:
   default:
     type: whl
     path: .
-    build: uv build --wheel
+    build: uv build --wheel --out-dir dist
 
 variables:
   catalog:
