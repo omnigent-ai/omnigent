@@ -158,6 +158,36 @@ interface UseChildSessionsResult {
 }
 
 /**
+ * Closed-session label key and value, mirroring the backend constants
+ * in ``omnigent/session_lifecycle.py`` so the frontend can detect
+ * tombstoned sub-agents without calling ``is_session_closed`` server-side.
+ *
+ * The backend writes ``omnigent.closed=true`` when ``sys_session_close``
+ * is called.  A legacy marker ``:closed:`` may also appear in the title.
+ */
+const CLOSED_LABEL_KEY = "omnigent.closed";
+const CLOSED_LABEL_VALUE = "true";
+const CLOSED_TITLE_INFIX = ":closed:";
+
+/**
+ * Mirror of ``omnigent/session_lifecycle.is_session_closed``.
+ *
+ * @param labels - Session-scoped labels that may carry the closed marker.
+ * @param title  - Optional title for legacy closed-rows that embed
+ *   ``:closed:`` in the text.
+ * @returns ``true`` when the session was closed via ``sys_session_close``.
+ */
+export function isSessionClosed(
+  labels: Record<string, string> | undefined,
+  title: string | null | undefined,
+): boolean {
+  return (
+    labels?.[CLOSED_LABEL_KEY] === CLOSED_LABEL_VALUE ||
+    (title ?? "").includes(CLOSED_TITLE_INFIX)
+  );
+}
+
+/**
  * Fetch child sessions for a parent session.
  *
  * Exported for unit testing of the HTTP-shape contract; production
@@ -169,18 +199,20 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
-  return json.data.map((row) => ({
-    id: row.id,
-    title: row.title,
-    tool: row.tool,
-    session_name: row.session_name,
-    labels: row.labels ?? {},
-    current_task_status: row.current_task_status,
-    last_task_error: parseChildSessionError(row.last_task_error),
-    busy: row.busy,
-    last_message_preview: row.last_message_preview ?? null,
-    pending_elicitations_count: row.pending_elicitations_count ?? 0,
-  }));
+  return json.data
+    .filter((row) => !isSessionClosed(row.labels, row.title))
+    .map((row) => ({
+      id: row.id,
+      title: row.title,
+      tool: row.tool,
+      session_name: row.session_name,
+      labels: row.labels ?? {},
+      current_task_status: row.current_task_status,
+      last_task_error: parseChildSessionError(row.last_task_error),
+      busy: row.busy,
+      last_message_preview: row.last_message_preview ?? null,
+      pending_elicitations_count: row.pending_elicitations_count ?? 0,
+    }));
 }
 
 /**
