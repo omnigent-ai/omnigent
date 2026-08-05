@@ -375,7 +375,7 @@ jobs:
               sys.exit(1)
 
           # Validate fields against allowed values to prevent label injection.
-          ALLOWED_TYPES = {"bug", "enhancement", "documentation"}
+          ALLOWED_TYPES = {"bug", "Feature", "Docs"}
           # Component labels come from .github/areas.json (single source of truth),
           # so the validator can never drift from the area definitions.
           ALLOWED_COMPONENTS = set(json.loads(pathlib.Path("/tmp/components.json").read_text()))
