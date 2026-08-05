@@ -62,12 +62,22 @@ const LINK_QUERY = `
   }
 `;
 
-// True when someone removed this label before. A maintainer who takes it off is
+// True when a HUMAN removed this label before. A maintainer who takes it off is
 // saying "not ready", and a sweep that reapplies it every hour would be arguing
 // with them.
-function removedBefore(pr) {
+//
+// The actor check is the whole point: waiting_on_author.py removes this label
+// itself whenever `waiting-on-author` goes on, since the two are mutually
+// exclusive. Counting that bot removal would permanently disqualify any PR that
+// has ever been through a review round trip, which is most of them.
+function removedByHuman(pr) {
   const events = pr.timelineItems?.nodes ?? [];
-  return events.some((e) => e?.label?.name === REVIEW_LABEL);
+  return events.some(
+    (e) =>
+      e?.label?.name === REVIEW_LABEL &&
+      e?.actor?.login &&
+      !e.actor.login.endsWith("[bot]")
+  );
 }
 
 // Does this PR reference an issue? Reuses the same resolution as the nudge, so
@@ -132,7 +142,7 @@ module.exports = async ({ context, github, core }) => {
       if (pr.isDraft) skip = "draft";
       else if (labels.includes(REVIEW_LABEL)) skip = "already labelled";
       else if (labels.includes(WAITING_LABEL)) skip = "waiting on author";
-      else if (removedBefore(pr)) skip = "label was removed by hand";
+      else if (removedByHuman(pr)) skip = "label was removed by hand";
       if (skip) {
         verdicts.push({ pr: pr.number, verdict: "skip", reason: skip });
         continue;
@@ -146,13 +156,20 @@ module.exports = async ({ context, github, core }) => {
 
       verdicts.push({ pr: pr.number, verdict: "READY", reason: "meets the bar" });
       if (!enforce) continue;
-      await github.rest.issues.addLabels({
-        owner,
-        repo,
-        issue_number: pr.number,
-        labels: [REVIEW_LABEL],
-      });
-      console.log(`Added ${REVIEW_LABEL} to #${pr.number}`);
+      // Per-PR, so one failed write does not abandon the rest of the sweep. The
+      // label is idempotent and the sweep is hourly, so a miss self-heals.
+      try {
+        await github.rest.issues.addLabels({
+          owner,
+          repo,
+          issue_number: pr.number,
+          labels: [REVIEW_LABEL],
+        });
+        console.log(`Added ${REVIEW_LABEL} to #${pr.number}`);
+      } catch (err) {
+        if (err.status === 429 || err.message?.includes("rate limit")) throw err;
+        core.warning(`Could not label #${pr.number}: ${err.message}`);
+      }
     }
 
     const counts = verdicts.reduce((acc, v) => {
@@ -190,5 +207,5 @@ module.exports = async ({ context, github, core }) => {
   }
 };
 
-module.exports.removedBefore = removedBefore;
+module.exports.removedByHuman = removedByHuman;
 module.exports.REVIEW_LABEL = REVIEW_LABEL;

@@ -17,15 +17,23 @@ function pr({
     isDraft: draft,
     labels: { nodes: labels.map((name) => ({ name })) },
     body,
+    // Each entry is a label name (removed by a human) or [name, actor].
     timelineItems: {
-      nodes: unlabeled.map((name) => ({ label: { name }, actor: { login: "maintainer1" } })),
+      nodes: unlabeled.map((u) =>
+        Array.isArray(u)
+          ? { label: { name: u[0] }, actor: { login: u[1] } }
+          : { label: { name: u }, actor: { login: "maintainer1" } }
+      ),
     },
   };
 }
 
 // `linked` maps PR number -> closing-issue count; `issues` maps number ->
 // "issue" | "pr" | undefined (404).
-async function run(nodes, { linked = {}, issues = {}, env = {}, linkError = false } = {}) {
+async function run(
+  nodes,
+  { linked = {}, issues = {}, env = {}, linkError = false, failLabelOn = null } = {}
+) {
   const labeled = [];
   const rows = [];
   let searchCalls = 0;
@@ -56,7 +64,14 @@ async function run(nodes, { linked = {}, issues = {}, env = {}, linkError = fals
     },
     rest: {
       issues: {
-        addLabels: async ({ issue_number, labels: ls }) => labeled.push({ issue_number, labels: ls }),
+        addLabels: async ({ issue_number, labels: ls }) => {
+          if (issue_number === failLabelOn) {
+            const err = new Error("boom");
+            err.status = 500;
+            throw err;
+          }
+          labeled.push({ issue_number, labels: ls });
+        },
         get: async ({ issue_number }) => {
           const kind = issues[issue_number];
           if (!kind) {
@@ -165,6 +180,44 @@ const verdictOf = (rows, n) => (rows.find((r) => r[0] === `#${n}`) || [])[1];
       env: ENFORCE,
     });
     assert.strictEqual(labeled.length, 1, "unrelated removals are ignored");
+  }
+  // The bot removes this label itself on every waiting-on-author transition, so
+  // counting that would disqualify any PR that has been through a review round
+  // trip. Observed on a real PR: unlabeled waiting-for-review by
+  // github-actions[bot].
+  {
+    const { labeled } = await run(
+      [pr({ number: 181, unlabeled: [[script.REVIEW_LABEL, "github-actions[bot]"]] })],
+      { linked: { 181: 1 }, env: ENFORCE }
+    );
+    assert.strictEqual(labeled.length, 1, "a bot removal is not a human 'not ready'");
+  }
+  // A human removal still wins even when a bot also removed it earlier.
+  {
+    const { labeled } = await run(
+      [
+        pr({
+          number: 182,
+          unlabeled: [[script.REVIEW_LABEL, "github-actions[bot]"], script.REVIEW_LABEL],
+        }),
+      ],
+      { linked: { 182: 1 }, env: ENFORCE }
+    );
+    assert.strictEqual(labeled.length, 0, "a human removal is still respected");
+  }
+
+  // One failed label write must not abandon the rest of the sweep.
+  {
+    const { labeled, warnings } = await run(
+      [pr({ number: 191 }), pr({ number: 192 })],
+      { linked: { 191: 1, 192: 1 }, env: ENFORCE, failLabelOn: 191 }
+    );
+    assert.deepStrictEqual(
+      labeled.map((l) => l.issue_number),
+      [192],
+      "the sweep continues past a write failure"
+    );
+    assert.ok(warnings.some((w) => /Could not label #191/.test(w)));
   }
 
   // Dry run touches nothing but still reports.
