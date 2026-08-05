@@ -470,10 +470,9 @@ describe("mergePendingBubbles", () => {
     expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual(["u1", "a1", "pend_1"]);
   });
 
-  it("keeps a burst contiguous, positioned by the FIFO head", () => {
-    // Promotion is FIFO, so the head is the entry about to commit;
-    // positioning the group by it keeps near-simultaneous sends together
-    // instead of scattering them one block apart.
+  it("keeps a burst sharing an anchor contiguous", () => {
+    // Two sends before either is acked resolve to the same slot, so they
+    // come out adjacent without any special-casing.
     const committed = [
       { ...userBubble("u1"), blockStart: 0 },
       { ...assistantText("a1"), blockStart: 5 },
@@ -481,6 +480,48 @@ describe("mergePendingBubbles", () => {
     const pending = [
       { ...userBubble("pend_1"), blockStart: 1 },
       { ...userBubble("pend_2"), blockStart: 1 },
+    ];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "u1",
+      "pend_1",
+      "pend_2",
+      "a1",
+    ]);
+  });
+
+  it("places each pending bubble at its own wire position", () => {
+    // Distinct anchors must resolve to distinct slots. Positioning the
+    // whole group by its head would put `pend_2` above `a1` — and it
+    // would then visibly jump down when its own ack committed it at
+    // anchor 6, which is precisely the artifact this placement removes.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 1 },
+      { ...assistantText("a2"), blockStart: 6 },
+    ];
+    const pending = [
+      { ...userBubble("pend_1"), blockStart: 1 },
+      { ...userBubble("pend_2"), blockStart: 6 },
+    ];
+    expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
+      "u1",
+      "pend_1",
+      "a1",
+      "pend_2",
+      "a2",
+    ]);
+  });
+
+  it("keeps FIFO order when a later anchor resolves to an earlier slot", () => {
+    // Defensive: anchors should be non-decreasing in FIFO order, but a
+    // stale one must never let a later send overtake an earlier one.
+    const committed = [
+      { ...userBubble("u1"), blockStart: 0 },
+      { ...assistantText("a1"), blockStart: 4 },
+    ];
+    const pending = [
+      { ...userBubble("pend_1"), blockStart: 4 },
+      { ...userBubble("pend_2"), blockStart: 0 },
     ];
     expect(bubbleIds(mergePendingBubbles(committed, pending))).toEqual([
       "u1",

@@ -433,11 +433,47 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
 // bubbles, walk back past them so the prompt stays on top.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
+  // Each pending bubble is placed at ITS OWN slot, not the group's. The
+  // store commits each message at its own `anchorIndex`, so positioning
+  // the whole group by its head would make every entry after the head
+  // jump when its own ack lands — the exact artifact this placement
+  // exists to remove. Entries sharing an anchor still come out adjacent,
+  // because they resolve to the same slot.
+  let floor = 0;
+  const slots = pending.map((bubble) => {
+    // Never move backwards: FIFO order among the pending bubbles wins
+    // over a slot computed from a stale or out-of-order anchor.
+    const slot = Math.max(pendingSlot(bubble, committed), floor);
+    floor = slot;
+    return slot;
+  });
+  const merged: Bubble[] = [];
+  let next = 0;
+  for (let i = 0; i <= committed.length; i += 1) {
+    while (next < pending.length && slots[next] === i) merged.push(pending[next++]!);
+    if (i < committed.length) merged.push(committed[i]!);
+  }
+  // Anything whose slot exceeded the committed length trails, as before.
+  while (next < pending.length) merged.push(pending[next++]!);
+  return merged;
+}
+
+/**
+ * Where one optimistic bubble belongs in the committed bubble list.
+ *
+ * Its `blockStart` is the block count at send time, so the slot is the
+ * first committed bubble built from a block at or after that point —
+ * everything earlier predates the send. Bubbles with no `blockStart`
+ * (snapshot-replayed, stash-restored) trail, as they did before wire
+ * positions existed.
+ *
+ * The REQUEST-phase elicitation walk-back then applies on top of the
+ * chosen slot, so an approval prompt never renders above the message it
+ * gates.
+ */
+function pendingSlot(bubble: Bubble, committed: Bubble[]): number {
   let insertAt = committed.length;
-  // Position the group by its FIFO head: promotion is FIFO, so the head is
-  // the entry about to commit, and near-simultaneous sends stay contiguous
-  // rather than being scattered by one block each.
-  const anchor = pending[0]!.blockStart;
+  const anchor = bubble.blockStart;
   if (anchor !== undefined) {
     const at = committed.findIndex((b) => b.blockStart !== undefined && b.blockStart >= anchor);
     if (at !== -1) insertAt = at;
@@ -445,8 +481,7 @@ export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bub
   while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
-  if (insertAt === committed.length) return [...committed, ...pending];
-  return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+  return insertAt;
 }
 
 type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
