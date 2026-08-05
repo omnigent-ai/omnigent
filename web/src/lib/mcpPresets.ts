@@ -29,6 +29,15 @@ export interface MCPServerPreset {
   create: (values: Record<string, string>) => MCPServerInput;
 }
 
+const MCP_INTEGRATION_CATEGORY_ORDER: readonly MCPServerPreset["category"][] = [
+  "Documentation",
+  "Web and research",
+  "Browser automation",
+  "Cloud infrastructure",
+  "Developer tools",
+  "Data and analytics",
+];
+
 export const MCP_SERVER_PRESETS: readonly MCPServerPreset[] = [
   {
     id: "microsoft-learn",
@@ -291,5 +300,8 @@ export function groupMCPServerPresets(
     group.push(preset);
     groups.set(preset.category, group);
   }
-  return [...groups.entries()];
+  return MCP_INTEGRATION_CATEGORY_ORDER.flatMap((category) => {
+    const group = groups.get(category);
+    return group ? [[category, group]] : [];
+  });
 }

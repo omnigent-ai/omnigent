@@ -8,7 +8,9 @@ describe("MCP server presets", () => {
     expect(new Set(MCP_SERVER_PRESETS.map((preset) => preset.provider))).toEqual(
       new Set(["AWS", "Cloudflare", "Devin", "Exa", "HashiCorp", "Microsoft", "Upstash"]),
     );
-    expect(groupMCPServerPresets().map(([category]) => category)).toEqual([
+    expect(
+      groupMCPServerPresets([...MCP_SERVER_PRESETS].reverse()).map(([category]) => category),
+    ).toEqual([
       "Documentation",
       "Web and research",
       "Browser automation",
