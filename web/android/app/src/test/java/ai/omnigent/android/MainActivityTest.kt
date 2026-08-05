@@ -1,9 +1,7 @@
 package ai.omnigent.android
 
 import android.content.res.Configuration
-import android.webkit.WebView
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -18,16 +16,16 @@ import org.robolectric.annotation.Config
 class MainActivityTest {
     @Test
     fun `webview leaves algorithmic darkening disabled`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        testStore().connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
-        assertFalse(activity.webView().settings.isAlgorithmicDarkeningAllowed)
+        assertFalse(activity.testWebView().settings.isAlgorithmicDarkeningAllowed)
     }
 
     @Test
     @Config(qualifiers = "notnight")
     fun `light configuration uses dark status bar icons`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        testStore().connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val insetsController =
             WindowInsetsControllerCompat(activity.window, activity.window.decorView)
@@ -39,7 +37,7 @@ class MainActivityTest {
     @Test
     @Config(qualifiers = "night")
     fun `dark configuration uses light status bar icons`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        testStore().connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val insetsController =
             WindowInsetsControllerCompat(activity.window, activity.window.decorView)
@@ -50,7 +48,7 @@ class MainActivityTest {
 
     @Test
     fun `configuration change updates system bar icon polarity`() {
-        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        testStore().connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val insetsController =
             WindowInsetsControllerCompat(activity.window, activity.window.decorView)
@@ -75,11 +73,4 @@ class MainActivityTest {
         assertTrue(insetsController.isAppearanceLightStatusBars)
         assertTrue(insetsController.isAppearanceLightNavigationBars)
     }
-
-    private fun MainActivity.webView(): WebView =
-        MainActivity::class
-            .java
-            .getDeclaredField("webView")
-            .apply { isAccessible = true }
-            .get(this) as WebView
 }

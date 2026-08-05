@@ -12,8 +12,29 @@ configuration on an API 36 emulator. Requires JDK 17 and the Android SDK
 
 Debug builds permit cleartext (`http://`) to localhost and private-range hosts
 via `res/xml/network_security_config.xml` for local development; release builds
-keep the platform default (HTTPS only), mirroring the iOS
-`NSAllowsArbitraryLoadsInWebContent` debug-only posture.
+are HTTPS-only except device-local loopback (for omnigent:// deep links — see
+_Deep links_ below), mirroring the iOS `NSAllowsArbitraryLoadsInWebContent`
+debug-only posture.
+
+## Deep links
+
+The app handles `omnigent://<host>[:port]/c/<id>` links. The manifest's
+intent filter lives on `DeepLinkActivity`, a trampoline that forwards to
+`MainActivity`; `DeepLink.kt` parses and `MainActivity` routes (design:
+`docs/android-deep-link-design.md`):
+same-origin links navigate in place, previously-connected servers switch
+directly, and never-connected servers require a consent dialog before any
+network request — the server is remembered only after its first successful
+page load. Links carrying a query, fragment, or userinfo are rejected.
+
+Known gap: unlike iOS/desktop, there is no workspace-mount discovery
+(`WorkspaceURLExpander` equivalent), so a consented **unknown** Databricks
+workspace host connects to the bare origin without probing `/ml/omnigents`.
+Links to already-connected workspaces work (the stored URL keeps the mount).
+Follow-up: port the mount probe, and consider verified Android App Links
+for operator-controlled domains.
+
+Try it: `adb shell am start -a android.intent.action.VIEW -d "omnigent://<host>/c/<id>"`.
 
 ## How it relates to the web bundle
 

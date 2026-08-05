@@ -1,11 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Release default: HTTPS only (mirrors iOS App Transport Security defaults).
-  Debug builds additionally permit cleartext to localhost / emulator loopback /
-  private LAN ranges for local development, matching the iOS shell's debug-only
-  NSAllowsArbitraryLoadsInWebContent. The debug overlay lives in
-  app/src/debug/res/xml/network_security_config.xml.
+  Release default: HTTPS only, EXCEPT device-local loopback — omnigent://
+  deep links infer http for loopback hosts (matching iOS, whose ATS exempts
+  loopback even in release), and that traffic never leaves the device. Debug
+  builds additionally permit emulator/LAN cleartext for development; that
+  overlay lives in app/src/debug/res/xml/network_security_config.xml.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">::1</domain>
+    </domain-config>
 </network-security-config>

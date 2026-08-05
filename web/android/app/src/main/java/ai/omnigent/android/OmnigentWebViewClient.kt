@@ -3,7 +3,9 @@ package ai.omnigent.android
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 
@@ -18,9 +20,24 @@ import android.webkit.WebViewClient
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
-    private val onPageReady: (url: String?) -> Unit,
+    private val onPageReady: (
+        url: String?,
+        mainFrameLoadFailed: Boolean,
+        mainFramePersistenceFailed: Boolean,
+    ) -> Unit,
     private val onLoginRequired: () -> Unit,
 ) : WebViewClient() {
+    // Set when the main frame's current load errors out (network/TLS, or an
+    // HTTP >=400 respectively); consumed by onPageFinished. WebView calls
+    // onPageFinished with the ORIGINAL url after such an error — never a
+    // chrome-error:// one — so callers can't tell success from failure from
+    // the url alone; these flags are the only signal. They must NOT be reset
+    // in onPageStarted: Chromium delivers a main-frame onReceivedHttpError
+    // BEFORE onPageStarted (observed on device), so a start-time reset would
+    // erase the error before the load it belongs to finishes.
+    private var mainFrameLoadFailed = false
+    private var mainFramePersistenceFailed = false
+
     override fun onPageStarted(
         view: WebView,
         url: String?,
@@ -51,16 +68,46 @@ class OmnigentWebViewClient(
         }
     }
 
+    // request.isForMainFrame is only meaningful on this (API 23+, our floor
+    // is 28) overload — the deprecated int/String one can't distinguish a
+    // subframe (an embedded image, an iframe) failure from the page's own.
+    override fun onReceivedError(
+        view: WebView,
+        request: WebResourceRequest,
+        error: WebResourceError,
+    ) {
+        super.onReceivedError(view, request, error)
+        if (request.isForMainFrame) mainFrameLoadFailed = true
+    }
+
+    override fun onReceivedHttpError(
+        view: WebView,
+        request: WebResourceRequest,
+        errorResponse: WebResourceResponse,
+    ) {
+        super.onReceivedHttpError(view, request, errorResponse)
+        if (request.isForMainFrame) mainFramePersistenceFailed = true
+    }
+
     override fun onPageFinished(
         view: WebView,
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        // Consume the error flags for the load that just finished. A stopped
+        // load (no onPageFinished) can leave a flag armed for the NEXT finish;
+        // that fails safe — it can only skip one persist, never allow one.
+        val loadFailed = mainFrameLoadFailed
+        val persistenceFailed = mainFramePersistenceFailed
+        mainFrameLoadFailed = false
+        mainFramePersistenceFailed = false
         if (originOf(url) == pinnedOrigin() && shouldInjectBridgeAtPageReady()) {
-            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            view.evaluateJavascript(
+                NativeBridgeScript.source,
+            ) { onPageReady(url, loadFailed, persistenceFailed) }
             return
         }
-        onPageReady(url)
+        onPageReady(url, loadFailed, persistenceFailed)
     }
 
     override fun shouldOverrideUrlLoading(

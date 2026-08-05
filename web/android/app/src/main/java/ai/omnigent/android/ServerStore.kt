@@ -17,6 +17,10 @@ class ServerStore(
     /** The current server, or the emulator-loopback debug default if unset. */
     fun currentServerUrl(): String = prefs.getString(KEY_CURRENT, null) ?: DEFAULT_DEBUG_SERVER
 
+    /** Every server the user has connected to: the current one (when set) plus recents. */
+    fun knownServers(): List<String> =
+        (listOfNotNull(currentServerUrl().takeIf { hasServer() }) + recentServers()).distinct()
+
     /** Recently-connected servers, most recent first. */
     fun recentServers(): List<String> =
         prefs

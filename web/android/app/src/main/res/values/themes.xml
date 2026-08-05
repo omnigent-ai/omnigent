@@ -15,4 +15,14 @@
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
     </style>
+
+    <!-- DeepLinkActivity: forwards and finishes in one frame, so it should
+         never actually be seen — translucent avoids a visible flash if a
+         frame does render before finish() takes effect. -->
+    <style name="Theme.Omnigent.Translucent" parent="Theme.Omnigent">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
 </resources>
