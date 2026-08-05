@@ -2712,9 +2712,10 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 # ── What a plain claude-native launch must NOT carry ─────────────────
 #
 # A session created without Smart Routing has to launch byte-for-byte like a
-# pre-Smart-Routing one: no spawn-routing endpoint, so no loopback server, no
+# pre-Smart-Routing one: no spawn-routing endpoint (so no loopback server, no
 # bearer token on disk, and no ``Task`` PreToolUse hook paying a hook
-# subprocess plus a round trip on every spawn.
+# subprocess plus a round trip on every spawn), and no custom-picker-slot pin
+# displacing the workspace's own picker row.
 #
 # Accepted consequence: the class is stamped at create, so flipping the gear's
 # Subagent-routing toggle on for a plain session is inert until recreate.
@@ -2843,9 +2844,11 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
         spec
     )
     assert all("claude_router_hook" not in command for command in _claude_hook_commands(spec))
+    # The workspace's own picker row survives untouched.
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "workspace-picker-row"
 
 
-async def test_a_routed_claude_native_launch_keeps_the_spawn_gate(
+async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spec = await _run_auto_create_claude_terminal_for_routing_class(
@@ -2857,3 +2860,4 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate(
 
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"

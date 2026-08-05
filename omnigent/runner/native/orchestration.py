@@ -6282,7 +6282,11 @@ async def _auto_create_claude_terminal(
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
     # alias points at. Recorded below, so the picker and the launch agree.
-    claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
+    # Routed launches only: the pin writes ``ANTHROPIC_CUSTOM_MODEL_OPTION``,
+    # and on a plain session that displaces the workspace's own picker row for
+    # no gain — nothing later re-picks the launch model there.
+    if launch_metadata.routing_enabled:
+        claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
     if record_launch_config is not None:
         record_launch_config(session_id, claude_config)
     _logger.info(
