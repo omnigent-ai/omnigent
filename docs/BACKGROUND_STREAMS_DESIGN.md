@@ -396,9 +396,13 @@ attempt controller.
 
 ## 6. Risks
 
-1. **`handleSessionEvent` conversion is the correctness minefield.** 28 event
-   types, each needing its writes routed and its cross-conversation effects left
-   alone. This is where regressions will come from, not the state-map change.
+1. ~~**`handleSessionEvent` conversion is the correctness minefield.**~~ *Done in
+   `64c7a087`* — 30 branches, each needing its writes routed and its
+   cross-conversation effects left alone. Two traps worth knowing if this code is
+   touched again: a mechanical find-and-replace rewrote the guard helper's own
+   body into an infinite recursion that `tsc` accepted (only tests caught it),
+   and the branches that name their own target need the payload id checked *as
+   well as* the delivering stream, not instead of it.
 2. **Splitting the 16 `conversationId === id` guards into liveness vs.
    foreground.** Leave them as-is and every background pump exits at its first
    reconnect check — silently degrading to today's behaviour while carrying all
@@ -453,8 +457,20 @@ so the existing 328 tests are the regression net; only phase 3 changes semantics
   - remaining: `retiredLiveMessages`, `liveLastIndex`, the rAF scheduler and
     `BlockStream` reducer (already per-pump locals — they move with the pump),
     and `racedNativeModelOptions` (already keyed by id; verify only)
-- **Phase 2** — convert `handleSessionEvent` and its helpers into entry methods;
-  delete the ad-hoc guards. Still capacity 1.
+- **Phase 2** — route `handleSessionEvent`'s writes by conversation. Still
+  capacity 1. ✅ `64c7a087`
+
+  Landed ahead of the entry store, as a parameter (`handleSessionEvent(event,
+  streamConversationId)`) plus a central `applyToConversation` gate rather than
+  as a method. Same effect — every conversation-scoped write is now routed — but
+  shippable and testable against the current suite, and it converts the audit
+  into executable tests before the larger refactor moves the code. Becoming a
+  method later is mechanical: the gate turns into "write my own store".
+
+  The audit that drove it: of 30 branches, 19 write conversation state and only
+  6 checked which conversation the event was for. Also found that events which
+  DO name a target need both checks — a session's stream can carry frames about
+  another conversation — hence `applyToNamedConversation`.
 - **Phase 3** — raise `MAX_LIVE` to its real value (30 prod / 3 dev), split the
   guards into liveness vs. foreground so background pumps keep reconnecting, and
   delete `transcriptCache`, `pendingByConversation`, and the cache-bridge paths.
