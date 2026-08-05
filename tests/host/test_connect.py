@@ -1109,18 +1109,20 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
         0.01,
     )
     host = _make_host_process()
-    tunnel = _ReadinessChangingTunnel()
+    ws = _RecordingWS()
 
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": True}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
 
-    hello = decode_host_frame(tunnel.sent[0])
-    assert isinstance(hello, HostHelloFrame)
-    assert hello.gateway_inference == {"codex": False}
-    refresh = decode_host_frame(tunnel.sent[1])
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
     assert isinstance(refresh, HostHarnessReadinessFrame)
     assert refresh.configured_harnesses == {"codex": True}
     assert refresh.gateway_inference == {"codex": True}
+    _cleanup_host(host)
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
