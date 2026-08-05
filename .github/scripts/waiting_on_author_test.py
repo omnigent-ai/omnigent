@@ -177,6 +177,10 @@ class WaitingOnAuthorTest(unittest.TestCase):
         self.assertEqual(api.closed, [20])
         self.assertEqual(len(api.comments), 1)
         self.assertIn(waiting_on_author.LABEL, api.comments[0][1])
+        # Must point at `/reopen`, not GitHub's Reopen button: a fork author
+        # cannot press that, so telling them to is advice they can't act on.
+        self.assertIn("/reopen", api.comments[0][1])
+        self.assertNotIn("please reopen this PR", api.comments[0][1])
 
     def test_scheduled_sweep_removes_label_after_author_comment(self) -> None:
         api = FakeAPI(

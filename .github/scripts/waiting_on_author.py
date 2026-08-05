@@ -56,13 +56,21 @@ def latest_waiting_label_at(timeline: list[dict[str, Any]]) -> str | None:
 
 
 def close_message(label_applied_at: str) -> str:
+    # Point at `/reopen` (reopen-pr.yml), not GitHub's Reopen button: reopening
+    # needs Triage+ on the base repo, which a fork contributor does not have, so
+    # telling them to reopen it themselves is advice they cannot act on.
     return "\n".join(
         [
             f"Closing this PR because it has been labeled `{LABEL}` for "
             f"{WAITING_DAYS} days without an author reply or new commit.",
             "",
-            f"The label was last applied on {label_applied_at}. If you are "
-            "ready to continue, please reopen this PR or open a new one.",
+            f"The label was last applied on {label_applied_at}. This isn't a "
+            "judgement on the merit of the PR -- it's how we keep the review "
+            "queue readable.",
+            "",
+            "If you're ready to continue, comment `/reopen` and this PR comes "
+            "back, as long as its source branch still exists. If the branch is "
+            "gone, push it again and open a fresh PR referencing this one.",
         ]
     )
 
