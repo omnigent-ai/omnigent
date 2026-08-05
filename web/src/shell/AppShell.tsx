@@ -1452,7 +1452,6 @@ export function AppShell() {
                   <div className="hidden md:flex md:flex-col md:w-48 md:shrink-0 md:border-l md:border-border md:overflow-y-auto md:p-2 md:gap-2">
                     <SessionRail
                       conversationId={conversationId}
-                      onExpandTerminals={openTerminalsPanel}
                       onExpandExecutionLogs={openExecutionLogsPanel}
                       suppressed={false}
                     />
