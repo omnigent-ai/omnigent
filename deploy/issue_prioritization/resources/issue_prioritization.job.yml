@@ -1,7 +1,7 @@
 resources:
   jobs:
     issue_prioritization:
-      name: "[${bundle.target}] Omnigent issue prioritization"
+      name: "[${bundle.target}] Issue prioritization v2"
       max_concurrent_runs: 1
       trigger:
         pause_status: PAUSED
