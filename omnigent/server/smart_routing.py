@@ -2205,3 +2205,37 @@ async def route_turn(
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
     return model, verdict
+
+
+async def route_turn_or_decline(
+    harness: str | None,
+    user_message: str,
+    **kwargs: Any,
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """Call :func:`route_turn`, converting a raised failure into a decline.
+
+    The fail-open boundary for the message/turn path. :func:`route_turn`
+    itself lets a routing failure raise — its own client calls, the credential
+    resolution behind them, a malformed body — and on the ``POST /events`` path
+    that surfaced as a 500: the user's message was persisted and then abandoned
+    rather than simply running unrouted. Nothing about routing is worth a
+    dropped turn, so every failure lands here instead as ``error``, and the
+    caller shows it on a declined routing card while the turn proceeds on the
+    session's own model.
+
+    Mirrors :func:`route_session_harness`'s ``(…, error)`` shape, so both
+    create-time and turn-time routing report an outage the same way.
+
+    :param harness: The session's harness, e.g. ``"claude-native"``.
+    :param user_message: The turn's text to route on.
+    :param kwargs: Forwarded to :func:`route_turn` verbatim.
+    :returns: ``(model, verdict, error)`` — ``error`` is ``None`` whenever
+        :func:`route_turn` answered at all, including its own "no verdict"
+        answers, which are ordinary declines rather than failures.
+    """
+    try:
+        model, verdict = await route_turn(harness, user_message, **kwargs)
+    except Exception as exc:  # a routing outage must never drop a turn
+        _logger.exception("smart_routing: route_turn failed; the turn runs unrouted")
+        return None, None, f"Routing call failed: {exc}"
+    return model, verdict, None

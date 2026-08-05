@@ -1452,3 +1452,259 @@ async def test_a_follow_up_message_cannot_flip_a_routed_childs_harness(
     assert after_second.harness_override == first_harness
     assert after_second.model_override == GPT_MODEL
     assert len(_routing_decisions(conv_store, child.id)) == 1
+
+
+# ── A routing OUTAGE never costs the user their turn ────────────────
+#
+# The owner's ruling: routing must not be blocking when the call fails. These
+# drive a raising routing client through each real dispatch path and assert two
+# things every time — the work still happens, and the failure is visible as a
+# declined decision rather than an error.
+
+
+#: What a routing outage is recorded as. Not a model, so nothing can be pinned
+#: from it; the same placeholder the auto-harness path already used.
+UNAVAILABLE_MODEL = "unavailable"
+
+
+def _outage_caps(exc: Exception) -> Any:  # type: ignore[explicit-any]
+    """
+    Caps whose routing client raises *exc* on every call.
+
+    :param exc: The failure to raise, e.g. ``httpx.ReadTimeout("...")``.
+    :returns: A ``FakeCaps`` carrying the raising client.
+    """
+    return FakeCaps(routing_client=FakeRoutingClient(None, error=exc))
+
+
+#: The five failure modes a routing call can present. A gateway 500 and a 401
+#: arrive as ``HTTPStatusError``, a wedged router as a read timeout, a garbled
+#: body as a decode error, and an unreachable relay as a connect error.
+ROUTING_FAILURES: list[tuple[str, Exception]] = [
+    (
+        "gateway_500",
+        httpx.HTTPStatusError(
+            "500 Internal Server Error",
+            request=httpx.Request("POST", "https://ws.invalid/routes:select"),
+            response=httpx.Response(500, text="upstream router unavailable"),
+        ),
+    ),
+    ("timeout", httpx.ReadTimeout("routes:select timed out")),
+    ("malformed_body", json.JSONDecodeError("Expecting value", "<not json>", 0)),
+    (
+        "unauthorized",
+        httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=httpx.Request("POST", "https://ws.invalid/routes:select"),
+            response=httpx.Response(401, text="invalid access token"),
+        ),
+    ),
+    ("relay_unreachable", httpx.ConnectError("connection refused")),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "failure"), ROUTING_FAILURES, ids=[f[0] for f in ROUTING_FAILURES]
+)
+async def test_a_routing_outage_still_delivers_the_turn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """
+    The SDK turn path forwards the message and records a declined decision.
+
+    Regression: ``route_turn`` let its client's failure raise, and the events
+    POST turned that into a 500 — the message was persisted and then abandoned.
+    A router being down is not a reason to lose a turn.
+    """
+    agent = await create_test_agent(client, name=f"routing-outage-turn-{label}")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(resp.json()["id"])
+    assert conv is not None
+
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=_outage_caps(failure)):
+        async with echo_runner_client() as runner_client:
+            item_id = await orchestration_module._forward_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                conv_store,
+                runner_client,
+            )
+    # The turn happened.
+    assert item_id
+
+    # And the outage is on the record rather than swallowed.
+    decisions = _routing_decisions(conv_store, conv.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.model == UNAVAILABLE_MODEL
+    assert decisions[0].data.applied is False
+    assert "Routing call failed" in decisions[0].data.rationale
+
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    # Nothing pinned: the turn ran on the session's own model.
+    assert refreshed.model_override is None
+    # And the route-once label is NOT claimed — one outage must not be the
+    # reason this session never routes again.
+    assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+
+@pytest.mark.parametrize(
+    ("label", "failure"), ROUTING_FAILURES, ids=[f[0] for f in ROUTING_FAILURES]
+)
+async def test_a_routing_outage_still_delivers_a_native_pane_turn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """
+    Same ruling on the native-terminal path, which has its own routing block.
+
+    The pane keeps its own model, the message reaches the terminal, and the
+    declined card explains why nothing was routed.
+    """
+    conv, conv_store = await _claude_native_session(
+        client, db_uri, agent_name=f"routing-outage-native-{label}"
+    )
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner.test", transport=httpx.MockTransport(_handler)
+    ) as runner_client:
+        with (
+            patch("omnigent.runtime._globals._caps", new=_outage_caps(failure)),
+            patch(
+                "omnigent.server.routes.sessions._get_runner_client",
+                new=AsyncMock(return_value=runner_client),
+            ),
+        ):
+            await orchestration_module._dispatch_session_event_to_runner_impl(
+                conv.id,
+                conv,
+                body,
+                conv_store,
+                runner_client,
+                agent_name="reviewer",
+                file_store=None,
+                artifact_store=None,
+            )
+
+    # The message reached the pane, carrying no routed model.
+    assert len(forwarded) == 1
+    assert forwarded[0].get("model_override") is None
+
+    decisions = _routing_decisions(conv_store, conv.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.model == UNAVAILABLE_MODEL
+    assert decisions[0].data.applied is False
+    assert "Routing call failed" in decisions[0].data.rationale
+
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    assert refreshed.model_override is None
+    assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+
+@pytest.mark.parametrize(
+    ("label", "failure"), ROUTING_FAILURES, ids=[f[0] for f in ROUTING_FAILURES]
+)
+async def test_a_routing_outage_still_allows_the_spawn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """
+    The spawn gate's own outage coverage, widened past ``RuntimeError``.
+
+    Extends ``test_dead_router_allows_the_spawn_unchanged`` to every failure
+    shape a real routing call presents, since the fail-open branch keys on the
+    exception being caught at all rather than on its type.
+    """
+    agent = await create_test_agent(client, name=f"routing-outage-spawn-{label}")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    with patch("omnigent.runtime._globals._caps", new=_outage_caps(failure)):
+        route = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-subagent",
+            json={"harness": "codex-native", "task_name": "explore", "prompt": "audit auth"},
+        )
+    assert route.status_code == 200, route.text
+    payload = route.json()
+    assert payload["action"] == "allow"
+    # No model: the spawn keeps whatever the parent asked for.
+    assert not payload.get("model")
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    assert len(_routing_decisions(conv_store, session_id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "failure"), ROUTING_FAILURES, ids=[f[0] for f in ROUTING_FAILURES]
+)
+async def test_a_routing_outage_still_allows_the_first_prompt(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """
+    The first-message relay answers ``allow`` instead of erroring the hook.
+
+    A 4xx/5xx here would reach the hook as an unreadable verdict, and a hook
+    that cannot read a verdict is the case that can eat a typed prompt.
+    """
+    agent = await create_test_agent(client, name=f"routing-outage-prompt-{label}")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    with patch("omnigent.runtime._globals._caps", new=_outage_caps(failure)):
+        route = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-turn",
+            json={"harness": "claude-native", "prompt": "refactor auth"},
+        )
+    assert route.status_code == 200, route.text
+    payload = route.json()
+    # ``allow`` = the prompt runs, unblocked and unrouted.
+    assert payload["action"] == "allow"
+    assert not payload.get("model")
+    # Non-terminal: a transient outage must leave the next prompt free to ask
+    # again, unlike the deliberate "routing is off" answer.
+    assert payload.get("terminal") is not True
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    refreshed = conv_store.get_conversation(session_id)
+    assert refreshed is not None
+    assert refreshed.model_override is None
+    assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)

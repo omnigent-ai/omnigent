@@ -4109,6 +4109,29 @@ def _unapplied_routed_verdict(model: str, verdict: dict[str, Any]) -> dict[str, 
     }
 
 
+#: Placeholder model on a decision card for a routing call that never answered.
+#: The same spelling the auto-harness path already uses, so the UI renders one
+#: "not routed" outcome however routing failed.
+_UNAVAILABLE_ROUTED_MODEL = "unavailable"
+
+
+def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
+    """
+    Build the declined ``routing_decision`` card for a routing call that failed.
+
+    Routing is never allowed to block work, but a silent fall-through leaves
+    the user with a session that quietly ignored the toggle they turned on.
+    This is the visible half of failing open: no model is pinned, and the card
+    names the reason.
+
+    :param reason: Why nothing was routed, e.g.
+        ``"Routing call failed: router returned HTTP 500"``.
+    :returns: ``(model, verdict)`` ready for
+        :func:`_emit_server_routing_decision`.
+    """
+    return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
+
+
 def _publish_routed_model(session_id: str, model: str) -> None:
     """
     Publish a ``session.model`` SSE for a router-selected model.
@@ -4405,6 +4428,9 @@ async def _forward_event_to_runner(
     # Set when the pick has no spelling this session can be switched to, so
     # nothing was pinned and the chip must say so.
     _turn_unapplied = False
+    # Set when the routing call itself failed. The chip then carries the
+    # "unavailable" placeholder rather than a model, and nothing is pinned.
+    _turn_route_failed = False
     # The model the orchestrator's ``sys_session_send`` asked for, captured
     # before routing overwrites it: when the router picks something else the
     # attempt is recorded on the decision instead of silently vanishing.
@@ -4508,7 +4534,7 @@ async def _forward_event_to_runner(
                     )
             else:
                 # Top-level sessions: model-only routing (harness already fixed by spec).
-                from omnigent.server.smart_routing import route_turn
+                from omnigent.server.smart_routing import route_turn_or_decline
 
                 _harness = _resolve_harness(conv)
                 # A turn cannot change harness, so only this session's own
@@ -4516,7 +4542,11 @@ async def _forward_event_to_runner(
                 _turn_backed = _gateway_backed(
                     await _session_routing_host(conv, host_store), (_harness or "",)
                 )
-                _routed_model, _verdict = await route_turn(
+                # ``_or_decline``: a routing outage returns an error string
+                # rather than raising. Raised here it became a 500 on the
+                # events POST, so a router that was merely down cost the user
+                # a message that had already been persisted.
+                _routed_model, _verdict, _turn_route_err = await route_turn_or_decline(
                     _harness,
                     _user_text,
                     session_id=session_id,
@@ -4525,7 +4555,12 @@ async def _forward_event_to_runner(
                     gateway_backed=_turn_backed,
                     allow_static_fallback=_turn_backed,
                 )
-                if _routed_model is not None:
+                if _turn_route_err is not None:
+                    # Not routed, and visibly so — the turn runs on the
+                    # session's own model with the reason on its card.
+                    _routed_model, _verdict = _unavailable_routing_card(_turn_route_err)
+                    _turn_route_failed = True
+                if _routed_model is not None and not _turn_route_failed:
                     # Whether the session can actually be switched onto the
                     # pick decides everything downstream: an unapplicable
                     # model must not be pinned (the pin disables routing for
@@ -4614,6 +4649,7 @@ async def _forward_event_to_runner(
             _overridden = (
                 _attempted_override
                 if _attempted_override is not None
+                and not _turn_route_failed
                 and _bare_model_id(_attempted_override) != _bare_model_id(_routed_model)
                 else None
             )
@@ -4626,7 +4662,12 @@ async def _forward_event_to_runner(
                 harness=_routed_harness or _resolve_harness(conv),
                 attempted_override=_overridden,
             )
-            await _stamp_routing_decision_label(session_id, conversation_store, _decision_id)
+            if not _turn_route_failed:
+                # A failed call is NOT this session's routing decision: the
+                # label is the route-once gate, so stamping it would make one
+                # outage the reason the session never routes again. The card
+                # still shows what happened.
+                await _stamp_routing_decision_label(session_id, conversation_store, _decision_id)
             # Mirror the routing decision into the parent session so the
             # orchestrator's transcript also shows which model was chosen
             # for this sub-agent — the decision is otherwise only visible
@@ -4852,6 +4893,9 @@ async def _dispatch_session_event_to_runner_impl(
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
+        # Set when the routing call itself failed; the chip then carries the
+        # "unavailable" placeholder and nothing is pinned or switched.
+        _native_route_failed = False
         _native_scope = "child_session" if _native_parent_routing_on else "turn"
         # The routed pick in the spelling this pane accepts, or ``None`` when
         # it has none. Gates the pin AND the in-band switch below: a model the
@@ -4861,7 +4905,7 @@ async def _dispatch_session_event_to_runner_impl(
         if _native_routing_enabled and (
             conv.model_override is None or conv.parent_conversation_id is not None
         ):
-            from omnigent.server.smart_routing import route_turn
+            from omnigent.server.smart_routing import route_turn_or_decline
 
             _harness = _resolve_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
@@ -4873,7 +4917,13 @@ async def _dispatch_session_event_to_runner_impl(
                 _native_backed = _gateway_backed(
                     await _session_routing_host(conv, host_store), (_harness or "",)
                 )
-                _native_routed_model, _native_verdict = await route_turn(
+                # ``_or_decline``: a routing outage must not 500 the message
+                # POST. The pane keeps its own model and the card says why.
+                (
+                    _native_routed_model,
+                    _native_verdict,
+                    _native_route_err,
+                ) = await route_turn_or_decline(
                     _harness,
                     _user_text,
                     session_id=session_id,
@@ -4882,7 +4932,12 @@ async def _dispatch_session_event_to_runner_impl(
                     gateway_backed=_native_backed,
                     allow_static_fallback=_native_backed,
                 )
-                if _native_routed_model is not None:
+                if _native_route_err is not None:
+                    _native_routed_model, _native_verdict = _unavailable_routing_card(
+                        _native_route_err
+                    )
+                    _native_route_failed = True
+                if _native_routed_model is not None and not _native_route_failed:
                     # A pane that already took a routed turn can only be moved
                     # by ``/model``, so the pick must be in its vocabulary —
                     # true of every top-level turn (the pane is up before
@@ -4942,7 +4997,7 @@ async def _dispatch_session_event_to_runner_impl(
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.
         if _native_routed_model is not None and _native_verdict is not None:
-            if _native_applied_model is None:
+            if _native_applied_model is None and not _native_route_failed:
                 _native_verdict = _unapplied_routed_verdict(_native_routed_model, _native_verdict)
             _native_decision_id = await _emit_server_routing_decision(
                 session_id,
@@ -4952,9 +5007,13 @@ async def _dispatch_session_event_to_runner_impl(
                 scope=_native_scope,
                 harness=_resolve_harness(conv),
             )
-            await _stamp_routing_decision_label(
-                session_id, conversation_store, _native_decision_id
-            )
+            if not _native_route_failed:
+                # The label is the route-once gate, so a failed call must not
+                # claim it — one outage would otherwise stop this pane's
+                # in-harness hook from ever routing.
+                await _stamp_routing_decision_label(
+                    session_id, conversation_store, _native_decision_id
+                )
             if _native_parent_routing_on and conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,

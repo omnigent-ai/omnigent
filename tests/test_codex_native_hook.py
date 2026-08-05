@@ -818,6 +818,57 @@ def test_route_turn_no_ops_when_the_endpoint_is_unreachable(
     assert not (bridge_dir / MARKER_FILE).exists()
 
 
+def test_route_turn_falls_open_on_the_ladders_own_request_budget(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    Codex's hook waits ``HOOK_REQUEST_TIMEOUT_S`` for a verdict, and no longer.
+
+    Same hazard as claude's: the typed prompt is held in the TUI until this
+    expires. Asserted against the constant, not elapsed time.
+    """
+    from omnigent.runner.turn_routing import HOOK_REQUEST_TIMEOUT_S, MARKER_FILE
+
+    _advertise_turn_router(bridge_dir)
+    seen: list[float] = []
+
+    def _timed_out(url: str, token: str, body: object, timeout: float) -> None:
+        del url, token, body
+        seen.append(timeout)
+        return
+
+    monkeypatch.setattr(codex_native_hook, "_post_json", _timed_out)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert seen == [HOOK_REQUEST_TIMEOUT_S]
+    assert HOOK_REQUEST_TIMEOUT_S < 10.0
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
+def test_the_thread_switch_is_capped_inside_the_harness_hook_budget() -> None:
+    """
+    Hop 2b sits inside hop 1 alongside hop 2a, with room to spare.
+
+    Codex's hook does two things after being invoked — ask for a verdict, then
+    switch the thread — and the harness kills it on one budget. If the two
+    inner budgets could together exceed the outer one, a slow switch would be
+    killed mid-``thread/settings/update``: the block marker is written after
+    the switch, so the harness would drop the prompt with nothing to replay it.
+    """
+    from omnigent.runner.turn_routing import (
+        HARNESS_HOOK_TIMEOUT_S,
+        HOOK_REQUEST_TIMEOUT_S,
+        SETTINGS_UPDATE_TIMEOUT_S,
+    )
+
+    assert HARNESS_HOOK_TIMEOUT_S > HOOK_REQUEST_TIMEOUT_S + SETTINGS_UPDATE_TIMEOUT_S
+    # A local app-server RPC over a unix socket, so seconds is generous.
+    assert SETTINGS_UPDATE_TIMEOUT_S < 10.0
+
+
 @pytest.mark.parametrize(
     "advertise",
     [False, True],

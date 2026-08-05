@@ -1666,3 +1666,101 @@ async def test_routing_authorizes_host_ownership_before_touching_the_host() -> N
     # Nothing was pushed into the owner's live host connection.
     assert sent == []
     assert conn.pending_model_options == {}
+
+
+# ── A routing OUTAGE never blocks the create ────────────────────────────────
+#
+# The owner's ruling on the create path: routing that FAILS must degrade to an
+# unrouted session, promptly. (Routing that is unconfigurable for this host is a
+# different answer and stays a rejection — that gate is deliberate.)
+
+
+#: The five failure modes a routing call presents, as exceptions raised out of
+#: the routing client: a gateway 500, a 401, a wedged router, a garbled body,
+#: and an unreachable endpoint.
+_ROUTING_FAILURES: list[tuple[str, Exception]] = [
+    (
+        "gateway_500",
+        httpx.HTTPStatusError(
+            "500 Internal Server Error",
+            request=httpx.Request("POST", "https://ws.invalid/routes:select"),
+            response=httpx.Response(500, text="upstream router unavailable"),
+        ),
+    ),
+    (
+        "unauthorized",
+        httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=httpx.Request("POST", "https://ws.invalid/routes:select"),
+            response=httpx.Response(401, text="invalid access token"),
+        ),
+    ),
+    ("timeout", httpx.ReadTimeout("routes:select timed out")),
+    ("malformed_body", json.JSONDecodeError("Expecting value", "<not json>", 0)),
+    ("relay_unreachable", httpx.ConnectError("connection refused")),
+]
+
+_FAILURE_IDS = [label for label, _ in _ROUTING_FAILURES]
+
+
+@pytest.mark.parametrize(("label", "failure"), _ROUTING_FAILURES, ids=_FAILURE_IDS)
+async def test_a_routing_outage_still_creates_the_auto_harness_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """
+    The auto route lands on an installed CLI instead of erroring the create.
+
+    The harness itself comes from the router here, so a failure has nothing to
+    bind — and a create that 4xx'd would leave the user with no session at all.
+    It falls back to the first installed CLI on the CLI's own default model.
+    """
+    del label
+    wrappers = await _native_wrappers(client, db_uri)
+    created = await _create_smart_routing_session(
+        client, wrappers, FakeRoutingClient(None, error=failure)
+    )
+    assert created.status_code == 201, created.text
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(created.json()["id"])
+    assert conv is not None
+    # A real terminal, on the CLI's own default model, with nothing pinned.
+    assert conv.agent_id == wrappers["claude-native"]
+    assert conv.model_override is None
+
+
+@pytest.mark.parametrize(("label", "failure"), _ROUTING_FAILURES, ids=_FAILURE_IDS)
+async def test_a_routing_outage_still_creates_the_fixed_harness_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """
+    ``omni claude --smart-routing`` creates and launches unrouted, with a card.
+
+    The harness was the caller's own choice, so only the model was ever at
+    stake: nothing is pinned, the session opens on the CLI's default, and the
+    declined decision names the outage rather than leaving it invisible.
+    """
+    del label
+    wrappers = await _native_wrappers(client, db_uri)
+    created = await _create_fixed_harness_session(
+        client, wrappers["claude-native"], FakeRoutingClient(None, error=failure)
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override is None
+    # The route-once gate is not claimed by a failure: the session's own
+    # first-message hook must still be free to try.
+    assert ROUTING_DECISION_LABEL_KEY not in conv.labels
+
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert len(decisions) == 1
+    assert decisions[0]["applied"] is False
+    assert decisions[0]["rationale"]

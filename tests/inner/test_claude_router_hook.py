@@ -606,3 +606,64 @@ async def test_sdk_callback_allows_unchanged_when_router_down(
     assert options.hooks is not None
     callback = options.hooks["PreToolUse"][0].hooks[0]
     assert await callback(_payload(), None, {"signal": None}) == {}
+
+
+# ── Fail open, and fail fast ────────────────────────────────────────────────
+
+
+def test_the_spawn_gate_asks_on_the_ladders_own_request_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The hook waits ``REQUEST_TIMEOUT_S`` for a verdict, and no longer.
+
+    A spawn gate holds the parent agent's tool call open until it answers, so
+    the budget IS the stall a wedged router costs. Asserted against the
+    constant, not elapsed time, so the ladder is what is pinned.
+    """
+    router_dir = advertise_router(tmp_path)
+    seen: list[float] = []
+
+    def _timed_out(
+        endpoint: subagent_router.RouterEndpoint,
+        session_id: str,
+        body: dict[str, Any],
+        *,
+        timeout: float = 0.0,
+    ) -> dict[str, Any] | None:
+        del endpoint, session_id, body
+        seen.append(timeout)
+        return None
+
+    monkeypatch.setattr(subagent_router, "request_decision", _timed_out)
+    raw = _run_hook_main(monkeypatch, json.dumps(_payload()), ["--bridge-dir", str(router_dir)])
+
+    # "No opinion": the spawn runs on exactly the model it asked for.
+    assert raw == ""
+    assert seen == [subagent_router.REQUEST_TIMEOUT_S]
+    assert subagent_router.REQUEST_TIMEOUT_S < 10.0
+    # The harness's own kill has to sit above it, or the fail-open branch above
+    # never runs and the harness sees a dead hook instead of "no opinion".
+    assert subagent_router.HOOK_TIMEOUT_S > subagent_router.REQUEST_TIMEOUT_S
+    assert subagent_router.HOOK_TIMEOUT_S <= 15
+
+
+def test_an_unreachable_relay_is_no_opinion_not_a_dropped_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Nothing is listening on the advertised port, so the real transport runs.
+
+    Exercises ``request_decision``'s own fail-open rather than a stubbed one:
+    an urllib failure of any kind has to read as "no opinion", because the
+    alternative is a spawn the agent asked for that never happens.
+    """
+    router_dir = advertise_router(tmp_path)
+    endpoint = subagent_router.read_router_endpoint(router_dir)
+    assert endpoint is not None
+    assert (
+        subagent_router.request_decision(endpoint, "conv_abc", {"harness": "claude-sdk"}) is None
+    )
+
+    raw = _run_hook_main(monkeypatch, json.dumps(_payload()), ["--bridge-dir", str(router_dir)])
+    assert raw == ""

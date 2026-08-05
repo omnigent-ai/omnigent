@@ -2780,6 +2780,41 @@ def test_route_turn_no_ops_when_the_endpoint_is_unreachable(
     assert not (bridge_dir / MARKER_FILE).exists()
 
 
+def test_route_turn_falls_open_on_the_ladders_own_request_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The hook waits ``HOOK_REQUEST_TIMEOUT_S`` for a verdict, and no longer.
+
+    The user-visible cost of a wedged router: the typed prompt sits in the pane
+    until this expires. Asserted against the constant rather than a wall clock,
+    so the test pins the ladder instead of timing the machine it runs on.
+    """
+    from omnigent.runner.turn_routing import HOOK_REQUEST_TIMEOUT_S, MARKER_FILE
+
+    bridge_dir = _turn_routing_bridge_dir(tmp_path)
+    _advertise_turn_router(bridge_dir)
+    seen: list[float] = []
+
+    def _timed_out(url: str, token: str, body: object, timeout: float) -> None:
+        del url, token, body
+        seen.append(timeout)
+        return
+
+    monkeypatch.setattr(claude_native_hook, "_route_turn_post", _timed_out)
+
+    assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+    assert seen == [HOOK_REQUEST_TIMEOUT_S]
+    # Single digits: a fail-open the user waits half a minute for is blocking
+    # in practice, whatever the code path says.
+    assert HOOK_REQUEST_TIMEOUT_S < 10.0
+    # Nothing blocked and nothing marked, so the prompt ran.
+    assert capsys.readouterr().out == ""
+    assert not (bridge_dir / MARKER_FILE).exists()
+
+
 def test_build_hook_settings_registers_the_route_turn_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

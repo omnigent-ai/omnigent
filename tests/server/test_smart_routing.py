@@ -3068,3 +3068,188 @@ async def test_llm_routing_client_serves_a_cross_harness_verdict_without_a_raw_m
     assert verdict is not None
     assert verdict["router_source"] == "oss-llm"
     assert "raw_model" not in verdict
+
+
+# ── Fail open, fail fast: every failure shape a routing call presents ──────
+#
+# The owner's ruling is that a routing failure must never block the user's
+# work, and must not block it slowly either. These cover the two clients and
+# the turn-path boundary against the five failure modes a real call produces.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "handler"),
+    [
+        ("gateway_500", lambda _r: __import__("httpx").Response(500, text="upstream down")),
+        (
+            "unauthorized",
+            lambda _r: __import__("httpx").Response(
+                401, json={"error_code": 401, "message": "invalid access token"}
+            ),
+        ),
+        ("malformed_body", lambda _r: __import__("httpx").Response(200, text="<html>nope</html>")),
+        (
+            "not_a_verdict",
+            lambda _r: __import__("httpx").Response(200, json={"unexpected": "shape"}),
+        ),
+    ],
+)
+async def test_external_router_declines_with_a_reason_on_every_failure(
+    label: str,
+    handler: Any,
+) -> None:
+    """
+    Each failure returns ``None`` AND names itself in ``last_error``.
+
+    A bare ``None`` reads identically to "the router had no opinion", so the
+    reason is what lets the caller show the user why nothing was routed
+    instead of silently ignoring the toggle they turned on.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+    assert client.last_error, label
+
+
+@pytest.mark.asyncio
+async def test_external_router_declines_when_the_transport_never_connects() -> None:
+    """An unreachable router is a decline, not an exception out of ``route``."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+    assert client.last_error is not None
+    assert "router request failed" in client.last_error
+
+
+@pytest.mark.asyncio
+async def test_external_router_passes_its_budget_to_the_transport() -> None:
+    """
+    The 5s budget reaches ``httpx``, rather than only being documented.
+
+    Asserted against the constant, not a wall clock: the point is that the
+    number the ladder is built on is the number the socket gets.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S, ExternalRoutingClient
+
+    seen: list[Any] = []
+    real = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("timeout"))
+        kwargs["transport"] = httpx.MockTransport(lambda _r: httpx.Response(503))
+        return real(*args, **kwargs)
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
+    with patch("httpx.AsyncClient", factory):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+    assert seen == [ROUTING_REQUEST_TIMEOUT_S]
+
+
+@pytest.mark.asyncio
+async def test_the_judge_declines_rather_than_hang_on_a_stalled_model() -> None:
+    """
+    A judge that never answers is a decline inside the routing budget.
+
+    Regression: the judge inherited the server ``llm:`` block's request
+    timeout (300s by default, times every fallback model), so choosing the
+    built-in router as the source turned every fail-open on the hazard paths
+    into a multi-minute hang. Driven with a patched ``wait_for`` so the
+    assertion is against the constant rather than real elapsed time.
+    """
+    import asyncio
+
+    from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S, LLMRoutingClient
+
+    class _Stalled:
+        async def create(self, **kwargs: Any) -> Any:
+            await asyncio.sleep(3600)
+
+    budgets: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _recording_wait_for(awaitable: Any, timeout: float | None) -> Any:
+        budgets.append(timeout)
+        # Zero, so the test never actually waits out the budget.
+        return await real_wait_for(awaitable, 0)
+
+    client = LLMRoutingClient(_Stalled())
+    with patch("asyncio.wait_for", new=_recording_wait_for):
+        assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-4-5"]}) is None
+    assert budgets == [ROUTING_REQUEST_TIMEOUT_S]
+    assert client.last_error is not None
+
+
+@pytest.mark.asyncio
+async def test_the_judge_is_capped_by_its_own_request_timeout_too() -> None:
+    """The adapter's per-call ``timeout`` carries the routing budget as well.
+
+    ``wait_for`` alone would abandon the coroutine but leave the underlying
+    HTTP request running against a 300s socket budget, so both bounds are set.
+    """
+    from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S, LLMRoutingClient
+
+    seen: dict[str, Any] = {}
+
+    class _Recording:
+        async def create(self, **kwargs: Any) -> Any:
+            seen.update(kwargs)
+            raise RuntimeError("no verdict today")
+
+    client = LLMRoutingClient(_Recording())
+    assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-4-5"]}) is None
+    assert seen["timeout"] == ROUTING_REQUEST_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_route_turn_or_decline_never_raises_at_the_turn_boundary() -> None:
+    """
+    The turn path's fail-open boundary converts a raise into an ``error``.
+
+    Regression: ``route_turn`` let the failure through and the events POST
+    answered 500, so a router outage cost the user a message that had already
+    been persisted.
+    """
+    from omnigent.server.smart_routing import route_turn_or_decline
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("router down")
+
+    with patch("omnigent.server.smart_routing.route_turn", new=_boom):
+        model, verdict, error = await route_turn_or_decline("claude-native", "refactor auth")
+    assert model is None
+    assert verdict is None
+    assert error is not None
+    assert "Routing call failed" in error
+
+
+@pytest.mark.asyncio
+async def test_route_turn_or_decline_reports_an_ordinary_no_verdict_as_no_error() -> None:
+    """
+    "The router had no opinion" is a decline, not a failure.
+
+    Only a raised failure earns the ``error`` string (and with it the
+    "unavailable" card): a router that answered and declined is the ordinary
+    unrouted path, which already says nothing.
+    """
+    from omnigent.server.smart_routing import route_turn_or_decline
+
+    async def _no_verdict(*_args: Any, **_kwargs: Any) -> Any:
+        return None, None
+
+    with patch("omnigent.server.smart_routing.route_turn", new=_no_verdict):
+        model, verdict, error = await route_turn_or_decline("claude-native", "refactor auth")
+    assert (model, verdict, error) == (None, None, None)

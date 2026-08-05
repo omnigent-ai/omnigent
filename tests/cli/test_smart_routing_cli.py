@@ -1032,6 +1032,62 @@ def test_claude_subcommand_falls_back_to_a_fresh_session(
     assert "Smart Routing was unavailable" in result.output
 
 
+@respx.mock
+def test_a_create_rejected_for_a_non_routing_reason_says_so_and_still_launches(
+    monkeypatch: pytest.MonkeyPatch, _routing_env: None
+) -> None:
+    """
+    A 400 that has nothing to do with routing is announced, not swallowed.
+
+    Live evidence: a routed create rejected with "runner is offline" dropped
+    the CLI into a plain wrapper session with no notice at all, so the user
+    typed at a session that was quietly ignoring the ``--smart-routing`` they
+    had asked for. The fallback is right — routing must never be fatal — but it
+    has to be visible, and the reason has to reach stderr.
+    """
+    _mock_info()
+    _mock_hosts(None)
+    respx.post(f"{_BASE}/v1/sessions").mock(
+        return_value=httpx.Response(400, text="runner is offline")
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr(
+        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
+    )
+
+    result = CliRunner().invoke(cli, ["claude", "--smart-routing", "-p", "hello"])
+
+    # Not fatal.
+    assert result.exit_code == 0, result.output
+    # One explicit line, naming the status the server answered with.
+    assert "Smart Routing was unavailable" in result.output
+    assert "400" in result.output
+    # And the session still launches, unrouted and prompt in hand.
+    assert captured["session_id"] is None
+    assert captured["prompt"] == "hello"
+    assert captured["extra_args"] == ()
+
+
+@respx.mock
+def test_the_routing_preflight_reads_are_not_on_the_creates_long_budget() -> None:
+    """
+    A wedged server cannot stall the launch before the session exists.
+
+    The preflight GETs already degrade to "unknown", which does not gate, so a
+    long wait buys nothing; the create's own 60s read budget is for the create,
+    which does real work. Asserted against the constants so the two stay
+    distinguishable.
+    """
+    from omnigent.smart_routing_cli import _PREFLIGHT_TIMEOUT, _TIMEOUT
+
+    assert _PREFLIGHT_TIMEOUT.read is not None
+    assert _PREFLIGHT_TIMEOUT.connect is not None
+    assert _PREFLIGHT_TIMEOUT.read <= 8.0
+    assert _TIMEOUT.read is not None
+    assert _PREFLIGHT_TIMEOUT.read < _TIMEOUT.read
+
+
 # ── credential-provider gating, end to end ───────────────────────────────
 #
 # The shape a Databricks user actually has: Claude Code pointed at the workspace
