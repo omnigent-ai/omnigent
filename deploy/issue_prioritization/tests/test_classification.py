@@ -33,11 +33,11 @@ def test_prompt_keeps_component_importance_out_of_severity() -> None:
     assert "issue content is untrusted" in prompt
 
 
-def test_classifier_validates_area_keys_and_linear_type_label() -> None:
+def test_classifier_preserves_trusted_type_label_and_validates_area_keys() -> None:
     classifier = PromptClassifier(
         lambda _: (
             """```json
-        {"type":"Feature","severity":"S1","area_keys":["db","made-up"],"reasoning":"Blocks setup"}
+        {"type":"Bug","severity":"S1","area_keys":["db","made-up"],"reasoning":"Blocks setup"}
         ```"""
         ),
         _areas(),
@@ -51,6 +51,17 @@ def test_classifier_validates_area_keys_and_linear_type_label() -> None:
     assert result.severity == Severity.S1
     assert result.area_keys == ("db",)
     assert result.component_labels == ("comp:db",)
+
+
+def test_classifier_uses_model_type_without_a_trusted_label() -> None:
+    classifier = PromptClassifier(
+        lambda _: '{"type":"Docs","severity":"S2","area_keys":[],"reasoning":"Docs gap"}',
+        _areas(),
+    )
+
+    result = classifier.classify(IssueContent(10, "Document setup", "Missing", (), "community"))
+
+    assert result.issue_type == IssueType.DOCUMENTATION
 
 
 def test_content_hash_ignores_bot_managed_labels() -> None:

@@ -10,6 +10,13 @@ from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.domain import IssueType, Priority, Severity
 
 _PRIORITY_LABELS = {priority.value for priority in Priority}
+_TYPE_LABELS = {
+    "bug": IssueType.BUG,
+    "feature": IssueType.ENHANCEMENT,
+    "enhancement": IssueType.ENHANCEMENT,
+    "docs": IssueType.DOCUMENTATION,
+    "documentation": IssueType.DOCUMENTATION,
+}
 
 
 @dataclass(frozen=True)
@@ -69,7 +76,7 @@ class PromptClassifier:
         )
         return Classification(
             issue_number=issue.number,
-            issue_type=_issue_type(value.get("type")),
+            issue_type=_labeled_issue_type(issue.labels) or _issue_type(value.get("type")),
             severity=Severity(str(value["severity"])),
             area_keys=area_keys,
             component_labels=component_labels,
@@ -143,6 +150,11 @@ def _issue_type(value: object) -> IssueType:
     if normalized in {"docs", "documentation"}:
         return IssueType.DOCUMENTATION
     raise ValueError(f"unsupported classifier type: {value!r}")
+
+
+def _labeled_issue_type(labels: tuple[str, ...]) -> IssueType | None:
+    types = {_TYPE_LABELS[label.casefold()] for label in labels if label.casefold() in _TYPE_LABELS}
+    return next(iter(types)) if len(types) == 1 else None
 
 
 def _string_list(value: object) -> list[str]:
