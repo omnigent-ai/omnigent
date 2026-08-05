@@ -384,7 +384,6 @@ export function ProjectSettingsDialog({
                 // agent" action and leave the handler inert.
                 onCreateCustomAgent={() => {}}
                 allowCreateCustomAgent={false}
-                sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
                 // Modal so the menu establishes its own scroll context and can
                 // scroll inside the Dialog's scroll-lock (a non-modal dropdown
                 // portals outside that lock and can't scroll). The dismiss

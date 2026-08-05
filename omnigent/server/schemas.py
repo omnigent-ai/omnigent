@@ -1452,6 +1452,11 @@ class SessionCreateMetadata(BaseModel):
         the runner has them before it boots. Bounds (count / length)
         are validated server-side. ``None`` for non-native sessions.
         See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    :param host_type: Runner provisioning mode. ``"external"`` (the
+        default) targets a caller-managed host. ``"managed"`` lets the
+        server provision a sandbox host at create time — ``host_id``
+        must be ``None`` and ``workspace``, when given, must be a git
+        repository URL (optionally ``#<branch>``).
     :param parent_session_id: Optional parent session id, e.g.
         ``"conv_abc123"``. When set, the new session is created as a
         sub-agent child of that session (``kind="sub_agent"``) and
@@ -1463,6 +1468,7 @@ class SessionCreateMetadata(BaseModel):
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None

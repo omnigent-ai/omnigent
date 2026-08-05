@@ -392,10 +392,9 @@ export function CreateScheduledTaskDialog({
                   pendingAgent={null}
                   pendingAgentId="__unused_pending_agent__"
                   onSelectPending={() => {}}
-                  // Custom-agent creation is inert until there is a way to
-                  // persist a new agent independently of creating a session.
+                  // Custom-agent creation is not wired here; this dialog
+                  // selects an existing agent only.
                   onCreateCustomAgent={() => {}}
-                  sandboxSelected={false}
                   // Forward the dropdown open/close into the dialog's outside-click
                   // dismiss guard so opening the picker doesn't close the modal.
                   onOpenChange={handleSelectOpenChange}

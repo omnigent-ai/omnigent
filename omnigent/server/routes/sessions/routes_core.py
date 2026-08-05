@@ -163,6 +163,7 @@ from omnigent.server.schemas import (
     PaginatedList,
     ReadStatePutRequest,
     SessionAgentChangedEvent,
+    SessionCreateMetadata,
     SessionCreateRequest,
     SessionForkRequest,
     SessionLabelsResponse,
@@ -252,7 +253,9 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            result = await _create_bundled_session_from_multipart(request, user_id)
+            result, parsed_metadata = await _create_bundled_session_from_multipart(
+                request, user_id
+            )
             if permission_store is not None and user_id is not None:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(
@@ -261,6 +264,57 @@ def register_core_routes(
             # Push the new session to this user's other open tabs so it
             # enters the sidebar without a list poll (WS /sessions/updates).
             _announce_session_added(user_id, result.session_id)
+            # Managed sandbox: kick off background provisioning, same as the
+            # JSON path. The session row is already created; the sandbox is
+            # provisioned asynchronously and binds itself once ready.
+            if parsed_metadata.host_type == "managed":
+                sandbox_config = getattr(request.app.state, "sandbox_config", None)
+                host_store_for_managed = getattr(request.app.state, "host_store", None)
+                managed_launches = getattr(request.app.state, "managed_launches", None)
+                if (
+                    sandbox_config is None
+                    or host_store_for_managed is None
+                    or managed_launches is None
+                ):
+                    raise OmnigentError(
+                        "managed hosts are not configured on this server — add a "
+                        "'sandbox:' section to the server config",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                from omnigent.server.auth import RESERVED_USER_LOCAL
+                from omnigent.server.managed_hosts import (
+                    MANAGED_REPO_LABEL_KEY,
+                    parse_repo_workspace,
+                )
+
+                repo = (
+                    parse_repo_workspace(parsed_metadata.workspace)
+                    if parsed_metadata.workspace is not None
+                    else None
+                )
+                if parsed_metadata.workspace is not None:
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        result.session_id,
+                        {MANAGED_REPO_LABEL_KEY: parsed_metadata.workspace},
+                    )
+                managed_launches.begin(result.session_id)
+                _publish_sandbox_status(result.session_id, "provisioning")
+                launch_task = asyncio.create_task(
+                    _run_managed_launch(
+                        session_id=result.session_id,
+                        owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
+                        sandbox_config=sandbox_config,
+                        repo=repo,
+                        tracker=managed_launches,
+                        conversation_store=conversation_store,
+                        host_store=host_store_for_managed,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    )
+                )
+                _managed_launch_tasks.add(launch_task)
+                launch_task.add_done_callback(_managed_launch_tasks.discard)
             return result
 
         try:
@@ -528,7 +582,7 @@ def register_core_routes(
     async def _create_bundled_session_from_multipart(
         request: Request,
         user_id: str | None,
-    ) -> CreatedSessionResponse:
+    ) -> tuple[CreatedSessionResponse, SessionCreateMetadata]:
         """
         Handle multipart ``POST /v1/sessions`` with inline agent upload.
 
@@ -538,8 +592,8 @@ def register_core_routes(
             ``"alice@example.com"``. Used to authorize
             ``metadata.parent_session_id`` and enforce
             runner ownership on parent inheritance.
-        :returns: :class:`CreatedSessionResponse` with the new
-            session id.
+        :returns: Tuple of :class:`CreatedSessionResponse` with the new
+            session id and the parsed :class:`SessionCreateMetadata`.
         :raises HTTPException: 422 when a required multipart part is
             absent.
         :raises OmnigentError: If metadata or bundle validation
@@ -567,6 +621,11 @@ def register_core_routes(
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
+        if parsed_metadata.host_type == "managed" and parsed_metadata.host_id is not None:
+            raise OmnigentError(
+                "host_type 'managed' lets the server provision the host; host_id must not be set",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -595,7 +654,7 @@ def register_core_routes(
                 result.agent_id,
                 runner_router,
             )
-        return result
+        return result, parsed_metadata
 
     # ── GET /sessions/projects ────────────────────────────────────
     #

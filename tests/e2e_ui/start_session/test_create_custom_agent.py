@@ -426,20 +426,20 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_create_agent_hidden_on_sandbox(
+def test_create_agent_visible_on_sandbox(
     seeded_session: tuple[str, str],
 ) -> None:
-    """On a managed sandbox target, "Create custom agent" is hidden.
+    """On a managed sandbox target, "Create custom agent" is available.
 
-    A sandbox provisions its runner from a baked image with no create path for
-    an uploaded bundle, so the affordance is omitted from the picker. Switching
-    to a connected host brings it back.
+    The bundle is uploaded via POST /v1/agents first, and the resulting
+    agent_id is used with POST /v1/sessions {host_type: "managed"}.
+    The create affordance is present on both sandbox and connected-host targets.
     """
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_hidden_on_sandbox(base_url, session_id))
+    _run_in_fresh_loop(_drive_visible_on_sandbox(base_url, session_id))
 
 
-async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
+async def _drive_visible_on_sandbox(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -464,20 +464,9 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
 
-            # On the sandbox, "Create custom agent" is not offered (a managed
-            # sandbox has no create path for an uploaded bundle), so it's never
-            # in the DOM.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
-
-            # Switch to the connected host: with no custom agents yet, create is
-            # a top-level row (not behind a "Custom agents" submenu) and opens.
-            await page.keyboard.press("Escape")
-            await page.get_by_test_id("new-chat-landing-host-chip").click()
-            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
-            await expect(page.get_by_test_id("new-chat-landing-host-chip")).not_to_contain_text(
-                "Databricks Sandbox"
-            )
+            # On the sandbox, "Create custom agent" is offered — bundle upload
+            # goes through POST /v1/agents, then the agent_id is bound at session
+            # create time.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
             await expect(create_item).to_be_visible()
@@ -487,20 +476,20 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_pending_agent_dropped_when_switching_to_sandbox(
+def test_pending_agent_kept_when_switching_to_sandbox(
     seeded_session: tuple[str, str],
 ) -> None:
-    """A pending custom agent picked on a host is dropped on switch to sandbox.
+    """A pending custom agent picked on a host is kept on switch to sandbox.
 
-    Creating a custom agent selects it as the pending pick. Since a pending
-    bundle can't run on a managed sandbox, switching the target to the sandbox
-    must fall the selection back to a real agent and drop the pending row.
+    Creating a custom agent selects it as the pending pick. Switching the
+    target to the sandbox must preserve the pending pick — the bundle will be
+    uploaded via POST /v1/agents and bound at session create time.
     """
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_pending_dropped_on_sandbox(base_url, session_id))
+    _run_in_fresh_loop(_drive_pending_kept_on_sandbox(base_url, session_id))
 
 
-async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> None:
+async def _drive_pending_kept_on_sandbox(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -531,16 +520,20 @@ async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> N
                 "pending-agent"
             )
 
-            # Switch the target back to the sandbox: the pending pick is dropped.
+            # Switch the target to the sandbox: the pending pick is preserved.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id("new-chat-landing-sandbox-option").click()
             await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
                 "Databricks Sandbox"
             )
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).not_to_contain_text(
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
                 "pending-agent"
             )
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await expect(page.get_by_test_id("new-chat-landing-agent-pending")).to_have_count(0)
+            # The pending agent may be inside the "Custom agents" submenu.
+            custom_group = page.get_by_test_id("new-chat-landing-custom-agents")
+            if await custom_group.count() > 0:
+                await custom_group.hover()
+            await expect(page.get_by_test_id("new-chat-landing-agent-pending")).to_be_visible()
         finally:
             await browser.close()
