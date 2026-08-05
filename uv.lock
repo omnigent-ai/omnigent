@@ -19,6 +19,12 @@ cryptography = "2026-06-26T00:00:00Z"
 nimble-python = "2026-07-29T00:00:00Z"
 pydantic-settings = "2026-06-26T00:00:00Z"
 
+[manifest]
+members = [
+    "omnigent",
+    "omnigent-issue-prioritization",
+]
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -3458,6 +3464,25 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "omnigent", editable = "." },
     { name = "pydantic", specifier = ">=2.0,<3" },
+]
+
+[[package]]
+name = "omnigent-issue-prioritization"
+version = "0.1.0"
+source = { editable = "deploy/issue_prioritization" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.12" },
 ]
 
 [[package]]

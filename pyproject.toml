@@ -354,6 +354,10 @@ dev = [
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
 
+# Share the repository lockfile with standalone deploy packages.
+[tool.uv.workspace]
+members = ["deploy/issue_prioritization"]
+
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
 omnigent-client = { path = "sdks/python-client", editable = true }
