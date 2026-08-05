@@ -868,7 +868,7 @@ def _harness_cli_version_string(
     """Return the parsed, normalized version string from *binary* ``--version``.
 
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
-        ``6.0`` on the readiness path.
+        :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
     try:
         completed = subprocess.run(

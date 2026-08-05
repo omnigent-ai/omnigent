@@ -619,7 +619,20 @@ def supervise_host_command(command: str) -> str:
     The loop stands down on a clean exit, on
     :data:`~omnigent.host.HOST_FATAL_EXIT_CODE` (a credential / version failure
     that can never succeed), and on SIGTERM (a deliberate stop). Anything else
-    is a crash, retried with a doubling delay.
+    is a crash, retried with a doubling delay. A signal-kill of the host alone
+    (SIGKILL → 137) counts as a crash on purpose: that is what an OOM kill looks
+    like, and restarting is the wanted response.
+
+    A path that means to STOP the host must therefore signal the supervisor too,
+    not just the host — otherwise the loop faithfully restarts it. Both in-sandbox
+    stop paths already do: ``foreground_kill_command`` signals the process the
+    pidfile recorded (the supervisor, which is what ``exec``s under it), and
+    islo's preserved-daemon stop matches ``"omnigent host"`` against full argv,
+    which the supervisor's own ``sh -c <script>`` argv contains.
+
+    The attempt counter in the restart log makes a persistently-crashing host
+    observable — the loop never gives up, so a wedged box would otherwise be
+    silent apart from indistinguishable repeats.
 
     :param command: The host launch, e.g. ``"OMNIGENT_HOST_TOKEN=… omnigent
         host --server https://…"``. Env prefixes are re-applied per attempt.
@@ -629,11 +642,14 @@ def supervise_host_command(command: str) -> str:
     stop_codes = f"0|{HOST_FATAL_EXIT_CODE}|{HOST_SIGTERM_EXIT_CODE}"
     return (
         "delay=1\n"
+        "attempt=0\n"
         "while :; do\n"
         f"  {command}\n"
         "  rc=$?\n"
         f'  case "$rc" in {stop_codes}) exit "$rc";; esac\n'
-        '  echo "omnigent host exited ($rc); restarting in ${delay}s" >&2\n'
+        "  attempt=$((attempt + 1))\n"
+        '  echo "omnigent host exited ($rc); attempt $attempt; '
+        'restarting in ${delay}s" >&2\n'
         '  sleep "$delay"\n'
         f'  delay=$((delay * 2)); [ "$delay" -gt {_RESTART_MAX_DELAY_S} ] '
         f"&& delay={_RESTART_MAX_DELAY_S}\n"

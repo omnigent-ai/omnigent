@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -114,8 +115,41 @@ def test_supervise_host_command_restarts_only_on_crash(
     with a scripted sequence of codes, with ``sleep`` stubbed out so the backoff
     doesn't slow the test.
     """
+    proc, launches = _run_supervisor(tmp_path, exit_codes)
+
+    assert proc.returncode == expected_rc
+    assert launches == expected_attempts
+
+
+def test_supervise_host_command_clamps_the_restart_backoff(tmp_path: Path) -> None:
+    """
+    The restart delay doubles but never exceeds the cap.
+
+    Without the clamp a long-running crash loop would back off unboundedly and
+    stop retrying in any useful timeframe; with it, a persistently failing host
+    settles into a steady slow retry instead of a hot loop.
+    """
+    proc, _ = _run_supervisor(tmp_path, [1] * 8 + [0])
+
+    delays = [int(m) for m in re.findall(r"restarting in (\d+)s", proc.stderr)]
+    assert delays == [1, 2, 4, 8, 16, 30, 30, 30]
+    # The attempt counter makes a wedged box observable in the log.
+    assert "attempt 8;" in proc.stderr
+
+
+def _run_supervisor(
+    tmp_path: Path, exit_codes: list[int]
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """
+    Run the real supervisor script against a fake host with scripted exit codes.
+
+    :param tmp_path: Per-test scratch dir.
+    :param exit_codes: Exit code for each successive host launch, in order.
+    :returns: ``(completed_process, launch_count)``.
+    """
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir()
+    # Stub `sleep` so the backoff is exercised without actually waiting.
     sleep_stub = stub_bin / "sleep"
     sleep_stub.write_text("#!/bin/sh\nexit 0\n")
     sleep_stub.chmod(0o755)
@@ -138,9 +172,7 @@ def test_supervise_host_command_restarts_only_on_crash(
         text=True,
         env={**os.environ, "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}"},
     )
-
-    assert proc.returncode == expected_rc
-    assert attempts.read_text().strip() == str(expected_attempts)
+    return proc, int(attempts.read_text().strip())
 
 
 def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:
