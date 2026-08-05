@@ -1196,12 +1196,48 @@ def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
         ("2026.05.24.1.dda726e", "2026.05.24"),
         ("kimi version 1.47.0", "1.47.0"),
         ("1.17.7-rc1", "1.17.7-rc1"),
+        # Hermes prints a semver token first, then a date in parentheses.
+        # The parser must prefer the date because Hermes's min_version
+        # (``2026.06.05``) is itself date-shaped — otherwise ``v0.20.0``
+        # is matched and rejected against the date floor.
+        ("Hermes Agent v0.20.0 (2026.8.3)", "2026.08.03"),
+        ("Hermes Agent v0.20.0 (2026.06.19)", "2026.06.19"),
     ],
 )
 def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: str) -> None:
     """Date-shaped Cursor versions are stripped to ``YYYY.MM.DD`` so PEP 440 can
-    compare them; normal semver versions stay unchanged."""
+    compare them; normal semver versions stay unchanged. When the version output
+    contains both a semver and a date token and any harness declares a
+    date-shaped floor, the date token wins so harnesses like Hermes aren't
+    flagged ``version-too-low`` against their own date floor."""
     assert hi._parse_harness_cli_version(raw) == expected
+
+
+def test_hermes_mixed_version_output_satisfies_date_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes emits ``v0.20.0 (2026.8.3)`` — semver first, then a date. Its
+    declared ``min_version`` is ``2026.06.05`` (date-shaped). Without preferring
+    the date token the parser grabs ``v0.20.0`` and the date floor rejects it,
+    causing the host to report ``version-too-low`` even though the trailing date
+    satisfies the floor. End-to-end, ``harness_cli_installed`` must read ``True``."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    hermes_output = (
+        "Hermes Agent v0.20.0 (2026.8.3)\n"
+        "Install directory: /home/user/.hermes/hermes-agent\n"
+        "Install method: git\n"
+    )
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=hermes_output, stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.HERMES_KEY) is True
 
 
 @pytest.mark.parametrize(

@@ -674,6 +674,11 @@ def harness_setup_hint(harness: str | None) -> str:
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 
+# Matches calendar-date versions like ``2026.06.05`` or Cursor's
+# ``2026.06.19-20-24-33-653a7fb``: a 4-digit year, month, day, each
+# dot-or-hyphen separated, optionally followed by build metadata.
+_DATE_VERSION_RE = re.compile(r"(20\d{2}[.\-]\d{1,2}[.\-]\d{1,2}(?:[-.][0-9A-Za-z]+)*)")
+
 
 def _normalize_date_version(version: str) -> str:
     """Trim date-shaped versions (``YYYY.MM.DD[-build]``) to their date part.
@@ -698,6 +703,20 @@ def _normalize_date_version(version: str) -> str:
     return version
 
 
+def _any_harness_declares_date_min_version() -> bool:
+    """Return ``True`` if any harness install spec uses a date-shaped floor.
+
+    Hermes prints ``v0.20.0 (2026.8.3)`` — a semver token first, then a date —
+    while its declared ``min_version`` is the date (``2026.06.05``). For such
+    harnesses the parser must prefer the date token so the comparison matches
+    the spec's own shape.
+    """
+    return any(
+        spec.min_version is not None and _DATE_VERSION_RE.match(spec.min_version)
+        for spec in _all_harness_install().values()
+    )
+
+
 def _parse_harness_cli_version(text: str) -> str | None:
     """Extract a semver-ish string from ``<binary> --version`` output.
 
@@ -706,8 +725,20 @@ def _parse_harness_cli_version(text: str) -> str | None:
     kept generic so any harness can declare a version range in its install spec.
     Date-shaped versions (e.g. Cursor's ``2026.06.22`` or
     ``2026.06.19-20-24-33-653a7fb``) are normalized to ``YYYY.MM.DD``.
+
+    When a harness's declared ``min_version`` is itself date-shaped, prefer the
+    first date-shaped token in the output over the first semver token. Hermes
+    emits ``v0.20.0 (2026.8.3)`` — without this preference ``_VERSION_RE.search``
+    matches ``v0.20.0`` and the date-shaped cutoff rejects it, so the host
+    reports ``version-too-low`` even though the trailing date satisfies it.
     """
-    match = _VERSION_RE.search(text or "")
+    if not text:
+        return None
+    if _any_harness_declares_date_min_version():
+        date_match = _DATE_VERSION_RE.search(text)
+        if date_match is not None:
+            return _normalize_date_version(date_match.group(1))
+    match = _VERSION_RE.search(text)
     if match is None:
         return None
     return _normalize_date_version(match.group(1))
