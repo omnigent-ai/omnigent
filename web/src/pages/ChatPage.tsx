@@ -953,10 +953,11 @@ export function ChatPage() {
   // Smart Routing is meaningless there.
   const serverInfo = useServerInfo();
   const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession);
-  // Sub-agent routing is a separate knob with a wider gate: Claude Code and
-  // Codex sessions get it in BOTH flavours (a native CLI can't per-turn route
-  // itself, but the sub-agents it spawns are routed per spawn), as do
-  // fully-auto sessions. For native sessions this is their only routing control.
+  // Sub-agent routing is a separate knob with a different gate: a native CLI
+  // can't per-turn route itself, but the sub-agents it spawns are routed per
+  // spawn — where the launch actually installed that apparatus. See
+  // isSubagentRoutingSession for which classes qualify; for native sessions
+  // this is their only routing control.
   const subagentRoutingEligible = isSubagentRoutingEligible(serverInfo, activeSession);
 
   // Non-null only when the active session is a sub-agent (child): the
@@ -5975,12 +5976,14 @@ function SessionConfigModal({
               </Select>
             </ConfigRow>
           )}
-          {/* Sub-agent routing — the only in-session routing control, for
-          native Claude/Codex (spawns route through the harness hook) and for
-          SDK/bundle agents alike (spawns route through the create path). A
-          session's own routing is a create-time choice. Two options — a session
-          that started on Smart Routing was stamped "on" at create, so an unset
-          value is Default and the trigger always shows what's stored. */}
+          {/* Sub-agent routing — the only in-session routing control, for a
+          native session whose launch installed the spawn-routing apparatus
+          (spawns route through the harness hook) and for SDK/bundle agents
+          (spawns route through the create path). Hidden where it would be
+          inert: pinned Codex, and any plain native session. A session's own
+          routing is a create-time choice. Two options — a session that started
+          on Smart Routing was stamped "on" at create, so an unset value is
+          Default and the trigger always shows what's stored. */}
           {subagentRoutingEligible && (
             <ConfigRow label={SUBAGENT_ROUTING_LABEL} description={SUBAGENT_ROUTING_DESCRIPTION}>
               <Select
