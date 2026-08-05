@@ -113,11 +113,15 @@ function exemptReason(pr, maintainers = new Set()) {
 }
 
 const message = (author) =>
-  `@${author} This PR doesn't link an issue.
+  `@${author} Thanks for the PR! It doesn't link an issue yet.
 
-Please edit the description to link the issue this PR addresses with a closing keyword, e.g. \`Closes #123\`, or link it from the **Development** section of the sidebar. Linking gives the PR the issue's priority in our review queue, and closes the issue automatically on merge.
+**We require an issue for every PR**, so the work can be prioritized before it's reviewed. Please add one to the description with a closing keyword, e.g. \`Closes #123\`, or link it from the **Development** section of the sidebar. Linking gives your PR the issue's priority in our review queue, and closes the issue when this merges.
 
-If this change genuinely has no associated issue, check **Refactor / chore**, **Docs**, or **Test / CI** under *Type of change* — those types don't need one. Anything else should have an issue so it can be prioritized; open one if it doesn't exist yet.
+No issue exists for this yet? Open one first, then link it. That's how we track what's worth doing, and it's usually quicker than it sounds.
+
+The only exceptions are changes with no user-visible behaviour: pure **Refactor / chore**, **Docs**, or **Test / CI** work. If that's genuinely what this is, check that box under *Type of change*. Anything that fixes a bug, adds a feature, or changes the UI needs an issue, even when it also touches docs or tests.
+
+See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md#every-pr-needs-an-issue) for the full policy.
 
 _No action is taken beyond this comment._`;
 
@@ -258,7 +262,7 @@ module.exports = async ({ context, github, core }) => {
     // The full verdict list, so a dry run can be reviewed before enforcing.
     if (core.summary) {
       core.summary
-        .addHeading(`Issue-link check ${enforce ? "(enforcing)" : "(dry run — nothing changed)"}`, 3)
+        .addHeading(`Issue-link check ${enforce ? "(enforcing)" : "(dry run, nothing changed)"}`, 3)
         .addRaw(`\n${summary}\n\n`)
         .addTable([
           [

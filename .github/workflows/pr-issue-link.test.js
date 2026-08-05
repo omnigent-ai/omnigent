@@ -222,6 +222,11 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
     assert.match(commented[0].body, /@alice/);
     assert.match(commented[0].body, /Closes #123/);
     assert.ok(commented[0].body.startsWith(script.MARKER), "comment carries the dedupe marker");
+    // House style: no em dashes in anything a contributor reads.
+    assert.ok(!commented[0].body.includes("—"), "no em dashes in the nudge");
+    // The exemption must not read as a free opt-out.
+    assert.match(commented[0].body, /require an issue for every PR/);
+    assert.match(commented[0].body, /even when it also touches docs or tests/);
     assert.deepStrictEqual(labeled, [], "no label is applied");
   }
 

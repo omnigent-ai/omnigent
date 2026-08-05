@@ -258,19 +258,67 @@ request enforces this, so unsigned commits will block merging.
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
 - Sign off your commits with `git commit -s` (see
   [Developer Certificate of Origin](#developer-certificate-of-origin) above).
+- **Link an issue** (see below).
 - Fill in the PR template. For **UI / frontend changes**, check the
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
+
+### Every PR needs an issue
+
+We require an issue for every pull request. Issues are how work gets
+prioritized, so a PR without one arrives unsorted and waits longer.
+
+Link it in the description with a closing keyword, for example `Closes #123`, or
+from the **Development** section of the sidebar. Either way GitHub records the
+link, gives your PR the issue's priority, and closes the issue when the PR
+merges.
+
+**No issue for your change yet?** Open one first, then link it. That is also the
+faster path for anything non-trivial: it lets a maintainer confirm the approach
+before you write code.
+
+The only exceptions are changes with no user-visible behaviour: pure
+**Refactor / chore**, **Docs**, or **Test / CI** work. If that is genuinely what
+your PR is, check that box under *Type of change* and no issue is needed.
+Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
+even when it also touches docs or tests.
+
+A bot comments once on PRs that link no issue. It never closes anything.
+
+### Review state labels
+
+Two labels track whose turn it is. Both are managed by automation, so you do not
+need to apply them.
+
+| Label | Meaning |
+| --- | --- |
+| `waiting-on-author` | A maintainer has left feedback. The PR is in your court. |
+| `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
+
+A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
+you push a commit, comment, or reply to a review, that clears automatically and
+`waiting-for-review` goes on instead, which also re-pings your reviewer. You do
+not need to ask for a re-review.
+
+A PR left in `waiting-on-author` for **7 days** with no reply or new commit is
+closed to keep the review queue readable. That is not a judgement on the change,
+and it is reversible: comment `/reopen` (see below).
+
+**As of 5 August 2026** maintainers follow this process for new pull requests.
+PRs opened before then are being worked through separately, so an older PR may
+not carry these labels yet; that does not mean it has been forgotten. The
+issue-link rule also applies only to PRs opened on or after that date, so you
+will not be asked to retrofit an issue onto an older PR.
 
 ### Reopening a closed PR
 
 If automation closed your PR (as a duplicate, for example) and you think that
 was wrong, comment `/reopen` on it and a bot will reopen it for you. GitHub only
 lets maintainers press the Reopen button, so this command is how you do it
-yourself — you can also use it on a PR you closed by hand.
+yourself. You can also use it on a PR you closed by hand.
 
 Only the PR author can use it, and it won't override a maintainer who closed
 your PR deliberately; ask them in a comment instead. It also needs your source
-branch to still exist — if you deleted it, push it again and open a fresh PR
+branch to still exist. If you deleted it, push it again and open a fresh PR
 linking the old one.
