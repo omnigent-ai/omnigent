@@ -1708,3 +1708,47 @@ async def test_a_routing_outage_still_allows_the_first_prompt(
     assert refreshed is not None
     assert refreshed.model_override is None
     assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+
+@pytest.mark.parametrize(
+    ("label", "failure"), ROUTING_FAILURES, ids=[f[0] for f in ROUTING_FAILURES]
+)
+async def test_a_routing_outage_still_delivers_a_child_spawns_turn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """
+    A child spawn runs on the model the orchestrator asked for, and says so.
+
+    ``route_session_harness`` already failed open here, but its ``error`` was
+    unpacked and dropped — so the one path that could not route left no card at
+    all, and an outage was indistinguishable from a router with no opinion.
+
+    A child of a PINNED parent, deliberately: a child of an auto-harness parent
+    carries the ``"auto"`` sentinel and is handled by the auto-harness block
+    instead, which has always emitted its own unavailable card.
+    """
+    _parent_id, child, conv_store = await _pinned_parent_and_child(
+        client,
+        db_uri,
+        agent_name=f"routing-outage-child-{label}",
+        harness="codex",
+    )
+
+    await _send_child_message(
+        child, conv_store, FakeRoutingClient(None, error=failure), "audit routing"
+    )
+
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    # Nothing pinned, and the route-once label is not claimed by a failure.
+    assert refreshed.model_override is None
+    assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+    decisions = _routing_decisions(conv_store, child.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.model == UNAVAILABLE_MODEL
+    assert decisions[0].data.applied is False
+    assert decisions[0].data.rationale

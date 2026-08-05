@@ -1632,6 +1632,79 @@ async def test_turn_catalog_keeps_a_stale_catalog_when_the_refetch_fails() -> No
         _model_options_stale.discard(session_id)
 
 
+async def test_turn_catalog_gives_up_on_a_refetch_that_never_finishes() -> None:
+    """
+    Routing waits a bounded moment for a sharper catalog, then routes anyway.
+
+    The fetch retries a booting runner across several delays (~30s worst case),
+    and this await sits on the routing hazard path — a wedged catalog would
+    stall the prompt as surely as a wedged router. The await is bounded and the
+    single-flight is left running, so the next turn gets the sharper answer.
+    """
+    import asyncio
+
+    from omnigent.server.routes._sessions.orchestration import (
+        _ROUTING_CATALOG_WAIT_S,
+        _model_options_cache,
+        _model_options_inflight,
+        _model_options_stale,
+        _native_turn_catalog,
+    )
+
+    session_id = "conv_stale_hang"
+    conv = _native_conv(session_id)
+    _model_options_cache[session_id] = [{"id": "opus", "model": "databricks-claude-opus-5"}]
+    _model_options_stale.add(session_id)
+
+    started = asyncio.Event()
+
+    async def _never_finishes() -> None:
+        started.set()
+        await asyncio.sleep(3600)
+
+    hanging = asyncio.create_task(_never_finishes())
+    _model_options_inflight[session_id] = hanging
+    await started.wait()
+
+    waited: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _recording_wait_for(awaitable: Any, timeout: float | None) -> Any:
+        waited.append(timeout)
+        # Zero, so the test never actually sits out the budget.
+        return await real_wait_for(awaitable, 0)
+
+    try:
+        with patch("asyncio.wait_for", new=_recording_wait_for):
+            # The stale vocabulary is served rather than the turn hanging on it.
+            assert await _native_turn_catalog(session_id, conv, _null_runner_client()) == [
+                "databricks-claude-opus-5"
+            ]
+        assert waited == [_ROUTING_CATALOG_WAIT_S]
+        # Bounded in single-digit seconds, like every other routing budget.
+        assert 0 < _ROUTING_CATALOG_WAIT_S < 10.0
+        # Shielded: giving up on the WAIT does not cancel the fetch, so the
+        # cache still fills for whoever reads it next.
+        assert not hanging.cancelled()
+        assert not hanging.done()
+    finally:
+        hanging.cancel()
+        _model_options_inflight.pop(session_id, None)
+        _model_options_cache.pop(session_id, None)
+        _model_options_stale.discard(session_id)
+
+
+def _null_runner_client() -> Any:
+    """A runner client stand-in that is never actually called.
+
+    ``_refresh_stale_native_model_options`` only needs a non-``None`` client to
+    reach its in-flight branch; the hanging task is what it waits on.
+
+    :returns: An object standing in for the bound runner's HTTP client.
+    """
+    return SimpleNamespace()
+
+
 async def test_routing_authorizes_host_ownership_before_touching_the_host() -> None:
     """A foreign ``host_id`` is rejected before any host read or frame push."""
     from fastapi import HTTPException

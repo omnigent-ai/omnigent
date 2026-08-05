@@ -4428,9 +4428,10 @@ async def _forward_event_to_runner(
     # Set when the pick has no spelling this session can be switched to, so
     # nothing was pinned and the chip must say so.
     _turn_unapplied = False
-    # Set when the routing call itself failed. The chip then carries the
-    # "unavailable" placeholder rather than a model, and nothing is pinned.
-    _turn_route_failed = False
+    # Set when the routing call itself failed — on either branch below. The
+    # chip then carries the "unavailable" placeholder rather than a model,
+    # nothing is pinned, and the route-once label is left unclaimed.
+    _route_failed = False
     # The model the orchestrator's ``sys_session_send`` asked for, captured
     # before routing overwrites it: when the router picks something else the
     # attempt is recorded on the decision instead of silently vanishing.
@@ -4532,6 +4533,15 @@ async def _forward_event_to_runner(
                         session_id,
                         exc_info=True,
                     )
+                if _routed_model is None and _route_err is not None:
+                    # ``route_session_harness`` already fails open, so the spawn
+                    # runs on whatever the orchestrator asked for — but the
+                    # reason was unpacked and dropped, leaving no card and no
+                    # way to tell an outage from a router with no opinion. Say
+                    # it, on the same placeholder the other paths use. Set last
+                    # so nothing above can pin or publish the placeholder.
+                    _routed_model, _verdict = _unavailable_routing_card(_route_err)
+                    _route_failed = True
             else:
                 # Top-level sessions: model-only routing (harness already fixed by spec).
                 from omnigent.server.smart_routing import route_turn_or_decline
@@ -4559,8 +4569,8 @@ async def _forward_event_to_runner(
                     # Not routed, and visibly so — the turn runs on the
                     # session's own model with the reason on its card.
                     _routed_model, _verdict = _unavailable_routing_card(_turn_route_err)
-                    _turn_route_failed = True
-                if _routed_model is not None and not _turn_route_failed:
+                    _route_failed = True
+                if _routed_model is not None and not _route_failed:
                     # Whether the session can actually be switched onto the
                     # pick decides everything downstream: an unapplicable
                     # model must not be pinned (the pin disables routing for
@@ -4649,7 +4659,7 @@ async def _forward_event_to_runner(
             _overridden = (
                 _attempted_override
                 if _attempted_override is not None
-                and not _turn_route_failed
+                and not _route_failed
                 and _bare_model_id(_attempted_override) != _bare_model_id(_routed_model)
                 else None
             )
@@ -4662,7 +4672,7 @@ async def _forward_event_to_runner(
                 harness=_routed_harness or _resolve_harness(conv),
                 attempted_override=_overridden,
             )
-            if not _turn_route_failed:
+            if not _route_failed:
                 # A failed call is NOT this session's routing decision: the
                 # label is the route-once gate, so stamping it would make one
                 # outage the reason the session never routes again. The card
