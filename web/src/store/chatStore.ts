@@ -80,6 +80,7 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
+import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -3272,6 +3273,10 @@ export async function startStreamPump(
         presenceIdle.noteReported(idle);
         if (reconnecting) {
           dropEphemeralInFlightBlocks(id, set);
+        } else {
+          // Fresh connection (not a reconnect) — clear any stale SSE log from
+          // a previous stream bind so the debug panel starts clean.
+          clearSseLog(id);
         }
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
@@ -3677,7 +3682,7 @@ export async function pumpStreamEvents(
   // Per-message high-water chunk index, for delta duplicate suppression.
   const liveLastIndex = new Map<string, number>();
   const events = tapLiveDeltas(
-    tapSessionEvents(rawEvents),
+    tapSessionEvents(rawEvents, id),
     id,
     retiredLiveMessages,
     liveLastIndex,
@@ -4998,9 +5003,13 @@ function applyChildSessionUpdated(
   queryClient.setQueryData<ChildSessionInfo[]>(key, next);
 }
 
-async function* tapSessionEvents(events: AsyncIterable<StreamEvent>): AsyncIterable<StreamEvent> {
+async function* tapSessionEvents(
+  events: AsyncIterable<StreamEvent>,
+  sessionId?: string,
+): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     handleSessionEvent(event);
+    if (sessionId !== undefined) pushSseEvent(sessionId, event);
     yield event;
   }
 }
