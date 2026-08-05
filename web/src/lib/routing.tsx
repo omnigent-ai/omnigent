@@ -102,7 +102,7 @@ function rebasePath(path: string, basename: string): string {
   // and `/mount?o=1` are all "already under `/mount`", but a distinct segment
   // like `/mounting` is not. Checking only `=== basename` / `${basename}/`
   // missed the query/hash forms: a mount-absolute path carrying a search (e.g.
-  // the settings "Back to Omnigent" target `/mount?o=123`, captured from
+  // the settings Back target `/mount?o=123`, captured from
   // `useLocation()` which already includes the basename) fell through and got
   // prefixed again → `/mount/mount?o=123`, a 404.
   if (path === basename) return path;

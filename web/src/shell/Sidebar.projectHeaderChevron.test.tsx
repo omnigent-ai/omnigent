@@ -130,10 +130,14 @@ describe("project folder header icon/chevron", () => {
     // Project folders are real rows, not muted section labels: use the shared
     // text-ui compact treatment with 8px insets/gap and foreground text.
     expect(header).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
       "gap-2",
       "rounded-[var(--radius-otto-button)]",
       "px-2",
-      "py-[3px]",
+      "py-1.5",
+      "md:py-1",
       "sidebar-compact-text",
       "text-foreground",
     );
@@ -175,7 +179,7 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
-  it("centers an empty-project message in an outlined container aligned to the title", () => {
+  it("matches row height for the centered empty-project container", () => {
     renderSidebar();
     fireEvent.click(headerButton("My Project"));
 
@@ -183,15 +187,19 @@ describe("project folder header icon/chevron", () => {
     expect(empty).toHaveClass(
       "ml-8",
       "mr-2",
-      "min-h-9",
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "py-1.5",
+      "md:py-1",
       "justify-center",
-      "rounded-xl",
+      "rounded-[var(--radius-otto-button)]",
       "border",
       "border-dashed",
       "text-center",
       "text-ui",
     );
-    expect(empty).not.toHaveClass("text-xs");
+    expect(empty).not.toHaveClass("min-h-9", "text-xs");
   });
 
   it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {

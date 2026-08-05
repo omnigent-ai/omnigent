@@ -607,3 +607,31 @@ def test_add_daemon_host_status_skips_http_for_dead_process() -> None:
     assert payload["host_status"] == "offline"
     assert payload["error"] is None
     assert http_calls == [], "No HTTP calls expected for a dead process"
+
+
+def test_host_http_json_handles_remote_headers_oserror() -> None:
+    """Auth resolution errors inside _host_http_json must return status_code=0.
+
+    _remote_headers() does file I/O and SDK calls that can raise OSError.
+    Before the fix the cache-populating call was outside the try/except, so
+    such a failure propagated unhandled (and aborted the whole host status
+    listing when running under ThreadPoolExecutor). It must be caught and
+    converted to a graceful _HostHttpResult(status_code=0) like any other
+    transport failure.
+    """
+    from omnigent.cli import _host_http_headers_cache, _host_http_json
+
+    # Clear cache so the resolution path is exercised.
+    url = "https://oserror-test.example.com"
+    _host_http_headers_cache.pop(url, None)
+
+    def _raise_oserror(*_args: object, **_kwargs: object) -> object:
+        raise OSError("credential file not found")
+
+    with patch("omnigent.chat._remote_headers", _raise_oserror):
+        result = _host_http_json(base_url=url, method="GET", path="/v1/test")
+
+    assert result.status_code == 0
+    assert "OSError" in result.body if isinstance(result.body, str) else True
+    # Ensure we didn't cache the failed result.
+    assert url not in _host_http_headers_cache

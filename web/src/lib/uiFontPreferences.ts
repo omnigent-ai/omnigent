@@ -15,7 +15,7 @@
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
-export const UI_FONT_SIZE_DEFAULT = 16;
+export const UI_FONT_SIZE_DEFAULT = 13;
 export const UI_FONT_SIZE_MIN = 11;
 export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;

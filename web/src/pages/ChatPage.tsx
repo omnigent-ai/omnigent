@@ -894,6 +894,7 @@ export function ChatPage() {
     runnerOnline,
     backgroundTaskCount,
   });
+
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
   // bound — so it identifies the source (for the picker's prefill) but is
@@ -1689,8 +1690,7 @@ function MainAgentSurface({
   // tool runs, and reasoning gaps — including after a reload that hydrates
   // `running` before any bubbles exist locally. Only a trailing compaction
   // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingStatus = shouldShowWorkingIndicator(showsWorking, bubbles);
-  const showWorkingIndicator = showWorkingStatus;
+  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
   if (showTerminal && conversationId) {
     return (
@@ -1717,20 +1717,32 @@ function MainAgentSurface({
     <>
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
-      <div ref={setConversationEl} className="relative flex min-h-0 flex-1 overflow-hidden">
+      <div
+        ref={setConversationEl}
+        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+      >
         {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
-              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
-              the message column so the ticks don't butt against the text; the
-              rail is hidden on mobile, so the extra left padding is md-only. */}
+          {/* Override ConversationContent's default spacing so the thread keeps
+              16px side gutters and consecutive agent turns read as one thread.
+              The left inset grows *continuously* as the conversation area
+              narrows: the centered column slides left with the area until its
+              edge nears the left-edge TurnRail, then the inset ramps up to hold
+              a minimum gap from the ticks — capped at 1.5rem so it stops moving
+              rather than stepping. Keyed on the area's width via cqi (the
+              @container/chat context on the wrapper), not the viewport, so
+              opening the sidebar — which narrows the area — feeds it too. The
+              ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
+              48rem column's auto-margins shrink past the clearance. md+ only:
+              the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
           {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
             scrollClassName="[overflow-anchor:none]"
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
+              "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
+              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1811,7 +1823,7 @@ function MainAgentSurface({
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingStatus && <RunnerStartingIndicator variant="row" />}
+                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
@@ -1830,7 +1842,7 @@ function MainAgentSurface({
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingStatus} suppress={subAgentLabel != null} />
+          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
           <UserMessageNavConnected
             goPrev={nav.goPrev}
             goNext={nav.goNext}
@@ -2017,9 +2029,9 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           (scrolled up) or collapsed (at the bottom, where the inline shimmer
           owns the visuals). */}
       {show && <span className="sr-only">Working…</span>}
-      {/* Mirror the conversation content column (mx-auto + px-6 + width) so the
+      {/* Mirror the conversation content column (mx-auto + px-4 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
-      <div className={cn("mx-auto w-full px-6", CHAT_COLUMN_WIDTH)}>
+      <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
         {show && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
           // its flat bottom edge merges into the chat box. aria-hidden: the
@@ -3252,7 +3264,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
-      className="max-w-3xl"
+      className="max-w-[640px]"
     >
       {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
           immediately left of the right-aligned bubble (the bubble's own
@@ -3447,7 +3459,7 @@ function AssistantBubble({
           </p>
         )}
         {markdownText && (
-          <MessageActions className="mt-1 opacity-40 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
@@ -5188,7 +5200,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 shrink-0 rounded-full md:size-8",
+                "size-9 shrink-0 rounded-lg md:size-8",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
@@ -5204,7 +5216,7 @@ export function Composer({
               {showInterruptButton ? (
                 <SquareIcon className="size-4 fill-current" />
               ) : (
-                <ArrowUpIcon className="size-4" />
+                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
               )}
               <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
             </Button>

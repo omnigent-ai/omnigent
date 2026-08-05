@@ -4,7 +4,7 @@
  * Renders into the AppShell chat outlet (see App.tsx) so the conversations
  * sidebar stays put when you enter settings — only the main area swaps to
  * this view. Inside, a section nav (left) drives a content panel (right),
- * modeled on a desktop-app settings window; a "← Back to Omnigent" link
+ * modeled on a desktop-app settings window; a Back link
  * returns to the composer.
  *
  * Sections:

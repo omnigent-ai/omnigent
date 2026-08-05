@@ -286,6 +286,33 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("file_id", text)
         self.assertIn("two attachments", text)
 
+    def test_historical_image_source_block_is_replaced_with_compact_placeholder(self):
+        # The ``Read`` tool returns an image file as an Anthropic content block
+        # ``{"type": "image", "source": {"type": "base64", ...}}`` — raw base64
+        # with no ``data:`` URI prefix. Redaction must catch this shape too, or a
+        # replayed image tool result flattens hundreds of KB into prompt text.
+        from omnigent.inner.claude_sdk_executor import _render_prior_content
+
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_payload,
+                },
+            }
+        ]
+
+        rendered = _render_prior_content(content)
+
+        self.assertNotIn(image_payload, rendered)
+        self.assertIn(
+            f"[image: image/png, {len(image_payload)} base64 chars]",
+            rendered,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties

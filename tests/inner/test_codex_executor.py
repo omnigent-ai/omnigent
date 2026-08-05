@@ -3418,3 +3418,27 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
             expected = str(Path(writable_dir) / ".codex-tmp")
             self.assertEqual(dir_used, expected)
+
+
+def test_run_turn_cli_config_passes_no_model_to_thread_create():
+    """On the cli-config path (model_provider_override set), model=None is passed
+    to thread/create so the codex binary uses its own configured model rather than
+    forwarding an unresolvable alias (e.g. gpt-5.6) to the Databricks UC API."""
+
+    async def _t():
+        fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.6",
+            model_provider_override="Databricks",
+            app_session_factory=lambda **kwargs: fake_session,
+        )
+        async for _ in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}],
+            [],
+            "",
+        ):
+            pass
+        assert fake_session.calls[0]["model"] is None
+
+    _run(_t())

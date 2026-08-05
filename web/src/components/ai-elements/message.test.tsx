@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MessageResponse } from "./message";
+import { MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -19,6 +19,17 @@ afterEach(() => {
   } else {
     delete (Document.prototype as { execCommand?: unknown }).execCommand;
   }
+});
+
+describe("MessageContent", () => {
+  it("uses the settings-driven interface text token", () => {
+    render(<MessageContent>Message text</MessageContent>);
+
+    const content = screen.getByText("Message text");
+    expect(content).toHaveClass("text-ui", "group-[.is-user]:px-3", "group-[.is-user]:py-2");
+    expect(content).not.toHaveClass("text-[0.8125rem]", "leading-[1.125rem]");
+    expect(content).not.toHaveClass("group-[.is-user]:px-4", "group-[.is-user]:py-3");
+  });
 });
 
 describe("MessageResponse", () => {

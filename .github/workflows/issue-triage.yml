@@ -13,6 +13,10 @@ name: Issue Triage
 # exfiltrate secrets. All GitHub mutations happen in steps the LLM
 # cannot influence.
 #
+# Runs on issue open, and again when someone removes the `needs-info` label —
+# the re-triage path reads the reporter's follow-up comments and classifies +
+# assigns the issue (re-adding `needs-info` only if it is still too vague).
+#
 # What the bot does:
 #   1. Removes `needs-triage`, adds `triaged`
 #   2. Classifies component — one `comp:*` label
@@ -24,11 +28,20 @@ name: Issue Triage
 
 on:
   issues:
-    types: [opened]
+    # `unlabeled` re-runs triage when someone removes `needs-info` (see the job
+    # `if:` below) — that removal is the signal the issue now has enough detail
+    # to classify and assign.
+    types: [opened, unlabeled]
 
 permissions:
   issues: write
   contents: read
+
+# One triage run per issue at a time; a newer event supersedes an in-flight one
+# (e.g. a re-label right after open won't race with the initial run).
+concurrency:
+  group: issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: true
 
 env:
   OMNIGENT_SKIP_WEB_UI: "true"
@@ -39,9 +52,25 @@ jobs:
   triage:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Skip issues opened by bots to avoid feedback loops.
+    # Run on:
+    #   - a newly opened issue by a non-bot author (initial triage), OR
+    #   - the `needs-info` label being REMOVED from an open issue (re-triage:
+    #     the removal signals the issue now has enough detail to classify).
+    # The `unlabeled` path intentionally allows a bot actor: the removal is made
+    # by the omnigent-ci App (see needs-info-response.yml) whose login ends in
+    # `[bot]`, and only an App-token/human removal re-triggers at all — this
+    # workflow's own label edits use the default GITHUB_TOKEN, which never emits
+    # re-triggering events, so there is no loop to guard against here.
     if: >-
-      !endsWith(github.event.issue.user.login, '[bot]')
+      (
+        github.event.action == 'opened' &&
+        !endsWith(github.event.issue.user.login, '[bot]')
+      ) ||
+      (
+        github.event.action == 'unlabeled' &&
+        github.event.label.name == 'needs-info' &&
+        github.event.issue.state == 'open'
+      )
     steps:
       - name: Check LLM credentials available
         id: creds
@@ -107,8 +136,11 @@ jobs:
           set -euo pipefail
 
           # Fetch issue metadata to a file — never interpolated into shell.
+          # `comments` is included so the re-triage path (needs-info removed) can
+          # see the detail the reporter added in comments, not just the original
+          # body.
           gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-            --json number,title,body,labels,author \
+            --json number,title,body,labels,author,comments \
             > /tmp/issue.json
 
           # Extract key terms for duplicate search (first 200 chars of title+body).
@@ -258,6 +290,22 @@ jobs:
           body = (issue.get("body") or "")[:8192]
           labels = [l["name"] for l in issue.get("labels", [])]
 
+          # Follow-up comments by the issue author — the reporter often supplies
+          # the missing detail here, so the re-triage path must read them. Only
+          # the author's own comments count as clarification (others' comments
+          # are noise for this purpose and are dropped). Capped to 4 KB total.
+          author_login = issue.get("author", {}).get("login")
+          comment_section = "None."
+          if author_login:
+              author_comments = [
+                  c.get("body", "")
+                  for c in issue.get("comments", [])
+                  if c.get("author", {}).get("login") == author_login and c.get("body")
+              ]
+              if author_comments:
+                  joined = "\n\n---\n\n".join(author_comments)[:4096]
+                  comment_section = joined
+
           dupe_section = "None found."
           if dupes:
               lines = [f"- #{d['number']}: {d['title']}" for d in dupes[:5]]
@@ -274,6 +322,10 @@ jobs:
 
           Body:
           {body}
+
+          ## AUTHOR FOLLOW-UP COMMENTS (UNTRUSTED — later clarification from the reporter)
+
+          {comment_section}
 
           ## CANDIDATE DUPLICATES
 
@@ -342,6 +394,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           set -euo pipefail
 
@@ -350,7 +403,7 @@ jobs:
           # All GitHub mutations are built in Python with proper escaping
           # — no eval, no shell interpolation of model output.
           python3 <<'PYEOF'
-          import json, pathlib, sys, shlex
+          import json, os, pathlib, sys, shlex
 
           raw = pathlib.Path("/tmp/triage_output.txt").read_text()
 
@@ -375,7 +428,7 @@ jobs:
               sys.exit(1)
 
           # Validate fields against allowed values to prevent label injection.
-          ALLOWED_TYPES = {"bug", "enhancement", "documentation"}
+          ALLOWED_TYPES = {"bug", "Feature", "Docs"}
           # Component labels come from .github/areas.json (single source of truth),
           # so the validator can never drift from the area definitions.
           ALLOWED_COMPONENTS = set(json.loads(pathlib.Path("/tmp/components.json").read_text()))
@@ -391,12 +444,18 @@ jobs:
           dup = None
 
           if result.get("needs_info"):
-              labels_add.append("needs-info")
+              if "needs-info" not in existing_labels:
+                  labels_add.append("needs-info")
               if "needs-triage" in existing_labels:
                   labels_remove.append("needs-triage")
               # needs-info issues are still triaged — they just need more info.
               labels_add.append("triaged")
           else:
+              # No longer needs info. On the re-triage path the label is already
+              # gone (its removal triggered this run); this is a safety net for
+              # any case where it lingers.
+              if "needs-info" in existing_labels:
+                  labels_remove.append("needs-info")
               # Type
               t = result.get("type")
               if t and t in ALLOWED_TYPES:
@@ -419,16 +478,22 @@ jobs:
                   labels_add.append("help wanted")
 
               # Duplicate — only accept if the issue number is in our
-              # pre-fetched candidate list (prevents hallucinated refs).
+              # pre-fetched candidate list (prevents hallucinated refs). Only on
+              # the initial open: on re-triage we neither re-label nor re-comment
+              # (the duplicate call was already made at open time), so the label
+              # and its explanatory comment stay consistent.
               dup = result.get("duplicate_of")
               candidates = json.loads(
                   pathlib.Path("/tmp/duplicates.json").read_text()
               )
               candidate_numbers = {d["number"] for d in candidates}
-              if dup and isinstance(dup, int) and dup in candidate_numbers:
+              if (
+                  dup and isinstance(dup, int) and dup in candidate_numbers
+                  and os.environ.get("EVENT_ACTION") == "opened"
+              ):
                   labels_add.append("duplicate")
               else:
-                  dup = None  # discard hallucinated duplicate
+                  dup = None  # discard hallucinated / re-triage duplicate
 
               if "needs-triage" in existing_labels:
                   labels_remove.append("needs-triage")
@@ -463,7 +528,6 @@ jobs:
           pathlib.Path("/tmp/triage_result.json").write_text(json.dumps(output))
 
           # Build a shell script with properly escaped arguments — no eval.
-          import os
           issue = os.environ["ISSUE_NUMBER"]
           repo = os.environ["REPO"]
           cmds = []
@@ -477,8 +541,10 @@ jobs:
           if labels_add or labels_remove:
               cmds.append(" ".join(shlex.quote(a) for a in args))
 
-          # Duplicate comment.
-          if output["duplicate_of"]:
+          # Duplicate comment — only on the initial open. On the re-triage path
+          # (needs-info removed) any duplicate note was already posted at open
+          # time, so we skip it to avoid re-commenting.
+          if output["duplicate_of"] and os.environ.get("EVENT_ACTION") == "opened":
               comment_args = [
                   "gh", "issue", "comment", issue, "--repo", repo,
                   "--body", f"Potential duplicate of #{output['duplicate_of']}. React 👎 to contest.",
