@@ -3351,8 +3351,7 @@ export function NewChatLandingScreen() {
               // 14px/20px. (Note: sub-16px inputs make mobile Safari
               // auto-zoom on focus — accepted tradeoff per the design.)
               // Heights are border-box (16px top + 4px bottom padding lives
-              // inside them): min 60px = one 20px line + a spare line of
-              // breathing room; max 200px = the spec's 180px of content.
+              // inside them): max 200px = the spec's 180px of content.
               // useAutoGrowTextarea drives the height between the two.
               className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
