@@ -840,6 +840,65 @@ async def test_messages_reach_harness_in_submission_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_ingest_waiter_does_not_block_later_messages() -> None:
+    """Cancelling a queued message must not strand its ingest ticket."""
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    server = _GatedFileServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    session_id = "ea532aed7642ec833ab31a5649c3495b"
+
+    async with _runner_client(app) as client:
+        first = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "file_id": "c531a3c97ad5fca15709d73d1f734a0c",
+                            "filename": "a.png",
+                        }
+                    ],
+                },
+            )
+        )
+        await asyncio.wait_for(server.meta_fetch_started.wait(), timeout=5.0)
+
+        cancelled = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "message", "content": [{"type": "input_text", "text": "drop"}]},
+            )
+        )
+        await asyncio.sleep(0.05)
+        cancelled.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancelled
+
+        server.release.set()
+        assert (await asyncio.wait_for(first, timeout=5.0)).status_code == 202
+        response = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "message", "content": [{"type": "input_text", "text": "next"}]},
+            ),
+            timeout=1.0,
+        )
+
+    assert response.status_code == 202
+
+
+@pytest.mark.asyncio
 async def test_buffered_continuation_skips_transient_idle() -> None:
     """End-of-turn `idle` is suppressed when a buffered message will start a new turn."""
     import asyncio as _aio
