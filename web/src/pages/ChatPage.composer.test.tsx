@@ -1969,6 +1969,59 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-config-model")).toBeTruthy();
     expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
   });
+
+  // A routed session is pinned to the router's fully-qualified pick, which the
+  // harness catalog carries only under an alias — the Model row used to render
+  // blank because no option declared that value.
+  describe("routed model not in the harness catalog", () => {
+    const ROUTED = "databricks-claude-opus-4-8";
+    const options = [
+      { id: "opus", model: "opus", displayName: "Opus" },
+      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+    ] as never;
+
+    async function openModalOnRoutedSession(setModel = vi.fn().mockResolvedValue(undefined)) {
+      useChatStore.setState({
+        setModel,
+        codexModelOptions: options,
+        sessionModelOverride: ROUTED,
+        // Routing pinned the model; the session's own routing switch is unset.
+        costControlModeOverride: null,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            costRoutingEligible: true,
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      fireEvent.click(gear()!);
+      await screen.findByTestId("composer-config-modal");
+      return setModel;
+    }
+
+    it("names the model the session is on instead of rendering blank", async () => {
+      await openModalOnRoutedSession();
+      expect(screen.getByTestId("composer-config-model")).toHaveTextContent(ROUTED);
+    });
+
+    it("pins nothing when Save runs without touching the Model row", async () => {
+      const setModel = await openModalOnRoutedSession();
+      fireEvent.click(screen.getByTestId("composer-config-save"));
+      expect(setModel).not.toHaveBeenCalled();
+    });
+
+    it("still commits a real pick made from the catalog", async () => {
+      const setModel = await openModalOnRoutedSession();
+      fireEvent.click(screen.getByTestId("composer-config-model"));
+      fireEvent.click(screen.getByRole("option", { name: "Sonnet" }));
+      fireEvent.click(screen.getByTestId("composer-config-save"));
+      await waitFor(() => expect(setModel).toHaveBeenCalledWith("sonnet"));
+    });
+  });
 });
 
 // The gear modal's "Subagent routing" row — the only in-session routing control,

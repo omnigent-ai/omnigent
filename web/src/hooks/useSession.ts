@@ -12,8 +12,7 @@
 // gets the user's actual level for any conversation they navigate to.
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef } from "react";
-import { ApiError, getSessionSlim } from "@/lib/sessionsApi";
+import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 
 /**
@@ -24,36 +23,10 @@ import type { Session } from "@/lib/types";
  */
 const MAX_ROOT_WALK_HOPS = 8;
 
-/**
- * Consecutive ``404``s that stop the poll. A deleted session never comes
- * back, so re-asking forever is pure noise; two in a row rules out the
- * single-response race of a snapshot read landing mid-delete.
- */
-const MAX_NOT_FOUND_POLLS = 2;
-
 interface UseSessionResult {
   session: Session | null;
   isLoading: boolean;
   error: Error | null;
-}
-
-export interface UseSessionOptions {
-  /**
-   * Re-ask for the snapshot on this interval (ms) while mounted; omitted keeps
-   * the query long-lived (chatStore-refreshed) as before.
-   *
-   * Some snapshot fields are DISCOVERED after the snapshot the UI cached and
-   * have no event channel of their own, so the surface rendering them has to
-   * re-ask or they would only ever appear after a hard reload.
-   */
-  refetchIntervalMs?: number;
-  /**
-   * Ask the server to re-read runner-backed state on EVERY fetch, not just
-   * the first. Off by default: `refresh_state=true` drops the runner's
-   * skills / model-options caches, so a polling caller would pop them on
-   * every tick and hand back empty lists while they refill.
-   */
-  refreshStateOnEveryFetch?: boolean;
 }
 
 /**
@@ -63,53 +36,24 @@ export interface UseSessionOptions {
  * Pass ``null`` to disable. The query is otherwise long-lived
  * (``staleTime: Infinity``) because chatStore is the source of truth
  * for refresh — it refetches on every bind, which writes back into
- * this same cache key. A cache-cold page load asks the server to
- * refresh runner-backed state so browser refresh pierces stale AP
- * process caches — only that first fetch, though: see
- * ``refreshStateOnEveryFetch``.
+ * this same cache key.
+ *
+ * EVERY fetch asks the server to re-read runner-backed state, not just the
+ * cache-cold one. The runner-backed fields (``model_options``, skills) are
+ * process-cached, and the fetches this query makes are exactly the moments
+ * they can have gone stale: a page load, and an invalidation after the
+ * session's agent/harness changed. Skipping the refresh on the invalidation
+ * refetch left the previous agent's model catalog on screen until a hard
+ * reload. There is no poll on this query, so nothing re-asks often enough
+ * for the refresh to thrash those caches.
  */
-export function useSession(
-  conversationId: string | null | undefined,
-  options?: UseSessionOptions,
-): UseSessionResult {
-  const queryClient = useQueryClient();
-  const queryKey = conversationId ? ["session", conversationId] : ["session", null];
-  // Consecutive 404s for the session currently being watched, tracked here
-  // rather than off query state (which resets its failure count at the start
-  // of every fetch). Navigating to another session starts a fresh streak.
-  const notFound = useRef({ id: conversationId ?? null, count: 0 });
-  if (notFound.current.id !== (conversationId ?? null)) {
-    notFound.current = { id: conversationId ?? null, count: 0 };
-  }
-  const notFoundStreak = notFound.current;
+export function useSession(conversationId: string | null | undefined): UseSessionResult {
   const { data, isLoading, error } = useQuery({
-    queryKey,
-    queryFn: async () => {
-      // Cache-cold = the first fetch for this session, the only one that
-      // needs the server to re-read runner state.
-      const refreshState =
-        options?.refreshStateOnEveryFetch === true ||
-        queryClient.getQueryData<Session>(queryKey) === undefined;
-      try {
-        const session = await getSessionSlim(conversationId as string, { refreshState });
-        notFoundStreak.count = 0;
-        return session;
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 404) notFoundStreak.count += 1;
-        else notFoundStreak.count = 0;
-        throw err;
-      }
-    },
+    queryKey: conversationId ? ["session", conversationId] : ["session", null],
+    queryFn: () => getSessionSlim(conversationId as string, { refreshState: true }),
     enabled: Boolean(conversationId),
     staleTime: Infinity,
     retry: false,
-    // Per-observer, so only the caller that asked for it polls (and TanStack
-    // pauses it while the tab is hidden). Stops for good once the session is
-    // gone — a deleted session is never coming back.
-    refetchInterval: () =>
-      options?.refetchIntervalMs !== undefined && notFoundStreak.count < MAX_NOT_FOUND_POLLS
-        ? options.refetchIntervalMs
-        : false,
   });
   return {
     session: data ?? null,

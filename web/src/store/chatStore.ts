@@ -1857,15 +1857,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!conversationId) return;
     let session: Session;
     try {
-      session =
-        queryClient !== null
-          ? await queryClient.fetchQuery({
-              queryKey: ["session", conversationId],
-              queryFn: () => getSessionSlim(conversationId),
-              staleTime: 0,
-              retry: false,
-            })
-          : await getSessionSlim(conversationId);
+      // Deliberately NOT through `queryClient` — the two switches this reads
+      // are plain DB columns, but writing the reply into the shared
+      // ``["session", id]`` cache would replace the refreshed snapshot every
+      // other surface reads with one the server did not refresh, dropping the
+      // runner-backed `model_options` the model picker renders from.
+      session = await getSessionSlim(conversationId);
     } catch {
       // Transient (server/runner blip) — keep what we have rather than
       // resetting the switches to their defaults.

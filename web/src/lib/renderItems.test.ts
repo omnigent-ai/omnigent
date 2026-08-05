@@ -1602,6 +1602,140 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
     ]);
   });
 
+  describe("create-time chip the first turn repeats", () => {
+    // A Smart Routing create records the pick as a `session` chip, then the
+    // first turn routes again and records the same model as a `turn` chip.
+    function verdictChip(
+      itemId: string,
+      scope: "session" | "turn",
+      overrides: Record<string, unknown> = {},
+    ): AnyBlock {
+      return routingDecisionBlock(ctx({ itemId, responseId: `routing_${itemId}` }), {
+        routing: { scope, harness: "claude-native" },
+        ...overrides,
+      });
+    }
+
+    it("renders one chip when the create-time and first-turn picks agree", () => {
+      const blocks: AnyBlock[] = [
+        verdictChip("rd_create", "session"),
+        verdictChip("rd_turn", "turn"),
+        userBlock("u1", "resp_1"),
+        doneBlock("a1", "resp_1", "Done."),
+      ];
+      const bubbles = buildBubbles(blocks, null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "assistant"]);
+      expect(chipIds(bubbles)).toEqual(["rd_turn"]);
+    });
+
+    it("tolerates the /model echo the native path injects between the two", () => {
+      const blocks: AnyBlock[] = [
+        verdictChip("rd_create", "session"),
+        modelInjectBlock("sc_1", "resp_1", "opus"),
+        verdictChip("rd_turn", "turn"),
+        userBlock("u1", "resp_1"),
+      ];
+      expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_turn"]);
+    });
+
+    it("keeps both when the turn changes the model, harness, or applied flag", () => {
+      const differing: Record<string, unknown>[] = [
+        { model: "databricks-claude-sonnet-5" },
+        { routing: { scope: "turn", harness: "codex-native" } },
+        { applied: false },
+      ];
+      for (const override of differing) {
+        const blocks: AnyBlock[] = [
+          verdictChip("rd_create", "session"),
+          verdictChip("rd_turn", "turn", override),
+          userBlock("u1", "resp_1"),
+        ];
+        expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_create", "rd_turn"]);
+      }
+    });
+
+    it("keeps a failed create-time route next to the turn that recovered", () => {
+      const blocks: AnyBlock[] = [
+        verdictChip("rd_create", "session", { model: "unavailable", applied: false }),
+        verdictChip("rd_turn", "turn"),
+        userBlock("u1", "resp_1"),
+      ];
+      expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_create", "rd_turn"]);
+    });
+
+    it("keeps a later identical turn chip — a real second turn still gets one", () => {
+      const blocks: AnyBlock[] = [
+        verdictChip("rd_create", "session"),
+        verdictChip("rd_turn1", "turn"),
+        userBlock("u1", "resp_1"),
+        doneBlock("a1", "resp_1", "one"),
+        verdictChip("rd_turn2", "turn"),
+        userBlock("u2", "resp_2"),
+      ];
+      expect(chipIds(buildBubbles(blocks, null))).toEqual(["rd_turn1", "rd_turn2"]);
+    });
+
+    it("stays stable frame by frame as the pair streams in", () => {
+      expectFrameByFrameStable(
+        [
+          verdictChip("rd_create", "session"),
+          verdictChip("rd_turn", "turn"),
+          userBlock("u1", "resp_1"),
+          startBlock("resp_1"),
+          doneBlock("a1", "resp_1", "Done."),
+          endBlock("resp_1"),
+        ],
+        ["user", "routing_decision", "assistant"],
+      );
+    });
+
+    // The rows as a Smart-Routing-harness create actually persists them: the
+    // create-time pick, then the first turn's, then the spawn's own decision.
+    it("static reload: one session chip survives the itemsToBlocks funnel", () => {
+      const items: ConversationItem[] = [
+        routingDecisionItem({
+          id: "rd_create",
+          response_id: "routing_create",
+          model: "databricks-claude-opus-4-8",
+          rationale: "Routed to claude-opus-4-8 because [prompt_short] holds.",
+          harness: "claude-native",
+          scope: "session",
+          decision_id: "68857ae9-374d-4a9f-8448-958c021bec04",
+        }),
+        routingDecisionItem({
+          id: "rd_turn",
+          response_id: "routing_turn",
+          model: "databricks-claude-opus-4-8",
+          rationale: "Routed to claude-opus-4-8 because [low_ambiguity] holds.",
+          harness: "claude-native",
+          scope: "turn",
+          decision_id: "ac50ed71-8fa9-4faa-aea2-90a6c901156f",
+        }),
+        {
+          id: "u1",
+          type: "message",
+          role: "user",
+          response_id: "resp_1",
+          status: "completed",
+          content: [{ type: "input_text", text: "refactor it" }],
+        } as unknown as ConversationItem,
+        // A spawn's own pick is a different scope — always its own chip.
+        routingDecisionItem({
+          id: "rd_spawn",
+          response_id: "routing_spawn",
+          model: "databricks-gpt-5-6-sol",
+          rationale: "Routed to gpt-5-6-sol.",
+          agent: "Explore",
+          harness: "codex-native",
+          scope: "native_subagent",
+        }),
+      ];
+      const bubbles = buildBubbles(itemsToBlocks(items), null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "routing_decision"]);
+      expect(chipIds(bubbles)).toEqual(["rd_turn", "rd_spawn"]);
+    });
+  });
+
   it("defers only the adjacent chip when two decisions precede a message", () => {
     const blocks: AnyBlock[] = [
       chipBlock("rd_far", "resp_1", "turn"),

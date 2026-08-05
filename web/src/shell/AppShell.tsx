@@ -93,12 +93,6 @@ import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
 
 /**
- * How often the open session's snapshot is re-asked, to pick up
- * server-side changes that have no SSE channel of their own.
- */
-export const SESSION_SNAPSHOT_POLL_MS = 30_000;
-
-/**
  * Top-level layout. The sidebar and right panels are responsive:
  *
  *   - **Mobile (`< md`)**: fixed full-screen overlays. When open they cover
@@ -333,11 +327,7 @@ export function AppShell() {
   // For sub-agent (child) sessions the sidebar list omits the row, so this
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
-  // Polled while a session is open so snapshot-only fields (with no SSE
-  // channel of their own) stay fresh without a hard reload.
-  const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId, {
-    refetchIntervalMs: SESSION_SNAPSHOT_POLL_MS,
-  });
+  const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is

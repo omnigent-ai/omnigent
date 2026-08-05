@@ -582,10 +582,13 @@ function walkBubbles(
       crossBubbleResults.set(`${blk.ctx.responseId}:${blk.callId}`, blk);
     }
   }
+  // Create-time chips the first turn re-decides identically; dropped before
+  // pairing so they neither render nor claim the user message.
+  const superseded = supersededCreateRoutingChips(blocks, startIndex);
   // A session/turn chip reads as the verdict on the message that triggered it,
   // so it renders below that message. Persistence order varies by harness:
   // native paths write the decision first, others write it after.
-  const deferred = deferredRoutingChips(blocks, startIndex);
+  const deferred = deferredRoutingChips(blocks, startIndex, superseded);
   // Bubble count at the moment the walk reached each deferred chip, so a
   // message pairing back to that chip can count every bubble the widened
   // region produced (the `/model` echo between them renders its own bubble).
@@ -666,6 +669,12 @@ function walkBubbles(
     }
 
     if (b.type === "routing_decision") {
+      // The create-time pick the first turn immediately repeats — the turn
+      // chip stands for both, so this one renders nothing.
+      if (superseded.has(i)) {
+        i += 1;
+        continue;
+      }
       // Emitted below the user message that follows it, once that bubble exists.
       if (deferred.indexes.has(i)) {
         bubbleCountAtChip.set(i, bubbles.length);
@@ -816,18 +825,22 @@ function routingChipBubble(b: RoutingDecisionBlock, index: number): Bubble {
  *     the reused prefix and are already placed. The neighbour lookup still
  *     reaches back across that boundary, so the pairing a region gets never
  *     depends on where the walk resumed.
+ * :param superseded: chip indexes that render nothing, so they neither claim a
+ *     message nor block the chip that does.
  * :returns: ``byMessage`` (user block index → chip block index) plus the set of
  *     chip indexes to skip when the walk reaches them.
  */
 function deferredRoutingChips(
   blocks: AnyBlock[],
   startIndex: number,
+  superseded: ReadonlySet<number>,
 ): { byMessage: Map<number, number>; indexes: Set<number> } {
   const byMessage = new Map<number, number>();
   const indexes = new Set<number>();
   for (let j = startIndex; j < blocks.length; j += 1) {
     const chip = blocks[j]!;
     if (chip.type !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope)) continue;
+    if (superseded.has(j)) continue;
     // Already below its message — leave it where it is.
     if (adjacent(blocks, j, -1)?.type === "user_message") continue;
     const next = adjacent(blocks, j, 1);
@@ -837,6 +850,46 @@ function deferredRoutingChips(
     }
   }
   return { byMessage, indexes };
+}
+
+/**
+ * Create-time `session` chips whose verdict the first turn repeats verbatim.
+ *
+ * A create with Smart Routing records the pick as a `session`-scope chip, then
+ * the session's first turn routes again and records the same model + harness as
+ * a `turn`-scope chip. Two router calls, two audit rows — but identical chips,
+ * one above the user's message and one below it. The turn chip stands for the
+ * pair (it is the one that pairs below the message), so the create-time chip is
+ * dropped. A create-time pick the turn then CHANGES (or a failed create-time
+ * route, recorded as an unapplied `"unavailable"` row) still renders: those two
+ * chips say different things.
+ *
+ * :param startIndex: first block the walk will visit. Earlier chips were
+ *     already resolved by the walk that placed the reused prefix.
+ * :returns: block indexes of the chips that render nothing.
+ */
+function supersededCreateRoutingChips(blocks: AnyBlock[], startIndex: number): Set<number> {
+  const superseded = new Set<number>();
+  for (let j = startIndex; j < blocks.length; j += 1) {
+    const chip = blocks[j]!;
+    if (chip.type !== "routing_decision" || chip.routing?.scope !== "session") continue;
+    const next = adjacent(blocks, j, 1);
+    if (next === null) continue;
+    const later = blocks[next.index]!;
+    if (later.type !== "routing_decision" || later.routing?.scope !== "turn") continue;
+    if (sameRoutingVerdict(chip, later)) superseded.add(j);
+  }
+  return superseded;
+}
+
+/** Whether two routing chips advertise the same pick (model, harness, applied). */
+function sameRoutingVerdict(a: RoutingDecisionBlock, b: RoutingDecisionBlock): boolean {
+  return (
+    a.model === b.model &&
+    a.applied === b.applied &&
+    (a.routing?.harness ?? null) === (b.routing?.harness ?? null) &&
+    (a.agent ?? null) === (b.agent ?? null)
+  );
 }
 
 /** Lifecycle markers that produce no bubble of their own. */

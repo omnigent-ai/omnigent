@@ -5767,7 +5767,7 @@ function SessionConfigModal({
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
-  const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
+  const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel, modelLabel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
 
   // Agents with a Model dropdown fold Smart Routing into it as an option. There
@@ -5899,9 +5899,23 @@ function SessionConfigModal({
     onOpenChange(false);
   };
 
-  const modelSelectOptions = usesServerModelOptions
-    ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
-    : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
+  const modelSelectOptions = useMemo(() => {
+    const catalog = usesServerModelOptions
+      ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
+      : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
+    // Smart Routing pins the router's fully-qualified pick
+    // (``databricks-claude-opus-4-8``), which the harness catalog carries only
+    // under an alias (``opus``) — or not at all. Radix falls back to the
+    // placeholder for a value no item declares, so the row rendered BLANK on a
+    // routed session. Carry the live model as its own option: the trigger then
+    // names the model the session is actually on, matching the status label
+    // below the composer. Nothing is submitted for an untouched row — `save`
+    // re-pins only a changed draft.
+    if (draftModelId === null || catalog.some((option) => option.id === draftModelId)) {
+      return catalog;
+    }
+    return [...catalog, { id: draftModelId, label: modelLabel ?? draftModelId }];
+  }, [usesServerModelOptions, modelOptions, draftModelId, modelLabel]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
