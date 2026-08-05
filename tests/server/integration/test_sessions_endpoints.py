@@ -24,6 +24,7 @@ import pytest
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
+from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -6459,16 +6460,16 @@ async def test_patch_model_override_skips_note_for_native_session(
     assert _model_change_notes(published) == []
 
 
-async def test_patch_model_override_surfaces_a_dropped_native_forward(
+async def test_patch_model_override_surfaces_a_refused_native_forward(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A native pane the model change never reached must say so.
+    A LIVE native pane the model change never reached must say so.
 
     The PATCH persists ``model_override`` and forwards it to the runner, which
     types ``/model`` into the terminal — the only thing that moves a native
-    pane's model. The forward's result was discarded, so a dropped one left the
+    pane's model. The forward's result was discarded, so a refused one left the
     row and the picker claiming a model the pane was never switched to, with
     nothing on screen to say the switch had not happened.
     """
@@ -6478,12 +6479,13 @@ async def test_patch_model_override_surfaces_a_dropped_native_forward(
         lambda sid, ev: published.append((sid, ev)),
     )
 
-    async def _no_runner(*_args: Any, **_kwargs: Any) -> None:
-        """No runner is bound, so nothing typed the slash command."""
+    async def _runner_refused(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
+        """The runner is up and answered that it could not drive the pane."""
+        return _RunnerForwardResult(status_code=503, body="claude_native_model_failed")
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._forward_session_change_to_runner",
-        _no_runner,
+        _runner_refused,
     )
     agent = await create_test_agent(client)
     session = await _create_session(
@@ -6505,6 +6507,49 @@ async def test_patch_model_override_surfaces_a_dropped_native_forward(
     ]
     assert len(errors) == 1, f"Expected one visible failure notice; got {published!r}"
     assert "opus" in errors[0]["error"]["message"]
+
+
+async def test_patch_model_override_stays_quiet_when_no_runner_answers(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stopped or detached native session must not claim a failed switch.
+
+    Nothing is running to diverge from: the relaunch reads ``model_override``
+    off the row and starts on it. The banner fired here too, so every model
+    change on a stopped terminal told the user their switch had not landed.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    async def _no_runner(*_args: Any, **_kwargs: Any) -> None:
+        """No runner is bound, so there is no live pane to be wrong about."""
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _no_runner,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"model_override": "opus"},
+    )
+    assert patch.status_code == 200, patch.text
+    assert [
+        event
+        for _sid, event in published
+        if event.get("error", {}).get("code") == "model_change_not_applied"
+    ] == []
 
 
 async def test_patch_model_override_records_note_for_terminal_view_sdk_session(

@@ -1831,8 +1831,10 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
-                # The injection is the only thing that moves a native pane's
-                # model, so a dropped forward must not pass as applied.
+                # The injection is the only thing that moves a LIVE native
+                # pane's model, so a forward its runner refused must not pass as
+                # applied. A stopped session reaches no runner and stays quiet —
+                # its relaunch reads the override off the row.
                 _surface_model_change_forward_failure(
                     session_id,
                     updated.model_override,

@@ -4904,25 +4904,34 @@ def _surface_model_change_forward_failure(
     persisted value at its next turn boundary, so a dropped forward there is
     genuinely benign.
 
+    Silent when no runner answered at all. That session is stopped or detached,
+    and its relaunch reads ``model_override`` off the row, so nothing has
+    diverged — the notice is for a session whose runner IS reachable and still
+    did not switch the pane.
+
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param model: The model that was persisted, or ``None`` when cleared.
     :param runner_result: HTTP result from the forward, or ``None`` when no
         runner was reachable.
     :returns: None.
     """
-    if runner_result is not None and 200 <= runner_result.status_code < 300:
+    if runner_result is None:
+        _logger.info(
+            "Model change for session=%s model=%r reached no runner; the launch will read it "
+            "off the row",
+            session_id,
+            model,
+        )
         return
-    reason = (
-        "no live runner is bound to this session"
-        if runner_result is None
-        else f"the runner returned status {runner_result.status_code}"
-    )
+    if 200 <= runner_result.status_code < 300:
+        return
+    reason = f"the runner returned status {runner_result.status_code}"
     _logger.warning(
         "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
         session_id,
         model,
         reason,
-        None if runner_result is None else runner_result.body,
+        runner_result.body,
     )
     target = model or "its default model"
     _publish_error_event(
