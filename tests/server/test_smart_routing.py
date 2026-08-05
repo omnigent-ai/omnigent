@@ -1250,6 +1250,7 @@ def _ambient_sdk(config: Any) -> Any:  # type: ignore[explicit-any]
         yield
 
 
+@pytest.mark.databricks
 @pytest.mark.asyncio
 async def test_ambient_credential_is_used_when_it_names_the_router_host() -> None:
     """No profile, no api_key: the workspace credential in the environment answers."""
@@ -1269,6 +1270,7 @@ async def test_ambient_credential_is_used_when_it_names_the_router_host() -> Non
     assert captured == ["Bearer ambient-tok-1", "Bearer ambient-tok-2"]
 
 
+@pytest.mark.databricks
 @pytest.mark.asyncio
 async def test_ambient_credential_is_withheld_from_another_host() -> None:
     """The guard: a workspace token never reaches an endpoint off that workspace."""
@@ -1289,6 +1291,7 @@ async def test_ambient_credential_is_withheld_from_another_host() -> None:
     assert config.calls == 0
 
 
+@pytest.mark.databricks
 @pytest.mark.asyncio
 async def test_no_ambient_credential_leaves_the_request_unauthenticated() -> None:
     """A plain unauthenticated endpoint keeps working when the SDK resolves nothing."""
@@ -1303,6 +1306,7 @@ async def test_no_ambient_credential_leaves_the_request_unauthenticated() -> Non
     assert captured == [None]
 
 
+@pytest.mark.databricks
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("host", "expected"),
@@ -1332,6 +1336,7 @@ async def test_ambient_host_matching(host: str, expected: str | None) -> None:
     assert captured == [expected]
 
 
+@pytest.mark.databricks
 @pytest.mark.asyncio
 async def test_the_ambient_chain_is_skipped_when_any_other_mode_is_configured() -> None:
     """Explicit config wins; the ambient chain is the last resort only."""
