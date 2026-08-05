@@ -43,7 +43,7 @@ Server is on http://localhost:8000.
 |---|---|
 | `Dockerfile` | Multi-stage build with two final targets. `web-builder` (node:20) runs `npm install && npm run build` on `web/`. `builder` (python:3.12) installs omnigent into `/opt/venv`; `server-builder` overlays the SPA bundle from `web-builder` and adds psycopg. The default target (`runtime`) copies the venv + `/build/` from `server-builder` and runs `entrypoint.py`. `--target host` builds the host image instead (from `builder`: omnigent + git/tmux, no SPA/psycopg/entrypoint). |
 | `Dockerfile.dockerignore` | BuildKit-aware exclude. Trims `deploy/databricks/`, `deploy/aws/`, tests, dev tooling — keeps the build context small. |
-| `entrypoint.py` | Server process entrypoint. Reads `DATABASE_URL`, runs Alembic migrations, builds the SQLAlchemy stores, calls `create_app()`, runs uvicorn. Single source of truth for what env vars the container respects. |
+| `entrypoint.py` | Server process entrypoint. Reads `DATABASE_URL`, runs Alembic migrations, builds the SQLAlchemy stores including the policy store, calls `create_app()`, runs uvicorn. Single source of truth for what env vars the container respects. |
 | `docker-compose.yaml` | Two services: `postgres` (16-alpine, persistent volume) and `omnigent` (built from the Dockerfile, depends on postgres healthcheck). Build context is `../..` (repo root). |
 | `.env.example` | Documents every env var the compose file passes through: `POSTGRES_PASSWORD`, `OMNIGENT_PORT`, all the `OMNIGENT_AUTH_*` and `OMNIGENT_OIDC_*` vars. |
 | `README.md` | Customer-facing quickstart + the OIDC walkthrough (GitHub OAuth, Google Workspace, generic OIDC). |
@@ -64,6 +64,17 @@ If you change it in `.env`, you need `docker compose down -v` before
 `up -d` or the server will fail to authenticate against the existing
 cluster.
 
+## Runtime policies
+
+Policies persist in the compose Postgres database — `DATABASE_URL`
+selects the store, and startup runs `alembic upgrade head` to create the
+`policies` table. Server-wide defaults come from `/v1/policies` and the
+`policies:` config block; session-scoped ones from
+`/v1/sessions/{session_id}/policies`.
+
+See [`POLICY_STORE.md`](POLICY_STORE.md) for the behavior contract,
+completion criteria, and the local smoke test.
+
 ## Common debugging
 
 | Symptom | Likely cause | First check |
@@ -71,6 +82,7 @@ cluster.
 | Root URL returns `{"service":"omnigent",…}` instead of the SPA | npm build didn't produce the bundle inside the container | `docker compose exec omnigent ls /build/omnigent/server/static/web-ui/` — empty = the `web-builder` stage didn't run cleanly. Rebuild with `--no-cache`. |
 | `ModuleNotFoundError: No module named 'uvicorn'` at startup | venv copy didn't pick up the install | Sanity-check the Dockerfile's `VIRTUAL_ENV=/opt/venv` is set before the `uv pip install` calls. |
 | `psycopg.OperationalError: password authentication failed` | `POSTGRES_PASSWORD` changed in `.env` after the data volume was initialized | `docker compose down -v` then `up -d` (wipes the DB). |
+| `/v1/policies` missing from OpenAPI, or no `policies` table | Running an image built before policy-store support | Rebuild and restart: `docker compose up -d --build`. Startup runs `alembic upgrade head`, which creates the `policies` table automatically — you don't create it by hand, and existing sessions/agents/files are untouched. (Dev regression check: confirm `entrypoint.py` still passes `policy_store` to both `init_runtime()` and `create_app()`.) |
 | Web UI loads but new chats hang forever | Expected — runners are external. The UI's landing page prints the CLI command to launch a runner. |
 
 ## Extending to a new platform

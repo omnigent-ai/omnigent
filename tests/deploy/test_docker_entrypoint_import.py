@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import importlib
 import sys
+import types
 from pathlib import Path
 from typing import NoReturn
 
+import httpx
 import pytest
 
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -28,8 +30,10 @@ _BOOT_MODULES = (
     "omnigent.runtime",
     "omnigent.server.app",
     "omnigent.server.server_config",
+    "omnigent.spec",
     "omnigent.stores.agent_store.sqlalchemy_store",
     "omnigent.stores.artifact_store.local",
+    "omnigent.stores.policy_store.sqlalchemy_store",
     "uvicorn",
 )
 
@@ -153,3 +157,131 @@ def test_select_artifact_store(
         port=8000,
     )
     assert isinstance(_select_artifact_store(resolved), expected_type)
+
+
+@pytest.mark.asyncio
+async def test_build_app_wires_policy_store_routes_and_api_defaults(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Docker build_app must enable the persisted policy APIs."""
+    from deploy.docker.entrypoint import _ResolvedConfig, build_app
+    from omnigent.runtime import get_caps, get_policy_store
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+    from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+
+    fake_module = types.ModuleType("tests.fake_policy_module")
+
+    def allow_all(event: dict[str, object]) -> dict[str, str]:
+        return {"action": "ALLOW"}
+
+    fake_module.allow_all = allow_all
+    fake_module.POLICY_REGISTRY = [
+        {
+            "handler": "tests.fake_policy_module.allow_all",
+            "kind": "callable",
+            "name": "Allow All",
+            "description": "Test policy module entry",
+        }
+    ]
+    monkeypatch.setitem(sys.modules, "tests.fake_policy_module", fake_module)
+
+    built = build_app(
+        _ResolvedConfig(
+            cfg={
+                "policy_modules": ["tests.fake_policy_module"],
+            },
+            database_url=db_uri,
+            artifact_dir=tmp_path / "artifacts",
+            artifact_store_uri=None,
+            host="0.0.0.0",
+            port=8000,
+        )
+    )
+
+    assert isinstance(get_policy_store(), SqlAlchemyPolicyStore)
+    assert get_caps().default_policies == []
+
+    route_paths = {route.path for route in built.app.routes}
+    assert "/v1/policies" in route_paths
+    assert "/v1/policies/{policy_id}" in route_paths
+    assert "/v1/sessions/{session_id}/policies" in route_paths
+    assert "/v1/sessions/{session_id}/policies/{policy_id}" in route_paths
+    assert "/v1/sessions/{session_id}/policies/evaluate" in route_paths
+
+    SqlAlchemyPermissionStore(db_uri).ensure_user(RESERVED_USER_LOCAL, is_admin=True)
+
+    async with built.app.router.lifespan_context(built.app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=built.app),
+            base_url="http://test",
+        ) as client:
+            registry_resp = await client.get("/v1/policy-registry")
+            assert registry_resp.status_code == 200
+            assert "tests.fake_policy_module.allow_all" in {
+                entry["handler"] for entry in registry_resp.json()["data"]
+            }
+
+            create_resp = await client.post(
+                "/v1/policies",
+                json={
+                    "name": "custom_default",
+                    "type": "python",
+                    "handler": "tests.fake_policy_module.allow_all",
+                },
+            )
+            assert create_resp.status_code == 200
+            assert create_resp.json()["name"] == "custom_default"
+
+            list_resp = await client.get("/v1/policies")
+            assert list_resp.status_code == 200
+            assert [policy["name"] for policy in list_resp.json()["data"]] == ["custom_default"]
+
+
+def test_build_app_loads_yaml_default_policies(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A YAML ``policies:`` block populates ``RuntimeCaps.default_policies``.
+
+    Parity with the CLI ``omnigent server`` path (omnigent/cli.py), which
+    reads the same config key via ``parse_default_policies``. Dropping the
+    YAML source from the Docker entrypoint silently diverged the two
+    entrypoints for an otherwise-valid config.
+    """
+    from deploy.docker.entrypoint import _ResolvedConfig, build_app
+    from omnigent.runtime import get_caps
+
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+
+    build_app(
+        _ResolvedConfig(
+            cfg={
+                "policies": {
+                    "deny_os_tools": {
+                        "type": "function",
+                        "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
+                    },
+                },
+            },
+            database_url=db_uri,
+            artifact_dir=tmp_path / "artifacts",
+            artifact_store_uri=None,
+            host="0.0.0.0",
+            port=8000,
+        )
+    )
+
+    default_policies = get_caps().default_policies
+    assert [spec.name for spec in default_policies] == ["deny_os_tools"]

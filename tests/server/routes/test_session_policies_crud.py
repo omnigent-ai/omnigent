@@ -161,6 +161,41 @@ async def test_list_session_policies_after_create(
     assert pid in ids
 
 
+async def test_list_session_policies_includes_enabled_global_defaults(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """Session policy list includes DB-backed global defaults as global rows."""
+    enabled_resp = await client.post(
+        "/v1/policies",
+        json={
+            "name": "global_default",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
+        },
+    )
+    assert enabled_resp.status_code == 200
+    disabled_resp = await client.post(
+        "/v1/policies",
+        json={
+            "name": "disabled_default",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
+        },
+    )
+    assert disabled_resp.status_code == 200
+    disabled_id = disabled_resp.json()["id"]
+    patch_resp = await client.patch(f"/v1/policies/{disabled_id}", json={"enabled": False})
+    assert patch_resp.status_code == 200
+
+    resp = await client.get(f"/v1/sessions/{session_id}/policies")
+    assert resp.status_code == 200
+    global_policies = [p for p in resp.json()["data"] if p["source"] == "global"]
+
+    assert [p["name"] for p in global_policies] == ["global_default"]
+    assert global_policies[0]["id"] == enabled_resp.json()["id"]
+    assert global_policies[0]["handler"] == "omnigent.policies.builtins.safety.ask_on_os_tools"
+
+
 async def test_list_session_policies_nonexistent_session(
     client: httpx.AsyncClient,
 ) -> None:
