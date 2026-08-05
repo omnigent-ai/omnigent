@@ -173,12 +173,23 @@ and verifies the same test goes fail→pass).
 
 ## Output — the reproduction artifacts
 
-End your **final message** with exactly one fenced ```json code block — the
-machine-readable handoff to the fix step and to the caller that labels the issue.
-This block is parsed programmatically, so the format is **not** your choice:
+The **last thing in your final message** must be exactly one fenced ```json code
+block — the machine-readable handoff to the fix step and to the caller that
+labels the issue. This block is parsed programmatically by taking the last
+```json fence in the message, so the format and its position are **not** your
+choice:
 
-- Emit it as **JSON**, never YAML or a prose summary. One ` ```json ` fence, one
-  JSON object, nothing after the closing fence.
+- You may write comprehensive prose above the block (a human-readable summary,
+  the journey, the per-facet notes) — that's fine and encouraged. But it is
+  **context, not the contract**: everything the parser needs lives *inside* the
+  JSON block, and the ```json block is the **last chunk** of the message, with
+  nothing after its closing fence.
+- Do **not** split the artifacts across separate sections or headers (no lone
+  "Reproduction Verdict" / "Journey" / "Facets" blocks standing in for the
+  handoff, and no second data block). Whatever you also say in prose, the single
+  ```json block below carries the complete, self-contained handoff.
+- Emit that block as **JSON**, never YAML. One ` ```json ` fence, one JSON
+  object.
 - Include **every** key below, always, even when a value is empty (`""`, `[]`) —
   the parser expects a fixed shape.
 - `verdict` must be **exactly one** of the four string literals
