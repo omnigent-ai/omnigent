@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from issue_prioritization.areas import AreaCatalog
-from issue_prioritization.domain import IssueType, Severity
+from issue_prioritization.domain import IssueType, Priority, Severity
+
+_PRIORITY_LABELS = {priority.value for priority in Priority}
 
 
 @dataclass(frozen=True)
@@ -24,7 +26,7 @@ class IssueContent:
             {
                 "title": self.title,
                 "body": self.body,
-                "labels": sorted(self.labels),
+                "labels": sorted(_classification_labels(self.labels)),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -62,7 +64,9 @@ class PromptClassifier:
         area_keys = tuple(
             key for key in _string_list(value.get("area_keys")) if key in self.areas.by_key
         )
-        component_labels = tuple(dict.fromkeys(self.areas.by_key[key].label for key in area_keys))
+        component_labels = tuple(
+            dict.fromkeys(self.areas.by_key[key].issue_label for key in area_keys)
+        )
         return Classification(
             issue_number=issue.number,
             issue_type=_issue_type(value.get("type")),
@@ -76,7 +80,7 @@ class PromptClassifier:
 
 def build_prompt(issue: IssueContent, areas: AreaCatalog) -> str:
     area_lines = [
-        f"- {area.key}: label={area.label}. {area.definition}"
+        f"- {area.key}: label={area.issue_label}. {area.definition}"
         for area in sorted(areas.by_key.values(), key=lambda item: item.key)
     ]
     return f"""Classify this Omnigent GitHub issue.
@@ -145,3 +149,13 @@ def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value]
+
+
+def _classification_labels(labels: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        label
+        for label in labels
+        if label not in _PRIORITY_LABELS
+        and not label.startswith("severity:")
+        and not label.startswith("comp:")
+    )

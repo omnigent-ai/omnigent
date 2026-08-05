@@ -51,3 +51,18 @@ def test_classifier_validates_area_keys_and_linear_type_label() -> None:
     assert result.severity == Severity.S1
     assert result.area_keys == ("db",)
     assert result.component_labels == ("comp:db",)
+
+
+def test_content_hash_ignores_bot_managed_labels() -> None:
+    base = IssueContent(1, "Broken", "Details", ("Bug",), "community")
+    managed = IssueContent(
+        1,
+        "Broken",
+        "Details",
+        ("Bug", "P1-high", "severity:S1", "comp:db"),
+        "community",
+    )
+    changed = IssueContent(1, "Broken", "Details", ("Bug", "needs-info"), "community")
+
+    assert base.content_hash == managed.content_hash
+    assert base.content_hash != changed.content_hash

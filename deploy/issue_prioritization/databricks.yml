@@ -11,6 +11,7 @@ sync:
   include:
     - .github/areas.json
     - .github/MAINTAINER
+    - .github/issue-prioritization-labels.json
 
 artifacts:
   default:
@@ -29,11 +30,26 @@ variables:
     default: issue_classifications
   scores_table:
     default: issue_scores
+  bot_state_table:
+    default: issue_bot_state
   artifact_volume_name:
     default: issue_priority_artifacts
   model_endpoint:
     description: Model Serving endpoint used for S0-S3 classification.
     default: ""
+  github_repo:
+    default: omnigent-ai/omnigent
+  github_secret_scope:
+    description: Secret scope containing the GitHub token used only in apply mode.
+    default: ""
+  github_token_secret_key:
+    default: github-token
+  legacy_priority_bot_logins:
+    description: Comma-separated actors whose historical priority labels may be adopted.
+    default: github-actions[bot],omnigent-ci[bot]
+  allow_github_writes:
+    description: Hard gate for GitHub mutations. Keep false until rollout approval.
+    default: "false"
 
 targets:
   dev:

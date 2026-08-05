@@ -11,6 +11,10 @@ resources:
       parameters:
         - name: mode
           default: dry_run
+        - name: regrade
+          default: "false"
+        - name: adopt_legacy_bot_priorities
+          default: "false"
       tasks:
         - task_key: score_open_issues
           python_wheel_task:
@@ -18,14 +22,23 @@ resources:
             entry_point: issue-priority-job
             named_parameters:
               mode: "{{job.parameters.mode}}"
+              regrade: "{{job.parameters.regrade}}"
+              adopt-legacy-bot-priorities: "{{job.parameters.adopt_legacy_bot_priorities}}"
               run-id: "{{job.run_id}}"
               source-table: ${var.catalog}.${var.schema}.${var.source_table}
               classifications-table: ${var.catalog}.${var.schema}.${var.classifications_table}
               scores-table: ${var.catalog}.${var.schema}.${var.scores_table}
+              bot-state-table: ${var.catalog}.${var.schema}.${var.bot_state_table}
               artifact-dir: /Volumes/${var.catalog}/${var.schema}/${var.artifact_volume_name}
               model-endpoint: ${var.model_endpoint}
               areas-path: ${workspace.file_path}/.github/areas.json
               maintainers-path: ${workspace.file_path}/.github/MAINTAINER
+              label-manifest-path: ${workspace.file_path}/.github/issue-prioritization-labels.json
+              github-repo: ${var.github_repo}
+              github-secret-scope: ${var.github_secret_scope}
+              github-token-secret-key: ${var.github_token_secret_key}
+              legacy-priority-bot-logins: ${var.legacy_priority_bot_logins}
+              allow-github-writes: ${var.allow_github_writes}
           environment_key: default
           libraries:
             - whl: ../dist/*.whl

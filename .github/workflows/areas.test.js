@@ -5,6 +5,10 @@ const fs = require("fs");
 const path = require("path");
 
 const areas = JSON.parse(fs.readFileSync(path.resolve(".github/areas.json"), "utf8")).areas;
+const priorityLabels = new Set(
+  JSON.parse(fs.readFileSync(path.resolve(".github/issue-prioritization-labels.json"), "utf8"))
+    .labels.map((label) => label.name),
+);
 const maint = new Set(
   fs.readFileSync(path.resolve(".github/MAINTAINER"), "utf8")
     .split("\n").map((l) => l.replace(/#.*/, "").trim().toLowerCase()).filter(Boolean)
@@ -31,6 +35,14 @@ for (const a of areas)
 // Every label is one of the real comp:* labels.
 for (const a of areas)
   assert(`area ${a.key} label ${a.label} is a real comp:*`, ALLOWED_LABELS.has(a.label));
+
+// V2 labels are declared separately so the active triage workflow can keep
+// using the legacy label until issue prioritization is enabled.
+for (const a of areas)
+  assert(
+    `area ${a.key} priority_label ${a.priority_label} is declared`,
+    priorityLabels.has(a.priority_label),
+  );
 
 // Every area has >= 2 owners (the 2+ codeowner requirement). Paused owners
 // still count -- pausing someone must not force adding a new active owner.
@@ -72,8 +84,10 @@ const cases = [
   ["omnigent/inner/kiro_native_harness.py", "harness-kiro"],
   ["web/src/main.tsx", "web"],
   ["web/ios/App.swift", "mobile-app"],
+  ["web/android/app/src/main/MainActivity.kt", "android-app"],
   ["web/electron/main.ts", "desktop-app"],
   ["omnigent/server/api.py", "server"],
+  ["omnigent/server/auth.py", "auth"],
 ];
 for (const [fn, key] of cases) {
   const m = resolve(fn);

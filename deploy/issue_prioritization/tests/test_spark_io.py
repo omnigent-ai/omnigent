@@ -6,6 +6,7 @@ from decimal import Decimal
 from issue_prioritization.artifacts import RankedIssue
 from issue_prioritization.classification import Classification
 from issue_prioritization.databricks_io import (
+    SparkBotStateRepository,
     SparkClassificationRepository,
     SparkScoreSink,
 )
@@ -16,6 +17,7 @@ from issue_prioritization.domain import (
     ScoreResult,
     Severity,
 )
+from issue_prioritization.mutations import BotState
 from issue_prioritization.pipeline import PipelineMode, PipelineRun
 
 
@@ -95,9 +97,19 @@ def test_score_sink_uses_schema_evolution() -> None:
         datetime.now(UTC),
         (ranked,),
         0,
+        (),
     )
 
     sink.write(run)
 
-    assert spark.schemas[0].count("ARRAY<STRING>") == 2
+    assert spark.schemas[0].count("ARRAY<STRING>") == 5
     assert spark.frames[0].write.options == {"mergeSchema": "true"}
+
+
+def test_bot_state_schema_handles_empty_ownership() -> None:
+    spark = FakeSpark()
+    repository = SparkBotStateRepository(spark, "main.team.bot_state")
+
+    repository.upsert([BotState(1, None, None, ())])
+
+    assert "components ARRAY<STRING>" in spark.schemas[0]

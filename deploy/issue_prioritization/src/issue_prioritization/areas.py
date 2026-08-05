@@ -15,6 +15,11 @@ class Area:
     label: str
     weight: Decimal
     definition: str = ""
+    priority_label: str | None = None
+
+    @property
+    def issue_label(self) -> str:
+        return self.priority_label or self.label
 
 
 @dataclass(frozen=True)
@@ -39,12 +44,15 @@ class AreaCatalog:
                     label=str(raw_area["label"]),
                     weight=Decimal(str(raw_area["weight"])),
                     definition=str(raw_area.get("definition", "")),
+                    priority_label=str(raw_area.get("priority_label") or raw_area["label"]),
                 )
             )
 
         by_label: dict[str, list[Area]] = {}
         for area in areas:
             by_label.setdefault(area.label, []).append(area)
+            if area.issue_label != area.label:
+                by_label.setdefault(area.issue_label, []).append(area)
         return cls(
             by_key={area.key: area for area in areas},
             by_label={label: tuple(items) for label, items in by_label.items()},
