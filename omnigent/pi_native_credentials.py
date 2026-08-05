@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 from collections.abc import Callable
@@ -809,6 +810,9 @@ def _inline_family_pi_provider(
         # ``zai-org/GLM-4.7``) and already-bare ids through unchanged. Family
         # defaults are bare, so the no-override path is unaffected.
         resolved_model = normalize_model_for_provider(resolved_model, KEY_KIND)
+        # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
+        # Anthropic API but rejected by the Databricks AI Gateway.
+        resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,

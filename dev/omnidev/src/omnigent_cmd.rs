@@ -1,5 +1,5 @@
 //! `omnidev omnigent …` — run an arbitrary omnigent command against this
-//! checkout's pod via `uv run omnigent …`.
+//! checkout's pod via `uv run --python <pinned> omnigent …`.
 //!
 //! Unlike the supervised `process::ProcSpec`s, this runs in the foreground
 //! (inheriting the user's stdio) and does *not* inject the log-mirror env
@@ -11,9 +11,10 @@
 
 use std::path::PathBuf;
 
+use crate::install::PYTHON_VERSION;
 use crate::pod::Pod;
 
-/// A resolved `uv run omnigent …` invocation for the passthrough subcommand.
+/// A resolved `uv run --python <pinned> omnigent …` invocation for the passthrough subcommand.
 pub struct OmnigentCmd {
     pub program: String,
     pub args: Vec<String>,
@@ -21,10 +22,15 @@ pub struct OmnigentCmd {
     pub cwd: PathBuf,
 }
 
-/// Build the command line + env for `uv run omnigent <passthrough…>` rooted at
+/// Build the command line + env for `uv run --python <pinned> omnigent <passthrough…>` rooted at
 /// the pod's repo, with the pod's `OMNIGENT_*` overrides applied.
 pub fn build(pod: &Pod, passthrough: &[String]) -> OmnigentCmd {
-    let mut args = vec!["run".to_string(), "omnigent".to_string()];
+    let mut args = vec![
+        "run".to_string(),
+        "--python".to_string(),
+        PYTHON_VERSION.to_string(),
+        "omnigent".to_string(),
+    ];
     args.extend_from_slice(passthrough);
     OmnigentCmd {
         program: "uv".into(),
@@ -82,14 +88,19 @@ mod tests {
     #[test]
     fn forwards_passthrough_args_after_uv_run_omnigent() {
         let pod = make_pod();
-        let cmd = build(
-            &pod,
-            &["agent".into(), "run".into(), "fix tests".into()],
-        );
+        let cmd = build(&pod, &["agent".into(), "run".into(), "fix tests".into()]);
         assert_eq!(cmd.program, "uv");
         assert_eq!(
             cmd.args.iter().map(String::as_str).collect::<Vec<_>>(),
-            vec!["run", "omnigent", "agent", "run", "fix tests"]
+            vec![
+                "run",
+                "--python",
+                PYTHON_VERSION,
+                "omnigent",
+                "agent",
+                "run",
+                "fix tests"
+            ]
         );
         assert_eq!(cmd.cwd, pod.repo_root);
     }
@@ -100,7 +111,7 @@ mod tests {
         let cmd = build(&pod, &[]);
         assert_eq!(
             cmd.args.iter().map(String::as_str).collect::<Vec<_>>(),
-            vec!["run", "omnigent"]
+            vec!["run", "--python", PYTHON_VERSION, "omnigent"]
         );
     }
 
@@ -138,7 +149,11 @@ mod tests {
     fn omits_log_mirror_env() {
         let pod = make_pod();
         let cmd = build(&pod, &["host".into()]);
-        assert!(cmd.env.iter().find(|(k, _)| k == "OMNIGENT_LOG_TTY_FD").is_none());
+        assert!(cmd
+            .env
+            .iter()
+            .find(|(k, _)| k == "OMNIGENT_LOG_TTY_FD")
+            .is_none());
         assert!(cmd
             .env
             .iter()

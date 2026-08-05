@@ -82,7 +82,7 @@ export function RegisterPage() {
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-ui text-muted-foreground">
             You were invited to join this Omnigent server.
           </p>
         </div>
@@ -90,7 +90,7 @@ export function RegisterPage() {
         {missingInvite ? (
           <div
             role="alert"
-            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
           >
             This page needs an invite token in the URL — make sure you opened the link your admin
             sent you.
@@ -98,7 +98,7 @@ export function RegisterPage() {
         ) : (
           <form onSubmit={onSubmit} className="space-y-4">
             <div className="space-y-1.5">
-              <label htmlFor="register-username" className="text-sm font-medium leading-none">
+              <label htmlFor="register-username" className="text-ui font-medium leading-none">
                 Username
               </label>
               <Input
@@ -118,7 +118,7 @@ export function RegisterPage() {
             </div>
 
             <div className="space-y-1.5">
-              <label htmlFor="register-password" className="text-sm font-medium leading-none">
+              <label htmlFor="register-password" className="text-ui font-medium leading-none">
                 Password
               </label>
               <Input
@@ -134,7 +134,7 @@ export function RegisterPage() {
             </div>
 
             <div className="space-y-1.5">
-              <label htmlFor="register-confirm" className="text-sm font-medium leading-none">
+              <label htmlFor="register-confirm" className="text-ui font-medium leading-none">
                 Confirm password
               </label>
               <Input
@@ -152,7 +152,7 @@ export function RegisterPage() {
             {error !== null && (
               <div
                 role="alert"
-                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
               >
                 {error}
               </div>

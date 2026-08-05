@@ -233,7 +233,6 @@ export function HtmlCommentViewer({
     <iframe
       ref={iframeRef}
       srcDoc={srcDoc}
-      // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
       sandbox={HTML_PREVIEW_SANDBOX}
       title="HTML preview"
       className="w-full h-full border-0"

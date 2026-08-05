@@ -5261,6 +5261,18 @@
             "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
             "title": "Total Cost Usd"
           },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch timestamp of the last persisted session activity. Advances when conversation items are appended and on session metadata edits (rename, agent switch, archive); a mid-stall rename therefore resets the clock, so an orchestrator treating this as a pure item-append heartbeat should account for that. Can be compared across snapshots independently of lifecycle status.",
+            "title": "Updated At"
+          },
           "usage_by_model": {
             "anyOf": [
               {

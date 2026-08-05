@@ -96,7 +96,7 @@ function FileListItem({
         >
           <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
           <span
-            className={cn("truncate font-mono text-sm md:text-xs", isDeleted && "line-through")}
+            className={cn("truncate font-mono text-ui md:text-xs", isDeleted && "line-through")}
             {...handlers}
           >
             {file.name}

@@ -19,6 +19,8 @@
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
 import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
+import { LIVE_ITEM_PREFIX } from "./blocks";
+import { isSystemUserContent } from "./systemMessage";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -141,6 +143,28 @@ export type Bubble =
       /** Free-form error message when `lifecycle === "failed"`. */
       error: string | null;
       items: RenderItem[];
+      /**
+       * Wall-clock seconds the turn spent working, when derivable —
+       * labels the completed turn's "Worked for Xs" process fold.
+       * Live-streamed turns span the blocks' page-relative timestamps;
+       * reloaded history spans the items' server `created_at` stamps.
+       */
+      workedForS?: number;
+      /**
+       * Server epoch seconds of the turn's newest item, when known.
+       * A just-active trace mounted from history may still be mid-turn
+       * (a reload inside a step-wise turn's between-step gap), so the
+       * fold holds briefly instead of appearing instantly.
+       */
+      lastActivityAtS?: number;
+      /**
+       * The turn's work continues in a LATER assistant bubble: this one
+       * yielded mid-task (e.g. dispatching sub-agents and awaiting their
+       * results), so the answer lands under a different response id. Lets
+       * the renderer fold this bubble's trace even though it carries no
+       * trailing answer of its own.
+       */
+      continued?: boolean;
     }
   | { kind: "compaction_loading"; itemId: string }
   | { kind: "compaction"; itemId: string }
@@ -229,7 +253,10 @@ export function buildBubbles(
 ): Bubble[] {
   const interruptedResponses = new Set(interruptedResponseIds);
   if (cache === undefined) {
-    return walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map()).bubbles;
+    return markContinuedTurns(
+      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map()).bubbles,
+      activeResponse,
+    );
   }
 
   // Nothing changed since the last call — hand back the same array.
@@ -262,9 +289,9 @@ export function buildBubbles(
     cache.blocks = blocks;
     cache.activeResponse = activeResponse;
     cache.interruptedResponseIds = interruptedResponseIds;
-    cache.bubbles = rest.bubbles;
+    cache.bubbles = markContinuedTurns(rest.bubbles, activeResponse);
     cache.lastBubbleStart = rest.lastBubbleStart;
-    return rest.bubbles;
+    return cache.bubbles;
   }
 
   // Cache miss (session switch, history prepend, in-place edit) — full rebuild.
@@ -272,9 +299,124 @@ export function buildBubbles(
   cache.blocks = blocks;
   cache.activeResponse = activeResponse;
   cache.interruptedResponseIds = interruptedResponseIds;
-  cache.bubbles = full.bubbles;
+  cache.bubbles = markContinuedTurns(full.bubbles, activeResponse);
   cache.lastBubbleStart = full.lastBubbleStart;
-  return full.bubbles;
+  return cache.bubbles;
+}
+
+/**
+ * Flag assistant bubbles whose turn continues in a later assistant
+ * bubble, so the renderer can fold a trace that carries no answer of
+ * its own.
+ *
+ * A turn that dispatches sub-agents must END to await their results;
+ * the inbox wake then starts a NEW turn (new response id) that carries
+ * the answer. That splits one logical turn across bubbles: the first
+ * holds narration + tool calls and no answer, the second holds the
+ * answer and no work. Neither half satisfies the fold's "did work AND
+ * answered" rule on its own, so the process trace stayed expanded.
+ *
+ * Runtime `[System: …]` markers (the sub-agent-result wakes, timers)
+ * are the await itself, not a new human turn, so scanning looks past
+ * them; a real user message ends the turn and stops the scan.
+ *
+ * Only runs between turns. While one is arriving the transcript is
+ * full of transient fragment bubbles — a streamed narration renders as
+ * its own `live:` preview until its authoritative item replaces it,
+ * and reasoning bursts group separately — so a codex turn that the
+ * server records as ONE response can show as half a dozen bubbles that
+ * appear and merge away on every delta. Marking those would fold and
+ * unfold fragments continuously. Flags are also sticky: a bubble that
+ * has folded never reopens because a later turn started streaming.
+ *
+ * Returns the same array when nothing changed; bubbles that flip are
+ * REPLACED (never mutated) so `bubblesEqual` sees a difference and the
+ * memoized bubble actually re-renders.
+ */
+function markContinuedTurns(bubbles: Bubble[], activeResponse: ActiveResponse | null): Bubble[] {
+  if (activeResponse?.state === "streaming") return bubbles;
+  let out: Bubble[] | null = null;
+  for (let i = 0; i < bubbles.length; i += 1) {
+    const bubble = bubbles[i]!;
+    if (bubble.kind !== "assistant" || bubble.continued) continue;
+    if (!hasAssistantContinuation(bubbles, i)) continue;
+    if (out === null) out = bubbles.slice();
+    out[i] = { ...bubble, continued: true };
+  }
+  return out ?? bubbles;
+}
+
+/**
+ * Index of the last assistant bubble that actually renders content.
+ *
+ * "Last assistant" gates the fold suppression for the possibly-live
+ * turn, so it must point at the turn's TRACE bubble. A parked
+ * elicitation forms its own trailing assistant bubble whose card
+ * ChatPage floats to the page bottom, leaving the bubble item-less (it
+ * renders null) — counting that phantom as "last" handed the live
+ * turn's trace to the fold.
+ */
+export function lastRenderableAssistantIndex(bubbles: readonly Bubble[]): number {
+  for (let i = bubbles.length - 1; i >= 0; i -= 1) {
+    const b = bubbles[i]!;
+    if (b.kind === "assistant" && b.items.length > 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Index of the last renderable assistant bubble ONLY IF it may still be
+ * the session's live turn; -1 otherwise.
+ *
+ * A real user message after that bubble ends its turn for good — any
+ * "running" status then belongs to the reply-in-flight for that newer
+ * input, which has no bubble yet. Suppressing the settled bubble's
+ * "Worked for" fold in that window pops it open until the new turn's
+ * first item lands (seconds on native harnesses, whose items round-trip
+ * through the vendor TUI). System `[System: ...]` markers don't end a
+ * turn (see `hasAssistantContinuation`), so they don't clear the
+ * suppression.
+ */
+export function liveCandidateAssistantIndex(bubbles: readonly Bubble[]): number {
+  const idx = lastRenderableAssistantIndex(bubbles);
+  for (let i = idx + 1; i < bubbles.length; i += 1) {
+    const b = bubbles[i]!;
+    if (b.kind === "user" && !isSystemUserContent(b.content)) return -1;
+  }
+  return idx;
+}
+
+/**
+ * Whether a block's response id doesn't identify a real turn: `""`
+ * (emitted before the turn was named) or a `live:` preview id. Such
+ * blocks belong to the turn around them, never to a turn of their own.
+ */
+function isAnonymousRid(rid: string): boolean {
+  return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
+}
+
+/**
+ * Blocks stamped a distinct response id ON PURPOSE so they render as
+ * their own bubble: deny/failure sentinels aren't part of any turn's
+ * work, and REQUEST-phase elicitations get a unique id precisely so
+ * `isRequestElicitationBubble` can lift them out. A response-id change
+ * into or out of one of these is a real bubble boundary, not a
+ * same-turn continuation.
+ */
+function isStandaloneSentinelBlock(b: AnyBlock): boolean {
+  return b.type === "policy_denied" || b.type === "error" || b.type === "elicitation";
+}
+
+/** Whether a later assistant bubble continues the turn started at `from`. */
+function hasAssistantContinuation(bubbles: Bubble[], from: number): boolean {
+  for (let i = from + 1; i < bubbles.length; i += 1) {
+    const next = bubbles[i]!;
+    if (next.kind === "assistant") return true;
+    // A real user turn ends this one; system markers do not.
+    if (next.kind === "user" && !isSystemUserContent(next.content)) return false;
+    // Compaction / routing markers are mid-turn events — keep scanning.
+  }
+  return false;
 }
 
 /**
@@ -455,13 +597,28 @@ function walkBubbles(
       continue;
     }
 
-    // Open an assistant bubble. Collect all subsequent blocks that
-    // share this `responseId` and are not themselves user/compaction
-    // boundaries. Out-of-band blocks with a different responseId
-    // (shouldn't happen in well-formed streams, but be defensive)
-    // close the bubble.
-    const groupResponseId = b.ctx.responseId;
+    // Open an assistant bubble: ONE bubble per user turn. Collect every
+    // subsequent assistant-side block up to the next user/compaction/
+    // routing boundary, REGARDLESS of response id. A response-id change
+    // between two assistant blocks with no user message between them is
+    // a continuation of the same turn, not a new one — native harnesses
+    // emit reasoning before the edge that names the turn (rid "") and
+    // stream text as `live:` previews, and codex's step-wise (goal/plan)
+    // turns publish a distinct response id PER STEP while the items all
+    // carry the thread id. Splitting on any of those rendered one turn
+    // as several fragment bubbles live (each folding into its own
+    // "Worked for" row) that merged back into one on reload. The group
+    // tracks the LAST real response id it saw, so lifecycle matching
+    // against `activeResponse` follows the live edge. Blocks that carry
+    // a DISTINCT id on purpose still open their own bubble: deny/failure
+    // sentinels (`policy_denied` / `error`) are not part of the turn's
+    // work, and REQUEST-phase elicitations are stamped a unique id
+    // precisely so they stand alone (`isRequestElicitationBubble`).
+    let groupResponseId = b.ctx.responseId;
     const groupStart = i;
+    // Sentinel-headed groups never absorb a different turn's blocks, in
+    // either direction (see the id-change handling below).
+    const groupOpenedOnSentinel = isStandaloneSentinelBlock(b);
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -482,8 +639,17 @@ function walkBubbles(
       }
       // A bare tool_result never renders standalone (it folds into its
       // call's card by callId) — don't let a backdated one split the
-      // open bubble.
-      if (cur.ctx.responseId !== groupResponseId && cur.type !== "tool_result") break;
+      // open bubble. Anonymous blocks never carry turn identity.
+      const curRid = cur.ctx.responseId;
+      if (cur.type !== "tool_result" && !isAnonymousRid(curRid) && curRid !== groupResponseId) {
+        if (
+          !isAnonymousRid(groupResponseId) &&
+          (isStandaloneSentinelBlock(cur) || groupOpenedOnSentinel)
+        ) {
+          break;
+        }
+        groupResponseId = curRid;
+      }
       i += 1;
     }
     const groupBlocks = blocks.slice(groupStart, i).filter(isAssistantSideBlock);
@@ -503,12 +669,21 @@ function walkBubbles(
     const subIndex = subIndexByResp.get(groupResponseId) ?? 0;
     subIndexByResp.set(groupResponseId, subIndex + 1);
     // Absorbed tool_results don't key the bubble: a backdated one would flip stableId mid-stream.
+    // Skip `live:` preview ids for keying — the authoritative item
+    // replaces the preview in place, and keying off the transient id
+    // would remount the whole bubble at that swap.
     const firstItemId =
-      groupBlocks.find((bk) => bk.type !== "tool_result" && bk.ctx.itemId !== null)?.ctx.itemId ??
-      null;
+      groupBlocks.find(
+        (bk) =>
+          bk.type !== "tool_result" &&
+          bk.ctx.itemId !== null &&
+          !bk.ctx.itemId.startsWith(LIVE_ITEM_PREFIX),
+      )?.ctx.itemId ?? null;
     const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
 
     lastBubbleStart = groupStart;
+    const workedForS = turnWorkedForS(groupBlocks);
+    const lastActivityAtS = turnLastActivityAtS(groupBlocks);
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
@@ -516,10 +691,53 @@ function walkBubbles(
       lifecycle,
       error,
       items: buildAssistantItems(groupBlocks, lifecycle, crossBubbleResults),
+      ...(workedForS !== undefined ? { workedForS } : {}),
+      ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
     });
   }
 
   return { bubbles, lastBubbleStart };
+}
+
+/**
+ * Server epoch seconds of the turn's newest block, when known. Lets the
+ * renderer tell a JUST-active trace (a reload can land in a step-wise
+ * turn's between-step gap, where everything else reads settled) from
+ * genuinely old history.
+ */
+function turnLastActivityAtS(groupBlocks: AnyBlock[]): number | undefined {
+  let latest: number | undefined;
+  for (const b of groupBlocks) {
+    const at = b.ctx.createdAtS;
+    if (at !== undefined && (latest === undefined || at > latest)) latest = at;
+  }
+  return latest;
+}
+
+/**
+ * Wall-clock seconds between a turn's first and last block, when both
+ * ends carry a usable stamp from the SAME clock. Live-streamed blocks
+ * carry page-relative `ctx.timestamp` (sub-second precision); reloaded
+ * history carries server `ctx.createdAtS` (epoch seconds). A bubble
+ * that mixes the two clocks (page loaded mid-turn) yields `undefined`
+ * rather than a cross-clock span — the FIRST block's clock decides
+ * which branch is tried: a live-stamped first block only ever pairs
+ * with a live-stamped last, an epoch-stamped first only with an
+ * epoch-stamped last, and either mixed direction fails both guards.
+ */
+function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
+  const first = groupBlocks[0];
+  const last = groupBlocks[groupBlocks.length - 1];
+  if (first === undefined || last === undefined || first === last) return undefined;
+  if (first.ctx.timestamp > 0 && last.ctx.timestamp >= first.ctx.timestamp) {
+    return last.ctx.timestamp - first.ctx.timestamp;
+  }
+  const firstCreated = first.ctx.createdAtS;
+  const lastCreated = last.ctx.createdAtS;
+  if (firstCreated !== undefined && lastCreated !== undefined && lastCreated >= firstCreated) {
+    return lastCreated - firstCreated;
+  }
+  return undefined;
 }
 
 /** Filter to blocks that participate in assistant rendering. */
@@ -879,7 +1097,13 @@ function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): b
 export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "assistant" && b.kind === "assistant") {
-    if (a.stableId !== b.stableId || a.lifecycle !== b.lifecycle || a.error !== b.error) {
+    if (
+      a.stableId !== b.stableId ||
+      a.lifecycle !== b.lifecycle ||
+      a.error !== b.error ||
+      // Flips when a later bubble continues this turn — the fold depends on it.
+      Boolean(a.continued) !== Boolean(b.continued)
+    ) {
       return false;
     }
     if (a.items.length !== b.items.length) return false;

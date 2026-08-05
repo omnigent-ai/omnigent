@@ -69,6 +69,11 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
+def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
+    settings_path = Path(args[args.index("--settings") + 1])
+    return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
 def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
     tmp_path: Path,
 ) -> None:
@@ -976,7 +981,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     gateway_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
     ucode = ClaudeNativeUcodeConfig(
         env=dict(gateway_env),
-        api_key_helper="databricks auth token --fake-helper",
+        api_key_helper="printf %s sk-sentinel-do-not-use",
         model="databricks-claude-opus-4-7",
     )
     # The runner imports ``_ucode_config_for_profile`` from
@@ -1043,9 +1048,10 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # The gateway default model is applied (no per-session override here).
     assert "--model" in spec.args
     assert spec.args[spec.args.index("--model") + 1] == "databricks-claude-opus-4-7"
-    # The apiKeyHelper threaded into the Claude settings augment so the
-    # gateway token command is registered.
-    assert "databricks auth token --fake-helper" in " ".join(spec.args)
+    # The apiKeyHelper is registered in private settings, not subprocess argv.
+    assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
+    settings = _load_claude_invocation_settings(spec.args)
+    assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
     await fake_client.aclose()
@@ -2677,7 +2683,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     assert spec.keep_alive_after_exit is True
     args = spec.args
     assert "--append-system-prompt" not in args
-    settings = json.loads(args[args.index("--settings") + 1])
+    settings = _load_claude_invocation_settings(args)
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
     assert permission_hook["type"] == "command"

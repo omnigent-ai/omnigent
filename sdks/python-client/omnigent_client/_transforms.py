@@ -12,7 +12,7 @@ stream. Compose with ``pipe()``:
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from ._blocks import (
     AnyBlock,
@@ -20,8 +20,10 @@ from ._blocks import (
     TextDone,
 )
 
+StreamTransform = Callable[[AsyncIterator[AnyBlock]], AsyncIterator[AnyBlock]]
 
-def pipe(stream: AsyncIterator[AnyBlock], *transforms: object) -> AsyncIterator[AnyBlock]:
+
+def pipe(stream: AsyncIterator[AnyBlock], *transforms: StreamTransform) -> AsyncIterator[AnyBlock]:
     """Compose transforms left-to-right.
 
     ``pipe(stream, t1, t2)`` is equivalent to ``t2(t1(stream))``.
@@ -31,7 +33,7 @@ def pipe(stream: AsyncIterator[AnyBlock], *transforms: object) -> AsyncIterator[
     return stream
 
 
-def skip_blocks(*types: type) -> object:
+def skip_blocks(*types: type) -> StreamTransform:
     """Drop blocks of the given types.
 
     Usage::
@@ -50,7 +52,7 @@ def skip_blocks(*types: type) -> object:
     return _transform
 
 
-def skip_intermediate_ends() -> object:
+def skip_intermediate_ends() -> StreamTransform:
     """Suppress ``ResponseEndBlock`` events from tool loop iterations.
 
     Only yields the final ``ResponseEndBlock`` — the one not followed
@@ -78,7 +80,7 @@ def skip_intermediate_ends() -> object:
     return _transform
 
 
-def merge_text_across_iterations() -> object:
+def merge_text_across_iterations() -> StreamTransform:
     """Merge ``TextDone`` blocks across tool loop iterations.
 
     When the tool loop runs N iterations, each may produce a
@@ -115,7 +117,7 @@ def merge_text_across_iterations() -> object:
     return _transform
 
 
-def only_agent(agent_name: str | None) -> object:
+def only_agent(agent_name: str | None) -> StreamTransform:
     """Filter to blocks from a specific agent.
 
     Pass ``None`` to include all agents (no filtering).

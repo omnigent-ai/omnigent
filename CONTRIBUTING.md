@@ -49,14 +49,20 @@ Pyrefly is the canonical Python type checker for the repository.
 ```bash
 uv run pytest                      # Python tests (e2e/live skipped by default)
 uv run ruff check . && uv run ruff format --check .
-uv run --no-sync pyrefly check     # Python type checking (omnigent/)
+uv run --no-sync pyrefly check     # Python type checking (core and client SDK)
 uv run pre-commit run --all-files
 ```
 
 When touching `web/`:
 
 ```bash
-cd web && pnpm install && pnpm run lint && pnpm run build
+cd web && pnpm install && pnpm run lint && pnpm run type-check && pnpm run build
+```
+
+When touching `editors/vscode/`:
+
+```bash
+cd editors/vscode && pnpm install && pnpm run type-check && pnpm run test && pnpm run build
 ```
 
 ## Running locally

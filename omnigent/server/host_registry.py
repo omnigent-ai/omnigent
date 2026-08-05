@@ -382,8 +382,13 @@ class HostRegistry:
             self._hosts[key] = conn
         return conn
 
-    def deregister(self, host_id: str, workspace_id: int | None = None) -> None:
-        """Remove a host connection.
+    def deregister(
+        self,
+        host_id: str,
+        workspace_id: int | None = None,
+        conn: HostConnection | None = None,
+    ) -> bool:
+        """Remove a host connection and end its sender loop.
 
         No-op if ``(workspace_id, host_id)`` is not registered.
 
@@ -391,10 +396,38 @@ class HostRegistry:
             spelling (see :func:`_canonical_host_id`).
         :param workspace_id: Tenant partition; defaults to
             :func:`current_workspace_id`.
+        :param conn: Optional generation guard, as on
+            :meth:`TunnelRegistry.deregister`. When given, the entry is
+            removed only if it is still this exact connection.
+        :returns: ``True`` when an entry was removed. ``False`` means
+            nothing was registered or the guard did not match, so the
+            caller is superseded and must not flip the host's durable
+            row offline — that row describes the live reconnect.
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
-            self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
+            key = (ws_id, _canonical_host_id(host_id))
+            current = self._hosts.get(key)
+            if current is None or (conn is not None and current is not conn):
+                return False
+            removed = self._hosts.pop(key)
+        # Without this the route handler's loops keep running and its ping loop
+        # keeps the host row online, even though the host is now unreachable.
+        removed.outbound_queue.put_nowait(None)
+        return True
+
+    def mark_frame_seen(self, conn: HostConnection) -> bool:
+        """Record that a frame arrived for ``conn``.
+
+        :param conn: Connection that received the frame.
+        :returns: ``True`` if the connection is still current,
+            ``False`` if it has been replaced or deregistered.
+        """
+        with self._lock:
+            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
+                return False
+            conn.last_frame_at = time.time()
+            return True
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.

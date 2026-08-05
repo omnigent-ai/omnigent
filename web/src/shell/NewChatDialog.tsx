@@ -116,7 +116,9 @@ import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
+  isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
+  isRecentHarness,
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
@@ -136,6 +138,7 @@ import {
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -960,21 +963,26 @@ export function AgentHarnessPicker({
   // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
   // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Split harnesses so the ready-to-use ones lead and the "needs setup" ones
-  // fold into a "More" submenu (kept discoverable, out of the primary list).
-  // The currently-selected harness always stays inline even when unconfigured,
-  // so the active pick is never buried. With the hide-unconfigured preference
-  // on, unconfigured harnesses are dropped entirely (no "More").
+  const { recentHarnesses } = useRecentHarnesses();
+  // Split harnesses by support level: the fully supported ones lead the primary
+  // list, and every other harness folds into "More" whether or not it is
+  // configured here. Also promoted out of "More": the selected harness (never
+  // bury the active pick) and any the user has launched before, so a regular
+  // Pi / Cursor user gets theirs one click away instead of one hover.
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     const more: AvailableAgent[] = [];
     for (const a of harnessEntries) {
-      const unconfigured = harnessUnconfiguredOnHost(a.harness, host);
-      if (!unconfigured || a.id === effectiveAgentId) ready.push(a);
-      else if (!hideUnconfigured) more.push(a);
+      const selected = a.id === effectiveAgentId;
+      // The preference hides harnesses that can't launch here — it outranks
+      // both support level and recency, but never buries the active pick.
+      if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(a.harness, host)) continue;
+      if (selected || isFullySupportedNativeCodingAgent(a) || isRecentHarness(a, recentHarnesses)) {
+        ready.push(a);
+      } else more.push(a);
     }
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId]);
+  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, recentHarnesses]);
 
   // Split the agents group: built-in bundle agents (Polly / Debby) stay inline
   // in the main list; user-registered custom agents fold into a "Custom agents"
@@ -2014,6 +2022,7 @@ export function NewChatLandingScreen() {
   }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
+  const { addRecentHarness } = useRecentHarnesses();
 
   const allHosts = hosts ?? [];
   const onlineHosts = allHosts.filter((h) => h.status === "online");
@@ -2103,12 +2112,31 @@ export function NewChatLandingScreen() {
   // once per settled workspace (and can't loop once it sets a branch name).
   const worktreeSeededForRef = useRef<string | null>(null);
 
+  // Signature of the stored config the machine last settled from. Lets a later
+  // save be noticed even when the pencil re-opens the SAME project — the config
+  // content changes while `projectParam` does not. `null` = not yet seeded.
+  const seededConfigSigRef = useRef<string | null>(null);
+  const prefillConfigSig = useMemo(
+    () => (prefillConfig === undefined ? null : JSON.stringify(prefillConfig)),
+    [prefillConfig],
+  );
+
   // The landing screen stays mounted while `?project=` changes (clicking
   // another project's pencil), so re-create a fresh visit by hand: clear
   // every seedable slot and restart the machine. Values the user set are
-  // reset too — a pencil click means "set me up for this project".
+  // reset too — a pencil click means "set me up for this project". Also
+  // restart when the SAME project's stored defaults change (the user edited
+  // its settings, then re-opened its composer): `projectParam` stays put, so
+  // without this the already-settled machine would keep the stale seeds.
   useEffect(() => {
-    if (prefill.project === projectParam) return;
+    const projectChanged = prefill.project !== projectParam;
+    const configChanged =
+      !projectChanged &&
+      projectParam !== "" &&
+      prefillConfigSig !== null &&
+      seededConfigSigRef.current !== null &&
+      prefillConfigSig !== seededConfigSigRef.current;
+    if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
@@ -2116,8 +2144,19 @@ export function NewChatLandingScreen() {
     setBranchName("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
+    seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project]);
+  }, [projectParam, prefill.project, prefillConfigSig]);
+
+  // Record the config the machine settled from, once it's loaded and the
+  // machine is done, so the reseed effect above can spot a later change to it
+  // (the reseed on a project switch runs before the config has loaded, leaving
+  // the signature `null` until this fills it in).
+  useEffect(() => {
+    if (prefill.project !== projectParam) return;
+    if (prefillConfigSig === null || !prefillDone(prefill)) return;
+    seededConfigSigRef.current = prefillConfigSig;
+  }, [prefill, projectParam, prefillConfigSig]);
 
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
@@ -3059,6 +3098,10 @@ export function NewChatLandingScreen() {
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
+      // Remember the launched harness so the picker promotes it out of "More"
+      // next time. Recorded only on a successful create, so a harness the user
+      // merely browsed past never earns a primary slot.
+      if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
       // Fire-and-forget: don't block navigation on the sidebar list refresh.
       // The background refetch (or the WS session_added push) backfills the
       // new session's row within ~1s of landing in the chat; the chat itself
@@ -3101,6 +3144,10 @@ export function NewChatLandingScreen() {
     }
   }
 
+  const placeholderText = selectedProject
+    ? `Start a new session in ${selectedProject}`
+    : "Describe a task to start a new session…";
+
   // The working-directory chip — a single Popover trigger button that opens
   // the file browser. The directory-conflict warning lives inside the browser
   // (a banner on the occupied folder), not on the chip.
@@ -3136,20 +3183,22 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 sm:flex-row">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-display-alt">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
             // to Otto's h-18 box so the centered composer doesn't shift when
             // toggling between the two landings.
             <span className="flex h-18 shrink-0 items-center">
-              <FolderIcon className="size-12 text-muted-foreground" />
+              <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
+                <FolderIcon className="size-6 text-brand-accent" />
+              </div>
             </span>
           ) : (
             <OttoEyes className="h-18 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-3xl font-medium tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
-            {selectedProject || "What should we do?"}
+          <h1 className="min-w-0 break-words text-center text-[1.75em] font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+            {selectedProject || "What should we build?"}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
@@ -3178,7 +3227,7 @@ export function NewChatLandingScreen() {
           >
             {isDragActive && (
               <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-sm font-medium text-ring">Drop files here</span>
+                <span className="text-ui font-medium text-ring">Drop files here</span>
               </div>
             )}
             {/* Skill suggestions — floats above the composer box. */}
@@ -3293,8 +3342,8 @@ export function NewChatLandingScreen() {
               }}
               // Suppress the native placeholder when the overlay supplies its
               // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : "Describe a task to start a new session…"}
-              aria-label="Describe a task to start a new session"
+              placeholder={pillSkills.length > 0 ? "" : placeholderText}
+              aria-label={placeholderText}
               rows={1}
               autoFocus
               data-testid="new-chat-landing-input"
@@ -3302,17 +3351,16 @@ export function NewChatLandingScreen() {
               // 14px/20px. (Note: sub-16px inputs make mobile Safari
               // auto-zoom on focus — accepted tradeoff per the design.)
               // Heights are border-box (16px top + 4px bottom padding lives
-              // inside them): min 60px = one 20px line + a spare line of
-              // breathing room; max 200px = the spec's 180px of content.
+              // inside them): max 200px = the spec's 180px of content.
               // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
                 textarea; the pills themselves opt back in. */}
             {pillSkills.length > 0 && message.length === 0 && (
               <div className="pointer-events-none absolute inset-x-4 top-4 flex flex-wrap items-center gap-2">
-                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-muted-foreground">
+                <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
                   Describe a task, or try a skill
                 </span>
                 <SkillPills skills={pillSkills} onPick={applySkillPill} />
@@ -3526,12 +3574,12 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
+                          className="size-8 rounded-lg bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
                           ) : (
-                            <ArrowUpIcon className="size-4" />
+                            <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
                           )}
                         </Button>
                       </span>

@@ -73,8 +73,17 @@ _INITIAL_RECONNECT_DELAY_S = 0.5
 _MAX_RECONNECT_DELAY_S = 10.0
 _RECONNECT_JITTER_FRACTION = 0.5
 _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
-_REFRESHABLE_HTTP_STATUSES = {401}
-_FATAL_SERVER_HTTP_STATUSES = {403}
+# Both 401 and 403 are treated as refreshable: the server may return 403
+# (not 401) when a previously-valid token expires while the machine is
+# offline or sleeping. A fresh token from the factory is obtained and the
+# connection is retried with normal backoff. After
+# _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS consecutive rejections the runner
+# gives up — a genuinely-forbidden runner must not busy-reconnect forever.
+_REFRESHABLE_HTTP_STATUSES = {401, 403}
+# Maximum consecutive HTTP 401/403 rejections before the runner exits.
+# A single rejection is almost certainly an expired token; a persistent
+# streak means the credentials can't be fixed and we should fail loud.
+_HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
 # ingress cycles long-lived WebSockets out from under a healthy app. The
@@ -328,11 +337,14 @@ async def serve_tunnel(
     ever_connected = False
     # Consecutive login-page redirects; reset by a successful upgrade.
     login_redirect_streak = 0
+    # Consecutive HTTP 401/403 rejections; reset by a successful upgrade.
+    http_auth_rejection_streak = 0
 
     def _mark_connected() -> None:
-        nonlocal ever_connected, login_redirect_streak
+        nonlocal ever_connected, login_redirect_streak, http_auth_rejection_streak
         ever_connected = True
         login_redirect_streak = 0
+        http_auth_rejection_streak = 0
 
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
@@ -407,37 +419,47 @@ async def serve_tunnel(
             else:
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
+                    http_auth_rejection_streak += 1
+                    if http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS:
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(HTTP {http_status} persisted across "
+                            f"{http_auth_rejection_streak} attempts); "
+                            "check remote server authentication"
+                        ) from exc
+                    # Invalidate the cached token so the loop-top _refresh_auth_token
+                    # fetches a fresh one on the next attempt. The loop-top call is
+                    # already guarded against transient factory errors (OSError etc.),
+                    # so we don't call the factory directly here.
                     _invalidate_auth_token_factory(auth_token_factory)
-                    auth_token = await _handle_refreshable_auth_failure(
-                        auth_token_factory, http_status, exc
-                    )
+                    _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
+                    retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     delay_s = _INITIAL_RECONNECT_DELAY_S
-                    continue
-                if http_status in _FATAL_SERVER_HTTP_STATUSES:
-                    raise RuntimeError(
-                        f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                        f"(HTTP {http_status}); check remote server authentication"
-                    ) from exc
-                close_code = _websocket_close_code(exc)
-                if close_code in _FATAL_SERVER_CLOSE_CODES:
-                    raise RuntimeError(
-                        f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                        f"(close code {close_code}); check frame protocol compatibility"
-                    ) from exc
-                if (
-                    close_code in _TUNNEL_RECYCLE_CLOSE_CODES
-                    or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
-                ):
-                    # Routine ingress recycle — reconnect promptly, don't
-                    # escalate the backoff (which would leave the runner
-                    # unregistered for seconds each recycle and drop
-                    # in-flight message delivery).
-                    delay_s = _INITIAL_RECONNECT_DELAY_S
-                    recycle = True
-                    detail = f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
-                    retry_reason = f"server recycled the tunnel ({detail}); reconnecting promptly"
                 else:
-                    retry_reason = str(exc)
+                    close_code = _websocket_close_code(exc)
+                    if close_code in _FATAL_SERVER_CLOSE_CODES:
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(close code {close_code}); check frame protocol compatibility"
+                        ) from exc
+                    if (
+                        close_code in _TUNNEL_RECYCLE_CLOSE_CODES
+                        or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
+                    ):
+                        # Routine ingress recycle — reconnect promptly, don't
+                        # escalate the backoff (which would leave the runner
+                        # unregistered for seconds each recycle and drop
+                        # in-flight message delivery).
+                        delay_s = _INITIAL_RECONNECT_DELAY_S
+                        recycle = True
+                        detail = (
+                            f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
+                        )
+                        retry_reason = (
+                            f"server recycled the tunnel ({detail}); reconnecting promptly"
+                        )
+                    else:
+                        retry_reason = str(exc)
         except (ConnectionError, OSError, ValueError) as exc:
             retry_reason = str(exc)
         jittered = delay_s * (
@@ -507,7 +529,7 @@ async def _handle_refreshable_auth_failure(
     exc: WebSocketException,
 ) -> str | None:
     """
-    Attempt a token refresh after an HTTP 401 rejection.
+    Attempt a token refresh after an HTTP 302 login-page redirect.
 
     If the factory produces a new token, returns it so the caller
     can retry immediately. If no factory is available or the refresh
@@ -515,7 +537,7 @@ async def _handle_refreshable_auth_failure(
 
     :param factory: Sync callable returning a fresh token.
     :param http_status: The HTTP status that triggered this call,
-        e.g. ``401``.
+        e.g. ``302`` for a login-page redirect.
     :param exc: The original ``WebSocketException``.
     :returns: A refreshed token string.
     :raises RuntimeError: When no factory is available or refresh
