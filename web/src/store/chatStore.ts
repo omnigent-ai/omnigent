@@ -230,19 +230,17 @@ export function composerAttachmentKey(a: ComposerAttachment): string {
   return `${a.path}|${a.isDir}|${a.lineRange ? `${a.lineRange.start}-${a.lineRange.end}` : ""}`;
 }
 
-export interface ChatState {
-  // Reactive — subscribed to by UI components.
-  conversationId: string | null;
-  /**
-   * Set when a live `session.superseded` event asks the client to follow
-   * the active conversation to another one (e.g. after a Claude `/clear`).
-   * `ChatPage` observes this, navigates to `/c/<id>` (replacing history so
-   * Back doesn't return to the cleared session), then clears it. Null when
-   * no redirect is pending. The store can't call react-router directly, so
-   * it hands the target to the page via this field. Live-only — a reload of
-   * the old conversation renders the persisted notice instead.
-   */
-  redirectToConversationId: string | null;
+/**
+ * State owned by a SINGLE conversation.
+ *
+ * Every field here describes one conversation: its transcript, turn
+ * lifecycle, binding, usage, and stream. Exactly one conversation is live
+ * at a time today, so these sit flat on the root store; keeping streams
+ * open in the background moves them onto a per-conversation store (see
+ * `docs/BACKGROUND_STREAMS_DESIGN.md`). A new field belongs here only if it
+ * still makes sense for a conversation the user is NOT looking at.
+ */
+export interface ConversationState {
   /**
    * Flat block list (history + streaming). Renderer walks this.
    *
@@ -257,34 +255,6 @@ export interface ChatState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
-  /**
-   * Messages submitted while the agent is busy, held client-side (not yet
-   * POSTed) and shown in the composer's queue strip. The head is flushed
-   * FIFO — one per turn — when the session goes idle. In-memory only.
-   */
-  queuedMessages: QueuedMessage[];
-  /**
-   * In-flight optimistic bubbles stashed per conversation so they survive
-   * in-app navigation (`switchTo`), keyed by conversation id.
-   *
-   * Scope: ONLY sends whose POST hasn't settled (`posted` unset). Until
-   * the POST returns, the message exists nowhere on the server — on a
-   * cold-starting runner the POST is held open for the whole ensure
-   * probe, before `pending_inputs.record()` runs — so navigating away
-   * and back in that window would otherwise drop the user's message
-   * entirely. Once the POST settles the server is the source of
-   * truth: the navigate-back snapshot re-seeds the bubble from
-   * `pending_inputs` while it's still queued, and shows it committed
-   * once the round-trip lands. Stashing a settled bubble is what made
-   * the stuck-forever pending message possible (committed while away +
-   * consumed event missed + image-only content the text dedupe can't
-   * match), so `send` prunes an entry from here the moment its POST
-   * settles. `bindStream` dedupes a restored bubble against committed
-   * messages that are NEW since the bubble was stashed (the round-trip
-   * can outrun the POST response — see
-   * {@link StashedPending.committedTexts}). Pruned to non-empty entries.
-   */
-  pendingByConversation: Record<string, StashedPending>;
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -360,17 +330,6 @@ export interface ChatState {
   /** Error from the snapshot fetch in `switchTo`, if any. */
   conversationLoadError: Error | null;
   /**
-   * Sticky picker pick — applies to the current session via PATCH and
-   * survives navigation + reload (localStorage). ``null`` means the
-   * agent-spec default applies.
-   */
-  selectedEffort: string | null;
-  /**
-   * Same shape as ``selectedEffort`` but for the LLM model. ``null``
-   * falls back to the agent's ``llmModel``.
-   */
-  selectedModel: string | null;
-  /**
    * The active session's REAL model override (server ``model_override``):
    * what the next turn actually uses, ``null`` when none and the agent
    * ``llmModel`` default applies. Session-scoped (NOT a sticky pick):
@@ -417,15 +376,6 @@ export interface ChatState {
    * fetch. `null` until the first snapshot is hydrated.
    */
   oldestItemId: string | null;
-  /** Bubble that should pulse briefly (highlight on nav jump). */
-  flashItemId: string | null;
-  /**
-   * Workspace files/folders queued to drop into the active composer's
-   * "@"-mention chips from outside the composer — e.g. the file viewer's
-   * "Attach to agent" button, which lives far from the composer in the tree.
-   * The composer drains this on change and clears it.
-   */
-  pendingComposerAttachments: ComposerAttachment[];
   /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
@@ -552,8 +502,88 @@ export interface ChatState {
    * cursor into the new one.
    */
   historyGeneration: number;
+}
 
-  // Actions.
+/**
+ * State that belongs to the APP, not to any one conversation.
+ *
+ * Sticky picker prefs span sessions; the rest describe the single active
+ * view (which conversation is on screen, what its composer is holding).
+ * These stay on the root store when per-conversation state moves out.
+ */
+export interface AppChatState {
+  /** The conversation currently on screen. `null` on `/`. */
+  conversationId: string | null;
+  /**
+   * Set when a live `session.superseded` event asks the client to follow
+   * the active conversation to another one (e.g. after a Claude `/clear`).
+   * `ChatPage` observes this, navigates to `/c/<id>` (replacing history so
+   * Back doesn't return to the cleared session), then clears it. Null when
+   * no redirect is pending. The store can't call react-router directly, so
+   * it hands the target to the page via this field. Live-only — a reload of
+   * the old conversation renders the persisted notice instead.
+   */
+  redirectToConversationId: string | null;
+  /**
+   * Messages submitted while the agent is busy, held client-side (not yet
+   * POSTed) and shown in the composer's queue strip. The head is flushed
+   * FIFO — one per turn — when the session goes idle. In-memory only.
+   *
+   * One flat array across ALL conversations (each entry carries its
+   * `conversationId`), so it is app-global rather than per-conversation:
+   * `flushBackgroundQueues` drains conversations the user has navigated
+   * away from.
+   */
+  queuedMessages: QueuedMessage[];
+  /**
+   * In-flight optimistic bubbles stashed per conversation so they survive
+   * in-app navigation (`switchTo`), keyed by conversation id.
+   *
+   * Scope: ONLY sends whose POST hasn't settled (`posted` unset). Until
+   * the POST returns, the message exists nowhere on the server — on a
+   * cold-starting runner the POST is held open for the whole ensure
+   * probe, before `pending_inputs.record()` runs — so navigating away
+   * and back in that window would otherwise drop the user's message
+   * entirely. Once the POST settles the server is the source of
+   * truth: the navigate-back snapshot re-seeds the bubble from
+   * `pending_inputs` while it's still queued, and shows it committed
+   * once the round-trip lands. Stashing a settled bubble is what made
+   * the stuck-forever pending message possible (committed while away +
+   * consumed event missed + image-only content the text dedupe can't
+   * match), so `send` prunes an entry from here the moment its POST
+   * settles. `bindStream` dedupes a restored bubble against committed
+   * messages that are NEW since the bubble was stashed (the round-trip
+   * can outrun the POST response — see
+   * {@link StashedPending.committedTexts}). Pruned to non-empty entries.
+   *
+   * Exists only because switching conversations destroys their state;
+   * keeping streams open in the background removes the need for it.
+   */
+  pendingByConversation: Record<string, StashedPending>;
+  /**
+   * Sticky picker pick — applies to the current session via PATCH and
+   * survives navigation + reload (localStorage). ``null`` means the
+   * agent-spec default applies.
+   */
+  selectedEffort: string | null;
+  /**
+   * Same shape as ``selectedEffort`` but for the LLM model. ``null``
+   * falls back to the agent's ``llmModel``.
+   */
+  selectedModel: string | null;
+  /** Bubble that should pulse briefly (highlight on nav jump). */
+  flashItemId: string | null;
+  /**
+   * Workspace files/folders queued to drop into the active composer's
+   * "@"-mention chips from outside the composer — e.g. the file viewer's
+   * "Attach to agent" button, which lives far from the composer in the tree.
+   * The composer drains this on change and clears it.
+   */
+  pendingComposerAttachments: ComposerAttachment[];
+}
+
+/** Actions exposed on the root store. */
+export interface ChatActions {
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
@@ -700,6 +730,16 @@ export interface ChatState {
    */
   refreshSessionState: (conversationId?: string) => Promise<void>;
 }
+
+/**
+ * The root store's shape: the active conversation's state, flattened
+ * alongside app-global state and the actions.
+ *
+ * The `ConversationState` half is a projection of whichever conversation is
+ * active. Reading it is how components stay agnostic about that; writing it
+ * is how the single active conversation is driven today.
+ */
+export interface ChatState extends ConversationState, AppChatState, ChatActions {}
 
 let queryClient: QueryClient | null = null;
 
