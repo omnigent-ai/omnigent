@@ -64,6 +64,10 @@ _FLAG_WRAPPERS: dict[str, frozenset[str]] = {
     # bare-word skip expects the command.
     "sudo": frozenset(
         {
+            "-a",
+            "--auth-type",  # BSD: authentication type (takes a value)
+            "-c",
+            "--login-class",  # BSD: login class (takes a value)
             "-C",
             "--close-from",
             "-D",

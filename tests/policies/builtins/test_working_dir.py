@@ -331,6 +331,11 @@ def test_env_prefix_stripped_before_classifying() -> None:
         # Bundled short options: ``-u root`` still consumes its value token.
         "sudo -nu root cd /etc",
         "env -iu FOO cd /etc",
+        # BSD sudo: -a/--auth-type and -c/--login-class take a value.
+        "sudo -a foo cd /etc",
+        "sudo --auth-type foo cd /etc",
+        "sudo -c bar cd /etc",
+        "sudo --login-class bar cd /etc",
         # ``git -C`` behind the same wrappers.
         "sudo -u root git -C /other status",
         "env -i git -C /other status",
