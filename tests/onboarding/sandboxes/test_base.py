@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 from typing import ClassVar
@@ -17,11 +18,15 @@ from typing import ClassVar
 import pytest
 import yaml
 
+from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxLauncher,
     render_host_config_write_command,
+    supervise_host_command,
 )
+
+_HOST_LAUNCH = "FOO=bar omnigent host --server https://srv"
 
 
 class _RecordingLauncher(SandboxLauncher):
@@ -67,13 +72,75 @@ def test_run_background_wraps_command_in_sh_c() -> None:
     """
     launcher = _RecordingLauncher()
 
-    launcher.run_background("sb-1", "FOO=bar omnigent host --server https://srv")
+    launcher.run_background("sb-1", _HOST_LAUNCH)
 
     [cmd] = launcher.commands
     assert cmd == (
-        "setsid nohup sh -c 'FOO=bar omnigent host --server https://srv' "
+        f"setsid nohup sh -c {shlex.quote(supervise_host_command(_HOST_LAUNCH))} "
         "> /tmp/omnigent-host.log 2>&1 < /dev/null & echo launched"
     )
+    # The env prefix stays attached to the launch inside the quoted script, so
+    # the inner shell re-applies it on every supervised restart attempt.
+    assert _HOST_LAUNCH in cmd
+
+
+@pytest.mark.parametrize(
+    ("exit_codes", "expected_attempts", "expected_rc"),
+    [
+        ([0], 1, 0),
+        ([HOST_FATAL_EXIT_CODE], 1, HOST_FATAL_EXIT_CODE),
+        ([143], 1, 143),
+        ([1, 9, 0], 3, 0),
+        ([1, HOST_FATAL_EXIT_CODE], 2, HOST_FATAL_EXIT_CODE),
+    ],
+)
+def test_supervise_host_command_restarts_only_on_crash(
+    tmp_path: Path,
+    exit_codes: list[int],
+    expected_attempts: int,
+    expected_rc: int,
+) -> None:
+    """
+    The supervisor restarts a crashed host and stands down on a deliberate exit.
+
+    A dead host leaves a healthy, still-billing sandbox with nothing running in
+    it, and the only recovery is re-provisioning a fresh one — which discards
+    the workspace. So a crash (any unexpected code) must restart in place. But a
+    clean exit, the fatal credential/version code, and SIGTERM are all
+    deliberate: retrying those would spin forever on a failure that can never
+    succeed, unwatched, inside a remote sandbox.
+
+    Runs the real generated script through ``sh`` against a fake host that exits
+    with a scripted sequence of codes, with ``sleep`` stubbed out so the backoff
+    doesn't slow the test.
+    """
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    sleep_stub = stub_bin / "sleep"
+    sleep_stub.write_text("#!/bin/sh\nexit 0\n")
+    sleep_stub.chmod(0o755)
+
+    plan = tmp_path / "plan"
+    plan.write_text("".join(f"{code}\n" for code in exit_codes))
+    attempts = tmp_path / "attempts"
+    attempts.write_text("0\n")
+    fake_host = tmp_path / "fake-host"
+    fake_host.write_text(
+        "#!/bin/sh\n"
+        f'n=$(cat {attempts}); n=$((n + 1)); echo "$n" > {attempts}\n'
+        f'exit "$(sed -n "${{n}}p" {plan})"\n'
+    )
+    fake_host.chmod(0o755)
+
+    proc = subprocess.run(
+        ["sh", "-c", supervise_host_command(str(fake_host))],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert proc.returncode == expected_rc
+    assert attempts.read_text().strip() == str(expected_attempts)
 
 
 def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:

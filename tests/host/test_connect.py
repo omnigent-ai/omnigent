@@ -16,6 +16,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
 
+from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
@@ -3554,11 +3555,14 @@ async def test_run_reconnects_on_transient_upgrade_failure(
 def test_run_host_process_exits_nonzero_on_fatal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """run_host_process surfaces a fatal tunnel failure as exit code 1.
+    """run_host_process surfaces a fatal tunnel failure as its own exit code.
 
     The CLI entry point must print the cause + fix and exit non-zero, not
-    hang silently. Driven through the real ``asyncio.run``
-    path, so this is a sync test.
+    hang silently. The code is the dedicated fatal one rather than a bare
+    1, so an in-sandbox supervisor can tell "this can never succeed" from
+    "this crashed" and stand down instead of restarting a bad credential
+    forever. Driven through the real ``asyncio.run`` path, so this is a
+    sync test.
     """
     _patch_connect(monkeypatch, _ConnectSpy([_invalid_status(403)]))
 
@@ -3568,8 +3572,10 @@ def test_run_host_process_exits_nonzero_on_fatal(
             config_path=tmp_path / "config.yaml",
         )
 
-    # Non-zero exit so callers/CI see the failure.
-    assert excinfo.value.code == 1
+    # Non-zero exit so callers/CI see the failure, and distinguishable
+    # from a crash so supervision doesn't retry it.
+    assert excinfo.value.code == HOST_FATAL_EXIT_CODE
+    assert HOST_FATAL_EXIT_CODE != 1
     err = capsys.readouterr().err
     # The actionable message reached stderr (banner + the 403 cause).
     assert "Could not connect" in err

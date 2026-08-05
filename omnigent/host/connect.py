@@ -28,6 +28,7 @@ from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -2855,8 +2856,8 @@ def run_host_process(
         ``"https://omnigent-app.databricksapps.com"``.
     :param config_path: Optional path to ``config.yaml``.
         Defaults to ``~/.omnigent/config.yaml``.
-    :raises SystemExit: With code 1 when the tunnel fails permanently
-        (auth / authorization / outdated server). The
+    :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
+        fails permanently (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
     host_log_path = configure_process_logging("host")
@@ -2895,5 +2896,7 @@ def run_host_process(
         # Fail loud: a permanent connection failure must not look like the
         # process is still working. Print the cause + fix, then exit non-zero
         # instead of the old behavior of reconnecting silently forever.
+        # The dedicated code (not a bare 1) tells a supervisor this can never
+        # succeed, so it stops retrying instead of looping on a bad credential.
         print(f"\n✗ Could not connect to {server_url}.\n{exc}", file=sys.stderr, flush=True)
-        raise SystemExit(1) from exc
+        raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
