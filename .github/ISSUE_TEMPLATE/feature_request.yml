@@ -31,7 +31,8 @@ body:
     id: harness
     attributes:
       label: Harness
-      description: Select the affected harness, if any.
+      description: Select the affected harnesses, if any.
+      multiple: true
       options:
         - Not applicable
         - Claude
@@ -72,6 +73,7 @@ body:
     id: harness-mode
     attributes:
       label: Harness mode
+      multiple: true
       options:
         - Not applicable
         - SDK
@@ -97,6 +99,7 @@ body:
     id: auth-type
     attributes:
       label: Authentication type
+      multiple: true
       options:
         - Not authentication-related
         - Local
