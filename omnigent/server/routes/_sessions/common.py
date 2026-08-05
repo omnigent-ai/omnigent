@@ -268,6 +268,15 @@ _HOST_RUNNER_STATUS_TIMEOUT_S = 3.0
 _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 
 
+# Budget for a freshly provisioned managed sandbox's FIRST tunnel connect —
+# separate from _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S (which times a warm
+# host's runner reconnect). A cold MicroVM boot (RunMicrovm -> RUNNING -> /run
+# hook -> omnigent host dial-back) can take 30-90s; 30s is too tight and
+# strands the session with a host that reads online but was never sent
+# launch_runner.
+_MANAGED_HOST_CONNECT_TIMEOUT_S = 120.0
+
+
 _RUNNER_CONVICTION_POLL_S = 0.25
 
 
@@ -794,6 +803,7 @@ __all__ = [
     "_LAST_CONTEXT_WINDOW_LABEL_KEY",
     "_LAST_TASK_ERROR_CODE_LABEL_KEY",
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
+    "_MANAGED_HOST_CONNECT_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",

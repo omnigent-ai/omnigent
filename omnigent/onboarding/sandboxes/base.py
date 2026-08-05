@@ -428,6 +428,27 @@ class SandboxLifecycle(ABC):
             return False
         return self_method is not base_method
 
+    # Whether :meth:`resume` brings back the previous ``omnigent host`` process
+    # itself, not just the compute + volume. A snapshot-suspend backend thaws a
+    # VM with the whole process tree (and its still-valid launch token) intact,
+    # so the host reconnects on its own — the wake path must NOT re-run
+    # :meth:`start_host` (which would start a SECOND host / mint a fresh
+    # sandbox). Providers whose resume only restores compute and rely on the
+    # wake path to restart the host (Islo pauses the daemon; the default)
+    # leave this ``False``. Only meaningful when :attr:`can_resume` is ``True``.
+    resume_preserves_host: ClassVar[bool] = False
+
+    # Set by :meth:`start_host` implementations whose sandbox id is assigned by
+    # the provider AT START (not knowable at :meth:`provision` time, and not the
+    # workspace path start_host must return). The managed-launch framework reads
+    # this AFTER start_host returns and persists it onto the host row as the
+    # canonical ``sandbox_id`` for later :meth:`terminate` / :meth:`resume`.
+    # ``None`` means "no remapping" — the provision-time id stands (every
+    # exec-model and name-your-own-resource provider). Instance attribute, not a
+    # ClassVar: a launcher is built fresh per managed op and one instance runs
+    # provision + start_host together, so it is safe per-op state.
+    started_sandbox_id: str | None = None
+
     @abstractmethod
     def prepare(self) -> None:
         """

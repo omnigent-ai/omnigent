@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import pathlib
 import sys
@@ -342,7 +343,49 @@ class _ClaudeSDK(Protocol):
     ToolResultBlock: type
 
 
-_CONNECT_TIMEOUT_SECONDS = 60.0
+def _env_float(name: str, default: float) -> float:
+    """Read a positive, finite float from the environment, falling back on default.
+
+    Rejects ``inf``/``nan`` (which ``float()`` parses without error): a non-finite
+    timeout would either never fire or blow up downstream (e.g. ``int(value * 1000)``
+    raises ``OverflowError`` on ``inf``).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+    """Read a non-negative int from the environment, falling back on default.
+
+    Unlike :func:`_env_float`, ``0`` is a valid value here (e.g. a retry count
+    of 0 disables retries) — only a negative or unparseable value falls back.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+# First `claude` CLI connect on a cold host (fresh sandbox: IMDS credential
+# resolution + first TLS handshake to the model endpoint) can exceed the warm
+# case by a wide margin; overridable so a slow-cold-start environment (e.g. a
+# just-booted Lambda MicroVM reaching Bedrock via its execution role) can raise
+# it without a rebuild.
+_CONNECT_TIMEOUT_SECONDS = _env_float("OMNIGENT_CLAUDE_SDK_CONNECT_TIMEOUT_S", 60.0)
+# One automatic retry when the FIRST connect times out: the SDK leaves a warmed
+# CLI process/credential cache behind, so the retry connects fast. Prevents a
+# cold-start timeout from failing the whole first turn. Set to 0 to disable.
+_CONNECT_TIMEOUT_RETRIES = _env_non_negative_int("OMNIGENT_CLAUDE_SDK_CONNECT_RETRIES", 1)
 _QUERY_START_TIMEOUT_SECONDS = 30.0
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
@@ -719,6 +762,32 @@ def _unset_env_var(name: str) -> Iterator[None]:
         yield
     finally:
         if previous is not None:
+            os.environ[name] = previous
+
+
+@contextmanager
+def _set_env_var(name: str, value: str) -> Iterator[None]:
+    """
+    Temporarily set an env var for the ``with`` block, then restore its prior
+    value (or unset it if it was absent before).
+
+    Used around the claude-cli subprocess spawn to hand the SDK a larger
+    ``CLAUDE_CODE_STREAM_CLOSE_TIMEOUT`` (its initialize control-request budget)
+    only for the connect window, without leaking the override to the rest of
+    the process.
+
+    :param name: Env var name to set for the block.
+    :param value: Value to set for the block.
+    :yields: Nothing; restores the prior state on exit.
+    """
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
             os.environ[name] = previous
 
 
@@ -1651,20 +1720,75 @@ class ClaudeSDKExecutor(Executor):
                 # ``options.settings`` explicitly sets apiKeyHelper and
                 # ``options.env`` sets the Databricks base URL, so the
                 # Claude CLI does not need an inherited Anthropic key.
-                with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
-                    await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
+                # Give the SDK's own initialize handshake the same generous
+                # budget as our outer connect wait. The SDK reads
+                # CLAUDE_CODE_STREAM_CLOSE_TIMEOUT (milliseconds, floored at 60s)
+                # for its "initialize" control request; on a cold host that
+                # handshake (CLI spawn + first IMDS credential resolution) can
+                # exceed the 60s default and raise "Control request timeout:
+                # initialize" before our wait_for fires.
+                with (
+                    _unset_env_var("CLAUDECODE"),
+                    _unset_env_var("ANTHROPIC_API_KEY"),
+                    _set_env_var(
+                        "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT",
+                        str(int(_CONNECT_TIMEOUT_SECONDS * 1000)),
+                    ),
+                ):
+                    # Retry a cold-start connect timeout: the first attempt on a
+                    # fresh host warms the CLI process + credential cache, so a
+                    # second attempt connects fast. Both our outer wait_for
+                    # TimeoutError and the SDK's inner "Control request timeout"
+                    # retry; a hard failure (bad option, missing CLI) does not.
+                    for _attempt in range(_CONNECT_TIMEOUT_RETRIES + 1):
+                        try:
+                            await asyncio.wait_for(
+                                client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
+                            )
+                            break
+                        except Exception as _connect_exc:
+                            _is_wait_timeout = isinstance(_connect_exc, asyncio.TimeoutError)
+                            _is_control_timeout = (
+                                not _is_wait_timeout
+                                and "control request timeout" in str(_connect_exc).lower()
+                            )
+                            if not _is_wait_timeout and not _is_control_timeout:
+                                raise
+                            if _attempt >= _CONNECT_TIMEOUT_RETRIES:
+                                if _is_control_timeout:
+                                    # A terminal control-request timeout is not an
+                                    # asyncio.TimeoutError, so re-raising as-is would
+                                    # land in the generic handler and drop the attempt
+                                    # count. Route it to the timeout handler instead so
+                                    # the surfaced message matches a connect timeout.
+                                    raise TimeoutError(str(_connect_exc)) from _connect_exc
+                                raise
+                            connect_stderr.clear()
+                            logger.warning(
+                                "Claude SDK connect timed out (%s) after %ds "
+                                "(attempt %d/%d); retrying with a warmed CLI",
+                                "control-request" if _is_control_timeout else "connect",
+                                int(_CONNECT_TIMEOUT_SECONDS),
+                                _attempt + 1,
+                                _CONNECT_TIMEOUT_RETRIES + 1,
+                            )
+                            await self._force_close_client(client)
+                            client = sdk.ClaudeSDKClient(options)
             except asyncio.TimeoutError as exc:
                 await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
                 logger.warning(
-                    "Claude SDK connect timed out after %ds; CLI stderr tail:\n%s",
+                    "Claude SDK connect timed out after %ds (%d attempts); CLI stderr tail:\n%s",
                     int(_CONNECT_TIMEOUT_SECONDS),
+                    _CONNECT_TIMEOUT_RETRIES + 1,
                     detail,
                 )
                 raise TimeoutError(
                     f"Claude SDK client connect timed out after "
-                    f"{int(_CONNECT_TIMEOUT_SECONDS)}s. CLI stderr tail:\n{detail}"
+                    f"{int(_CONNECT_TIMEOUT_SECONDS)}s "
+                    f"({_CONNECT_TIMEOUT_RETRIES + 1} attempts). "
+                    f"CLI stderr tail:\n{detail}"
                 ) from exc
             except Exception as exc:
                 # The CLI may exit immediately (e.g. ``unknown option``) before

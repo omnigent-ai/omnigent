@@ -68,6 +68,22 @@ def test_plugin_state_loads_builtins() -> None:
     assert isinstance(state, SandboxProviderPluginState)
     assert "modal" in state
     assert "kubernetes" in state
+    assert "lambda_microvm" in state
+
+
+def test_lambda_microvm_resolves_through_registry_not_legacy_fallback(
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    """lambda_microvm instantiates via the canonical registry, silently.
+
+    Resolution through the deprecated _LAUNCHERS fallback would emit a
+    DeprecationWarning on every launch and break the day the fallback is
+    removed — the built-in contribution is the supported registration.
+    """
+    reset_plugin_state_for_tests()
+    launcher = get_launcher("lambda_microvm")
+    assert type(launcher).__name__ == "LambdaMicroVMSandboxLauncher"
+    assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
 
 
 def test_plugin_state_is_cached() -> None:

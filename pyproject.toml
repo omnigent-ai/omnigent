@@ -173,6 +173,14 @@ openshell = ["openshell>=0.0.88,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<37"]
+# AWS Lambda MicroVMs launcher (server-managed `sandbox.provider:
+# lambda_microvm`). The launcher module ships in the base package and imports
+# boto3 lazily, so only users of the provider need this extra. Floor is the
+# `lambda-microvms` service-model GA release (botocore 1.43.35 and its matching
+# boto3), NOT the looser bedrock/s3 pin — an older boto3 passes the import
+# probe and then fails at `boto3.client("lambda-microvms")` with
+# UnknownServiceError.
+lambda-microvm = ["boto3>=1.43.35,<2", "botocore>=1.43.35,<2"]
 # The tracing extra is now a no-op shim kept for backwards compatibility.
 # Tracing is built on OpenTelemetry directly (opentelemetry-exporter-otlp-*
 # are in the default install). `omnigent[tracing]` still works — it just
@@ -353,6 +361,16 @@ dev = [
 # `omni` ship, internal and OSS alike.)
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
+
+[tool.uv]
+# Temporary cap-lift: mlflow (transitive via the `databricks` extra's
+# databricks-mcp -> databricks-ai-bridge chain) declares cryptography<50 even at
+# its latest release (3.15.1, 2026-08-03), which blocks the ONLY release fixing
+# PYSEC-2026-3552 / CVE-2026-69247 (cryptography 50.0.0 — the OSV scan fails
+# the lock on it). mlflow's cryptography use has no known 50.x break; the cap
+# is the usual precautionary major-version pin. Drop this override once mlflow
+# ships a release allowing cryptography>=50.
+override-dependencies = ["cryptography>=43.0.0,<51"]
 
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]

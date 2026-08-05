@@ -133,6 +133,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _FENCE_EXEMPT_EVENT_TYPES,
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
     _LAST_CONTEXT_WINDOW_LABEL_KEY,
+    _MANAGED_HOST_CONNECT_TIMEOUT_S,
     _MANAGED_RESUMABLE_TUNNEL_STALE_S,
     _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
     _MODEL_TOKEN_KEYS,
@@ -2615,6 +2616,48 @@ async def _bind_and_launch_managed_runner(
     runner_id: str | None = None
     if host_registry is not None:
         host_conn = host_registry.get(managed.host_id)
+        if host_conn is None:
+            # A freshly provisioned sandbox (e.g. a Lambda MicroVM that boots,
+            # runs its /run hook, then dials back) can take tens of seconds to
+            # register its tunnel — the bind above completes well before the
+            # host connection lands on this replica. Poll until it appears so
+            # the runner launches, instead of settling "ready" with no runner
+            # (which strands the session: the host reads online, so the message
+            # relaunch path won't wake it either). The budget covers a cold
+            # MicroVM boot (run → RUNNING → /run hook → omnigent host dial-back).
+            #
+            # REPLICA-LOCAL: HostRegistry only sees tunnels terminated on THIS
+            # server process. A host that dialed back to a different replica
+            # never appears here, so this poll runs its full budget and fails a
+            # launch that actually succeeded elsewhere. Fine on the current
+            # single-replica deployment topology; horizontal scaling needs
+            # either tunnel-affinity routing (the launching replica receives
+            # the dial-back) or a shared connection registry before this path
+            # is correct with >1 replica.
+            _host_connect_deadline = time.monotonic() + _MANAGED_HOST_CONNECT_TIMEOUT_S
+            while host_conn is None and time.monotonic() < _host_connect_deadline:
+                await asyncio.sleep(0.5)
+                host_conn = host_registry.get(managed.host_id)
+            if host_conn is None:
+                # The host never dialed back within the budget. Falling through
+                # to "ready" here would strand the session (host reads online so
+                # the message-relaunch path won't wake it, yet no runner exists).
+                # Fail the launch loudly, mirroring the harness-not-configured
+                # path below and the delete-during-provisioning path above.
+                reason = (
+                    f"managed host did not register its tunnel within "
+                    f"{_MANAGED_HOST_CONNECT_TIMEOUT_S}s of provisioning"
+                )
+                _logger.warning(
+                    "Managed host %s for session %s did not register its tunnel "
+                    "within %ss of provisioning; failing the launch",
+                    managed.host_id,
+                    session_id,
+                    _MANAGED_HOST_CONNECT_TIMEOUT_S,
+                )
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
         if host_conn is not None:
             launch_attempt = await _launch_runner_on_host(
                 conv,

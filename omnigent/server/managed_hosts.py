@@ -86,6 +86,13 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
+         lambda_microvm:          # optional block (provider: lambda_microvm)
+           region: us-east-1                 # AWS region (default: ambient boto3)
+           image_identifier: omnigent-host   # prebuilt MicroVM image name/ARN
+           image_version: "1.0"              # optional; default: latest
+           execution_role_arn: arn:aws:iam::123:role/omnigent-microvm-exec
+           env: [ANTHROPIC_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+                                                # as MicroVM env
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -101,9 +108,13 @@ stores into ``create_app``):
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
-   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
-   parses but rejects at launch.
+   OpenShell gateway access. The ``lambda_microvm`` launcher reads AWS
+   credentials from the server's ambient boto3 chain (profile /
+   environment / instance role) and needs a prebuilt MicroVM image
+   (``sandbox.lambda_microvm.image_identifier``). ``modal``, ``daytona``,
+   ``boxlite``, ``cwsandbox``, ``islo``, ``e2b``, ``openshell``,
+   ``kubernetes``, and ``lambda_microvm`` have managed-launch support;
+   ``lakebox`` parses but rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -126,13 +137,14 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import os
 import posixpath
 import re
 import secrets
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import click
@@ -163,17 +175,52 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "lambda_microvm",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+        "lambda_microvm",
+    }
 )
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """
+    Read a positive int from the environment, falling back on default.
+
+    :param name: Environment variable to read, e.g. ``"OMNIGENT_X_S"``.
+    :param default: Value used when unset, unparseable, or non-positive.
+    :returns: The resolved positive int.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
 
 # How long a managed launch waits for the sandboxed host to register
 # before declaring failure. The image is pre-baked (no pip install at
 # boot), so a healthy launch registers in seconds; the budget covers a
 # cold registry pull of the image on first use.
-MANAGED_HOST_ONLINE_TIMEOUT_S = 120
+#
+# Shared by every managed provider, so the default stays tight enough to
+# detect a genuinely stuck launch. Tunable for deployments whose cold
+# image pull runs long (a constrained registry path, a large custom
+# image), where the default would report a slow launch as a failed one.
+MANAGED_HOST_ONLINE_TIMEOUT_S = _env_positive_int("OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S", 120)
 _ONLINE_POLL_INTERVAL_S = 1.0
 
 # Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
@@ -862,6 +909,23 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             secret_mounts=secret_mounts,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "lambda_microvm":
+        from omnigent.onboarding.sandboxes.lambda_microvm import managed_token_ttl_s
+
+        launcher_factory = _lambda_microvm_launcher_factory(
+            region=_parse_provider_string(raw, "lambda_microvm", "region"),
+            image_identifier=_parse_provider_string(raw, "lambda_microvm", "image_identifier"),
+            image_version=_parse_provider_string(raw, "lambda_microvm", "image_version"),
+            execution_role_arn=_parse_provider_string(raw, "lambda_microvm", "execution_role_arn"),
+            env=_parse_provider_env(raw, "lambda_microvm"),
+            egress_network_connectors=_parse_provider_string_list(
+                raw, "lambda_microvm", "egress_network_connectors"
+            ),
+        )
+        # Derived from OMNIGENT_LAMBDA_MICROVM_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) 8 h sandbox lifetime — mirrors the
+        # cwsandbox / e2b path.
+        token_ttl_s = managed_token_ttl_s()
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -1596,6 +1660,33 @@ def _parse_provider_env(raw: dict[str, object], provider: str) -> list[str] | No
     return [name.strip() for name in env]
 
 
+def _parse_provider_string_list(
+    raw: dict[str, object], provider: str, key: str
+) -> list[str] | None:
+    """
+    Extract and validate an optional provider list-of-strings field.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param provider: Provider block name, e.g. ``"lambda_microvm"``.
+    :param key: Field name under the provider block.
+    :returns: The stripped non-empty strings, or ``None`` when omitted.
+    :raises ValueError: When present but not a list of non-empty strings.
+    """
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(
+            f"server config 'sandbox.{provider}.{key}' must be a list of non-empty strings"
+        )
+    return [item.strip() for item in value]
+
+
 def _parse_provider_string(raw: dict[str, object], provider: str, key: str) -> str | None:
     """
     Extract and validate an optional provider string field.
@@ -2118,6 +2209,53 @@ def _kubernetes_launcher_factory(
     return _build
 
 
+def _lambda_microvm_launcher_factory(
+    *,
+    region: str | None,
+    image_identifier: str | None,
+    image_version: str | None,
+    execution_role_arn: str | None,
+    env: list[str] | None,
+    egress_network_connectors: list[str] | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: lambda_microvm`` path.
+
+    :param region: AWS region MicroVMs run in, or ``None`` for the launcher's
+        env-var fallback / ambient boto3 region.
+    :param image_identifier: Prebuilt MicroVM image (name or ARN) the host was
+        built into via ``create-microvm-image``, or ``None`` for the launcher's
+        env-var fallback (required at launch).
+    :param image_version: Specific MicroVM image version, or ``None`` for the
+        account's latest.
+    :param execution_role_arn: IAM role the running MicroVM assumes, or ``None``
+        for the launcher's env-var fallback (required at launch).
+    :param env: Names of server-process environment variables (harness LLM
+        credentials, gateway URLs, ``GIT_TOKEN``) injected into every MicroVM,
+        e.g. ``["ANTHROPIC_API_KEY", "GIT_TOKEN"]``, or ``None``.
+    :param egress_network_connectors: VPC egress network-connector ARNs attached
+        at ``run-microvm`` so the MicroVM reaches a private server / private
+        resources over the customer VPC, or ``None`` for the launcher's env-var
+        fallback / the account default (public internet egress).
+    :returns: A factory producing parameterized Lambda MicroVM launchers.
+    """
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the Lambda MicroVM launcher (lazy boto3 import inside)."""
+        from omnigent.onboarding.sandboxes.lambda_microvm import LambdaMicroVMSandboxLauncher
+
+        return LambdaMicroVMSandboxLauncher(
+            region=region,
+            image_identifier=image_identifier,
+            image_version=image_version,
+            execution_role_arn=execution_role_arn,
+            env=env,
+            egress_network_connectors=egress_network_connectors,
+        )
+
+    return _build
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxConfig,
@@ -2414,6 +2552,15 @@ async def _arm_and_start_host(
             host_config=config.host_config,
             on_stage=on_stage,
         )
+        # Some providers assign the real sandbox id only at start (Lambda
+        # MicroVMs' run-microvm returns a microvmId unknowable at provision
+        # time). Persist it so terminate/resume — including this block's own
+        # failure cleanup, which keys off record.sandbox_id — hit the id the
+        # provider actually knows, not the reserved name.
+        started_id = getattr(launcher, "started_sandbox_id", None)
+        if started_id is not None and started_id != sandbox_id:
+            await asyncio.to_thread(host_store.update_sandbox_id, host_id, started_id)
+            record = replace(record, sandbox_id=started_id)
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
         # Broad on purpose: any post-provision failure — launcher CLI
@@ -2625,33 +2772,40 @@ async def resume_managed_host(
         )
         try:
             await asyncio.to_thread(launcher.resume, sandbox_id)
-            # Mint a fresh token: the old one died with the host process's env
-            # (only its hash persists). register_managed_host's relaunch branch
-            # overwrites it in place, keeping the host_id's session bindings.
-            token = secrets.token_urlsafe(32)
-            await asyncio.to_thread(
-                host_store.register_managed_host,
-                host_id=host.host_id,
-                name=host.name,
-                user_id=host.user_id,
-                token=token,
-                provider=launcher.provider,
-                sandbox_id=sandbox_id,
-                token_expires_at=now_epoch() + config.token_ttl_s,
-            )
-            await _start_sandbox_host(
-                launcher,
-                sandbox_id,
-                token=token,
-                host_id=host.host_id,
-                host_name=host.name,
-                server_url=config.server_url,
-                repo_url=None,  # the persistent volume already holds the workspace
-                repo_branch=None,
-                repo_name=None,
-                host_config=config.host_config,
-                on_stage=on_stage,
-            )
+            if not launcher.resume_preserves_host:
+                # The resume restored compute + volume but NOT the host process
+                # (e.g. Islo pauses the daemon). Mint a fresh token — the old one
+                # died with the host process's env (only its hash persists) — and
+                # restart the host. register_managed_host's relaunch branch
+                # overwrites the token in place, keeping the host_id's session
+                # bindings.
+                token = secrets.token_urlsafe(32)
+                await asyncio.to_thread(
+                    host_store.register_managed_host,
+                    host_id=host.host_id,
+                    name=host.name,
+                    user_id=host.user_id,
+                    token=token,
+                    provider=launcher.provider,
+                    sandbox_id=sandbox_id,
+                    token_expires_at=now_epoch() + config.token_ttl_s,
+                )
+                await _start_sandbox_host(
+                    launcher,
+                    sandbox_id,
+                    token=token,
+                    host_id=host.host_id,
+                    host_name=host.name,
+                    server_url=config.server_url,
+                    repo_url=None,  # the persistent volume already holds the workspace
+                    repo_branch=None,
+                    repo_name=None,
+                    host_config=config.host_config,
+                    on_stage=on_stage,
+                )
+            # else: a snapshot thaw brought the ``omnigent host`` process back
+            # with its still-valid launch token, so it reconnects on its own —
+            # restarting it would start a second host / mint a fresh sandbox.
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
             # A failed wake must NOT tear the sandbox down (the volume is the

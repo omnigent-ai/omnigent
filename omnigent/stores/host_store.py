@@ -735,6 +735,30 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
+    def update_sandbox_id(self, host_id: str, sandbox_id: str) -> None:
+        """
+        Overwrite a managed host's recorded sandbox id.
+
+        Used when the provider assigns the real sandbox id only at start
+        (e.g. Lambda MicroVMs' ``run-microvm`` returns a ``microvmId`` that
+        cannot be known at ``provision`` time): the framework registers the
+        row with the reserved name, then calls this once ``start_host`` has
+        surfaced the real id, so later terminate / resume key off the id the
+        provider actually knows. No-op if the host does not exist.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param sandbox_id: The provider-assigned sandbox id to persist.
+        """
+        with self._session("update_host_sandbox_id") as session:
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                row.sandbox_id = sandbox_id
+                row.updated_at = now_epoch()
+
     def resolve_launch_token(self, host_id: str, token: str) -> Host | None:
         """
         Resolve a launch token presented for *host_id* to its managed host.
