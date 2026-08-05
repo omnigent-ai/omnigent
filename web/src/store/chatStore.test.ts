@@ -3113,6 +3113,15 @@ describe("chatStore — stop", () => {
 });
 
 describe("chatStore — handleSessionEvent (session.* events)", () => {
+  // These cases call `handleSessionEvent` directly, without the stream that
+  // normally names the delivering conversation. Bind `conv_abc` — the id their
+  // events carry — so a write lands on the active conversation exactly as it
+  // would in production. Cases that assert the cross-conversation guard
+  // deliberately bind something else, or name another conversation in the event.
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_abc" });
+  });
+
   describe("session.presence", () => {
     it("replaces the viewer list wholesale for the bound conversation", () => {
       useChatStore.setState({
@@ -3358,6 +3367,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       // cost_control.plan verdict) BEFORE the harness runs; this refetch is
       // what lets the routing-verdict tooltip render mid-turn instead of
       // only after the idle/failed turn-end invalidation.
+      //
+      // Bind conv_ts: the once-per-turn latch compares against
+      // `activeResponse.responseId`, which only advances when the status patch
+      // applies — i.e. for the conversation on screen.
+      useChatStore.setState({ conversationId: "conv_ts" });
       const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
         type: "session_status",
@@ -4558,6 +4572,104 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent(event);
       // Same reference — no setState call fired.
       expect(useChatStore.getState()).toBe(before);
+    });
+  });
+
+  describe("routing by delivering stream", () => {
+    // Events are routed by the stream that delivered them, not by their
+    // payload: `session.input.consumed`, `session.interrupted` and others carry
+    // no conversation id at all, so their contents cannot say where they
+    // belong. Once background streams stay open, a write that ignores its
+    // source paints a conversation the user is not looking at onto the one they
+    // are. These cases pass an explicit source id — what `tapSessionEvents`
+    // supplies in production — and assert the visible conversation is untouched.
+    beforeEach(() => {
+      useChatStore.setState({ conversationId: "conv_visible" });
+    });
+
+    it("drops a status patch delivered by a background conversation's stream", () => {
+      useChatStore.setState({ sessionStatus: "idle", status: "idle" });
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_bg", status: "running" },
+        "conv_bg",
+      );
+      // The visible conversation is idle and must stay idle — otherwise a
+      // background agent's turn lights up this conversation's "Working…".
+      expect(useChatStore.getState().sessionStatus).toBe("idle");
+      expect(useChatStore.getState().status).toBe("idle");
+    });
+
+    it("drops a todo list delivered by a background conversation's stream", () => {
+      useChatStore.setState({ todos: [] });
+      handleSessionEvent(
+        {
+          type: "session_todos",
+          conversationId: "conv_bg",
+          todos: [{ content: "bg work", status: "in_progress", activeForm: "Doing bg work" }],
+        },
+        "conv_bg",
+      );
+      expect(useChatStore.getState().todos).toEqual([]);
+    });
+
+    it("drops a consumed-input bubble delivered by a background stream", () => {
+      // `session.input.consumed` carries NO conversation id, so the delivering
+      // stream is the only thing that can route it. Unrouted, a background
+      // conversation's committed message would append to this transcript.
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+      handleSessionEvent(
+        {
+          type: "session_input_consumed",
+          itemId: "item_bg",
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "from background" }] },
+        },
+        "conv_bg",
+      );
+      expect(useChatStore.getState().blocks).toEqual([]);
+    });
+
+    it("drops a usage update delivered by a background conversation's stream", () => {
+      useChatStore.setState({ tokensUsed: 100, sessionCostUsd: 1 });
+      handleSessionEvent(
+        {
+          type: "session_usage",
+          conversationId: "conv_bg",
+          contextTokens: 99_999,
+          totalCostUsd: 42,
+        },
+        "conv_bg",
+      );
+      expect(useChatStore.getState().tokensUsed).toBe(100);
+      expect(useChatStore.getState().sessionCostUsd).toBe(1);
+    });
+
+    it("does not cancel the visible turn when a background stream reports an interrupt", () => {
+      // `session.interrupted` also carries no conversation id.
+      useChatStore.setState({
+        activeResponse: { responseId: "resp_visible", state: "streaming", error: null },
+        interruptedResponseIds: [],
+      });
+      handleSessionEvent(
+        { type: "session_interrupted", requestedAt: 0, responseId: "resp_bg" },
+        "conv_bg",
+      );
+      expect(useChatStore.getState().activeResponse).toEqual({
+        responseId: "resp_visible",
+        state: "streaming",
+        error: null,
+      });
+      expect(useChatStore.getState().interruptedResponseIds).toEqual([]);
+    });
+
+    it("still applies events delivered by the visible conversation's own stream", () => {
+      // The converse of the above: routing must not make the normal path a
+      // no-op. A guard that always dropped would pass every test above.
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_visible", status: "running" },
+        "conv_visible",
+      );
+      expect(useChatStore.getState().sessionStatus).toBe("running");
     });
   });
 });

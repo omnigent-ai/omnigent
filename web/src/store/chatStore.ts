@@ -4307,9 +4307,56 @@ function removeFromPendingStash(
  * deliberately ignores these events; session-scoped state lives on
  * the store, not on the reducer's internal state machine.
  *
+ * :param event: the parsed stream event.
+ * :param streamConversationId: the conversation whose stream delivered this
+ *     event. Writes to conversation-scoped state are dropped unless it is the
+ *     active conversation — see {@link applyToConversation}. Omit only in
+ *     tests that mean "as if delivered by the active conversation's stream".
+ *
  * No-op for events outside the `session.*` family.
  */
-export function handleSessionEvent(event: StreamEvent): void {
+export function handleSessionEvent(event: StreamEvent, streamConversationId?: string): void {
+  // Routing is by DELIVERING STREAM, not by event payload: several events
+  // (`session.input.consumed`, `session.interrupted`, `session.resource.created`)
+  // carry no conversation id at all, so their contents can't say where they
+  // belong. Default to the active conversation so a caller that omits the id
+  // keeps today's behaviour.
+  const sourceConversationId = streamConversationId ?? useChatStore.getState().conversationId;
+
+  /**
+   * Write conversation-scoped state, but only when this event's stream is the
+   * active conversation's.
+   *
+   * Every branch below that touches `ConversationState` must go through this
+   * rather than `useChatStore.setState` directly. Once background streams stay
+   * open, an unguarded write would paint a backgrounded conversation's status,
+   * transcript, or todos onto the one the user is looking at.
+   */
+  const applyToConversation = (
+    patch: Partial<ConversationState> | ((s: ChatState) => Partial<ConversationState>),
+  ): void => {
+    useChatStore.setState((s) => {
+      if (s.conversationId !== sourceConversationId) return {};
+      return typeof patch === "function" ? patch(s) : patch;
+    });
+  };
+
+  /**
+   * Same as {@link applyToConversation}, for events that name their own target.
+   *
+   * Most `session.*` events carry a `conversationId`. That payload id is
+   * authoritative — a session's stream can carry frames about a DIFFERENT
+   * conversation (a sub-agent's, or a rotated-away session's) — so it has to
+   * agree with the active conversation as well as the delivering stream.
+   */
+  const applyToNamedConversation = (
+    namedConversationId: string,
+    patch: Partial<ConversationState> | ((s: ChatState) => Partial<ConversationState>),
+  ): void => {
+    if (namedConversationId !== sourceConversationId) return;
+    applyToConversation(patch);
+  };
+
   switch (event.type) {
     case "response_completed":
       // Prefer contextTokens (last sub-call total) for the context ring — on
@@ -4320,27 +4367,27 @@ export function handleSessionEvent(event: StreamEvent): void {
       if (event.response.usage != null) {
         const ringTokens = event.response.usage.contextTokens ?? event.response.usage.totalTokens;
         if (ringTokens != null) {
-          useChatStore.setState({ tokensUsed: ringTokens });
+          applyToConversation({ tokensUsed: ringTokens });
         }
       }
       return;
     case "session_todos":
       // Replace the todo list entirely — each event carries the full
       // current list, not a diff.
-      useChatStore.setState({ todos: event.todos });
+      applyToConversation({ todos: event.todos });
       return;
     case "session_terminal_pending":
       // Toggle the Terminal-pill spinner. The runner sets pending=true
       // before auto-creating the terminal and clears it once the
       // terminal lands or auto-create fails.
-      useChatStore.setState({ terminalPending: event.pending });
+      applyToConversation({ terminalPending: event.pending });
       return;
     case "session_sandbox_status":
       // Advance the managed-sandbox provisioning indicator. `ready`
       // clears it — from then on the session looks like any
       // host-bound session; `failed` retains the reason so the page
       // explains why the sandbox never came up.
-      useChatStore.setState({
+      applyToConversation({
         sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
       });
       return;
@@ -4351,7 +4398,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       // never came up.
       const records = Object.values(event.servers);
       const allReady = records.length === 0 || records.every((r) => r.status === "ready");
-      useChatStore.setState({ mcpStartup: allReady ? null : event.servers });
+      applyToConversation({ mcpStartup: allReady ? null : event.servers });
       return;
     }
     case "session_usage": {
@@ -4378,7 +4425,7 @@ export function handleSessionEvent(event: StreamEvent): void {
         patch.sessionUsageByModel = event.usageByModel;
       }
       if (Object.keys(patch).length > 0) {
-        useChatStore.setState(patch);
+        applyToConversation(patch);
       }
       return;
     }
@@ -4391,11 +4438,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       // terminal switch is a per-session choice, not a new default).
       // Guard by conversation id so a late frame from a switched-away
       // stream cannot overwrite the model for the currently-open session.
-      useChatStore.setState((s) =>
-        s.conversationId === event.conversationId
-          ? { selectedModel: event.model, sessionModelOverride: event.model }
-          : {},
-      );
+      if (event.conversationId === useChatStore.getState().conversationId) {
+        // `selectedModel` is a sticky app-level pref, so it is set directly.
+        useChatStore.setState({ selectedModel: event.model });
+      }
+      applyToNamedConversation(event.conversationId, { sessionModelOverride: event.model });
       return;
     case "session_reasoning_effort":
       // A thinking-level switch made inside a native terminal. Reflect it
@@ -4403,26 +4450,27 @@ export function handleSessionEvent(event: StreamEvent): void {
       // reasoning_effort, so reload restores the same value.
       // Guard by conversation id so a late event from a previous session
       // cannot overwrite the effort picker for the currently-open one.
-      useChatStore.setState((s) =>
-        s.conversationId === event.conversationId ? { selectedEffort: event.reasoningEffort } : {},
-      );
+      // Sticky app-level pref, but only adopt a value reported by the
+      // conversation the user is actually looking at.
+      if (
+        event.conversationId === sourceConversationId &&
+        useChatStore.getState().conversationId === event.conversationId
+      ) {
+        useChatStore.setState({ selectedEffort: event.reasoningEffort });
+      }
       return;
     case "session_collaboration_mode":
       // A Codex /plan switch made in either the web UI or native TUI.
       // Guard by conversation id so a late frame from an aborted stream
       // cannot paint Plan mode onto the newly-opened conversation.
-      useChatStore.setState((s) =>
-        s.conversationId === event.conversationId ? { codexPlanMode: event.mode === "plan" } : {},
-      );
+      applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the
       // complete viewer list, so there is no join/leave ordering to
       // get wrong. Guarded by conversation id so a late frame from a
       // switched-away stream can't paint another session's viewers.
-      useChatStore.setState((s) =>
-        s.conversationId === event.conversationId ? { viewers: event.viewers } : {},
-      );
+      applyToNamedConversation(event.conversationId, { viewers: event.viewers });
       return;
     case "session_agent_changed":
       // The session's bound agent was switched in place (switch-agent
@@ -4432,11 +4480,10 @@ export function handleSessionEvent(event: StreamEvent): void {
       // lifecycle) from a fresh snapshot — the event is the only signal
       // an in-place switch produces; the URL doesn't change, so the
       // switchTo/bindStream path never re-runs.
-      useChatStore.setState((s) =>
-        s.conversationId === event.conversationId
-          ? { boundAgentId: event.agentId, boundAgentName: event.agentName }
-          : {},
-      );
+      applyToNamedConversation(event.conversationId, {
+        boundAgentId: event.agentId,
+        boundAgentName: event.agentName,
+      });
       void refreshSessionBinding(event.conversationId);
       // Refresh the header's agent card and the sidebar row for every
       // connected client (the switching client's dialog already does
@@ -4470,13 +4517,13 @@ export function handleSessionEvent(event: StreamEvent): void {
       // estimate so the ring reflects the reduced context without waiting
       // for the next LLM response.completed event.
       if (event.totalTokens != null) {
-        useChatStore.setState({ tokensUsed: event.totalTokens });
+        applyToConversation({ tokensUsed: event.totalTokens });
       }
       return;
     case "compaction_failed":
       // Compaction failed — history is unchanged. Remove the compaction_loading
       // block so the "Compacting…" shimmer disappears without leaving a marker.
-      useChatStore.setState((s) => {
+      applyToConversation((s) => {
         const idx = [...s.blocks].reverse().findIndex((b) => b.type === "compaction_loading");
         if (idx === -1) return {};
         const realIdx = s.blocks.length - 1 - idx;
@@ -4488,7 +4535,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       // server won't emit session.input.consumed for denied inputs, so
       // it would otherwise linger in the transcript). The "Working…"
       // indicator is driven by session.status, not this.
-      useChatStore.setState({
+      applyToConversation({
         pendingUserMessages: [],
       });
       return;
@@ -4501,7 +4548,10 @@ export function handleSessionEvent(event: StreamEvent): void {
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
-      useChatStore.setState((s) => {
+      // The status patch is conversation-scoped; the cache/query side effects
+      // further down are deliberately NOT (they are keyed by explicit id, so a
+      // sub-agent's status still refreshes its parent's rail).
+      applyToNamedConversation(event.conversationId, (s) => {
         // `sessionStatus` tracks the server's session-level status 1:1 — a
         // server `idle` means the session is idle, full stop, and the
         // "Working…" indicator (which reads only `sessionStatus`) turns off.
@@ -4715,7 +4765,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
-      useChatStore.setState((s) => {
+      applyToConversation((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) return {};
 
         // 1. Drop by id when the server names the drained entry.
@@ -4800,7 +4850,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       // until refresh. Pop the FIFO head here to ack the local
       // send; non-empty guard so observing clients (with no pending
       // bubble) just render the block.
-      useChatStore.setState((s) => {
+      applyToConversation((s) => {
         if (s.pendingUserMessages.length === 0) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
@@ -4814,14 +4864,14 @@ export function handleSessionEvent(event: StreamEvent): void {
       // becomes a no-op when it sees the existing terminal state.
       if (event.responseId !== undefined) {
         const interruptedResponseId = event.responseId;
-        useChatStore.setState((s) => {
+        applyToConversation((s) => {
           if (s.interruptedResponseIds.includes(interruptedResponseId)) return {};
           return {
             interruptedResponseIds: [...s.interruptedResponseIds, interruptedResponseId],
           };
         });
       }
-      finalizeCurrentActive("cancelled", event.responseId);
+      finalizeCurrentActive("cancelled", event.responseId, sourceConversationId);
       return;
     case "session_created":
       // Sub-agent spawn signal. Invalidate the parent's child-sessions
@@ -4840,6 +4890,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       // switched away from can't yank the user, and ignore a self-target
       // no-op. `ChatPage` observes `redirectToConversationId` and performs
       // the actual react-router navigation.
+      // Writes app-global state (`redirectToConversationId`) alongside
+      // conversation state, so it keeps its own guard rather than going through
+      // `applyToConversation`: the redirect only makes sense for the
+      // conversation on screen, and a background conversation that gets
+      // superseded should redirect when the user switches to it, not before.
       useChatStore.setState((s) => {
         if (s.conversationId !== event.conversationId) return {};
         if (event.targetConversationId === s.conversationId) return {};
@@ -4925,7 +4980,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       // Match by id, not first-pending — the `pending` guard keeps
       // a user-delivered verdict from being overwritten by a later
       // duplicate-resolve.
-      useChatStore.setState((s) => {
+      applyToConversation((s) => {
         const matchIdx = s.blocks.findIndex(
           (b) =>
             b.type === "elicitation" &&
@@ -5116,13 +5171,20 @@ function applyChildSessionUpdated(
   queryClient.setQueryData<ChildSessionInfo[]>(key, next);
 }
 
+/**
+ * Apply `session.*` side effects for each event, then pass it through.
+ *
+ * `conversationId` is the stream's own conversation — the only reliable routing
+ * key, since several events carry no id in their payload. It also keys the raw
+ * SSE debug log the execution-logs panel reads.
+ */
 async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
-  sessionId?: string,
+  conversationId: string,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
-    handleSessionEvent(event);
-    if (sessionId !== undefined) pushSseEvent(sessionId, event);
+    handleSessionEvent(event, conversationId);
+    pushSseEvent(conversationId, event);
     yield event;
   }
 }
@@ -5131,9 +5193,19 @@ async function* tapSessionEvents(
  * Force the store's `activeResponse` into a terminal state without
  * needing a closure-scoped setter. Mirrors `finalizeActive` but
  * works from the module-scope `handleSessionEvent` boundary.
+ *
+ * :param conversationId: the conversation whose stream reported this, or
+ *     ``null`` to target whichever is active. `activeResponse` is
+ *     conversation-scoped, so a mismatch is a no-op — a backgrounded
+ *     conversation's interrupt must not cancel the visible turn's bubble.
  */
-function finalizeCurrentActive(state: ActiveResponse["state"], responseIdOverride?: string): void {
+function finalizeCurrentActive(
+  state: ActiveResponse["state"],
+  responseIdOverride?: string,
+  conversationId?: string | null,
+): void {
   useChatStore.setState((s) => {
+    if (conversationId != null && s.conversationId !== conversationId) return {};
     if (s.activeResponse === null && responseIdOverride === undefined) return {};
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
