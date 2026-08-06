@@ -28,6 +28,7 @@ from __future__ import annotations
 import re
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 from omnigent.onboarding.provider_config import load_config
 
@@ -127,6 +128,26 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
             )
         )
     return entries
+
+
+def workspace_acp_agents(workspace: Path) -> list[AcpAgentEntry]:
+    """Return the ACP agents declared in a workspace's ``.omnigent/config.yaml``.
+
+    Reads the project-level ``acp:`` block only — the global config is not
+    merged in, so callers can attribute every returned entry to the repo.
+    Any failure (missing/unreadable file, malformed YAML) yields ``[]``; a
+    broken repo config must never break discovery.
+
+    :param workspace: The working directory the repo config lives under.
+    :returns: The repo-declared agents (possibly empty).
+    """
+    from omnigent.config import load_local_config
+
+    try:
+        config_path = Path(workspace).expanduser() / ".omnigent" / "config.yaml"
+        return acp_agents(config=load_local_config(path=config_path))
+    except Exception:
+        return []
 
 
 def resolve_acp_agent(slug: str, config: dict[str, object] | None = None) -> AcpAgentEntry | None:

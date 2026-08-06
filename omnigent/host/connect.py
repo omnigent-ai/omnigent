@@ -65,6 +65,8 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceHarnessesFrame,
+    HostWorkspaceHarnessesResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -2198,6 +2200,48 @@ class HostProcess:
             routable_models=list(config.routable_models) if config is not None else [],
         )
 
+    async def _handle_workspace_harnesses(
+        self,
+        frame: HostWorkspaceHarnessesFrame,
+    ) -> HostWorkspaceHarnessesResultFrame:
+        """Discover repo-declared ACP agents in a workspace's ``.omnigent/``.
+
+        Reads only the project-level config, so every returned row is
+        attributable to the repo. ``command_found`` is a soft PATH hint for
+        the picker, never a gate — the agent owns its own install.
+        """
+        try:
+            from omnigent.onboarding.acp_auth import (
+                command_binary_on_path,
+                workspace_acp_agents,
+            )
+
+            entries = await asyncio.to_thread(workspace_acp_agents, Path(frame.path))
+            agents: list[dict[str, object]] = [
+                {
+                    "slug": entry.slug,
+                    "name": entry.name,
+                    "command": entry.command,
+                    "model": entry.model,
+                    "session_id_mode": entry.session_id_mode,
+                    "send_model": entry.send_model,
+                    "command_found": command_binary_on_path(entry.command),
+                }
+                for entry in entries
+            ]
+        except Exception:
+            _logger.exception("Failed to discover workspace harnesses")
+            return HostWorkspaceHarnessesResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="failed to discover workspace harnesses",
+            )
+        return HostWorkspaceHarnessesResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            agents=agents,
+        )
+
     @staticmethod
     def _dispatch_fs_op(
         reader: object,
@@ -2847,6 +2891,8 @@ class HostProcess:
             await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
+        elif isinstance(frame, HostWorkspaceHarnessesFrame):
+            await ws.send(encode_host_frame(await self._handle_workspace_harnesses(frame)))
 
 
 def run_host_process(

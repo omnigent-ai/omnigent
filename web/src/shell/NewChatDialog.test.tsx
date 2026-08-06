@@ -56,6 +56,7 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
+  useWorkspaceHarnesses: vi.fn(() => ({ data: [] })),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),

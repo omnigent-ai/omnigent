@@ -37,6 +37,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerFrame,
     HostListDirFrame,
     HostStoreSecretFrame,
+    HostWorkspaceHarnessesFrame,
     encode_host_frame,
     optional_str_bool_map,
 )
@@ -71,6 +72,10 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+# Per-call timeout for host.workspace_harnesses round-trips. Reading one
+# small YAML file on the host is cheap; a short cap also bounds the wait
+# when an older host daemon silently ignores the unknown frame kind.
+_WORKSPACE_HARNESSES_TIMEOUT_S = 10.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -115,6 +120,42 @@ async def _proxy_model_options(
                 f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
             ),
         ) from exc
+
+
+async def _proxy_workspace_harnesses(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    path: str,
+) -> dict[str, Any]:
+    """Ask a host for the repo-declared harnesses in a workspace."""
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_workspace_harnesses[request_id] = future
+    frame = encode_host_frame(
+        HostWorkspaceHarnessesFrame(request_id=request_id, path=path),
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_WORKSPACE_HARNESSES_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not resolve workspace harnesses "
+                    f"within {_WORKSPACE_HARNESSES_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        host_conn.pending_workspace_harnesses.pop(request_id, None)
 
 
 async def _proxy_list_dir(
@@ -517,7 +558,15 @@ async def _resolve_agent_harness(
     if agent is None or agent.bundle_location is None:
         return None
     loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
-    return canonicalize_harness(loaded.spec.executor.harness_kind)
+    executor = loaded.spec.executor
+    harness = canonicalize_harness(executor.harness_kind)
+    # A spec embedding a one-shot ``acp_agent`` is self-contained — the
+    # command rides in the spec, so the host's global ``acp`` readiness
+    # doesn't apply. None skips the host-side check (fail open).
+    config = getattr(executor, "config", None)
+    if harness == "acp" and isinstance(config, dict) and "acp_agent" in config:
+        return None
+    return harness
 
 
 def create_hosts_router(
@@ -686,6 +735,56 @@ def create_hosts_router(
             )
         models = result.get("models")
         return {"models": models if isinstance(models, list) else []}
+
+    @router.get("/hosts/{host_id}/workspace-harnesses")
+    async def get_host_workspace_harnesses(
+        request: Request,
+        host_id: str,
+        path: str = Query(min_length=1),
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return the harnesses a workspace's ``.omnigent/`` declares.
+
+        Reads ``<path>/.omnigent/config.yaml`` on the selected host and
+        returns its ``acp:`` agents so the picker can suggest repo-declared
+        harnesses. Owner-scoped like the filesystem endpoints; discovery
+        only — launching a discovered agent still goes through the client's
+        explicit consent flow.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier.
+        :param path: Absolute or tilde-prefixed workspace path on the host.
+        :returns: ``{"agents": [...]}`` (empty when nothing is declared).
+        :raises HTTPException: 404 (host missing), 403 (not owner), 409
+            (offline), 400 (path validation), 504 (timeout), 502 (host
+            failure).
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        if "\x00" in path:
+            raise HTTPException(
+                status_code=400,
+                detail="path must not contain NUL bytes",
+            )
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        result = await _proxy_workspace_harnesses(
+            host_registry=host_registry,
+            host_conn=conn,
+            path=path,
+        )
+        if result.get("status") != "ok":
+            raise HTTPException(
+                status_code=502,
+                detail=str(result.get("error") or "workspace harness discovery failed"),
+            )
+        agents = result.get("agents")
+        return {"agents": agents if isinstance(agents, list) else []}
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(

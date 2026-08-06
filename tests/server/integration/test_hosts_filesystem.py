@@ -28,6 +28,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostWorkspaceHarnessesFrame,
+    HostWorkspaceHarnessesResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -187,6 +189,22 @@ async def fs_setup(
                                 request_id=frame.request_id,
                                 status=reply.get("status", "ok"),
                                 models=reply.get("models", []),
+                                error=reply.get("error"),
+                            )
+                        ),
+                    }
+                )
+                continue
+            if isinstance(frame, HostWorkspaceHarnessesFrame):
+                reply = replies.get(f"ws:{frame.path}", {})
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostWorkspaceHarnessesResultFrame(
+                                request_id=frame.request_id,
+                                status=reply.get("status", "ok"),
+                                agents=reply.get("agents", []),
                                 error=reply.get("error"),
                             )
                         ),
@@ -400,6 +418,124 @@ async def test_list_filesystem_tilde_path_forwards_unchanged(
         resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/~/projects")
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"][0]["name"] == "myapp"
+
+
+async def test_workspace_harnesses_returns_repo_declared_agents(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The REST endpoint proxies the workspace's repo-declared ACP agents."""
+    app, _reg, _comm, replies, _drain = fs_setup
+    agents = [
+        {
+            "slug": "repo-echo",
+            "name": "Repo Echo",
+            "command": "echo-agent --acp",
+            "model": None,
+            "session_id_mode": "server",
+            "send_model": False,
+            "command_found": True,
+        }
+    ]
+    replies["ws:/Users/corey/universe"] = {"agents": agents}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/workspace-harnesses",
+            params={"path": "/Users/corey/universe"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"agents": agents}
+
+
+async def test_workspace_harnesses_host_failure_returns_502(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["ws:/Users/corey/universe"] = {"status": "failed", "error": "boom"}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/workspace-harnesses",
+            params={"path": "/Users/corey/universe"},
+        )
+
+    assert resp.status_code == 502
+
+
+async def test_workspace_harnesses_unknown_host_returns_404(
+    fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, _reg, _hs, _cs = fs_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts/7139b7e896ef9478abca6480107d1677/workspace-harnesses",
+            params={"path": "/tmp"},
+        )
+    assert resp.status_code == 404
+
+
+async def test_workspace_harnesses_offline_host_returns_409(
+    fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, _reg, host_store, _cs = fs_app
+    host_store.upsert_on_connect(
+        host_id="3d9665477127e41f42de3f4109418173",
+        name="offline-host",
+        user_id="local",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts/3d9665477127e41f42de3f4109418173/workspace-harnesses",
+            params={"path": "/tmp"},
+        )
+    assert resp.status_code == 409
+
+
+async def test_workspace_harnesses_nul_path_returns_400(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    app, _reg, _comm, _replies, _drain = fs_setup
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/workspace-harnesses",
+            params={"path": "/tmp/\x00evil"},
+        )
+    assert resp.status_code == 400
+
+
+async def test_workspace_harnesses_missing_path_returns_422(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The path query param is required — FastAPI validation rejects its absence."""
+    app, _reg, _comm, _replies, _drain = fs_setup
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/workspace-harnesses")
+    assert resp.status_code == 422
 
 
 # ── Error paths ─────────────────────────────────────────

@@ -84,6 +84,7 @@ vi.mock("@/hooks/useHosts", () => ({
     ],
   })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useWorkspaceHarnesses: vi.fn(() => ({ data: [] })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({

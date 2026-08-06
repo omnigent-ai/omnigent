@@ -1720,6 +1720,38 @@ def _resolve_harness_impl(conv: Conversation | None) -> str | None:
         return None
 
 
+def _harness_for_launch_gate(conv: Conversation | None) -> str | None:
+    """
+    Harness to send on the ``host.launch_runner`` frame.
+
+    Same resolution as :func:`_resolve_harness`, except a spec embedding a
+    one-shot ``acp_agent`` returns ``None``: the command rides in the spec,
+    so the host's global ``acp`` readiness doesn't apply and must not refuse
+    the launch. ``None`` skips the host-side check — fail open.
+    """
+    harness = _resolve_harness(conv)
+    if harness != "acp" or conv is None or conv.agent_id is None:
+        return harness
+    try:
+        from omnigent.runtime import get_agent_cache
+        from omnigent.runtime._globals import _agent_store
+
+        if _agent_store is None:
+            return harness
+        agent = _agent_store.get(conv.agent_id)
+        if agent is None:
+            return harness
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+        config = loaded.spec.executor.config
+        if isinstance(config, dict) and "acp_agent" in config:
+            return None
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        pass
+    return harness
+
+
 def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     """
     Validate + canonicalize a session-create ``harness_override``.
@@ -4334,10 +4366,11 @@ async def _launch_runner_on_host_impl(
             binding_token=binding_token,
             workspace=conv.workspace,
             session_id=conv.id,
-            # Canonical harness (see _resolve_harness) so the host runs the
-            # same configuration check it does at create-time launch. None
-            # (agent not resolvable) skips the host-side check — fail open.
-            harness=_resolve_harness(conv),
+            # Canonical harness so the host runs the same configuration
+            # check it does at create-time launch. None (agent not
+            # resolvable, or a self-contained embedded ACP agent) skips
+            # the host-side check — fail open.
+            harness=_harness_for_launch_gate(conv),
         )
     )
     try:

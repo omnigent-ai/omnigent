@@ -108,6 +108,51 @@ export function useHostModelOptions(hostId: string | null, harness: string, enab
   });
 }
 
+/** One ACP agent declared in a workspace's `.omnigent/config.yaml`. */
+export interface WorkspaceAcpAgent {
+  slug: string;
+  name: string;
+  command: string;
+  model: string | null;
+  session_id_mode: "server" | "client";
+  send_model: boolean;
+  /** Soft hint: the command's binary resolves on the host's PATH. */
+  command_found: boolean;
+}
+
+async function fetchWorkspaceHarnesses(
+  hostId: string,
+  workspace: string,
+): Promise<WorkspaceAcpAgent[]> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/workspace-harnesses?path=${encodeURIComponent(workspace)}`,
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { agents?: WorkspaceAcpAgent[] };
+  return body.agents ?? [];
+}
+
+/**
+ * Harnesses declared by the selected workspace's repo (`.omnigent/config.yaml`),
+ * resolved on the selected host. Errors (offline host, older host daemon that
+ * doesn't speak the frame) degrade to an empty list.
+ */
+export function useWorkspaceHarnesses(hostId: string | null, workspace: string, enabled = true) {
+  return useQuery({
+    queryKey: ["workspace-harnesses", hostId, workspace],
+    queryFn: async () => {
+      try {
+        return await fetchWorkspaceHarnesses(hostId as string, workspace);
+      } catch {
+        return [];
+      }
+    },
+    enabled: enabled && hostId !== null && workspace.length > 0,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
 interface InstallHarnessResult {
   object: "harness_install";
   harness: string;

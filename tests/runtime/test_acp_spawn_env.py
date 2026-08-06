@@ -146,6 +146,49 @@ def test_embedded_omnigent_mcp_flag_forwarded() -> None:
     )
     assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
 
+def test_embedded_agent_takes_precedence_over_config(_isolate_config: Path) -> None:
+    """An embedded ``acp_agent`` wins over the slug's configured command."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:goose",
+            acp_agent={"name": "Repo Goose", "command": "goose acp --repo"},
+        )
+    )
+    assert env["HARNESS_ACP_COMMAND"] == "goose acp --repo"
+    assert env["HARNESS_ACP_NAME"] == "Repo Goose"
+
+
+def test_embedded_agent_optional_fields_forwarded(_isolate_config: Path) -> None:
+    """Embedded ``model`` / ``session_id_mode`` / ``send_model`` are honored."""
+    _write_acp_config(_isolate_config, agents=[])
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:repo-qwen",
+            acp_agent={
+                "name": "Repo Qwen",
+                "command": "qwen --acp",
+                "model": "qwen3-coder",
+                "session_id_mode": "client",
+                "send_model": True,
+            },
+        )
+    )
+    assert env["HARNESS_ACP_MODEL"] == "qwen3-coder"
+    assert env["HARNESS_ACP_SESSION_ID_MODE"] == "client"
+    assert env["HARNESS_ACP_SEND_MODEL"] == "1"
+
+
+def test_embedded_agent_invalid_mode_falls_back_to_server(_isolate_config: Path) -> None:
+    _write_acp_config(_isolate_config, agents=[])
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:helper",
+            acp_agent={"name": "Helper", "command": "helper --acp", "session_id_mode": "bogus"},
+        )
+    )
+    assert env["HARNESS_ACP_SESSION_ID_MODE"] == "server"
+
 
 @pytest.mark.parametrize(
     "acp_agent",
