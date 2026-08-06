@@ -599,7 +599,10 @@ def main() -> None:
         )
         raise SystemExit(2)
 
-    _ZygoteServer(control_sock).serve()
+    try:
+        _ZygoteServer(control_sock).serve()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
