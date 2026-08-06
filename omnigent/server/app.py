@@ -2496,6 +2496,20 @@ def create_app(
             prefix="/v1",
             tags=["hosts"],
         )
+        # Host-facing GitHub credential vending: a sandbox fetches its owner's
+        # token over the launch-token-authenticated channel instead of having it
+        # injected. Only when GitHub is configured.
+        if github_enabled and github_store is not None and github_config is not None:
+            from omnigent.server.github_app_client import GitHubAppClient
+            from omnigent.server.routes.host_github import create_host_github_router
+
+            app.include_router(
+                create_host_github_router(
+                    host_store, github_store, GitHubAppClient(github_config)
+                ),
+                prefix="/v1",
+                tags=["hosts"],
+            )
         app.include_router(
             create_hosts_router(
                 host_registry,
