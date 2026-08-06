@@ -622,6 +622,38 @@ def _attachment_disposition(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
+# A file id maps to one set of bytes for the file's whole life — content is
+# never rewritten in place, only deleted — so the id is a strong validator and
+# the bytes can be cached indefinitely. ``private`` keeps the response out of
+# shared caches, since the bytes are readable only by session members.
+FILE_CONTENT_CACHE_CONTROL = "private, max-age=31536000, immutable"
+
+
+def _file_content_etag(file_id: str) -> str:
+    """Build the strong ``ETag`` for a stored file's content.
+
+    :param file_id: The stored file identifier.
+    :returns: A quoted entity tag value.
+    """
+    return f'"{file_id}"'
+
+
+def _if_none_match_matches(header: str | None, etag: str) -> bool:
+    """Check an ``If-None-Match`` request header against an entity tag.
+
+    :param header: Raw ``If-None-Match`` value, or ``None`` when absent.
+    :param etag: The current entity tag, quoted.
+    :returns: ``True`` when the client's cached copy is still current.
+    """
+    if not header:
+        return False
+    candidates = [candidate.strip() for candidate in header.split(",")]
+    if "*" in candidates:
+        return True
+    # Comparison is weak per RFC 9110: strip the ``W/`` prefix before matching.
+    return any(candidate.removeprefix("W/") == etag for candidate in candidates)
+
+
 def _stored_file_to_resource(
     session_id: str,
     stored: StoredFile,
@@ -8940,6 +8972,7 @@ async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
 
 
 __all__ = [
+    "FILE_CONTENT_CACHE_CONTROL",
     "SessionLiveness",
     "_HostLaunchAttempt",
     "_NativeTerminalEnsureOutcome",
@@ -8994,6 +9027,7 @@ __all__ = [
     "_extract_persistent_item_from_sse",
     "_extract_user_text_for_routing",
     "_extract_user_text_from_event",
+    "_file_content_etag",
     "_find_claude_native_subagent_child",
     "_find_codex_native_subagent_child",
     "_find_subagent_child_by_title",
@@ -9007,6 +9041,7 @@ __all__ = [
     "_handle_external_session_todos",
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
+    "_if_none_match_matches",
     "_invalidate_runner_backed_snapshot_state",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",

@@ -3399,9 +3399,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           // a glance without any email text.
           style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
         >
-          {/* Inline image previews */}
+          {/* Inline image previews — one non-wrapping strip. Wrapping would
+              re-flow the row as each image's width resolves on load, changing
+              the bubble's height and shoving the transcript; scrolling keeps
+              the row exactly one preview tall no matter what lands. */}
           {images.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-2">
+            <div className="mb-1.5 flex gap-2 overflow-x-auto">
               {images.map((img) =>
                 img.file_id.startsWith("pending:") ? (
                   // Upload in-flight — show a chip placeholder
@@ -3424,7 +3427,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         : undefined
                     }
                     alt={img.filename ?? img.file_id}
-                    className="max-h-64 max-w-full rounded-md object-contain"
+                    // Sizing lives in SessionImage, which reserves a matching
+                    // box so the bubble's height is settled before bytes land.
+                    className="rounded-md object-contain"
                   />
                 ),
               )}

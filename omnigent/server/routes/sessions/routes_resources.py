@@ -61,9 +61,12 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
+    _file_content_etag,
     _get_runner_client_for_resource_access,
+    _if_none_match_matches,
     _load_agent_spec_for_session,
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
@@ -1079,13 +1082,25 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        stored = file_store.get(file_id, session_id=session_id)
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
         if stored is None:
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        content = artifact_store.get(stored.id)
+        # Content is immutable per file id, so a still-valid cached copy can be
+        # answered before ever touching the artifact store. Transcripts re-render
+        # the same attachments on every load, and the originals run to megabytes.
+        etag = _file_content_etag(stored.id)
+        if _if_none_match_matches(request.headers.get("if-none-match"), etag):
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
+                },
+            )
+        content = await asyncio.to_thread(artifact_store.get, stored.id)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
         # The filename and bytes are fully user-controlled. Serving the
         # content inline lets a browser navigating directly to this URL
@@ -1101,6 +1116,8 @@ def register_resources_routes(
             headers={
                 "Content-Disposition": _attachment_disposition(stored.filename),
                 "X-Content-Type-Options": "nosniff",
+                "ETag": etag,
+                "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
             },
         )
 
