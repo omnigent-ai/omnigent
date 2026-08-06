@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import secrets
 import time
+from datetime import datetime
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 import jwt
@@ -31,6 +34,9 @@ from omnigent.server.github_identity import resolve_access_token
 from omnigent.server.github_store import GithubConnectionStore
 from omnigent.server.routes._auth_helpers import require_user
 
+if TYPE_CHECKING:
+    from omnigent.stores.conversation_store import ConversationStore
+
 _logger = logging.getLogger(__name__)
 
 # The OAuth state JWT is short-lived: it only has to survive the user's
@@ -45,6 +51,35 @@ _DEFAULT_RETURN_TO = "/settings"
 # GitHub owner / repo name charset, enforced before either reaches the
 # branches URL so a caller can never smuggle a path or query.
 _GITHUB_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# Extract ``owner/repo`` from a github.com clone URL (https or scp-style),
+# stripping any trailing ``.git``. Returns None for non-github or malformed URLs.
+_GITHUB_HTTPS_RE = re.compile(r"^https://github\.com/([^/\s]+)/([^/\s#]+?)(?:\.git)?/?$")
+_GITHUB_SSH_RE = re.compile(r"^git@github\.com:([^/\s]+)/([^/\s#]+?)(?:\.git)?/?$")
+
+
+def _repo_full_name(url: str) -> str | None:
+    """Return the ``owner/repo`` of a github.com clone URL, or ``None``.
+
+    :param url: A clone URL (fragment already stripped), https or scp-style.
+    :returns: ``"owner/repo"`` when it is a github.com URL, else ``None``.
+    """
+    m = _GITHUB_HTTPS_RE.match(url) or _GITHUB_SSH_RE.match(url)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def _iso_to_epoch(value: object) -> int | None:
+    """Parse an ISO-8601 timestamp (e.g. GitHub ``created_at``) to epoch seconds.
+
+    :param value: The timestamp string, or anything non-string.
+    :returns: Epoch seconds, or ``None`` when unparseable.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
 
 
 def _sanitize_return_to(raw: str | None) -> str:
@@ -76,6 +111,7 @@ def create_integrations_github_router(
     *,
     auth_provider: AuthProvider | None = None,
     client: GitHubAppClient | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> APIRouter:
     """Build the GitHub App integration router.
 
@@ -85,9 +121,13 @@ def create_integrations_github_router(
         ``None`` when auth is disabled (single-user/local).
     :param client: GitHub App client. Defaults to one built from
         *config*; injectable for tests.
+    :param conversation_store: Session store, used to resolve a session's
+        cloned repos for the "PRs opened this session" endpoint. When
+        ``None`` that endpoint returns an empty list.
     :returns: A FastAPI router with the integration endpoints.
     """
     router = APIRouter()
+
     api = client if client is not None else GitHubAppClient(config)
 
     def _current_user(request: Request) -> str:
@@ -165,6 +205,104 @@ def create_integrations_github_router(
             _logger.warning("GitHub branch list failed for %s/%s: %s", owner, repo, exc)
             raise HTTPException(status_code=502, detail="Failed to list GitHub branches") from exc
         return {"connected": True, "branches": branches}
+
+    async def _resolve_session_pulls(
+        user_id: str, session_id: str, conv: object
+    ) -> dict[str, object]:
+        """Resolve the PRs opened during *session_id*, across ALL repos.
+
+        A PR belongs to this session iff its body carries this session's
+        Open-in-Omnigent link (``…/c/<id>``), stamped deterministically by the
+        GitHub MCP proxy on PR creation. Found by a GitHub *search* for that link
+        — so PRs the agent opened via the MCP in a repo the session never cloned
+        are still returned — unioned with a direct listing of the cloned repo (if
+        any) so a just-opened PR there shows immediately (search is eventually
+        consistent). Returns ``{connected, pulls}``; ``connected: false`` when
+        GitHub isn't linked; empty when this instance's public base URL is unset
+        (no link to match on).
+        """
+        from omnigent.server.managed_hosts import (
+            MANAGED_REPO_LABEL_KEY,
+            parse_repo_workspace,
+        )
+
+        connection = await asyncio.to_thread(store.get, user_id)
+        token = await resolve_access_token(user_id, store=store, client=api)
+        if token is None:
+            return {"connected": False, "pulls": []}
+        login = connection.github_login if connection is not None else None
+
+        from omnigent.conversation_browser import conversation_url
+
+        public_base = (os.environ.get("OMNIGENT_ACCOUNTS_BASE_URL") or "").strip()
+        session_url = conversation_url(public_base, session_id) if public_base else None
+        if not session_url:
+            return {"connected": True, "pulls": []}
+        since = conv.created_at
+
+        # Gather candidates from two sources, cloned-repo listing first so its
+        # richer record (it carries ``head_ref``) wins on dedup.
+        candidates: list[dict[str, object]] = []
+        raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
+        if raw_repo:
+            try:
+                repo = parse_repo_workspace(raw_repo)
+            except ValueError:
+                repo = None
+            full_name = _repo_full_name(repo.url) if repo is not None else None
+            if full_name:
+                try:
+                    for pr in await api.list_pulls(token, full_name):
+                        candidates.append({**pr, "repo": full_name})
+                except GitHubAppError as exc:
+                    _logger.warning("session PRs: list_pulls failed for %s: %s", full_name, exc)
+
+        # Cross-repo: one search for the session's link (by its unique id), scoped
+        # to the connected user's PRs.
+        query = f"{session_id} in:body type:pr"
+        if login:
+            query += f" author:{login}"
+        try:
+            candidates.extend(await api.search_pulls(token, query))
+        except GitHubAppError as exc:
+            _logger.warning("session PRs: search failed for %s: %s", session_id, exc)
+
+        # Keep a PR iff its body carries this session's link; scope by author and
+        # session-start; dedup by ``repo#number``. Strip the raw body afterward.
+        seen: set[tuple[str, object]] = set()
+        pulls: list[dict[str, object]] = []
+        for pr in candidates:
+            key = (str(pr.get("repo") or ""), pr.get("number"))
+            if key in seen:
+                continue
+            if login is not None and pr.get("author_login") != login:
+                continue
+            created = _iso_to_epoch(pr.get("created_at"))
+            if created is not None and created < since:
+                continue
+            if session_url not in str(pr.get("body") or ""):
+                continue
+            seen.add(key)
+            pulls.append({k: v for k, v in pr.items() if k != "body"})
+
+        pulls.sort(key=lambda p: str(p.get("created_at") or ""), reverse=True)
+        return {"connected": True, "pulls": pulls}
+
+    @router.get("/integrations/github/sessions/{session_id}/pull-requests")
+    async def session_pull_requests(request: Request, session_id: str) -> dict[str, object]:
+        """List PRs opened DURING *session_id*, across its cloned repos.
+
+        Any state (open/draft/merged/closed) is included. ``connected: false``
+        when the caller hasn't linked GitHub; an empty list for a non-managed
+        session or one with no cloned repo.
+        """
+        user_id = _current_user(request)
+        if conversation_store is None:
+            return {"connected": True, "pulls": []}
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return await _resolve_session_pulls(user_id, session_id, conv)
 
     @router.get("/integrations/github/connect")
     async def connect(request: Request, return_to: str | None = None) -> RedirectResponse:

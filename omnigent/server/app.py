@@ -2402,6 +2402,7 @@ def create_app(
                 github_store,
                 auth_provider=auth_provider,
                 client=app.state.github_client,
+                conversation_store=conversation_store,
             ),
             prefix="/v1",
             tags=["integrations"],
