@@ -459,12 +459,50 @@ def already_routed(conv: Any) -> bool:
     return bool(labels.get(ROUTING_DECISION_LABEL_KEY))
 
 
+def out_of_parent_family(
+    conv: Any,
+    parent: Any,
+    parent_harness: str | None,
+    harness: str | None,
+) -> bool:
+    """Report whether this pane runs outside its parent's routed family.
+
+    A pinned Smart Routing parent routes its spawns inside its own family,
+    so a child pane on another family's CLI has no candidate its parent's
+    family could serve — routing it here would pick a model the pane cannot
+    speak. The create gate refuses such a child outright, so this only
+    catches a pane that exists anyway (a row created before that gate).
+
+    :param conv: Conversation row for the pane.
+    :param parent: Conversation row for its parent, or ``None``.
+    :param parent_harness: The parent's resolved harness, e.g. ``"codex"``.
+    :param harness: The pane's own harness, from the hook payload.
+    :returns: ``True`` when the pane must not be routed.
+    """
+    from omnigent.runner.subagent_routing import (
+        auto_harness_session,
+        harness_family,
+        subagent_routing_enabled,
+    )
+
+    if parent is None or conv is None:
+        return False
+    if not subagent_routing_enabled(getattr(parent, "subagent_routing_override", None)):
+        return False
+    if auto_harness_session(conv, parent):
+        return False
+    parent_family = harness_family(parent_harness)
+    own_family = harness_family(harness)
+    return parent_family is not None and own_family is not None and parent_family != own_family
+
+
 async def resolve_turn_route(
     session_id: str,
     req: TurnRouteRequest,
     *,
     conv: Any,
     parent: Any = None,
+    parent_harness: str | None = None,
     route_turn: RouteTurnFn,
     pin: Callable[[str], Awaitable[bool]] | None = None,
     persist: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
@@ -480,6 +518,8 @@ async def resolve_turn_route(
     :param req: The prompt awaiting a verdict.
     :param conv: Conversation row for the session, or ``None``.
     :param parent: Conversation row for its parent, when it has one.
+    :param parent_harness: The parent's resolved harness, for the family
+        guard. ``None`` skips it (nothing to compare against).
     :param route_turn: The routing seam, called as
         ``route_turn(harness, prompt)``.
     :param pin: Coroutine persisting ``model_override``; returns ``False``
@@ -509,6 +549,18 @@ async def resolve_turn_route(
         # prompt in the TUI; the composer gate and create-time path are
         # unaffected.
         return _allow("smart routing is off for this session", terminal=True)
+    if out_of_parent_family(conv, parent, parent_harness, req.harness):
+        # Non-terminal: the parent's subagent-routing switch is togglable, and
+        # a pane this fires for is not supposed to exist at all (the create
+        # gate refuses it), so the extra round trip buys a guard that cannot
+        # go stale.
+        _logger.info(
+            "route-turn: session=%s harness=%s runs outside its parent's routed "
+            "family; allowing unrouted",
+            session_id,
+            req.harness,
+        )
+        return _allow("this session's parent routes only its own model family")
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])

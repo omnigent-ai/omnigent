@@ -47,6 +47,7 @@ class _FakeConv:
     cost_control_mode_override: str | None = "on"
     parent_conversation_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    subagent_routing_override: str | None = None
 
 
 def _routed_labels() -> dict[str, str]:
@@ -180,6 +181,79 @@ async def test_a_routed_parent_routes_its_child() -> None:
         _request(),
         conv=_FakeConv(cost_control_mode_override=None, parent_conversation_id="conv_parent"),
         parent=_FakeConv(),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "route"
+
+
+async def test_a_pinned_parents_out_of_family_pane_is_not_routed() -> None:
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="claude-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(subagent_routing_override="on"),
+        parent_harness="codex-native",
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "allow"
+    assert "model family" in decision.rationale
+    # Nothing was routed, pinned or recorded: the pane keeps its own model.
+    assert rec.routed == []
+    assert rec.pinned == []
+    assert rec.chips == []
+    # Not terminal — the parent's switch can be turned off.
+    assert decision.terminal is False
+
+
+async def test_a_pinned_parents_in_family_pane_still_routes() -> None:
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="codex-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(subagent_routing_override="on"),
+        parent_harness="codex-native",
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "route"
+    assert rec.pinned == [ROUTED_MODEL]
+
+
+async def test_an_auto_parents_cross_family_pane_still_routes() -> None:
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="claude-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(
+            subagent_routing_override="on",
+            labels={AUTO_HARNESS_LABEL_KEY: "1"},
+        ),
+        parent_harness="codex-native",
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "route"
+
+
+async def test_an_unrouted_parents_cross_family_pane_still_routes() -> None:
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="claude-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(),
+        parent_harness="codex-native",
         route_turn=rec.route,
         pin=rec.pin,
         persist=rec.persist,

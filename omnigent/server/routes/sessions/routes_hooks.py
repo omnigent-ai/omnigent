@@ -1494,6 +1494,7 @@ def register_hooks_routes(
             decision_scope,
             resolve_turn_route,
         )
+        from omnigent.server.routes._sessions.helpers import _resolve_harness
         from omnigent.server.routes._sessions.orchestration import (
             _native_turn_catalog,
             _publish_routed_model,
@@ -1601,6 +1602,9 @@ def register_hooks_routes(
             route_request,
             conv=conv,
             parent=parent,
+            # A pinned routed parent confines its spawns to its own family, so
+            # the pane's own family is not the only one that matters.
+            parent_harness=_resolve_harness(parent) if parent is not None else None,
             route_turn=_route,
             pin=_pin,
             persist=_persist,
