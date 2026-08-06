@@ -46,15 +46,15 @@ export function FileMentionMenu({
 
   return (
     <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
-      <div className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-xl border border-border bg-popover shadow-menu">
-        <div className="flex items-center justify-between gap-2 px-2 pb-0.5 pt-1.5 text-sm font-medium text-muted-foreground">
+      <div className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu">
+        <div className="flex items-center justify-between gap-2 px-1.5 py-1 text-sm font-medium text-muted-foreground">
           <span className="truncate">{currentDir ? `/${currentDir}` : "Workspace"}</span>
           <span className="shrink-0 text-[10px]">↵ open · ⇥ attach</span>
         </div>
         {entries.length === 0 && loading ? (
-          <div className="px-3 py-2 text-ui text-muted-foreground">Loading…</div>
+          <div className="px-1.5 py-1 text-ui text-muted-foreground">Loading…</div>
         ) : (
-          <div ref={listRef} role="listbox" className="max-h-80 overflow-y-auto p-1">
+          <div ref={listRef} role="listbox" className="max-h-80 overflow-y-auto">
             {entries.map((entry, i) => {
               const isDir = entry.type === "directory";
               return (
@@ -65,8 +65,8 @@ export function FileMentionMenu({
                   data-testid={`file-mention-item-${i}`}
                   data-active={i === activeIndex ? "true" : undefined}
                   className={cn(
-                    "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-ui text-foreground",
-                    i === activeIndex && "bg-accent",
+                    "flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-ui text-foreground",
+                    i === activeIndex && "bg-muted dark:bg-muted/50",
                   )}
                 >
                   <button

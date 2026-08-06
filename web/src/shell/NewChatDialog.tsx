@@ -998,7 +998,7 @@ export function AgentHarnessPicker({
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={active ? "true" : undefined}
         onSelect={() => onSelectAgent(agent)}
-        className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+        className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
       >
         {renderRowInner(agent, true)}
         {renderBadge(agent)}
@@ -1055,7 +1055,7 @@ export function AgentHarnessPicker({
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
-      className="gap-2 rounded-sm px-2 py-1.5 text-ui text-muted-foreground"
+      className="text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
       Create custom agent
@@ -1073,7 +1073,7 @@ export function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-pending"
           data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
           onSelect={onSelectPending}
-          className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+          className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
@@ -1153,7 +1153,7 @@ export function AgentHarnessPicker({
         // height cap / pin a width; tailwind-merge lets the passed max-h/width
         // override the defaults.
         className={cn(
-          "max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1",
+          "max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto",
           contentClassName,
         )}
       >
@@ -1166,7 +1166,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
+              className="items-center font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">More</span>
@@ -1183,7 +1183,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
+              className="items-center font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">Custom agents</span>
@@ -1204,7 +1204,7 @@ export function AgentHarnessPicker({
                     onSelectAutoHarness?.();
                     setOpen(false);
                   }}
-                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+                  className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
                 >
                   <span className="flex-1 truncate">{SMART_ROUTING_LABEL}</span>
                 </DropdownMenuItem>
@@ -1227,7 +1227,7 @@ export function AgentHarnessPicker({
                         e.preventDefault();
                         setMobilePage("more");
                       }}
-                      className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                      className="items-center"
                     >
                       <span className="flex-1">More</span>
                       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1237,11 +1237,11 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                        className="items-center"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto p-1">
+                      <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
                         {moreHarnessEntries.map(renderEntry)}
                       </DropdownMenuSubContent>
                     </DropdownMenuSub>
@@ -1266,7 +1266,7 @@ export function AgentHarnessPicker({
                     e.preventDefault();
                     setMobilePage("custom");
                   }}
-                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                  className="items-center"
                 >
                   <span className="flex-1">Custom agents</span>
                   <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1276,11 +1276,11 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                    className="items-center"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto p-1">
+                  <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
                     {customAgentsBody}
                   </DropdownMenuSubContent>
                 </DropdownMenuSub>
@@ -1573,7 +1573,7 @@ function HarnessConfigModal({
                   <SelectContent
                     position="popper"
                     align="start"
-                    className="[&_[data-slot=select-item]]:pl-2.5"
+                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
                   >
                     <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                     {CLAUDE_NATIVE_EFFORTS.map((e) => (
@@ -4091,7 +4091,7 @@ export function NewChatLandingScreen() {
                           onSelect={selectSandbox}
                           data-testid="new-chat-landing-sandbox-option"
                           data-active={sandboxSelected ? "true" : undefined}
-                          className="text-sm data-[active=true]:bg-accent/60"
+                          className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
@@ -4143,7 +4143,7 @@ export function NewChatLandingScreen() {
                       onSelect={() => selectHost(host.host_id)}
                       data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
-                      className="text-sm data-[active=true]:bg-accent/60"
+                      className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
                     >
                       <HostOption
                         host={host}
@@ -4424,10 +4424,10 @@ export function NewChatLandingScreen() {
                             // Floats over the popover as a combobox popup, so it
                             // doesn't stretch the box. Bounded height + internal
                             // scroll keep it from running off the viewport.
-                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-menu"
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
-                            <span className="px-2 pt-1 pb-0.5 text-sm font-medium tracking-wide text-muted-foreground uppercase">
+                            <span className="px-1.5 py-1 text-sm font-medium text-muted-foreground">
                               Existing worktrees
                             </span>
                             <ul className="flex flex-col gap-0.5">
@@ -4448,8 +4448,8 @@ export function NewChatLandingScreen() {
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
                                       }}
-                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-accent ${
-                                        selected ? "bg-accent" : ""
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-1.5 py-1 text-left text-sm transition-colors hover:bg-muted dark:hover:bg-muted/50 ${
+                                        selected ? "bg-muted dark:bg-muted/50" : ""
                                       }`}
                                       data-testid="new-chat-landing-worktree-option"
                                     >
