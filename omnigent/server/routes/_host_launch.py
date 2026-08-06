@@ -129,7 +129,7 @@ def resolve_host_launch(
     host_registry: HostRegistry,
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
-    host_permission_store: HostPermissionStore,
+    host_permission_store: HostPermissionStore | None = None,
     admin_list: AdminList | None = None,
 ) -> HostLaunchTarget:
     """
@@ -167,15 +167,18 @@ def resolve_host_launch(
     # never enough to launch — the session-owner check below still gates
     # which session the runner binds to (sharing a host must not widen
     # session reach).
-    host = resolve_host_access(
-        user_id=user_id,
-        host_id=host_id,
-        host_store=host_store,
-        host_permission_store=host_permission_store,
-        permission_store=permission_store,
-        admin_list=admin_list,
-        required_level=HOST_LEVEL_USE,
-    )
+    if host_permission_store is None:
+        host = resolve_host_owner(user_id=user_id, host_id=host_id, host_store=host_store)
+    else:
+        host = resolve_host_access(
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            host_permission_store=host_permission_store,
+            permission_store=permission_store,
+            admin_list=admin_list,
+            required_level=HOST_LEVEL_USE,
+        )
 
     conn = host_registry.get(host_id)
     if conn is None:
