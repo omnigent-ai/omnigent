@@ -35,6 +35,12 @@ interface FilesPanelDrawerProps {
   flatView: boolean;
   onFlatViewChange: (flatView: boolean) => void;
   /**
+   * Lifted Changed-scope layout (list vs folder tree). Lifted to AppShell
+   * (persisted) so the choice survives drawer open/close and page refreshes.
+   */
+  changedTreeView: boolean;
+  onChangedTreeViewChange: (changedTreeView: boolean) => void;
+  /**
    * Lifted hidden-files toggle state. Lifted to AppShell so the
    * eye-icon choice survives inline→drawer transitions.
    */
@@ -54,6 +60,8 @@ export function FilesPanelDrawer({
   onFileSelect,
   flatView,
   onFlatViewChange,
+  changedTreeView,
+  onChangedTreeViewChange,
   showHidden,
   onShowHiddenChange,
   sort,
@@ -112,6 +120,8 @@ export function FilesPanelDrawer({
           onFileSelect={onFileSelect}
           flatView={flatView}
           onFlatViewChange={onFlatViewChange}
+          changedTreeView={changedTreeView}
+          onChangedTreeViewChange={onChangedTreeViewChange}
           showHidden={showHidden}
           onShowHiddenChange={onShowHiddenChange}
           sort={sort}

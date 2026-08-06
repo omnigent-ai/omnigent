@@ -131,6 +131,8 @@ function renderWorkspace(
         onSortChange={vi.fn()}
         filesPanelFlatView={false}
         onFlatViewChange={vi.fn()}
+        filesPanelChangedTreeView={false}
+        onChangedTreeViewChange={vi.fn()}
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
