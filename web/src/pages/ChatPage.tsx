@@ -51,7 +51,11 @@ import {
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
-import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
+import {
+  BlockRenderer,
+  FilePathAwareMessageResponse,
+  rendersOnlyWorkedFold,
+} from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
@@ -3540,6 +3544,18 @@ function AssistantBubble({
 
   const markdownText = collectBubbleMarkdown(bubble.items);
 
+  // The bubble collapses to nothing but the "Worked for" row — its text
+  // all sits inside the fold, and its answer lands in a later bubble.
+  const foldOnly = rendersOnlyWorkedFold({
+    items: bubble.items,
+    sessionStatus,
+    turnLifecycle: bubble.lifecycle,
+    continued: bubble.continued,
+    isLastAssistant,
+    hasPendingElicitation,
+    showsWorking,
+  });
+
   // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
@@ -3554,7 +3570,12 @@ function AssistantBubble({
         data-role="assistant"
         className={isWide ? "max-w-full" : "max-w-3xl"}
       >
-        <MessageContent className={isWide ? "w-full" : undefined}>
+        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
+            rather than shrink-wrapping to the summary row's ~110px, which
+            collapsed the row's trailing hairline (a flex-1 span) to zero
+            and stopped its click target short of the column. Keeping the
+            cap lands the hairline where an answered turn's does. */}
+        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -3577,7 +3598,10 @@ function AssistantBubble({
             <span>Interrupted</span>
           </p>
         )}
-        {markdownText && (
+        {/* Skipped on a fold-only bubble: the actions belong to content
+            the user can see, and hanging them off a collapsed row spaced
+            consecutive rows unevenly depending on hidden narration. */}
+        {markdownText && !foldOnly && (
           <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
