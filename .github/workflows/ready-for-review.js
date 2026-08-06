@@ -11,11 +11,16 @@
 // and the rest of this file stays the same.
 //
 // Never applied when:
+//   - the author is a maintainer or a bot. The label exists to route incoming
+//     contributions; maintainers land their own work and half the in-window PRs
+//     are theirs, so labelling them halves the signal. It matches the nudge, which
+//     exempts maintainers for the same reason.
+//   - the PR is closed or merged. `is:open` in the search lags, so one that closed
+//     in the last few minutes still comes back and must not be labelled.
 //   - the PR is a draft (the author is telling us it is not ready)
 //   - `waiting-on-author` is set (the ball is in the author's court; applying
 //     both would break the mutual exclusion the two labels rely on)
-//   - the label is already there (idempotent, and it must not fight a maintainer
-//     who removed it on purpose -- see REMOVED_BY_HUMAN below)
+//   - the label is already there (idempotent), or a human removed it before
 //
 // Forward-only, sharing pr-issue-link.js's effective date: labelling 478 backlog
 // PRs in one sweep would bury the signal it exists to create.
@@ -26,6 +31,7 @@ const MS_PER_HOUR = 60 * 60 * 1000;
 const HOURS_TO_SCAN = 24;
 const REVIEW_LABEL = "waiting-for-review";
 const WAITING_LABEL = "waiting-on-author";
+const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
 
 const QUERY = `
   query($cursor: String, $searchQuery: String!) {
@@ -35,7 +41,10 @@ const QUERY = `
       nodes {
         ... on PullRequest {
           number
+          state
           isDraft
+          authorAssociation
+          author { login __typename }
           labels(first: 30) { nodes { name } }
           body
           timelineItems(last: 50, itemTypes: [UNLABELED_EVENT]) {
@@ -105,6 +114,17 @@ async function belowBar(ctx) {
   return null;
 }
 
+// True when the PR is the project's own work rather than an incoming contribution.
+// Checked on both signals, like the nudge: a maintainer whose org membership is
+// private reads as CONTRIBUTOR, and one with write access may be unlisted.
+function isOwnWork(pr, maintainers) {
+  const login = pr.author?.login ?? "";
+  if (pr.author?.__typename === "Bot" || login.endsWith("[bot]")) return "bot";
+  if (MAINTAINER_ASSOCIATIONS.includes(pr.authorAssociation)) return "maintainer";
+  if (maintainers.has(login.toLowerCase())) return "maintainer";
+  return null;
+}
+
 module.exports = async ({ context, github, core }) => {
   const { owner, repo } = context.repo;
   const enforce = process.env.ENFORCE === "true";
@@ -132,11 +152,37 @@ module.exports = async ({ context, github, core }) => {
     }
     console.log(`Found ${allPRs.length} open PRs in the window`);
 
+    // Read from the API, not the checked-out tree, so a PR cannot self-grant by
+    // editing the file (same approach as the nudge).
+    const maintainers = new Set();
+    try {
+      const resp = await github.rest.repos.getContent({
+        owner,
+        repo,
+        path: ".github/MAINTAINER",
+        ref: context.payload.repository?.default_branch ?? "main",
+      });
+      Buffer.from(resp.data.content, "base64")
+        .toString("utf8")
+        .split("\n")
+        .map((l) => l.replace(/#.*$/, "").trim().toLowerCase())
+        .filter(Boolean)
+        .forEach((m) => maintainers.add(m));
+    } catch (err) {
+      core.warning(`Could not load .github/MAINTAINER: ${err.message}`);
+    }
+
     const verdicts = [];
     for (const pr of allPRs) {
       const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
-      let skip = null;
-      if (pr.isDraft) skip = "draft";
+      let skip = isOwnWork(pr, maintainers);
+      if (skip) {
+        // own work: reported as-is
+      }
+      // `is:open` in the search is index-backed and lags, so a PR closed or merged
+      // in the last few minutes still comes back. Check the state we were handed.
+      else if (pr.state !== "OPEN") skip = pr.state.toLowerCase();
+      else if (pr.isDraft) skip = "draft";
       else if (labels.includes(REVIEW_LABEL)) skip = "already labelled";
       else if (labels.includes(WAITING_LABEL)) skip = "waiting on author";
       else if (removedByHuman(pr)) skip = "label was removed by hand";

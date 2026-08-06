@@ -11,10 +11,17 @@ function pr({
   draft = false,
   labels = [],
   unlabeled = [],
+  state = "OPEN",
+  author = "ext",
+  assoc = "CONTRIBUTOR",
+  bot = false,
 }) {
   return {
     number,
+    state,
     isDraft: draft,
+    authorAssociation: assoc,
+    author: { login: author, __typename: bot ? "Bot" : "User" },
     labels: { nodes: labels.map((name) => ({ name })) },
     body,
     // Each entry is a label name (removed by a human) or [name, actor].
@@ -32,7 +39,14 @@ function pr({
 // "issue" | "pr" | undefined (404).
 async function run(
   nodes,
-  { linked = {}, issues = {}, env = {}, linkError = false, failLabelOn = null } = {}
+  {
+    linked = {},
+    issues = {},
+    env = {},
+    linkError = false,
+    failLabelOn = null,
+    maintainers = [],
+  } = {}
 ) {
   const labeled = [];
   const rows = [];
@@ -63,6 +77,11 @@ async function run(
       };
     },
     rest: {
+      repos: {
+        getContent: async () => ({
+          data: { content: Buffer.from(maintainers.join("\n"), "utf8").toString("base64") },
+        }),
+      },
       issues: {
         addLabels: async ({ issue_number, labels: ls }) => {
           if (issue_number === failLabelOn) {
@@ -93,7 +112,10 @@ async function run(
   Object.assign(process.env, env);
   try {
     await script({
-      context: { repo: { owner: "o", repo: "r" } },
+      context: {
+        repo: { owner: "o", repo: "r" },
+        payload: { repository: { default_branch: "main" } },
+      },
       github,
       core: { warning: (m) => warnings.push(m), summary },
     });
@@ -152,6 +174,50 @@ const verdictOf = (rows, n) => (rows.find((r) => r[0] === `#${n}`) || [])[1];
     const { labeled, rows } = await run([pr({ number: 13 })], { env: ENFORCE });
     assert.strictEqual(labeled.length, 0);
     assert.strictEqual(verdictOf(rows, 13), "below bar");
+  }
+
+  // The label routes incoming contributions, so the project's own work is skipped.
+  for (const [who, opts] of [
+    ["MEMBER", { assoc: "MEMBER" }],
+    ["OWNER", { assoc: "OWNER" }],
+    ["COLLABORATOR", { assoc: "COLLABORATOR" }],
+    ["a bot", { bot: true, author: "omnigent-ci[bot]" }],
+  ]) {
+    const { labeled, rows } = await run([pr({ number: 30, ...opts })], {
+      linked: { 30: 1 },
+      env: ENFORCE,
+    });
+    assert.strictEqual(labeled.length, 0, `${who} PRs are not labelled`);
+    assert.strictEqual(verdictOf(rows, 30), "skip");
+  }
+  // A maintainer with private org membership reads as CONTRIBUTOR, so the
+  // MAINTAINER file is the second signal (same as the nudge).
+  {
+    const { labeled } = await run([pr({ number: 31, author: "listed-maintainer" })], {
+      linked: { 31: 1 },
+      env: ENFORCE,
+      maintainers: ["listed-maintainer", "# a comment"],
+    });
+    assert.strictEqual(labeled.length, 0, "the MAINTAINER file also exempts");
+  }
+  // ...but a genuine outside contributor still gets the label.
+  {
+    const { labeled } = await run([pr({ number: 32, author: "outsider" })], {
+      linked: { 32: 1 },
+      env: ENFORCE,
+      maintainers: ["listed-maintainer"],
+    });
+    assert.strictEqual(labeled.length, 1, "contributors are still labelled");
+  }
+
+  // `is:open` in the search lags, so a just-closed or merged PR still comes back.
+  for (const state of ["CLOSED", "MERGED"]) {
+    const { labeled, rows } = await run([pr({ number: 33, state })], {
+      linked: { 33: 1 },
+      env: ENFORCE,
+    });
+    assert.strictEqual(labeled.length, 0, `${state} PRs are not labelled`);
+    assert.strictEqual(verdictOf(rows, 33), "skip");
   }
 
   // Draft: the author is saying it is not ready.
