@@ -3328,7 +3328,7 @@ function ConversationRow({
             <ContextMenuTrigger asChild>
               <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
             </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
+            <ContextMenuContent className="min-w-44">
               <ConversationMenuItems
                 components={contextBundle}
                 setMenuOpen={() => {}}
@@ -3345,7 +3345,7 @@ function ConversationRow({
       ) : isMobile ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
+          <ContextMenuContent className="min-w-44">
             <ConversationMenuItems
               components={contextBundle}
               setMenuOpen={() => {}}
@@ -3361,7 +3361,7 @@ function ConversationRow({
                 <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
               </div>
             </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-sm">
+            <ContextMenuContent className="min-w-44">
               <ConversationMenuItems
                 components={contextBundle}
                 setMenuOpen={() => {}}

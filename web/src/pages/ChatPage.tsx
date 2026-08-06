@@ -5950,7 +5950,11 @@ function SessionConfigModal({
                 >
                   <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
                 </SelectTrigger>
-                <SelectContent position="popper" align="start">
+                <SelectContent
+                  position="popper"
+                  align="start"
+                  className="w-(--radix-select-trigger-width)"
+                >
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                   {effortLevels.map((level) => (
                     <SelectItem

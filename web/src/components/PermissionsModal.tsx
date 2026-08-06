@@ -422,7 +422,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
       />
       {isOpen && (
         // Wider than the (narrow) field so suggested emails aren't truncated.
-        <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-lg border bg-popover p-1 text-popover-foreground shadow-menu">
+        <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu">
           {isLoading ? (
             <div className="py-6 text-center text-ui text-muted-foreground">Searching…</div>
           ) : suggestions.length === 0 ? (
@@ -441,8 +441,8 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                     commit(index);
                   }}
                   className={cn(
-                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-ui",
-                    index === activeIndex && "bg-muted",
+                    "flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-ui",
+                    index === activeIndex && "bg-muted dark:bg-muted/50",
                   )}
                 >
                   {/* Primary label fills the row and truncates. When the host
