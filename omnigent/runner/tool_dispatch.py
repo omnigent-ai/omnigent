@@ -4259,6 +4259,18 @@ def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
     return entries
 
 
+#: Budget for the confinement lookup. Short on purpose: a slow or wedged
+#: server must not hold an agent listing open, and an unanswered lookup
+#: fails open to the unfiltered list.
+_SPAWN_FAMILY_TIMEOUT_S = 5.0
+
+#: Resolved confinement per session. Routing state is stamped at create and
+#: never changes, so one lookup serves every later ``sys_agent_list``. Only
+#: sessions with routing armed locally reach it, and only answered lookups
+#: are stored, so a fail-open miss is retried next call.
+_spawn_family_cache: dict[str, str | None] = {}
+
+
 async def _spawn_family(
     server_client: httpx.AsyncClient,
     conversation_id: str | None,
@@ -4273,9 +4285,15 @@ async def _spawn_family(
     plain session is not routed at all — both see the whole surface, byte
     for byte as before.
 
-    Best-effort: an unreadable session reads as "no confinement", because
-    a discovery listing must not fail on the routing lookup. The
-    child-create gate is the enforcement.
+    The runner-local routing class answers for those two cases without
+    touching the server, so a plain session — the overwhelming majority —
+    pays nothing for a feature it does not use. Only a locally pinned
+    routed session spends the one cached lookup that reads the
+    subagent-routing switch.
+
+    Best-effort: an unreadable or slow session read fails open to "no
+    confinement", because a discovery listing must not block on the
+    routing lookup. The child-create gate is the enforcement.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The calling session's id, or ``None``.
@@ -4287,18 +4305,24 @@ async def _spawn_family(
     from omnigent.runner.subagent_routing import (
         auto_harness_session,
         harness_family,
+        session_routing_class,
         subagent_routing_enabled,
     )
 
     if conversation_id is None:
         return None
+    local = session_routing_class(conversation_id)
+    if not local.routing_enabled or local.auto_harness:
+        return None
+    if conversation_id in _spawn_family_cache:
+        return _spawn_family_cache[conversation_id]
     try:
         resp = await server_client.get(
             f"/v1/sessions/{conversation_id}",
             # Only the routing fields are read, so skip the history and
             # runner-liveness work the full snapshot would do.
             params={"include_items": "false", "include_liveness": "false"},
-            timeout=30.0,
+            timeout=_SPAWN_FAMILY_TIMEOUT_S,
         )
     except Exception:  # noqa: BLE001 — discovery must not fail on this read
         return None
@@ -4307,18 +4331,27 @@ async def _spawn_family(
     snapshot = _string_object_dict(resp.json())
     if snapshot is None:
         return None
-    if not subagent_routing_enabled(_optional_string(snapshot.get("subagent_routing_override"))):
-        return None
-    harness = _optional_string(snapshot.get("harness"))
-    labels = _string_object_dict(snapshot.get("labels")) or {}
-    # The shared predicate reads the same two fields off a conversation row.
-    row = SimpleNamespace(
-        labels={key: value for key, value in labels.items() if isinstance(value, str)},
-        harness_override=harness,
-    )
-    if auto_harness_session(row):
-        return None
-    return harness_family(harness)
+    family: str | None = None
+    if subagent_routing_enabled(_optional_string(snapshot.get("subagent_routing_override"))):
+        harness = _optional_string(snapshot.get("harness"))
+        labels = _string_object_dict(snapshot.get("labels")) or {}
+        # The shared predicate reads the same two fields off a conversation row.
+        row = SimpleNamespace(
+            labels={key: value for key, value in labels.items() if isinstance(value, str)},
+            harness_override=harness,
+        )
+        if not auto_harness_session(row):
+            family = harness_family(harness)
+    _spawn_family_cache[conversation_id] = family
+    return family
+
+
+def forget_spawn_family(conversation_id: str) -> None:
+    """Drop the cached spawn confinement for a finished session.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    _spawn_family_cache.pop(conversation_id, None)
 
 
 def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_JsonObject]:
