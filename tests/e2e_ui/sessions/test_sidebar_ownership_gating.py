@@ -1,4 +1,4 @@
-"""Browser e2e for the sidebar's owner-vs-not row gating and tab placement.
+"""Browser e2e for the sidebar's owner-vs-not row gating and scope filters.
 
 This is the end-to-end companion to the mocked ``Sidebar`` unit tests, and the
 coverage the ``E2E UI Required`` gate asks for: the sidebar derives ownership
@@ -6,16 +6,16 @@ coverage the ``E2E UI Required`` gate asks for: the sidebar derives ownership
 user id carried on each list row — NOT from an effective ``permission_level``.
 The behavior under test:
 
-- A session's **owner** sees it under the **"My sessions"** tab, with the
+- A session's **owner** sees it, with the
   kebab's **Rename** and **Share** items **enabled**.
 - A **non-owner the session is shared with** (even at EDIT) sees it under the
-  **"Shared with me"** tab, with **Rename** and **Share** **disabled**
+  **"Shared sessions"** filter, with **Rename** and **Share** **disabled**
   ("Only the session owner can …"). Editing shared *content* still happens in
   the open session — that path reads the real level from the single-session
   snapshot and is unaffected — but the sidebar affordances are owner-only.
 
 Runs against a dedicated multi-user server: the shared ``live_server`` is
-single-user (``OMNIGENT_LOCAL_SINGLE_USER=1``), which hides the My/Shared tabs
+single-user (``OMNIGENT_LOCAL_SINGLE_USER=1``), which hides the Shared filter
 AND the Share item entirely, so the ownership split can't be observed there.
 The multi-user server clears that marker and declares an admin identity, exactly
 like a Databricks Apps / SSO-proxy install — the deployment shape this gating
@@ -51,8 +51,8 @@ from tests.e2e_ui.collaboration._multi_user_server import (
 # sidebar. Mirrors LEVEL_EDIT in omnigent/server/auth.py.
 _LEVEL_EDIT = 2
 
-_TAB_MINE = '[data-testid="sidebar-tab-mine"]'
-_TAB_SHARED = '[data-testid="sidebar-tab-shared"]'
+_FILTER = '[data-testid="session-filter"]'
+_FILTER_SHARED = '[data-testid="session-filter-shared"]'
 
 
 @pytest.fixture(scope="module")
@@ -61,7 +61,7 @@ def multi_user_server(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[MultiUserServer]:
-    """A NON-single-user server so the My/Shared tabs + Share item render."""
+    """A NON-single-user server so the Shared filter + Share item render."""
     server_tmp = tmp_path_factory.mktemp("e2e_ui_sidebar_ownership_multi_user")
     yield from spawn_multi_user_server(mock_llm_server_url, server_tmp)
 
@@ -99,7 +99,7 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """The owner's own session: "My sessions" tab, Rename + Share enabled.
+    """The owner's own session: visible in the sidebar, Rename + Share enabled.
 
     The baseline half of the ownership split — nothing about owner affordances
     regressed when the sidebar moved off ``permission_level``.
@@ -111,8 +111,8 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
         page = ctx.new_page()
         page.goto(f"{server.public_url}/c/{sid}")
 
-        # Owned → shows under the default "My sessions" tab, never "Shared".
-        expect(page.locator(_TAB_MINE)).to_be_visible(timeout=30_000)
+        # Owned → shows under the default "All sessions" filter.
+        expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
         _open_row_menu(page, sid)
@@ -133,15 +133,15 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
-def test_shared_viewer_sees_session_under_shared_tab_with_owner_only_actions(
+def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """A non-owner (granted EDIT): "Shared with me" tab, Rename + Share disabled.
+    """A non-owner (granted EDIT): "Shared sessions" filter, Rename + Share disabled.
 
     The behavior this PR introduces: an EDIT grant is enough to open and edit
     the session, but the sidebar's Rename/Share are owner-only — so a shared
-    session lands on the "Shared with me" tab (never "My sessions"), and its
+    session shows under the "Shared sessions" filter, and its
     kebab Rename/Share are disabled regardless of the granted level.
     """
     server = multi_user_server
@@ -154,13 +154,14 @@ def test_shared_viewer_sees_session_under_shared_tab_with_owner_only_actions(
         page = ctx.new_page()
         page.goto(f"{server.public_url}/c/{sid}")
 
-        # The shared session is NOT the viewer's own, so it must not appear on
-        # the default "My sessions" tab...
-        expect(page.locator(_TAB_MINE)).to_be_visible(timeout=30_000)
-        expect(_row(page, sid)).to_have_count(0)
+        # The shared session is not the viewer's own, but "All sessions" (the
+        # default filter) includes it, so it is visible up front...
+        expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
+        expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
-        # ...it lives under "Shared with me".
-        page.locator(_TAB_SHARED).click()
+        # ...and it stays visible under the "Shared sessions" filter.
+        page.locator(_FILTER).click()
+        page.locator(_FILTER_SHARED).click()
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
         _open_row_menu(page, sid)

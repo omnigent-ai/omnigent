@@ -2802,9 +2802,10 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, command, timeout_s))
+        captured.append((bridge_dir, command, timeout_s, confirm_hint))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -2871,8 +2872,13 @@ async def test_events_effort_change_on_native_session_types_slash_command(
     assert len(captured) == 1, (
         f"Expected one inject_slash_command call from native effort_change, got {len(captured)}."
     )
-    bridge_dir, command, timeout_s = captured[0]
+    bridge_dir, command, timeout_s, confirm_hint = captured[0]
     assert bridge_dir == bridge_dir_for_conversation_id("c7e9584b9bb34910a0068521106c1abc")
+    # The effort dialog's own title, not "Switch model?". Watching for the wrong
+    # one would leave the pane wedged behind an unconfirmed modal; watching for
+    # "any dialog" would answer a foreign one (a permission prompt, a picker the
+    # person opened) that rendered while the poll was running.
+    assert confirm_hint == claude_native_bridge.EFFORT_DIALOG_HINT
     # Body contract: ``/effort high`` is the literal Claude Code's TUI
     # accepts. A regression in shape (``/efforthigh``, ``effort high``,
     # missing leading slash) would either 404 on the slash router or

@@ -413,7 +413,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
-        codex_cli_version: tuple[int, int, int] | None = None
+        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -612,6 +612,13 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         )
     ]
     assert published_events[0]["type"] == "session.resource.created"
+    assert len(forward_calls) == 1
+    # The router handles are threaded through so the forwarder's ``finally``
+    # tears down *its* endpoints, not a re-created session's live ones.
+    assert "subagent_router" in forward_calls[0]
+    del forward_calls[0]["subagent_router"]
+    assert "turn_router" in forward_calls[0]
+    del forward_calls[0]["turn_router"]
     assert forward_calls == [
         {
             "session_id": session_id,
@@ -1413,6 +1420,15 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     launched_sandbox = launch_captured["spec"].os_env.sandbox
     assert launched_sandbox is not None and launched_sandbox.type == "none"
     assert launch_captured["parent_os_env"] is codex_os_env
+
+    # This fake app-server reports no codex version (an unparseable / failed
+    # probe). The argv flag requires a positively parsed version: on a
+    # pre-0.131 codex an unknown flag aborts argv parsing outright, which is
+    # strictly worse than the recoverable trust prompt. (The app-server's
+    # hooks-file gate keeps the opposite "unknown = supported" policy, since
+    # an unsupported hooks file is only ignored.)
+    assert app_server.codex_cli_version is None
+    assert "--dangerously-bypass-hook-trust" not in launch_captured["spec"].args
 
 
 @pytest.mark.asyncio

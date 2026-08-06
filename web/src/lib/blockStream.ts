@@ -38,6 +38,7 @@ import {
   slashCommandEchoText,
 } from "./blocks";
 import type { StreamEvent } from "./events";
+import { routingExtras } from "./routingDecision";
 import type { Response } from "./types";
 
 const DEFAULT_FLUSH_THRESHOLD = 30;
@@ -660,6 +661,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         applied: event.applied,
         rationale: event.rationale,
         ...(event.agent !== undefined && { agent: event.agent }),
+        routing: routingExtras(event.routing),
       } satisfies RoutingDecisionBlock;
       return;
     }

@@ -72,7 +72,11 @@ import {
 } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
-import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
+import {
+  BRAIN_HARNESS_LABELS,
+  SMART_ROUTING_LABEL,
+  useBrainHarnessLabels,
+} from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
@@ -149,7 +153,8 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { isCostRoutingSession } from "@/components/CostRoutingControl";
+import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+import { showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
   DialogContent,
@@ -165,14 +170,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import {
   ConfigRow,
   EFFORT_SELECT_NONE,
+  EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
+  RoutingModelSelect,
 } from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -193,6 +200,49 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+
+/** Server-info as consumers see it: the probe's result, or "loading". */
+type ServerInfoValue = ServerInfo | "loading";
+
+/**
+ * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
+ * probe still in flight) reads as off, so no routing control flashes in and
+ * then disappears on a server that has none.
+ *
+ * Source-agnostic: the gates below key on `smart_routing_enabled` alone because
+ * which router answers doesn't change whether a session can be routed.
+ */
+function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
+  return serverInfo !== "loading" && serverInfo.smart_routing_enabled;
+}
+
+/**
+ * Whether the session's own model can be routed per turn: the deployment flag,
+ * plus a top-level agent session that is not a native terminal (their CLI bakes
+ * the model at launch and can't per-turn route).
+ */
+export function isCostRoutingEligible(
+  serverInfo: ServerInfoValue,
+  session: Session | null | undefined,
+): boolean {
+  return (
+    smartRoutingEnabled(serverInfo) &&
+    isCostRoutingSession(session) &&
+    !isNativeTerminalSession(session)
+  );
+}
+
+/**
+ * Whether the session may control the routing of the sub-agents it spawns —
+ * same deployment flag, wider session gate (native Claude/Codex included, and
+ * every non-native top-level agent session regardless of harness).
+ */
+export function isSubagentRoutingEligible(
+  serverInfo: ServerInfoValue,
+  session: Session | null | undefined,
+): boolean {
+  return smartRoutingEnabled(serverInfo) && isSubagentRoutingSession(session);
+}
 
 function extractUserText(content: MessageContentBlock[]): string {
   return content
@@ -471,6 +521,26 @@ export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
   return result ?? bubbles;
 }
 
+// Hide the sub-agent spawn chips of a session whose sub-agent routing is not
+// "on". Deliberate product decision: the toggle hides `native_subagent` chips
+// WHOLESALE, including historic chips for spawns that already ran routed while
+// the switch was on — the display follows the current setting, not per-row
+// history. Rows stay persisted (audit trail; flipping the switch back reveals
+// them) and the session's own session/turn chips are untouched. Returns the
+// input array unchanged when nothing is hidden, so the memo stays stable.
+export function stripGatedSubagentRoutingChips(
+  bubbles: Bubble[],
+  subagentRoutingOverride: "on" | "off" | null,
+): Bubble[] {
+  if (subagentRoutingOverride === "on") return bubbles;
+  const shown = bubbles.filter(
+    (b) =>
+      b.kind !== "routing_decision" ||
+      showsRoutingDecisionChip(b.routing?.scope, subagentRoutingOverride),
+  );
+  return shown.length === bubbles.length ? bubbles : shown;
+}
+
 // Whether a user bubble should carry the author's avatar badge (and the
 // author-tinted background): only in a shared session, only when a human
 // author is attached (agent/tool/system output and pre-attribution
@@ -714,6 +784,9 @@ export function ChatPage() {
   const { data: boundAgentBySession } = useSessionAgent(urlConvId ?? null);
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
+  // Gates the sub-agent spawn chips: only a session that explicitly turned
+  // sub-agent routing on shows them (see stripGatedSubagentRoutingChips).
+  const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
 
   // Build bubbles once per blocks/activeResponse change. Memo here so
   // unrelated store updates (status, loading flags) don't re-walk.
@@ -731,8 +804,11 @@ export function ChatPage() {
     // consumed message lands in `blocks` AFTER the card
     // (`reorderCommittedRequestElicitations` swaps the card below it).
     // Both keep the prompt on top across the pending → approved flip.
-    const committed = reorderCommittedRequestElicitations(
-      buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
+    const committed = stripGatedSubagentRoutingChips(
+      reorderCommittedRequestElicitations(
+        buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
+      ),
+      subagentRoutingOverride,
     );
     // claude-native live previews are NOT trailing bubbles — they live in
     // `blocks` as provisional `live:*` text blocks at their streamed
@@ -744,7 +820,13 @@ export function ChatPage() {
       committed,
       buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
     );
-  }, [blocks, activeResponse, interruptedResponseIds, pendingUserMessages]);
+  }, [
+    blocks,
+    activeResponse,
+    interruptedResponseIds,
+    pendingUserMessages,
+    subagentRoutingOverride,
+  ]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
   // so the pick survives sidebar clicks; resets on full page reload.
@@ -870,11 +952,13 @@ export function ChatPage() {
   // excluded: their CLI bakes the model at launch and can't per-turn route, so
   // Smart Routing is meaningless there.
   const serverInfo = useServerInfo();
-  const costRoutingEligible =
-    serverInfo !== "loading" &&
-    serverInfo.smart_routing_enabled &&
-    isCostRoutingSession(activeSession) &&
-    !isNativeTerminalSession(activeSession);
+  const costRoutingEligible = isCostRoutingEligible(serverInfo, activeSession);
+  // Sub-agent routing is a separate knob with a different gate: a native CLI
+  // can't per-turn route itself, but the sub-agents it spawns are routed per
+  // spawn — where the launch actually installed that apparatus. See
+  // isSubagentRoutingSession for which classes qualify; for native sessions
+  // this is their only routing control.
+  const subagentRoutingEligible = isSubagentRoutingEligible(serverInfo, activeSession);
 
   // Non-null only when the active session is a sub-agent (child): the
   // composer then peeks a "Chatting with sub-agent …" tray and the
@@ -894,6 +978,7 @@ export function ChatPage() {
     runnerOnline,
     backgroundTaskCount,
   });
+
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
   // bound — so it identifies the source (for the picker's prefill) but is
@@ -1147,6 +1232,7 @@ export function ChatPage() {
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
       costRoutingEligible={costRoutingEligible}
+      subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
     />
   );
@@ -1386,6 +1472,8 @@ interface MainAgentSurfaceProps {
   showPollyCodexGoalControl?: boolean;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
   costRoutingEligible: boolean;
+  /** Session passes `isSubagentRoutingSession` (top-level, native Claude/Codex or non-native). */
+  subagentRoutingEligible: boolean;
   /**
    * Sub-agent instance label when the active session is a child, e.g.
    * ``"check-account-eligibility"``; ``null`` for top-level sessions.
@@ -1458,6 +1546,7 @@ function MainAgentSurface({
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
   costRoutingEligible,
+  subagentRoutingEligible,
   subAgentLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
@@ -1597,6 +1686,15 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
+  // How far the composer has grown past its resting height. The composer keeps
+  // that growth out of the flex column, so the wrapper's box never moves —
+  // this only lifts the overlays pinned to its bottom edge (the scroll-to-
+  // bottom button, the Working… tab, the message nav) clear of the taller
+  // card. Written straight to the DOM: a re-render per line of typing would
+  // re-render the whole transcript for a purely visual offset.
+  const publishComposerGrowth = useCallback((px: number) => {
+    conversationRef.current?.style.setProperty("--composer-growth", `${px}px`);
+  }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
   // True only while the chat/terminal surface is the frontmost thing on screen.
   // Drives both native overlays so neither floats over an opened drawer.
@@ -1689,8 +1787,7 @@ function MainAgentSurface({
   // tool runs, and reasoning gaps — including after a reload that hydrates
   // `running` before any bubbles exist locally. Only a trailing compaction
   // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingStatus = shouldShowWorkingIndicator(showsWorking, bubbles);
-  const showWorkingIndicator = showWorkingStatus;
+  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
   if (showTerminal && conversationId) {
     return (
@@ -1823,7 +1920,7 @@ function MainAgentSurface({
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingStatus && <RunnerStartingIndicator variant="row" />}
+                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
@@ -1842,7 +1939,7 @@ function MainAgentSurface({
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingStatus} suppress={subAgentLabel != null} />
+          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
           <UserMessageNavConnected
             goPrev={nav.goPrev}
             goNext={nav.goNext}
@@ -1917,7 +2014,9 @@ function MainAgentSurface({
         }
         onShowReconnectHelp={onShowReconnectHelp}
         costRoutingEligible={costRoutingEligible}
+        subagentRoutingEligible={subagentRoutingEligible}
         subAgentLabel={subAgentLabel}
+        onGrowthChange={publishComposerGrowth}
       />
 
       {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
@@ -1963,7 +2062,7 @@ function ConversationLoadError({
         <h1 className="font-medium text-foreground text-lg">Conversation not found</h1>
         <p className="text-muted-foreground text-ui">
           Couldn't load{" "}
-          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{conversationId}</code>
+          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-sm">{conversationId}</code>
           : {error.message}
         </p>
         {/* Route to the home composer ("/"), which owns session creation. */}
@@ -2009,6 +2108,7 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
 function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
   const { isAtBottom } = useStickToBottomContext();
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const blockedOn = useChatStore((s) => s.blockedOn);
   const tick = useWorkingLabelTick();
   const visible = show && !isAtBottom && !suppress;
   return (
@@ -2019,7 +2119,9 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
       aria-live="polite"
       data-testid="working-indicator-pin"
       className={cn(
-        "pointer-events-none absolute inset-x-0 bottom-0 z-20 transition-opacity duration-200",
+        // bottom tracks --composer-growth so the tab keeps meeting the card's
+        // top edge while the composer is grown (it overlaps this wrapper).
+        "pointer-events-none absolute inset-x-0 bottom-[var(--composer-growth,0px)] z-20 transition-opacity duration-200",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
@@ -2046,8 +2148,8 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
             )}
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-xs font-mono" duration={1.5}>
-              {workingIndicatorLabel(bgCount, tick)}
+            <Shimmer className="text-sm font-mono" duration={1.5}>
+              {workingIndicatorLabel(bgCount, tick, blockedOn)}
             </Shimmer>
           </div>
         )}
@@ -2594,7 +2696,7 @@ export function JumpToTopButton({
         tabIndex={visible ? 0 : -1}
         aria-hidden={!visible}
         className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-xs shadow-sm",
+          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
           // Force an OPAQUE background in both themes and on hover. The outline
           // variant's hover (bg-muted) is a translucent black wash (--muted is
           // #0000000f), so over the faded chat text behind the pill it bleeds
@@ -2646,12 +2748,22 @@ export const WORKING_MESSAGES = [
 ] as const;
 
 /**
- * The label shown next to the working spinner. When background shells outlive
- * the turn (`bgCount > 0`) it names how many are still running (the tick is
- * ignored — that count is information, not decoration). Otherwise it rotates
- * through `WORKING_MESSAGES` by wall-clock `tick`.
+ * The label shown next to the working spinner. When the agent is parked on a
+ * dialog (`blockedOn`) it says so — that outranks everything else, because it
+ * is the one case where the session needs the user rather than time, and the
+ * dialog may live only in the terminal tab. Otherwise, when background shells
+ * outlive the turn (`bgCount > 0`) it names how many are still running (the
+ * tick is ignored — that count is information, not decoration). Failing both
+ * it rotates through `WORKING_MESSAGES` by wall-clock `tick`.
  */
-export function workingIndicatorLabel(bgCount: number, tick = 0): string {
+export function workingIndicatorLabel(
+  bgCount: number,
+  tick = 0,
+  blockedOn: string | null = null,
+): string {
+  if (blockedOn) {
+    return `Blocked on: ${blockedOn}`;
+  }
   if (bgCount > 0) {
     return bgCount === 1
       ? "1 background task still running"
@@ -2662,14 +2774,15 @@ export function workingIndicatorLabel(bgCount: number, tick = 0): string {
 
 function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const blockedOn = useChatStore((s) => s.blockedOn);
   const tick = useWorkingLabelTick();
-  const label = workingIndicatorLabel(bgCount, tick);
+  const label = workingIndicatorLabel(bgCount, tick, blockedOn);
   return (
     <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
       <MessageContent>
         <div className="flex items-center gap-1.5 py-0.5">
           <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-          <Shimmer className="text-xs font-mono" duration={1.5}>
+          <Shimmer className="text-sm font-mono" duration={1.5}>
             {label}
           </Shimmer>
         </div>
@@ -2731,7 +2844,7 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
       data-testid="sandbox-failed-indicator"
       role="status"
       className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-xs",
+        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
         CHAT_COLUMN_WIDTH,
       )}
     >
@@ -2808,7 +2921,7 @@ export function ConnectionIndicator({
         data-testid="disconnected-indicator"
         onClick={onShowReconnectHelp}
         className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-xs text-destructive underline-offset-2 hover:underline",
+          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
           CHAT_COLUMN_WIDTH,
         )}
       >
@@ -2858,7 +2971,7 @@ export function ConnectionIndicator({
       <div
         data-testid="connecting-indicator"
         className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-xs",
+          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
           CHAT_COLUMN_WIDTH,
         )}
       >
@@ -3111,7 +3224,7 @@ function CompactionLoadingIndicator() {
   return (
     <Message from="assistant" data-testid="compacting-indicator">
       <MessageContent>
-        <div className="flex items-center gap-2 text-xs font-mono">
+        <div className="flex items-center gap-2 text-sm font-mono">
           <Shimmer as="span" duration={1.5}>
             Compacting conversation…
           </Shimmer>
@@ -3156,6 +3269,7 @@ export const BubbleView = memo(
           applied={bubble.applied}
           rationale={bubble.rationale}
           agent={bubble.agent}
+          routing={bubble.routing}
         />
       );
     }
@@ -3297,15 +3411,18 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           // a glance without any email text.
           style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
         >
-          {/* Inline image previews */}
+          {/* Inline image previews — one non-wrapping strip. Wrapping would
+              re-flow the row as each image's width resolves on load, changing
+              the bubble's height and shoving the transcript; scrolling keeps
+              the row exactly one preview tall no matter what lands. */}
           {images.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-2">
+            <div className="mb-1.5 flex gap-2 overflow-x-auto">
               {images.map((img) =>
                 img.file_id.startsWith("pending:") ? (
                   // Upload in-flight — show a chip placeholder
                   <span
                     key={img.file_id}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
                     <ImageIcon className="size-3 shrink-0" />
                     <span className="max-w-[180px] truncate">
@@ -3322,7 +3439,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         : undefined
                     }
                     alt={img.filename ?? img.file_id}
-                    className="max-h-64 max-w-full rounded-md object-contain"
+                    // Sizing lives in SessionImage, which reserves a matching
+                    // box so the bubble's height is settled before bytes land.
+                    className="rounded-md object-contain"
                   />
                 ),
               )}
@@ -3334,7 +3453,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               {fileChips.map((att) => (
                 <span
                   key={att.file_id}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                 >
                   <FileTextIcon className="size-3 shrink-0" />
                   <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
@@ -3348,7 +3467,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               {mentionedChips.map((item) => (
                 <span
                   key={mentionItemPath(item)}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                 >
                   {item.isDir ? (
                     <FolderIcon className="size-3 shrink-0" />
@@ -3451,7 +3570,7 @@ function AssistantBubble({
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
           <p
-            className="mt-1 flex items-center gap-1 text-xs text-muted-foreground"
+            className="mt-1 flex items-center gap-1 text-sm text-muted-foreground"
             data-testid="assistant-interrupted-indicator"
           >
             <XIcon className="size-3" aria-hidden="true" />
@@ -3459,7 +3578,7 @@ function AssistantBubble({
           </p>
         )}
         {markdownText && (
-          <MessageActions className="mt-1 opacity-40 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
@@ -3481,7 +3600,7 @@ function AssistantBubble({
       </Message>
 
       {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-xs">Error: {bubble.error}</p>
+        <p className="text-destructive text-sm">Error: {bubble.error}</p>
       )}
     </>
   );
@@ -3589,12 +3708,25 @@ interface ComposerProps {
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
   /**
+   * Session passes `isSubagentRoutingSession` — a top-level session that gets
+   * the gear modal's "Subagent routing" row. Wider than `costRoutingEligible`:
+   * native-terminal Claude/Codex sessions qualify here too.
+   */
+  subagentRoutingEligible?: boolean;
+  /**
    * Sub-agent instance label when the active session is a child, e.g.
    * ``"check-account-eligibility"``; ``null``/omitted for top-level
    * sessions. When set, the composer peeks a "Chatting with sub-agent …"
    * tray above the card. See ``subAgentComposerLabel``.
    */
   subAgentLabel?: string | null;
+  /**
+   * Reports how many pixels taller than its resting height the composer has
+   * grown. The composer keeps that growth out of the column's flex layout
+   * (see the negative top margin below); the transcript uses the number to
+   * lift its bottom-anchored overlays clear of the taller card.
+   */
+  onGrowthChange?: (px: number) => void;
 }
 
 /**
@@ -3696,12 +3828,12 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
               />
             )}
           </svg>
-          <span className="text-xs tabular-nums" aria-hidden="true">
+          <span className="text-sm tabular-nums" aria-hidden="true">
             {usedPct}%
           </span>
         </span>
       </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-xs">
+      <TooltipContent side="top" className="max-w-44 text-center text-sm">
         <p className="tabular-nums">{usedPct}% of context used.</p>
       </TooltipContent>
     </Tooltip>
@@ -3859,20 +3991,20 @@ function ComposerStatusLine({
         // dark-mode glass rule — bg-card here would re-decorate the tray
         // with its own border/shadow, duplicating the composer's chrome —
         // and matches the home composer's footer tray surface.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/40 px-4 pb-1.5 pt-5.5",
+        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/20 px-4 pb-1.5 pt-5.5",
         CHAT_COLUMN_WIDTH,
       )}
     >
       {/* Left: host badge then worktree branch. Always holds the flex-1 slot
           so the right cluster stays pinned right even when both are absent;
           each item truncates to an ellipsis so the tray never wraps. */}
-      <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
+      <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
         {showHost && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
         )}
         {showBranch && (
           <span className="flex min-w-0 items-center gap-1.5">
-            <GitBranchIcon className="size-3.5 shrink-0" />
+            <GitBranchIcon className="ui-icon" />
             <span data-testid="composer-git-branch" className="min-w-0 truncate" title={gitBranch}>
               {gitBranch}
             </span>
@@ -3884,9 +4016,9 @@ function ComposerStatusLine({
         {showPlanMode && (
           <span
             data-testid="composer-plan-mode"
-            className="inline-flex items-center gap-1 text-xs font-medium text-foreground"
+            className="inline-flex items-center gap-1 text-sm font-medium text-foreground"
           >
-            <FileTextIcon className="size-3.5 shrink-0" />
+            <FileTextIcon className="ui-icon" />
             <span>Plan mode</span>
           </span>
         )}
@@ -3954,7 +4086,7 @@ function SubagentComposerTray({ label }: { label: string }) {
     <div
       data-testid="composer-subagent-tray"
       className={cn(
-        "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-xs text-brand-accent",
+        "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-sm text-brand-accent",
         CHAT_COLUMN_WIDTH,
       )}
     >
@@ -4002,7 +4134,9 @@ export function Composer({
   unreachable = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
+  subagentRoutingEligible = false,
   subAgentLabel = null,
+  onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const dictation = useDictationInsert(setValue);
@@ -4032,6 +4166,7 @@ export function Composer({
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
@@ -4484,7 +4619,20 @@ export function Composer({
   };
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
-  useAutoGrowTextarea(textareaRef, value);
+  // The extra rows float over the transcript instead of shrinking it: a
+  // negative top margin holds the form's margin box at its resting height, so
+  // the transcript's scroll viewport — and with it the scrollbar's travel and
+  // the turn rail's centering — stays exactly where it was. Only the taller
+  // card overlaps, and it's opaque across the message column.
+  const applyGrowth = useCallback(
+    (px: number) => {
+      const form = formRef.current;
+      if (form) form.style.marginTop = px > 0 ? `${-px}px` : "";
+      onGrowthChange?.(px);
+    },
+    [onGrowthChange],
+  );
+  useAutoGrowTextarea(textareaRef, value, 10, applyGrowth);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -4774,9 +4922,12 @@ export function Composer({
 
   return (
     <form
+      ref={formRef}
       onSubmit={handleSubmit}
       className={cn(
-        "chat-composer-form px-4 md:px-6",
+        // relative: the grown card overlaps the transcript above it, and a
+        // positioned box paints over that in-flow sibling.
+        "chat-composer-form relative px-4 md:px-6",
         isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
       )}
     >
@@ -4833,6 +4984,10 @@ export function Composer({
           glass rule still keys off the bg-card class, so the dark border/
           shadow chrome is unchanged; only the fill goes opaque. */}
       <div
+        // Marks the opaque card so the row can measure where it ends: the
+        // translucent status shelf below it is what the transcript shows
+        // through, so clearance stops at this edge, not the row's bottom.
+        data-composer-card
         className={cn(
           "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-sm transition",
           CHAT_COLUMN_WIDTH,
@@ -4875,7 +5030,7 @@ export function Composer({
           <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
             {replyQuotes.map((quote, i) => (
               <div key={quote.id} className="flex items-start gap-2">
-                <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-xs text-muted-foreground">
+                <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-sm text-muted-foreground">
                   <span className="block truncate">
                     {quote.text.length > 120 ? `${quote.text.slice(0, 120)}…` : quote.text}
                   </span>
@@ -4998,7 +5153,7 @@ export function Composer({
             {files.map((file, i) => (
               <span
                 key={attachmentKey(file)}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
               >
                 {file.type.startsWith("image/") ? (
                   <ImageIcon className="size-3 shrink-0" />
@@ -5020,7 +5175,7 @@ export function Composer({
         )}
         {/* Rejected-attachment feedback: unsupported type or too large */}
         {attachmentError !== null && (
-          <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
+          <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
             {attachmentError}
           </div>
         )}
@@ -5031,7 +5186,7 @@ export function Composer({
             {mentionedItems.map((item, i) => (
               <span
                 key={mentionItemPath(item)}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
               >
                 {item.isDir ? (
                   <FolderIcon className="size-3 shrink-0" />
@@ -5061,7 +5216,7 @@ export function Composer({
         )}
         {/* Inline slash-command feedback: errors and /help output */}
         {commandError !== null && (
-          <div className="px-4 pb-2 text-xs text-muted-foreground whitespace-pre-wrap">
+          <div className="px-4 pb-2 text-sm text-muted-foreground whitespace-pre-wrap">
             {commandError}
           </div>
         )}
@@ -5077,7 +5232,7 @@ export function Composer({
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
             >
-              <PaperclipIcon className="size-4" />
+              <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
             </Button>
             <ComposerMicButton
@@ -5117,7 +5272,7 @@ export function Composer({
                     size="sm"
                     variant={codexPlanMode ? "secondary" : "ghost"}
                     className={cn(
-                      "h-9 gap-1.5 px-2 text-xs md:h-8",
+                      "h-9 gap-1.5 px-2 text-sm md:h-8",
                       codexPlanMode && "border border-ring/30 text-foreground",
                     )}
                     disabled={isReadOnly || planModeBusy}
@@ -5167,30 +5322,33 @@ export function Composer({
                 backendLabel="Codex"
               />
             )}
-            <ComposerModelEffortLabel
-              showModels={showModels}
-              showEffort={showEffort}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              harnessLabel={harnessLabel}
-            />
-            <ComposerConfigGear
-              harnessLabel={harnessLabel}
-              showModels={showModels}
-              showEffort={showEffort}
-              effortLevels={effortLevels}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              // Config changes persist server-side and apply on the next
-              // wake/turn (the runner forward is best-effort), so the gear
-              // stays live wherever a message could be sent — including
-              // asleep/starting/unknown. Only read-only viewers and sessions
-              // no message can wake (unreachable) get an inert gear.
-              disabled={isReadOnly || unreachable}
-              openNonce={pickerOpenNonce}
-            />
+            <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
+              <ComposerModelEffortLabel
+                showModels={showModels}
+                showEffort={showEffort}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                harnessLabel={harnessLabel}
+              />
+              <ComposerConfigGear
+                harnessLabel={harnessLabel}
+                showModels={showModels}
+                showEffort={showEffort}
+                effortLevels={effortLevels}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                subagentRoutingEligible={subagentRoutingEligible}
+                // Config changes persist server-side and apply on the next
+                // wake/turn (the runner forward is best-effort), so the gear
+                // stays live wherever a message could be sent — including
+                // asleep/starting/unknown. Only read-only viewers and sessions
+                // no message can wake (unreachable) get an inert gear.
+                disabled={isReadOnly || unreachable}
+                openNonce={pickerOpenNonce}
+              />
+            </div>
             <Button
               type="submit"
               size="icon"
@@ -5200,8 +5358,9 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 shrink-0 rounded-full md:size-8",
-                !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
+                "size-9 shrink-0 rounded-lg md:size-8",
+                !showInterruptButton &&
+                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
               )}
               // Interrupt stays live during a pending elicitation —
               // cancelling the turn is the other legitimate way out.
@@ -5216,7 +5375,7 @@ export function Composer({
               {showInterruptButton ? (
                 <SquareIcon className="size-4 fill-current" />
               ) : (
-                <ArrowUpIcon className="size-4" />
+                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
               )}
               <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
             </Button>
@@ -5581,17 +5740,23 @@ function formatEffortLabel(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
+/** Gear-modal row governing the routing of sub-agents the session spawns. */
+const SUBAGENT_ROUTING_LABEL = "Subagent routing";
+const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
+
 /**
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
- * knobs switchable mid-session appear — Model, Effort, and Smart Routing.
- * Permission/approval/cursor modes are launch-time only (no in-session state to
+ * knobs switchable mid-session appear — Model (which folds Smart Routing in as
+ * an option where a dropdown exists), Effort, and Subagent routing. A session's
+ * own Smart Routing is otherwise a create-time choice, and
+ * permission/approval/cursor modes are launch-time only (no in-session state to
  * read or write), so they are intentionally absent.
  *
  * Like the new-session modal, changes are drafted locally and only applied on
  * Save (through the store setters ``setModel`` / ``setEffort`` /
- * ``setCostControlMode``); Cancel / dismiss discards them. The setters enforce
- * the model↔routing mutual exclusion server-side.
+ * ``setCostControlMode`` / ``setSubagentRouting``); Cancel / dismiss discards
+ * them. The setters enforce the model↔routing mutual exclusion server-side.
  */
 function SessionConfigModal({
   open,
@@ -5603,6 +5768,7 @@ function SessionConfigModal({
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
+  subagentRoutingEligible,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -5613,14 +5779,17 @@ function SessionConfigModal({
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
+  subagentRoutingEligible: boolean;
 }) {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
+  const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
+  const conversationId = useChatStore((s) => s.conversationId);
+  const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel, modelLabel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
 
-  // Agents with a Model dropdown fold Smart Routing into it as an option; those
-  // without one get a standalone Switch (matches HarnessConfigModal).
+  // Agents with a Model dropdown fold Smart Routing into it as an option. There
+  // is no in-session switch for agents without one — they choose at create.
   const liveRoutingOn = costRoutingEligible && costControlModeOverride === "on";
 
   // Resolve the row the current model maps to: the explicit override wins,
@@ -5643,14 +5812,29 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  // The sub-agent row is stored as a PICK, not a pre-seeded draft:
+  // `undefined` means "untouched", so the row mirrors the live stored value for
+  // as long as the user hasn't chosen anything. A draft seeded once per open
+  // would keep showing the value the session had when the modal opened — and
+  // Save would write that stale value back — if the stored one changed
+  // underneath (a bind/refresh landing, or another client's PATCH).
+  const [pickedSubagentRouting, setPickedSubagentRouting] = useState<"on" | "off" | undefined>(
+    undefined,
+  );
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
-    // Seed once per open from the current live values.
+    setPickedSubagentRouting(undefined);
+    // Nothing pushes a routing-switch change to the client (no SSE event, and
+    // the session query never goes stale), so re-read them here — otherwise the
+    // switches show whatever they were at bind time.
+    void useChatStore.getState().refreshSessionOverrides();
+    // Seed once per open from the current live values, and re-seed if the bound
+    // session changes under an open modal (its drafts describe the old one).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, conversationId]);
 
   // The Select value: the router sentinel when routing is drafted on, else the
   // drafted model, else the "Default" sentinel (no override).
@@ -5672,6 +5856,14 @@ function SessionConfigModal({
       setDraftRoutingOn(false);
     }
   };
+
+  // Two-state row. A row stored before the switch became explicit carries no
+  // value, and that reads as Default — the same thing "off" means — so the
+  // trigger never shows a third state. Untouched (`undefined`) reads through
+  // to the stored value, so what the row shows is always what is persisted.
+  const effectiveSubagentRouting =
+    pickedSubagentRouting === undefined ? subagentRoutingOverride : pickedSubagentRouting;
+  const subagentRoutingValue = effectiveSubagentRouting === "on" ? "on" : "off";
 
   const save = () => {
     // Commit the changed knobs SEQUENTIALLY, awaiting each PATCH before the
@@ -5705,6 +5897,18 @@ function SessionConfigModal({
         // stray ``/effort`` injection would just be noise.
         if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
           await store.setEffort(draftEffort);
+        // Sub-agent routing is independent of this session's own model — a
+        // plain PATCH with no slash-command injection, so ordering is free.
+        // Only an explicit pick is written, and only when it still differs from
+        // what the session has now: an untouched row must never persist a value
+        // the user didn't choose, and an unset store value already means "off",
+        // so picking Default on such a session writes nothing.
+        if (
+          subagentRoutingEligible &&
+          pickedSubagentRouting !== undefined &&
+          pickedSubagentRouting !== (store.subagentRoutingOverride ?? "off")
+        )
+          await store.setSubagentRouting(pickedSubagentRouting);
       } catch {
         // Individual setters already roll back their optimistic state; a failed
         // PATCH shouldn't wedge the modal open.
@@ -5713,9 +5917,23 @@ function SessionConfigModal({
     onOpenChange(false);
   };
 
-  const modelSelectOptions = usesServerModelOptions
-    ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
-    : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
+  const modelSelectOptions = useMemo(() => {
+    const catalog = usesServerModelOptions
+      ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
+      : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
+    // Smart Routing pins the router's fully-qualified pick
+    // (``databricks-claude-opus-4-8``), which the harness catalog carries only
+    // under an alias (``opus``) — or not at all. Radix falls back to the
+    // placeholder for a value no item declares, so the row rendered BLANK on a
+    // routed session. Carry the live model as its own option: the trigger then
+    // names the model the session is actually on, matching the status label
+    // below the composer. Nothing is submitted for an untouched row — `save`
+    // re-pins only a changed draft.
+    if (draftModelId === null || catalog.some((option) => option.id === draftModelId)) {
+      return catalog;
+    }
+    return [...catalog, { id: draftModelId, label: modelLabel ?? draftModelId }];
+  }, [usesServerModelOptions, modelOptions, draftModelId, modelLabel]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -5728,63 +5946,26 @@ function SessionConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {/* Smart Routing as a standalone toggle only for routable agents with
-          no Model dropdown to fold it into (e.g. Polly). Agents that render a
-          Model dropdown (Claude, Codex, …) offer it as a Model option below. */}
-          {costRoutingEligible && !showModels && (
-            <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
-              <div className="flex h-8 items-center justify-end">
-                <Switch
-                  size="sm"
-                  checked={draftRoutingOn}
-                  data-testid="composer-config-smart-routing"
-                  aria-label="Smart Routing"
-                  onCheckedChange={(next) => {
-                    setDraftRoutingOn(next);
-                    // Routing picks the model + effort per turn, so an explicit
-                    // effort can't apply — reset it while routing is on.
-                    if (next) setDraftEffort(null);
-                  }}
-                />
-              </div>
-            </ConfigRow>
-          )}
           {showModels && (
             <ConfigRow label="Model" description="Underlying LLM">
-              <Select value={modelValue} onValueChange={onModelChange}>
-                <SelectTrigger
-                  className="w-full"
-                  data-testid="composer-config-model"
-                  aria-label="Model"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  {costRoutingEligible && (
-                    <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
-                  )}
-                  <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
-                  {modelSelectOptions.map((m) => (
-                    <SelectItem
-                      key={m.id}
-                      value={m.id}
-                      data-model-id={m.id}
-                      data-active={draftModelId === m.id ? "true" : undefined}
-                    >
-                      {m.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <RoutingModelSelect
+                value={modelValue}
+                onValueChange={onModelChange}
+                offerSmartRouting={costRoutingEligible}
+                testId="composer-config-model"
+                models={modelSelectOptions}
+                activeModelId={draftModelId}
+              />
             </ConfigRow>
           )}
           {showEffort && (
             <ConfigRow label="Effort" description="Reasoning depth vs. speed">
               <Select
-                value={draftEffort ?? EFFORT_SELECT_NONE}
+                // Routing picks the model (and its effort) per turn, so an
+                // explicit effort is meaningless: the row is frozen and reads as
+                // an em-dash placeholder (Radix shows it for the empty value).
+                value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
-                // Smart Routing picks the model + effort per turn, so an
-                // explicit effort can't apply — freeze it to Default.
                 disabled={draftRoutingOn}
               >
                 <SelectTrigger
@@ -5792,7 +5973,7 @@ function SessionConfigModal({
                   data-testid="composer-config-effort"
                   aria-label="Effort"
                 >
-                  <SelectValue />
+                  <SelectValue placeholder={EFFORT_UNAVAILABLE_PLACEHOLDER} />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
@@ -5808,6 +5989,38 @@ function SessionConfigModal({
                       {formatStatusEffortLabel(level, modelPickerKind === "codex") ?? level}
                     </SelectItem>
                   ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {/* Sub-agent routing — the only in-session routing control, for a
+          native session whose launch installed the spawn-routing apparatus
+          (spawns route through the harness hook) and for SDK/bundle agents
+          (spawns route through the create path). Hidden where it would be
+          inert: pinned Codex, and any plain native session. A session's own
+          routing is a create-time choice. Two options — a session that started
+          on Smart Routing was stamped "on" at create, so an unset value is
+          Default and the trigger always shows what's stored. */}
+          {subagentRoutingEligible && (
+            <ConfigRow label={SUBAGENT_ROUTING_LABEL} description={SUBAGENT_ROUTING_DESCRIPTION}>
+              <Select
+                value={subagentRoutingValue}
+                onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-subagent-routing"
+                  aria-label={SUBAGENT_ROUTING_LABEL}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value="on" data-subagent-routing="on">
+                    {SMART_ROUTING_LABEL}
+                  </SelectItem>
+                  <SelectItem value="off" data-subagent-routing="off">
+                    Default
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </ConfigRow>
@@ -5850,6 +6063,7 @@ function ComposerConfigGear({
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
+  subagentRoutingEligible,
   disabled,
   openNonce = 0,
 }: {
@@ -5860,6 +6074,7 @@ function ComposerConfigGear({
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
+  subagentRoutingEligible: boolean;
   disabled: boolean;
   openNonce?: number;
 }) {
@@ -5883,7 +6098,7 @@ function ComposerConfigGear({
     costRoutingEligible,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible) return null;
+  if (!showModels && !showEffort && !costRoutingEligible && !subagentRoutingEligible) return null;
 
   return (
     <>
@@ -5898,8 +6113,12 @@ function ComposerConfigGear({
               // read-only config summary) still shows, but block the click and
               // dim it. A native `disabled` button swallows pointer events, so
               // the tooltip would never fire.
+              // The ::before hairline is this gear's divider from the
+              // model/effort label in the composer's split pill. It's drawn
+              // here rather than as a sibling node because the label renders
+              // nothing for some sessions — `first:` then drops the divider.
               className={cn(
-                "size-9 shrink-0 text-muted-foreground hover:text-foreground md:size-8",
+                "size-9 shrink-0 text-muted-foreground before:absolute before:top-1/2 before:left-0 before:h-4 before:w-px before:-translate-y-1/2 before:bg-border hover:text-foreground first:before:hidden md:size-8",
                 disabled && "cursor-default opacity-50 hover:text-muted-foreground",
               )}
               aria-disabled={disabled}
@@ -5910,7 +6129,7 @@ function ComposerConfigGear({
               data-testid="composer-config-gear"
               aria-label="Configure session"
             >
-              <SettingsIcon className="size-4" />
+              <SettingsIcon className="size-4" data-icon-size="16" />
             </Button>
           </TooltipTrigger>
           {summary.length > 0 && (
@@ -5921,7 +6140,8 @@ function ComposerConfigGear({
             >
               {summary.map((row) => (
                 <span key={row.label} className="text-muted-foreground">
-                  {row.label}: <span className="text-popover-foreground">{row.value}</span>
+                  {row.label}:{" "}
+                  <span className="text-background dark:text-popover-foreground">{row.value}</span>
                 </span>
               ))}
             </TooltipContent>
@@ -5938,6 +6158,7 @@ function ComposerConfigGear({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         costRoutingEligible={costRoutingEligible}
+        subagentRoutingEligible={subagentRoutingEligible}
       />
     </>
   );
@@ -5971,18 +6192,16 @@ function useSessionConfigSummary({
   const rows: { label: string; value: string }[] = [];
   if (harnessLabel) rows.push({ label: "Harness", value: harnessLabel });
   if (showModels) {
-    rows.push({ label: "Model", value: routingOn ? "Smart Routing" : (modelLabel ?? "Default") });
+    rows.push({
+      label: "Model",
+      value: routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default"),
+    });
   }
-  // Suppress Effort while Smart Routing is on: the router picks the model and
-  // its effort per turn, so a pinned effort doesn't apply and would mislead.
+  // Suppress Effort while routing is on: the router picks the model and its
+  // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
-  }
-  // Routable agents with no Model row surface Smart Routing as a standalone row;
-  // those with a Model dropdown fold it into Model above (shown as the value).
-  if (costRoutingEligible && !showModels && routingOn) {
-    rows.push({ label: "Smart Routing", value: "On" });
   }
   return rows;
 }
@@ -6129,15 +6348,15 @@ function ComposerModelEffortLabel({
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  // Smart Routing picks the model + effort per turn, so the label reads
-  // "Smart Routing" with no pinned model/effort — matching the gear tooltip.
+  // Routing picks the model + effort per turn, so the label reads
+  // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
       >
-        <span className="text-foreground">Smart Routing</span>
+        <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
       </span>
     );
   }
@@ -6159,7 +6378,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{harnessLabel}</span>
       </span>
@@ -6169,7 +6388,7 @@ function ComposerModelEffortLabel({
   return (
     <span
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+      className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
     >
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}

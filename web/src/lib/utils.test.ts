@@ -9,7 +9,9 @@ describe("cn", () => {
   });
 
   it("treats text-ui as a font-size utility when resolving conflicts", () => {
+    // The two body steps must override each other, whichever order they arrive
+    // in — a component passing text-sm has to beat a default text-ui.
     expect(cn("text-sm text-ui")).toBe("text-ui");
-    expect(cn("text-ui text-xs")).toBe("text-xs");
+    expect(cn("text-ui text-sm")).toBe("text-sm");
   });
 });

@@ -1,12 +1,15 @@
 name: Waiting on Author Hygiene
 
-# Keeps the `waiting-on-author` PR label actionable: author activity clears it,
-# and PRs that sit in that state for 7 days are closed. The workflow runs from
-# trusted default-branch code and never checks out PR-authored files.
+# Keeps the review-state labels actionable. `waiting-on-author` means the ball is
+# in the author's court; author activity clears it and hands off to
+# `waiting-for-review` (re-requesting the reviewer, since GitHub drops the request
+# once a review is submitted). The two labels are mutually exclusive. PRs left
+# waiting on the author for 7 days are closed. The workflow runs from trusted
+# default-branch code and never checks out PR-authored files.
 
 on:
   pull_request_target:
-    types: [synchronize]
+    types: [synchronize, labeled]
   issue_comment:
     types: [created]
   pull_request_review_comment:

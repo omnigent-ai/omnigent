@@ -72,7 +72,7 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     # Auth-aware native harnesses (now including Cursor native) check login state
     # in the picker map. Treat them as logged in when the test just needs
     # "binary present".
-    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key: True)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
 
 
 def _no_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -188,7 +188,7 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
     )
-    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key: False)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
     # opencode: no stored/env provider.
     import omnigent.onboarding.opencode_auth as oc
 
@@ -217,7 +217,7 @@ def test_claude_ready_via_configured_provider_without_cli_login(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
 
-    def _must_not_probe(_key: str) -> bool:
+    def _must_not_probe(_key: str, **_kw: object) -> bool:
         raise AssertionError("CLI login probed despite a configured provider")
 
     monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
@@ -270,7 +270,7 @@ def test_auth_aware_native_harness_launch_gate_stays_binary_only(
     So with the binary present it stays ``True`` even when not signed in.
     """
     _all_clis_installed(monkeypatch)
-    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key: False)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
     assert harness_is_configured("claude-native") is True
     assert harness_is_configured("opencode-native") is True
 
@@ -584,8 +584,8 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
     of being told the binary is missing.
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(hi, "harness_cli_installed", lambda _key: False)
-    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key: True)
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
     result = configured_harness_map()
     for harness in (
         "claude-native",

@@ -187,6 +187,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -546,7 +547,12 @@ describe("double-click to rename", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
 

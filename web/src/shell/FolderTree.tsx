@@ -304,18 +304,18 @@ export function FolderTree({
   // When a search query is active, render a flat filtered list instead of the tree.
   if (searchQuery.trim().length > 0) {
     if (isSearching && !searchResults) {
-      return <p className="px-2 py-1 text-muted-foreground text-xs">Searching…</p>;
+      return <p className="px-2 py-1 text-muted-foreground text-sm">Searching…</p>;
     }
     if (isSearchError) {
       return (
-        <p className="px-2 py-1 text-destructive text-xs">
+        <p className="px-2 py-1 text-destructive text-sm">
           Search failed: {searchError instanceof Error ? searchError.message : "Unknown error"}
         </p>
       );
     }
     if (!searchResults || searchResults.length === 0) {
       return (
-        <p className="px-2 py-1 text-muted-foreground text-xs">
+        <p className="px-2 py-1 text-muted-foreground text-sm">
           No files match "{searchQuery.trim()}"
         </p>
       );
@@ -328,7 +328,7 @@ export function FolderTree({
       // a true zero-match result so the user knows to toggle hidden files.
       const hiddenCount = searchResults.length;
       return (
-        <p className="px-2 py-1 text-muted-foreground text-xs">
+        <p className="px-2 py-1 text-muted-foreground text-sm">
           {hiddenCount} match{hiddenCount === 1 ? "" : "es"} in hidden directories.{" "}
           <button
             type="button"
@@ -358,7 +358,7 @@ export function FolderTree({
   }
 
   if (isLoading) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
   }
   if (isError) {
     // Runner not connected. If it went offline after being up (host
@@ -366,23 +366,23 @@ export function FolderTree({
     // session just hasn't started, fall through to the empty state.
     if (error instanceof RunnerOfflineError) {
       if (runnerWentOffline) return <RunnerAsleepHint />;
-      return <p className="px-2 py-1 text-muted-foreground text-xs">No files in workspace</p>;
+      return <p className="px-2 py-1 text-muted-foreground text-sm">No files in workspace</p>;
     }
     return (
-      <p className="px-2 py-1 text-destructive text-xs">
+      <p className="px-2 py-1 text-destructive text-sm">
         Failed to load: {error instanceof Error ? error.message : String(error)}
       </p>
     );
   }
   if (!files || files.length === 0) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">No files in workspace</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-sm">No files in workspace</p>;
   }
 
   const tree = buildTree(files, sort);
   const visibleTree = showHidden ? tree : tree.filter((n) => !n.name.startsWith("."));
   if (visibleTree.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
+      <p className="px-2 py-1 text-muted-foreground text-sm">
         All files are hidden — click the eye icon to reveal them.
       </p>
     );
@@ -477,7 +477,7 @@ function FileRowItem({
           />
           <span
             className={cn(
-              "min-w-0 flex-1 truncate font-mono text-ui md:text-xs",
+              "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
               labelIsPath ? "[direction:rtl]" : fileStatus === "created" && "font-semibold",
               isDeleted && "line-through opacity-50",
               fileColorClass,
@@ -682,7 +682,7 @@ function TreeNodeRow({
         />
         <span
           className={cn(
-            "min-w-0 flex-1 truncate font-mono text-ui md:text-xs",
+            "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
             dirStatus === "created" && "font-semibold",
             dirDotClass,
           )}
@@ -699,7 +699,7 @@ function TreeNodeRow({
         <ul className="flex flex-col gap-0.5">
           {lazyLoading && (
             <li
-              className="relative py-1 pr-2 text-muted-foreground text-xs"
+              className="relative py-1 pr-2 text-muted-foreground text-sm"
               style={{ paddingLeft: `${indentFor(depth + 1)}px` }}
             >
               <IndentGuides depth={depth + 1} />
@@ -708,7 +708,7 @@ function TreeNodeRow({
           )}
           {!lazyLoading && childNodes.length === 0 && rawChildNodes.length > 0 && (
             <li
-              className="relative py-1 pr-2 text-muted-foreground text-xs"
+              className="relative py-1 pr-2 text-muted-foreground text-sm"
               style={{ paddingLeft: `${indentFor(depth + 1)}px` }}
             >
               <IndentGuides depth={depth + 1} />

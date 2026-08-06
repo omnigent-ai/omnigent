@@ -152,7 +152,7 @@ export function SharingPage() {
                     />
                     <span className="flex-1">
                       <span className="block text-ui font-medium">{tier.label}</span>
-                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                      <span className="mt-0.5 block text-sm text-muted-foreground">
                         {tier.description}
                       </span>
                     </span>
@@ -165,13 +165,13 @@ export function SharingPage() {
             <div className="mt-6 flex items-center justify-between rounded-lg border px-4 py-3">
               <div className="pr-4">
                 <p className="text-ui font-medium">Public access</p>
-                <p className="mt-0.5 text-xs text-muted-foreground">
+                <p className="mt-0.5 text-sm text-muted-foreground">
                   Allow sharing a session with anyone who has the link (public read access). When
                   off, the Share dialog's "Public access" toggle is hidden and new public grants are
                   rejected; sessions already shared publicly stay public until revoked.
                 </p>
                 {!publicEditable && (
-                  <p className="mt-1 text-xs text-muted-foreground">
+                  <p className="mt-1 text-sm text-muted-foreground">
                     Managed by this deployment and can't be changed here.
                   </p>
                 )}

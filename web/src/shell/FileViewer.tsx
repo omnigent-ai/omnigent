@@ -1197,7 +1197,7 @@ function FileViewerBody({
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{path}</span>
+          <span className="min-w-0 truncate font-mono text-sm text-muted-foreground">{path}</span>
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"
@@ -1216,7 +1216,7 @@ function FileViewerBody({
                   : undefined
               }
               className={cn(
-                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px]",
+                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-sm",
                 saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
               )}
             >
@@ -1333,7 +1333,7 @@ function FileViewerBody({
           <span
             ref={toolbarPathMeasureRef}
             aria-hidden
-            className="pointer-events-none absolute left-[-9999px] top-0 font-mono text-xs whitespace-nowrap"
+            className="pointer-events-none absolute left-[-9999px] top-0 font-mono text-sm whitespace-nowrap"
           >
             {path}
           </span>
@@ -1351,7 +1351,7 @@ function FileViewerBody({
               <Trash2Icon className="size-5 opacity-40" />
               <span>This file has been deleted.</span>
               {isDiffAvailable && (
-                <span className="text-xs">
+                <span className="text-sm">
                   Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
                   previous content.
                 </span>

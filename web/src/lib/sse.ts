@@ -67,6 +67,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { routingExtrasFromWire } from "./routingDecision";
 import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
@@ -448,12 +449,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
               message: (rawError as Record<string, unknown>).message as string,
             }
           : undefined;
+      // Absent = not parked. An empty string is treated the same, so a
+      // blank reason never renders as a dangling parenthetical.
+      const rawBlockedOn = data.blocked_on;
+      const blockedOn = typeof rawBlockedOn === "string" && rawBlockedOn ? rawBlockedOn : undefined;
       return {
         type: "session_status",
         conversationId,
         status,
         responseId,
         backgroundTaskCount,
+        ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }
@@ -1065,6 +1071,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
       ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),
+      routing: routingExtrasFromWire(rec),
       itemId,
       responseId,
     } satisfies RoutingDecision;

@@ -108,7 +108,10 @@ export const ConversationScrollButton = ({
     !isAtBottom && (
       <Button
         className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full",
+          // Offset by the composer's growth (0 elsewhere): a grown composer
+          // overlaps the bottom of this scroll area, and the button has to
+          // stay above its card.
+          "absolute bottom-[calc(1rem+var(--composer-growth,0px))] left-[50%] translate-x-[-50%] rounded-full",
           // Keep the fill OPAQUE on hover. The outline variant's hover (bg-muted)
           // is a translucent black wash (--muted is #0000000f), so over the chat
           // content behind it the button reads as transparent on hover. Hover
