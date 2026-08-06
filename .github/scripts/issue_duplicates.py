@@ -336,48 +336,80 @@ def validate_duplicate_decision(
     }
 
 
-def build_duplicate_comment(decision: dict[str, Any], *, close_issue: bool) -> str:
-    """Build the public, idempotently identifiable bot comment."""
+def build_duplicate_comment(
+    decision: dict[str, Any],
+    *,
+    close_issue: bool,
+    reasoning: str = "",
+) -> str:
+    """Build the public, idempotently identifiable bot comment.
+
+    Wording leads with the issue link — the one thing a reporter can act on —
+    and avoids describing the classifier's internals. A `none` verdict produces
+    no comment at all; the caller is expected not to post it.
+    """
     marker = "<!-- omnigent-duplicate-check -->"
-    reason = decision["duplicate_reasoning"]
 
     if decision["duplicate_decision"] == "duplicate":
         issue_number = decision["duplicate_of"]
+        # Only the closing case owes the reporter a justification, and only there
+        # is the model's own sentence worth surfacing over a fixed string.
+        explanation = f" {_one_sentence(reasoning)}" if close_issue and reasoning else ""
         if close_issue:
-            disposition = (
-                f"I’m closing this issue so discussion stays in #{issue_number}. "
-                "If this report is materially different, please leave a comment and "
-                "a maintainer can reopen it."
+            message = (
+                f"Thanks for reporting this. This looks like the same problem as "
+                f"#{issue_number}, so I’m closing it to keep the discussion in one "
+                f"place.{explanation}\n\n"
+                "If it isn't the same, say so here and a maintainer will reopen it."
             )
         else:
-            disposition = (
-                "Automatic duplicate closure is currently disabled, so I’m leaving "
-                "this issue open for maintainers to evaluate."
+            message = (
+                f"Thanks for reporting this. This looks like the same problem as "
+                f"#{issue_number} — worth a look to see if it covers your case.\n\n"
+                "Leaving it open for a maintainer to confirm."
             )
-        message = (
-            f"Thanks for reporting this. This appears to be a high-confidence "
-            f"duplicate of #{issue_number}.\n\n"
-            f"Reason: {reason}\n\n"
-            f"{disposition}"
-        )
     elif decision["duplicate_decision"] == "similar":
         references = ", ".join(f"#{number}" for number in decision["similar_issues"])
+        plural = "these" if len(decision["similar_issues"]) > 1 else "it"
         message = (
-            f"Thanks for reporting this. These existing issues may be related: "
-            f"{references}.\n\n"
-            f"Reason: {reason}\n\n"
-            "I’m leaving this issue open because the match is not strong enough "
-            "to treat it as a duplicate."
+            f"Thanks for reporting this. {references} may be related — worth a look "
+            f"in case {plural} already covers this.\n\n"
+            "If it's the same problem, feel free to add your details there; "
+            "otherwise a maintainer will pick this up."
         )
     else:
-        message = (
-            "Thanks for reporting this. I did not find an existing issue that "
-            "confidently matches this report.\n\n"
-            f"Reason: {reason}\n\n"
-            "I’m leaving this issue open for normal triage."
-        )
+        return ""
 
     return f"{marker}\n{message}\n"
+
+
+_MENTION = re.compile(r"@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))")
+_URL = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
+_ISSUE_REF = re.compile(r"#\d+")
+REASON_MAX_CHARS = 240
+
+
+def _one_sentence(text: str) -> str:
+    """Reduce model prose to one sanitized sentence fit for a public comment.
+
+    The model's text is derived from attacker-controllable issue content, so it
+    is never posted verbatim: mentions would ping real people, links could
+    phish under the bot's badge, and issue refs would cross-link unrelated
+    threads. Each is defanged rather than dropped so the sentence still reads.
+    """
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return ""
+    collapsed = _URL.sub("[link removed]", collapsed)
+    collapsed = _MENTION.sub(r"\1", collapsed)
+    collapsed = _ISSUE_REF.sub("an issue", collapsed)
+    head, separator, _ = collapsed.partition(". ")
+    sentence = head + ("." if separator else "")
+    if not sentence.endswith("."):
+        sentence = f"{sentence}."
+    if len(sentence) > REASON_MAX_CHARS:
+        sentence = f"{sentence[:REASON_MAX_CHARS].rstrip()}…"
+    return sentence
 
 
 def _similarity_map(issue: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[int, float]:

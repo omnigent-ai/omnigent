@@ -23,7 +23,8 @@ name: Issue Triage
 #   3. Assigns priority until Databricks owns scoring
 #   4. Routes to contributors — `good-first-issue` or `help-wanted`
 #   5. Flags incomplete issues — `needs-info` (replaces priority label)
-#   6. Comments with duplicate-check results on every issue
+#   6. Optionally comments when a duplicate or related issue is found
+#      (disabled by default; never comments when nothing matches)
 #   7. Optionally closes validated high-confidence duplicates (disabled by default)
 #   8. Assigns P0/P1 issues to a maintainer via round-robin
 
@@ -33,6 +34,21 @@ on:
     # `if:` below) — that removal is the signal the issue now has enough detail
     # to classify and assign.
     types: [opened, unlabeled]
+  # Manual dry run against any issue: classify and log the decision without
+  # labeling, commenting, or closing unless the inputs opt in.
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue to triage
+        required: true
+      apply_labels:
+        description: Apply label changes (otherwise log only)
+        type: boolean
+        default: false
+      post_comment:
+        description: Post the duplicate-check comment (otherwise log only)
+        type: boolean
+        default: false
 
 permissions:
   issues: write
@@ -41,7 +57,7 @@ permissions:
 # One triage run per issue at a time; a newer event supersedes an in-flight one
 # (e.g. a re-label right after open won't race with the initial run).
 concurrency:
-  group: issue-triage-${{ github.event.issue.number }}
+  group: issue-triage-${{ github.event.issue.number || inputs.issue_number }}
   cancel-in-progress: true
 
 env:
@@ -49,6 +65,10 @@ env:
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
   CLOSE_DUPLICATE_ISSUES: ${{ vars.ISSUE_TRIAGE_CLOSE_DUPLICATES || 'false' }}
+  # Duplicate-check comments are off while the classifier is still being
+  # calibrated: detection and labeling run, but nothing is posted publicly.
+  # A manual dispatch can opt in per run via the `post_comment` input.
+  POST_DUPLICATE_COMMENTS: ${{ vars.ISSUE_TRIAGE_POST_DUPLICATE_COMMENTS || 'false' }}
 
 jobs:
   triage:
@@ -64,6 +84,7 @@ jobs:
     # workflow's own label edits use the default GITHUB_TOKEN, which never emits
     # re-triggering events, so there is no loop to guard against here.
     if: >-
+      github.event_name == 'workflow_dispatch' ||
       (
         github.event.action == 'opened' &&
         !endsWith(github.event.issue.user.login, '[bot]')
@@ -133,7 +154,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
           # Every issue ever filed, so long-closed reports stay discoverable.
           # Raise this as the repository grows.
           CORPUS_LIMIT: "2000"
@@ -424,8 +445,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          # A manual dispatch classifies as though the issue had just opened, so
+          # a dry run exercises the full duplicate decision. Whether anything is
+          # written is gated by APPLY_LABELS / POST_DUPLICATE_COMMENT below.
+          EVENT_ACTION: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && 'opened' || github.event.action }}
+          APPLY_LABELS: >-
+            ${{ github.event_name != 'workflow_dispatch'
+                || inputs.apply_labels }}
+          POST_DUPLICATE_COMMENT: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && inputs.post_comment || env.POST_DUPLICATE_COMMENTS }}
           ISSUE_PRIORITIZATION_V2_ENABLED: ${{ vars.ISSUE_PRIORITIZATION_V2_ENABLED }}
         run: |
           set -euo pipefail
@@ -471,11 +503,18 @@ jobs:
           # The duplicate call is made once, at open time. On the re-triage path
           # (needs-info removed) the label, comment, and closure decision were
           # all settled then, so they are left exactly as they are.
+          def flag(name):
+              return os.environ.get(name, "").strip().lower() == "true"
+
           is_open_event = os.environ.get("EVENT_ACTION") == "opened"
           is_duplicate = duplicate["duplicate_decision"] == "duplicate" and is_open_event
-          close_duplicate_issue = (
-              is_duplicate
-              and os.environ.get("CLOSE_DUPLICATE_ISSUES", "").strip().lower() == "true"
+          close_duplicate_issue = is_duplicate and flag("CLOSE_DUPLICATE_ISSUES")
+          # Nothing is posted for a `none` verdict: most issues are not
+          # duplicates, so the comment would be noise on the majority of them.
+          post_duplicate_comment = (
+              is_open_event
+              and flag("POST_DUPLICATE_COMMENT")
+              and duplicate["duplicate_decision"] != "none"
           )
 
           labels_add = []
@@ -569,7 +608,7 @@ jobs:
                   duplicate["duplicate_decision"] if is_open_event else "none"
               ),
               "close_duplicate_issue": close_duplicate_issue,
-              "post_duplicate_comment": is_open_event,
+              "post_duplicate_comment": post_duplicate_comment,
               # Left as None while Databricks owns scoring.
               "priority": valid_priority,
               "needs_info": bool(result.get("needs_info")),
@@ -581,7 +620,11 @@ jobs:
           }
           pathlib.Path("/tmp/triage_result.json").write_text(json.dumps(output))
           pathlib.Path("/tmp/duplicate_comment.md").write_text(
-              build_duplicate_comment(duplicate, close_issue=close_duplicate_issue)
+              build_duplicate_comment(
+                  duplicate,
+                  close_issue=close_duplicate_issue,
+                  reasoning=output["reasoning"],
+              )
           )
 
           # Build a shell script with properly escaped arguments — no eval.
@@ -595,7 +638,7 @@ jobs:
               args += ["--add-label", label]
           for label in labels_remove:
               args += ["--remove-label", label]
-          if labels_add or labels_remove:
+          if (labels_add or labels_remove) and flag("APPLY_LABELS"):
               cmds.append(" ".join(shlex.quote(a) for a in args))
 
           pathlib.Path("/tmp/triage_commands.sh").write_text(
@@ -604,6 +647,8 @@ jobs:
           )
 
           # Print summary for the workflow log.
+          if not flag("APPLY_LABELS"):
+              print("Dry run: labels computed but not applied")
           print(f"Labels to add: {labels_add}")
           print(f"Labels to remove: {labels_remove}")
           if v2_owns_scoring:
@@ -620,16 +665,18 @@ jobs:
           # Execute the validated label changes.
           bash /tmp/triage_commands.sh
 
-          # Post the duplicate-check result once, on the initial open. Re-triage
-          # runs skip it, and an existing comment is never overwritten so a human
-          # override survives workflow reruns.
+          # Post the duplicate-check result once, on the initial open, and only
+          # when commenting is enabled and the verdict names a related issue. An
+          # existing comment is never overwritten so a human override survives
+          # workflow reruns.
           post_duplicate_comment=$(jq -r '.post_duplicate_comment' /tmp/triage_result.json)
           comment_id=$(gh api --paginate \
             "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- omnigent-duplicate-check -->"))) | .id' \
             | sed -n '1p')
           if [ "$post_duplicate_comment" != "true" ]; then
-            echo "Re-triage run; leaving the existing duplicate-check result in place."
+            echo "Not commenting. The comment that would have been posted:"
+            cat /tmp/duplicate_comment.md
           elif [ -n "$comment_id" ]; then
             echo "Duplicate-check result already exists; preserving any human override."
           else
