@@ -243,7 +243,7 @@ export function InboxPage() {
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
             <p className="text-ui font-medium">Nothing waiting on you</p>
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               When an agent needs your input or someone comments on a file, it will show up here.
             </p>
           </div>
@@ -289,23 +289,23 @@ export function InboxPage() {
                   <span className="min-w-0 shrink-0 truncate text-ui font-medium">
                     {title}
                     {agentLabel !== title && (
-                      <span className="ml-2 text-xs font-normal text-muted-foreground">
+                      <span className="ml-2 text-sm font-normal text-muted-foreground">
                         {agentLabel}
                       </span>
                     )}
                   </span>
                   {!expanded && (
-                    <span className="min-w-0 truncate text-xs text-muted-foreground">
+                    <span className="min-w-0 truncate text-sm text-muted-foreground">
                       {item.elicitation.message}
                     </span>
                   )}
                 </button>
                 <span className="flex shrink-0 items-center gap-2">
-                  <span className="text-xs text-muted-foreground">
+                  <span className="text-sm text-muted-foreground">
                     {/* Server timestamps are epoch seconds; relativeTime takes ms. */}
                     {relativeTime(item.row.updated_at * 1000)}
                   </span>
-                  <Button asChild variant="ghost" size="sm" className="text-xs">
+                  <Button asChild variant="ghost" size="sm" className="text-sm">
                     <Link to={`/c/${item.row.id}`}>
                       Open session
                       <ArrowRightIcon className="ml-1 size-3.5" />
@@ -363,14 +363,14 @@ export function InboxPage() {
                   <span className="min-w-0 truncate text-ui">
                     <span className="font-medium">{author}</span>
                     <span className="text-muted-foreground"> commented on </span>
-                    <span className="font-mono text-xs">{comment.path}</span>
+                    <span className="font-mono text-sm">{comment.path}</span>
                   </span>
                   <span className="ml-auto flex shrink-0 items-center gap-2">
-                    <span className="text-xs text-muted-foreground">
+                    <span className="text-sm text-muted-foreground">
                       {/* created_at is epoch seconds; relativeTime takes ms. */}
                       {relativeTime(comment.created_at * 1000)}
                     </span>
-                    <Button asChild variant="ghost" size="sm" className="text-xs">
+                    <Button asChild variant="ghost" size="sm" className="text-sm">
                       {/* Deep-link into the file browser with this comment
                           selected — opening it there marks it seen, which
                           is what clears this inbox item. */}
@@ -384,20 +384,20 @@ export function InboxPage() {
                   </span>
                 </div>
                 {comment.anchor_content && (
-                  <p className="truncate font-mono text-[11px] text-muted-foreground">
+                  <p className="truncate font-mono text-sm text-muted-foreground">
                     {comment.anchor_content.trim()}
                   </p>
                 )}
                 <p className="line-clamp-3 text-ui break-words whitespace-pre-wrap">
                   {comment.body}
                 </p>
-                <span className="text-xs text-muted-foreground">{sessionTitle}</span>
+                <span className="text-sm text-muted-foreground">{sessionTitle}</span>
               </div>
             </div>
           );
         })}
         {assembling && (items.length > 0 || commentInbox.items.length > 0) && (
-          <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
+          <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" />
             Checking remaining sessions…
           </div>

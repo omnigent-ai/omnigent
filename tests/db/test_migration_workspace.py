@@ -399,6 +399,9 @@ def test_compressed_columns_are_binary_at_head(db_engine: Engine) -> None:
         ],
         "comments": ["body", "anchor_content"],
         "agents": ["description"],
+        "policies": ["handler", "factory_params"],
+        "hosts": ["configured_harnesses"],
+        "projects": ["config"],
     }
     for table, columns in expected.items():
         types = {c["name"]: c["type"] for c in inspector.get_columns(table)}

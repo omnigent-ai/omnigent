@@ -66,7 +66,7 @@ function HostLabel({ host }: { host: Host }) {
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-xs">{host.name}</span>
+      <span className="font-mono text-sm">{host.name}</span>
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
@@ -533,9 +533,9 @@ export function ForkSessionForm({
               instructions directly when none are. */}
         {isCodingSource && (
           <div className="flex flex-col gap-2">
-            <span className="text-xs font-medium text-muted-foreground">Host</span>
+            <span className="text-sm font-medium text-muted-foreground">Host</span>
             {hosts === undefined ? (
-              <p className="text-xs text-muted-foreground" data-testid="fork-session-no-hosts">
+              <p className="text-sm text-muted-foreground" data-testid="fork-session-no-hosts">
                 Loading hosts…
               </p>
             ) : onlineHosts.length === 0 ? (
@@ -566,7 +566,7 @@ export function ForkSessionForm({
                     setBrowsing(false);
                   }}
                 >
-                  <SelectTrigger className="w-full text-xs" data-testid="fork-session-host-select">
+                  <SelectTrigger className="w-full text-sm" data-testid="fork-session-host-select">
                     <SelectValue placeholder="Select a host" />
                   </SelectTrigger>
                   <SelectContent>
@@ -594,7 +594,7 @@ export function ForkSessionForm({
                 <button
                   type="button"
                   onClick={() => setShowConnect((v) => !v)}
-                  className="flex cursor-pointer items-center gap-1 self-start text-xs text-muted-foreground transition hover:text-foreground"
+                  className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
                   data-testid="fork-session-connect-host-toggle"
                 >
                   {showConnect ? (
@@ -611,14 +611,14 @@ export function ForkSessionForm({
         )}
 
         <div className="flex flex-col gap-1.5">
-          <label htmlFor="fork-session-agent" className="text-xs font-medium text-muted-foreground">
+          <label htmlFor="fork-session-agent" className="text-sm font-medium text-muted-foreground">
             Agent
           </label>
           <Select value={agentChoice} onValueChange={setAgentChoice}>
             <SelectTrigger
               id="fork-session-agent"
               data-testid="fork-session-agent-select"
-              className="w-full text-xs"
+              className="w-full text-sm"
             >
               {/* Custom value so the default reads "<agent> (same as original
                     session)" with the parenthetical greyed, mirroring the option. */}
@@ -638,7 +638,7 @@ export function ForkSessionForm({
               <SelectItem
                 value={SAME_AS_SOURCE}
                 data-testid="fork-session-agent-option-same"
-                className="text-xs"
+                className="text-sm"
               >
                 {sourceAgentDisplay}{" "}
                 <span className="text-muted-foreground">(same as original session)</span>
@@ -648,7 +648,7 @@ export function ForkSessionForm({
                   key={agent.id}
                   value={agent.id}
                   data-testid={`fork-session-agent-option-${agent.id}`}
-                  className="text-xs"
+                  className="text-sm"
                 >
                   {agent.display_name}
                 </SelectItem>
@@ -661,7 +661,7 @@ export function ForkSessionForm({
                   key={agent.id}
                   value={agent.id}
                   data-testid={`fork-session-agent-option-${agent.id}`}
-                  className="text-xs"
+                  className="text-sm"
                 >
                   {agent.display_name}
                 </SelectItem>
@@ -673,7 +673,7 @@ export function ForkSessionForm({
         {/* Indicator: by default the clone reuses the source's working
               directory; changing it lives under Advanced settings. */}
         {usingSourceDir && (
-          <p className="text-xs text-muted-foreground" data-testid="fork-session-reuse-dir-hint">
+          <p className="text-sm text-muted-foreground" data-testid="fork-session-reuse-dir-hint">
             By default the clone reuses the original session's{" "}
             <Tooltip>
               <TooltipTrigger asChild>
@@ -696,7 +696,7 @@ export function ForkSessionForm({
               shares its directory with the still-active original. */}
         {showConflictHint && (
           <p
-            className="flex items-start gap-1.5 text-xs text-warning"
+            className="flex items-start gap-1.5 text-sm text-warning"
             data-testid="fork-session-conflict-hint"
           >
             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -719,7 +719,7 @@ export function ForkSessionForm({
           <button
             type="button"
             onClick={() => setShowAdvanced((v) => !v)}
-            className="flex cursor-pointer items-center gap-1 self-start text-xs font-medium text-foreground transition hover:text-foreground"
+            className="flex cursor-pointer items-center gap-1 self-start text-sm font-medium text-foreground transition hover:text-foreground"
             data-testid="fork-session-advanced-toggle"
             aria-expanded={showAdvanced}
             aria-controls="fork-session-advanced-content"
@@ -741,7 +741,7 @@ export function ForkSessionForm({
               <div className="flex flex-col gap-1.5">
                 <label
                   htmlFor="fork-session-title"
-                  className="text-xs font-medium text-muted-foreground"
+                  className="text-sm font-medium text-muted-foreground"
                 >
                   Name (optional)
                 </label>
@@ -755,14 +755,14 @@ export function ForkSessionForm({
                     if (e.key === "Enter" && !submitting && canSubmit) handleFork();
                   }}
                   placeholder={namePlaceholder}
-                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
                 />
               </div>
 
               {isCodingSource && (
                 <>
                   <div className="flex flex-col gap-2">
-                    <span className="text-xs font-medium text-muted-foreground">
+                    <span className="text-sm font-medium text-muted-foreground">
                       Working directory
                     </span>
                     {selectedHostId ? (
@@ -792,7 +792,7 @@ export function ForkSessionForm({
                         )}
                         {showMismatchWarning && (
                           <p
-                            className="flex items-start gap-1.5 text-xs text-warning"
+                            className="flex items-start gap-1.5 text-sm text-warning"
                             data-testid="fork-session-mismatch-warning"
                           >
                             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -805,7 +805,7 @@ export function ForkSessionForm({
                         )}
                       </>
                     ) : (
-                      <p className="text-xs text-muted-foreground">
+                      <p className="text-sm text-muted-foreground">
                         Select a host to choose a directory.
                       </p>
                     )}
@@ -814,7 +814,7 @@ export function ForkSessionForm({
                   <div className="flex flex-col gap-1">
                     <label
                       htmlFor="fork-session-branch"
-                      className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+                      className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
                     >
                       <GitBranchIcon className="size-3.5" />
                       Git worktree (optional)
@@ -826,9 +826,9 @@ export function ForkSessionForm({
                       onChange={(e) => setBranchName(e.target.value)}
                       placeholder="feature/my-branch"
                       data-testid="fork-session-branch-input"
-                      className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                      className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
                     />
-                    <p className="text-xs text-muted-foreground">
+                    <p className="text-sm text-muted-foreground">
                       {usingSourceWorktree
                         ? "The clone starts in the original session's existing worktree for this " +
                           "branch. Name a different branch to work in an isolated copy."
@@ -845,7 +845,7 @@ export function ForkSessionForm({
       </div>
 
       {error !== null && (
-        <p data-testid="fork-session-error" className="text-xs text-destructive">
+        <p data-testid="fork-session-error" className="text-sm text-destructive">
           {error}
         </p>
       )}

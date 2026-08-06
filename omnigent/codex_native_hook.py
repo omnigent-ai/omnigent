@@ -16,6 +16,7 @@ import json
 import sys
 import urllib.parse
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent.codex_native_bridge import (
     read_bridge_state,
@@ -31,6 +32,9 @@ from omnigent.native_policy_hook import (
     read_relay_policy_config,
     relay_policy_evaluate_url,
 )
+
+if TYPE_CHECKING:
+    from omnigent.codex_native_app_server import CodexAppServerClient
 
 # Budget for the policy evaluation POST. Normally a quick
 # request/reply, but a TOOL_CALL ASK now parks server-side (URL-based
@@ -55,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "route-turn":
+        return _main_route_turn(raw_argv[1:])
     print(
         f"omnigent codex hook: unknown subcommand {raw_argv[:1]!r}",
         file=sys.stderr,
@@ -202,6 +208,323 @@ def _parse_evaluate_policy_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook evaluate-policy")
     parser.add_argument("--bridge-dir", required=True)
     return parser.parse_args(argv)
+
+
+def _main_route_turn(argv: list[str]) -> int:
+    """
+    Route the model this session runs on, from its first real prompt.
+
+    The in-harness half of first-message routing (see
+    :mod:`omnigent.runner.turn_routing`), registered as a second
+    ``UserPromptSubmit`` command alongside the policy gate. On every
+    prompt submit, in order:
+
+    1. Fast skip on ``<bridge_dir>/turn_routing_done`` **when it names this
+       session** — no output, no network. The authoritative gate is the
+       endpoint's routing-decision check; this file only saves the round
+       trip, and a marker another conversation in the same bridge dir wrote
+       is not ours to skip on.
+    2. POST ``{session_id, prompt, harness, turn_id, model}`` to the
+       advertised loopback ``route-turn`` endpoint. ``model`` comes from
+       the hook payload, which tracks the LIVE thread model —
+       ``config.toml`` reports the stale launch model.
+    3. On a routed verdict: switch the thread with
+       ``thread/settings/update`` (codex binds the turn's model before
+       this hook runs, so the switch lands from the next turn), write the
+       marker, and BLOCK the prompt. The runner then replays it as a
+       normal user turn, which runs on the routed model.
+
+    Fails open everywhere: an absent advertisement, an unreachable
+    endpoint, an unroutable verdict or a failed switch all exit ``0`` with
+    no output, and the prompt runs untouched on the current model.
+
+    :param argv: CLI argv after the ``route-turn`` subcommand, e.g.
+        ``["--bridge-dir", "/tmp/x", "--harness", "codex-native"]``.
+    :returns: Process exit code. Always ``0`` — the block is expressed via
+        the JSON on stdout, never via the exit code.
+    """
+    from omnigent.runner.turn_routing import (
+        ADVERTISEMENT_FILE,
+        HOOK_REQUEST_TIMEOUT_S,
+        ROUTE_PATH_TEMPLATE,
+        trace_turn_routing,
+        turn_routing_marker_present,
+    )
+
+    parser = argparse.ArgumentParser(prog="python -m omnigent.codex_native_hook route-turn")
+    parser.add_argument("--bridge-dir", required=True)
+    parser.add_argument("--harness", default="codex-native")
+    args = parser.parse_args(argv)
+    bridge_dir = Path(args.bridge_dir)
+
+    # Every prompt submit is traced, including the ones that fall open. A
+    # session that "just never routed" is otherwise indistinguishable from
+    # one the harness never fired the hook for at all.
+    raw = sys.stdin.read()
+
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        trace_turn_routing(bridge_dir, "fail-open", "malformed hook payload")
+        return 0
+    if not isinstance(payload, dict):
+        trace_turn_routing(bridge_dir, "fail-open", "hook payload is not an object")
+        return 0
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        trace_turn_routing(bridge_dir, "skip", "no prompt text on this submit")
+        return 0
+
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+
+    endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
+    if endpoint is None:
+        trace_turn_routing(bridge_dir, "fail-open", f"no usable {ADVERTISEMENT_FILE}")
+        return 0
+    state = read_bridge_state(bridge_dir)
+    session_id = endpoint.session_id or (state.session_id if state is not None else None)
+    if not session_id:
+        trace_turn_routing(bridge_dir, "fail-open", "no session id to route")
+        return 0
+
+    # The marker is checked here, after the session id is known, because it is
+    # scoped to a session: this bridge dir is shared with whichever
+    # conversation a ``/clear`` rotation or a fork left behind, and their
+    # verdict is not ours. Still zero network on the fast path.
+    if turn_routing_marker_present(bridge_dir, session_id):
+        trace_turn_routing(bridge_dir, "skip", "marker present")
+        return 0
+
+    body = {
+        "harness": args.harness,
+        "prompt": prompt,
+        "turn_id": _payload_str(payload, "turn_id"),
+        # The payload's model tracks thread/settings/update; config.toml does not.
+        "model": _payload_str(payload, "model"),
+    }
+    url = endpoint.url + ROUTE_PATH_TEMPLATE.format(
+        session_id=urllib.parse.quote(session_id, safe="")
+    )
+    decision = _post_json(url, endpoint.token, body, HOOK_REQUEST_TIMEOUT_S)
+    if decision is None:
+        # Not the endpoint URL: it comes out of the advertisement that also
+        # holds the bearer token, and this trace is world-readable stderr.
+        trace_turn_routing(bridge_dir, "fail-open", "no verdict from the turn router")
+        return 0
+    model = decision.get("model")
+    if decision.get("action") != "route" or not isinstance(model, str) or not model:
+        rationale = decision.get("rationale")
+        trace_turn_routing(
+            bridge_dir,
+            "allow",
+            f"{rationale if isinstance(rationale, str) else ''} "
+            f"(terminal={bool(decision.get('terminal'))})",
+        )
+        if decision.get("terminal"):
+            # Nothing will route this session again, so stop asking. Covers the
+            # no-op verdict too (the pick equals the live model): terminal and
+            # unblocking, so the prompt runs where it already was.
+            _write_marker(bridge_dir, session_id, decision)
+        return 0
+
+    if not _apply_thread_model(bridge_dir, model):
+        # No marker: the prompt is about to run, and the marker is what
+        # tells the runner to replay it. Writing one here would replay a
+        # prompt that already ran. The server-side pin still keeps the
+        # next prompt from re-routing.
+        trace_turn_routing(bridge_dir, "fail-open", f"could not switch to {model}")
+        print(
+            f"omnigent codex route-turn hook: could not switch to {model}; "
+            "letting the prompt run on the current model",
+            file=sys.stderr,
+        )
+        return 0
+    # Marker after the switch and before the block, so its presence means
+    # both "the routed model is applied" and "this prompt was dropped, you
+    # owe it a replay".
+    if not _write_marker(bridge_dir, session_id, decision):
+        trace_turn_routing(bridge_dir, "fail-open", "could not write the block marker")
+        return 0
+    trace_turn_routing(bridge_dir, "route", f"blocked and switched to {model}")
+    sys.stdout.write(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": f"Smart Routing selected {model}; rerunning your message on it.",
+            }
+        )
+    )
+    return 0
+
+
+def _payload_str(payload: dict[str, object], key: str) -> str | None:
+    """
+    Read an optional string field from a hook payload.
+
+    :param payload: Decoded hook payload.
+    :param key: Field name, e.g. ``"turn_id"``.
+    :returns: The value, or ``None`` when absent or not a non-empty string.
+    """
+    value = payload.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _write_marker(bridge_dir: Path, session_id: str, decision: dict[str, object]) -> bool:
+    """
+    Write the session-scoped turn-routing marker file.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param session_id: Session the verdict belongs to — a later conversation
+        sharing this dir must not fast-skip on it.
+    :param decision: The verdict, for its ``decision_id``.
+    :returns: ``True`` when the marker is on disk.
+    """
+    from omnigent.runner.turn_routing import write_turn_routing_marker
+
+    decision_id = decision.get("decision_id")
+    if write_turn_routing_marker(
+        bridge_dir,
+        session_id=session_id,
+        decision_id=decision_id if isinstance(decision_id, str) else None,
+    ):
+        return True
+    print(
+        f"omnigent codex route-turn hook: could not write the marker in {bridge_dir}",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _post_json(
+    url: str,
+    token: str,
+    body: dict[str, object],
+    timeout: float,
+) -> dict[str, object] | None:
+    """
+    POST one JSON body to the loopback endpoint.
+
+    :param url: Fully-qualified loopback URL.
+    :param token: Bearer token from the advertisement.
+    :param body: Request body.
+    :param timeout: Socket timeout in seconds.
+    :returns: The decoded response object, or ``None`` on any transport or
+        decode failure (callers treat that as "allow unrouted").
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            decoded = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _apply_thread_model(bridge_dir: Path, model: str) -> bool:
+    """
+    Switch the live Codex thread onto *model*.
+
+    ``thread/settings/update`` is the thread-level switch (the same one the
+    web picker drives through the executor); the app-server accepts a
+    second concurrent client while a turn is in flight, so the hook can
+    fire it from inside its own synchronous window. The accepted switch is
+    mirrored into ``config.toml`` the way the executor does, so the
+    cost-budget gate reads the routed model rather than the launch one.
+
+    The routed catalog id is translated into codex's own spelling first (see
+    :mod:`omnigent.codex_model_vocabulary`) — codex serves either, but only
+    recognizes its own, so an untranslated switch runs the right model while
+    the TUI warns about missing metadata and ``/model`` keeps highlighting
+    the launch slug.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param model: Routed model id, e.g. ``"databricks-gpt-5-6-luna"``.
+    :returns: ``True`` when Codex accepted the switch.
+    """
+    import asyncio
+
+    from omnigent.codex_model_vocabulary import codex_model_slug
+    from omnigent.codex_native_app_server import client_for_transport
+    from omnigent.codex_native_bridge import write_codex_config_model
+    from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
+
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        return False
+
+    # The spelling codex accepted, mirrored into config.toml below so the
+    # file and the live thread never disagree about the model.
+    applied = model
+
+    async def _switch() -> None:
+        nonlocal applied
+        client = client_for_transport(state.socket_path, client_name="omnigent-route-turn-hook")
+        await client.connect()
+        try:
+            applied = codex_model_slug(model, await _list_codex_models(client))
+            await client.request(
+                "thread/settings/update",
+                {"threadId": state.thread_id, "model": applied},
+            )
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(asyncio.wait_for(_switch(), timeout=SETTINGS_UPDATE_TIMEOUT_S))
+    except Exception as exc:  # noqa: BLE001 - any failure means "leave the model alone"
+        print(
+            f"omnigent codex route-turn hook: thread/settings/update failed: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    if not write_codex_config_model(bridge_dir, applied):
+        print(
+            f"omnigent codex route-turn hook: could not mirror {applied} into config.toml",
+            file=sys.stderr,
+        )
+    return True
+
+
+async def _list_codex_models(client: CodexAppServerClient) -> list[dict[str, object]]:
+    """
+    Read this session's codex model catalog over an open app-server client.
+
+    Hidden rows are included: they are still switchable, and translating a
+    routed model beats sending a spelling codex has no metadata for.
+
+    :param client: Connected app-server client.
+    :returns: Raw ``model/list`` rows, empty when the call fails (the
+        caller then applies the routed id verbatim).
+    """
+    rows: list[dict[str, object]] = []
+    cursor: str | None = None
+    try:
+        while True:
+            params: dict[str, object] = {"includeHidden": True}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await client.request("model/list", params)
+            result = response.get("result")
+            if not isinstance(result, dict):
+                break
+            rows.extend(row for row in result.get("data") or () if isinstance(row, dict))
+            cursor = result.get("nextCursor")
+            if not isinstance(cursor, str) or not cursor:
+                break
+    except Exception as exc:  # noqa: BLE001 - an unreadable catalog means "no translation"
+        print(
+            f"omnigent codex route-turn hook: model/list failed: {exc}",
+            file=sys.stderr,
+        )
+    return rows
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from omnigent.codex_native_bridge import (
     read_bridge_state,
     read_mcp_startup,
     update_active_turn_id,
+    write_codex_config_model,
 )
 from omnigent.inner.codex_goal_command import goal_objective_from_content
 from omnigent.inner.executor import (
@@ -39,7 +40,7 @@ from omnigent.inner.native_attachments import (
     parse_data_uri,
     unresolved_attachment_marker,
 )
-from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.reasoning_effort import CODEX_EFFORTS, effort_for_model_switch, validate_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -301,6 +302,20 @@ class CodexNativeExecutor(Executor):
                                     **settings_overrides,
                                 },
                             )
+                            # Mirror the accepted switch into config.toml —
+                            # the file the forwarder's model mirror and the
+                            # cost-gate hook read. thread/settings/update does
+                            # not write it, so without this the stale launch
+                            # model is mirrored back at the next turn/started
+                            # and silently reverts the switch.
+                            switched_model = settings_overrides.get("model")
+                            if isinstance(switched_model, str) and switched_model:
+                                if not write_codex_config_model(self._bridge_dir, switched_model):
+                                    _logger.warning(
+                                        "Failed to mirror codex model switch into "
+                                        "config.toml: model=%s",
+                                        switched_model,
+                                    )
                         turn_params: dict[str, object] = {
                             "threadId": state.thread_id,
                             "input": input_items,
@@ -364,6 +379,12 @@ def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
         # current effort rather than failing the whole dispatch.
         _logger.warning("Ignoring unsupported codex reasoning effort: %r", raw_effort)
         effort = None
+    model_str = model if isinstance(model, str) and model else None
+    # A model switch inherits config.toml's effort (the user's xhigh default),
+    # which the switched-to model may reject (GLM has no xhigh). Guard the live
+    # turn: clamp an explicit effort, and when none was requested but the model
+    # caps below the codex default, send that ceiling so the turn does not 400.
+    effort = effort_for_model_switch(effort, model_str)
     if effort:
         overrides["effort"] = effort
     return overrides

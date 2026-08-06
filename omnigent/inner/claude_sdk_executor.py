@@ -46,6 +46,7 @@ from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.hook_scripts import subagent_router
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
@@ -1931,6 +1932,63 @@ class ClaudeSDKExecutor(Executor):
                 return str(metadata["session_id"])
         return "default"
 
+    def _install_subagent_router_hook(
+        self,
+        sdk: _ClaudeSDK,
+        options: Any,  # type: ignore[explicit-any]  # ClaudeAgentOptions — avoid a hard sdk import
+        model: str | None,
+    ) -> None:
+        """
+        Register the in-process subagent-routing ``PreToolUse`` hook.
+
+        The claude-agent-sdk runs hook callbacks in this process, so the
+        native hook script's decision logic is imported instead of
+        subprocessed. No-op unless the runner advertises a
+        ``route-subagent`` endpoint, so unrouted sessions register nothing.
+
+        :param sdk: The ``claude_agent_sdk`` module (or a test double).
+        :param options: ``ClaudeAgentOptions`` to mutate.
+        :param model: Model this session runs on, sent as the spawn's
+            parent model.
+        """
+        hook_matcher_cls = getattr(sdk, "HookMatcher", None)
+        if hook_matcher_cls is None:
+            return
+        router_dir = subagent_router.discover_router_dir()
+        if subagent_router.read_router_endpoint(router_dir) is None:
+            return
+
+        async def route_spawn(
+            payload: Any,  # type: ignore[explicit-any]  # HookInput TypedDict
+            tool_use_id: str | None,  # noqa: ARG001 -- HookCallback signature
+            context: Any,  # type: ignore[explicit-any]  # HookContext  # noqa: ARG001 -- HookCallback signature
+        ) -> dict[str, Any]:  # type: ignore[explicit-any]  # HookJSONOutput
+            if not isinstance(payload, dict):
+                return {}
+            output = await asyncio.to_thread(
+                subagent_router.route_pre_tool_use,
+                payload,
+                harness="claude-sdk",
+                router_dir=router_dir,
+                parent_model=model,
+            )
+            return output or {}
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        entries = list(hooks.get("PreToolUse") or [])
+        entries.append(
+            hook_matcher_cls(
+                matcher=subagent_router.AGENT_TOOL_MATCHER,
+                # Strictly outside the router call's own HTTP budget: equal
+                # numbers let the SDK cancel the hook at the same instant its
+                # request gives up, so the fail-open branch never ran.
+                timeout=subagent_router.HOOK_TIMEOUT_S,
+                hooks=[route_spawn],
+            )
+        )
+        hooks["PreToolUse"] = entries
+        options.hooks = hooks
+
     async def _can_use_tool_for_permission(
         self,
         tool_name: str,
@@ -2366,6 +2424,8 @@ class ClaudeSDKExecutor(Executor):
             or self._elicitation_handler is not None
         ):
             options.can_use_tool = self._can_use_tool_gate
+
+        self._install_subagent_router_hook(sdk, options, model)
 
         # Log the full configuration for debugging
         logger.info(

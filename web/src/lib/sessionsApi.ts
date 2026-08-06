@@ -148,6 +148,8 @@ interface SessionResponseWire {
   model_override?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
+  /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
+  subagent_routing_override?: "on" | "off" | null;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -300,6 +302,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     harness: wire.harness ?? null,
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
+    subagentRoutingOverride: wire.subagent_routing_override,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -636,9 +639,11 @@ export async function launchRunner(
  *
  * `null` on `reasoningEffort` / `modelOverride` sends the server's
  * ``"default"`` clear alias (matches the REPL's ``/effort | /model
- * default``). `null` on `costControlModeOverride` is sent as a JSON
- * ``null`` — for that field, "off" is a real value, so explicit null
- * (not an alias) is the server's clear signal.
+ * default``). `null` on `costControlModeOverride` /
+ * `subagentRoutingOverride` is sent as a JSON ``null`` — for those fields
+ * "off" is a real value, so explicit null (not an alias) is the server's
+ * clear signal. Clearing sub-agent routing lands the session on Default,
+ * the same place ``"off"`` does.
  *
  * `silent: true` persists without firing the claude-native tmux
  * forward — use for bind-time auto-apply (e.g. the sticky-pref
@@ -653,6 +658,7 @@ export async function updateSession(
     modelOverride?: string | null;
     codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
+    subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -670,6 +676,9 @@ export async function updateSession(
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
+  }
+  if ("subagentRoutingOverride" in updates) {
+    body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;

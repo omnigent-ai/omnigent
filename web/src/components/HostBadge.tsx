@@ -132,7 +132,7 @@ export function HostBadge({
         type="button"
         data-testid="host-badge"
         onClick={onReconnect}
-        className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
         title={title}
       >
         {content}
@@ -145,7 +145,7 @@ export function HostBadge({
     // would only duplicate the sr-only text where it is honored.
     <div
       data-testid="host-badge"
-      className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
+      className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
       title={title}
     >
       {content}

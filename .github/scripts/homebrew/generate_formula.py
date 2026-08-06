@@ -30,6 +30,7 @@ Run by `.github/workflows/homebrew-tap-pr.yml` on `release: published`.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import subprocess
@@ -55,6 +56,13 @@ DEFAULT_EXTRAS = ["cursor"]
 DEFAULT_PYTHON_VERSION = "3.14"
 DEFAULT_INDEX_URL = "https://pypi.org/simple"
 PYPI_JSON_API = "https://pypi.org/pypi"
+
+# The three packages that release together at one version. At release time they
+# are minutes old, so they are the only ones that legitimately need to be exempt
+# from the supply-chain cooldown re-applied below.
+LOCKSTEP_PACKAGES = ("omnigent", "omnigent-client", "omnigent-ui-sdk")
+# Fallback when `exclude-newer` can't be read out of uv.toml.
+DEFAULT_COOLDOWN_DAYS = 7
 
 # Packages provided by the brewed Python environment (system site-packages),
 # not built as virtualenv resources. `cffi`/`pycparser` are listed because cffi
@@ -142,6 +150,30 @@ _PLACEHOLDERS = (
 def normalize_name(name: str) -> str:
     """PEP 503 normalized project name (lowercase, runs of [-_.] -> -)."""
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def cooldown_days(repo_root: Path | None = None) -> int:
+    """The repo's `exclude-newer` span in days, read from uv.toml.
+
+    Read rather than hardcoded so the formula's cooldown cannot silently drift
+    from the one the lockfile uses. Falls back to `DEFAULT_COOLDOWN_DAYS` (with a
+    warning) if uv.toml is missing or expresses the span in a form this doesn't
+    understand -- never silently to "no cooldown".
+    """
+    root = repo_root or Path(__file__).resolve().parents[3]
+    uv_toml = root / "uv.toml"
+    try:
+        m = re.search(r'^exclude-newer\s*=\s*"P(\d+)D"', uv_toml.read_text(), re.MULTILINE)
+    except OSError:
+        m = None
+    if m:
+        return int(m.group(1))
+    print(
+        f"::warning::could not read `exclude-newer` from {uv_toml}; "
+        f"falling back to {DEFAULT_COOLDOWN_DAYS}d cooldown.",
+        file=sys.stderr,
+    )
+    return DEFAULT_COOLDOWN_DAYS
 
 
 def _http_get_json(url: str, retries: int = 5, timeout: int = 30) -> dict:
@@ -301,16 +333,38 @@ def resolve_closure(
     python_version: str,
     index_url: str,
     uv: str,
+    cooldown: int,
 ) -> dict[str, str]:
     """Union of `uv pip compile` resolutions per platform -> {name: version}.
 
-    Runs `uv pip compile` with `--no-config` (ignore the repo's uv.toml cooldown,
-    which would block the just-released version) against the public index. If a
-    package resolves to different versions across platforms, the highest PEP 440
-    version wins and a warning is printed (rare for sdists).
+    Runs `uv pip compile` with `--no-config` against the public index, so neither
+    the repo's uv.toml nor any user-level config decides the index or the uv
+    version floor. But `--no-config` also discards `exclude-newer`, the
+    supply-chain cooldown, so it is re-applied explicitly here: without that, every
+    resource pinned into the formula -- i.e. the code Homebrew users install -- may
+    be a distribution published minutes ago, even though the same dependency graph
+    in uv.lock has to wait out the window.
+
+    The cooldown cannot simply be left on: at release time `omnigent` and its two
+    lockstep SDKs are minutes old, and uv would filter out the very version being
+    packaged ("no version of omnigent==X.Y.Z"). So the window applies to everything
+    except those three, via `--exclude-newer-package`.
+
+    If a package resolves to different versions across platforms, the highest
+    PEP 440 version wins and a warning is printed (rare for sdists).
     """
     extras_spec = f"[{','.join(extras)}]" if extras else ""
     requirement = f"omnigent{extras_spec}=={version}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = (now - datetime.timedelta(days=cooldown)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # The lockstep packages are exempted up to "now" rather than skipped, so a
+    # typo'd name still gets a cooldown rather than silently getting none.
+    exempt_until = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(
+        f"Cooldown: ignoring distributions uploaded after {cutoff} "
+        f"({cooldown}d), except {', '.join(LOCKSTEP_PACKAGES)}.",
+        file=sys.stderr,
+    )
     closure: dict[str, str] = {}
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -322,6 +376,14 @@ def resolve_closure(
                 "pip",
                 "compile",
                 "--no-config",
+                # Re-apply the cooldown that --no-config just discarded.
+                "--exclude-newer",
+                cutoff,
+                *[
+                    arg
+                    for pkg in LOCKSTEP_PACKAGES
+                    for arg in ("--exclude-newer-package", f"{pkg}={exempt_until}")
+                ],
                 "--no-header",
                 "--no-annotate",
                 "--python-version",
@@ -402,6 +464,7 @@ def generate(
     index_url: str,
     uv: str,
     exclude: set[str],
+    cooldown: int,
     allow_no_sdist: set[str] | None = None,
     api_base: str = PYPI_JSON_API,
     url_rewrites: list[tuple[str, str]] | None = None,
@@ -418,7 +481,7 @@ def generate(
         f"(python {python_version})…",
         file=sys.stderr,
     )
-    closure = resolve_closure(version, platforms, extras, python_version, index_url, uv)
+    closure = resolve_closure(version, platforms, extras, python_version, index_url, uv, cooldown)
     print(f"Resolved {len(closure)} packages.", file=sys.stderr)
 
     rewrites = url_rewrites or []
@@ -614,6 +677,14 @@ def main(argv: list[str]) -> int:
         help="Package allowed to have no PyPI sdist (repeatable). Without this, a "
         "wheel-only dependency fails the run instead of vanishing from the formula.",
     )
+    ap.add_argument(
+        "--cooldown-days",
+        type=int,
+        default=None,
+        help="Supply-chain cooldown in days: ignore distributions uploaded more "
+        "recently than this, except the lockstep omnigent packages. Defaults to "
+        "the repo uv.toml `exclude-newer` span. 0 disables it (not recommended).",
+    )
     ap.add_argument("--uv", default="uv", help="uv binary path.")
     args = ap.parse_args(argv)
 
@@ -637,6 +708,7 @@ def main(argv: list[str]) -> int:
         index_url=index_url,
         uv=args.uv,
         exclude={normalize_name(n) for n in (args.exclude or [])},
+        cooldown=args.cooldown_days if args.cooldown_days is not None else cooldown_days(),
         allow_no_sdist={normalize_name(n) for n in (args.allow_no_sdist or [])},
         api_base=api_base,
         url_rewrites=url_rewrites,
