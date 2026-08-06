@@ -49,6 +49,21 @@ class HostLaunchTarget:
     conv: Conversation
 
 
+def resolve_host_owner(
+    *,
+    user_id: str | None,
+    host_id: str,
+    host_store: HostStore,
+) -> Host:
+    """Authorize that the caller owns a known host."""
+    host = host_store.get_host(host_id)
+    if host is None:
+        raise HTTPException(status_code=404, detail="host not found")
+    if user_id is not None and host.user_id != user_id:
+        raise HTTPException(status_code=403, detail="not your host")
+    return host
+
+
 def resolve_host_access(
     *,
     user_id: str | None,
