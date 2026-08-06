@@ -43,7 +43,9 @@ class GitHubClient:
         repo: str,
         transport: Callable[[str, str, object | None], object] | None = None,
     ) -> None:
-        self.token = token
+        self.token = token.strip()
+        if not self.token:
+            raise ValueError("GitHub token must not be empty")
         self.repo = repo
         self.transport = transport or self._request
 

@@ -246,3 +246,9 @@ def test_client_ignores_closed_issues_and_pull_requests() -> None:
 
     payload = {"state": "open", "pull_request": {}}
     assert client.open_issue(7) is None
+
+
+def test_client_strips_token_whitespace() -> None:
+    client = GitHubClient(" token\n", "org/repo", lambda method, path, body: None)
+
+    assert client.token == "token"

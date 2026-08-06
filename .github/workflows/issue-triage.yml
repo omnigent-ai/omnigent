@@ -861,7 +861,6 @@ jobs:
             --model-endpoint "$MODEL_ENDPOINT" \
             --areas .github/areas.json \
             --label-manifest .github/issue-prioritization-labels.json \
-            --maintainers .github/MAINTAINER \
             --output-dir /tmp/issue-priority-v2 \
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}" \
             --source-revision "${{ github.sha }}" \

@@ -242,22 +242,13 @@ def _write_skip_artifact(output_dir: Path, run_id: str, issue_number: int, reaso
     (output_dir / "event.json").write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def _maintainers(path: Path) -> set[str]:
-    return {
-        line.split("#", 1)[0].strip().lower()
-        for line in path.read_text().splitlines()
-        if line.split("#", 1)[0].strip()
-    }
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prioritize one newly opened community issue")
+    parser = argparse.ArgumentParser(description="Prioritize one newly opened issue")
     parser.add_argument("--issue-number", required=True, type=int)
     parser.add_argument("--github-repo", required=True)
     parser.add_argument("--model-endpoint", required=True)
     parser.add_argument("--areas", required=True, type=Path)
     parser.add_argument("--label-manifest", required=True, type=Path)
-    parser.add_argument("--maintainers", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--source-revision", default="")
@@ -275,11 +266,6 @@ def main() -> None:
         _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, "issue_not_open")
         print(f"Skipping #{args.issue_number}: issue is not open")
         return
-    if issue.author.lower() in _maintainers(args.maintainers):
-        _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, "maintainer_authored")
-        print(f"Skipping #{args.issue_number}: maintainer-authored issue")
-        return
-
     config = ScoringConfig.default()
     areas = AreaCatalog.from_json(args.areas)
     manifest = LabelManifest.from_json(args.label_manifest)

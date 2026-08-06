@@ -62,7 +62,6 @@ class IssuePrioritizationPipeline:
         scores: ScoreSink,
         artifacts: ArtifactSink,
         engine: ScoreEngine,
-        maintainers: set[str],
         mutation_planner: MutationPlanner | None = None,
         mutation_sink: MutationSink | None = None,
         classification_progress: Callable[[int, int], None] | None = None,
@@ -73,7 +72,6 @@ class IssuePrioritizationPipeline:
         self.scores = scores
         self.artifacts = artifacts
         self.engine = engine
-        self.maintainers = maintainers
         self.mutation_planner = mutation_planner
         self.mutation_sink = mutation_sink
         self.classification_progress = classification_progress
@@ -86,11 +84,7 @@ class IssuePrioritizationPipeline:
         adopt_legacy_bot_priorities: bool = False,
     ) -> PipelineRun:
         now = datetime.now(UTC)
-        issues = [
-            issue
-            for issue in self.source.load_open_issues()
-            if issue.author.lower() not in self.maintainers
-        ]
+        issues = self.source.load_open_issues()
         existing = self.classifications.load()
         contents = {issue.number: issue.content() for issue in issues}
         refresh = {

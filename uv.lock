@@ -3472,6 +3472,7 @@ version = "0.1.0"
 source = { editable = ".github/triage_v2" }
 dependencies = [
     { name = "databricks-sdk" },
+    { name = "pyjwt", extra = ["crypto"] },
 ]
 
 [package.dev-dependencies]
@@ -3481,7 +3482,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "databricks-sdk", specifier = ">=0.56.0,<1" }]
+requires-dist = [
+    { name = "databricks-sdk", specifier = ">=0.56.0,<1" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8,<3" },
+]
 
 [package.metadata.requires-dev]
 dev = [

@@ -27,7 +27,8 @@ demand counts GitHub `+1` reactions only, not all reaction types.
 ## New-issue grading
 
 When `ISSUE_PRIORITIZATION_V2_ENABLED=true`, the existing Issue Triage workflow
-runs v2 after intake for each new community issue. It calls the configured model
+runs v2 after intake for each new non-bot issue, including maintainer-authored
+issues. It calls the configured model
 serving endpoint, applies severity, component, and priority labels, and uploads
 a 30-day decision artifact. The periodic Databricks job remains responsible for
 the complete ranking and dashboard; the issue-open path does not wait for it.
@@ -66,7 +67,6 @@ uv run --frozen --project .github/triage_v2 issue-priority-event \
   --model-endpoint databricks-gpt-5-6-luna \
   --areas .github/areas.json \
   --label-manifest .github/issue-prioritization-labels.json \
-  --maintainers .github/MAINTAINER \
   --output-dir /tmp/issue-priority-v2 \
   --run-id local-2125 \
   --mode dry_run
@@ -78,7 +78,9 @@ consume it without changing the event path.
 
 ## Databricks dry-run
 
-The bundle defines a paused six-hour job. Manual runs default to `mode=dry_run`:
+The bundle defines a paused trigger on updates to `github_issues_bronze`. It
+waits five minutes after an update and runs at most once per hour. Manual runs
+default to `mode=dry_run`:
 
 ```bash
 databricks bundle validate --strict --target dev --profile <profile>
@@ -86,7 +88,7 @@ databricks bundle deploy --target dev --profile <profile>
 databricks bundle run issue_prioritization --target dev --profile <profile>
 ```
 
-The job reads open community issues from `github_issues_bronze`, persists LLM
+The job reads all open issues from `github_issues_bronze`, persists LLM
 classifications in `issue_classifications`, appends the ranking to `issue_scores`,
 and writes ranking plus proposed label mutations to the managed
 `issue_priority_artifacts` volume. Dry-run never changes GitHub issues.
@@ -135,16 +137,64 @@ dashboard.
 
 ## GitHub apply gate
 
-The schedule is paused. GitHub writes additionally require `mode=apply`, the
-deploy variable `allow_github_writes=true`, and a configured secret scope. The
-job re-reads every issue's live labels before writing and preserves maintainer
-priority and severity overrides. Removing a bot-owned label is also a durable
-override; human-added component labels are never removed.
+The table-update trigger is paused. GitHub writes additionally require
+`mode=apply`, the deploy variable `allow_github_writes=true`, and a configured
+secret scope. The job re-reads every issue's live labels before writing and
+preserves maintainer priority and severity overrides. Removing a bot-owned label
+is also a durable override; human-added component labels are never removed.
+
+For scheduled runs, prefer a GitHub App installation token over a personal PAT.
+Install the App on `omnigent-ai/omnigent` with metadata read and issues read/write,
+then store its client ID and PEM private key. The job discovers the installation
+ID from the repository and mints a fresh token for every run:
+
+```bash
+printf '%s' "$GITHUB_APP_CLIENT_ID" | databricks secrets put-secret \
+  <scope> github-app-client-id --profile <profile>
+databricks secrets put-secret \
+  <scope> github-app-private-key --profile <profile> < app-private-key.pem
+```
+
+The existing `github-token` secret remains a temporary fallback. Secret values
+are stripped before use, so a trailing newline from stdin does not become part
+of the HTTP authorization header.
+
+Deploy with App authentication while the trigger remains paused, then run a
+read-only ownership check. Confirm the run log does not contain the PAT fallback
+warning:
+
+```bash
+databricks bundle deploy --target dev --profile <profile> \
+  --var="model_endpoint=<endpoint>" \
+  --var="github_secret_scope=<scope>" \
+  --var="github_auth_mode=app" \
+  --var="allow_github_writes=true"
+databricks bundle run issue_prioritization --target dev --profile <profile> \
+  --params mode=dry_run,regrade=false,adopt_legacy_bot_priorities=true
+```
+
+After reviewing that run, enable apply-mode table-update runs. Keep legacy
+adoption enabled until new-issue artifacts are imported into `issue_bot_state`:
+
+```bash
+databricks bundle deploy --target dev --profile <profile> \
+  --var="model_endpoint=<endpoint>" \
+  --var="github_secret_scope=<scope>" \
+  --var="github_auth_mode=app" \
+  --var="allow_github_writes=true" \
+  --var="scheduled_mode=apply" \
+  --var="scheduled_adopt_legacy_bot_priorities=true" \
+  --var="schedule_pause_status=UNPAUSED"
+```
+
+Defaults remain `token`, `dry_run`, and `PAUSED`, so an ordinary development
+deployment cannot silently enable scheduled writes.
 
 ```bash
 databricks bundle deploy --target dev --profile <profile> \
   --var="allow_github_writes=true" \
-  --var="github_secret_scope=<scope>"
+  --var="github_secret_scope=<scope>" \
+  --var="github_auth_mode=app"
 databricks bundle run issue_prioritization --target dev --profile <profile> \
   --params mode=apply,adopt_legacy_bot_priorities=true
 ```
