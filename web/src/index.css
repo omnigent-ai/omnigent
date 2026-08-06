@@ -31,15 +31,6 @@
      * hasn't loaded. Variable file covers 100-900, so set font-weight at the
      * usage site (the design calls for 400). */
   --font-display-alt: "Hanken Grotesk Variable", var(--font-sans);
-  /* 13px/18px text step between text-xs (12px) and text-sm (14px) —
-     * generates the `text-13` utility. Body and chat-thread text (both
-     * 13/18), plus compact UI chrome like the composer footer selectors
-     * and slash-command menu rows. */
-  --text-13: 13px;
-  --text-13--line-height: 18px;
-  /* Fixed caption step for non-scaling microcopy. */
-  --text-caption: 12px;
-  --text-caption--line-height: 16px;
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
   --text-3xl: 32px;
@@ -117,14 +108,24 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* The two body text steps. Keep these non-inline: `@theme inline` bakes the
+ * literal value into each utility, which would make the runtime typography
+ * mapping below a no-op. Line heights are unitless so both tiers keep their
+ * 1.6 rhythm at every size the Appearance setting allows. */
 @theme {
-  /* App-default interface/body text. Keep this non-inline so runtime
-   * typography mappings can override the token. */
+  /* App-default interface/body text — every control, label, and menu item. */
   --text-ui: 1rem;
-  --text-ui--line-height: 1.4;
-  /* Slightly larger hierarchy/caption step than Tailwind's default. */
+  --text-ui--line-height: 1.6;
+  /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
+   * body step, mapped below so it tracks the Appearance setting. */
   --text-sm: 0.9rem;
-  --text-sm--line-height: 1.4;
+  --text-sm--line-height: 1.6;
+  /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
+   * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
+   * ignores the Appearance setting — the same trap the ramp test guards. Keeps
+   * vendor markup (streamdown's image-fallback) on the caption tier too. */
+  --text-xs: var(--text-sm);
+  --text-xs--line-height: var(--text-sm--line-height);
 }
 
 /* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
@@ -882,15 +883,17 @@ html:not(.dark) .conversations-sidebar {
      * they need the preference on that scale. Multiplying the raw 13px shrinks
      * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
     --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
-    --text-xs: calc(var(--ui-ramp-anchor) * 0.75);
-    --text-sm: calc(var(--ui-ramp-anchor) * 0.9);
+    /* Body and caption tiers come off the raw preference, not the anchor: the
+     * anchor is the 16px-equivalent grid the title ratios need, and running the
+     * caption factor through it put text-sm at 14.4px against a 13px body —
+     * a caption step larger than the text it captions. */
+    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);
+    /* Title steps keep the anchor so each stays on its Tailwind ratio. */
     --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
     --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
     --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
-    --text-3xl: calc(var(--ui-ramp-anchor) * 2);
-    --text-3xl--line-height: calc(var(--ui-ramp-anchor) * 2.25);
   }
 
   body {
@@ -938,6 +941,16 @@ html:not(.dark) .conversations-sidebar {
 }
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
+}
+
+/* Streamdown pins `text-sm` on table cells and h6. That tier is the caption
+ * step, so inside chat prose those read as a shrink rather than body text —
+ * pin them back to the surrounding size. sub/sup keep the caption step, where
+ * a smaller face is correct. */
+[data-streamdown="table-cell"],
+[data-streamdown="table-header-cell"],
+[data-streamdown="heading-6"] {
+  font-size: 1em;
 }
 
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).

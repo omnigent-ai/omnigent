@@ -421,7 +421,7 @@ export function CreateScheduledTaskDialog({
               </div>
             )}
             {!showModelEffort && (
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Uses this agent&apos;s default model, effort, and permission settings
               </p>
             )}
@@ -440,7 +440,7 @@ export function CreateScheduledTaskDialog({
                 onEffortChange={setPickedEffort}
                 onSelectOpenChange={handleSelectOpenChange}
               />
-              <p className="mt-1.5 text-[11px] text-muted-foreground">
+              <p className="mt-1.5 text-sm text-muted-foreground">
                 Leave on Default to use the agent&apos;s configured model and effort.
               </p>
             </div>
@@ -455,7 +455,7 @@ export function CreateScheduledTaskDialog({
             onSelectOpenChange={handleSelectOpenChange}
           />
           {scheduleUnsupported && (
-            <p className="text-xs text-destructive" role="alert">
+            <p className="text-sm text-destructive" role="alert">
               This schedule can&apos;t be edited in this form yet.
             </p>
           )}
@@ -493,7 +493,7 @@ export function CreateScheduledTaskDialog({
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               Leave unset to run on your connected host when the task fires.
             </p>
           </div>
@@ -501,7 +501,7 @@ export function CreateScheduledTaskDialog({
           {hostId !== "" && (
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Defaults to the host&apos;s home directory. Pick a directory to pin it.
               </p>
               <div className="h-56 overflow-hidden rounded-md border border-border">
@@ -512,14 +512,14 @@ export function CreateScheduledTaskDialog({
                 />
               </div>
               {workspace && (
-                <p className="truncate font-mono text-[11px] text-muted-foreground">{workspace}</p>
+                <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
               )}
             </div>
           )}
 
           {workspaceWithoutHost && (
             <p
-              className="flex items-center gap-1.5 text-xs text-destructive"
+              className="flex items-center gap-1.5 text-sm text-destructive"
               data-testid="workspace-without-host-error"
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />
@@ -531,7 +531,7 @@ export function CreateScheduledTaskDialog({
             <div
               role="alert"
               data-testid="create-error"
-              className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+              className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive"
             >
               <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
               <span>{error}</span>

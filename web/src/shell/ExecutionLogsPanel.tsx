@@ -193,7 +193,7 @@ export function ExecutionLogsPanel({
                 </SelectContent>
               </Select>
               {/* View toggle: conv items vs raw SSE events */}
-              <div className="ml-auto flex rounded-md border border-border text-xs">
+              <div className="ml-auto flex rounded-md border border-border text-sm">
                 <button
                   type="button"
                   className={cn(
@@ -286,24 +286,24 @@ function SessionItemsList({ sessionId }: { sessionId: string }) {
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   if (isLoading) {
-    return <div className="text-muted-foreground text-xs">Loading…</div>;
+    return <div className="text-muted-foreground text-sm">Loading…</div>;
   }
   if (error) {
-    return <div className="text-destructive text-xs">Failed to load items: {error.message}</div>;
+    return <div className="text-destructive text-sm">Failed to load items: {error.message}</div>;
   }
   if (items.length === 0) {
-    return <div className="text-muted-foreground text-xs">No items</div>;
+    return <div className="text-muted-foreground text-sm">No items</div>;
   }
   return (
     <div
       ref={scrollRootRef}
-      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-xs"
+      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-sm"
     >
       {items.map((item, idx) => (
         <SessionItemEntry key={itemKey(item, idx)} item={item} index={idx + 1} />
       ))}
       {hasNextPage && (
-        <div ref={sentinelRef} className="py-2 text-center text-muted-foreground text-xs">
+        <div ref={sentinelRef} className="py-2 text-center text-muted-foreground text-sm">
           {isFetchingNextPage ? "Loading more…" : ""}
         </div>
       )}
@@ -366,7 +366,7 @@ function SseEventsList({ sessionId }: { sessionId: string }) {
 
   if (entries.length === 0) {
     return (
-      <div className="text-muted-foreground text-xs">
+      <div className="text-muted-foreground text-sm">
         No SSE events yet — events are captured while the agent runs.
       </div>
     );
@@ -374,7 +374,7 @@ function SseEventsList({ sessionId }: { sessionId: string }) {
   return (
     <div
       ref={scrollRootRef}
-      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-xs"
+      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-sm"
     >
       {entries.map((entry) => (
         <SseEventEntry key={entry.index} entry={entry} />

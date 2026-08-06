@@ -840,6 +840,55 @@ async def test_messages_reach_harness_in_submission_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forwarded_model_override_reaches_the_harness() -> None:
+    """A routed model rides the forwarded message all the way to the harness.
+
+    Intelligent routing puts its pick in-band on the native-terminal message
+    (``model_override``); the harness forwards it into
+    ``CreateResponseRequest.model_override`` and the executor adapter into
+    ``ExecutorConfig.model``, which is the only way a native TUI learns to
+    type ``/model`` for this turn. ``_run_turn_bg`` builds the harness body
+    field by field, so a missing thread-through silently drops the switch —
+    the routing card claims a model was applied while the pane never moves.
+    """
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/dd0f1b1a7e3f4a6c8f2b5c9d0e1f2a3b/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-native",
+                "model_override": "databricks-claude-sonnet-5",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received a turn"
+    assert hc.posted_bodies[0].get("model_override") == "databricks-claude-sonnet-5", (
+        "the routed model was dropped between the runner's message intake and "
+        f"the harness body: {hc.posted_bodies[0].keys()}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_buffered_continuation_skips_transient_idle() -> None:
     """End-of-turn `idle` is suppressed when a buffered message will start a new turn."""
     import asyncio as _aio

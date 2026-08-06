@@ -507,7 +507,7 @@ export const ComposerMicButton = ({
           <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
         </span>
       ) : (
-        <MicIcon className="size-4" />
+        <MicIcon className="size-4" data-icon-size="16" />
       )}
     </Button>
   );

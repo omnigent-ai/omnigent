@@ -30,7 +30,7 @@ export function TerminalStatusBadge({ status }: { status: TerminalStatus }) {
     <span
       aria-label={label}
       title={label}
-      className="inline-flex shrink-0 items-center gap-1 text-muted-foreground text-xs"
+      className="inline-flex shrink-0 items-center gap-1 text-muted-foreground text-sm"
     >
       <span className={cn("inline-block size-1.5 rounded-full", className)} />
       <span>{label}</span>

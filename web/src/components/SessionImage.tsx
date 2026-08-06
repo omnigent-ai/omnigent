@@ -16,6 +16,26 @@ export interface SessionImageProps {
 }
 
 /**
+ * Fixed-height box every inline preview renders into, reserved before the bytes
+ * arrive and unchanged once they land. The chat scroller runs with
+ * `overflow-anchor: none` (history prepends own the anchoring) and its
+ * resize-compensating observer is iOS-only, so an image that grew on decode
+ * would shove the transcript down under the reader with nothing to absorb it.
+ */
+const PREVIEW_BOX = "flex h-64 max-w-full shrink-0 items-center justify-center";
+
+/**
+ * Cap on the image itself, in the same absolute unit as the box's height so the
+ * two can't drift apart. It has to be absolute rather than `max-h-full`: the
+ * lightbox wraps the image in an auto-height button, and a percentage height
+ * resolves against that wrapper, leaving a tall image free to overflow the box.
+ */
+const PREVIEW_IMAGE = "max-h-64 max-w-full";
+
+/** Placeholder width, so the box holds a slot on the row before its image lands. */
+const PREVIEW_PLACEHOLDER_BOX = "flex h-64 w-40 shrink-0 items-center justify-center";
+
+/**
  * Inline preview for an uploaded image stored as a session file resource.
  *
  * Standalone the file path is same-origin, so a plain `<img src>` works and we
@@ -29,32 +49,104 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
   // safe to branch on it before any hooks. Hooks live in the embedded child.
   if (!getOmnigentHostConfig().fetcher) {
-    return <ZoomableImage src={path} alt={alt} className={className} />;
+    return (
+      <div className={PREVIEW_BOX}>
+        <ZoomableImage
+          src={path}
+          alt={alt}
+          className={cn(PREVIEW_IMAGE, className)}
+          // Offscreen history images cost nothing until scrolled to, and
+          // decoding off the main thread keeps the swap from blocking paint.
+          loading="lazy"
+          decoding="async"
+        />
+      </div>
+    );
   }
   return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
 }
 
 type LoadState = "loading" | "loaded" | "error";
 
+/**
+ * Object URLs for image bytes already pulled through the host fetcher, keyed by
+ * content path. A file id addresses one immutable set of bytes, so a hit is
+ * always current — re-opening a session re-renders the same attachments, and
+ * without this every remount re-downloaded and re-decoded megabytes.
+ *
+ * Bounded and evicted least-recently-used: entries outlive the components that
+ * created them, so nothing else would ever release them.
+ */
+const MAX_CACHED_IMAGES = 32;
+const blobUrlCache = new Map<string, string>();
+
+/** In-flight fetches, so concurrent mounts of one path share a single download. */
+const inFlight = new Map<string, Promise<string>>();
+
+function cacheBlobUrl(path: string, url: string): void {
+  blobUrlCache.set(path, url);
+  while (blobUrlCache.size > MAX_CACHED_IMAGES) {
+    const oldest = blobUrlCache.keys().next();
+    if (oldest.done) break;
+    const evicted = blobUrlCache.get(oldest.value);
+    blobUrlCache.delete(oldest.value);
+    if (evicted) URL.revokeObjectURL(evicted);
+  }
+}
+
+function loadBlobUrl(path: string): Promise<string> {
+  const cached = blobUrlCache.get(path);
+  if (cached) {
+    // Re-insert to mark it most-recently-used.
+    blobUrlCache.delete(path);
+    blobUrlCache.set(path, cached);
+    return Promise.resolve(cached);
+  }
+  const pending = inFlight.get(path);
+  if (pending) return pending;
+
+  const request = hostFetch(path)
+    .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      cacheBlobUrl(path, url);
+      return url;
+    })
+    .finally(() => {
+      inFlight.delete(path);
+    });
+  inFlight.set(path, request);
+  return request;
+}
+
 function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [state, setState] = useState<LoadState>("loading");
+  // Seed from cache so a revisited image paints on the first frame instead of
+  // flashing the placeholder.
+  const [blobUrl, setBlobUrl] = useState<string | null>(() =>
+    path ? (blobUrlCache.get(path) ?? null) : null,
+  );
+  const [state, setState] = useState<LoadState>(() =>
+    path && blobUrlCache.has(path) ? "loaded" : "loading",
+  );
 
   useEffect(() => {
     if (!path) {
       setState("error");
       return;
     }
+    const cached = blobUrlCache.get(path);
+    if (cached) {
+      setBlobUrl(cached);
+      setState("loaded");
+      return;
+    }
     setState("loading");
     setBlobUrl(null);
     let cancelled = false;
-    let objectUrl: string | null = null;
-    hostFetch(path)
-      .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
-      .then((blob) => {
+    loadBlobUrl(path)
+      .then((url) => {
         if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setBlobUrl(objectUrl);
+        setBlobUrl(url);
         setState("loaded");
       })
       .catch(() => {
@@ -62,7 +154,6 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
       });
     return () => {
       cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [path]);
 
@@ -72,7 +163,7 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
         role="img"
         aria-label={alt}
         className={cn(
-          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-xs text-muted-foreground",
+          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
           className,
         )}
       >
@@ -87,10 +178,9 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
       <div
         role="status"
         aria-label="Loading image"
-        // Square placeholder keeps the bubble from collapsing before the
-        // (unknown-dimension) image resolves.
         className={cn(
-          "flex size-24 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground",
+          PREVIEW_PLACEHOLDER_BOX,
+          "rounded-md border border-border bg-muted text-muted-foreground",
           className,
         )}
       >
@@ -99,5 +189,14 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
     );
   }
 
-  return <ZoomableImage src={blobUrl} alt={alt} className={className} />;
+  return (
+    <div className={PREVIEW_BOX}>
+      <ZoomableImage
+        src={blobUrl}
+        alt={alt}
+        className={cn(PREVIEW_IMAGE, className)}
+        decoding="async"
+      />
+    </div>
+  );
 }

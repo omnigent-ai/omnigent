@@ -696,6 +696,75 @@ describe("BlockRenderer dispatch", () => {
       await waitFor(() => expect(screen.queryByText("Checking the CLI.")).toBeNull());
     });
 
+    it("keeps a shown fold through a scheduled wake's running edge", async () => {
+      // A /loop iteration ends, folds, and minutes later a cron/wakeup
+      // firing flips the session to running while this settled bubble is
+      // still the last one (the new turn has no items yet). The shown
+      // fold must hold through that item-less gap instead of popping
+      // open every iteration.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Polling CI.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "All green this round.", final: true },
+      ];
+      const view = (status: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus={status}
+            turnLifecycle="completed"
+            isLastAssistant
+            showsWorking={status === "running"}
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender } = render(view("idle"));
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+
+      rerender(view("running"));
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      // Structural, not timing: the fold stays across further renders.
+      rerender(view("running"));
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.queryByText("Polling CI.")).toBeNull();
+    });
+
+    it("a revive clears the latch and restores live-turn suppression", async () => {
+      // If this bubble's OWN turn goes live again (a stray idle's
+      // revive), the trace re-expands, and a later mid-turn settled
+      // misread goes back to being suppressed — the latch must not
+      // carry across a revive and resurrect the codex flicker.
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Working through it.", final: true },
+        tool(1, "Bash"),
+        { kind: "text", itemId: "m1", text: "Done for now.", final: true },
+      ];
+      const view = (lifecycle: "completed" | "streaming", status: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={items}
+            sessionStatus={status}
+            turnLifecycle={lifecycle}
+            isLastAssistant
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender } = render(view("completed", "idle"));
+      await waitFor(() => expect(screen.getByTestId("turn-worked-fold")).toBeDefined());
+
+      // The turn revives — trace expands immediately.
+      rerender(view("streaming", "running"));
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Working through it.")).toBeDefined();
+
+      // A settled misread while the session still runs stays suppressed.
+      rerender(view("completed", "running"));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 700);
+      });
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+    });
+
     it("holds the mount fold over a just-active trace so a live edge can cancel it", () => {
       // A reload can land inside a step-wise turn's between-step gap,
       // where the snapshot reads settled although the turn continues.

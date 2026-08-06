@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import secrets
 import time
 import urllib.parse
@@ -66,6 +67,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
@@ -166,6 +168,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
+    SUBAGENT_ROUTING_OVERRIDE_VALUES,
     _logger,
     _managed_launch_tasks,
     _model_options_cache,
@@ -617,6 +620,38 @@ def _attachment_disposition(filename: str) -> str:
         ascii_name = "download"
     encoded = urllib.parse.quote(filename, safe="")
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
+# A file id maps to one set of bytes for the file's whole life — content is
+# never rewritten in place, only deleted — so the id is a strong validator and
+# the bytes can be cached indefinitely. ``private`` keeps the response out of
+# shared caches, since the bytes are readable only by session members.
+FILE_CONTENT_CACHE_CONTROL = "private, max-age=31536000, immutable"
+
+
+def _file_content_etag(file_id: str) -> str:
+    """Build the strong ``ETag`` for a stored file's content.
+
+    :param file_id: The stored file identifier.
+    :returns: A quoted entity tag value.
+    """
+    return f'"{file_id}"'
+
+
+def _if_none_match_matches(header: str | None, etag: str) -> bool:
+    """Check an ``If-None-Match`` request header against an entity tag.
+
+    :param header: Raw ``If-None-Match`` value, or ``None`` when absent.
+    :param etag: The current entity tag, quoted.
+    :returns: ``True`` when the client's cached copy is still current.
+    """
+    if not header:
+        return False
+    candidates = [candidate.strip() for candidate in header.split(",")]
+    if "*" in candidates:
+        return True
+    # Comparison is weak per RFC 9110: strip the ``W/`` prefix before matching.
+    return any(candidate.removeprefix("W/") == etag for candidate in candidates)
 
 
 def _stored_file_to_resource(
@@ -1775,6 +1810,53 @@ def _validated_harness_override_executor_type(agent: Agent) -> None:
             f"declares executor.type {executor_type!r}",
             code=ErrorCode.INVALID_INPUT,
         )
+
+
+#: ``executor.config`` key by which a spec hands its brain harness to Smart
+#: Routing. ``auto`` is the only accepted value.
+SMART_ROUTING_HARNESS_CONFIG_KEY = "smart_routing_harness"
+
+#: The ``harness_override`` sentinel meaning "the router picks the harness".
+AUTO_HARNESS_SENTINEL = "auto"
+
+
+def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
+    """
+    Read a spec's opt-in for routing its own brain harness.
+
+    A spec that pins ``executor.config.harness`` also pins the family every
+    sub-agent is routed within, so a cross-family sub-agent cannot stay on its
+    declared harness. ``smart_routing_harness: auto`` lets such a spec keep its
+    pin for a normal session and hand the harness to the router when Smart
+    Routing is on.
+
+    Validated on the same rules as :func:`_validated_harness_override`: the
+    value must be the ``"auto"`` sentinel, and only an ``executor.type:
+    omnigent`` spec has a swappable brain harness to give away.
+
+    :param spec: The bound agent's parsed spec.
+    :returns: ``"auto"`` when the spec opts in, else ``None``.
+    :raises OmnigentError: ``invalid_input`` for any other value, or for the
+        key on a non-omnigent executor type.
+    """
+    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
+
+    value = spec.executor.config.get(SMART_ROUTING_HARNESS_CONFIG_KEY)
+    if value is None:
+        return None
+    key = f"executor.config.{SMART_ROUTING_HARNESS_CONFIG_KEY}"
+    if value != AUTO_HARNESS_SENTINEL:
+        raise OmnigentError(
+            f"invalid {key}: must be {AUTO_HARNESS_SENTINEL!r}, got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if spec.executor.type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"{key} only applies to executor.type {OMNIGENT_EXECUTOR_TYPE!r} "
+            f"agents; this spec declares executor.type {spec.executor.type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return AUTO_HARNESS_SENTINEL
 
 
 def _utc_day(epoch_seconds: int) -> str:
@@ -3178,6 +3260,52 @@ def _is_kiro_native_session(conv: Conversation) -> bool:
     return conv.labels.get("omnigent.wrapper") == "kiro-native-ui"
 
 
+# Claude Code writes this record into its own transcript when a turn is
+# interrupted (Escape, or steering while a tool is in flight). Anchored so a
+# user's bracketed question such as "[Request interrupted by user?]" stays a
+# real message. Kept in sync with `INTERRUPT_RE` in web/src/lib/systemMessage.ts,
+# which re-classifies the mirrored record as a muted "Interrupted" marker.
+_CLAUDE_INTERRUPT_RECORD_RE = re.compile(r"^\[Request interrupted by user(?: for tool use)?\]$")
+
+
+def _is_native_interrupt_record(data: MessageData) -> bool:
+    """
+    Whether a mirrored user item is the vendor CLI's own interrupt record.
+
+    The transcript forwarder mirrors every user-role record back, but this
+    one is synthesized by Claude itself — it is not the round-trip of a web
+    message, so no :mod:`omnigent.runtime.pending_inputs` entry exists for
+    it. Draining one anyway shifts the FIFO by a slot: the marker absorbs
+    the queued message's uploads and the real message persists with none.
+
+    Runtime ``[System: ...]`` notices are deliberately NOT matched here.
+    Those are posted through ``POST /v1/sessions/{id}/events`` and record a
+    pending entry of their own (see
+    :func:`_dispatch_session_event_to_runner`), so their mirror-back must
+    keep draining normally.
+
+    Matched on the first line only, exactly as ``parseSystemMessage`` does
+    web-side. The two predicates must agree: a record the web hides as a
+    marker but the server drains for would put the bug straight back.
+
+    :param data: The mirrored user message's data, whose ``content`` is a
+        list of block dicts, e.g. ``[{"type": "input_text", "text":
+        "[Request interrupted by user]"}]``.
+    :returns: ``True`` for an interrupt record, ``False`` for a real
+        user message.
+    """
+    if any(
+        isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+        for block in data.content
+    ):
+        return False
+    text = _message_text(data.content)
+    if text is None:
+        return False
+    first_line = text.strip().split("\n", 1)[0]
+    return _CLAUDE_INTERRUPT_RECORD_RE.match(first_line) is not None
+
+
 def _merge_pending_file_blocks(
     item: NewConversationItem,
     pending_content: list[dict[str, Any]],
@@ -3400,6 +3528,7 @@ def _publish_status(
     error: ErrorDetail | None = None,
     response_id: str | None = None,
     background_task_count: int | None = None,
+    blocked_on: str | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -3499,12 +3628,15 @@ def _publish_status(
         response_id=response_id,
         error=error,
         background_task_count=background_task_count,
+        blocked_on=blocked_on,
     )
     payload = event.model_dump()
     if response_id is None:
         payload.pop("response_id", None)
     if background_task_count is None:
         payload.pop("background_task_count", None)
+    if blocked_on is None:
+        payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
 
 
@@ -4744,7 +4876,7 @@ class _NativeTerminalEnsureOutcome:
     """
 
     error: ErrorData | None
-    policy_notice: str | None
+    policy_notice: str | None = None
 
 
 def _policy_notice_from_ensure_response(resp: httpx.Response) -> str | None:
@@ -4784,6 +4916,71 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
         error=RetryErrorDetail(code=error.code, message=error.message),
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+#: Error code for a model change the terminal never applied.
+_MODEL_CHANGE_NOT_APPLIED_CODE = "model_change_not_applied"
+
+
+def _surface_model_change_forward_failure(
+    session_id: str,
+    model: str | None,
+    runner_result: _RunnerForwardResult | None,
+) -> None:
+    """
+    Publish a visible notice when a native pane never took a model change.
+
+    A PATCH persists ``model_override`` and then forwards the change to the
+    runner, which types ``/model`` into the terminal. On a native terminal that
+    injection is the ONLY thing that moves the model, so a dropped forward left
+    the row (and the picker) claiming a model the pane was never on, silently.
+    This does not roll the row back — it makes the divergence visible.
+
+    Call only for native terminal sessions: every other harness re-reads the
+    persisted value at its next turn boundary, so a dropped forward there is
+    genuinely benign.
+
+    Silent when no runner answered at all. That session is stopped or detached,
+    and its relaunch reads ``model_override`` off the row, so nothing has
+    diverged — the notice is for a session whose runner IS reachable and still
+    did not switch the pane.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param model: The model that was persisted, or ``None`` when cleared.
+    :param runner_result: HTTP result from the forward, or ``None`` when no
+        runner was reachable.
+    :returns: None.
+    """
+    if runner_result is None:
+        _logger.info(
+            "Model change for session=%s model=%r reached no runner; the launch will read it "
+            "off the row",
+            session_id,
+            model,
+        )
+        return
+    if 200 <= runner_result.status_code < 300:
+        return
+    reason = f"the runner returned status {runner_result.status_code}"
+    _logger.warning(
+        "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
+        session_id,
+        model,
+        reason,
+        runner_result.body,
+    )
+    target = model or "its default model"
+    _publish_error_event(
+        session_id,
+        ErrorData(
+            source="execution",
+            code=_MODEL_CHANGE_NOT_APPLIED_CODE,
+            message=(
+                f"The terminal was not switched to {target}: {reason}. "
+                "It is still running on its previous model."
+            ),
+        ),
+    )
 
 
 async def _persist_native_policy_notice(
@@ -4886,10 +5083,19 @@ async def _forward_session_change_to_runner(
     return await _facade._forward_session_change_to_runner(*args, **kwargs)
 
 
+#: Forward budget for a control event the runner answers by driving the TUI.
+#: The claude-native ``/model`` and ``/effort`` injectors wait up to 1s for the
+#: tmux advertisement and then up to 4s for the confirmation dialog, so the
+#: default 5s budget could time out on a legitimately-still-working injection
+#: and report a failure that did not happen.
+_TUI_INJECT_FORWARD_TIMEOUT_S = 20.0
+
+
 async def _forward_session_change_to_runner_impl(
     session_id: str,
     runner_router: Any,
     event: dict[str, Any],
+    timeout_s: float = 5.0,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -4929,6 +5135,9 @@ async def _forward_session_change_to_runner_impl(
         ``{"type": "effort_change", "effort": "high"}``,
         ``{"type": "model_change", "model": "claude-opus-4-7"}``, or
         ``{"type": "compact"}``.
+    :param timeout_s: Request budget, e.g. ``5.0``. Callers whose event the
+        runner answers by driving the TUI pass
+        :data:`_TUI_INJECT_FORWARD_TIMEOUT_S`.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -4945,7 +5154,7 @@ async def _forward_session_change_to_runner_impl(
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=event,
-            timeout=5.0,
+            timeout=timeout_s,
         )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
@@ -5583,7 +5792,11 @@ async def _emit_server_routing_decision(
     verdict: dict[str, Any],
     *,
     agent: str | None = None,
-) -> None:
+    scope: str = "turn",
+    harness: str | None = None,
+    decision_id: str | None = None,
+    attempted_override: str | None = None,
+) -> str | None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
     Called by the server-side routing path before the turn is forwarded
@@ -5593,15 +5806,38 @@ async def _emit_server_routing_decision(
 
     :param agent: Sub-agent name to include when mirroring a child
         session's routing decision into the parent's transcript.
+    :param scope: What the decision governs, e.g. ``"child_session"``.
+    :param harness: Harness the decision applies to, when it picked one.
+    :param decision_id: Decision identity shared with the child-sessions
+        API. ``None`` mints one.
+    :param attempted_override: Model the spawning agent asked for and the
+        router overrode — an LLM-supplied ``args.model``, or a native
+        spawn's own ``requested_model``. ``None`` when nothing was asked
+        for, or when the pick names the same arm as the ask.
+    :returns: The decision id, so callers can join it onto the session
+        row, or ``None`` when the payload failed validation and no chip
+        was recorded.
     """
     import uuid
 
     rationale = verdict.get("rationale", "")
     applied = verdict.get("applied", True)
+    resolved_decision_id = decision_id or str(uuid.uuid4())
+    raw_model = verdict.get("raw_model")
+    # Which router answered, so the chip can mark an AI-Gateway-routed decision.
+    router_source = verdict.get("router_source")
     item_data: dict[str, Any] = {
         "model": model,
         "applied": bool(applied),
         "rationale": rationale if isinstance(rationale, str) else "",
+        "scope": scope,
+        "harness": harness,
+        "decision_id": resolved_decision_id,
+        "raw_model": raw_model if isinstance(raw_model, str) and raw_model else None,
+        "attempted_override": attempted_override,
+        "router_source": (
+            router_source if isinstance(router_source, str) and router_source else None
+        ),
     }
     if agent is not None:
         item_data["agent"] = agent
@@ -5609,7 +5845,7 @@ async def _emit_server_routing_decision(
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
         _logger.warning("Server routing: failed to parse routing_decision data")
-        return
+        return None
 
     routing_item = NewConversationItem(
         type="routing_decision",
@@ -5638,6 +5874,7 @@ async def _emit_server_routing_decision(
             },
         },
     )
+    return resolved_decision_id
 
 
 @dataclass
@@ -7131,6 +7368,28 @@ def _validated_cost_control_mode_override(value: str | None) -> str | None:
     )
 
 
+def _validated_subagent_routing_override(value: str | None) -> str | None:
+    """
+    Validate a caller-supplied per-session subagent-routing switch.
+
+    Two-state: ``"on"`` routes subagent spawns and ``"off"`` / unset both
+    read as Default. ``None`` from a PATCH clears the stored value, which
+    lands the session on Default rather than inheriting anything.
+
+    :param value: The candidate value, e.g. ``"on"``, or ``None`` when
+        the caller did not set / wants to clear the override.
+    :returns: The value unchanged when valid, or ``None``.
+    :raises OmnigentError: 400 (``invalid_input``) when *value* is
+        anything other than ``"on"``, ``"off"``, or ``None``.
+    """
+    if value is None or value in SUBAGENT_ROUTING_OVERRIDE_VALUES:
+        return value
+    raise OmnigentError(
+        f"invalid subagent_routing_override: {value!r} (expected 'on', 'off', or null to clear)",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     Parse the JSON metadata part from bundled session creation.
@@ -8094,6 +8353,7 @@ def _child_session_summary_from_conversation(
             collapsed = " ".join(raw_prompt.split())
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
+    routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -8116,6 +8376,13 @@ def _child_session_summary_from_conversation(
         # in-memory index that feeds the sidebar badge, so the Agents
         # rail can flag a child that's awaiting user input.
         pending_elicitations_count=pending_elicitations.count_for(conv.id),
+        # The model routing picked for this child, reported only when a
+        # decision actually produced it: a user-pinned model_override is not a
+        # routed model, and reporting one with a null decision id makes the
+        # two fields contradict each other. The decision is joined through a
+        # conversation label rather than a new column.
+        routed_model=conv.model_override if routing_decision_id is not None else None,
+        routing_decision_id=routing_decision_id,
     )
 
 
@@ -8147,8 +8414,8 @@ async def _handle_advise_models_mcp(
     """
     Server-side handler for ``sys_advise_models`` MCP tool calls.
 
-    Intercepts the call before the runner forward because
-    ``RuntimeCaps.routing_client`` lives in the server process.
+    Intercepts the call before the runner forward because the deployment's
+    routing backends live in the server process.
 
     :param rpc_id: The JSON-RPC request id.
     :param conv: The :class:`Conversation` for this session.
@@ -8162,13 +8429,15 @@ async def _handle_advise_models_mcp(
             rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
         )
 
+    from omnigent.server.routing_backend import backends_from_caps
+
     caps = get_caps()
-    routing_client = caps.routing_client
+    routing_client = backends_from_caps(caps).any()
     if routing_client is None:
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import fetch_runner_models
+    from omnigent.server.smart_routing import _WORKER_NAME_TO_HARNESS, fetch_runner_models
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
@@ -8200,12 +8469,6 @@ async def _handle_advise_models_mcp(
                     "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
                 )
 
-    _WORKER_HARNESS: dict[str, str] = {
-        "claude_code": "claude-sdk",
-        "codex": "codex",
-        "pi": "pi",
-    }
-
     def _resolve_harness_for_worker(agent: str) -> str | None:
         if spec is not None:
             sub_agents = getattr(spec, "sub_agents", None) or []
@@ -8215,7 +8478,7 @@ async def _handle_advise_models_mcp(
                     if h:
                         return h
                     break
-        return _WORKER_HARNESS.get(agent)
+        return _WORKER_NAME_TO_HARNESS.get(agent)
 
     recommendations: list[dict[str, Any]] = []
     for task in tasks:
@@ -8703,6 +8966,7 @@ async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
 
 
 __all__ = [
+    "FILE_CONTENT_CACHE_CONTROL",
     "SessionLiveness",
     "_HostLaunchAttempt",
     "_NativeTerminalEnsureOutcome",
@@ -8757,6 +9021,7 @@ __all__ = [
     "_extract_persistent_item_from_sse",
     "_extract_user_text_for_routing",
     "_extract_user_text_from_event",
+    "_file_content_etag",
     "_find_claude_native_subagent_child",
     "_find_codex_native_subagent_child",
     "_find_subagent_child_by_title",
@@ -8770,6 +9035,7 @@ __all__ = [
     "_handle_external_session_todos",
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
+    "_if_none_match_matches",
     "_invalidate_runner_backed_snapshot_state",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
@@ -8907,6 +9173,8 @@ __all__ = [
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
     "_validated_harness_override_executor_type",
+    "_validated_spec_smart_routing_harness",
+    "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
     "announce_hosts_changed",

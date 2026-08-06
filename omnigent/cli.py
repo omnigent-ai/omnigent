@@ -79,7 +79,8 @@ if TYPE_CHECKING:
 
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
-    from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
+    from omnigent.server.smart_routing import LLMRoutingClient
+    from omnigent.smart_routing_cli import RoutingDecision
     from omnigent.spec.types import LLMConfig
     from omnigent.update_check import _InstalledWheelInfo
 
@@ -98,17 +99,22 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
 
 def _parse_model_prefixes(
     raw: object,
-) -> list[str]:
+) -> list[str] | None:
     """Normalize the ``model_prefix`` config into a list of prefixes.
 
     Accepts a single string (``"databricks-"``) or a list
-    (``["databricks-", "system.ai."]``); blanks are dropped. Returns an
-    empty list when unset, so catalog ids are sent verbatim.
+    (``["databricks-", "system.ai."]``); blanks are dropped.
+
+    :returns: The configured prefixes — an explicit empty list is honoured as
+        "this catalog carries no prefix" — or ``None`` when the key is absent or
+        malformed, leaving :data:`MODEL_ID_PREFIXES` in place.
     """
+    if raw is None:
+        return None
     if isinstance(raw, str):
         raw = [raw]
     if not isinstance(raw, list):
-        return []
+        return None
     return [p.strip() for p in raw if isinstance(p, str) and p.strip()]
 
 
@@ -121,9 +127,129 @@ def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
     raise click.ClickException(f"routing.{key} must be a string")
 
 
+def parse_routing_settings(
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+) -> Any:  # type: ignore[explicit-any]  # RoutingSettings
+    """Parse the ``routing:`` block into the shared ``RoutingSettings``.
+
+    This is the only place ``routing.*`` config is read; every consumer
+    (the routing clients, the subagent router) reads the dataclass off
+    ``RuntimeCaps`` instead.
+
+    :param routing_cfg: The parsed ``routing:`` mapping, or ``None``.
+    :returns: A :class:`~omnigent.server.smart_routing.RoutingSettings`;
+        all-defaults when the block is absent or malformed.
+    """
+    from omnigent.server.smart_routing import (
+        DEFAULT_ROUTER_NAME,
+        MODEL_ID_PREFIXES,
+        RoutingSettings,
+        parse_routing_tables,
+    )
+
+    if not isinstance(routing_cfg, dict):
+        return RoutingSettings()
+    router_name = (routing_cfg.get("router_name") or "").strip() or DEFAULT_ROUTER_NAME
+    selection_model = (routing_cfg.get("selection_model") or "").strip() or None
+    prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
+    return RoutingSettings(
+        router_name=router_name,
+        selection_model=selection_model,
+        # Only an absent key falls back: ``model_prefix: []`` means bare ids.
+        model_prefixes=MODEL_ID_PREFIXES if prefixes is None else tuple(prefixes),
+        # The arm menu / alias / effort tables a deployment fronting a different
+        # catalog overrides; absent keys keep the built-in defaults.
+        **parse_routing_tables(routing_cfg),
+    )
+
+
+# Databricks workspaces serve the routing API under this path.
+_AIGW_ROUTING_PATH = "/ai-gateway/routing/v1"
+
+
+def _databricks_provider_profile(
+    cfg: Any,  # type: ignore[explicit-any]  # parsed server config
+) -> str | None:
+    """Return the profile of the config's Databricks provider, if any.
+
+    Reads the server ``--config`` first and falls back to the global
+    ``providers:`` block, which is where most deployments declare their
+    workspace. A ``default:``-flagged entry wins so a workspace that also
+    declares a secondary Databricks provider still routes against the primary.
+
+    :param cfg: The parsed server ``--config`` mapping.
+    :returns: The Databricks profile name, or ``None`` when the deployment
+        declares no ``kind: databricks`` provider.
+    """
+    providers = cfg.get("providers") if isinstance(cfg, dict) else None
+    if not isinstance(providers, dict):
+        from omnigent.onboarding.provider_config import load_config as load_provider_config
+
+        providers = load_provider_config().get("providers")
+    if not isinstance(providers, dict):
+        return None
+    matches: list[tuple[bool, str]] = []
+    for entry in providers.values():
+        if not isinstance(entry, dict) or entry.get("kind") != "databricks":
+            continue
+        profile = entry.get("profile")
+        if isinstance(profile, str) and profile.strip():
+            matches.append((bool(entry.get("default")), profile.strip()))
+    if not matches:
+        return None
+    matches.sort(key=lambda m: not m[0])
+    return matches[0][1]
+
+
+def _build_default_databricks_routing_client(
+    cfg: Any,  # type: ignore[explicit-any]  # parsed server config
+    settings: Any,  # type: ignore[explicit-any]  # RoutingSettings
+) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
+    """Route through the workspace's AI Gateway when no ``routing:`` block exists.
+
+    A Databricks-backed deployment gets smart routing without extra
+    config: the client points at that workspace's routing API and authenticates
+    with the same profile. Returns ``None`` for any other deployment, so the
+    built-in judge stays the fallback.
+
+    :param cfg: The parsed server ``--config`` mapping.
+    :param settings: The parsed routing settings (all defaults here).
+    :returns: A configured client, or ``None`` when there is no Databricks
+        provider or its workspace host can't be resolved.
+    """
+    profile = _databricks_provider_profile(cfg)
+    if profile is None:
+        return None
+    from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+    try:
+        host = resolve_databricks_workspace(profile).host.rstrip("/")
+    except Exception:  # noqa: BLE001 — unresolvable workspace just means no routing
+        logging.getLogger(__name__).info(
+            "routing: could not resolve workspace host for Databricks profile %r; "
+            "leaving smart routing off",
+            profile,
+        )
+        return None
+    if not host:
+        return None
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    return ExternalRoutingClient(
+        base_url=host + _AIGW_ROUTING_PATH,
+        router_name=settings.router_name,
+        databricks_profile=profile,
+        model_prefixes=list(settings.model_prefixes),
+        selection_model=settings.selection_model,
+        menus=settings.menus,
+        servable_aliases=settings.servable_aliases,
+    )
+
+
 def _build_external_routing_client(
-    routing_cfg: Mapping[str, object],
-) -> ExternalRoutingClient | None:
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+    settings: Any = None,  # type: ignore[explicit-any]  # RoutingSettings | None
+) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
@@ -137,14 +263,18 @@ def _build_external_routing_client(
 
     :param routing_cfg: The parsed ``routing:`` mapping (a dict with
         ``provider == "external"``, per the caller).
+    :param settings: The parsed routing settings, supplying the extraction
+        model, scenario menus, and model prefixes. ``None`` parses them from
+        *routing_cfg*.
     :returns: A configured client, or ``None`` when required config is
         missing (a warning is logged; routing stays off rather than raising).
     """
+    if settings is None:
+        settings = parse_routing_settings(routing_cfg)
     base_url = _routing_config_text(routing_cfg, "base_url")
     router_name = _routing_config_text(routing_cfg, "router_name")
     api_key = _routing_config_text(routing_cfg, "api_key")
     profile = _routing_config_text(routing_cfg, "profile")
-    model_prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
 
     if not base_url or not router_name:
         click.echo(
@@ -176,7 +306,10 @@ def _build_external_routing_client(
         router_name=router_name,
         auth=auth,
         databricks_profile=databricks_profile,
-        model_prefixes=model_prefixes,
+        model_prefixes=list(settings.model_prefixes),
+        selection_model=settings.selection_model,
+        menus=settings.menus,
+        servable_aliases=settings.servable_aliases,
     )
 
 
@@ -203,6 +336,46 @@ def _build_local_llm_routing_client(
     from omnigent.server.smart_routing import LLMRoutingClient
 
     return LLMRoutingClient(policy_client)
+
+
+def _build_routing_backends(
+    cfg: Any,  # type: ignore[explicit-any]  # parsed server config
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+    settings: Any,  # type: ignore[explicit-any]  # RoutingSettings
+) -> Any:  # type: ignore[explicit-any]  # RoutingBackends
+    """Build BOTH routing backends from configuration alone — no opt-in env needed.
+
+    They are not alternatives. The external client's picks are AI Gateway catalog
+    ids, so a harness whose inference runs off something else is served by the
+    built-in judge instead (see :mod:`omnigent.server.routing_backend`).
+
+    An explicit ``routing:`` block chooses the external side by ``provider``:
+
+    * ``external`` — call an external ``routes:select`` service.
+    * ``none`` — opt out of routing entirely; neither backend.
+    * anything else — no external side, the built-in judge only.
+
+    With no ``routing:`` block at all, a Databricks-backed deployment gets its
+    own workspace AI Gateway as the external side. Managed deployments override
+    ``RuntimeCaps.routing_backends`` themselves.
+
+    :param cfg: The parsed server ``--config`` mapping.
+    :param server_llm: The parsed server-level ``LLMConfig``, or ``None``.
+    :param settings: The parsed routing settings.
+    :returns: The pair; both sides may be ``None`` (routing off).
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    routing_cfg = cfg.get("routing")
+    provider = routing_cfg.get("provider") if isinstance(routing_cfg, dict) else None
+    if provider == "none":
+        return RoutingBackends()
+    external: Any = None  # type: ignore[explicit-any]
+    if provider == "external":
+        external = _build_external_routing_client(routing_cfg, settings)
+    elif not isinstance(routing_cfg, dict):
+        external = _build_default_databricks_routing_client(cfg, settings)
+    return RoutingBackends(external=external, local=_build_local_llm_routing_client(server_llm))
 
 
 def _server_uvicorn_log_config(
@@ -1802,20 +1975,21 @@ def main() -> None:
     from omnigent.cli_diagnostics import (
         log_cli_error_hint,
         log_cli_exception,
-        print_setup_hint,
+        print_stale_host_hint,
         setup_cli_logging,
     )
 
     setup_cli_logging(argv)
 
-    # ``omnigent setup`` IS the setup wizard — if it fails, telling the
-    # user to "run omnigent setup" would be circular. ``upgrade`` (and its
-    # ``update`` alias) is excluded too: its failures (unreachable index,
-    # dev checkout, install error) are never about a missing model
-    # credential, so the setup hint would only mislead. ``integration``
-    # likewise: its errors (package not installed, daemon not running) have
-    # nothing to do with model credentials.
-    suggest_setup = argv[0] not in {"setup", "update", "upgrade", "integration"}
+    # Do not recommend the off-switch when it is already running. Commands
+    # unrelated to runner startup are excluded to avoid a misleading hint.
+    suggest_stale_host_recovery = argv[0] not in {
+        "integration",
+        "setup",
+        "stop",
+        "update",
+        "upgrade",
+    }
 
     # Lightweight update notice: only on an interactive terminal and only
     # for user-facing commands. Reads a cached "latest PyPI version" and
@@ -1839,8 +2013,8 @@ def main() -> None:
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
-        if suggest_setup:
-            print_setup_hint()
+        if suggest_stale_host_recovery:
+            print_stale_host_hint()
         raise SystemExit(exc.exit_code) from exc
     except click.Abort as exc:
         # Ctrl+C / user cancel — no hint, the user knows what they did.
@@ -1852,8 +2026,8 @@ def main() -> None:
         # always-on CLI log has more context than this single crash — then
         # hand off to the friendly crash handler for the calm screen,
         # de-emphasized traceback, and the bug-filing prompt. We drop the
-        # `omnigent setup` hint here: genuine crashes are rarely auth issues,
-        # and "run setup" would contradict the crash screen's reassurance.
+        # stale-host hint here: genuine crashes are not runner startup failures,
+        # and recovery advice would contradict the crash screen's reassurance.
         # `handle_crash` renders the UX and we exit with code 1 (SystemExit
         # does NOT re-trigger sys.excepthook, so there's no double render).
         from omnigent.crash_handler import handle_crash
@@ -3569,26 +3743,18 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the routing client from configuration alone — no opt-in env needed.
-    # Two mutually-exclusive providers, chosen by ``routing.provider``:
-    #   - ``external``: call an external ``routes:select`` service (built when a
-    #     ``routing:`` block declares ``provider: external``).
-    #   - ``llm`` (default): the built-in judge using the ``llm:`` block (built
-    #     whenever a server ``llm:`` block is configured).
-    # Stays None when neither is configured. Managed deployments override
-    # RuntimeCaps.routing_client with their own implementation.
-    routing_cfg = cfg.get("routing")
-    routing_client: ExternalRoutingClient | LLMRoutingClient | None
-    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
-        routing_client = _build_external_routing_client(routing_cfg)
-    else:
-        routing_client = _build_local_llm_routing_client(server_llm)
+    routing_settings = parse_routing_settings(cfg.get("routing"))
+    routing_backends = _build_routing_backends(cfg, server_llm, routing_settings)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
-        routing_client=routing_client,
+        # The primary stays the single "is routing configured" answer for every
+        # legacy consumer; the pair is what a per-call selection reads.
+        routing_client=routing_backends.any(),
+        routing_backends=routing_backends,
+        routing_settings=routing_settings,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -6034,6 +6200,11 @@ _RESUME_HELP = (
 )
 _CONTINUE_HELP = "Continue the most recent conversation for this agent."
 _NO_SESSION_HELP = "Use a fresh temporary local session store for this run."
+_SMART_ROUTING_HELP = (
+    "Let the server pick the model for this launch (and the harness too, "
+    "unless --harness pins one). Requires -p, except with --harness "
+    "claude-native / codex-native, which route on your first typed message."
+)
 
 _FORK_HELP = "Fork an existing session by id and open the REPL on the fork."
 _LOG_HELP = "Write a JSON dump of the conversation to ~/.omnigent/logs/ on exit."
@@ -6319,12 +6490,14 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.claude_native",
         function="run_claude_native",
         args_param="extra_args",
+        prompt_param="prompt",
     ),
     "codex": _NativeTerminalDispatchSpec(
         module="omnigent.codex_native",
         function="run_codex_native",
         args_param="extra_args",
         model_strategy="first_class",
+        prompt_param="prompt",
     ),
     "pi": _NativeTerminalDispatchSpec(
         module="omnigent.pi_native",
@@ -6503,6 +6676,359 @@ def _dispatch_native_terminal_harness(
     launcher = getattr(import_module(spec.module), spec.function)
     launcher(**launcher_kwargs)
     return True
+
+
+# ── Smart Routing (route before launch) ──────────────────────────────────
+# Only a launch with no harness able to route from inside itself needs the text
+# up front: the cross-harness route has to pick a harness before one exists to
+# hook, and a harness without the first-message hook can never route in-session.
+_SMART_ROUTING_NEEDS_PROMPT = (
+    "--smart-routing needs the text to route up front here: this launch has no "
+    'harness that can route from inside itself, so pass -p "<prompt>", start the '
+    "session from the web UI, or pin --harness claude-native / --harness "
+    "codex-native, which route on the first message you type."
+)
+#: Fail-open harness for a tier-3 route that returned nothing usable.
+_SMART_ROUTING_FALLBACK_HARNESS = "claude-native"
+
+
+def _smart_routing_capable_harness(harness: str | None) -> str | None:
+    """
+    Canonical native harness for *harness*, when Smart Routing can launch it.
+
+    A routed launch has to carry the prompt into the TUI, so only native
+    terminal harnesses whose dispatch spec accepts a prompt qualify.
+
+    :param harness: Requested harness (canonical or alias), e.g.
+        ``"claude-native"``. Bare ``"claude"`` canonicalizes to the SDK
+        harness, which is not routable here.
+    :returns: The canonical harness id, or ``None`` when it is not routable.
+    """
+    from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+    native = native_coding_agent_for_harness(harness)
+    if native is None:
+        return None
+    spec = _NATIVE_TERMINAL_DISPATCH_SPECS.get(native.key)
+    if spec is None or spec.prompt_param is None:
+        return None
+    return native.harness
+
+
+def _require_smart_routing_prompt(
+    prompt: str | None, *, in_harness_routing: bool = True
+) -> str | None:
+    """
+    Resolve the text a routed launch starts from, rejecting an unroutable one.
+
+    A harness that hooks its own first typed message can be launched bare — the
+    hook routes whatever the user types — so a missing prompt is fine there.
+    Any other launch has to route before a harness exists to hook, and needs the
+    text up front.
+
+    :param prompt: The ``-p`` text, or ``None``.
+    :param in_harness_routing: Whether this launch's harness routes its own
+        first message (see
+        :func:`omnigent.runner.turn_routing.supports_in_harness_turn_routing`).
+        Defaults to ``True`` for the per-harness ``--smart-routing``
+        subcommands, which exist only on harnesses carrying that hook.
+    :returns: The prompt, or ``None`` when the harness routes in-session.
+    :raises click.UsageError: When there is no text and no in-harness route.
+    """
+    if prompt is not None and prompt.strip():
+        return prompt
+    if in_harness_routing:
+        return None
+    raise click.UsageError(_SMART_ROUTING_NEEDS_PROMPT)
+
+
+def _reject_smart_routing_resume(*, resuming: bool, flag: str = "--resume") -> None:
+    """
+    Reject ``--smart-routing`` combined with a resume.
+
+    Routing happens when the session is created, so a routed launch is always a
+    new session; resuming one would silently ignore the routing request.
+
+    :param resuming: ``True`` when the invocation targets an existing session.
+    :param flag: The flag to name in the error, e.g. ``"--continue"``.
+    :returns: None when the combination is fine.
+    :raises click.ClickException: When *resuming* is ``True``.
+    """
+    if not resuming:
+        return
+    raise click.ClickException(
+        f"--smart-routing routes a new session, so it cannot be combined with {flag}. "
+        f"Drop {flag} to route, or drop --smart-routing to reopen the existing session "
+        "on its own model."
+    )
+
+
+def _with_routed_model_arg(args: tuple[str, ...], model: str | None) -> tuple[str, ...]:
+    """
+    Append ``--model <routed>`` to a wrapper's pass-through args.
+
+    A ``--model`` the user typed themselves wins: they asked for that model
+    explicitly, and routing is a default-filling service.
+
+    :param args: The wrapper's pass-through args, e.g. ``("--verbose",)``.
+    :param model: Routed model id, or ``None`` to leave *args* alone.
+    :returns: The args, with the routed model appended when appropriate.
+    """
+    if not model:
+        return args
+    if any(arg == "--model" or arg.startswith("--model=") for arg in args):
+        return args
+    return (*args, "--model", model)
+
+
+def _smart_routing_decision(
+    *,
+    server: str,
+    prompt: str | None,
+    harness: str | None,
+) -> RoutingDecision:
+    """
+    Preflight Smart Routing, then create the routed session for *prompt*.
+
+    Preflight failures raise (a pick that cannot be applied is worse than no
+    pick); a create the server rejects comes back as a decision with no session
+    whose notice is printed here, so the caller only has to launch a plain
+    wrapper session.
+
+    A ``None`` *prompt* creates the session with Smart Routing on but nothing
+    routed: the harness's own first-message hook picks the model once the user
+    types, which is what the stderr line reports.
+
+    :param server: Resolved Omnigent server base URL.
+    :param prompt: The text to route (also the TUI's initial input), or ``None``
+        to leave the pick to the harness's in-session hook.
+    :param harness: Canonical harness to pin, or ``None`` to route the harness
+        too.
+    :returns: The routed session and pick to launch on.
+    :raises click.ClickException: When Smart Routing is unavailable.
+    """
+    from omnigent.smart_routing_cli import (
+        check_smart_routing_available,
+        create_smart_routing_session,
+        known_host_id,
+        smart_routing_families,
+    )
+
+    # The session must be bound to the host it will run on: the server builds
+    # the router's candidate model catalog from that host's model-options
+    # frames, so the daemon has to be connected before we create (the wrapper
+    # ensures it again on attach; the call is idempotent).
+    host_id: str | None
+    try:
+        from omnigent.host.identity import load_or_create_host_identity
+
+        _ensure_host_daemon(server)
+        host_id = known_host_id(base_url=server, host_id=load_or_create_host_identity().host_id)
+    except (OSError, ValueError):
+        # No host identity yet — the per-host gate has nothing to read, which
+        # is the same "unknown does not gate" case as an older host.
+        host_id = None
+    check_smart_routing_available(
+        base_url=server,
+        harnesses=smart_routing_families(harness),
+        host_id=host_id,
+    )
+    decision = create_smart_routing_session(
+        base_url=server,
+        prompt=prompt,
+        harness=harness,
+        host_id=host_id,
+        # The server requires a workspace with a host_id, and this is the cwd
+        # the wrapper will attach in.
+        workspace=str(Path.cwd().resolve()) if host_id is not None else None,
+    )
+    if decision.notice is not None:
+        click.echo(decision.notice, err=True)
+    elif prompt is None:
+        click.echo(
+            "omnigent: Smart Routing is on for this session; your first message picks the model.",
+            err=True,
+        )
+    elif decision.model is not None:
+        picked = (
+            f"{decision.harness} on {decision.model}"
+            if decision.harness is not None
+            else decision.model
+        )
+        click.echo(f"omnigent: Smart Routing picked {picked}.", err=True)
+    return decision
+
+
+def _dispatch_smart_routing(
+    *,
+    harness: str | None,
+    server: str | None,
+    prompt: str | None,
+    model: str | None,
+    auto_open_conversation: bool,
+) -> None:
+    """
+    Create the routed session, then attach its native TUI wrapper to it.
+
+    Tier 2 (*harness* given) routes the model only and keeps the requested
+    harness. Tier 3 (*harness* ``None``) routes both, and the wrapper is chosen
+    from the harness the server bound — falling back to
+    :data:`_SMART_ROUTING_FALLBACK_HARNESS` (with a notice) when the create
+    resolved nothing, or a harness the CLI cannot hand a prompt to.
+
+    Without a *prompt*, a *harness* that routes its own first typed message is
+    launched bare: the session is created with Smart Routing on, and the TUI
+    starts with no initial input and no routed ``--model`` (there is no
+    create-time pick — the harness's hook applies one in-session). The auto
+    route cannot do this, because a harness has to be chosen before one exists
+    to hook.
+
+    The wrapper always attaches to the created session rather than bundling its
+    own, so the routed model, the decision card, and the wrapper labels the
+    server wrote at create are the ones the launch runs on. When the create
+    failed entirely, the wrapper starts a plain session instead — the launch is
+    never blocked.
+
+    :param harness: Canonical native harness to pin, or ``None`` for the auto
+        route.
+    :param server: ``--server`` value (or its config default), or ``None``.
+    :param prompt: The routed prompt (also the TUI's initial input), or ``None``
+        to let *harness* route its own first message.
+    :param model: ``--model`` fallback used when routing returns no model.
+    :param auto_open_conversation: Whether to open the web conversation.
+    :returns: None once the TUI attach ends.
+    :raises click.ClickException: When Smart Routing is unavailable.
+    :raises click.UsageError: When there is no prompt and no in-harness route.
+    """
+    from omnigent.runner.turn_routing import supports_in_harness_turn_routing
+
+    prompt = _require_smart_routing_prompt(
+        prompt, in_harness_routing=supports_in_harness_turn_routing(harness)
+    )
+    server = _ensure_backend(server)
+    decision = _smart_routing_decision(server=server, prompt=prompt, harness=harness)
+    launch_harness = harness or _smart_routing_capable_harness(decision.harness)
+    if launch_harness is None:
+        launch_harness = _SMART_ROUTING_FALLBACK_HARNESS
+        click.echo(
+            f"omnigent: Smart Routing did not resolve a launchable harness; "
+            f"launching {launch_harness}.",
+            err=True,
+        )
+    routed_model = decision.model or model
+    _dispatch_native_terminal_harness(
+        harness=launch_harness,
+        server=server,
+        model=routed_model,
+        # A routed model is an explicit request, so wrappers that only take a
+        # model when the user asked for one still receive it.
+        model_from_cli=routed_model is not None,
+        prompt=prompt,
+        system_prompt=None,
+        tools=None,
+        log=False,
+        debug_events=False,
+        # Attach to the routed session; ``None`` (create failed) lets the
+        # wrapper start its own.
+        resume_conversation_id=decision.session_id,
+        resume_picker=False,
+        resume_latest=False,
+        fork_session_id=None,
+        ephemeral=False,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_smart_routing(
+    *,
+    target: str | None,
+    harness: str | None,
+    prompt: str | None,
+    server: str | None,
+    model: str | None,
+    resume_conversation_id: str | None,
+    resume_picker: bool,
+    resume_latest: bool,
+    auto_open_conversation: bool,
+    system_prompt: str | None = None,
+    tools: str | None = None,
+    log: bool = False,
+    debug_events: bool = False,
+    fork_session_id: str | None = None,
+    ephemeral: bool = False,
+) -> None:
+    """
+    Handle ``omnigent run --smart-routing``: validate, then route and launch.
+
+    ``--harness`` (a native terminal harness) pins the harness and routes the
+    model; ``--harness auto`` or no ``--harness`` at all routes both, and always
+    needs ``-p`` (the harness is picked before one exists to route in). An AGENT
+    is rejected: a routed session is a native TUI, and an agent spec's
+    prompt/tools are never consulted there.
+
+    :param target: The AGENT argument as the user passed it, or ``None``.
+    :param harness: The ``--harness`` value the user passed, or ``None``.
+    :param prompt: The ``-p`` text, or ``None`` — allowed only when
+        ``--harness`` pins a harness that routes its own first message.
+    :param server: ``--server`` value or its config default.
+    :param model: ``--model`` fallback for an unrouted launch.
+    :param resume_conversation_id: ``--resume <id>`` target, rejected when set.
+    :param resume_picker: ``--resume`` with no value, rejected when set.
+    :param resume_latest: ``--continue``, rejected when set.
+    :param auto_open_conversation: Whether to open the web conversation.
+    :param system_prompt: ``--system-prompt`` value, rejected when set.
+    :param tools: ``--tools`` value, rejected when set.
+    :param log: ``--log``, rejected when set.
+    :param debug_events: ``--debug-events``, rejected when set.
+    :param fork_session_id: ``--fork`` value, rejected when set.
+    :param ephemeral: ``--no-session``, rejected when set.
+    :returns: None once the TUI attach ends.
+    :raises click.ClickException: On a rejected combination, or when Smart
+        Routing is unavailable.
+    """
+    # The same REPL-only options the plain native dispatch rejects: a routed
+    # launch is still a TUI attach, so they would be silently dropped.
+    repl_only = [
+        flag
+        for flag, active in (
+            ("--system-prompt", system_prompt is not None),
+            ("--tools", tools is not None),
+            ("--log", log),
+            ("--debug-events", debug_events),
+            ("--fork", fork_session_id is not None),
+            ("--no-session", ephemeral),
+        )
+        if active
+    ]
+    if repl_only:
+        raise click.ClickException(
+            "--smart-routing launches a native harness TUI; the REPL-only option(s) "
+            f"{', '.join(repl_only)} have no effect there — remove them."
+        )
+    _reject_smart_routing_resume(resuming=resume_conversation_id is not None or resume_picker)
+    _reject_smart_routing_resume(resuming=resume_latest, flag="--continue")
+    if target is not None:
+        raise click.ClickException(
+            "--smart-routing launches a native harness TUI, so it takes no AGENT. "
+            "Drop the AGENT to route the harness and model, or pass "
+            "`--harness claude-native` to route the model only."
+        )
+    requested: str | None = None
+    if harness is not None and harness != "auto":
+        requested = _smart_routing_capable_harness(harness)
+        if requested is None:
+            raise click.ClickException(
+                f"--smart-routing does not support --harness {harness!r}. Use a native "
+                "terminal harness that accepts a prompt (claude-native, codex-native, "
+                "kiro-native), or `--harness auto` to route the harness too."
+            )
+    _dispatch_smart_routing(
+        harness=requested,
+        server=server,
+        prompt=prompt,
+        model=model,
+        auto_open_conversation=auto_open_conversation,
+    )
 
 
 def _reject_agent_with_native_terminal_harness(harness: str) -> None:
@@ -6983,6 +7509,13 @@ def attach(
 )
 @click.option("--harness", default=None, help=_RUN_HARNESS_HELP)
 @click.option(
+    "--smart-routing",
+    "smart_routing",
+    is_flag=True,
+    default=False,
+    help=_SMART_ROUTING_HELP,
+)
+@click.option(
     "--from-openclaw",
     "from_openclaw",
     default=None,
@@ -7056,6 +7589,7 @@ def run(
     target: str | None,
     tools: str | None,
     harness: str | None,
+    smart_routing: bool,
     from_openclaw: str | None,
     model: str | None,
     prompt: str | None,
@@ -7086,6 +7620,8 @@ def run(
     Examples:
       omnigent run --harness claude-sdk
       omnigent run --harness codex -p "review the last commit"
+      omnigent run --smart-routing -p "review the last commit"
+      omnigent run --harness claude-native --smart-routing -p "fix the flaky test"
       omnigent run --from-openclaw "Gemini CLI" -p "review the last commit"
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
@@ -7110,6 +7646,32 @@ def run(
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
+    # Smart Routing owns the whole launch: it routes before anything is
+    # created, then execs a native TUI wrapper. Handle it here, before the
+    # default-agent / first-run resolution below can substitute an agent the
+    # routed launch would have to reject.
+    if smart_routing:
+        _smart_routing_cfg = _load_effective_config()
+        _smart_routing_resume = _split_resume_value(resume)
+        _run_smart_routing(
+            target=target,
+            harness=harness if harness_from_cli else None,
+            prompt=prompt,
+            server=server if server_from_cli else _smart_routing_cfg.get("server"),
+            model=model if model_from_cli else None,
+            resume_conversation_id=_smart_routing_resume.conversation_id,
+            resume_picker=_smart_routing_resume.picker,
+            resume_latest=resume_latest,
+            auto_open_conversation=_resolve_auto_open_conversation_from_config(_smart_routing_cfg),
+            system_prompt=system_prompt,
+            tools=tools,
+            log=log,
+            debug_events=debug_events,
+            fork_session_id=fork_session_id,
+            ephemeral=ephemeral,
+        )
+        return
+
     acp_agent: AcpAgentEntry | None = None
     if from_openclaw is not None:
         if target is not None:
