@@ -223,7 +223,7 @@ function HandleMenu({
   return createPortal(
     <div
       data-table-handle-menu
-      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-md border border-border bg-popover py-1 shadow-md"
+      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-md border border-border bg-popover py-1 shadow-menu"
       style={{ top: anchorTop, left: anchorLeft }}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}

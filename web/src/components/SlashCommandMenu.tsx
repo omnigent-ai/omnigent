@@ -201,7 +201,7 @@ export function SlashCommandMenu({
 
   return (
     <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
-      <div className="w-64 shrink-0 overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
+      <div className="w-64 shrink-0 overflow-hidden rounded-xl border border-border bg-popover shadow-menu">
         <div ref={listRef} className="max-h-80 overflow-y-auto p-1">
           {builtinRows.length > 0 && sectionHeader("Commands")}
           {builtinRows.map((row) => (
@@ -229,7 +229,7 @@ export function SlashCommandMenu({
       {active && (
         <div
           data-testid="slash-menu-detail"
-          className="hidden max-h-80 w-80 shrink-0 overflow-y-auto rounded-xl border border-border bg-popover p-3 shadow-lg md:block"
+          className="hidden max-h-80 w-80 shrink-0 overflow-y-auto rounded-xl border border-border bg-popover p-3 shadow-menu md:block"
         >
           <p className="font-mono text-sm font-medium text-foreground">{active.name}</p>
           <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">

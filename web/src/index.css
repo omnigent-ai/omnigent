@@ -106,6 +106,18 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+  --shadow-composer: 0 0 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-composer-focus: 0 0 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-xs: 0 2px 8px rgb(var(--ui-shadow-neutral-rgb) / 0.04);
+  --shadow-sm: 0 4px 10px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.09);
+  --shadow-md: 0 6px 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-lg: 0 6px 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-menu: 0 8px 28px rgb(var(--ui-shadow-warm-rgb) / 0.12);
+  --shadow-xl: 0 12px 44px rgb(var(--ui-shadow-warm-rgb) / 0.16);
+  --shadow-card:
+    0 4px 16px -2px rgb(var(--ui-shadow-warm-rgb) / 0.1),
+    0 1px 0 rgb(var(--ui-shadow-neutral-rgb) / 0.02);
+  --shadow-tooltip: 0 3px 6px rgb(var(--ui-shadow-neutral-rgb) / 0.05);
 }
 
 /* The two body text steps. Keep these non-inline: `@theme inline` bakes the
@@ -140,6 +152,8 @@
   --desktop-ui-font-size: 13px;
   --icon-size-default: 14px;
   --icon-container-default: 16px;
+  --ui-shadow-neutral-rgb: 0 0 0;
+  --ui-shadow-warm-rgb: 60 40 10;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -297,6 +311,8 @@
 
 .dark {
   /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
+  --ui-shadow-neutral-rgb: 0 0 0;
+  --ui-shadow-warm-rgb: 0 0 0;
   --background: #0e1013;
   --foreground: oklch(0.965 0.003 240);
   --card: rgba(31, 39, 45, 0.6);

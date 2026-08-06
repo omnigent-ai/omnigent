@@ -330,6 +330,34 @@ describe("index.css body text tokens", () => {
   });
 });
 
+describe("index.css shadow tokens", () => {
+  const themeBlock = cssSource.match(/@theme inline \{[^}]*\}/)?.[0].replace(/\s+/g, " ");
+
+  it.each([
+    "--shadow-composer: 0 0 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-composer-focus: 0 0 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-xs: 0 2px 8px rgb(var(--ui-shadow-neutral-rgb) / 0.04)",
+    "--shadow-sm: 0 4px 10px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.09)",
+    "--shadow-md: 0 6px 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-lg: 0 6px 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12)",
+    "--shadow-menu: 0 8px 28px rgb(var(--ui-shadow-warm-rgb) / 0.12)",
+    "--shadow-xl: 0 12px 44px rgb(var(--ui-shadow-warm-rgb) / 0.16)",
+    "--shadow-card: 0 4px 16px -2px rgb(var(--ui-shadow-warm-rgb) / 0.1), 0 1px 0 rgb(var(--ui-shadow-neutral-rgb) / 0.02)",
+    "--shadow-tooltip: 0 3px 6px rgb(var(--ui-shadow-neutral-rgb) / 0.05)",
+  ])("defines %s", (token) => {
+    expect(themeBlock).toContain(token);
+  });
+
+  it("uses the specified light colors and black dark-mode counterparts", () => {
+    expect(cssSource).toMatch(
+      /:root \{[^}]*--ui-shadow-neutral-rgb: 0 0 0;[^}]*--ui-shadow-warm-rgb: 60 40 10;/s,
+    );
+    expect(cssSource).toMatch(
+      /\.dark \{[^}]*--ui-shadow-neutral-rgb: 0 0 0;[^}]*--ui-shadow-warm-rgb: 0 0 0;/s,
+    );
+  });
+});
+
 /* Regression test for the "mobile sidebar is see-through" bug.
  *
  * Below md the sidebar is a full-screen overlay on top of the chat. The

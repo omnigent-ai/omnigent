@@ -384,7 +384,7 @@ export function TurnRail({
           // inside the narrow w-6 rail column, so without a set width it
           // shrink-wraps to a few words per line. w-80 lets it fill out and
           // preview more content; max-w caps it on small viewports.
-          "pointer-events-none absolute left-7 w-80 max-w-[calc(100vw-4rem)] -translate-y-1/2 rounded-xl border border-border/60 bg-background px-3 py-2 shadow-md transition-[opacity,top] duration-150",
+          "pointer-events-none absolute left-7 w-80 max-w-[calc(100vw-4rem)] -translate-y-1/2 rounded-xl border border-border/60 bg-background px-3 py-2 shadow-tooltip transition-[opacity,top] duration-150",
           hovered ? "opacity-100" : "opacity-0",
         )}
       >

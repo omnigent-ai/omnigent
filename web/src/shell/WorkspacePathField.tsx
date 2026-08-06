@@ -292,7 +292,7 @@ export function WorkspacePathField({
           // clipped by the dialog's scrollable body, and a body
           // portal can't be clicked through Radix's modal layer.
           // Inline content just scrolls with the form instead.
-          className="mt-1 max-h-72 overflow-y-auto rounded-md border border-border bg-popover shadow-md"
+          className="mt-1 max-h-72 overflow-y-auto rounded-md border border-border bg-popover shadow-menu"
           data-testid="workspace-path-dropdown"
         >
           {filteredRecent.length > 0 && (
