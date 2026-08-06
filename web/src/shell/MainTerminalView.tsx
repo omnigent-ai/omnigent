@@ -139,7 +139,7 @@ export function MainTerminalView({
             {isShellView && activeTerminal && (
               // Shell header — identity + close, nothing else.
               <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-2 pt-1 pb-2">
-                <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-xs">
+                <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-sm">
                   <TerminalIcon className="size-3 shrink-0" />
                   <span className="max-w-[8rem] truncate">{activeTerminal.name}</span>
                   <span className="shrink-0 text-muted-foreground/60">

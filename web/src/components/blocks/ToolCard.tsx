@@ -244,7 +244,7 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
     <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
         <span>{label}</span>
       </CollapsibleTrigger>
@@ -318,7 +318,7 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
+      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground"
     >
       <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
       <span className="min-w-0 flex-1 truncate">
@@ -438,7 +438,7 @@ function OutputSection({ output }: { output: string }) {
         )}
       </div>
       {canExpand && (
-        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-sm sm:flex-row sm:items-center sm:justify-between">
           <span className="min-w-0">
             {isExpanded ? "Showing full output" : "Previewing output"} (
             {formatOutputStats(isExpanded ? preview : collapsedPreview)})

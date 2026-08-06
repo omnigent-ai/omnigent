@@ -1,6 +1,7 @@
 project-includes = [
     "omnigent/**/*.py",
     "omnigent/**/*.pyi",
+    "sdks/python-client/**/*.py",
 ]
 
 project-excludes = []

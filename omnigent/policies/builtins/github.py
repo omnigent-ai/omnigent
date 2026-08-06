@@ -76,6 +76,7 @@ from typing import Any
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
+    is_unresolved_invocation,
     real_invocation_tokens,
     split_command_segments,
     unwrap_shell_command,
@@ -873,18 +874,29 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         leave it 0.
     :returns: One :class:`_ShellOp` per git/gh remote invocation found. Local
         git commands and non-git/gh segments produce no op. A segment that
-        starts with git/gh but cannot be tokenized yields an ``"unparseable"``
-        op so the caller can ASK rather than silently allow.
+        mentions git/gh but whose real command cannot be resolved — it does not
+        tokenize, or a wrapper's own flags left an option as the head — yields
+        an ``"unparseable"`` op so the caller can ASK rather than silently allow.
     """
     if _depth > MAX_SHELL_NESTING:
         return []
     ops: list[_ShellOp] = []
     for segment in split_command_segments(command):
+        unreadable = False
         try:
             tokens = shlex.split(segment)
         except ValueError:
             # Unbalanced quotes etc. If it looks like a git/gh command we can't
             # read, surface it for approval instead of guessing.
+            unreadable = True
+            tokens = []
+        else:
+            tokens = real_invocation_tokens(tokens)
+            # A leading option means some wrapper's own flags were not modelled,
+            # so the real command was never reached. Same fail-safe as an
+            # un-tokenizable segment rather than a silent abstain.
+            unreadable = is_unresolved_invocation(tokens)
+        if unreadable:
             if re.search(r"\b(git|gh)\b", segment):
                 ops.append(
                     _ShellOp(
@@ -896,7 +908,6 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
                     )
                 )
             continue
-        tokens = real_invocation_tokens(tokens)
         if not tokens:
             continue
         # Unwrap shell-interpreter (``bash -c "<cmd>"``) and ``eval`` wrappers so

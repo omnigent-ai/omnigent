@@ -160,7 +160,7 @@ export function LoginPage() {
               disabled={submitting}
               required
             />
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               On a fresh install your username is your machine login (the output of{" "}
               <code className="font-mono">whoami</code>), unless an admin set a different one.
             </p>
@@ -195,7 +195,7 @@ export function LoginPage() {
           </Button>
         </form>
 
-        <p className="text-center text-xs text-muted-foreground">
+        <p className="text-center text-sm text-muted-foreground">
           On a fresh install you set the first admin's password yourself — no credential is
           auto-generated. A brand-new instance shows a Create-admin form instead of this one; the
           password can also be pre-seeded with{" "}

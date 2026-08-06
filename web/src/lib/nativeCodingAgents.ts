@@ -27,6 +27,12 @@ export interface NativeCodingAgentSpec {
   iconKind: NativeCodingAgentIconKind;
   sortRank: number;
   capabilities?: readonly NativeCodingAgentCapability[];
+  /**
+   * A fully supported harness — the integration we maintain and test end to
+   * end. Only these lead the picker's primary list; every other harness folds
+   * into the "More" group regardless of whether it is configured on the host.
+   */
+  fullySupported?: boolean;
 }
 
 export const NATIVE_CODING_AGENTS = [
@@ -39,6 +45,7 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "claude",
     sortRank: 10,
     capabilities: ["permissionMode"],
+    fullySupported: true,
   },
   {
     key: "codex",
@@ -49,6 +56,7 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "codex",
     sortRank: 20,
     capabilities: ["approvalMode"],
+    fullySupported: true,
   },
   {
     key: "opencode",
@@ -213,6 +221,31 @@ export function isNativeCodingAgent(
   agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
 ): boolean {
   return nativeCodingAgentForAvailableAgent(agent) !== undefined;
+}
+
+/**
+ * Whether a harness is fully supported — the maintained, end-to-end tested
+ * integrations that lead the picker. Everything else (including non-native
+ * agents) belongs in the "More" group regardless of host readiness.
+ */
+export function isFullySupportedNativeCodingAgent(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+): boolean {
+  return nativeCodingAgentForAvailableAgent(agent)?.fullySupported === true;
+}
+
+/**
+ * Whether ``agent``'s harness is one of ``recentHarnesses``. Compares resolved
+ * specs rather than raw strings so a stored reversed alias (``native-pi``) still
+ * matches the canonical spelling (``pi-native``).
+ */
+export function isRecentHarness(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+  recentHarnesses: readonly string[],
+): boolean {
+  const spec = nativeCodingAgentForAvailableAgent(agent);
+  if (spec === undefined) return false;
+  return recentHarnesses.some((h) => nativeCodingAgentForHarness(h)?.key === spec.key);
 }
 
 export function isNativeWrapper(wrapper: string | null | undefined): boolean {

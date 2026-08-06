@@ -78,7 +78,11 @@ export function ModelEffortFields({
           <SelectTrigger id="task-model" data-testid="task-model-trigger" className="w-full">
             <SelectValue />
           </SelectTrigger>
-          <SelectContent position="popper" align="start">
+          <SelectContent
+            position="popper"
+            align="start"
+            className="w-(--radix-select-trigger-width)"
+          >
             <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
             {modelOptions.map((m) => (
               <SelectItem key={m.id} value={m.id}>
@@ -99,7 +103,11 @@ export function ModelEffortFields({
           <SelectTrigger id="task-effort" data-testid="task-effort-trigger" className="w-full">
             <SelectValue />
           </SelectTrigger>
-          <SelectContent position="popper" align="start">
+          <SelectContent
+            position="popper"
+            align="start"
+            className="w-(--radix-select-trigger-width)"
+          >
             <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
             {CLAUDE_NATIVE_EFFORTS.map((e) => (
               <SelectItem key={e.value} value={e.value}>

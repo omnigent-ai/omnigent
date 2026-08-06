@@ -250,7 +250,7 @@ export function ChatHeader({
                   <span className="truncate text-ui font-semibold text-foreground">
                     {boundAgent.name}
                   </span>
-                  <span className="text-xs text-muted-foreground">Sub-agent</span>
+                  <span className="text-sm text-muted-foreground">Sub-agent</span>
                 </div>
               ) : (
                 <span className="text-ui font-semibold text-foreground">Sub-agent</span>
@@ -260,7 +260,7 @@ export function ChatHeader({
         )}
       </div>
 
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-2">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -337,7 +337,7 @@ export function ChatHeader({
                   title={shareDisabledReason}
                   // share-button-glassy (index.css) paints the pink gradient,
                   // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white"
+                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white"
                 >
                   <span className="flex size-4 shrink-0 items-center justify-center">
                     <UserPlusIcon />
@@ -355,7 +355,7 @@ export function ChatHeader({
             onClick={onShare}
             // share-button-glassy (index.css) paints the pink gradient,
             // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white md:inline-flex"
+            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white md:inline-flex"
           >
             <span className="flex size-4 shrink-0 items-center justify-center">
               <UserPlusIcon />
@@ -369,10 +369,10 @@ export function ChatHeader({
               <Button
                 type="button"
                 variant="ghost"
-                size="icon"
+                size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
                 onClick={onToggleRightPanel}
-                className="hidden md:inline-flex text-muted-foreground hover:text-foreground"
+                className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
               >
                 {rightPanelOpen ? (
                   <PanelRightCloseIcon className="size-4" />

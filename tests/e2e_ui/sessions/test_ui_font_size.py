@@ -32,7 +32,7 @@ def _desktop_ui_font_size(page: Page) -> str:
 
 
 def _stored_size(page: Page) -> str | None:
-    """The persisted font-size preference, or None when unset (default 16)."""
+    """The persisted font-size preference, or None when unset (default 13)."""
     return page.evaluate(f"() => window.localStorage.getItem('{STORAGE_KEY}')")
 
 
@@ -45,7 +45,7 @@ def _open_appearance(page: Page, base_url: str) -> None:
 def test_ui_font_size_scales_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
     """Stepping the size updates the token + value live and survives a reload.
 
-    A fresh context has no stored preference → default 16px. Increasing the
+    A fresh context has no stored preference → default 13px. Increasing the
     size updates ``--desktop-ui-font-size`` and persists the px value; a page
     reload restores it (no reset, no flash back to the default).
     """
@@ -55,14 +55,14 @@ def test_ui_font_size_scales_and_persists(page: Page, seeded_session: tuple[str,
     value = page.get_by_test_id("ui-font-size-input")
     increase = page.get_by_test_id("ui-font-size-inc")
 
-    # Fresh context → default 16px token, nothing stored.
-    expect(value).to_have_value("16")
+    # Fresh context → default 13px token, nothing stored.
+    expect(value).to_have_value("13")
     assert _stored_size(page) is None, "expected no persisted size on a fresh load"
-    assert _desktop_ui_font_size(page) == "16px", "fresh load should apply the default size"
+    assert _desktop_ui_font_size(page) == "13px", "fresh load should apply the default size"
 
-    # → 18px: two steps up. The value, applied token, and storage all move.
-    increase.click()
-    increase.click()
+    # → 18px: five steps up. The value, applied token, and storage all move.
+    for _ in range(5):
+        increase.click()
     expect(value).to_have_value("18")
     assert _stored_size(page) == "18"
     assert _desktop_ui_font_size(page) == "18px", "font token did not track the stepped size"

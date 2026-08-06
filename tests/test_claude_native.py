@@ -26,6 +26,7 @@ from omnigent import claude_native
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
+from omnigent.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.spec import load_omnigent_yaml
 from omnigent.terminals.ws_bridge import (
@@ -316,6 +317,9 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
             "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
+            # The gateway allowlists beta flags and 400s the whole request on
+            # an unknown one, so the CLI's experimental betas stay off.
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         },
         api_key_helper="printf token",
         model="databricks-claude-opus-test",
@@ -571,17 +575,21 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     )
     calls: list[tuple[str, str]] = []
 
-    def _discover(host: str, token: str) -> dict[str, str]:
+    def _discover(host: str, token: str) -> DatabricksClaudeCatalog:
         calls.append((host, token))
         opus_version = "4-9" if len(calls) == 1 else "4-10"
-        return {
+        families = {
             "fable": "system.ai.claude-fable-5",
             "opus": f"system.ai.claude-opus-{opus_version}",
             "sonnet": "system.ai.claude-sonnet-5",
         }
+        return DatabricksClaudeCatalog(
+            families=families,
+            model_ids=(*families.values(), "system.ai.claude-sonnet-4-6"),
+        )
 
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
+        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
         _discover,
     )
 
@@ -694,6 +702,49 @@ def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
         model="claude-sonnet-5",
     )
     assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
+
+
+def test_launch_model_takes_the_custom_slot_when_no_alias_names_it() -> None:
+    """A routed older generation gets its own spelling for later ``/model``."""
+    from omnigent.claude_model_vocabulary import claude_model_command_arg
+
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+        },
+        model="databricks-claude-opus-5",
+    )
+
+    pinned = claude_native.claude_config_with_launch_model_pinned(
+        config, "databricks-claude-opus-4-8"
+    )
+
+    assert pinned is not None
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-8"
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Opus 4.8"
+    assert config.env.get("ANTHROPIC_CUSTOM_MODEL_OPTION") is None
+    assert (
+        claude_model_command_arg("databricks-claude-opus-4-8", pinned.env)
+        == "databricks-claude-opus-4-8"
+    )
+
+
+@pytest.mark.parametrize(
+    "launch_model",
+    ["opus", "databricks-claude-opus-5", None, ""],
+)
+def test_launch_model_needs_no_custom_slot_when_already_speakable(
+    launch_model: str | None,
+) -> None:
+    """Aliases and the pinned id resolve without the extra slot."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
+        model="databricks-claude-opus-5",
+    )
+
+    assert claude_native.claude_config_with_launch_model_pinned(config, launch_model) is config
+    assert claude_native.claude_config_with_launch_model_pinned(None, "x") is None
 
 
 def test_managed_settings_pin_keeps_alias_passthrough_on_a_gateway(
@@ -858,11 +909,14 @@ def test_ucode_config_retains_live_fable_when_opted_in(
         lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
     )
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
-        lambda host, token: {
-            "fable": "system.ai.claude-fable-5",
-            "opus": "system.ai.claude-opus-4-10",
-        },
+        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        lambda host, token: DatabricksClaudeCatalog(
+            families={
+                "fable": "system.ai.claude-fable-5",
+                "opus": "system.ai.claude-opus-4-10",
+            },
+            model_ids=("system.ai.claude-fable-5", "system.ai.claude-opus-4-10"),
+        ),
     )
 
     config = claude_native._ucode_config_for_profile("test-profile")
@@ -901,11 +955,11 @@ def test_ucode_config_uses_cached_models_when_live_refresh_fails(
         lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
     )
 
-    def _fail(host: str, token: str) -> dict[str, str]:
+    def _fail(host: str, token: str) -> DatabricksClaudeCatalog:
         raise httpx.ConnectError("offline")
 
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
+        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
         _fail,
     )
 
@@ -946,8 +1000,8 @@ def test_ucode_config_rejects_authoritative_empty_live_catalog(
         lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
     )
     monkeypatch.setattr(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
-        lambda host, token: {},
+        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        lambda host, token: DatabricksClaudeCatalog(families={}, model_ids=()),
     )
 
     with pytest.raises(click.ClickException, match="exposes no Claude model services"):
@@ -4947,7 +5001,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None: (
+        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
             tmp_path / (bridge_id or session_id)
         ),
     )
@@ -5060,7 +5114,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None: (
+        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
             tmp_path / (bridge_id or session_id)
         ),
     )
@@ -6675,10 +6729,15 @@ def test_resolve_native_claude_config_global_databricks_auth_uses_ucode(
         api_key_helper="databricks auth token",
         model="databricks-claude",
     )
-    seen: dict[str, str | None] = {}
+    seen: dict[str, str | bool | None] = {}
 
-    def _fake_ucode(profile: str | None) -> claude_native.ClaudeNativeUcodeConfig:
+    def _fake_ucode(
+        profile: str | None,
+        *,
+        refresh_models: bool = True,
+    ) -> claude_native.ClaudeNativeUcodeConfig:
         seen["profile"] = profile
+        seen["refresh_models"] = refresh_models
         return sentinel
 
     monkeypatch.setattr(claude_native, "_ucode_config_for_profile", _fake_ucode)
@@ -6687,6 +6746,8 @@ def test_resolve_native_claude_config_global_databricks_auth_uses_ucode(
     assert cfg is sentinel
     # The global auth block's profile was threaded to the ucode path.
     assert seen["profile"] == "oss"
+    # Launch resolution keeps refreshing the model catalog by default.
+    assert seen["refresh_models"] is True
 
 
 def test_resolve_native_claude_config_databricks_provider_uses_ucode(
@@ -6701,7 +6762,7 @@ def test_resolve_native_claude_config_databricks_provider_uses_ucode(
     monkeypatch.setattr(
         claude_native,
         "_ucode_config_for_profile",
-        lambda profile: seen.setdefault("profile", profile),
+        lambda profile, *, refresh_models=True: seen.setdefault("profile", profile),
     )
 
     claude_native.resolve_native_claude_config(spec=_no_auth_claude_spec())
@@ -7169,3 +7230,48 @@ def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
     )
     assert len(records) == 1
     assert json.loads(records[0]["toolUseResult"]) == output
+
+
+def test_routed_arms_repoint_the_family_aliases() -> None:
+    """A routing-enabled launch spells the frozen arms, not just the newest models."""
+    from omnigent.claude_model_vocabulary import claude_model_command_arg
+    from omnigent.server.smart_routing import task_v1_claude_arms
+
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
+        },
+        model="databricks-claude-opus-5",
+        routable_models=(
+            "databricks-claude-opus-5",
+            "databricks-claude-opus-4-8",
+            "databricks-claude-sonnet-5",
+            "databricks-claude-haiku-4-5",
+        ),
+    )
+
+    pinned = claude_native.claude_config_with_routed_arms_pinned(config, task_v1_claude_arms())
+
+    assert pinned is not None
+    assert pinned.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-8"
+    assert pinned.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-5"
+    # Untouched: haiku is not an arm, so it keeps the newest haiku.
+    assert pinned.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "databricks-claude-haiku-4-5"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-5"
+    assert claude_model_command_arg("databricks-claude-opus-4-8", pinned.env) == "opus"
+
+
+def test_routed_arms_keep_the_existing_pin_when_no_spelling_is_servable() -> None:
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
+        model="databricks-claude-opus-5",
+        routable_models=("databricks-claude-opus-5",),
+    )
+
+    assert claude_native.claude_config_with_routed_arms_pinned(config, ("claude-opus-4-8",)) is (
+        config
+    )
+    assert claude_native.claude_config_with_routed_arms_pinned(None, ("claude-opus-4-8",)) is None
+    assert claude_native.claude_config_with_routed_arms_pinned(config, ()) is config

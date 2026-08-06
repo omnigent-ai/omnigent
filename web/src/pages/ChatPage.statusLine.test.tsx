@@ -319,20 +319,30 @@ describe("Composer status line (branch + context ring)", () => {
   });
 
   it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
-    // host_offline surfaces the reconnect affordance in the host badge (in
-    // place of the old banner below the composer): the tray shows even with
-    // no branch/ring, and clicking the badge opens the reconnect help.
+    // An offline host surfaces the reconnect affordance in the host badge (in
+    // place of the old banner below the composer) while keeping the host name:
+    // the tray shows even with no branch/ring, and clicking opens the help.
     bindHost("mac-laptop");
     useSessionHostOnlineMock.mockReturnValue(false);
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
     const onShowReconnectHelp = vi.fn();
-    renderComposer({ hostOffline: true, onShowReconnectHelp });
+    renderComposer({ onShowReconnectHelp });
 
     expect(statusLine()).not.toBeNull();
     const badge = screen.getByTestId("host-badge");
     expect(badge.tagName).toBe("BUTTON");
-    expect(badge).toHaveTextContent(/Host is offline/);
+    expect(badge).toHaveTextContent("mac-laptop");
     badge.click();
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the tray hidden for a session with no host and nothing else to show", () => {
+    // onShowReconnectHelp is now passed for every session, so it must not
+    // resurrect an empty tray on a session with no host badge to hang it on.
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer({ onShowReconnectHelp: vi.fn() });
+
+    expect(statusLine()).toBeNull();
   });
 
   it("hides the host badge on a sub-agent session", () => {

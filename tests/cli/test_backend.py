@@ -1185,6 +1185,85 @@ def test_host_stop_daemon_only_skips_session_stop(
     assert terminated == ["https://server.example.com"]
 
 
+def test_host_stop_session_list_timeout_points_at_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session-list timeout names the flags that stop the daemon anyway.
+
+    ``GET /v1/sessions`` is one of the slowest managed APIs, so the
+    pre-check times out on healthy hosts. The failure has to name the
+    escape hatch or the daemon looks unstoppable.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated despite the failure"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "ReadTimeout" in result.output
+    assert "--force" in result.output
+    assert "--daemon-only" in result.output
+
+
+def test_host_stop_force_terminates_after_session_list_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--force`` stops the daemon when the session pre-check times out."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["https://server.example.com"]
+    assert "sessions_stopped=0" in result.output
+
+
 def test_host_stop_session_stops_only_named_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

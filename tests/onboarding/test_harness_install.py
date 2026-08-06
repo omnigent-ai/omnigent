@@ -1190,6 +1190,30 @@ def test_harness_cli_installed_checks_minimum_for_other_versioned_specs(
     assert hi.harness_cli_installed(key) is False
 
 
+def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0.139.0 must read as installed, not ``version-too-low``.
+
+    A too-low codex makes ``harness_is_configured`` false, and the host then
+    refuses EVERY codex launch — plain sessions included — with a misleading
+    "run omni setup". Smart Routing's spawn hook wants 0.145.0, but that is
+    enforced where the hook is registered, so an older CLI loses only the
+    spawn gate.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="codex-cli 0.139.0\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
+
+
 def test_harness_cli_installed_true_when_version_in_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

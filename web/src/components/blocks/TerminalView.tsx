@@ -434,7 +434,7 @@ function StatusOverlay({
             </Button>
           )}
           {resumeError && (
-            <span className="basis-full text-center text-xs text-destructive">{resumeError}</span>
+            <span className="basis-full text-center text-sm text-destructive">{resumeError}</span>
           )}
         </div>
       )}

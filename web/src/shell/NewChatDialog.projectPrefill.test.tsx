@@ -271,6 +271,30 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.agent_id).toBe("ag_other");
   });
 
+  it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
+    const EDITED_REPO = "/Users/corey/projects/alpha-edited";
+    // First open reads the original config.
+    setProjectConfig({ host_id: "host_1", workspace: REPO });
+    const rerender = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    // User edits the project's defaults; the save seeds the fresh config into
+    // the cache, so a re-open of the SAME project (`?project=Alpha` unchanged)
+    // must pick up the new workspace rather than latch onto the settled seed.
+    setProjectConfig({ host_id: "host_1", workspace: EDITED_REPO });
+    rerender(<NewChatLandingScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "alpha-edited",
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(EDITED_REPO);
+  });
+
   it("does not seed an offline config host (falls back to the generic default)", async () => {
     vi.mocked(useHosts).mockReturnValue({
       data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],

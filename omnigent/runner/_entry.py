@@ -415,7 +415,20 @@ class _InitialAuthTokenFactory:
                     _proxy_bearer=self._last_initial_token,
                 )
                 self._fallback_resolved = True
+            # Managed mint failed because the proxy bearer is expired — the
+            # initial bearer was injected once and cannot self-renew. Skip
+            # managed mint entirely and go straight to SDK/OIDC.
+            if getattr(self._fallback_factory, "proxy_auth_failed", False):
+                self._fallback_factory = _make_auth_token_factory(
+                    self._server_url,
+                    _allow_initial_token=False,
+                    _allow_delegated_mint=False,
+                )
             if self._fallback_factory is None:
+                _logger.error(
+                    "host bootstrap bearer expired and no SDK/OIDC credential is available "
+                    "to renew it; run `databricks auth login` to re-authenticate"
+                )
                 return None
             return self._fallback_factory()
 
@@ -423,7 +436,8 @@ class _InitialAuthTokenFactory:
     def declined(self) -> bool:
         """True when the inner fallback factory has definitively declined."""
         with self._lock:
-            return getattr(self._fallback_factory, "declined", False)
+            f = self._fallback_factory
+            return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
 
     def invalidate(self) -> bool:
         """Discard the host bearer so the next call resolves local auth."""
@@ -680,7 +694,7 @@ def _make_managed_mint_factory(
         mint_url, server_url, binding_token, proxy_bearer=proxy_bearer
     )
     factory()
-    if factory.declined:
+    if factory.declined or factory.proxy_auth_failed:
         return None
     return factory
 
@@ -724,6 +738,10 @@ class _ManagedMintTokenFactory:
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
         self.declined = False
+        # Set when mint fails with 401/403 on the proxy bearer (not a server
+        # refusal). Unlike ``declined``, this means the caller should try
+        # another credential path (SDK/OIDC) rather than sending bare requests.
+        self.proxy_auth_failed = False
 
     def __call__(self) -> str | None:
         """Return a fresh owner JWT, or ``None``.
@@ -760,6 +778,14 @@ class _ManagedMintTokenFactory:
                     self.declined = True
                     return None
                 return self._still_valid_cached_token(now)
+            if response.status_code in (401, 403):
+                # The proxy bearer is expired or invalid. If we have never
+                # successfully minted, there is no self-sustaining refresh
+                # loop to fall back to — signal proxy_auth_failed so the
+                # caller can try SDK/OIDC instead of looping on a dead bearer.
+                if self._cached_token is None:
+                    self.proxy_auth_failed = True
+                    return None
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             # Transient mint failure: keep serving the cached token while

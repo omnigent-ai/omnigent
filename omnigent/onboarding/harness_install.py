@@ -99,7 +99,11 @@ KIRO_KEY = "kiro"
 #   before 2026-06-01. The first Claude Code release after the cutoff is
 #   2.1.161, so use that as the supported floor.
 # - codex: native policy hook requires >= 0.129.0, but that shipped before
-#   2026-06-01. The first Codex release after the cutoff is 0.137.0.
+#   2026-06-01. The first Codex release after the cutoff is 0.137.0. The
+#   subagent-router ``PreToolUse`` hook needs 0.145.0, but that is enforced
+#   where the hook is registered
+#   (``codex_native_app_server._CODEX_ROUTING_HOOK_MIN_VERSION``) so an older
+#   CLI loses only smart-routing spawn gating, not the ability to launch.
 # - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
 # - kimi: first ``kimi-cli`` release after 2026-06-01 is 1.47.0
@@ -169,7 +173,9 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
         # The native Codex policy hook requires ``codex >= 0.129.0``;
         # anything older silently disables tool-call enforcement. Setup
-        # enforces the same floor up-front.
+        # enforces the same floor up-front. Smart Routing's spawn hook wants
+        # 0.145.0, but it is gated at its own registration site so it degrades
+        # to "no spawn gate" instead of blocking every codex launch.
         min_version=_CODEX_MIN_VERSION,
     ),
     PI_KEY: HarnessInstallSpec(
@@ -868,7 +874,7 @@ def _harness_cli_version_string(
     """Return the parsed, normalized version string from *binary* ``--version``.
 
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
-        ``6.0`` on the readiness path.
+        :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
     try:
         completed = subprocess.run(

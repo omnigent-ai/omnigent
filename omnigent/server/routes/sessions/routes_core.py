@@ -109,6 +109,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
@@ -137,9 +138,11 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_from_cache,
     _set_read_state,
+    _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
+    _validated_subagent_routing_override,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -420,6 +423,8 @@ def register_core_routes(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    agent_store=agent_store,
+                    agent_id=conv.agent_id if conv is not None else None,
                 )
             )
             _managed_launch_tasks.add(launch_task)
@@ -633,7 +638,7 @@ def register_core_routes(
             # First-class first so its id wins when a name exists in both.
             by_name: dict[str, SessionProjectSummary] = {}
             if project_store is not None:
-                for proj in project_store.list(owner_user_id=user_id):
+                for proj in project_store.list(user_id=user_id):
                     by_name[proj.name] = SessionProjectSummary(id=proj.id, name=proj.name)
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in conversation_store.list_projects(owned_by=user_id):
@@ -1645,6 +1650,17 @@ def register_core_routes(
             body.cost_control_mode_override
         )
 
+        # Same presence-is-the-clear-signal rule for the subagent-routing
+        # switch: an explicit null returns the session to inheriting its
+        # main routing state.
+        clear_subagent_routing = (
+            "subagent_routing_override" in body.model_fields_set
+            and body.subagent_routing_override is None
+        )
+        subagent_routing_override = _validated_subagent_routing_override(
+            body.subagent_routing_override
+        )
+
         # Native-terminal pass-through args: ``None`` leaves them
         # unchanged; a provided list (including ``[]``) replaces the
         # stored value wholesale (resume is last-write-wins, never an
@@ -1750,6 +1766,10 @@ def register_core_routes(
             _unset_model_override=clear_model,
             cost_control_mode_override=None if clear_cost_control else cost_control_mode_override,
             _unset_cost_control_mode_override=clear_cost_control,
+            subagent_routing_override=(
+                None if clear_subagent_routing else subagent_routing_override
+            ),
+            _unset_subagent_routing_override=clear_subagent_routing,
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
@@ -1792,12 +1812,19 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 {"type": "effort_change", "effort": updated.reasoning_effort},
+                # Same TUI injection budget as the model change below: the
+                # ``/effort`` confirm dialog can render seconds after the
+                # command.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
         if live_forward and (model_override is not None or clear_model):
-            await _forward_session_change_to_runner(
+            _model_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {"type": "model_change", "model": updated.model_override},
+                # The runner answers this by typing ``/model`` into the pane and
+                # confirming the dialog, which outlasts the default budget.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -1805,7 +1832,17 @@ def register_core_routes(
             # polly/debby also carry) — see _persist_model_change_note for the
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
-            if not _is_native_terminal_session(updated):
+            if _is_native_terminal_session(updated):
+                # The injection is the only thing that moves a LIVE native
+                # pane's model, so a forward its runner refused must not pass as
+                # applied. A stopped session reaches no runner and stays quiet —
+                # its relaunch reads the override off the row.
+                _surface_model_change_forward_failure(
+                    session_id,
+                    updated.model_override,
+                    _model_forward,
+                )
+            else:
                 await _persist_model_change_note(
                     session_id,
                     updated.model_override,
@@ -1839,6 +1876,17 @@ def register_core_routes(
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        # Archiving means "get this out of my way", which contradicts a pin
+        # ("keep it at the top"), so drop the archiver's own pin — otherwise the
+        # session lingers as a pinned row if later unarchived. Runs after the
+        # label upsert so a same-request {archived, pin} can't re-add the pin,
+        # and after _spawn_archive_stop so a raise here can't leave the session
+        # archived-but-not-stopped. Per-user key only; delete_label no-ops when
+        # the session wasn't pinned.
+        if body.archived is True:
+            await asyncio.to_thread(
+                conversation_store.delete_label, session_id, pinned_label_key(user_id)
+            )
         if requested_codex_collaboration_mode is not None:
             _publish_collaboration_mode(
                 session_id,
@@ -1893,7 +1941,7 @@ def register_core_routes(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, owner_user_id=user_id
+                    project_store.get, target_project_id, user_id=user_id
                 )
                 if owned is None:
                     raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
@@ -2092,9 +2140,7 @@ def register_core_routes(
         # unfiled (a foreign project id would show in no folder view).
         fork_project_id = None
         if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(
-                project_store.get, source.project_id, owner_user_id=user_id
-            )
+            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
             if owned is not None:
                 fork_project_id = source.project_id
 

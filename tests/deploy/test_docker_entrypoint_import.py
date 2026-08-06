@@ -153,3 +153,35 @@ def test_select_artifact_store(
         port=8000,
     )
     assert isinstance(_select_artifact_store(resolved), expected_type)
+
+
+# ── routing wiring ────────────────────────────────────────────────────────
+# A Docker deploy must honour its own `routing:` block rather than running on
+# all-default knobs, so the settings that reach RuntimeCaps are the parsed ones.
+
+
+def test_build_routing_carries_the_configured_settings() -> None:
+    from deploy.docker.entrypoint import _build_routing
+
+    cfg = {
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/ai-gateway/routing/v1",
+            "router_name": "task_v1",
+            "model_prefix": ["databricks-", "system.ai."],
+        }
+    }
+    client, settings = _build_routing(cfg, None)
+
+    assert settings.model_prefixes == ("databricks-", "system.ai.")
+    assert client is not None
+    assert client._model_prefixes == ["databricks-", "system.ai."]
+
+
+def test_build_routing_defaults_without_a_routing_block() -> None:
+    from deploy.docker.entrypoint import _build_routing
+    from omnigent.server.smart_routing import RoutingSettings
+
+    client, settings = _build_routing({}, None)
+    assert client is None
+    assert settings == RoutingSettings()
