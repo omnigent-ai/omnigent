@@ -36,9 +36,8 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-import tomllib
-
 from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
+from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
 
@@ -54,15 +53,6 @@ KEY_KIND: DetectedKind = "key"
 SUBSCRIPTION_KIND: DetectedKind = "subscription"
 LOCAL_KIND: DetectedKind = "local"
 CLI_CONFIG_KIND: DetectedKind = "cli-config"
-
-# Codex's built-in model provider ids (openai/codex,
-# ``codex-rs/model-provider-info/src/lib.rs``). A ``model_provider`` set to
-# one of these is not a *custom* provider: ``openai`` is the subscription /
-# API-key path (covered by the auth.json detection), ``ollama`` / ``lmstudio``
-# are local servers (ollama is covered by the TCP-probe detection), and
-# ``amazon-bedrock`` resolves auth from the AWS environment — none of them is
-# a config-defined credential this detection should adopt.
-_CODEX_BUILTIN_PROVIDERS = frozenset({"openai", "amazon-bedrock", "ollama", "lmstudio"})
 
 # Ollama's default OpenAI-compatible endpoint.
 _OLLAMA_HOST = "localhost"
@@ -255,92 +245,6 @@ class CodexConfigProvider:
     display_name: str
 
 
-def _provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:
-    """Return whether a Codex ``[model_providers.X]`` table carries its own auth.
-
-    "Self-contained" means the Codex CLI can authenticate against the
-    provider from the config table alone — no ``auth.json`` login and no
-    environment variable that omnigents would have to thread into the codex
-    subprocess. Mirrors Codex's own provider auth fields (``openai/codex``,
-    ``codex-rs/model-provider-info/src/lib.rs``):
-
-    - ``[X.auth]`` — a token-printing command (``command`` + ``args``), the
-      shape ``isaac configure codex`` writes (``jq`` reading a cached
-      Databricks Model Serving token);
-    - ``experimental_bearer_token`` — an inline static bearer token;
-    - ``[X.aws]`` — AWS SigV4 request signing (Bedrock-style);
-    - ``http_headers`` containing an ``Authorization`` header — a static
-      auth header.
-
-    Deliberately **excluded** (each with a reason):
-
-    - ``env_key`` / ``env_http_headers`` — auth via an environment
-      variable. The codex executor launches the CLI with a scrubbed
-      environment (``_clean_codex_env``), so an arbitrary env var would not
-      reach the subprocess and the provider would 401 at run time despite
-      detecting as "configured". Supporting these needs an env-passthrough
-      design first.
-    - ``requires_openai_auth = true`` — the provider rides the ChatGPT
-      login, which is exactly the ``auth.json`` subscription detection's
-      territory (checked separately by the caller).
-
-    :param table: The raw ``[model_providers.X]`` mapping parsed from
-        ``config.toml``, e.g. ``{"name": "Databricks AI Gateway",
-        "base_url": "...", "auth": {"command": "jq", ...}}``.
-    :returns: ``True`` when the table carries self-contained auth.
-    """
-    auth = table.get("auth")
-    if isinstance(auth, dict):
-        command = auth.get("command")
-        if isinstance(command, str) and command.strip():
-            return True
-    bearer = table.get("experimental_bearer_token")
-    if isinstance(bearer, str) and bearer.strip():
-        return True
-    if isinstance(table.get("aws"), dict):
-        return True
-    headers = table.get("http_headers")
-    if isinstance(headers, dict):
-        for key, value in headers.items():
-            if (
-                isinstance(key, str)
-                and key.lower() == "authorization"
-                and isinstance(value, str)
-                and value.strip()
-            ):
-                return True
-    return False
-
-
-def _effective_codex_model_provider(config: dict[str, object]) -> str | None:
-    """Resolve the effective default ``model_provider`` id from a Codex config.
-
-    Mirrors Codex's own profile-merge resolution (``openai/codex``,
-    ``codex-rs/core/src/config``): the active profile's ``model_provider``
-    (top-level ``profile = "name"`` selecting ``[profiles.name]``) wins over
-    the top-level ``model_provider``.
-
-    :param config: The parsed ``config.toml`` mapping, e.g.
-        ``{"model_provider": "Databricks", "model_providers": {...}}``.
-    :returns: The effective provider id, e.g. ``"Databricks"``, or ``None``
-        when neither the active profile nor the top level sets one (Codex
-        then defaults to the built-in ``openai`` provider).
-    """
-    provider_id: object = config.get("model_provider")
-    active_profile = config.get("profile")
-    if isinstance(active_profile, str) and active_profile.strip():
-        profiles = config.get("profiles")
-        if isinstance(profiles, dict):
-            profile_table = profiles.get(active_profile)
-            if isinstance(profile_table, dict) and isinstance(
-                profile_table.get("model_provider"), str
-            ):
-                provider_id = profile_table["model_provider"]
-    if isinstance(provider_id, str) and provider_id.strip():
-        return provider_id
-    return None
-
-
 def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | None:
     """Detect a custom, auth-carrying default model provider in a Codex config.
 
@@ -353,7 +257,8 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
 
     A config counts when its **effective default provider** is a custom
     (non-built-in) ``[model_providers.X]`` table with self-contained auth
-    (see :func:`_provider_table_has_self_contained_auth`). The effective
+    (see :func:`codex_auth_readiness.provider_table_has_self_contained_auth`).
+    The effective
     provider mirrors Codex's own resolution (``openai/codex``,
     ``codex-rs/core/src/config``): the active profile's ``model_provider``
     (top-level ``profile = "name"`` selecting ``[profiles.name]``) wins
@@ -371,19 +276,13 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
         malformed, the effective provider is built-in or unset, its table
         is absent, or the table carries no self-contained auth.
     """
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        # Missing or unreadable file — nothing configured.
-        return None
-    try:
-        config = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
-        # Malformed TOML — treat as not configured rather than crash setup.
+    config = codex_auth_readiness.load_codex_config(config_path)
+    if config is None:
+        # Missing, unreadable, or malformed — treat as not configured.
         return None
 
-    provider_id = _effective_codex_model_provider(config)
-    if provider_id is None or provider_id in _CODEX_BUILTIN_PROVIDERS:
+    provider_id = codex_auth_readiness.effective_codex_model_provider(config)
+    if provider_id is None or provider_id in codex_auth_readiness.CODEX_BUILTIN_PROVIDERS:
         return None
 
     providers = config.get("model_providers")
@@ -398,7 +297,7 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
         # Rides the ChatGPT login — the auth.json subscription detection's
         # territory, not a config-defined credential.
         return None
-    if not _provider_table_has_self_contained_auth(table):
+    if not codex_auth_readiness.provider_table_has_self_contained_auth(table):
         return None
 
     name = table.get("name")
@@ -452,13 +351,8 @@ def codex_config_provider_transport(
         missing / malformed, the table is absent, or it declares no
         ``base_url``.
     """
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        return None
-    try:
-        config = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+    config = codex_auth_readiness.load_codex_config(config_path)
+    if config is None:
         return None
 
     providers = config.get("model_providers")
