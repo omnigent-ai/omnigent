@@ -1874,6 +1874,17 @@ def register_core_routes(
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        # Archiving means "get this out of my way", which contradicts a pin
+        # ("keep it at the top"), so drop the archiver's own pin — otherwise the
+        # session lingers as a pinned row if later unarchived. Runs after the
+        # label upsert so a same-request {archived, pin} can't re-add the pin,
+        # and after _spawn_archive_stop so a raise here can't leave the session
+        # archived-but-not-stopped. Per-user key only; delete_label no-ops when
+        # the session wasn't pinned.
+        if body.archived is True:
+            await asyncio.to_thread(
+                conversation_store.delete_label, session_id, pinned_label_key(user_id)
+            )
         if requested_codex_collaboration_mode is not None:
             _publish_collaboration_mode(
                 session_id,
