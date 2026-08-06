@@ -780,6 +780,11 @@ def _host_env_keep(args: argparse.Namespace) -> set[str]:
 # less than this remaining rather than 401 partway through.
 _MIN_TOKEN_RUNWAY_S = 10 * 60
 
+# When --profile-token-auth is used, the bearer token is stored here instead
+# of os.environ so it's only passed to subprocesses that need it (the
+# `databricks` CLI and the SDK), not to build.sh / uv / git / etc.
+_TOKEN_AUTH: dict[str, str] = {}
+
 
 def _setup_profile_token_auth(profile: str) -> None:
     """Switch to bearer auth using the profile's cached OAuth token.
@@ -797,9 +802,9 @@ def _setup_profile_token_auth(profile: str) -> None:
     auth env`` echoes an ambient host back instead of the profile's, which
     would pin the wrong workspace for every later CLI/SDK call.
 
-    The captured token is NOT refreshed for the rest of the deploy, so this
-    fails fast when its remaining runway (``_MIN_TOKEN_RUNWAY_S``) can't cover
-    a full deploy — re-run ``databricks auth login --profile <p>`` first.
+    The token is stored in ``_TOKEN_AUTH`` (not ``os.environ``) so it's only
+    passed to subprocesses that need it (the ``databricks`` CLI and the SDK),
+    not to ``build.sh`` / ``uv`` / ``git`` etc.
     """
     for name in ("DATABRICKS_HOST", "DATABRICKS_TOKEN"):
         if os.environ.pop(name, None) is not None:
@@ -823,8 +828,12 @@ def _setup_profile_token_auth(profile: str) -> None:
     host_url = json.loads(host).get("env", {}).get("DATABRICKS_HOST", "")
     if not host_url:
         raise SystemExit(f"could not resolve DATABRICKS_HOST for profile {profile!r}")
+    # DATABRICKS_HOST stays in os.environ (it's a hostname, not a secret) so the
+    # SDK and CLI resolve the right workspace. The token is kept out of
+    # os.environ and injected only into subprocesses that need it.
     os.environ["DATABRICKS_HOST"] = host_url
-    os.environ["DATABRICKS_TOKEN"] = token
+    _TOKEN_AUTH["DATABRICKS_HOST"] = host_url
+    _TOKEN_AUTH["DATABRICKS_TOKEN"] = token
     _log(f"--profile-token-auth: using cached bearer token for {profile} ({host_url})")
 
 
@@ -857,13 +866,18 @@ def _assert_token_runway(expiry: str | None, profile: str) -> None:
 def _workspace_client(args: argparse.Namespace) -> WorkspaceClient:
     """Construct the SDK client, honoring --profile-token-auth.
 
-    With token auth, DATABRICKS_HOST + DATABRICKS_TOKEN are already in the
-    env, so a bare client uses bearer auth and skips the profile refresh.
+    With token auth, the host is in the env and the token is in
+    ``_TOKEN_AUTH``; pass it explicitly so the SDK uses bearer auth
+    and skips the profile refresh, without leaking the token to
+    unrelated subprocesses.
     """
     from databricks.sdk import WorkspaceClient as _WorkspaceClient
 
     if getattr(args, "profile_token_auth", False):
-        return _WorkspaceClient()
+        return _WorkspaceClient(
+            host=_TOKEN_AUTH["DATABRICKS_HOST"],
+            token=_TOKEN_AUTH["DATABRICKS_TOKEN"],
+        )
     return _WorkspaceClient(profile=args.profile) if args.profile else _WorkspaceClient()
 
 
@@ -908,6 +922,7 @@ def _ensure_bound(args: argparse.Namespace) -> None:
             *_bundle_vars(args),
         ],
         cwd=_deploy_dir(),
+        env=_token_env(args),
         capture_output=True,
         text=True,
     )
@@ -971,9 +986,23 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def _token_env(args: argparse.Namespace) -> dict[str, str] | None:
+    """Return an env dict with DATABRICKS_TOKEN for `databricks` CLI calls.
+
+    With --profile-token-auth the token lives in ``_TOKEN_AUTH`` (not
+    os.environ) to avoid leaking it to build.sh / uv / git. This helper
+    builds the env for the CLI subprocesses that do need it.
+    """
+    if getattr(args, "profile_token_auth", False):
+        env = os.environ.copy()
+        env["DATABRICKS_TOKEN"] = _TOKEN_AUTH["DATABRICKS_TOKEN"]
+        return env
+    return None
+
+
 def _profile_arg(args: argparse.Namespace) -> list[str]:
     # With --profile-token-auth the CLI authenticates via DATABRICKS_HOST +
-    # DATABRICKS_TOKEN in the env; passing --profile too would re-trigger the
+    # DATABRICKS_TOKEN; passing --profile too would re-trigger the
     # keychain refresh we're avoiding.
     if getattr(args, "profile_token_auth", False):
         return []
@@ -1021,6 +1050,7 @@ def _ensure_app_sp_uc_traversal(
                 check=True,
                 capture_output=True,
                 text=True,
+                env=_token_env(args),
             )
         except subprocess.CalledProcessError as exc:
             # SP may already have access via group inheritance, or the
@@ -1038,12 +1068,9 @@ def main() -> int:
     if args.profile_token_auth:
         if not args.profile:
             raise SystemExit("--profile-token-auth requires --profile")
-        # Re-populates DATABRICKS_HOST + DATABRICKS_TOKEN from the profile.
-        # Both stay set for the rest of the deploy on purpose: feeding them to
-        # the SDK *and* the `databricks` CLI subprocesses is the whole point of
-        # this mode. That does hand a live workspace token to every child
-        # (build.sh, uv, git) — the accepted cost of dodging the keychain
-        # refresh; don't "fix" it by re-clearing the token.
+        # Re-populates DATABRICKS_HOST in env and stores DATABRICKS_TOKEN
+        # in _TOKEN_AUTH (not os.environ) so it's only passed to the SDK and
+        # `databricks` CLI subprocesses that need it, not to build.sh / uv / git.
         _setup_profile_token_auth(args.profile)
     _assert_clean_tree(skip=args.allow_dirty)
 
@@ -1134,6 +1161,7 @@ def main() -> int:
         ],
         cwd=_deploy_dir(),
         check=True,
+        env=_token_env(args),
     )
 
     # 5) databricks bundle run <key> --target <target> (starts/restarts
@@ -1152,6 +1180,7 @@ def main() -> int:
         ],
         cwd=_deploy_dir(),
         check=True,
+        env=_token_env(args),
     )
 
     # 6) Resolve URL + smoke-check.

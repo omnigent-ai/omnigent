@@ -163,7 +163,8 @@ def test_token_auth_ignores_ambient_host(
     deploy_mod._setup_profile_token_auth("myprof")
 
     assert deploy_mod.os.environ["DATABRICKS_HOST"] == "https://myprof.cloud.databricks.com"
-    assert deploy_mod.os.environ["DATABRICKS_TOKEN"] == "tok-myprof"
+    assert "DATABRICKS_TOKEN" not in deploy_mod.os.environ
+    assert deploy_mod._TOKEN_AUTH["DATABRICKS_TOKEN"] == "tok-myprof"
 
 
 @pytest.mark.parametrize("naive", [True, False])
