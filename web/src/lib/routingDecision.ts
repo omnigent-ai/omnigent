@@ -114,6 +114,29 @@ export function showsRoutingDecisionChip(
 }
 
 /**
+ * Display form of a decision's harness.
+ *
+ * Sub-agent chips say `"claude"` / `"codex"`: the `-native` suffix is an
+ * implementation detail of how the spawn runs, and on a spawn chip it reads
+ * as noise. SDK-brain sub-agents (a bundle agent's `codex` / `claude-sdk`
+ * children) carry no suffix, so they render unchanged, as do session/turn
+ * chips — the session's own harness identity keeps its full id.
+ *
+ * @param scope - Decision scope; only the sub-agent scopes are shortened.
+ * @param harness - Harness id carried on the decision, when known.
+ * @returns The display label, or `null` when the decision has no harness.
+ */
+export function harnessDisplayLabel(
+  scope: RoutingScope | null | undefined,
+  harness: string | null | undefined,
+): string | null {
+  const id = harness?.trim();
+  if (!id) return null;
+  if (scope != null && SUBAGENT_SCOPES.has(scope)) return id.replace(/-native$/, "");
+  return id;
+}
+
+/**
  * Badge text for a sub-agent-scoped decision, e.g. `"subagent: researcher"`.
  *
  * @param scope - Decision scope; only the sub-agent scopes get a badge.

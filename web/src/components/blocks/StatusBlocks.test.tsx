@@ -71,11 +71,13 @@ describe("routing decision — harness / scope / raw pick", () => {
   // Harness + which sub-agent the decision covers: without the badge a
   // native-subagent decision is indistinguishable from a session one, and a
   // badge on a session/turn decision would invent a sub-agent that has none.
+  // Sub-agent chips also shorten the harness id: "-native" is how the spawn
+  // runs, not something a spawn chip needs to say. Session/turn chips keep it.
   it.each([
-    ["native_subagent", "subagent: researcher"],
-    ["turn", null],
-    ["session", null],
-  ] as const)("card: %s scope renders the sub-agent badge as %s", (scope, badge) => {
+    ["native_subagent", "subagent: researcher", "claude"],
+    ["turn", null, "claude-native"],
+    ["session", null, "claude-native"],
+  ] as const)("card: %s scope renders the sub-agent badge as %s", (scope, badge, harnessText) => {
     render(
       <RoutingDecisionCard
         model="databricks-claude-sonnet-5"
@@ -85,7 +87,7 @@ describe("routing decision — harness / scope / raw pick", () => {
         routing={{ harness: "claude-native", scope }}
       />,
     );
-    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("claude-native");
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent(harnessText);
     if (badge === null) {
       expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
     } else {
@@ -132,7 +134,8 @@ describe("routing decision — harness / scope / raw pick", () => {
         }}
       />,
     );
-    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex-native");
+    // child_session is a sub-agent scope, so the harness id renders shortened.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex");
     // The badge's exact wording is pinned once, on subagentScopeLabel.
     expect(screen.getByTestId("routing-decision-scope")).toBeTruthy();
     expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");

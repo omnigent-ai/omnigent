@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  harnessDisplayLabel,
   isSessionScopedDecision,
   routingExtras,
   routingExtrasFromWire,
@@ -134,5 +135,29 @@ describe("showsRoutingDecisionChip", () => {
     [undefined, null, true],
   ] as const)("scope %s with override %s shows: %s", (scope, override, expected) => {
     expect(showsRoutingDecisionChip(scope, override)).toBe(expected);
+  });
+});
+
+describe("harnessDisplayLabel", () => {
+  it("shortens native harness ids on subagent-scoped chips", () => {
+    expect(harnessDisplayLabel("native_subagent", "claude-native")).toBe("claude");
+    expect(harnessDisplayLabel("native_subagent", "codex-native")).toBe("codex");
+    expect(harnessDisplayLabel("child_session", "codex-native")).toBe("codex");
+  });
+
+  it("leaves SDK-brain subagents and session chips unchanged", () => {
+    // A bundle agent's (Polly/Debby) SDK children carry no -native suffix.
+    expect(harnessDisplayLabel("child_session", "codex")).toBe("codex");
+    expect(harnessDisplayLabel("child_session", "claude-sdk")).toBe("claude-sdk");
+    expect(harnessDisplayLabel("child_session", "auto")).toBe("auto");
+    // The session's own chips keep the full harness id.
+    expect(harnessDisplayLabel("session", "claude-native")).toBe("claude-native");
+    expect(harnessDisplayLabel("turn", "codex-native")).toBe("codex-native");
+    expect(harnessDisplayLabel(null, "codex-native")).toBe("codex-native");
+  });
+
+  it("returns null when the decision has no harness", () => {
+    expect(harnessDisplayLabel("native_subagent", null)).toBeNull();
+    expect(harnessDisplayLabel("turn", "  ")).toBeNull();
   });
 });
