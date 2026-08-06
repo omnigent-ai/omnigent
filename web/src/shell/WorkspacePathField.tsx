@@ -67,7 +67,7 @@ function PathRow({ path, active, onSelect, testId }: RowProps) {
         e.preventDefault();
         onSelect();
       }}
-      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition ${
+      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition ${
         active ? "bg-accent text-accent-foreground" : "hover:bg-accent hover:text-accent-foreground"
       }`}
       data-testid={testId}
@@ -270,7 +270,7 @@ export function WorkspacePathField({
           aria-expanded={dropdownOpen}
           aria-controls="workspace-path-listbox"
           aria-activedescendant={dropdownOpen ? activeDescendantId : undefined}
-          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
           data-testid="workspace-path-input"
         />
         <button
@@ -327,7 +327,7 @@ export function WorkspacePathField({
               ))}
               {hiddenMatchCount > 0 && (
                 <div
-                  className="px-3 py-2 text-xs text-muted-foreground"
+                  className="px-3 py-2 text-sm text-muted-foreground"
                   data-testid="workspace-match-overflow"
                 >
                   +{hiddenMatchCount} more — keep typing to narrow
@@ -335,7 +335,7 @@ export function WorkspacePathField({
               )}
             </>
           )}
-          {showLoading && <div className="px-3 py-2 text-xs text-muted-foreground">Loading…</div>}
+          {showLoading && <div className="px-3 py-2 text-sm text-muted-foreground">Loading…</div>}
         </div>
       )}
     </div>

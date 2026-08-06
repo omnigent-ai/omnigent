@@ -30,6 +30,9 @@ executor:
   context_window: 1000000
   config:
     harness: claude-sdk
+    # A pinned brain also pins the family its workers are routed within, which
+    # strands the codex / pi sub-agents. Route the brain instead.
+    smart_routing_harness: auto
 
 prompt: |
   You are polly, a multi-agent CODING orchestrator. You are the tech lead, not

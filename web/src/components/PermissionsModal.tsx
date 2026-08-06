@@ -180,7 +180,7 @@ export function PermissionsModal({
           <div className="flex items-center justify-between rounded-lg border px-3 py-2">
             <div>
               <p className="text-ui font-medium">Public access</p>
-              <p className="text-xs text-muted-foreground">Anyone can view this session</p>
+              <p className="text-sm text-muted-foreground">Anyone can view this session</p>
             </div>
             <Switch
               checked={isPublic}
@@ -202,10 +202,10 @@ export function PermissionsModal({
             <>
               {/* Column headers */}
               <div className="flex items-center gap-2 px-2 pb-0.5">
-                <span className="flex-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="flex-1 text-sm font-medium uppercase tracking-wide text-muted-foreground">
                   Name
                 </span>
-                <span className="w-28 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="w-28 text-sm font-medium uppercase tracking-wide text-muted-foreground">
                   Permission
                 </span>
                 <span className="size-7 shrink-0" aria-hidden="true" />
@@ -230,13 +230,13 @@ export function PermissionsModal({
         {/* Add grant form */}
         <form onSubmit={handleGrant} className="flex items-end gap-2">
           <div className="flex-1">
-            <label htmlFor="perm-user" className="text-xs font-medium text-muted-foreground">
+            <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
               User ID
             </label>
             <AddUserField value={newUserId} onChange={setNewUserId} />
           </div>
           <div>
-            <label htmlFor="perm-level" className="text-xs font-medium text-muted-foreground">
+            <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
               Level
             </label>
             <Select value={newLevel} onValueChange={setNewLevel}>
@@ -260,12 +260,12 @@ export function PermissionsModal({
         </form>
 
         {canDelegateApprovals && !sharingReadOnly && (
-          <p className="text-xs text-muted-foreground">
+          <p className="text-sm text-muted-foreground">
             Approvers can authorize actions that use your session credentials.
           </p>
         )}
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <p className="text-sm text-destructive">{error}</p>}
 
         <DialogFooter className="flex-row justify-between sm:justify-between">
           <div className="flex items-center gap-2">
@@ -451,7 +451,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                       distinct display name to pair it with. */}
                   <span className="min-w-0 flex-1 truncate">{s.displayName ?? s.userId}</span>
                   {s.displayName && s.displayName !== s.userId && (
-                    <span className="ml-2 shrink-0 truncate text-xs text-muted-foreground">
+                    <span className="ml-2 shrink-0 truncate text-sm text-muted-foreground">
                       {s.userId}
                     </span>
                   )}

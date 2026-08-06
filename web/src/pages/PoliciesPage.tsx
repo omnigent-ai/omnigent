@@ -184,14 +184,14 @@ function AddDefaultPolicyDialog({
                       >
                         <span className="text-ui">{r.name}</span>
                         {r.description && (
-                          <span className="line-clamp-2 text-[11px] text-muted-foreground">
+                          <span className="line-clamp-2 text-sm text-muted-foreground">
                             {r.description}
                           </span>
                         )}
                       </button>
                     ))}
                     {filtered.length === 0 && (
-                      <p className="py-2 text-center text-xs text-muted-foreground">
+                      <p className="py-2 text-center text-sm text-muted-foreground">
                         No policies match your filter.
                       </p>
                     )}
@@ -211,19 +211,19 @@ function AddDefaultPolicyDialog({
                     setFactoryParams({});
                     setParamError(null);
                   }}
-                  className="text-[11px] text-muted-foreground hover:text-foreground"
+                  className="text-sm text-muted-foreground hover:text-foreground"
                 >
                   Change
                 </button>
               </div>
               {entry.description && (
-                <p className="text-xs text-muted-foreground">{entry.description}</p>
+                <p className="text-sm text-muted-foreground">{entry.description}</p>
               )}
             </div>
           )}
           {entry && (
             <div>
-              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+              <label className="flex items-center gap-1 text-sm text-muted-foreground">
                 <span className="font-medium text-foreground">name</span>
               </label>
               <input
@@ -240,7 +240,7 @@ function AddDefaultPolicyDialog({
                 const prop = properties[key];
                 return (
                   <div key={key}>
-                    <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                    <label className="flex items-center gap-1 text-sm text-muted-foreground">
                       <span className="font-medium text-foreground">{key}</span>
                       {prop?.type && (
                         <span>
@@ -255,7 +255,7 @@ function AddDefaultPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="break-words text-[11px] text-muted-foreground">
+                      <p className="break-words text-sm text-muted-foreground">
                         {prop.description}
                       </p>
                     )}
@@ -312,7 +312,7 @@ function AddDefaultPolicyDialog({
                                 {current.map((v) => (
                                   <span
                                     key={v}
-                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-sm"
                                   >
                                     {v}
                                     <button
@@ -399,7 +399,7 @@ function AddDefaultPolicyDialog({
                   onOpenChange(false);
                 }
               }}
-              className="rounded px-3 py-1.5 text-xs hover:bg-muted"
+              className="rounded px-3 py-1.5 text-sm hover:bg-muted"
             >
               Cancel
             </button>
@@ -407,7 +407,7 @@ function AddDefaultPolicyDialog({
               type="button"
               onClick={handleAdd}
               disabled={!selected || addPolicy.isPending}
-              className="rounded bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
+              className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
             >
               {addPolicy.isPending ? "Adding..." : "Add"}
             </button>
@@ -534,11 +534,11 @@ export function PoliciesPage() {
                         )}
                       </div>
                       {registryEntry?.description && (
-                        <p className="mt-0.5 text-xs text-muted-foreground">
+                        <p className="mt-0.5 text-sm text-muted-foreground">
                           {registryEntry.description}
                         </p>
                       )}
-                      <code className="mt-1 block text-[11px] text-muted-foreground/70">
+                      <code className="mt-1 block text-sm text-muted-foreground/70">
                         {p.handler}
                       </code>
                     </div>
@@ -577,7 +577,7 @@ export function PoliciesPage() {
                     </span>
                     <div className="mt-1 flex flex-col gap-0.5">
                       {Object.entries(params).map(([key, value]) => (
-                        <div key={key} className="flex items-baseline gap-1.5 text-xs">
+                        <div key={key} className="flex items-baseline gap-1.5 text-sm">
                           <span className="font-medium text-foreground/80">{key}:</span>
                           <span className="text-muted-foreground">
                             {Array.isArray(value) ? value.join(", ") : String(value)}

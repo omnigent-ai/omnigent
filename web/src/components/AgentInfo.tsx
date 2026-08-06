@@ -118,12 +118,12 @@ export function McpServerList({
                   <span className="font-medium text-ui">{srv.name}</span>
                 </div>
                 {srv.description && (
-                  <p className="text-xs text-muted-foreground">{srv.description}</p>
+                  <p className="text-sm text-muted-foreground">{srv.description}</p>
                 )}
                 <button
                   type="button"
                   onClick={() => onDelete(srv.name)}
-                  className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                  className="flex items-center gap-1 self-end rounded px-2 py-1 text-sm text-destructive hover:bg-destructive/10"
                 >
                   <TrashIcon className="size-3" />
                   Remove
@@ -229,13 +229,13 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
               className="flex flex-col gap-0.5"
               data-testid={`agent-info-model-${model}`}
             >
-              <span className="truncate font-mono text-[11px] text-muted-foreground" title={model}>
+              <span className="truncate font-mono text-sm text-muted-foreground" title={model}>
                 {model}
               </span>
               {rows.map((row) => (
                 <div
                   key={row.label}
-                  className="flex items-baseline justify-between gap-3 pl-2 text-xs"
+                  className="flex items-baseline justify-between gap-3 pl-2 text-sm"
                 >
                   <span className="text-muted-foreground/70">{row.label}</span>
                   <span className="tabular-nums text-muted-foreground">
@@ -244,7 +244,7 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
                 </div>
               ))}
               {usage.totalCostUsd != null && (
-                <div className="flex items-baseline justify-between gap-3 pl-2 text-xs">
+                <div className="flex items-baseline justify-between gap-3 pl-2 text-sm">
                   <span className="text-muted-foreground/70">Cost</span>
                   <span className="tabular-nums text-muted-foreground">
                     {formatSessionCostUsd(usage.totalCostUsd)}
@@ -420,14 +420,14 @@ function AddPolicyDialog({
                       >
                         <span className="text-ui">{r.name}</span>
                         {r.description && (
-                          <span className="line-clamp-2 text-[11px] text-muted-foreground">
+                          <span className="line-clamp-2 text-sm text-muted-foreground">
                             {r.description}
                           </span>
                         )}
                       </button>
                     ))}
                     {filtered.length === 0 && (
-                      <p className="py-2 text-center text-xs text-muted-foreground">
+                      <p className="py-2 text-center text-sm text-muted-foreground">
                         No policies match your filter.
                       </p>
                     )}
@@ -447,19 +447,19 @@ function AddPolicyDialog({
                     setFactoryParams({});
                     setParamError(null);
                   }}
-                  className="text-[11px] text-muted-foreground hover:text-foreground"
+                  className="text-sm text-muted-foreground hover:text-foreground"
                 >
                   Change
                 </button>
               </div>
               {entry.description && (
-                <p className="text-xs text-muted-foreground">{entry.description}</p>
+                <p className="text-sm text-muted-foreground">{entry.description}</p>
               )}
             </div>
           )}
           {entry && (
             <div>
-              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+              <label className="flex items-center gap-1 text-sm text-muted-foreground">
                 <span className="font-medium text-foreground">name</span>
               </label>
               <input
@@ -476,7 +476,7 @@ function AddPolicyDialog({
                 const prop = properties[key];
                 return (
                   <div key={key}>
-                    <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                    <label className="flex items-center gap-1 text-sm text-muted-foreground">
                       <span className="font-medium text-foreground">{key}</span>
                       {prop?.type && (
                         <span>
@@ -491,7 +491,7 @@ function AddPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="break-words text-[11px] text-muted-foreground">
+                      <p className="break-words text-sm text-muted-foreground">
                         {prop.description}
                       </p>
                     )}
@@ -548,7 +548,7 @@ function AddPolicyDialog({
                                 {current.map((v: string) => (
                                   <span
                                     key={v}
-                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-sm"
                                   >
                                     {v}
                                     <button
@@ -635,7 +635,7 @@ function AddPolicyDialog({
                   onOpenChange(false);
                 }
               }}
-              className="rounded px-3 py-1.5 text-xs hover:bg-muted"
+              className="rounded px-3 py-1.5 text-sm hover:bg-muted"
             >
               Cancel
             </button>
@@ -643,7 +643,7 @@ function AddPolicyDialog({
               type="button"
               onClick={handleAdd}
               disabled={!selected || addPolicy.isPending}
-              className="rounded bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
+              className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
             >
               {addPolicy.isPending ? "Adding..." : "Add"}
             </button>
@@ -856,8 +856,8 @@ function McpServerManagerDialog({
                       }}
                       className="min-w-0 flex-1 text-left"
                     >
-                      <span className="block truncate font-mono text-xs">{server.name}</span>
-                      <span className="block truncate text-[11px] text-muted-foreground">
+                      <span className="block truncate font-mono text-sm">{server.name}</span>
+                      <span className="block truncate text-sm text-muted-foreground">
                         {server.transport}
                       </span>
                     </button>
@@ -887,7 +887,7 @@ function McpServerManagerDialog({
                 ))}
               </div>
             ) : (
-              <p className="py-3 text-xs text-muted-foreground">No MCP servers</p>
+              <p className="py-3 text-sm text-muted-foreground">No MCP servers</p>
             )}
             {form.originalName && (
               <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
@@ -899,7 +899,7 @@ function McpServerManagerDialog({
 
           <div className="flex min-w-0 flex-col gap-2">
             <SectionLabel>{form.originalName ? "Edit Server" : "New Server"}</SectionLabel>
-            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+            <label className="flex flex-col gap-1 text-sm text-muted-foreground">
               Name
               <Input
                 value={form.name}
@@ -908,7 +908,7 @@ function McpServerManagerDialog({
                 placeholder="github"
               />
             </label>
-            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+            <label className="flex flex-col gap-1 text-sm text-muted-foreground">
               Transport
               <select
                 value={form.transport}
@@ -926,7 +926,7 @@ function McpServerManagerDialog({
             </label>
             {form.transport === "http" ? (
               <>
-                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                <label className="flex flex-col gap-1 text-sm text-muted-foreground">
                   URL
                   <Input
                     value={form.url}
@@ -935,7 +935,7 @@ function McpServerManagerDialog({
                   />
                 </label>
                 <div className="flex flex-col gap-1">
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <div className="flex items-center justify-between text-sm text-muted-foreground">
                     <span>Headers</span>
                     <button
                       type="button"
@@ -962,7 +962,7 @@ function McpServerManagerDialog({
                             return { ...prev, headers };
                           })
                         }
-                        className="font-mono text-xs"
+                        className="font-mono text-sm"
                         placeholder="Header-Name"
                       />
                       <Input
@@ -974,7 +974,7 @@ function McpServerManagerDialog({
                             return { ...prev, headers };
                           })
                         }
-                        className="font-mono text-xs"
+                        className="font-mono text-sm"
                         placeholder="value"
                       />
                       <Button
@@ -997,7 +997,7 @@ function McpServerManagerDialog({
               </>
             ) : (
               <>
-                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                <label className="flex flex-col gap-1 text-sm text-muted-foreground">
                   Command
                   <Input
                     value={form.command}
@@ -1005,18 +1005,18 @@ function McpServerManagerDialog({
                     placeholder="npx"
                   />
                 </label>
-                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                <label className="flex flex-col gap-1 text-sm text-muted-foreground">
                   Args
                   <Textarea
                     value={form.argsText}
                     onChange={(e) => setForm((prev) => ({ ...prev, argsText: e.target.value }))}
-                    className="min-h-20 font-mono text-xs"
+                    className="min-h-20 font-mono text-sm"
                     placeholder={"-y\n@modelcontextprotocol/server-github"}
                   />
                 </label>
               </>
             )}
-            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+            <label className="flex flex-col gap-1 text-sm text-muted-foreground">
               Description
               <Input
                 value={form.description}
@@ -1128,7 +1128,7 @@ function McpServersSection({
         )}
       </div>
       {mcpDirty && (
-        <p className="flex items-center gap-1 text-xs text-yellow-700 dark:text-yellow-400">
+        <p className="flex items-center gap-1 text-sm text-yellow-700 dark:text-yellow-400">
           <AlertTriangleIcon className="size-3 shrink-0" />
           Restart to apply changes
         </p>
@@ -1136,7 +1136,7 @@ function McpServersSection({
       {servers.length > 0 ? (
         <McpServerList servers={servers} onDelete={canEdit ? handleDeleteServer : undefined} />
       ) : (
-        <p className="text-xs text-muted-foreground">No MCP servers</p>
+        <p className="text-sm text-muted-foreground">No MCP servers</p>
       )}
       {canEdit && (
         <McpServerManagerDialog
@@ -1208,12 +1208,12 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                       <span className="min-w-0 break-all font-medium text-ui">{p.name}</span>
                     </div>
                     {description && (
-                      <p className="break-words text-xs text-muted-foreground">{description}</p>
+                      <p className="break-words text-sm text-muted-foreground">{description}</p>
                     )}
                     <button
                       type="button"
                       onClick={() => p.id && deletePolicy.mutate(p.id)}
-                      className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                      className="flex items-center gap-1 self-end rounded px-2 py-1 text-sm text-destructive hover:bg-destructive/10"
                     >
                       <TrashIcon className="size-3" />
                       Remove
@@ -1225,7 +1225,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
           })}
         </div>
       ) : (
-        <p className="text-xs text-muted-foreground">No policies added</p>
+        <p className="text-sm text-muted-foreground">No policies added</p>
       )}
       <AddPolicyDialog
         sessionId={sessionId}
@@ -1346,7 +1346,7 @@ export function AgentInfoContent({
         <div className="flex flex-col gap-0.5 pb-3">
           <span className="font-medium text-ui">{displayName}</span>
           {agent?.description && (
-            <span className="text-xs text-muted-foreground">{agent.description}</span>
+            <span className="text-sm text-muted-foreground">{agent.description}</span>
           )}
         </div>
       )}
@@ -1354,7 +1354,7 @@ export function AgentInfoContent({
         <div className="flex flex-col gap-1.5 py-3">
           <SectionLabel>Owner</SectionLabel>
           <span
-            className="truncate font-mono text-xs text-muted-foreground"
+            className="truncate font-mono text-sm text-muted-foreground"
             data-testid="agent-info-session-owner"
             title={owner}
           >
@@ -1368,7 +1368,7 @@ export function AgentInfoContent({
           <SectionLabel>Session ID</SectionLabel>
           <div className="flex items-center gap-2">
             <code
-              className="min-w-0 flex-1 truncate py-1 font-mono text-xs text-muted-foreground"
+              className="min-w-0 flex-1 truncate py-1 font-mono text-sm text-muted-foreground"
               data-testid="agent-info-session-id"
               title={sessionId}
             >
@@ -1400,7 +1400,7 @@ export function AgentInfoContent({
               <div className="flex items-baseline justify-between gap-3">
                 <SectionLabel>Session cost</SectionLabel>
                 <span
-                  className="font-mono text-xs tabular-nums text-muted-foreground"
+                  className="font-mono text-sm tabular-nums text-muted-foreground"
                   data-testid="agent-info-session-cost"
                 >
                   {formatSessionCostUsd(sessionCostUsd)}

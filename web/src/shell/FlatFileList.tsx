@@ -96,12 +96,12 @@ function FileListItem({
         >
           <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
           <span
-            className={cn("truncate font-mono text-ui md:text-xs", isDeleted && "line-through")}
+            className={cn("truncate font-mono text-ui md:text-sm", isDeleted && "line-through")}
             {...handlers}
           >
             {file.name}
           </span>
-          {dir && <span className="truncate text-muted-foreground text-[11px]">{dir}</span>}
+          {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
         </button>
         {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
           <span
@@ -182,7 +182,7 @@ export function FlatFileList({
   runnerWentOffline?: boolean;
 }) {
   if (isLoading) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
   }
   if (isError) {
     // Runner not connected. If it went offline after being up (host
@@ -191,16 +191,16 @@ export function FlatFileList({
     // state rather than alarm the user.
     if (error instanceof RunnerOfflineError) {
       if (runnerWentOffline) return <RunnerAsleepHint />;
-      return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
+      return <p className="px-2 py-1 text-muted-foreground text-sm">No workspace changes yet</p>;
     }
     return (
-      <p className="px-2 py-1 text-destructive text-xs">
+      <p className="px-2 py-1 text-destructive text-sm">
         Failed to load: {error instanceof Error ? error.message : String(error)}
       </p>
     );
   }
   if (!files || files.length === 0) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-sm">No workspace changes yet</p>;
   }
   const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
   const visibleFiles = files.filter(
@@ -217,7 +217,7 @@ export function FlatFileList({
   const hiddenCount = files.length - visibleFiles.length;
   if (visibleFiles.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
+      <p className="px-2 py-1 text-muted-foreground text-sm">
         All changes are in hidden files.{" "}
         <button
           type="button"
@@ -231,7 +231,7 @@ export function FlatFileList({
   }
   if (sorted.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
+      <p className="px-2 py-1 text-muted-foreground text-sm">
         No changed files match "{searchQuery.trim()}"
       </p>
     );
@@ -239,7 +239,7 @@ export function FlatFileList({
   return (
     <>
       {hiddenCount > 0 && (
-        <p className="px-2 py-1 text-muted-foreground text-xs">
+        <p className="px-2 py-1 text-muted-foreground text-sm">
           {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden.{" "}
           <button
             type="button"

@@ -128,7 +128,7 @@ export function ThemeColorPicker({
               className="size-7 shrink-0 rounded-lg border border-white/25 shadow-sm ring-1 ring-black/10"
               style={{ backgroundColor: value }}
             />
-            <span className="min-w-0 flex-1 font-mono text-xs font-medium tracking-wide">
+            <span className="min-w-0 flex-1 font-mono text-sm font-medium tracking-wide">
               {value.toUpperCase()}
             </span>
           </button>
@@ -139,10 +139,8 @@ export function ThemeColorPicker({
           className="w-72 gap-0 overflow-hidden rounded-2xl border border-border/70 bg-popover p-0 shadow-2xl ring-1 ring-black/5"
         >
           <div className="flex items-center justify-between px-3.5 py-2.5">
-            <span className="text-xs font-medium">{label}</span>
-            <span className="font-mono text-[11px] text-muted-foreground">
-              {value.toUpperCase()}
-            </span>
+            <span className="text-sm font-medium">{label}</span>
+            <span className="font-mono text-sm text-muted-foreground">{value.toUpperCase()}</span>
           </div>
           <div className="px-2.5 pb-2.5">
             <div
@@ -221,7 +219,7 @@ export function ThemeColorPicker({
                 spellCheck={false}
                 onChange={(event) => updateDraft(event.target.value)}
                 onBlur={() => setDraft(value.toUpperCase())}
-                className="h-9 min-w-0 flex-1 rounded-xl border bg-background px-3 font-mono text-xs font-medium uppercase tracking-wide outline-none transition-shadow focus:ring-2 focus:ring-ring/40"
+                className="h-9 min-w-0 flex-1 rounded-xl border bg-background px-3 font-mono text-sm font-medium uppercase tracking-wide outline-none transition-shadow focus:ring-2 focus:ring-ring/40"
               />
               <button
                 type="button"

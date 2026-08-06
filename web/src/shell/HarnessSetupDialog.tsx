@@ -156,7 +156,7 @@ export function HarnessSetupDialog({
           // (all green ticks) rather than showing a "run omni setup"
           // signpost that would contradict the "is ready" description.
           <p className="py-1 text-ui text-muted-foreground" data-testid="harness-setup-empty">
-            Run <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">omni setup</code>{" "}
+            Run <code className="rounded bg-muted px-1 py-0.5 font-mono text-sm">omni setup</code>{" "}
             on {host?.name} to finish setting up {name}.
           </p>
         ) : hasSteps ? (
@@ -254,11 +254,11 @@ function SetupStepRow({
               the progress caption — kept next to the install step it describes
               rather than stranded at the bottom of the dialog. */}
           {step.kind === "install" && installing ? (
-            <span className="text-xs text-muted-foreground" data-testid="harness-setup-installing">
+            <span className="text-sm text-muted-foreground" data-testid="harness-setup-installing">
               Installing on {host?.name} — this can take a few minutes for larger agents.
             </span>
           ) : (
-            detail && <span className="text-xs text-muted-foreground">{detail}</span>
+            detail && <span className="text-sm text-muted-foreground">{detail}</span>
           )}
         </div>
         {/* Control: one-click Install (when the allowlist accepts it), an
@@ -328,7 +328,7 @@ function CopyCommand({ command }: { command: string }) {
       type="button"
       data-testid="harness-setup-command"
       title="Copy command"
-      className="group flex shrink-0 items-center gap-1.5 rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="group flex shrink-0 items-center gap-1.5 rounded bg-muted px-1.5 py-0.5 font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       onClick={() => {
         void copyText(command)
           .then(() => {

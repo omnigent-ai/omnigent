@@ -8,6 +8,7 @@ import asyncio
 import faulthandler
 import gc
 import inspect
+import json
 import logging
 import os
 import pathlib
@@ -149,6 +150,65 @@ async def _hang_diagnostic_task_dumper() -> asyncio.AsyncGenerator[None, None]:
     finally:
         if handle is not None:
             handle.cancel()
+
+
+def advertise_router(
+    router_dir: pathlib.Path,
+    *,
+    session_id: str | None = "conv_abc",
+    **extra: object,
+) -> pathlib.Path:
+    """Write a subagent-router advertisement into *router_dir*.
+
+    Shared by the claude and codex router-hook suites. The filename comes
+    from the hook script's own ``ADVERTISEMENT_FILE`` constant, so renaming
+    it fails these tests instead of quietly making every advertisement
+    invisible to the hook under test.
+
+    :param router_dir: Bridge/router directory the hook is pointed at.
+    :param session_id: Baked-in session id; ``None`` omits the key so the
+        hook has to fall back to its env/bridge-config sources.
+    :param extra: Extra advertisement keys to merge in.
+    :returns: *router_dir*, for use as the hook's ``--bridge-dir``.
+    """
+    from omnigent.inner.hook_scripts import subagent_router
+
+    # A live ``pid`` by default: the hook rejects an advertisement without
+    # one, since the runner always writes it.
+    payload: dict[str, object] = {
+        "url": "http://127.0.0.1:1/",
+        "token": "t0k",
+        "pid": os.getpid(),
+        **extra,
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    (router_dir / subagent_router.ADVERTISEMENT_FILE).write_text(json.dumps(payload))
+    return router_dir
+
+
+def advertise_relay_tools(bridge_dir: pathlib.Path, *tool_names: str) -> pathlib.Path:
+    """Write a ``tool_relay.json`` advertising *tool_names* into *bridge_dir*.
+
+    The hook reads this to decide whether a deny reason may name
+    ``sys_session_create``. The filename comes from the hook script's own
+    constant so a rename fails these tests instead of silently reading nothing.
+
+    :param bridge_dir: Bridge directory the hook is pointed at.
+    :param tool_names: Omnigent tool names to advertise; none writes an empty
+        list, which is how "the session holds no spawn tool" is expressed.
+    :returns: *bridge_dir*, for use as the hook's ``--bridge-dir``.
+    """
+    from omnigent.inner.hook_scripts import subagent_router
+
+    payload = {
+        "url": "http://127.0.0.1:2/",
+        "token": "relay-t0k",
+        "pid": os.getpid(),
+        "tools": [{"name": name, "input_schema": {"type": "object"}} for name in tool_names],
+    }
+    (bridge_dir / subagent_router._TOOL_RELAY_FILE).write_text(json.dumps(payload))
+    return bridge_dir
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:

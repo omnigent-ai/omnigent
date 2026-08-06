@@ -27,18 +27,22 @@ function stubScrollHeight(el: HTMLElement, px: number): void {
   });
 }
 
-function Harness({ value }: { value: string }) {
+function Harness({ value, onGrowth }: { value: string; onGrowth?: (px: number) => void }) {
   const ref = useRef<HTMLTextAreaElement>(null);
-  useAutoGrowTextarea(ref, value);
+  useAutoGrowTextarea(ref, value, 10, onGrowth);
   // Inline line-height/padding so getComputedStyle returns real numbers
-  // (jsdom reflects inline styles), letting the maxHeight math run.
+  // (jsdom reflects inline styles), letting the maxHeight math run. The
+  // wrapper mirrors both composers, where the textarea sits in a box of its
+  // own that the hook pins while it collapses to measure.
   return (
-    <textarea
-      ref={ref}
-      data-testid="ta"
-      defaultValue={value}
-      style={{ lineHeight: "20px", paddingTop: "0px", paddingBottom: "0px" }}
-    />
+    <div data-testid="wrapper">
+      <textarea
+        ref={ref}
+        data-testid="ta"
+        defaultValue={value}
+        style={{ lineHeight: "20px", paddingTop: "0px", paddingBottom: "0px" }}
+      />
+    </div>
   );
 }
 
@@ -89,5 +93,70 @@ describe("useAutoGrowTextarea", () => {
     // prompt scrolls instead of growing without bound. A larger value means
     // the maxRows clamp regressed.
     expect(ta.style.height).toBe("200px");
+  });
+
+  it("holds the wrapper's height while the textarea collapses to measure", () => {
+    // The collapse to "auto" is a one-row box. Left free to reach the page it
+    // briefly shortens the composer, and the browser clamps the transcript's
+    // scrollTop against the taller viewport that opens up — a clamp that
+    // sticks, shunting the chat down a line on every keystroke. jsdom can't
+    // reproduce the clamp (no layout), so assert the invariant that prevents
+    // it: the wrapper's box is fixed for as long as the textarea is collapsed.
+    const { getByTestId } = render(<Harness value="two\nlines" />);
+    const ta = getByTestId("ta") as HTMLTextAreaElement;
+    const wrapper = getByTestId("wrapper") as HTMLDivElement;
+    wrapper.getBoundingClientRect = () => ({ height: 100 }) as DOMRect;
+
+    // scrollHeight is read while the textarea is collapsed, so it's the one
+    // moment that sees the layout the rest of the page would have seen.
+    let wrapperHeightWhileCollapsed: string | null = null;
+    Object.defineProperty(ta, "scrollHeight", {
+      configurable: true,
+      get: () => {
+        wrapperHeightWhileCollapsed = wrapper.style.height;
+        return 40;
+      },
+    });
+    roCallback?.([], {} as ResizeObserver);
+
+    expect(wrapperHeightWhileCollapsed).toBe("100px");
+    // Released again once the real height is on, so the wrapper goes back to
+    // tracking its content instead of freezing at the pinned value.
+    expect(wrapper.style.height).toBe("");
+    expect(ta.style.height).toBe("40px");
+  });
+
+  it("reports no growth while the element has no layout", () => {
+    // Mid route swap scrollHeight reads 0 and the height is left alone. The
+    // growth has to be published anyway: a caller offsetting its layout by the
+    // last value would otherwise hold that offset until the next measure.
+    const growth: number[] = [];
+    render(<Harness value="two rows" onGrowth={(px) => growth.push(px)} />);
+    expect(growth).toEqual([0]);
+  });
+
+  it("reports how far past one row the box has grown", () => {
+    // The in-session composer subtracts this from its own top margin, keeping
+    // the extra rows out of the flex column so the transcript's scroll
+    // viewport — and the scrollbar and turn rail drawn from it — hold still.
+    const growth: number[] = [];
+    const { getByTestId } = render(<Harness value="x" onGrowth={(px) => growth.push(px)} />);
+    const ta = getByTestId("ta") as HTMLTextAreaElement;
+
+    // One 20px row: resting height, nothing to float.
+    stubScrollHeight(ta, 20);
+    roCallback?.([], {} as ResizeObserver);
+    expect(growth.at(-1)).toBe(0);
+
+    // Four rows: three of them past resting.
+    stubScrollHeight(ta, 80);
+    roCallback?.([], {} as ResizeObserver);
+    expect(growth.at(-1)).toBe(60);
+
+    // Past the 10-row cap the box scrolls instead of growing, so the reported
+    // growth caps with it rather than tracking the content.
+    stubScrollHeight(ta, 800);
+    roCallback?.([], {} as ResizeObserver);
+    expect(growth.at(-1)).toBe(180);
   });
 });
