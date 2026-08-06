@@ -213,7 +213,7 @@ describe("project folder header icon/chevron", () => {
     const header = headerButton("Projects");
 
     // The parent section label uses the settings-scaled subtitle tier.
-    expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-sm", "font-normal");
+    expect(header).toHaveClass("gap-1", "pl-2", "text-sm", "font-normal");
     expect(header).not.toHaveClass("font-medium", "uppercase");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
