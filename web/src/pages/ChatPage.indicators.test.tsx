@@ -200,7 +200,7 @@ describe("BubbleView dispatch", () => {
     expect(bubble).toHaveAttribute("data-role", "assistant");
     expect(bubble).toHaveClass("gap-2");
     expect(bubble).toHaveTextContent("the answer is 42");
-    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xs");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
   });
 
   it("uses full-width layout for assistant display math", () => {

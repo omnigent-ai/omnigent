@@ -279,15 +279,23 @@ function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
   isTasksPage: boolean;
+  newSessionProjectName: string | null;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
-  const leaf = useLocation().pathname.split("/").filter(Boolean).at(-1);
+  const location = useLocation();
+  const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isInboxPage = leaf === "inbox";
   const isTasksPage = leaf === "tasks";
+  const isNewSessionRoute = activeConversationId == null && !isInboxPage && !isTasksPage;
+  const requestedProject = isNewSessionRoute
+    ? new URLSearchParams(location.search).get("project")
+    : null;
+  const newSessionProjectName = requestedProject || null;
   // Exclude inbox/tasks: they also have no `:conversationId`, so they would
-  // otherwise light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage && !isTasksPage;
-  return { isNewChatPage, isInboxPage, isTasksPage };
+  // otherwise light up the "New session" button. A project-prefilled new
+  // session belongs to that project row instead of the global nav item.
+  const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
+  return { isNewChatPage, isInboxPage, isTasksPage, newSessionProjectName };
 }
 
 /**
@@ -549,7 +557,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage, newSessionProjectName } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -890,6 +898,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               scrollContainerRef={scrollContainerRef}
               onRowClick={onNavClick}
               searchQuery=""
+              newSessionProjectName={newSessionProjectName}
               activeTab={activeTab}
               onActiveTabChange={switchTab}
               multiUser={multiUser}
@@ -985,6 +994,7 @@ function ProjectFolder({
   projectId,
   windowConversations,
   expanded,
+  active,
   marker,
   onToggleCollapsed,
   pinnedConversationIds,
@@ -1007,6 +1017,8 @@ function ProjectFolder({
       membership here before the folder query returns it). */
   windowConversations: Conversation[];
   expanded: boolean;
+  /** Whether the new-session composer is currently scoped to this project. */
+  active: boolean;
   marker: SessionState | null;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
@@ -1079,11 +1091,22 @@ function ProjectFolder({
         title={name}
         icon={
           expanded ? (
-            <FolderOpenIcon className="ui-icon text-muted-foreground" />
+            <FolderOpenIcon
+              className={cn(
+                "ui-icon",
+                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+              )}
+            />
           ) : (
-            <FolderIcon className="ui-icon text-muted-foreground" />
+            <FolderIcon
+              className={cn(
+                "ui-icon",
+                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+              )}
+            />
           )
         }
+        active={active}
         marker={marker}
         conversations={conversations}
         pinnedConversationIds={pinnedConversationIds}
@@ -1096,7 +1119,24 @@ function ProjectFolder({
         selectedIds={selectedIds}
         onToggleSelected={onToggleSelected}
         onProjectAssigned={onProjectAssigned}
-        emptyMessage={loadingFirstPage ? undefined : "No sessions"}
+        emptyMessage={
+          loadingFirstPage ? undefined : (
+            <span className="block text-ui">
+              No sessions. Start a{" "}
+              <Link
+                to={`/?project=${encodeURIComponent(name)}`}
+                className="font-medium text-primary underline-offset-4 hover:underline"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRowClick(e);
+                }}
+              >
+                new session
+              </Link>
+              .
+            </span>
+          )
+        }
         indentRows
         headerAction={
           <ProjectFolderActions projectName={name} projectId={projectId} onNavigate={onRowClick} />
@@ -1125,6 +1165,8 @@ interface ConversationListProps {
   scrollContainerRef: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
+  /** Project selected on the new-session composer route, if any. */
+  newSessionProjectName: string | null;
   activeTab: SidebarTab;
   onActiveTabChange: (tab: SidebarTab) => void;
   /** Multi-user server; gates the "Shared" filter option. */
@@ -1193,6 +1235,7 @@ function ConversationList({
   scrollContainerRef,
   onRowClick,
   searchQuery,
+  newSessionProjectName,
   activeTab,
   onActiveTabChange,
   multiUser,
@@ -1821,6 +1864,7 @@ function ConversationList({
                       projectId={group.id}
                       windowConversations={group.conversations}
                       expanded={expandedProjects.includes(group.name)}
+                      active={newSessionProjectName === group.name}
                       // Best-effort marker from the globally-loaded window: a
                       // collapsed folder hasn't fetched its own sessions yet.
                       marker={projectMarkerState(group.conversations)}
@@ -2057,6 +2101,7 @@ function SectionHeader({
   title,
   icon,
   marker,
+  active = false,
   hasAction,
   collapsed,
   onToggleCollapsed,
@@ -2064,6 +2109,8 @@ function SectionHeader({
   title: string;
   icon?: ReactNode;
   marker?: SessionState | null;
+  /** Whether this header represents the current page context. */
+  active?: boolean;
   /** Whether the section also renders a hover-revealed header action (the
       project-folder kebab), which shares the header's right edge with the
       collapsed marker. */
@@ -2076,6 +2123,7 @@ function SectionHeader({
       <button
         type="button"
         aria-expanded={!collapsed}
+        aria-current={active ? "page" : undefined}
         onClick={onToggleCollapsed}
         className={
           icon
@@ -2083,6 +2131,7 @@ function SectionHeader({
                 SIDEBAR_ROW,
                 "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
+                active && SIDEBAR_ACTIVE_HIGHLIGHT,
               )
             : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
@@ -2329,6 +2378,7 @@ function ConversationSection({
   title,
   icon,
   marker,
+  active,
   conversations,
   pinnedConversationIds,
   collapsed,
@@ -2350,6 +2400,8 @@ function ConversationSection({
   icon?: ReactNode;
   /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
   marker?: SessionState | null;
+  /** Whether this section header represents the current page context. */
+  active?: boolean;
   conversations: Conversation[];
   pinnedConversationIds: string[];
   /** Whether this section is currently collapsed. */
@@ -2361,7 +2413,7 @@ function ConversationSection({
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   /** Placeholder shown when expanded with no rows (e.g. an empty project). */
-  emptyMessage?: string;
+  emptyMessage?: ReactNode;
   /** Indent the rows one extra step (used to nest a project's chats). */
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge (e.g. a project's
@@ -2390,6 +2442,7 @@ function ConversationSection({
             title={title}
             icon={icon}
             marker={marker}
+            active={active}
             hasAction={headerAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
@@ -2407,18 +2460,18 @@ function ConversationSection({
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
-            <p
-              className={
-                indentRows
-                  ? cn(
-                      SIDEBAR_ROW,
-                      "mt-1 mr-2 ml-8 flex items-center justify-center border border-dashed border-border text-center text-ui text-muted-foreground",
-                    )
-                  : "px-2 py-1 text-ui text-muted-foreground"
-              }
-            >
-              {emptyMessage}
-            </p>
+            indentRows ? (
+              <div
+                className={cn(
+                  SIDEBAR_ROW,
+                  "mt-1 mr-2 ml-8 flex flex-col items-start justify-center gap-1.5 px-0 py-1 pb-2 text-left md:py-1 md:pb-2",
+                )}
+              >
+                <p className="text-ui text-muted-foreground">{emptyMessage}</p>
+              </div>
+            ) : (
+              <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
+            )
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>

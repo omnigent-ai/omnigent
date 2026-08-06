@@ -189,7 +189,7 @@ describe("UserBubble copy button", () => {
     renderBubble(userBubble("copy me please"));
 
     expect(screen.getByTestId("message-bubble")).toHaveClass("gap-2");
-    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xs");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
   });
 
   it("copies the message text to the clipboard when clicked", async () => {
