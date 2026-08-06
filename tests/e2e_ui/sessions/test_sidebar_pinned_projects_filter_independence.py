@@ -247,3 +247,45 @@ def test_projects_section_ignores_the_session_filter(
         expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
     finally:
         ctx.close()
+
+
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
+def test_shared_session_stays_in_flat_list_on_project_name_collision(
+    browser: Browser,
+    multi_user_server: MultiUserServer,
+) -> None:
+    """A shared session with a colliding project label isn't pulled into a folder.
+
+    Filing is owner-only (unlike pins), so project-folder membership is
+    ownership-gated. The viewer owns a session filed under a project, and a
+    DIFFERENT owner's session — shared with the viewer — carries the same
+    project-name label. That collision must not pull the foreign session into
+    the viewer's folder (which would also drop it from the flat Sessions list).
+    """
+    server = multi_user_server
+    uniq = uuid.uuid4().hex[:6]
+    viewer_email = f"viewer-collide-{uniq}@ui.test"
+    project = f"E2E Collide {uniq}"
+
+    # The viewer's own session filed under the project (surfaces the folder).
+    owned = _create_session(server, owner_email=viewer_email, title=f"e2e-collide-owned-{uniq}")
+    _patch(server, owned, viewer_email, {"labels": {_PROJECT_LABEL_KEY: project}})
+    # An admin-owned session SHARED with the viewer, carrying the SAME project
+    # label — the name collision the ownership guard must reject.
+    shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-collide-shared-{uniq}")
+    _patch(server, shared, ADMIN_EMAIL, {"labels": {_PROJECT_LABEL_KEY: project}})
+    _grant(server, shared, viewer_email, _LEVEL_EDIT)
+
+    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
+    try:
+        page = ctx.new_page()
+        page.goto(f"{server.public_url}/c/{owned}")
+        expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
+
+        # The folder exists (the owned session filed it), but the shared session
+        # is NOT filed away: it stays in the flat Sessions list, not the folder.
+        expect(page.get_by_role("button", name=project, exact=True)).to_be_visible(timeout=30_000)
+        expect(_section(page, "Sessions").locator(f'a[href="/c/{shared}"]')).to_be_visible()
+        expect(_row(page, shared)).to_be_visible()
+    finally:
+        ctx.close()

@@ -984,6 +984,33 @@ describe("Sidebar tabs", () => {
     expect(screen.getByText("conv_shared")).toBeInTheDocument();
   });
 
+  it("keeps a shared session in the flat list on a project-name collision", () => {
+    // Filing is owner-only (UNLIKE pins), so `projectGroups` membership is
+    // ownership-gated. A session shared with the viewer that carries its own
+    // owner's `omni_project` label colliding with one of the viewer's folder
+    // names must NOT be treated as filed — otherwise `filedIds` would swallow
+    // it and it would vanish from the flat Sessions list. (The folder's own
+    // expanded contents come from the owner-scoped `?project=` server fetch,
+    // so this asserts the parent-level flat-list scoping the fix changed.)
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("conv_owned", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      // Shared (owner set) with the SAME project-name label — the collision.
+      conv("conv_shared_alpha", "Claude Code", {
+        owner: "other@example.com",
+        labels: { omni_project: "Alpha" },
+      }),
+    ]);
+    renderSidebar();
+
+    // The owned session is filed (peeled out of the flat list into its
+    // collapsed folder), but the shared collision stays in the flat Sessions
+    // list rather than being pulled into the viewer's folder.
+    const sessionsSection = screen.getByText("Sessions").closest("section")!;
+    expect(within(sessionsSection).queryByText("conv_owned")).toBeNull();
+    expect(within(sessionsSection).getByText("conv_shared_alpha")).toBeInTheDocument();
+  });
+
   it("keeps paginating when the shared tab is empty on the loaded page but more exist", () => {
     // The list is one paginated stream (owned + shared mixed, updated_at desc),
     // so page 1 can be all-owned while shared sessions live on a later page.
