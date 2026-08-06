@@ -122,9 +122,16 @@ _CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
 
 @dataclass(frozen=True)
 class _CodexAuthSource:
-    """Resolved source for Codex authentication material."""
+    """Resolved source for Codex authentication material.
+
+    :param auth_path: Codex's ``auth.json``, the credential for a launch that
+        defers to Codex's own login.
+    :param config_path: Codex's ``config.toml``, whose effective
+        ``model_provider`` can carry a credential of its own instead.
+    """
 
     auth_path: Path
+    config_path: Path
 
 
 def _resolve_codex_auth_source() -> _CodexAuthSource:
@@ -141,7 +148,11 @@ def _resolve_codex_auth_source() -> _CodexAuthSource:
     """
     from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
-    return _CodexAuthSource(auth_path=_codex_home_config_source_from_env() / "auth.json")
+    codex_home = _codex_home_config_source_from_env()
+    return _CodexAuthSource(
+        auth_path=codex_home / "auth.json",
+        config_path=codex_home / "config.toml",
+    )
 
 
 def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
@@ -194,6 +205,25 @@ def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
     return False
 
 
+def _codex_config_provider_has_credential(config_path: Path) -> bool:
+    """Return whether Codex's own config authenticates its effective provider.
+
+    Resolves the credential against the *filtered* environment the native Codex
+    launch passes to the CLI (``_clean_codex_env``) rather than the daemon's raw
+    ``os.environ``, so a config whose ``env_key`` names a variable the launch
+    scrubs is not reported as ready and then 401s on the first turn. Readiness
+    and the launch therefore read the same environment.
+
+    :param config_path: Path to the Codex ``config.toml`` the launch would use.
+    :returns: ``True`` when the config's effective provider carries a
+        credential Codex can use without ``auth.json``.
+    """
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.onboarding.ambient import codex_config_provider_has_credential
+
+    return codex_config_provider_has_credential(config_path, env=_clean_codex_env())
+
+
 def _find_codex_cli() -> str | None:
     """Return the resolved path to the Codex CLI binary, if any."""
     from omnigent._platform import resolve_cli_binary
@@ -222,6 +252,18 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
     rely on: their gateway token is a runtime mint the daemon can't observe.
 
+    "Defers to Codex" is not the same as "uses ``auth.json``", though: when the
+    launch leaves Codex's provider selection alone, Codex resolves its own
+    effective ``model_provider`` from ``config.toml``, and a custom provider
+    there authenticates from that table (an auth command, an inline bearer, or
+    an ``env_key``) without ever reading ``auth.json``. That config is checked
+    before ``auth.json`` (see :func:`_codex_config_provider_has_credential`), so
+    a self-authenticating provider is not reported as needing a ``codex login``
+    that would add a second, competing credential. A launch that pins
+    ``model_provider`` itself — the dismissed-custom-provider case, which pins
+    the built-in ``openai`` — overrides that selection, so Codex's config cannot
+    authenticate and ``auth.json`` decides.
+
     The check stays synchronous and local: it resolves the launch (local config
     reads) and, only on the defer-to-login path, inspects the local auth source.
     It never runs ``codex login`` or a status command; the CLI ``--version``
@@ -230,9 +272,10 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     onto the ``auth.json`` check.
 
     :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
-        when the launch would defer to Codex's own login but ``auth.json`` is
-        missing, malformed, or carries no credential, and ``None`` when a
-        provider will route the launch or a login credential is configured.
+        when the launch would defer to Codex's own login but neither Codex's
+        ``config.toml`` provider nor ``auth.json`` carries a credential, and
+        ``None`` when a provider will route the launch, Codex's own config
+        authenticates its provider, or a login credential is configured.
         Token *validity* (revoked/expired refresh, an unreachable gateway) is
         not judged locally — it surfaces at the first turn via the executor.
     """
@@ -248,10 +291,14 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         return HARNESS_VERSION_TOO_LOW
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
+    defers_to_codex_config = False
     try:
         launch = resolve_native_codex_launch(model=None)
         routes_through_provider = (
             launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+        )
+        defers_to_codex_config = not routes_through_provider and not any(
+            override.startswith("model_provider=") for override in launch.config_overrides
         )
     except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
@@ -259,6 +306,8 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     if routes_through_provider:
         return None
     source = _resolve_codex_auth_source()
+    if defers_to_codex_config and _codex_config_provider_has_credential(source.config_path):
+        return None
     if not _codex_auth_json_has_available_credential(source.auth_path):
         return HARNESS_NEEDS_AUTH
     return None

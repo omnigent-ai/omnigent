@@ -29,6 +29,7 @@ import shlex
 import socket
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -250,12 +251,14 @@ def _provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:
 
     Deliberately **excluded** (each with a reason):
 
-    - ``env_key`` / ``env_http_headers`` — auth via an environment
-      variable. The codex executor launches the CLI with a scrubbed
-      environment (``_clean_codex_env``), so an arbitrary env var would not
-      reach the subprocess and the provider would 401 at run time despite
-      detecting as "configured". Supporting these needs an env-passthrough
-      design first.
+    - ``env_key`` / ``env_http_headers`` — auth from an environment
+      variable. Adoption re-routes the provider through Omnigent's own
+      config, which would have to thread that variable into a scrubbed
+      subprocess env (``_clean_codex_env``), so an arbitrary env var would
+      not reach the CLI and the adopted provider would 401 at run time.
+      Readiness is a different question — there Codex keeps its own config
+      and inherits the variable — so env-based auth is recognized by
+      :func:`codex_config_provider_has_credential` instead.
     - ``requires_openai_auth = true`` — the provider rides the ChatGPT
       login, which is exactly the ``auth.json`` subscription detection's
       territory (checked separately by the caller).
@@ -286,6 +289,73 @@ def _provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:
             ):
                 return True
     return False
+
+
+def _load_codex_config(config_path: Path) -> dict[str, object] | None:
+    """Parse a Codex ``config.toml``, or ``None`` when it is unusable.
+
+    A missing, unreadable, or malformed file is "nothing configured" rather
+    than an error: every caller is a local, side-effect-free detection that
+    must not crash setup or the readiness refresh on a hand-edited file.
+
+    :param config_path: Path to the Codex ``config.toml`` to parse, e.g.
+        ``Path("~/.codex/config.toml").expanduser()``.
+    :returns: The parsed mapping, or ``None`` when the file is missing,
+        unreadable, or not decodable TOML.
+    """
+    try:
+        raw = config_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        return tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _provider_table_env_auth_var(
+    table: dict[str, object],
+    env: Mapping[str, str],
+) -> str | None:
+    """Return the env var a provider table authenticates from, when populated.
+
+    Codex's env-based provider auth (``openai/codex``,
+    ``codex-rs/model-provider-info/src/lib.rs``) names an environment
+    variable rather than carrying the secret inline:
+
+    - ``env_key = "X"`` — ``$X`` is sent as the bearer token;
+    - ``env_http_headers = { Authorization = "X" }`` — ``$X`` is sent as the
+      value of an auth header.
+
+    Provider-agnostic by construction: the variable name comes from the
+    config, so any gateway or vendor works without being named here.
+
+    :param table: The raw ``[model_providers.X]`` mapping parsed from
+        ``config.toml``, e.g. ``{"base_url": "...", "env_key": "GW_TOKEN"}``.
+    :param env: Environment to resolve the variable in, e.g. ``os.environ``
+        or the filtered env a harness launch would pass to the CLI.
+    :returns: The declared variable name when it is set and non-empty in
+        *env*, else ``None`` (no env auth declared, or nothing to send).
+    """
+    names: list[str] = []
+    env_key = table.get("env_key")
+    if isinstance(env_key, str) and env_key.strip():
+        names.append(env_key.strip())
+    env_headers = table.get("env_http_headers")
+    if isinstance(env_headers, dict):
+        names.extend(
+            value.strip()
+            for key, value in env_headers.items()
+            if isinstance(key, str)
+            and key.lower() == "authorization"
+            and isinstance(value, str)
+            and value.strip()
+        )
+    for name in names:
+        value = env.get(name)
+        if isinstance(value, str) and value.strip():
+            return name
+    return None
 
 
 def _effective_codex_model_provider(config: dict[str, object]) -> str | None:
@@ -347,15 +417,9 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
         malformed, the effective provider is built-in or unset, its table
         is absent, or the table carries no self-contained auth.
     """
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        # Missing or unreadable file — nothing configured.
-        return None
-    try:
-        config = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
-        # Malformed TOML — treat as not configured rather than crash setup.
+    config = _load_codex_config(config_path)
+    if config is None:
+        # Missing, unreadable, or malformed — treat as not configured.
         return None
 
     provider_id = _effective_codex_model_provider(config)
@@ -380,6 +444,64 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
     name = table.get("name")
     display_name = name if isinstance(name, str) and name.strip() else provider_id
     return CodexConfigProvider(provider_id=provider_id, display_name=display_name)
+
+
+def codex_config_provider_has_credential(
+    config_path: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether a Codex config authenticates itself without ``auth.json``.
+
+    Readiness counterpart of :func:`codex_config_custom_provider`: it answers
+    "would the ``codex`` CLI authenticate from this config alone?" for a launch
+    that leaves Codex's own provider selection in place. Codex resolves its
+    effective ``model_provider`` from ``config.toml`` and, when that is a custom
+    ``[model_providers.X]`` table, never reads ``auth.json`` — so gating
+    availability on ``auth.json`` there is a false "needs auth" and telling the
+    user to run ``codex login`` is the wrong remedy.
+
+    A config counts when its effective provider is custom (non-built-in), does
+    not ride the ChatGPT login (``requires_openai_auth``), and carries either
+    self-contained auth (see :func:`_provider_table_has_self_contained_auth`)
+    or env-based auth whose variable is populated in *env* (see
+    :func:`_provider_table_env_auth_var`). Which provider it is never matters —
+    only that the config names a credential Codex can use.
+
+    Purely local and structural, like the ``auth.json`` check: it parses one
+    TOML file, runs nothing, and never validates that the credential would be
+    accepted by the endpoint.
+
+    :param config_path: Path to the Codex ``config.toml`` to inspect, e.g.
+        ``Path("~/.codex/config.toml").expanduser()``.
+    :param env: Environment to resolve env-based auth in. Defaults to
+        ``os.environ``; a caller that launches the CLI with a filtered
+        environment should pass that env so the answer matches the launch.
+    :returns: ``True`` when the config carries a usable credential for its
+        effective provider, ``False`` when it is missing / malformed, selects a
+        built-in provider, or names no credential.
+    """
+    config = _load_codex_config(config_path)
+    if config is None:
+        return False
+    provider_id = _effective_codex_model_provider(config)
+    if provider_id is None or provider_id in _CODEX_BUILTIN_PROVIDERS:
+        # Built-in/unset provider → Codex's own login decides; auth.json's job.
+        return False
+    providers = config.get("model_providers")
+    if not isinstance(providers, dict):
+        return False
+    table = providers.get(provider_id)
+    if not isinstance(table, dict):
+        # The config selects a provider it never defines — codex itself fails.
+        return False
+    if table.get("requires_openai_auth") is True:
+        # Rides the ChatGPT login, so auth.json is the credential after all.
+        return False
+    if _provider_table_has_self_contained_auth(table):
+        return True
+    resolved = os.environ if env is None else env
+    return _provider_table_env_auth_var(table, resolved) is not None
 
 
 @dataclass(frozen=True)
@@ -428,13 +550,8 @@ def codex_config_provider_transport(
         missing / malformed, the table is absent, or it declares no
         ``base_url``.
     """
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        return None
-    try:
-        config = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+    config = _load_codex_config(config_path)
+    if config is None:
         return None
 
     providers = config.get("model_providers")
