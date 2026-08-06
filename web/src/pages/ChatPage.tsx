@@ -3919,16 +3919,9 @@ export function composerHarnessLabel(
 }
 
 /**
- * Status-line tray tucked behind the composer card: the worktree branch
- * on the left (truncated to an ellipsis so the tray never wraps), the
- * model/effort + context ring on the right. Shares the card's background so the two
- * read as one rounded shape: the card keeps its full rounded-2xl and
- * paints on top (it's position:relative), while this in-flow sibling is
- * pulled up behind it so a rounded shelf peeks out below the card's
- * bottom edge — the card's own bottom border is the divider. Owns the
- * visibility guards so an empty tray never renders — no dead shelf when
- * the session has nothing to report. Session cost lives in the header
- * agent-info popover (the "i" button), not here.
+ * Status tray under the composer: branch left, model/context right.
+ * Pulled up behind the card so a shelf peeks below; skips render when empty.
+ * Session cost lives in the header agent-info popover, not here.
  */
 function ComposerStatusLine({
   goal,
@@ -3983,21 +3976,12 @@ function ComposerStatusLine({
     <div
       data-testid="composer-status-line"
       className={cn(
-        // -mt-4 slides the tray's square top corners up behind the card
-        // (the 16px overlap exceeds the card's ~14px corner radius, so
-        // they hide behind its straight sides); pt-5.5 (= --spacing *
-        // 5.5) re-reserves the hidden region so the content sits below
-        // the card's edge. bg-tray/40 (not bg-card) keeps it out of the
-        // dark-mode glass rule — bg-card here would re-decorate the tray
-        // with its own border/shadow, duplicating the composer's chrome —
-        // and matches the home composer's footer tray surface.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/20 px-4 pb-1.5 pt-5.5",
+        // -mt-4 tucks under the card; pt-5.5 keeps content below the overlap.
+        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Left: host badge then worktree branch. Always holds the flex-1 slot
-          so the right cluster stays pinned right even when both are absent;
-          each item truncates to an ellipsis so the tray never wraps. */}
+      {/* Left: host + branch. flex-1 keeps the right cluster pinned; truncate, no wrap. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
         {showHost && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
@@ -4973,20 +4957,11 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-      {/* Single rounded container — textarea on top, action row beneath.
-          No top border on the surrounding form; the box itself is the
-          visual container. The static neutral border carries through
-          focus — no focus-within ring — so the box stays clean while
-          typing. Drag-over still lifts an inset ring (below).
-          dark:bg-card-solid: the trays tuck their square corners behind
-          this card (-mb-4 / -mt-4), and the dark glass --card is 60%
-          alpha — the tucked strips ghost through a translucent card. The
-          glass rule still keys off the bg-card class, so the dark border/
-          shadow chrome is unchanged; only the fill goes opaque. */}
+      {/* Single rounded container — textarea + action row. No focus-within
+          ring; drag-over still lifts an inset ring. dark:bg-card-solid so
+          upper trays (queued / sub-agent) don't ghost through glass --card. */}
       <div
-        // Marks the opaque card so the row can measure where it ends: the
-        // translucent status shelf below it is what the transcript shows
-        // through, so clearance stops at this edge, not the row's bottom.
+        // Opaque card edge for transcript clearance; status shelf below is translucent.
         data-composer-card
         className={cn(
           "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-sm transition",

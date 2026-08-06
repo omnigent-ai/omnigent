@@ -3651,11 +3651,8 @@ export function NewChatLandingScreen() {
             // Two visual states only (no hover): resting --border, and
             // --foreground while the textarea itself has focus (has-[]
             // scopes it so focusing footer buttons doesn't trigger it).
-            // dark:bg-card-solid: the footer tray below tucks its top
-            // edge behind this card (-mt-9), and the dark glass --card
-            // is 60% alpha — the tucked strip ghosts through a
-            // translucent card. Mirrors the chat composer card. Drag-over
-            // lifts an inset ring (overlay below).
+            // dark:bg-card-solid: opaque fill so dark glass --card doesn't
+            // show through; mirrors the chat composer. Drag-over inset ring.
             className={cn(
               "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)] transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground",
               isDragActive && "ring-2 ring-ring ring-inset",
@@ -4051,16 +4048,9 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </form>
-          {/* Composer footer tray — host / working directory / worktree
-              selectors. Renders below the pill at z-0 while the pill sits
-              at z-10: -mt-9 cancels the wrapper's gap-3 (12px) and tucks
-              the tray's top 24px underneath the pill's rounded bottom
-              edge. Height is padding-driven (pt-8 + h-6 chips + pb-2 =
-              the same 64px as before when the chips fit one row) so the
-              chip row can wrap on narrow screens — with a fixed h-16 the
-              chips overflowed the viewport on phones, widening the whole
-              page (#sidebar-wider-than-screen on the landing page). */}
-          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl bg-tray/40 pt-8 pr-3 pb-2 pl-2">
+          {/* Footer tray (host / cwd / worktree). z-0 under the pill; -mt-9
+              tucks under it. Padding-driven height so chips can wrap. */}
+          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl pt-8 pr-3 pb-2 pl-2">
             <div className="flex flex-wrap items-center gap-1">
               {/* Host chip */}
               <DropdownMenu
