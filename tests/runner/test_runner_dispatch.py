@@ -47,6 +47,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _build_spawn_env_from_spec,
@@ -1248,14 +1249,21 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Spec resolver failures are surfaced as structured 503 errors.
 
     :param caplog: Pytest log capture, used to confirm the raw cause is
         logged server-side (the other half of the log-and-genericize
         contract).
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir, standing in for the runner's log file
+        so the surfaced path is deterministic.
     :returns: None.
     """
+    runner_log = tmp_path / "runner-conv_spec_resolver_failed.log"
+    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(runner_log))
 
     async def _failing_spec_resolver(
         agent_id: str, session_id: str | None = None
@@ -1289,11 +1297,13 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
 
     assert response.status_code == 503
     body = response.json()
-    # The structured error slug is preserved for the caller; the detail is a
-    # fixed client-safe string. The raw resolver exception text must not leak
-    # into the HTTP body (it is logged on the runner instead).
+    # The structured error slug is preserved for the caller; the detail names
+    # the runner log holding the cause. The raw resolver exception text must
+    # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
-    assert body["detail"] == "Request failed on the runner; see runner logs for details."
+    assert body["detail"] == (
+        f"Request failed on the runner; see the runner log for details: {runner_log}"
+    )
     assert "spec resolver unavailable" not in body["detail"]
     # The other half of the contract: the raw cause IS logged for operators.
     # If this fails, log-and-genericize logged nothing and the detail is the

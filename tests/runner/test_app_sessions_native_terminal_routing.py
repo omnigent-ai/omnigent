@@ -16,6 +16,7 @@ from omnigent import (
 )
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _auto_create_repl_terminal,
@@ -205,6 +206,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
 @pytest.mark.asyncio
 async def test_create_session_terminal_ensure_failure_returns_json_without_live_error(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     Native terminal ensure failures are reported to AP, not published live.
@@ -218,9 +220,13 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     the relay.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir, standing in for the runner's log file
+        so the surfaced path is deterministic.
     :returns: None.
     """
     sid = "aefc71354fadf0dd2ae5c224c40e772c"
+    runner_log = tmp_path / "runner-aefc7135.log"
+    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(runner_log))
 
     async def _failing_auto_create(
         session_id: str,
@@ -257,13 +263,13 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         )
 
     assert resp.status_code == 500
-    # Structured code is preserved; the message is a fixed client-safe
-    # string. The raw ImportError text ("requires the 'claude' CLI") must
-    # not appear in the HTTP body — it is logged on the runner instead.
+    # Structured code is preserved; the message names the runner log file so
+    # the reader can find the cause. The raw ImportError text ("requires the
+    # 'claude' CLI") must not appear in the HTTP body — only in that log.
     body = resp.json()
     assert body["error"]["code"] == "native_terminal_start_failed"
     assert body["error"]["message"] == (
-        "Native Claude terminal failed to start; see runner logs for details."
+        f"Native Claude terminal failed to start; see the runner log for details: {runner_log}"
     )
     assert "requires the 'claude' CLI" not in body["error"]["message"]
 

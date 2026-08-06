@@ -36,6 +36,7 @@ from omnigent.claude_native_bridge import (
 )
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -1713,6 +1714,8 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
 
 def test_publish_native_terminal_start_error_emits_failed_status_only(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     Native terminal startup failure publishes a generic ``failed`` status.
@@ -1724,13 +1727,18 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     and then publish/persist a second error when the user message
     fast-fails against the same terminal.
 
-    The published/returned message is a fixed, client-safe string — the raw
-    exception text (which can embed paths/CLI details) is logged for
+    The published/returned message names the runner's log file — the raw
+    exception text (which can embed paths/CLI details) is logged there for
     operators, not surfaced on the session stream.
 
     :param caplog: Pytest log capture fixture, used to confirm the raw
         cause is logged server-side.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir, standing in for the runner's log file
+        so the surfaced path is deterministic.
     """
+    runner_log = tmp_path / "runner-415c9954.log"
+    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(runner_log))
     published: list[_PublishedEvent] = []
 
     def _capture(session_id: str, event: dict[str, Any]) -> None:
@@ -1744,10 +1752,12 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
             ImportError("Native Codex requires the 'codex' CLI on PATH."),
         )
 
-    # Generic, client-safe payload — no raw exception text.
+    # Client-safe payload pointing at the runner log — no raw exception text.
     assert error == {
         "code": "native_terminal_start_failed",
-        "message": "Native Codex terminal failed to start; see runner logs for details.",
+        "message": (
+            f"Native Codex terminal failed to start; see the runner log for details: {runner_log}"
+        ),
     }
     # The raw cause must NOT leak into the surfaced message, but MUST be
     # logged for operators. If this fails, the redaction regressed (raw

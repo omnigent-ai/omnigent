@@ -67,6 +67,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
+from omnigent.process_logging import process_log_reference
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals
 from omnigent.runner.background_titles import (
@@ -301,14 +302,21 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     only this fixed string. The structured ``error`` code that accompanies
     the detail already names the failure category for the caller.
 
+    The runner's own log path is named so the reader can go read the cause
+    instead of hunting for it; it is home-relative (``~/…``) so it points
+    somewhere without leaking the account name.
+
     :param exc: The caught exception, e.g. a ``RuntimeError`` from a harness
         spawn or an ``InvalidPath`` from path validation.
     :param context: Short operator-facing label for the failing operation,
         e.g. ``"harness spawn"``. Appears only in the server log.
-    :returns: A fixed, non-sensitive string safe to return to clients.
+    :returns: A non-sensitive string safe to return to clients, e.g.
+        ``"Request failed on the runner; see the runner log for details:
+        ~/.omnigent/logs/runner/runner-conv_ab12.log"``.
     """
     _logger.warning("%s failed: %s", context, exc, exc_info=exc)
-    return "Request failed on the runner; see runner logs for details."
+    log_reference = process_log_reference("runner")
+    return f"Request failed on the runner; see the runner log for details: {log_reference}"
 
 
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec

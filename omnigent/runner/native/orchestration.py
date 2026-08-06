@@ -53,6 +53,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native_dispatch import resolve_hook
+from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -5261,20 +5262,25 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
-        JSON error responses. The message is a fixed, client-safe string;
-        the raw cause is logged for operators, not surfaced to the caller.
+        JSON error responses. The message is a client-safe string naming
+        the runner's log file; the raw cause is logged there for operators,
+        not surfaced to the caller.
     """
     _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=exc)
     if IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
-        # Give the client an actionable message instead of "see runner logs".
+        # Give the client an actionable message instead of a log pointer.
         message = (
             f"Native {runtime_name} terminal (tmux/PTY) is not supported on "
             "Windows. Use an SDK-based harness (e.g. claude-sdk, cursor, "
             "copilot, or codex) for this agent, or run it on Linux/macOS."
         )
     else:
-        message = f"Native {runtime_name} terminal failed to start; see runner logs for details."
+        log_reference = process_log_reference("runner")
+        message = (
+            f"Native {runtime_name} terminal failed to start; "
+            f"see the runner log for details: {log_reference}"
+        )
     return {"code": _NATIVE_TERMINAL_START_FAILED_CODE, "message": message}
 
 
