@@ -15,6 +15,7 @@ never sees the first message pre-inference and the turn gate would never fire.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -1823,6 +1824,61 @@ async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
         ]
         assert len(requested) == 1
     finally:
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+        _model_options_stale.discard(session_id)
+
+
+async def test_launch_prefetch_takes_the_stale_refresh_off_the_turn_path() -> None:
+    """
+    Warming the catalog when the runner binds is what makes a first turn fast.
+
+    The stale-catalog refresh is the biggest single term in routing's
+    pre-router latency: the turn awaits a fetch that retries a booting runner.
+    Started at launch instead, it has landed by the time the prompt arrives and
+    the turn reads the cache — no wait, no second fetch.
+    """
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _model_options_inflight,
+        _model_options_stale,
+        _native_turn_catalog,
+    )
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_launch"
+    conv = _native_conv(session_id)
+    # What the host resolved before launch — stale, so a turn would refetch it.
+    _model_options_cache[session_id] = [{"id": "opus", "model": "databricks-claude-opus-5"}]
+    _model_options_stale.add(session_id)
+    requested: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"workers": {"self": {"models": [{"id": "opus"}]}}})
+        return httpx.Response(
+            200, json={"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+    try:
+        prefetch_session_routing_catalogs(session_id, conv, runner_client)
+        inflight = _model_options_inflight.get(session_id)
+        assert inflight is not None
+        await inflight
+        assert session_id not in _model_options_stale
+        requested.clear()
+
+        assert await _native_turn_catalog(session_id, conv, runner_client) == [
+            "databricks-claude-opus-4-8"
+        ]
+        # The turn neither waited nor re-fetched: the launch prefetch answered.
+        assert requested == []
+    finally:
+        await asyncio.sleep(0)
         await runner_client.aclose()
         _model_options_cache.pop(session_id, None)
         _model_options_stale.discard(session_id)

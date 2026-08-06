@@ -465,6 +465,11 @@ _model_options_stale: set[str] = set()
 _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
+# Strong references to fire-and-forget catalog prefetches, so a task cannot be
+# garbage-collected mid-flight. Entries remove themselves when they finish.
+_catalog_prefetch_tasks: set[asyncio.Task[None]] = set()
+
+
 _pushed_model_options_cache: dict[str, list[dict[str, Any]]] = {}
 
 
@@ -841,6 +846,7 @@ __all__ = [
     "_browser_action_claims",
     "_browser_action_owners",
     "_browser_action_registry",
+    "_catalog_prefetch_tasks",
     "_deferred_elicitation_clear_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",

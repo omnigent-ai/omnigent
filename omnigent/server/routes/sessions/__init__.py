@@ -527,6 +527,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel as _wait_for_managed_runner_tunnel,
     announce_hosts_changed as announce_hosts_changed,
     cancel_managed_launch_tasks as cancel_managed_launch_tasks,
+    prefetch_session_routing_catalogs as prefetch_session_routing_catalogs,
 )
 
 # Runner-forward / ASK-gate helpers are patched by tests on this facade module

@@ -3973,17 +3973,27 @@ async def _refresh_stale_native_model_options(
     """
     if runner_client is None or session_id not in _model_options_stale:
         return
+    # This wait was the biggest single term in routing's pre-router latency on
+    # a first message, and nothing named it in the logs. Time it, so the ladder
+    # above can be sized against a measurement rather than a guess.
+    started = time.monotonic()
     inflight = _model_options_inflight.get(session_id)
-    if inflight is not None:
-        await _await_briefly(inflight)
-        return
-    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
-    task = asyncio.create_task(
-        _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+    if inflight is None:
+        endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
+        inflight = asyncio.create_task(
+            _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+        )
+        _model_options_inflight[session_id] = inflight
+        inflight.add_done_callback(
+            lambda _t, sid=session_id: _model_options_inflight.pop(sid, None)
+        )
+    await _await_briefly(inflight)
+    _logger.info(
+        "smart_routing: session=%s stale catalog refresh waited %.3fs (still_stale=%s)",
+        session_id,
+        time.monotonic() - started,
+        session_id in _model_options_stale,
     )
-    _model_options_inflight[session_id] = task
-    task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
-    await _await_briefly(task)
 
 
 async def _await_briefly(task: asyncio.Task[None]) -> None:
