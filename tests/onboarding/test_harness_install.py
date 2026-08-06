@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
@@ -1111,7 +1112,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
     [
         (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
-        (hi.KIMI_KEY, "1.47.0", None),
+        (hi.KIMI_KEY, "0.29.1", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
         (hi.PI_KEY, "0.79.0", None),
@@ -1249,7 +1250,7 @@ def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
         ("cursor-agent 2026.07.01-777f564", "2026.07.01"),
         ("2026.06.19-20-24-33-653a7fb", "2026.06.19"),
         ("2026.05.24.1.dda726e", "2026.05.24"),
-        ("kimi version 1.47.0", "1.47.0"),
+        ("kimi version 0.32.0", "0.32.0"),
         ("1.17.7-rc1", "1.17.7-rc1"),
     ],
 )
@@ -1263,7 +1264,6 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     "key,outdated,satisfying",
     [
         (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
-        (hi.KIMI_KEY, "1.46.0", "1.48.0"),
         (hi.HERMES_KEY, "2026.05.29", "2026.06.19"),
     ],
 )
@@ -1273,7 +1273,7 @@ def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
     outdated: str,
     satisfying: str,
 ) -> None:
-    """Cursor and Kimi default to the first release after 2026-06-01."""
+    """Cursor and Hermes default to the first release after 2026-06-01."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
@@ -1295,6 +1295,44 @@ def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
 
     monkeypatch.setattr(hi.subprocess, "run", _run_ok)
     assert hi.harness_cli_installed(key) is True
+
+
+@pytest.mark.parametrize("version", ["0.29.1", "0.32.0", "1.0.0"])
+def test_kimi_floor_accepts_the_kimi_code_0x_series(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """A shipped Kimi Code build must read as installed, not "Needs upgrade".
+
+    The binary gated here is Kimi *Code* (``code.kimi.com`` installer), which
+    versions in a 0.x series — not the separate 1.x ``kimi-cli`` project, whose
+    command surface this spec deliberately rejects (see
+    :func:`test_kimi_only_upstream_binary_satisfies_readiness`). A floor taken
+    from ``kimi-cli``'s changelog is unreachable for every real install: setup
+    prints "Kimi Code ✗ Needs upgrade" and ``harness_readiness`` refuses to
+    launch the harness at all, no matter how current the user's CLI is.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_kimi_floor_stays_in_the_kimi_code_version_series() -> None:
+    """The declared kimi floor must be a 0.x version.
+
+    Guards the wrong-project regression directly: any future floor lifted from
+    ``kimi-cli`` (1.x) would again be unreachable for the CLI Omnigent installs.
+    """
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None and spec.min_version is not None
+    assert Version(spec.min_version) < Version("1.0.0")
 
 
 def test_harness_cli_installed_false_when_version_unparseable(
