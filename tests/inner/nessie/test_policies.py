@@ -390,8 +390,9 @@ def test_team_bounds_state_is_per_evaluator_instance() -> None:
     why the caps fire there — this test pins the contrast so nobody reads
     those as proof of an enforced server-side wave bound.
 
-    ``spawn_bounds`` has the same limitation (see the polly CUJ notes); it is
-    documented in ``designs/team-p2p-parity-experiment.md``.
+    ``spawn_bounds`` has the same limitation, so this is a property of the
+    evaluation path rather than of either policy (see the polly CUJ's
+    ``scenario_fanout_dispatch`` notes).
     """
     # A single evaluator bounds the wave: the 3rd send is refused.
     shared = team_bounds(max_peer_sends_per_turn=2, max_team_peers=2)

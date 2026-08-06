@@ -3,8 +3,8 @@
 
 Validates the agent-team peer-messaging feature end-to-end against a live
 server + sibling runner + mock LLM — using the *native* ``sys_session_send``
-tool, nothing swapped out. See ``designs/team-p2p-parity-experiment.md`` for the
-rationale and the scenario list.
+tool, nothing swapped out. The bundle (a lead plus alice/bob teammates) is
+synthesized in ``_rewrite_team_bundle``, so the driver needs nothing on disk.
 
 The load-bearing claim under test: when teammate ALICE messages teammate BOB by
 ``session_id`` (both under the same team root), BOB's reply is delivered into
@@ -150,7 +150,13 @@ def _rewrite_team_bundle(
     team: bool = True,
     peer_send_cap: int | None = None,
 ) -> Path:
-    """Copy ``examples/team_demo`` into *tmp*, wired to the mock LLM.
+    """Synthesize a minimal lead + alice/bob team bundle in *tmp*.
+
+    The bundle is written here rather than copied from a checked-in example so
+    the driver is self-contained: the shapes it asserts on (the top-level
+    ``team`` flag, ``spawn`` on each leaf teammate, one mock model per session)
+    are the things under test, and reading them from a file someone can edit
+    for unrelated reasons makes a failure ambiguous.
 
     Each session gets its own mock model key so the coordinator, alice, and bob
     draw from independent scripted queues. ``team`` toggles the TOP-LEVEL opt-in
@@ -159,53 +165,91 @@ def _rewrite_team_bundle(
     both teammates all resolve this one flag. Setting it ``False`` is how the
     negative scenario (S3) proves the peer send is refused.
 
-    ``peer_send_cap`` overrides the TOP-LEVEL ``team_bounds`` per-turn cap (S4).
-    The bound must live at the top level: declared sub-agents share the parent
+    ``peer_send_cap`` adds the TOP-LEVEL ``team_bounds`` per-turn cap (S4). The
+    bound must live at the top level: declared sub-agents share the parent
     bundle's ``agent_id``, so the server evaluates alice's tool calls against the
     top-level spec's guardrails — her own sub-config ``guardrails`` block is
     never loaded for policy evaluation.
     """
-    src = (_REPO_ROOT / "examples" / "team_demo").resolve()
     dst = tmp / "team_demo"
     if dst.exists():
         shutil.rmtree(dst)
-    shutil.copytree(src, dst, symlinks=False)
 
-    def _wire(cfg_path: Path, model: str, *, team_flag: bool | None) -> None:
-        spec = yaml.safe_load(cfg_path.read_text())
-        if team_flag is not None:
-            spec["team"] = team_flag
-        executor = spec.setdefault("executor", {})
-        exec_cfg = executor.pop("config", {}) or {}
-        exec_cfg["harness"] = "openai-agents"
-        executor["config"] = exec_cfg
-        executor["model"] = model
-        executor["auth"] = {
-            "type": "api_key",
-            "api_key": "mock-key",
-            "base_url": f"{mock_url}/v1",
-        }
-        executor["connection"] = {"base_url": f"{mock_url}/v1", "api_key": "mock-key"}
-        cfg_path.write_text(yaml.safe_dump(spec, sort_keys=False))
-
-    _wire(dst / "config.yaml", _COORD_MODEL, team_flag=team)
-    _wire(dst / "agents" / "alice" / "config.yaml", _ALICE_MODEL, team_flag=None)
-    _wire(dst / "agents" / "bob" / "config.yaml", _BOB_MODEL, team_flag=None)
-
-    if peer_send_cap is not None:
-        cfg_path = dst / "config.yaml"
-        spec = yaml.safe_load(cfg_path.read_text())
-        # The example ships without a peer-send bound (a team messages freely),
-        # so S4 adds the policy itself rather than editing an existing block.
-        policies = spec.setdefault("guardrails", {}).setdefault("policies", {})
-        policies["team_bounds"] = {
-            "type": "function",
-            "function": {
-                "path": "omnigent.inner.nessie.policies.team_bounds",
-                "arguments": {"max_peer_sends_per_turn": peer_send_cap},
+    def _executor(model: str) -> dict[str, object]:
+        return {
+            "type": "omnigent",
+            "config": {"harness": "openai-agents"},
+            "model": model,
+            "auth": {
+                "type": "api_key",
+                "api_key": "mock-key",
+                "base_url": f"{mock_url}/v1",
             },
+            "connection": {"base_url": f"{mock_url}/v1", "api_key": "mock-key"},
         }
-        cfg_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+
+    # ``spawn: true`` is what REGISTERS sys_session_send on a leaf teammate (the
+    # read tools are always on; the write tool needs declared sub-agents or
+    # spawn). ``team: true`` is what AUTHORIZES the peer target.
+    def _teammate(name: str, model: str) -> dict[str, object]:
+        return {
+            "spec_version": 1,
+            "name": name,
+            "description": f"{name} — a peer teammate that messages siblings by session_id.",
+            "team": True,
+            "spawn": True,
+            "executor": _executor(model),
+            "prompt": (
+                f"You are {name}, a teammate on an agent team. Siblings are peers you "
+                "can message directly: call sys_session_list to find a teammate's "
+                "conversation_id, sys_session_send with that session_id, then "
+                "sys_read_inbox to collect the reply. Act in the same turn you "
+                "announce.\n"
+            ),
+            "async": True,
+            "cancellable": True,
+            "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+        }
+
+    lead: dict[str, object] = {
+        "spec_version": 1,
+        "name": "team_demo",
+        "description": "An agent-team lead that spawns two peer teammates (alice, bob).",
+        "team": team,
+        "executor": _executor(_COORD_MODEL),
+        "prompt": (
+            "You are the coordinator of a small agent team with teammates alice and "
+            "bob. Spawn both, then instruct alice to discover bob via "
+            "sys_session_list and message him by session_id. Supervise via the "
+            "inbox: end your turn after dispatching.\n"
+        ),
+        "async": True,
+        "cancellable": True,
+        "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+        "tools": {"agents": ["alice", "bob"]},
+    }
+    if peer_send_cap is not None:
+        lead["guardrails"] = {
+            "policies": {
+                "team_bounds": {
+                    "type": "function",
+                    "function": {
+                        "path": "omnigent.inner.nessie.policies.team_bounds",
+                        "arguments": {"max_peer_sends_per_turn": peer_send_cap},
+                    },
+                }
+            }
+        }
+
+    (dst / "agents" / "alice").mkdir(parents=True)
+    (dst / "agents" / "bob").mkdir(parents=True)
+    (dst / "config.yaml").write_text(yaml.safe_dump(lead, sort_keys=False))
+    (dst / "agents" / "alice" / "config.yaml").write_text(
+        yaml.safe_dump(_teammate("alice", _ALICE_MODEL), sort_keys=False)
+    )
+    (dst / "agents" / "bob" / "config.yaml").write_text(
+        yaml.safe_dump(_teammate("bob", _BOB_MODEL), sort_keys=False)
+    )
     return dst
 
 
@@ -781,10 +825,6 @@ def main(argv: list[str] | None = None) -> int:
         chosen = [args.scenario]
     else:
         print(f"error: unknown scenario {args.scenario!r}; try --list-scenarios", file=sys.stderr)
-        return 2
-
-    if not (_REPO_ROOT / "examples" / "team_demo" / "config.yaml").exists():
-        print("error: examples/team_demo not found", file=sys.stderr)
         return 2
 
     tmp = Path(tempfile.mkdtemp(prefix="team-p2p-cuj-"))
