@@ -2,7 +2,6 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
-import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { HistoryAutoLoader, JumpToTopButton, LatestTurnSpacer } from "./ChatPage";
 
@@ -210,30 +209,25 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
-  it("starts initial paging when the live scroll element becomes available after mount", () => {
-    const loadMoreHistory = vi.fn(async () => {
-      useChatStore.setState({ loadingMoreHistory: true });
-    });
+  it("leaves the initial window to the store, fetching nothing on mount", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    // A mid-turn window — one real prompt with older history behind it, the
+    // shape that used to make this effect page once per frame. The store now
+    // completes the window in a single commit, so mounting well clear of the
+    // top threshold must fetch nothing.
     useChatStore.setState({
       blocks: [userBlock("latest")],
       hasMoreHistory: true,
+      oldestItemId: "item_1",
       loadMoreHistory,
     });
     const scrollRoot = document.createElement("div");
     setScrollMetrics(scrollRoot, { scrollTop: 600, scrollHeight: 1000, clientHeight: 500 });
-    stickContext.scrollRef.current = null;
+    stickContext.scrollRef.current = scrollRoot;
 
-    function DeferredScroller() {
-      const [scrollElement, setScrollElement] = useState<HTMLElement | null>(null);
-      useEffect(() => {
-        setScrollElement(scrollRoot);
-      }, []);
-      return <HistoryAutoLoader scrollElement={scrollElement} />;
-    }
+    render(<HistoryAutoLoader />);
 
-    render(<DeferredScroller />);
-
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
   });
 
   it("keeps loading after reaching the top during an in-flight fetch", () => {
@@ -261,68 +255,6 @@ describe("HistoryAutoLoader", () => {
       useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_1" });
     });
     expect(loadMoreHistory).toHaveBeenCalledTimes(2);
-  });
-
-  it("loads to the second real user prompt even when the viewport already scrolls", () => {
-    const loadMoreHistory = vi.fn(async () => {
-      useChatStore.setState({ loadingMoreHistory: true });
-    });
-    useChatStore.setState({
-      blocks: [userBlock("latest"), userBlock("system", "[System: task completed]")],
-      hasMoreHistory: true,
-      loadMoreHistory,
-    });
-    const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
-    stickContext.scrollRef.current = scrollRoot;
-
-    render(<HistoryAutoLoader />);
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
-    expect(useChatStore.getState().loadingMoreHistory).toBe(true);
-
-    act(() => {
-      useChatStore.setState({
-        blocks: [userBlock("previous"), userBlock("latest")],
-        loadingMoreHistory: false,
-        oldestItemId: "item_1",
-      });
-    });
-
-    expect(useChatStore.getState().loadingMoreHistory).toBe(false);
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
-  });
-
-  it("caps the prompt search at the page cap", () => {
-    const loadMoreHistory = vi.fn(async () => {
-      useChatStore.setState({ loadingMoreHistory: true });
-    });
-    useChatStore.setState({
-      blocks: [userBlock("latest")],
-      hasMoreHistory: true,
-      loadMoreHistory,
-    });
-
-    const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
-    stickContext.scrollRef.current = scrollRoot;
-
-    render(<HistoryAutoLoader />);
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
-
-    // The newest page counts as page one. Settle older pages without finding a
-    // second prompt; the semantic search must stop at the cap — reachability is
-    // no longer this loop's job (the spacer keeps the pane scrollable).
-    for (let page = 2; page <= MAX_INITIAL_PAGES; page++) {
-      act(() => {
-        useChatStore.setState({
-          loadingMoreHistory: false,
-          oldestItemId: `item_${page + 1}`,
-        });
-      });
-    }
-
-    // MAX_INITIAL_PAGES total fetches: the initial page plus (cap − 1) more.
-    expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES - 1);
   });
 
   it("does not page a short window for viewport fill (the spacer handles reachability)", () => {
@@ -446,7 +378,7 @@ describe("LatestTurnSpacer", () => {
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
 
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 500 });
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
     stickContext.scrollRef.current = scrollRoot;
 
     const anchor = document.createElement("div");
@@ -458,7 +390,7 @@ describe("LatestTurnSpacer", () => {
     vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (
       this: HTMLDivElement,
     ) {
-      return this.getAttribute("aria-hidden") !== null ? rect(100) : rect(0);
+      return this.getAttribute("aria-hidden") !== null ? rect(400) : rect(0);
     });
 
     const onRender = vi.fn();
@@ -469,14 +401,24 @@ describe("LatestTurnSpacer", () => {
     );
 
     const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
-    expect(spacer.style.height).toBe("304px");
+    expect(spacer.style.height).toBe("104px");
     expect(onRender).toHaveBeenCalledTimes(1);
   });
 
-  it("pads a short reply so the anchor prompt pins to the top", () => {
-    // anchor→end = 100px content, viewport 500 → spacer = 500 − 100 − 96 = 304.
-    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 100, anchor: "user" })).toBe(
-      304,
+  it("pads a reply that falls short of the viewport so the anchor pins near the top", () => {
+    // anchor→end = 400px content, viewport 600 → 600 − 400 − 96 = 104, which is
+    // under the 200px cap, so the pin-to-top formula is what applies here.
+    expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 400, anchor: "user" })).toBe(
+      104,
+    );
+  });
+
+  it("caps the reserved space so a short turn does not blank most of the viewport", () => {
+    // anchor→end = 100px, viewport 600 → the raw pin formula wants
+    // 600 − 100 − 96 = 404px of blank (two thirds of the screen). The cap holds
+    // it to a third, so the anchor sits lower and earlier turns stay on screen.
+    expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 100, anchor: "user" })).toBe(
+      200,
     );
   });
 
@@ -489,9 +431,9 @@ describe("LatestTurnSpacer", () => {
   });
 
   it("anchors to the last assistant text when no user prompt is present", () => {
-    // 500 − 50 − 96 = 354.
-    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 50, anchor: "text" })).toBe(
-      354,
+    // 600 − 400 − 96 = 104 (under the cap, so anchor choice is what's measured).
+    expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 400, anchor: "text" })).toBe(
+      104,
     );
   });
 
@@ -513,7 +455,7 @@ describe("LatestTurnSpacer", () => {
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
 
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 500 });
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
     stickContext.scrollRef.current = scrollRoot;
 
     const initial = document.createElement("div");
@@ -531,9 +473,11 @@ describe("LatestTurnSpacer", () => {
     useChatStore.setState({ blocks: [userBlock("initial-user")] });
     const { container } = render(<LatestTurnSpacer />);
     const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
-    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(200));
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
     act(() => holder.cb?.());
-    expect(spacer.style.height).toBe("204px");
+    // Measured from the initial prompt: 600 − 400 − 96 = 104. Retargeting to
+    // the promoted prompt would give 600 − 250 − 96 = 254 → capped to 200.
+    expect(spacer.style.height).toBe("104px");
 
     // The consumed event moves the pending prompt into committed blocks. The
     // spacer still measures from the initial prompt instead of retargeting.
@@ -541,7 +485,7 @@ describe("LatestTurnSpacer", () => {
       useChatStore.setState({ blocks: [userBlock("initial-user"), userBlock("pending-user")] });
       holder.cb?.();
     });
-    expect(spacer.style.height).toBe("204px");
+    expect(spacer.style.height).toBe("104px");
   });
 
   it("does not create an anchor after an initially empty conversation's first prompt commits", () => {

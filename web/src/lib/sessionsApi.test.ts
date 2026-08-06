@@ -7,6 +7,7 @@
 // useful client-side error trail.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConversationItem } from "./conversationItems";
 import {
   approve,
   bindOnlyOnlineRunner,
@@ -14,6 +15,8 @@ import {
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
   forkSession,
+  initialWindowNeedsMore,
+  type SessionItemsPage,
   getSession,
   getSessionSlim,
   interrupt,
@@ -857,6 +860,10 @@ describe("fetchInitialHistoryWindow", () => {
       content: [{ type: "output_text", text: id }],
     };
   }
+  /** An already-fetched window, chronological — what `bindStream` seeds with. */
+  function seedPage(itemsChronological: { id: string }[], hasMore: boolean): SessionItemsPage {
+    return { items: itemsChronological as unknown as ConversationItem[], hasMore };
+  }
   function pageBody(dataNewestFirst: { id: string }[], hasMore: boolean): Response {
     return mockJsonResponse({
       object: "list",
@@ -962,6 +969,44 @@ describe("fetchInitialHistoryWindow", () => {
     // Both real prompts present; the meta page alone would have stopped a
     // count-only window short of any real prompt.
     expect(page.items.filter((i) => i.id === "u_prev" || i.id === "u_last")).toHaveLength(2);
+  });
+
+  it("initialWindowNeedsMore gates the extra round trips on the bind's page", () => {
+    // The bind pays for older pages only when its own page stops short of
+    // the prompt boundary — and never once history is exhausted.
+    expect(initialWindowNeedsMore(seedPage([asstWire("a_1"), userWire("u_last")], true))).toBe(
+      true,
+    );
+    expect(initialWindowNeedsMore(seedPage([userWire("u_prev"), userWire("u_last")], true))).toBe(
+      false,
+    );
+    expect(initialWindowNeedsMore(seedPage([asstWire("a_1")], false))).toBe(false);
+  });
+
+  it("continues from a seed page without refetching it", async () => {
+    // bindStream renders one page, then hands it back here to finish the
+    // window. The seed must be reused, not re-requested: the first fetch
+    // this makes is already the OLDER page, cursored off the seed's oldest
+    // item, and the returned window still spans seed + older.
+    const seed = seedPage([userWire("u_last"), asstWire("a_1")], true);
+    fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_prev"), userWire("u_prev")], true));
+
+    const page = await fetchInitialHistoryWindow("conv_abc", seed);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc&after=u_last`,
+    );
+    expect(page.items.map((i) => i.id)).toEqual(["u_prev", "a_prev", "u_last", "a_1"]);
+  });
+
+  it("returns a seed that already meets the boundary without fetching at all", async () => {
+    const seed = seedPage([userWire("u_prev"), userWire("u_last")], true);
+
+    const page = await fetchInitialHistoryWindow("conv_abc", seed);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(page).toEqual(seed);
   });
 
   it("stops at MAX_INITIAL_PAGES, leaving hasMore=true so scroll-up still reaches older items", async () => {

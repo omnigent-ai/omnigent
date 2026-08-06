@@ -29,6 +29,31 @@ const loadCode = (): Promise<CodeHighlighterPlugin> => {
   return codePromise;
 };
 
+/**
+ * Load the highlighting engine during idle time, before any code block asks
+ * for it.
+ *
+ * Until the engine resolves, `highlight` below returns null and every code
+ * block paints as plain text, then re-renders tokenized at a different height
+ * — which shifts the transcript under the reader, since the scroll container
+ * runs with `overflow-anchor: none`. Warming it early means the common case
+ * highlights on the first paint instead.
+ *
+ * Idempotent: later calls (and any real highlight) reuse the same promise.
+ */
+export const schedulePrewarmCodeHighlighter = (): void => {
+  if (codePromise !== null) return;
+  const warm = (): void => void loadCode();
+  if (typeof requestIdleCallback === "function") {
+    requestIdleCallback(warm, { timeout: PREWARM_TIMEOUT_MS });
+  } else {
+    setTimeout(warm, 0);
+  }
+};
+
+/** Idle deadline for the pre-warm: load it anyway if the tab stays busy. */
+const PREWARM_TIMEOUT_MS = 2000;
+
 export const lazyCodePlugin: CodeHighlighterPlugin = {
   name: "shiki",
   type: "code-highlighter",

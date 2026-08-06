@@ -21,6 +21,7 @@ import {
   supportsBrowser,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { schedulePrewarmCodeHighlighter } from "@/components/ai-elements/lazyCodePlugin";
 import {
   buildDesignModePrompt,
   dataUrlToFile,
@@ -134,6 +135,13 @@ export function AppShell() {
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
   useIOSViewportLock();
+
+  // Warm the code highlighter while the shell settles, so a transcript's code
+  // blocks are tokenized on their first paint instead of re-laying out once
+  // the engine arrives. Idle-scheduled, so it never delays the first render.
+  useEffect(() => {
+    schedulePrewarmCodeHighlighter();
+  }, []);
 
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.

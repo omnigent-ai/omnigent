@@ -55,7 +55,6 @@ import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
-import { initialWindowComplete } from "@/lib/sessionsApi";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
@@ -2257,7 +2256,7 @@ function HistoryLoadingIndicator() {
   );
 }
 
-/** Builds the initial history window, then keeps loading near the top. */
+/** Loads older history when the reader scrolls near the top. */
 const HISTORY_LOAD_TOP_THRESHOLD_PX = 500;
 
 export function HistoryAutoLoader({
@@ -2277,7 +2276,6 @@ export function HistoryAutoLoader({
   // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
   // still changes when many fetched tool calls collapse into one visual row.
   const oldestItemId = useChatStore((s) => s.oldestItemId);
-  const pagesFetchedRef = useRef(1);
   const generationRef = useRef(historyGeneration);
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
@@ -2322,17 +2320,10 @@ export function HistoryAutoLoader({
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
-      pagesFetchedRef.current = 1;
       prevScrollHeightRef.current = null;
     }
 
     const state = useChatStore.getState();
-    const userPromptCount = state.blocks.reduce(
-      (count, block) =>
-        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
-      0,
-    );
-    const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
     if ((itemsChanged || loadingChanged) && prevScrollHeightRef.current !== null) {
       const nextScrollTop = Math.max(
@@ -2348,13 +2339,12 @@ export function HistoryAutoLoader({
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
-      (!buildingInitialWindow &&
-        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX))
+      !(itemsChanged || scrollPositionChanged) ||
+      el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX
     ) {
       return;
     }
 
-    if (buildingInitialWindow) pagesFetchedRef.current += 1;
     void state.loadMoreHistory();
   }, [
     ctx.scrollRef,
@@ -2374,6 +2364,15 @@ export function HistoryAutoLoader({
 const PINNED_ANCHOR_TOP_GAP_PX = 96;
 
 /**
+ * Ceiling on the reserved space, as a share of the viewport. Pinning a SHORT
+ * latest turn to the top costs almost a full screen of blank, with readable
+ * history sitting just above the fold. Capping it keeps most of the viewport
+ * showing real messages; a long turn is unaffected, since it already needs
+ * little or no reserved space to reach the top.
+ */
+const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
+
+/**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
  * the viewport — the newest committed user prompt, or (on a page deep in a
  * long tool chain with no prompt yet) the newest assistant text output. The
@@ -2386,11 +2385,14 @@ const PINNED_ANCHOR_TOP_GAP_PX = 96;
  * by scroll-up without a viewport-fill loop.
  *
  * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
- * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
- * once the reply alone exceeds the viewport the spacer collapses to 0 and
- * normal stick-to-bottom following resumes. The "content-bottom" edge is the
- * spacer's own top, whose position is fixed by the content above it and so is
- * independent of the height we set — the measurement can't feed back on itself.
+ * ≥ 0 and to `MAX_RESERVED_VIEWPORT_FRACTION` of the viewport: a short reply
+ * leaves some empty space below, but never so much that the screen is mostly
+ * blank while history sits just above the fold — past the cap the anchor
+ * simply sits lower and the turns before it stay visible. Once the reply alone
+ * exceeds the viewport the spacer collapses to 0 and normal stick-to-bottom
+ * following resumes. The "content-bottom" edge is the spacer's own top, whose
+ * position is fixed by the content above it and so is independent of the
+ * height we set — the measurement can't feed back on itself.
  */
 export function LatestTurnSpacer({
   scrollElement,
@@ -2458,7 +2460,14 @@ export function LatestTurnSpacer({
     // spacer's top is fixed by the content above it, so this is stable across
     // the height we're about to set — it converges in one pass.
     const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
-    const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
+    const viewport = scrollEl.clientHeight;
+    const next = Math.max(
+      0,
+      Math.min(
+        viewport - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX,
+        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
+      ),
+    );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
   }, [ctx.scrollRef, scrollElement]);

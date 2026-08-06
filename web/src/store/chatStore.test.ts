@@ -457,6 +457,41 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
+  it("completes the initial window in one commit, not one per page", async () => {
+    // A turn long enough to span several pages: the newest page holds no
+    // prompt at all, so the window has to reach back past the whole turn.
+    // Paging that from the transcript's layout effect committed once per
+    // page, and every commit grew the content above the viewport and forced
+    // another scroll correction — which is what made a cold open climb and
+    // jitter. The window must now land in a single further commit.
+    const items: ConversationItem[] = [
+      userMessage("old", "the previous prompt"),
+      ...Array.from({ length: 60 }, (_, i) => assistantMessage(`step_${i}`, `step ${i}`)),
+    ];
+    seedSession("conv_window", items);
+
+    const blockCounts: number[] = [];
+    const unsubscribe = useChatStore.subscribe((state, prev) => {
+      if (state.blocks !== prev.blocks) blockCounts.push(state.blocks.length);
+    });
+    try {
+      await useChatStore.getState().switchTo("conv_window");
+      await vi.waitFor(() => {
+        expect(useChatStore.getState().blocks).toHaveLength(items.length);
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    // Reset to empty, the bind's first page, then the whole remaining window.
+    expect(blockCounts).toEqual([0, SESSION_HISTORY_PAGE_SIZE, items.length]);
+    const state = useChatStore.getState();
+    // Reached back past the long turn to the prompt that precedes it.
+    expect(state.blocks[0]!.type).toBe("user_message");
+    expect(state.hasMoreHistory).toBe(false);
+    expect(state.loadingMoreHistory).toBe(false);
+  });
+
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {
     // The core fix: a native web message that hasn't round-tripped
     // through the transcript yet is replayed by the server in

@@ -65,6 +65,7 @@ import {
   getSessionSlim,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
+  initialWindowNeedsMore,
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
@@ -2613,12 +2614,77 @@ async function bindStream(
       };
     });
     racedNativeModelOptions.delete(id);
+    // Grow the window to the prompt boundary in one further commit.
+    void completeInitialWindow(id, page, set, get);
   } catch (err) {
     if (get().conversationId !== id) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
+  }
+}
+
+/**
+ * Finish the initial history window off the render path, in one commit.
+ *
+ * `bindStream` renders after a single page so the newest turn paints on one
+ * round-trip, but a coding transcript's newest page is usually mid-turn (tool
+ * calls outnumber prompts), so the window still has to reach back to the
+ * previous prompt. Paging that from a layout effect committed one page per
+ * frame: every page grew the transcript above the viewport and forced another
+ * scroll correction, which is what made a cold load visibly climb and jitter.
+ *
+ * Fetching the remainder here — looping with no intervening `set`, then
+ * prepending once — keeps that growth to a single reflow the reader never
+ * sees, because it all lands above the pinned anchor.
+ */
+async function completeInitialWindow(
+  id: string,
+  seed: SessionItemsPage,
+  set: Setter,
+  get: Getter,
+): Promise<void> {
+  if (!initialWindowNeedsMore(seed)) return;
+
+  const generation = get().historyGeneration;
+  // Same guard `loadMoreHistory` uses: a window reset mid-flight makes this
+  // page cursor-relative to a window that no longer exists.
+  const stale = (): boolean =>
+    get().conversationId !== id || get().historyGeneration !== generation;
+
+  // Yield first so the bind's page renders before the rest of the window is
+  // fetched: the newest turn is on screen while the older pages load, and the
+  // request never competes with that first paint.
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+  if (stale()) return;
+
+  set({ loadingMoreHistory: true });
+  try {
+    const window = await fetchInitialHistoryWindow(id, seed);
+    if (stale()) return;
+    const newBlocks = itemsToBlocks(window.items);
+    set((state) => {
+      // The window re-includes the seed page; drop what the bind already
+      // committed (and anything the live pump raced in).
+      const seen = new Set(
+        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+      );
+      const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+      return {
+        blocks: [...unique, ...state.blocks],
+        hasMoreHistory: window.hasMore,
+        oldestItemId: window.items[0]?.id ?? state.oldestItemId,
+        loadingMoreHistory: false,
+      };
+    });
+  } catch {
+    if (stale()) return;
+    // Leave scroll-up paging enabled: the window is short but valid, and
+    // `loadMoreHistory` can still reach the rest.
+    set({ loadingMoreHistory: false });
   }
 }
 

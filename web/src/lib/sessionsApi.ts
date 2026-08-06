@@ -846,6 +846,14 @@ export function initialWindowComplete(userPromptCount: number, pagesFetched: num
 }
 
 /**
+ * True when `page` — the single page a bind renders first — still stops short
+ * of the prompt boundary, so the window needs older pages to be usable.
+ */
+export function initialWindowNeedsMore(page: SessionItemsPage): boolean {
+  return page.hasMore && !initialWindowComplete(page.items.filter(isUserPrompt).length, 1);
+}
+
+/**
  * Hydrate the initial conversation window: at least
  * `SESSION_HISTORY_PAGE_SIZE` items, but extended further back when
  * needed so the *previous* user prompt is included — i.e.
@@ -865,21 +873,27 @@ export function initialWindowComplete(userPromptCount: number, pagesFetched: num
  *
  * Returns the same `{ items, hasMore }` shape as `fetchSessionItemsPage`
  * so callers feed `oldestItemId` / `hasMoreHistory` from it unchanged.
+ *
+ * Pass `seed` to continue from a page the caller already has (the one
+ * `bindStream` renders first), so completing the window costs only the
+ * pages still missing rather than refetching from the newest item.
  */
-export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
-  let items: ConversationItem[] = [];
-  let hasMore = true;
+export async function fetchInitialHistoryWindow(
+  sessionId: string,
+  seed?: SessionItemsPage,
+): Promise<SessionItemsPage> {
+  let items: ConversationItem[] = seed ? [...seed.items] : [];
+  let hasMore = seed?.hasMore ?? true;
+  let pagesFetched = seed ? 1 : 0;
   // Each page starts before the cursor returned by the prior page.
   /* oxlint-disable no-await-in-loop */
-  for (let pagesFetched = 1; pagesFetched <= MAX_INITIAL_PAGES; pagesFetched += 1) {
+  while (hasMore && !initialWindowComplete(items.filter(isUserPrompt).length, pagesFetched)) {
     const cursor = items[0]?.id;
+    if (pagesFetched > 0 && !cursor) break; // no cursor to page further; avoid a spin
     const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
     items = [...page.items, ...items]; // prepend the older page
     hasMore = page.hasMore;
-    if (!hasMore) break; // reached the start of the conversation
-    const userPromptCount = items.filter(isUserPrompt).length;
-    if (initialWindowComplete(userPromptCount, pagesFetched)) break;
-    if (!items[0]?.id) break; // no cursor to page further; avoid a spin
+    pagesFetched += 1;
   }
   /* oxlint-enable no-await-in-loop */
   // If the cap stopped us before the previous user prompt (a pathological
