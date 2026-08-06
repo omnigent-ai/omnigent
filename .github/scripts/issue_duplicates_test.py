@@ -183,11 +183,33 @@ class IssueDuplicatesTest(unittest.TestCase):
         self.assertIn("<!-- omnigent-duplicate-check -->", comment)
         self.assertIn("#12", comment)
         self.assertIn("may be related", comment)
+        # Like the duplicate case, this asks the reporter to close it rather than
+        # parking it in a maintainer queue.
+        self.assertIn("please close this one", comment)
+        self.assertNotIn("maintainer", comment)
         # The similar case never surfaces model prose, so injected content in
         # the reasoning cannot reach the comment at all.
         self.assertNotIn("@admin", comment)
         self.assertNotIn("https://example.com", comment)
         self.assertNotIn("#999", comment)
+
+    def test_similar_comment_agrees_in_number_with_its_references(self):
+        """One reference reads "it already covers", several read "they already cover"."""
+
+        def comment_for(numbers):
+            return build_duplicate_comment(
+                {
+                    "duplicate_decision": "similar",
+                    "duplicate_of": None,
+                    "similar_issues": numbers,
+                    "duplicate_confidence": 0.8,
+                    "duplicate_reasoning": "unused",
+                },
+                close_issue=False,
+            )
+
+        self.assertIn("it already covers", comment_for([12]))
+        self.assertIn("they already cover", comment_for([12, 34]))
 
     def test_duplicate_comment_reflects_closure_flag(self):
         decision = {
@@ -202,7 +224,11 @@ class IssueDuplicatesTest(unittest.TestCase):
         close_comment = build_duplicate_comment(decision, close_issue=True)
 
         self.assertIn("#12", observe_comment)
-        self.assertIn("Leaving it open", observe_comment)
+        # The open case asks the reporter to close it themselves rather than
+        # parking the issue in a maintainer queue.
+        self.assertIn("please close this one", observe_comment)
+        self.assertIn("If it doesn't", observe_comment)
+        self.assertNotIn("maintainer", observe_comment)
         self.assertIn("I’m closing it", close_comment)
 
     def test_no_comment_is_built_for_a_none_verdict(self):

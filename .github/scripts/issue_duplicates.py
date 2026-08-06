@@ -363,19 +363,28 @@ def build_duplicate_comment(
                 "If it isn't the same, say so here and a maintainer will reopen it."
             )
         else:
+            # The reporter can settle this faster than a maintainer can: they know
+            # whether the other issue covers their case. Ask them to close it
+            # themselves, and say what to do when it doesn't.
             message = (
                 f"Thanks for reporting this. This looks like the same problem as "
-                f"#{issue_number} — worth a look to see if it covers your case.\n\n"
-                "Leaving it open for a maintainer to confirm."
+                f"#{issue_number} — could you take a look?\n\n"
+                "If it covers your case, please close this one and add anything "
+                f"new over on #{issue_number} so the discussion stays in one place. "
+                "If it doesn't, say what's different and we'll pick it up here."
             )
     elif decision["duplicate_decision"] == "similar":
         references = ", ".join(f"#{number}" for number in decision["similar_issues"])
-        plural = "these" if len(decision["similar_issues"]) > 1 else "it"
+        covers = (
+            "they already cover" if len(decision["similar_issues"]) > 1 else "it already covers"
+        )
+        # Softer than the duplicate case — a loose match is a weaker basis for
+        # asking someone to close their own report — but still theirs to settle.
         message = (
-            f"Thanks for reporting this. {references} may be related — worth a look "
-            f"in case {plural} already covers this.\n\n"
-            "If it's the same problem, feel free to add your details there; "
-            "otherwise a maintainer will pick this up."
+            f"Thanks for reporting this. {references} may be related — could you "
+            f"take a look in case {covers} this?\n\n"
+            "If it turns out to be the same problem, please close this one and add "
+            "your details there. Otherwise leave a note and we'll pick it up here."
         )
     else:
         return ""
