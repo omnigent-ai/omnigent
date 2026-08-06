@@ -130,6 +130,18 @@ cleared, why a subscription leaks, where a timeout fires). That mechanism is the
 **root cause**, and it belongs in the per-facet evidence / root-cause leads
 (Step 2, Output), never in the journey.
 
+**Passive and time/system triggers are journey steps too — write them as the
+condition, not the internals.** Not every bug is triggered by a click. Some fire
+from waiting (an idle timeout elapses), a lifecycle event (the runner shuts
+down), or a system state (network drops, disk fills). Express that trigger as the
+observable condition the user creates or waits through — e.g. `leave the session
+idle past the 1h timeout`, `runner shuts down` — **not** the code it runs. So a
+teardown-hang bug's journey is `start a session → leave it idle past the idle
+timeout → session becomes unresponsive / server returns 500s (runner hung)`,
+never `idle monitor fires _request_idle_shutdown → cancels coalescer futures →
+_cancel_all_tasks waits forever`. The latter is root cause; keep it in
+`facets`/`evidence`.
+
 **When the report has no clear "Steps to reproduce", derive the journey — don't
 substitute the root-cause analysis.** Some reports are mostly a mechanism theory
 (named functions, code traces, "X never executes Y", hypothesized fixes) with no
