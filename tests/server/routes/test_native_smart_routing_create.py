@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1714,12 +1715,20 @@ async def test_pre_session_catalog_reads_the_hosts_model_options(
     assert conn.pending_model_options == {}
 
 
-def _native_conv(session_id: str) -> Any:  # type: ignore[explicit-any]
+def _native_conv(  # type: ignore[explicit-any]
+    session_id: str,
+    *,
+    routing: bool = False,
+    archived: bool = False,
+) -> Any:
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 
     return SimpleNamespace(
         id=session_id,
         labels={"omnigent.wrapper": CLAUDE_NATIVE_CODING_AGENT.wrapper_label},
+        cost_control_mode_override="on" if routing else None,
+        harness_override=None,
+        archived=archived,
     )
 
 
@@ -1847,7 +1856,7 @@ async def test_launch_prefetch_takes_the_stale_refresh_off_the_turn_path() -> No
     from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
 
     session_id = "conv_prefetch_launch"
-    conv = _native_conv(session_id)
+    conv = _native_conv(session_id, routing=True)
     # What the host resolved before launch — stale, so a turn would refetch it.
     _model_options_cache[session_id] = [{"id": "opus", "model": "databricks-claude-opus-5"}]
     _model_options_stale.add(session_id)
@@ -1882,6 +1891,141 @@ async def test_launch_prefetch_takes_the_stale_refresh_off_the_turn_path() -> No
         await runner_client.aclose()
         _model_options_cache.pop(session_id, None)
         _model_options_stale.discard(session_id)
+
+
+def _prefetch_client(requested: list[str], *, fail: bool = False) -> httpx.AsyncClient:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if fail:
+            # What a tunnel torn down mid-prefetch raises: not an httpx error,
+            # so the fetch helpers do not catch it themselves.
+            raise RuntimeError("tunnel closed")
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"workers": {"self": {"models": [{"id": "opus"}]}}})
+        return httpx.Response(
+            200, json={"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}
+        )
+
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+
+
+async def test_plain_session_gets_no_catalog_prefetch_on_runner_connect() -> None:
+    """
+    A reconnect must cost a plain pane nothing.
+
+    The reconnect callback walks every session bound to the runner, so an
+    ungated prefetch turned one host's tunnel flap into two runner round trips
+    per plain pane — work only Smart Routing ever reads — starving the session
+    re-init running alongside it.
+    """
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_plain"
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested)
+    try:
+        before = set(_catalog_prefetch_tasks)
+        prefetch_session_routing_catalogs(session_id, _native_conv(session_id), runner_client)
+        await asyncio.sleep(0)
+
+        assert session_id not in _model_options_inflight
+        assert set(_catalog_prefetch_tasks) == before
+        assert requested == []
+    finally:
+        await runner_client.aclose()
+
+
+async def test_archived_routed_session_gets_no_catalog_prefetch() -> None:
+    """An archived session is not going to route a turn, so it warms nothing."""
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_archived"
+    conv = _native_conv(session_id, routing=True, archived=True)
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested)
+    try:
+        before = set(_catalog_prefetch_tasks)
+        prefetch_session_routing_catalogs(session_id, conv, runner_client)
+        await asyncio.sleep(0)
+
+        assert session_id not in _model_options_inflight
+        assert set(_catalog_prefetch_tasks) == before
+        assert requested == []
+    finally:
+        await runner_client.aclose()
+
+
+async def test_routed_live_session_still_warms_both_catalogs() -> None:
+    """The gate keeps the case it was built for: a routed pane warms both."""
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _model_options_inflight,
+    )
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_routed"
+    conv = _native_conv(session_id, routing=True)
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested)
+    try:
+        before = set(_catalog_prefetch_tasks)
+        prefetch_session_routing_catalogs(session_id, conv, runner_client)
+        started = set(_catalog_prefetch_tasks) - before
+        options_task = _model_options_inflight.get(session_id)
+        assert options_task is not None
+        assert len(started) == 1
+        await asyncio.gather(options_task, *started)
+
+        assert sorted(requested) == [
+            f"/v1/sessions/{session_id}/claude-model-options",
+            f"/v1/sessions/{session_id}/models",
+        ]
+        assert _model_options_cache[session_id] == [
+            {"id": "opus", "model": "databricks-claude-opus-4-8"}
+        ]
+    finally:
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+
+
+async def test_failing_prefetch_retrieves_its_own_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A prefetch that raises must not leave an unretrieved task exception.
+
+    Nothing awaits these tasks, so an escaping error surfaces only as asyncio's
+    unretrieved-exception warning at GC time — noise that hides real failures.
+    """
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_raises"
+    conv = _native_conv(session_id, routing=True)
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested, fail=True)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="omnigent.server.routes.sessions"):
+            before = set(_catalog_prefetch_tasks)
+            prefetch_session_routing_catalogs(session_id, conv, runner_client)
+            started = set(_catalog_prefetch_tasks) - before
+            options_task = _model_options_inflight.get(session_id)
+            assert options_task is not None
+            await asyncio.gather(options_task, *started)
+
+        assert options_task.exception() is None
+        assert [task.exception() for task in started] == [None]
+        assert any("Catalog prefetch failed" in record.message for record in caplog.records)
+    finally:
+        await runner_client.aclose()
 
 
 async def test_turn_catalog_keeps_a_stale_catalog_when_the_refetch_fails() -> None:

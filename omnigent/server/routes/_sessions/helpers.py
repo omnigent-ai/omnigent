@@ -14,8 +14,17 @@ import re
 import secrets
 import time
 import urllib.parse
+import weakref
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -8906,6 +8915,58 @@ async def _load_model_options(
         return
 
 
+#: How many sessions may warm their catalogs at once. A tunnel flap reconnects
+#: every session bound to the runner at once, and each warm-up costs a runner
+#: round trip plus a provider listing on a worker thread; the cap keeps that
+#: burst off the executor the concurrent session re-init needs.
+_CATALOG_PREFETCH_CONCURRENCY = 4
+
+#: One semaphore per event loop: the server runs a single loop, but an asyncio
+#: primitive cannot be shared across the loops the test suite creates.
+_catalog_prefetch_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _catalog_prefetch_semaphore() -> asyncio.Semaphore:
+    """
+    Return this loop's catalog-prefetch concurrency gate.
+
+    :returns: The semaphore bounding concurrent prefetches.
+    """
+    loop = asyncio.get_running_loop()
+    semaphore = _catalog_prefetch_semaphores.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(_CATALOG_PREFETCH_CONCURRENCY)
+        _catalog_prefetch_semaphores[loop] = semaphore
+    return semaphore
+
+
+async def _run_catalog_prefetch(
+    coro: Coroutine[Any, Any, Any],
+    session_id: str,
+) -> None:
+    """
+    Run one best-effort catalog prefetch under the concurrency cap.
+
+    Retrieves its own exception: a prefetch is fire-and-forget, so anything it
+    raises (a runner round trip torn down mid-flight, say) would otherwise
+    surface as an unretrieved-task warning and drown real errors. A failure
+    here just leaves a cold cache, which every reader already handles.
+
+    :param coro: The prefetch coroutine to run.
+    :param session_id: Session/conversation identifier, for the log line.
+    """
+    try:
+        async with _catalog_prefetch_semaphore():
+            await coro
+    except asyncio.CancelledError:
+        coro.close()
+        raise
+    except Exception:  # noqa: BLE001 - best-effort warm-up; a cold cache is fine.
+        _logger.debug("Catalog prefetch failed for %s", session_id, exc_info=True)
+
+
 def prefetch_session_routing_catalogs(
     session_id: str,
     conv: Conversation,
@@ -8922,28 +8983,54 @@ def prefetch_session_routing_catalogs(
     prompt; a turn arriving before they finish still falls back to its own
     inline fetch, so this only ever removes waiting.
 
+    Only routed, live sessions warm anything. Smart Routing is the sole reader
+    of these caches, and the caller reconnects *every* session bound to a
+    runner — a plain-session host with a flapping tunnel would otherwise spend
+    two runner round trips per pane, on nothing, while the session re-init
+    running alongside it waits for the same executor. Archived sessions are
+    skipped for the same reason: nothing is going to route a turn on them.
+
     Fire-and-forget: a failed prefetch is a cold cache, which every reader
     already handles.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-    :param conv: Conversation row, read for the wrapper label.
+    :param conv: Conversation row, read for the routing state and the wrapper
+        label.
     :param runner_client: HTTP client pointed at the newly bound runner.
     """
+    from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.server.smart_routing import prefetch_runner_catalog
+
+    if conv.archived:
+        return
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode=conv.cost_control_mode_override,
+        harness_override=conv.harness_override,
+        labels=conv.labels,
+    )
+    if not routing_class.routing_enabled:
+        return
 
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(
         conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or ""
     )
     if endpoint is not None and session_id not in _model_options_inflight:
         options_task = asyncio.create_task(
-            _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+            _run_catalog_prefetch(
+                _load_model_options(
+                    runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}"
+                ),
+                session_id,
+            )
         )
         _model_options_inflight[session_id] = options_task
         options_task.add_done_callback(
             lambda _task, sid=session_id: _model_options_inflight.pop(sid, None)
         )
     _catalog_prefetch_tasks.add(
-        task := asyncio.create_task(prefetch_runner_catalog(session_id, runner_client))
+        task := asyncio.create_task(
+            _run_catalog_prefetch(prefetch_runner_catalog(session_id, runner_client), session_id)
+        )
     )
     task.add_done_callback(_catalog_prefetch_tasks.discard)
 

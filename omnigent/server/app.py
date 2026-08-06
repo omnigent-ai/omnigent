@@ -2249,7 +2249,9 @@ def create_app(
             )
             # The session's terminal exists as of the handshake above, so its
             # model catalogs are answerable now. Warming them here is what
-            # keeps the first routed message off the runner round trip.
+            # keeps the first routed message off the runner round trip. The
+            # helper self-gates on routing state, so the plain sessions in this
+            # loop (and any archived row) cost nothing.
             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
             # Reconcile the persisted pending-elicitation count with this
             # pod's live index. A runner that crashed with prompts parked
