@@ -131,6 +131,33 @@ async def test_delete_running_session_attempts_stop(
         sessions_module._session_status_cache.pop(session_id, None)
 
 
+async def test_delete_idle_session_with_background_tasks_attempts_stop(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """An idle session with live background shells is still stopped.
+
+    Regression test: the sidebar rollup deliberately reads such a session
+    as ``idle`` — the turn ended and it takes a new message immediately —
+    so a stop gate keyed on that rollup alone would skip the runner and
+    leave the shells running past the delete.
+    """
+    mock_stop = AsyncMock(return_value=True)
+    sessions_module._session_status_cache[session_id] = "idle"
+    sessions_module._session_background_task_count_cache[session_id] = 1
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+        mock_stop.assert_awaited_once()
+        assert mock_stop.await_args is not None
+        assert mock_stop.await_args.args[0] == session_id
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
+
+
 async def test_delete_idle_parent_stops_running_child(
     client: httpx.AsyncClient,
     session_id: str,

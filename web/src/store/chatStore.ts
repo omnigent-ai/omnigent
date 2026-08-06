@@ -1560,7 +1560,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // genuinely still running may briefly revert the sidebar dot — the helper's
     // "never fights the poller" contract doesn't hold here. Self-corrects on the
     // real idle event.
-    patchConversationStatusInCache(sessionId, "idle", get().backgroundTaskCount);
+    patchConversationStatusInCache(sessionId, "idle");
     // Mirror the session.status handler: a sub-agent's row lives in its parent's
     // child-sessions list, not the sidebar, so refresh the rail in lockstep.
     const snapshot = queryClient?.getQueryData<Session>(["session", sessionId]);
@@ -4570,11 +4570,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       // chat's "Working…" indicator — the exact desync users hit on a
       // claude-native session (chat clears/sets working instantly while
       // the sidebar dot stays stale).
-      patchConversationStatusInCache(
-        event.conversationId,
-        event.status,
-        useChatStore.getState().backgroundTaskCount,
-      );
+      patchConversationStatusInCache(event.conversationId, event.status);
       // On turn completion, refresh the Agents-rail preview for this
       // conversation. A child (added agent) finishing a turn leaves a stale
       // last_message_preview in its parent's child-sessions list (the runner
@@ -4878,15 +4874,12 @@ export function handleSessionEvent(event: StreamEvent): void {
 function patchConversationStatusInCache(
   conversationId: string,
   sessionStatus: SessionStatus,
-  backgroundTaskCount = 0,
 ): void {
   if (queryClient === null) return;
-  // Mirror the in-chat working indicator: a claude-native session that has
-  // settled to `idle` but still has background shells running must keep the
-  // sidebar spinner lit, exactly as `computeShowsWorking` keeps the chat
-  // indicator visible. `failed` still wins (the count is cleared on failure).
-  const working =
-    sessionStatus === "running" || sessionStatus === "waiting" || backgroundTaskCount > 0;
+  // Background shells outliving a turn do NOT light the row: the server
+  // delivers that turn-end as `idle` (it takes a new message right away), and
+  // the in-chat indicator still reports the shells from the tally.
+  const working = sessionStatus === "running" || sessionStatus === "waiting";
   const listStatus: NonNullable<Conversation["status"]> =
     sessionStatus === "failed" ? "failed" : working ? "running" : "idle";
   queryClient.setQueriesData<InfiniteData<ConversationsPage>>(
