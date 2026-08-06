@@ -40,9 +40,24 @@ def _clear_caches() -> None:
     """Isolate each case from leaked module-level cache state."""
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
+    _sessions_mod._session_active_response_cache.pop(_SID, None)
     yield
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
+    _sessions_mod._session_active_response_cache.pop(_SID, None)
+
+
+def test_background_task_turn_end_closes_the_active_response() -> None:
+    # The composer bug's mechanism: `waiting` KEEPS the in-flight response id,
+    # and the snapshot projects `waiting` as `running` — so a reconnect reopened
+    # the settled turn as "streaming" and queued every send behind "Steer".
+    # Delivering the turn-end as `idle` closes the response, so the snapshot has
+    # nothing to reopen. The tally still reports the shells.
+    _publish_status(_SID, "running", response_id="resp_1")
+    assert _sessions_mod._session_active_response_cache.get(_SID) == "resp_1"
+    _publish_status(_SID, "idle", response_id="resp_1", background_task_count=2)
+    assert _SID not in _sessions_mod._session_active_response_cache
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
 
 
 def test_idle_with_positive_count_sets_sticky_tally_but_list_stays_idle() -> None:
