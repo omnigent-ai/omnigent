@@ -42,6 +42,25 @@ def _wait_for_caret(page: Page, expected: str) -> None:
     page.wait_for_function(f"() => ({_ACTIVE_COMPOSER_JS})() === {expected!r}", timeout=10_000)
 
 
+def _wait_for_highlighted(page: Page, label: str) -> None:
+    """Wait until `label` is the row Enter would run.
+
+    The palette re-sorts around the debounced session search, so for a beat
+    after the results swap there is no highlighted row and Enter is a no-op.
+    Waiting for the highlight — rather than sleeping past the debounce and
+    hoping — is what keeps the keypress landing on the intended row on a
+    loaded machine.
+    """
+    page.wait_for_function(
+        """(label) => {
+             const el = document.querySelector('[cmdk-item][aria-selected="true"]');
+             return !!el && el.textContent.trim() === label;
+           }""",
+        arg=label,
+        timeout=10_000,
+    )
+
+
 def test_new_chat_from_palette_focuses_the_landing_composer(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:
@@ -55,9 +74,9 @@ def test_new_chat_from_palette_focuses_the_landing_composer(
     # "new chat" names the action outright, so the top result can't be a
     # session whose title happens to contain "new".
     palette.type("new chat", delay=20)
-    # The palette debounces its session search by 300ms; let the list settle so
-    # Enter commits the intended result.
-    page.wait_for_timeout(600)
+    # "New chat" has to be the highlighted row before Enter, or the keypress
+    # lands in the gap where the debounced session results are swapping out.
+    _wait_for_highlighted(page, "New chat")
     page.keyboard.press("Enter")
 
     expect(page.get_by_test_id(_LANDING_INPUT)).to_be_visible(timeout=15_000)
