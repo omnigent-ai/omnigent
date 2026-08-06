@@ -45,11 +45,14 @@ def _make_spec(
     model: str | None = "claude-haiku-4.5",
     name: str = "test-copilot",
     auth: ApiKeyAuth | DatabricksAuth | None = None,
+    extra_config: dict[str, object] | None = None,
 ) -> AgentSpec:
     """Build a minimal copilot :class:`AgentSpec` for the spawn-env tests."""
     config: dict[str, object] = {"harness": "copilot"}
     if model is not None:
         config["model"] = model
+    if extra_config:
+        config.update(extra_config)
     return AgentSpec(
         spec_version=1,
         name=name,
@@ -107,3 +110,36 @@ def test_no_auth_prefers_stored_block_over_ambient(
 def test_bundle_dir_threaded(tmp_path: Path) -> None:
     env = _build_copilot_spawn_env(_make_spec(), workdir=tmp_path)
     assert env["HARNESS_COPILOT_BUNDLE_DIR"] == str(tmp_path)
+
+
+def test_gh_host_from_stored_config(tmp_path: Path) -> None:
+    # A host registered once via `omnigent setup` (the copilot: block) reaches
+    # the harness spawn env without any daemon/runner env plumbing; the
+    # builder runs in the runner and reads the config itself.
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"copilot": {"gh_host": "https://tenant.ghe.com"}})
+    )
+    env = _build_copilot_spawn_env(_make_spec())
+    assert env["HARNESS_COPILOT_GH_HOST"] == "https://tenant.ghe.com"
+
+
+def test_gh_host_stored_value_is_normalized(tmp_path: Path) -> None:
+    # A hand-edited trailing slash must not reach the CLI verbatim.
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"copilot": {"gh_host": "https://tenant.ghe.com/"}})
+    )
+    env = _build_copilot_spawn_env(_make_spec())
+    assert env["HARNESS_COPILOT_GH_HOST"] == "https://tenant.ghe.com"
+
+
+def test_gh_host_spec_config_wins_over_stored(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"copilot": {"gh_host": "https://stored.ghe.com"}})
+    )
+    env = _build_copilot_spawn_env(_make_spec(extra_config={"gh_host": "https://spec.ghe.com"}))
+    assert env["HARNESS_COPILOT_GH_HOST"] == "https://spec.ghe.com"
+
+
+def test_no_gh_host_emits_no_env_var() -> None:
+    env = _build_copilot_spawn_env(_make_spec())
+    assert "HARNESS_COPILOT_GH_HOST" not in env

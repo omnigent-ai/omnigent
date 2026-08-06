@@ -254,3 +254,83 @@ def test_install_copilot_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(copilot_auth.subprocess, "run", _boom)
     assert install_copilot_sdk() is False
+
+
+def test_normalize_gh_host_trims_and_strips_slashes() -> None:
+    assert copilot_auth.normalize_gh_host("  https://tenant.ghe.com/  ") == (
+        "https://tenant.ghe.com"
+    )
+    assert copilot_auth.normalize_gh_host("   ") == ""
+
+
+def test_looks_like_gh_host_accepts_https_origin() -> None:
+    assert copilot_auth.looks_like_gh_host("https://tenant.ghe.com")
+    assert copilot_auth.looks_like_gh_host("https://ghe.example.internal:8443")
+
+
+def test_looks_like_gh_host_flags_surprising_shapes() -> None:
+    # No scheme, an explicit path, or github.com itself: warn-and-confirm
+    # material, not silently acceptable.
+    assert not copilot_auth.looks_like_gh_host("tenant.ghe.com")
+    assert not copilot_auth.looks_like_gh_host("https://tenant.ghe.com/api/v3")
+    assert not copilot_auth.looks_like_gh_host("https://github.com")
+    assert not copilot_auth.looks_like_gh_host("https://api.github.com")
+
+
+def test_copilot_gh_host_reads_the_block(tmp_path: Path) -> None:
+    _write_config(tmp_path, {"copilot": {"gh_host": "https://tenant.ghe.com"}})
+    assert copilot_auth.copilot_gh_host() == "https://tenant.ghe.com"
+
+
+def test_copilot_gh_host_normalizes_on_read(tmp_path: Path) -> None:
+    _write_config(tmp_path, {"copilot": {"gh_host": "https://tenant.ghe.com/"}})
+    assert copilot_auth.copilot_gh_host() == "https://tenant.ghe.com"
+
+
+def test_copilot_gh_host_none_when_missing_or_invalid(tmp_path: Path) -> None:
+    assert copilot_auth.copilot_gh_host() is None
+    _write_config(tmp_path, {"copilot": {"github_token_ref": "env:GH_TOKEN"}})
+    assert copilot_auth.copilot_gh_host() is None
+    _write_config(tmp_path, {"copilot": {"gh_host": 42}})
+    assert copilot_auth.copilot_gh_host() is None
+    _write_config(tmp_path, {"copilot": {"gh_host": "   "}})
+    assert copilot_auth.copilot_gh_host() is None
+
+
+def test_copilot_gh_host_settings_shape() -> None:
+    assert copilot_auth.copilot_gh_host_settings("https://tenant.ghe.com") == {
+        "copilot": {"gh_host": "https://tenant.ghe.com"}
+    }
+
+
+def test_token_removed_settings_keeps_gh_host(tmp_path: Path) -> None:
+    # Removing the token must not silently drop a configured GHE host.
+    _write_config(
+        tmp_path,
+        {"copilot": {"github_token_ref": "env:GH_TOKEN", "gh_host": "https://t.ghe.com"}},
+    )
+    from omnigent.onboarding.provider_config import load_config
+
+    settings = copilot_auth.copilot_token_removed_settings(load_config())
+    assert settings == {"copilot": {"gh_host": "https://t.ghe.com"}}
+
+
+def test_gh_host_removed_settings_keeps_token(tmp_path: Path) -> None:
+    _write_config(
+        tmp_path,
+        {"copilot": {"github_token_ref": "env:GH_TOKEN", "gh_host": "https://t.ghe.com"}},
+    )
+    from omnigent.onboarding.provider_config import load_config
+
+    settings = copilot_auth.copilot_gh_host_removed_settings(load_config())
+    assert settings == {"copilot": {"github_token_ref": "env:GH_TOKEN"}}
+
+
+def test_removed_settings_none_when_block_would_empty(tmp_path: Path) -> None:
+    # None tells the caller to unset the whole block instead of writing {}.
+    _write_config(tmp_path, {"copilot": {"gh_host": "https://t.ghe.com"}})
+    from omnigent.onboarding.provider_config import load_config
+
+    assert copilot_auth.copilot_gh_host_removed_settings(load_config()) is None
+    _write_config(tmp_path, {"copilot": {"github_token_ref": "env:GH_TOKEN"}})
+    assert copilot_auth.copilot_token_removed_settings(load_config()) is None

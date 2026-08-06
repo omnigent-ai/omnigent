@@ -23,6 +23,7 @@ def _clear_harness_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HARNESS_COPILOT_MODEL",
         "HARNESS_COPILOT_CWD",
         "HARNESS_COPILOT_GITHUB_TOKEN",
+        "HARNESS_COPILOT_GH_HOST",
         "HARNESS_COPILOT_OS_ENV",
         "HARNESS_COPILOT_SKILLS_FILTER",
         "HARNESS_COPILOT_BUNDLE_DIR",
@@ -30,6 +31,8 @@ def _clear_harness_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "COPILOT_GITHUB_TOKEN",
         "GH_TOKEN",
         "GITHUB_TOKEN",
+        "COPILOT_GH_HOST",
+        "GH_HOST",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -98,3 +101,21 @@ def test_create_app_exposes_executor_adapter_routes() -> None:
     # endpoints exist, not merely that the object has a ``routes`` attribute.
     assert "/health" in paths
     assert any("/v1/sessions/" in p and p.endswith("/events") for p in paths)
+
+
+def test_apply_gh_host_exports_copilot_gh_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The SDK-spawned CLI inherits os.environ and CopilotClient has no host
+    # parameter, so the wrap's process env is the only channel to GHE.
+    monkeypatch.setenv("HARNESS_COPILOT_GH_HOST", "https://tenant.ghe.com")
+    ch._apply_gh_host()
+    import os
+
+    assert os.environ["COPILOT_GH_HOST"] == "https://tenant.ghe.com"
+    assert "GH_HOST" not in os.environ
+
+
+def test_apply_gh_host_noop_when_unset() -> None:
+    ch._apply_gh_host()
+    import os
+
+    assert "COPILOT_GH_HOST" not in os.environ

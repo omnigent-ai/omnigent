@@ -3360,3 +3360,52 @@ def test_credential_label_bedrock_not_duplicated() -> None:
 
     assert credential_label(BEDROCK_KIND, "bedrock") == "AWS Bedrock"
     assert credential_label(BEDROCK_KIND, "nexus") == "AWS Bedrock (nexus)"
+
+
+def test_copilot_drillin_sets_the_ghe_host(isolated_config, monkeypatch) -> None:
+    """The Copilot drill-in stores the GHE host in the ``copilot:`` block.
+
+    L1 10=Copilot → menu 2=Set GitHub Enterprise host → host value →
+    menu q=back → L1 q. The confirmation line and the persisted
+    ``copilot.gh_host`` are the contract.
+    """
+    monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+
+    stdin = "\n".join(["10", "2", "https://tenant.ghe.com", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    # The non-TTY numbered menu re-renders with the host in the header line
+    # (the checkmark status line is a TTY-only nicety).
+    assert "\xb7 tenant.ghe.com" in result.output
+    config = _config_yaml(isolated_config)
+    assert config["copilot"] == {"gh_host": "https://tenant.ghe.com"}
+
+
+def test_copilot_token_write_keeps_the_ghe_host(isolated_config, monkeypatch) -> None:
+    """Storing a token deep-merges the ``copilot:`` block, keeping ``gh_host``.
+
+    Regression for the shallow top-level replace: before the deep-merge fix,
+    "Set GitHub token" rewrote the whole block and silently dropped a
+    configured GHE host.
+    """
+    monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    for var in ("COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    with open(os.path.join(isolated_config, "config.yaml"), "w") as fh:
+        yaml.safe_dump({"copilot": {"gh_host": "https://tenant.ghe.com"}}, fh)
+    monkeypatch.setenv("GH_TOKEN", "gho_ambient")
+
+    # L1 10=Copilot → menu 1=Set GitHub token → y=use detected $GH_TOKEN →
+    # menu q=back → L1 q.
+    stdin = "\n".join(["10", "1", "y", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    config = _config_yaml(isolated_config)
+    assert config["copilot"] == {
+        "gh_host": "https://tenant.ghe.com",
+        "github_token_ref": "env:GH_TOKEN",
+    }

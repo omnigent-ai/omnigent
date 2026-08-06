@@ -123,6 +123,20 @@ executor:
     api_key: ${GH_TOKEN}       # a GitHub token with Copilot access
 ```
 
+**GitHub Enterprise:** the Copilot CLI validates a token against
+`api.github.com` unless `COPILOT_GH_HOST` names the tenant host. Register the
+host once via `omnigent setup` → Copilot → "Set GitHub Enterprise host" (the
+`copilot:` block's `gh_host`, e.g. `https://tenant.ghe.com`); the runtime
+exports it to the harness on every spawn, so no shell/env plumbing is needed.
+A per-agent override rides `executor.config`:
+
+```yaml
+executor:
+  harness: copilot
+  config:
+    gh_host: https://tenant.ghe.com
+```
+
 To route through OpenRouter / a gateway, declare a key/gateway provider in
 `~/.omnigent/config.yaml` and reference it (`auth: {type: provider, name: …}`),
 or set `auth.base_url` to the OpenAI-compatible endpoint alongside the key.
