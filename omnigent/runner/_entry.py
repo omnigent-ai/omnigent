@@ -425,10 +425,9 @@ class _InitialAuthTokenFactory:
                     _allow_delegated_mint=False,
                 )
             if self._fallback_factory is None:
-                host = self._server_url or "(server URL unknown)"
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    f"to renew it; run `databricks auth login --host {host}` to re-authenticate"
+                    "to renew it; run `databricks auth login` to re-authenticate"
                 )
                 return None
             return self._fallback_factory()
