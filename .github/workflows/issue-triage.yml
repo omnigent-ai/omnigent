@@ -34,15 +34,17 @@ on:
     # `if:` below) — that removal is the signal the issue now has enough detail
     # to classify and assign.
     types: [opened, unlabeled]
-  # Manual dry run against any issue: classify and log the decision without
-  # labeling, commenting, or closing unless the inputs opt in.
+  # Manual dry run against any issue: classify and log the decision. Both
+  # inputs default off, and with them off nothing is written — no label,
+  # comment, assignment, or closure.
   workflow_dispatch:
     inputs:
       issue_number:
         description: Issue to triage
         required: true
       apply_labels:
-        description: Apply label changes (otherwise log only)
+        description: >-
+          Apply labels, assignment, and duplicate closure (otherwise log only)
         type: boolean
         default: false
       post_comment:
@@ -446,18 +448,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
-          # A manual dispatch classifies as though the issue had just opened, so
-          # a dry run exercises the full duplicate decision. Whether anything is
-          # written is gated by APPLY_LABELS / POST_DUPLICATE_COMMENT below.
-          EVENT_ACTION: >-
-            ${{ github.event_name == 'workflow_dispatch'
-                && 'opened' || github.event.action }}
-          APPLY_LABELS: >-
-            ${{ github.event_name != 'workflow_dispatch'
-                || inputs.apply_labels }}
-          POST_DUPLICATE_COMMENT: >-
-            ${{ github.event_name == 'workflow_dispatch'
-                && inputs.post_comment || env.POST_DUPLICATE_COMMENTS }}
+          # The dispatch inputs are passed through raw and combined in Python.
+          # An Actions `a && b || c` ternary yields `c` whenever `b` is false,
+          # so folding a boolean input into one would turn "don't write" back
+          # into the repo default.
+          EVENT_ACTION: ${{ github.event.action }}
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          DISPATCH_APPLY_LABELS: ${{ inputs.apply_labels }}
+          DISPATCH_POST_COMMENT: ${{ inputs.post_comment }}
           ISSUE_PRIORITIZATION_V2_ENABLED: ${{ vars.ISSUE_PRIORITIZATION_V2_ENABLED }}
         run: |
           set -euo pipefail
@@ -506,14 +504,27 @@ jobs:
           def flag(name):
               return os.environ.get(name, "").strip().lower() == "true"
 
-          is_open_event = os.environ.get("EVENT_ACTION") == "opened"
+          # A dispatch classifies as though the issue had just opened so the full
+          # duplicate path runs, but every write is opt-in: each dispatch input
+          # decides on its own, never falling back to the repo default.
+          is_dispatch = flag("IS_DISPATCH")
+          is_open_event = is_dispatch or os.environ.get("EVENT_ACTION") == "opened"
+          apply_labels = flag("DISPATCH_APPLY_LABELS") if is_dispatch else True
+          post_comment_enabled = (
+              flag("DISPATCH_POST_COMMENT") if is_dispatch else flag("POST_DUPLICATE_COMMENTS")
+          )
+          # Closure has no dispatch input of its own: a dry run that closed the
+          # issue it was inspecting would be the worst possible surprise, so it
+          # rides on apply_labels as well as the repo flag.
           is_duplicate = duplicate["duplicate_decision"] == "duplicate" and is_open_event
-          close_duplicate_issue = is_duplicate and flag("CLOSE_DUPLICATE_ISSUES")
+          close_duplicate_issue = (
+              is_duplicate and flag("CLOSE_DUPLICATE_ISSUES") and apply_labels
+          )
           # Nothing is posted for a `none` verdict: most issues are not
           # duplicates, so the comment would be noise on the majority of them.
           post_duplicate_comment = (
               is_open_event
-              and flag("POST_DUPLICATE_COMMENT")
+              and post_comment_enabled
               and duplicate["duplicate_decision"] != "none"
           )
 
@@ -609,6 +620,8 @@ jobs:
               ),
               "close_duplicate_issue": close_duplicate_issue,
               "post_duplicate_comment": post_duplicate_comment,
+              # Read by the assignment steps below, which mutate the issue too.
+              "apply_labels": apply_labels,
               # Left as None while Databricks owns scoring.
               "priority": valid_priority,
               "needs_info": bool(result.get("needs_info")),
@@ -638,7 +651,7 @@ jobs:
               args += ["--add-label", label]
           for label in labels_remove:
               args += ["--remove-label", label]
-          if (labels_add or labels_remove) and flag("APPLY_LABELS"):
+          if (labels_add or labels_remove) and apply_labels:
               cmds.append(" ".join(shlex.quote(a) for a in args))
 
           pathlib.Path("/tmp/triage_commands.sh").write_text(
@@ -647,8 +660,8 @@ jobs:
           )
 
           # Print summary for the workflow log.
-          if not flag("APPLY_LABELS"):
-              print("Dry run: labels computed but not applied")
+          if not apply_labels:
+              print("Dry run: labels computed but neither applied nor assigned")
           print(f"Labels to add: {labels_add}")
           print(f"Labels to remove: {labels_remove}")
           if v2_owns_scoring:
@@ -689,6 +702,13 @@ jobs:
           issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
             --json state --jq '.state')
           if [ "$issue_state" != "OPEN" ]; then
+            exit 0
+          fi
+
+          # Assignment mutates the issue just as much as a label does, so a dry
+          # run stops here. Closure is already gated in Python.
+          if [ "$(jq -r '.apply_labels' /tmp/triage_result.json)" != "true" ]; then
+            echo "Dry run: skipping closure and assignment."
             exit 0
           fi
 

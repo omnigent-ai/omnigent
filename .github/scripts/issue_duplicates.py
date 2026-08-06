@@ -383,9 +383,12 @@ def build_duplicate_comment(
     return f"{marker}\n{message}\n"
 
 
-_MENTION = re.compile(r"@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))")
-_URL = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
-_ISSUE_REF = re.compile(r"#\d+")
+_MENTION = re.compile(r"@+([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))")
+# `//host` is scheme-relative and still renders as an external link, so it is
+# matched alongside the explicit schemes. Bare domains are left alone: GitHub
+# does not autolink them.
+_URL = re.compile(r"(?:\b(?:https?://|www\.)|(?<![\w:/])//)\S+", re.IGNORECASE)
+_ISSUE_REF = re.compile(r"(?:#|\bGH-)\d+", re.IGNORECASE)
 REASON_MAX_CHARS = 240
 
 

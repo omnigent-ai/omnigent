@@ -5,6 +5,7 @@ from issue_duplicates import (
     AUTO_CLOSE_CONFIDENCE,
     CLOSE_COSINE_FLOOR,
     SIMILAR_MIN_CONFIDENCE,
+    _one_sentence,
     build_duplicate_comment,
     document_tokens,
     extract_issue_references,
@@ -160,7 +161,8 @@ class IssueDuplicatesTest(unittest.TestCase):
         self.assertEqual(result["duplicate_decision"], "similar")
         self.assertEqual(result["similar_issues"], [12, 11, 10])
 
-    def test_public_comment_uses_templated_reason(self):
+    def test_similar_comment_never_carries_model_prose(self):
+        """The non-closing comment is fixed copy, so injected text cannot reach it."""
         issue = {
             "title": "Workspace rail resize is unusable on the browser tab",
             "body": "Dragging the workspace rail orphans the pointer.",
@@ -236,6 +238,39 @@ class IssueDuplicatesTest(unittest.TestCase):
         self.assertNotIn("evil.example.com", comment)
         self.assertNotIn("#999", comment)
         self.assertIn("admin", comment)
+
+    def test_closing_comment_defangs_evasive_mention_and_link_forms(self):
+        """Doubled `@`, scheme-relative links, and `GH-` refs are all live on GitHub.
+
+        Each renders exactly like the plain form the sanitizer already handled,
+        so missing one would leave a real ping or clickable link in a comment
+        built from attacker-controllable prose.
+        """
+        decision = {
+            "duplicate_decision": "duplicate",
+            "duplicate_of": 12,
+            "similar_issues": [],
+            "duplicate_confidence": 1.0,
+            "duplicate_reasoning": "unused",
+        }
+
+        comment = build_duplicate_comment(
+            decision,
+            close_issue=True,
+            reasoning="Ping @@admin re [x](//evil.example.com) and GH-999 now.",
+        )
+
+        self.assertNotIn("@admin", comment)
+        self.assertNotIn("@@", comment)
+        self.assertNotIn("evil.example.com", comment)
+        self.assertNotIn("GH-999", comment)
+
+    def test_sanitizer_keeps_prose_that_merely_looks_like_a_link(self):
+        """A bare `//` inside prose is not a link, so it must survive intact."""
+        self.assertEqual(
+            _one_sentence("Ratio was 50//50 in both reports."),
+            "Ratio was 50//50 in both reports.",
+        )
 
     def test_closing_comment_keeps_only_the_first_reason_sentence(self):
         decision = {
