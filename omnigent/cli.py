@@ -1115,8 +1115,9 @@ def _apply_bind_auth_defaults(host: str) -> None:
 
     The bind address is the discriminator for the *implicit* (env-unset)
     auth posture. Explicit operator choices always win — an
-    ``OMNIGENT_AUTH_PROVIDER`` keeps header/oidc, and
-    ``OMNIGENT_AUTH_ENABLED`` (or its deprecated alias) pins auth on/off.
+    ``OMNIGENT_AUTH_PROVIDER`` keeps header/oidc,
+    ``OMNIGENT_AUTH_ENABLED`` pins auth on/off, and a truthy
+    ``OMNIGENT_LOCAL_SINGLE_USER`` declares a single-user server.
 
     Decision matrix for the env-unset default:
 
@@ -1132,6 +1133,15 @@ def _apply_bind_auth_defaults(host: str) -> None:
       login. First-admin setup happens via the web Create-admin form
       (the server boots and serves; no terminal prompt). Mirrors the
       Docker/Cloudflare/k8s entrypoints.
+    - **Non-loopback + a truthy ``OMNIGENT_LOCAL_SINGLE_USER``** → leave
+      header mode alone and warn loudly. The operator declared a
+      single-operator server, so auto-enabling accounts would route
+      identity through :meth:`UnifiedAuthProvider._check_cookie`, where
+      neither the ``"local"`` fallback nor the identity header is
+      reachable — 401 on every request and 403 on the host tunnel, i.e. a
+      total outage rather than a login prompt. The warning names the
+      exposure because this posture serves unauthenticated to anyone who
+      can reach the bind address.
 
     Uses ``setdefault`` throughout so an operator's explicit value wins.
     Must run before ``create_auth_provider()``, which reads these vars.
@@ -1140,6 +1150,7 @@ def _apply_bind_auth_defaults(host: str) -> None:
         ``"0.0.0.0"``.
     :returns: None.
     """
+    from omnigent.server.auth import env_var_is_truthy as _env_var_is_truthy
     from omnigent.server.auth import resolve_auth_source as _resolve_auth_source
 
     _is_loopback_bind = host in ("127.0.0.1", "localhost", "::1")
@@ -1153,9 +1164,19 @@ def _apply_bind_auth_defaults(host: str) -> None:
     if _is_loopback_bind and not _auth_provider_explicit and _resolve_auth_source() == "header":
         os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
+    # A truthy marker is a deliberate "this is a single-operator server".
+    # Only truthy counts: LOCAL_SINGLE_USER=0 is an explicit opt-out and
+    # must not suppress the accounts auto-enable below.
+    _single_user_requested = _env_var_is_truthy("OMNIGENT_LOCAL_SINGLE_USER")
+
     # Non-loopback + no explicit auth → accounts (login) mode.
     _auth_enabled_explicit = bool(os.environ.get("OMNIGENT_AUTH_ENABLED", "").strip())
-    if not _is_loopback_bind and not _auth_provider_explicit and not _auth_enabled_explicit:
+    if (
+        not _is_loopback_bind
+        and not _auth_provider_explicit
+        and not _auth_enabled_explicit
+        and not _single_user_requested
+    ):
         os.environ.setdefault("OMNIGENT_AUTH_ENABLED", "1")
         click.echo(
             f"  ⚠ Binding to non-local interface {host}: enabling accounts "
@@ -1164,6 +1185,16 @@ def _apply_bind_auth_defaults(host: str) -> None:
             "account.\n"
             "    Set OMNIGENT_AUTH_ENABLED=0 first to override and stay in "
             "single-user mode.",
+            err=True,
+        )
+    elif not _is_loopback_bind and _single_user_requested and not _auth_enabled_explicit:
+        click.echo(
+            "  ⚠ SECURITY: OMNIGENT_LOCAL_SINGLE_USER=1 is set and you are "
+            f"binding to non-local interface {host}.\n"
+            "    This server will serve UNAUTHENTICATED requests as the "
+            '"local" user to anyone who can reach this address.\n'
+            "    Only do this on a trusted private network.\n"
+            "    Unset OMNIGENT_LOCAL_SINGLE_USER to require login instead.",
             err=True,
         )
 
