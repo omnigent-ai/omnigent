@@ -602,6 +602,7 @@ def main() -> None:
     try:
         _ZygoteServer(control_sock).serve()
     except KeyboardInterrupt:
+        # Ctrl+C is a normal operator-driven shutdown; exit quietly without a traceback.
         pass
 
 
