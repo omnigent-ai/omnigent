@@ -13,13 +13,18 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import token_bound_runner_id
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
-from omnigent.server.routes._auth_helpers import require_access_and_level
+from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user,
+    require_access_and_level,
+)
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -248,3 +253,178 @@ async def test_missing_conversation_raises_404(
         )
 
     assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+# --- Runner capability auth (header-mode, feature 003) ---
+
+_BINDING_TOKEN = "test-binding-token-xyz"
+
+
+@pytest.mark.asyncio
+async def test_runner_token_authenticates_on_own_session_without_user(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A runner reads its own bound session via capability, no user_id.
+
+    The header-mode case: user_id is None (no readable identity), but the
+    token's derived runner id matches conv.runner_id → the runner is
+    authorized via RunnerAction.READ_SESSION with level None.
+    """
+    from omnigent.server.runner_capabilities import RunnerAction
+
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+
+    class FakeRequest:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": _BINDING_TOKEN}
+
+    auth = await authorize_runner_or_user(
+        FakeRequest(),
+        conv.id,
+        RunnerAction.READ_SESSION,
+        LEVEL_READ,
+        None,  # auth_provider=None → no user extraction
+        perm_store,
+        conv_store,
+    )
+    assert auth.is_runner
+    assert auth.user_id is None
+    assert auth.level is None
+    assert auth.conversation is not None
+    assert auth.conversation.id == conv.id
+
+
+@pytest.mark.asyncio
+async def test_runner_token_does_not_grant_other_session(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A token bound to session X grants nothing on session Y."""
+    from omnigent.server.runner_capabilities import RunnerAction
+
+    conv_y = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv_y.id, token_bound_runner_id("some-other-token"))
+
+    class FakeRequest:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": _BINDING_TOKEN}
+
+    with pytest.raises(OmnigentError) as exc:
+        await authorize_runner_or_user(
+            FakeRequest(),
+            conv_y.id,
+            RunnerAction.READ_SESSION,
+            LEVEL_READ,
+            None,
+            perm_store,
+            conv_store,
+        )
+    assert exc.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_runner_token_cannot_perform_non_runner_action(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A matching token authorizes the runner regardless of required_level.
+
+    The runner capability path is action-based, not level-based: a valid
+    token + allowed action authorizes regardless of required_level (which is
+    only used for the human fallback). An invalid token falls through to
+    human auth, which 401s without a user.
+    """
+    from omnigent.server.runner_capabilities import RunnerAction
+
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+
+    class FakeRequest:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": _BINDING_TOKEN}
+
+    # Runner is authorized for READ_SESSION even though required_level is OWNER.
+    auth = await authorize_runner_or_user(
+        FakeRequest(),
+        conv.id,
+        RunnerAction.READ_SESSION,
+        LEVEL_OWNER,
+        None,
+        perm_store,
+        conv_store,
+    )
+    assert auth.is_runner
+    assert auth.level is None
+
+    # But an invalid token falls through to human auth, which 401s without a user.
+    class FakeRequestBad:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": "wrong-token"}
+
+    with pytest.raises(OmnigentError) as exc:
+        await authorize_runner_or_user(
+            FakeRequestBad(),
+            conv.id,
+            RunnerAction.READ_SESSION,
+            LEVEL_OWNER,
+            None,
+            perm_store,
+            conv_store,
+        )
+    assert exc.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_absent_runner_token_unchanged(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """No binding token → resolution is exactly as before (401)."""
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+
+    class FakeRequest:
+        headers = {}
+
+    with pytest.raises(OmnigentError) as exc:
+        await authorize_runner_or_user(
+            FakeRequest(),
+            conv.id,
+            RunnerAction.READ_SESSION,
+            LEVEL_READ,
+            None,
+            perm_store,
+            conv_store,
+        )
+    assert exc.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_runner_token_owner_access_unaffected(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A real owner still gets their owner level even with a bogus token.
+
+    The runner capability check fails (bogus token) and falls through to
+    human auth, which resolves the owner's real permission level.
+    """
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.runner_capabilities import RunnerAction
+
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, conv.id, LEVEL_OWNER)
+
+    class FakeRequest:
+        headers = {
+            "X-Forwarded-Email": ALICE,
+            "X-Omnigent-Runner-Tunnel-Token": "unrelated-token",
+        }
+
+    auth = await authorize_runner_or_user(
+        FakeRequest(),
+        conv.id,
+        RunnerAction.READ_SESSION,
+        LEVEL_READ,
+        UnifiedAuthProvider(source="header", local_single_user=False),
+        perm_store,
+        conv_store,
+    )
+    assert not auth.is_runner
+    assert auth.level == LEVEL_OWNER
+    assert auth.user_id == ALICE

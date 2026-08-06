@@ -50,7 +50,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
@@ -120,6 +120,7 @@ class FireDeps:
     permission_store: Any | None
     host_store: Any | None
     host_registry: Any | None
+    host_permission_store: Any | None = None
     agent_cache: Any | None = None
     runner_router: Any | None = None
     tunnel_registry: Any | None = None
@@ -818,6 +819,8 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             host_registry=deps.host_registry,
             conversation_store=deps.conversation_store,
             permission_store=deps.permission_store,
+            # App wiring requires this store whenever host support is enabled.
+            host_permission_store=cast(Any, deps.host_permission_store),
         )
 
         attempt = await _launch_runner_on_host(

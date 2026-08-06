@@ -59,6 +59,9 @@ from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
 from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user,
+)
+from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -104,6 +107,7 @@ from omnigent.server.routes._sessions.common import (
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _INTERRUPT_TYPE,
     _MCP_ELICITATION_TYPE,
+    _RUNNER_EVENT_TYPES,
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
@@ -184,6 +188,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
     _wait_for_host_bound_runner_client,
 )
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     ConversationDeleted,
     ElicitationRequestEvent,
@@ -330,9 +335,29 @@ def register_events_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        # Runner capability or human permission: a runner appends its own
+        # produced events (transcript deltas, status, usage, elicitation
+        # resolutions) via the binding token; a human needs EDIT to submit
+        # controls or item inputs. A runner token that resolves but whose
+        # event type is not runner-produced is rejected (a runner must not
+        # inject human-role messages).
+        access = await authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.APPEND_EVENT,
+            LEVEL_EDIT,
+            auth_provider,
+            permission_store,
+            conversation_store,
+            user_id=user_id,
         )
+        if access.runner_principal is not None and body.type not in _RUNNER_EVENT_TYPES:
+            raise OmnigentError(
+                f"Runner may not submit event type {body.type!r} via the "
+                f"runner capability; human-role events require user auth.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        user_id = access.user_id
         conv = access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)

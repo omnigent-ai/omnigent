@@ -32,6 +32,7 @@ from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailab
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AT_CAPACITY_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -59,6 +60,7 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostShutdownFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -108,6 +110,7 @@ from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
@@ -206,6 +209,33 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # ~900 zombies and OOM'd the box (#1782). A ``WNOHANG`` sweep is a cheap
 # syscall, so 2s keeps zombie lifetime short at negligible cost.
 _ORPHAN_REAP_INTERVAL_S = 2.0
+
+
+def _max_concurrent_runners() -> int | None:
+    """Max concurrent runners this host will spawn, or ``None`` for unlimited.
+
+    Read from ``OMNIGENT_HOST_MAX_RUNNERS`` at call time (not import) so a
+    redeploy can change it without a code change. On a fixed-resource host
+    (e.g. a Databricks App container: 4 vCPU / 12 GB) each runner is a full
+    agent process using 0.5-1.5 GB, so an unbounded fan-out of
+    ``host.launch_runner`` frames can OOM the box and take down every session
+    on it (cf. the zombie-OOM incident, #1782). A positive value caps the
+    fan-out; ``0`` / unset / non-numeric means unlimited (unchanged behavior).
+
+    :returns: The positive cap, or ``None`` when unlimited.
+    """
+    raw = os.environ.get("OMNIGENT_HOST_MAX_RUNNERS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning(
+            "OMNIGENT_HOST_MAX_RUNNERS=%r is not an integer — ignoring (unlimited)",
+            raw,
+        )
+        return None
+    return value if value > 0 else None
 
 
 def _install_child_subreaper() -> bool:
@@ -363,6 +393,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # and fail to mint a token — the runner tunnel is rejected with HTTP 401
         # even though the host authenticated fine.
         "DATABRICKS_AUTH_STORAGE",
+        # Optional executable command that returns a fresh Databricks bearer.
+        # The command is configuration, not a credential; host-spawned runners
+        # execute it on demand so Apps-proxy auth can refresh without receiving
+        # a static token or client secret.
+        "OMNIGENT_DATABRICKS_TOKEN_COMMAND",
         # Runtime config/data-dir selection. These are filesystem PATHS, not
         # secrets, so they're safe to propagate to the host owner's own
         # daemon/runner subprocesses. They MUST propagate so the whole local
@@ -391,8 +426,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # OMNIGENT_OIDC_* is set); =0 opts back out. Must propagate down the
         # CLI → daemon → local-server chain or `omnigent run`/`connect` would
         # spawn the wrong auth mode while the operator set the switch on the CLI.
-        # Not a secret.
+        # Not a secret. OMNIGENT_ACCOUNTS_ENABLED is the deprecated pre-rename
+        # alias, still propagated so existing setups keep working.
         "OMNIGENT_AUTH_ENABLED",
+        "OMNIGENT_ACCOUNTS_ENABLED",
         # Process logging controls. These are diagnostics knobs, not secrets.
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
@@ -566,6 +603,16 @@ class HostConnectError(Exception):
     """
 
 
+class HostShutdownRequested(Exception):
+    """The server ordered this host to shut down (``host.shutdown``).
+
+    Raised out of the frame dispatch so the reconnect loop in
+    :meth:`HostProcess.run` exits cleanly instead of treating the
+    ensuing disconnect as transient and reconnecting. The message is
+    the server-provided reason, if any.
+    """
+
+
 def _build_runner_env(
     base_env: Mapping[str, str],
     *,
@@ -574,6 +621,7 @@ def _build_runner_env(
     binding_token: str,
     workspace: str,
     parent_pid: int,
+    prefer_binding_token_mint: bool = False,
     initial_auth_token: str | None = None,
 ) -> dict[str, str]:
     """
@@ -598,6 +646,12 @@ def _build_runner_env(
     :param workspace: Absolute runner cwd on the host, e.g.
         ``"/Users/alice/proj"``.
     :param parent_pid: Host process pid, for orphan detection.
+    :param prefer_binding_token_mint: When ``True``, set the env flag that
+        tells the runner to authenticate its server callbacks via the
+        binding-token mint (session-owner identity) instead of the
+        inherited host-owner credential. Set by the server on the
+        ``host.launch_runner`` frame only when the session owner differs
+        from the host owner.
     :param initial_auth_token: Current host bearer for the runner's initial
         server connection. The runner consumes and removes it before spawning
         any children. ``None`` leaves the legacy auth path unchanged.
@@ -641,6 +695,8 @@ def _build_runner_env(
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    if prefer_binding_token_mint:
+        env[RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR] = "1"
     # Bound glibc allocator RSS in the runner (no-op off Linux). Injected
     # explicitly because the allowlist above would otherwise drop an inherited
     # MALLOC_ARENA_MAX. setdefault so an operator override still wins.
@@ -1214,6 +1270,34 @@ class HostProcess:
             ``"harness_not_configured"`` when the harness check
             refuses the launch.
         """
+        # Backpressure: refuse to spawn past this host's configured runner cap.
+        # On a fixed-resource host each runner is a full agent process, so an
+        # unbounded fan-out of launch frames can OOM the box and kill every
+        # session on it. ``_alive_runner_ids`` prunes dead entries first, so the
+        # count reflects only runners actually still consuming resources.
+        # ``None`` (unset/0) preserves the original unlimited behavior.
+        max_runners = _max_concurrent_runners()
+        if max_runners is not None:
+            live = len(self._alive_runner_ids())
+            if live >= max_runners:
+                _logger.warning(
+                    "Refusing launch_runner: host %r at capacity "
+                    "(%d/%d live runners, OMNIGENT_HOST_MAX_RUNNERS)",
+                    self._identity.name,
+                    live,
+                    max_runners,
+                )
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=(
+                        f"host {self._identity.name!r} is at capacity "
+                        f"({live}/{max_runners} runners) — close a session or "
+                        f"raise OMNIGENT_HOST_MAX_RUNNERS"
+                    ),
+                    error_code=HOST_AT_CAPACITY_ERROR_CODE,
+                )
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -1251,6 +1335,7 @@ class HostProcess:
             binding_token=frame.binding_token,
             workspace=str(workspace),
             parent_pid=os.getpid(),
+            prefer_binding_token_mint=frame.prefer_binding_token_mint,
             initial_auth_token=initial_auth_token,
         )
 
@@ -2404,6 +2489,12 @@ class HostProcess:
                     backoff = _RECONNECT_BASE_S
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     break
+                except HostShutdownRequested as exc:
+                    # Server-ordered stop: exit the loop instead of
+                    # reconnecting — that's the whole difference between
+                    # a shutdown and an ordinary tunnel drop.
+                    print(f"Host shut down by server: {exc}", flush=True)
+                    break
                 except HostConnectError:
                     # Permanent failure (auth / authorization / outdated
                     # server). Do NOT back off and retry — propagate so
@@ -2854,6 +2945,15 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostShutdownFrame):
+            # Server-ordered shutdown (owner/admin action). Terminate the
+            # runners here so they die even if process teardown is
+            # interrupted, then raise the control signal — run()'s finally
+            # re-runs cleanup, which is a no-op on the emptied map.
+            reason = frame.reason or "shut down by server request"
+            _logger.info("Received host.shutdown: %s", reason)
+            self._cleanup_runners()
+            raise HostShutdownRequested(reason)
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.
