@@ -1,7 +1,7 @@
 // Unit tests for the comments API helpers and TanStack Query hooks:
 // the URL/encoding/method contract of each request, the throw-on-non-2xx
 // guard, the cache-invalidation fan-out on mutation success, and the
-// send-to-agent dispatch that calls useChatStore.send().
+// send-to-agent dispatch that queues one agent turn per comment.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
@@ -35,13 +35,13 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 }
 
 const fetchMock = vi.fn();
-const sendMock = vi.fn();
+const enqueueMock = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
-  sendMock.mockReset();
+  enqueueMock.mockReset();
   vi.mocked(useChatStore.getState).mockReturnValue({
-    send: sendMock,
+    enqueueMessage: enqueueMock,
   } as unknown as ReturnType<typeof useChatStore.getState>);
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -256,39 +256,75 @@ describe("useSendCommentsToAgent", () => {
     });
   }
 
-  it("POSTs the comment ids to the send endpoint", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ formatted_message: "msg", sent_comment_ids: ["c1"] }),
-    );
+  it("POSTs each comment separately in order", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ formatted_message: "first", sent_comment_ids: ["c1"] }))
+      .mockResolvedValueOnce(
+        mockResponse({ formatted_message: "second", sent_comment_ids: ["c2"] }),
+      );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const { result } = renderSend(queryClient);
-    result.current.mutate({ comment_ids: ["c1"], instruction: "fix" });
+    result.current.mutate({ comment_ids: ["c1", "c2"], instruction: "fix" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/v1/sessions/conv_1/comments/send");
-    expect(init.method).toBe("POST");
-    expect(JSON.parse(init.body as string)).toEqual({ comment_ids: ["c1"], instruction: "fix" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/sessions/conv_1/comments/send",
+      "/v1/sessions/conv_1/comments/send",
+    ]);
+    expect(
+      fetchMock.mock.calls.map(([, init]) => JSON.parse((init as RequestInit).body as string)),
+    ).toEqual([
+      { comment_ids: ["c1"], instruction: "fix" },
+      { comment_ids: ["c2"], instruction: "fix" },
+    ]);
   });
 
-  it("dispatches the formatted message to the agent via the chat store on success", async () => {
-    // The whole point of this hook: the server-formatted message is sent
-    // to the agent immediately, no manual send. Regressing this leaves
-    // comments queued but never delivered.
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ formatted_message: "please address these", sent_comment_ids: ["c1"] }),
-    );
+  it("queues each formatted comment as its own agent turn", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ formatted_message: "first", sent_comment_ids: ["c1"] }))
+      .mockResolvedValueOnce(
+        mockResponse({ formatted_message: "second", sent_comment_ids: ["c2"] }),
+      );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderSend(queryClient);
-    result.current.mutate({ comment_ids: ["c1"] });
+    result.current.mutate({ comment_ids: ["c1", "c2"] });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1");
+    expect(enqueueMock.mock.calls).toEqual([
+      ["first", undefined, "ag_1"],
+      ["second", undefined, "ag_1"],
+    ]);
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
   });
 
-  it("throws on non-2xx and never dispatches to the agent", async () => {
+  it("formats every comment before starting the queue", async () => {
+    let resolveSecond!: (response: Response) => void;
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ formatted_message: "first", sent_comment_ids: ["c1"] }))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveSecond = resolve;
+          }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1", "c2"] });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(enqueueMock).not.toHaveBeenCalled();
+
+    resolveSecond(mockResponse({ formatted_message: "second", sent_comment_ids: ["c2"] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(enqueueMock.mock.calls).toEqual([
+      ["first", undefined, "ag_1"],
+      ["second", undefined, "ag_1"],
+    ]);
+  });
+
+  it("throws on non-2xx and never queues the failed comment", async () => {
     // A failed send must NOT call the chat store, or the user sees a
     // message dispatched while the comments stay unsent server-side.
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
@@ -296,6 +332,6 @@ describe("useSendCommentsToAgent", () => {
     const { result } = renderSend(queryClient);
     result.current.mutate({ comment_ids: ["c1"] });
     await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueMock).not.toHaveBeenCalled();
   });
 });

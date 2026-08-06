@@ -556,11 +556,10 @@ export interface ChatState {
   // Actions.
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
   /**
-   * Queue a message client-side instead of POSTing it now, for a send made
-   * while the agent is busy. The head is flushed automatically (FIFO, one per
-   * turn) when the session next goes idle — see the `session_status` handler.
+   * Queue a message client-side. The head is flushed automatically (FIFO, one
+   * per turn) immediately when idle or when the session next goes idle.
    */
-  enqueueMessage: (text: string, files?: File[]) => void;
+  enqueueMessage: (text: string, files?: File[], agentId?: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -977,9 +976,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files) => {
+  enqueueMessage: (text, files, agentId) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
+    const queuedAgentId = agentId ?? boundAgentId;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     set((s) => ({
@@ -989,7 +989,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           queueId,
           text,
           conversationId,
-          ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
+          ...(queuedAgentId !== null ? { agentId: queuedAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
         },
       ],

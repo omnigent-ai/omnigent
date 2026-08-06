@@ -2,8 +2,7 @@
 // POST/GET/PATCH/DELETE /v1/sessions/{id}/comments
 // POST /v1/sessions/{id}/comments/send
 //
-// `useSendCommentsToAgent` calls `useChatStore.send()` directly on success
-// so the message is submitted immediately without requiring a manual send.
+// `useSendCommentsToAgent` queues each comment as its own agent turn.
 // It requires a non-null `agentId`; for the FileViewer case where an
 // agent may not be registered, see `CommentSenderProvider` /
 // `useOptionalCommentSender` in `CommentSenderContext.tsx`.
@@ -160,22 +159,35 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (payload: { comment_ids: string[]; instruction?: string }) => {
-      const res = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(sessionId)}/comments/send`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
+      const sentCommentIds: string[] = [];
+      const results = await Promise.allSettled(
+        payload.comment_ids.map(async (commentId) => {
+          const res = await authenticatedFetch(
+            `/v1/sessions/${encodeURIComponent(sessionId)}/comments/send`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...payload, comment_ids: [commentId] }),
+            },
+          );
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+          const data = (await res.json()) as {
+            formatted_message: string;
+            sent_comment_ids: string[];
+          };
+          return data;
+        }),
       );
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as {
-        formatted_message: string;
-        sent_comment_ids: string[];
-      };
+      for (const result of results) {
+        if (result.status === "rejected") continue;
+        useChatStore.getState().enqueueMessage(result.value.formatted_message, undefined, agentId);
+        sentCommentIds.push(...result.value.sent_comment_ids);
+      }
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+      return { sent_comment_ids: sentCommentIds };
     },
-    onSuccess: (data) => {
-      void useChatStore.getState().send(data.formatted_message, agentId);
+    onSettled: () => {
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });
