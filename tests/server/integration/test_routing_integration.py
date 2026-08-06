@@ -915,6 +915,103 @@ async def test_child_of_an_auto_parent_keeps_cross_harness_candidates(
     assert set(routing_client.offered[0]) == {"claude-sdk", "codex", "pi"}
 
 
+@pytest.mark.parametrize(
+    ("case", "picked", "verdict_harness", "applied"),
+    [
+        # The reported verdict: the external router named codex + a gpt arm for
+        # a child spawned onto pi. Nothing offered runs it, so the chip declines.
+        ("cross-family-declines", GPT_MODEL, "codex", False),
+        # An in-family pick is applied normally.
+        ("in-family-applies", ROUTED_MODEL, "pi", True),
+    ],
+)
+async def test_named_worker_child_of_an_auto_parent_stays_on_its_own_harness(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    case: str,
+    picked: str,
+    verdict_harness: str,
+    applied: bool,
+) -> None:
+    """A spawn that named a worker keeps that worker's harness.
+
+    The polly shape: a Smart Routing brain whose ``pi`` sub-agent declares its
+    own harness. The spawn pins the CLI the child boots on, so the router is
+    offered pi alone — it used to be handed every family, and a codex verdict
+    was written to the row and stamped "applied" on a pane running pi.
+    """
+    agent = await create_test_agent(
+        client,
+        name=f"routing-child-named-worker-{case}",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk", "smart_routing_harness": "auto"},
+        },
+        sub_agents=[{"name": "pi", "executor": {"type": "omnigent", "config": {"harness": "pi"}}}],
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert parent.status_code == 201, parent.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent_conv = conv_store.get_conversation(str(parent.json()["id"]))
+    assert parent_conv is not None
+    assert parent_conv.harness_override == "auto"
+
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent.json()["id"],
+            "sub_agent_name": "pi",
+            "title": "pi:joke-pi",
+        },
+    )
+    assert child.status_code == 201, child.text
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    # The named worker is not handed the auto sentinel: its harness is decided.
+    assert child_conv.harness_override != "auto"
+    assert AUTO_HARNESS_LABEL_KEY not in child_conv.labels
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=picked, rationale="cheap and fast", harness=verdict_harness)
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "tell me a joke"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child_conv.id,
+                child_conv,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    # Only the child's own harness was on offer.
+    assert set(routing_client.offered[0]) == {"pi"}
+    # And nothing cross-family lands: the row never moves off pi, and the chip
+    # is an in-family pick or an honest decline — never another family stamped
+    # "applied" over a pane that is still running pi.
+    refreshed = conv_store.get_conversation(child_conv.id)
+    assert refreshed is not None
+    assert refreshed.harness_override in (None, "pi")
+    decisions = _routing_decisions(conv_store, child_conv.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.scope == "child_session"
+    assert decisions[0].data.harness in (None, "pi")
+    assert decisions[0].data.applied is applied
+    if applied:
+        assert refreshed.model_override == decisions[0].data.model
+    else:
+        assert decisions[0].data.model == "unavailable"
+        assert refreshed.model_override is None
+
+
 # ── 7b. The subagent-routing switch is the child-spawn gate ────────
 
 

@@ -724,12 +724,15 @@ async def _decide(
     # ``raw_model`` / ``applied`` stay truthful to whatever the router picks.
     task = _routing_task(req)
 
-    from omnigent.server.routing_backend import backends_from_caps, select_router
+    from omnigent.server.routing_backend import (
+        backends_from_caps,
+        route_with_fallback,
+        select_router,
+    )
 
-    router = select_router(backends_from_caps(caps), gateway_backed=gateway_backed)
-    if router is None:
+    backends = backends_from_caps(caps)
+    if select_router(backends, gateway_backed=gateway_backed) is None:
         return _unavailable_decision("no routing client configured")
-    client = router.client
 
     candidates = (
         available_models
@@ -750,26 +753,31 @@ async def _decide(
     # allow with no model, the hook leaves ``tool_input`` untouched, and the
     # spawn runs on exactly the model it named.
     raised: str | None = None
+    client: Any = backends.any()  # type: ignore[explicit-any]
+    source: str | None = None
+    result = None
     try:
-        result = await client.route(task, candidates)
+        call = await route_with_fallback(backends, task, candidates, gateway_backed=gateway_backed)
     except Exception as exc:  # noqa: BLE001 — router outages are a normal path here
         _logger.warning(
             "route-subagent: router call failed for session=%s", session_id, exc_info=True
         )
-        result = None
         # A client that raises past its own error reporting leaves
         # ``last_error`` unset; without this the chip said only "no verdict"
         # and the cause lived in the server log alone.
         from omnigent.server.smart_routing import failure_detail
 
         raised = f"router call failed: {failure_detail(exc)}"
+    else:
+        if call is not None:
+            result, client, source = call.result, call.client, call.source
     if result is None or not getattr(result, "model", None):
         detail = (
             _opt_str(getattr(client, "last_error", None)) or raised or "router returned no verdict"
         )
         return _unavailable_decision(detail)
 
-    return replace(_decision_from_result(req, result, candidates), router_source=router.source)
+    return replace(_decision_from_result(req, result, candidates), router_source=source)
 
 
 def _requested_match(req: SubagentRouteRequest, model: str | None) -> bool:
