@@ -32,6 +32,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
@@ -3661,50 +3662,83 @@ export function buildSlashCommandWithArgsSet(
 /** Circumference of the progress ring (r=5.5). */
 const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
 
-/** Circular progress ring showing how much context window is used, with the used percentage beside it. */
+/** Format a token count compactly: 1234 → "1.2k", 1234567 → "1.2M". */
+function fmtTokens(n: number | null | undefined): string {
+  if (n == null) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString();
+}
+
+/** Clickable context ring with popover showing token breakdown and compact button. */
 function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
   const pct = Math.min(tokensUsed / contextWindow, 1);
-  // Arc, %, label, and tooltip all encode context USED: a fresh session
-  // shows an empty ring at 0% and the ring fills as context is consumed.
   const usedArc = pct * RING_CIRCUMFERENCE;
   const usedPct = Math.round(pct * 100);
+  const sessionUsageByModel = useChatStore((s) => s.sessionUsageByModel);
+  const sessionCostUsd = useChatStore((s) => s.sessionCostUsd);
+
+  const totals = useMemo(() => {
+    let input = 0, output = 0, cacheRead = 0, cacheCreate = 0;
+    if (sessionUsageByModel) {
+      for (const u of Object.values(sessionUsageByModel)) {
+        input += u.inputTokens ?? 0;
+        output += u.outputTokens ?? 0;
+        cacheRead += u.cacheReadInputTokens ?? 0;
+        cacheCreate += u.cacheCreationInputTokens ?? 0;
+      }
+    }
+    return { input, output, cacheRead, cacheCreate };
+  }, [sessionUsageByModel]);
 
   const color =
     pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
 
+  const ringIcon = (
+    <span
+      className={cn("flex items-center gap-1.5 cursor-pointer", color)}
+      aria-label={`${usedPct}% of context used`}
+    >
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+        <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
+        {usedArc > 0 && (
+          <circle
+            cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2"
+            strokeLinecap="round" strokeDasharray={`${usedArc} ${RING_CIRCUMFERENCE}`}
+            transform="rotate(-90 8 8)"
+          />
+        )}
+      </svg>
+      <span className="text-xs tabular-nums" aria-hidden="true">{usedPct}%</span>
+    </span>
+  );
+
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          className={cn("flex items-center gap-1.5", color)}
-          aria-label={`${usedPct}% of context used`}
+    <Popover>
+      <PopoverTrigger asChild>{ringIcon}</PopoverTrigger>
+      <PopoverContent side="top" align="end" className="w-64 p-3 text-xs">
+        <div className="mb-2 flex justify-between">
+          <span className="text-muted-foreground">Context</span>
+          <span>{fmtTokens(tokensUsed)} / {fmtTokens(contextWindow)}</span>
+        </div>
+        <div className="mb-3 h-1.5 rounded-full bg-muted overflow-hidden">
+          <div className={cn("h-full rounded-full", pct > 0.8 ? "bg-destructive" : pct > 0.6 ? "bg-warning" : "bg-primary")} style={{ width: `${usedPct}%` }} />
+        </div>
+        <div className="space-y-1 text-muted-foreground">
+          <div className="flex justify-between"><span>Input</span><span>{fmtTokens(totals.input)}</span></div>
+          <div className="flex justify-between"><span>Output</span><span>{fmtTokens(totals.output)}</span></div>
+          {totals.cacheRead > 0 && <div className="flex justify-between"><span>Cache read</span><span>{fmtTokens(totals.cacheRead)}</span></div>}
+          {totals.cacheCreate > 0 && <div className="flex justify-between"><span>Cache create</span><span>{fmtTokens(totals.cacheCreate)}</span></div>}
+          {sessionCostUsd != null && <div className="flex justify-between font-medium text-foreground"><span>Cost</span><span>${sessionCostUsd.toFixed(4)}</span></div>}
+        </div>
+        <button
+          className="mt-3 w-full rounded bg-muted px-2 py-1 text-xs hover:bg-muted/80"
+          onClick={() => useChatStore.getState().compact()}
         >
-          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
-            {/* Track */}
-            <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
-            {/* Used arc — skipped at 0, where round linecaps would still paint a dot. */}
-            {usedArc > 0 && (
-              <circle
-                cx="8"
-                cy="8"
-                r="5.5"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeDasharray={`${usedArc} ${RING_CIRCUMFERENCE}`}
-                transform="rotate(-90 8 8)"
-              />
-            )}
-          </svg>
-          <span className="text-xs tabular-nums" aria-hidden="true">
-            {usedPct}%
-          </span>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-xs">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
-      </TooltipContent>
-    </Tooltip>
+          Compact Context
+        </button>
+      </PopoverContent>
+    </Popover>
   );
 }
 
