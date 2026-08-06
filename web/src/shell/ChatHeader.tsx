@@ -187,9 +187,11 @@ export function ChatHeader({
   // its parent's `<vendor>-native-ui` row, so its agent name is an internal
   // the server itself hides (`public_agent_name`). Name the product instead,
   // matching the Agents rail and the composer. Every other sub-agent keeps its
-  // own agent name, which is already human-readable.
-  const subAgentName =
-    nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null;
+  // own agent name, which is already human-readable. Only the child branch
+  // below reads this, so it stays behind `isChildSession`.
+  const subAgentName = isChildSession
+    ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null)
+    : null;
   return (
     <header
       className={cn(
