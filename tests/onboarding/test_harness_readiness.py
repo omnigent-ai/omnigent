@@ -602,6 +602,30 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
         )
 
 
+def test_kimi_code_zero_x_is_ready_not_version_too_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current Kimi Code build reads as ready across every kimi surface.
+
+    Regression: the spec's floor came from the legacy kimi-cli 1.x line, so a
+    real 0.x Kimi Code install badged ``version-too-low`` and the harness could
+    not be selected at all.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="0.31.1", stderr="")
+        # Any other probe (e.g. `claude auth status`) is not this test's concern;
+        # a non-zero exit keeps other harnesses' readiness deterministic.
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    result = configured_harness_map()
+    for harness in ("kimi", "kimi-code", "kimi-native", "native-kimi"):
+        assert result[harness] is True, f"{harness} should be ready, got {result[harness]!r}"
+
+
 def test_antigravity_native_requires_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
