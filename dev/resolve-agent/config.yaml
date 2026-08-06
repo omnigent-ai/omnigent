@@ -115,9 +115,12 @@ guardrails:
         arguments:
           max_dispatches_per_turn: 2
           dispatch_tools: [sys_session_send, sys_session_create]
-    # The only child this agent should launch is a REVIEWER. Constrain spawned
-    # sub-agents to the review purpose so it can't turn a child into a second
-    # code author.
+    # Require `review` on any sys_session_SEND dispatch. Note this guard only
+    # inspects sys_session_send, NOT the sys_session_create that launches the
+    # reviewer child (create carries no purpose arg) — so it does not itself
+    # constrain that child. spawn_bounds (which counts sys_session_create) caps
+    # the fan-out; the reviewer being read-only rests on its prompt and the codex
+    # bundle's own guardrails. This guard is a backstop for any follow-up sends.
     headless_subagent_purpose_guard:
       type: function
       on: [tool_call]

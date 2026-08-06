@@ -68,6 +68,13 @@ def test_parse_ci_run_url(url: str, expected: dict[str, str]) -> None:
         "https://github.com/omnigent-ai/omnigent/actions",
         "not a url",
         "",
+        # A different host that merely contains the run path — the old
+        # unanchored regex would have wrongly accepted this.
+        "https://evil.example.com/github.com/o/r/actions/runs/123",
+        # Trailing extra path beyond the recognized job/attempts suffixes.
+        "https://github.com/o/r/actions/runs/123/steps/9",
+        # Non-http scheme.
+        "ftp://github.com/o/r/actions/runs/123",
     ],
 )
 def test_parse_ci_run_url_rejects_non_run_urls(url: str) -> None:

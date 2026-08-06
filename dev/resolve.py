@@ -44,6 +44,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import NoReturn
 
@@ -81,13 +82,21 @@ def parse_session_ref(ref: str) -> str:
 def parse_ci_run_url(url: str) -> dict[str, str] | None:
     """Parse a GitHub Actions run URL into ``{org, repo, run_id}``.
 
-    Matches ``https://github.com/<org>/<repo>/actions/runs/<run_id>`` (with an
-    optional trailing ``/job/<id>`` or ``/attempts/<n>``). Returns ``None`` when
-    the URL is not a recognizable Actions run URL, so the caller can reject it.
+    Requires a real ``https://github.com`` (or ``www.github.com``) URL whose
+    path is ``/<org>/<repo>/actions/runs/<run_id>`` (an optional trailing
+    ``/job/<id>`` or ``/attempts/<n>`` is allowed). Parses the URL structurally
+    — host, then anchored path — rather than substring-matching, so a string
+    that merely *contains* that fragment is rejected. Returns ``None`` when the
+    URL is not a recognizable Actions run URL, so the caller can reject it.
     """
-    m = re.search(
-        r"github\.com/([^/]+)/([^/]+)/actions/runs/(\d+)",
-        url.strip(),
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.netloc.lower() not in ("github.com", "www.github.com"):
+        return None
+    m = re.fullmatch(
+        r"/([^/]+)/([^/]+)/actions/runs/(\d+)(?:/(?:job/\d+|attempts/\d+))?/?",
+        parsed.path,
     )
     if not m:
         return None
@@ -156,6 +165,41 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return result.stdout
 
 
+def _resolve_base_ref() -> str:
+    """Resolve the commit to base the fix worktree on: latest ``origin/main``.
+
+    Fetches ``origin main`` (best-effort) and resolves ``origin/main`` to a
+    concrete SHA, so the fix sits on top of mainline rather than whatever branch
+    this script happens to run from. Falls back to the local ``main`` ref, and
+    finally to ``HEAD``, when the remote isn't reachable (offline runs).
+    """
+    subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "fetch", "--quiet", "origin", "main"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for ref in ("origin/main", "main", "HEAD"):
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(_REPO_ROOT),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{ref}^{{commit}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        sha = result.stdout.strip()
+        if result.returncode == 0 and sha:
+            return sha
+    _die(f"could not resolve a base ref (origin/main, main, HEAD) in {_REPO_ROOT}")
+
+
 def _unique_branch(slug: str) -> str:
     """Return ``fix/<slug>`` (or ``fix/<slug>-2``, …) not yet used locally."""
     existing = set(_git("branch", "--format=%(refname:short)").split())
@@ -211,7 +255,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _confirm_launch(
-    payload: str, worktree: Path, branch: str, *, skip_push: bool, assume_yes: bool
+    payload: str, branch: str, base: str, *, skip_push: bool, assume_yes: bool
 ) -> None:
     """Confirm before launching, since the agent takes outward git/GitHub actions."""
     author_line = (
@@ -224,7 +268,7 @@ def _confirm_launch(
         "  - review an existing fix PR (comment findings on it), or\n"
         f"  - implement a fix, run tests, then {author_line}.\n"
         f"  input:    {payload}\n"
-        f"  worktree: {worktree}  (branch {branch})\n"
+        f"  branch:   {branch}  (off {base[:12]})\n"
     )
     if assume_yes:
         print("→ --yes given; proceeding without confirmation.\n")
@@ -254,23 +298,27 @@ def main() -> None:
 
     from omnigent.host.git_worktree import WorktreeError, create_worktree
 
-    # Create a fresh worktree off THIS checkout's HEAD (latest main), and let the
-    # agent recover the reproduction from the pointer you gave. The driver does
-    # NOT try to map your session to a repro/<slug> worktree — there is no stored
-    # session→worktree link, so any "pick the newest repro worktree" guess is
-    # wrong whenever more than one exists (it would branch + stage the wrong bug).
-    # Instead the agent calls sys_session_get_info to learn the repro session's
-    # own workspace and reads the full uncommitted test off that worktree's disk
-    # (the session transcript truncates large tool args, so the file — not the
-    # transcript — is the source of truth). For --ci-link it recovers the test
-    # from the run's artifacts. The branch is named from the pointer you actually
-    # passed (the session id or the CI run id), so it never shows a phantom slug.
+    # Base the fresh fix worktree on the latest `main`, NOT this checkout's HEAD:
+    # the script may be run from a feature branch, and branching off HEAD would
+    # drag that branch's unrelated commits into the fix (contaminating the PR /
+    # review). The agent recovers the reproduction from the pointer you gave —
+    # the driver does NOT try to map your session to a repro/<slug> worktree
+    # (there is no stored session→worktree link, so "pick the newest repro
+    # worktree" is wrong whenever more than one exists). Instead the agent calls
+    # sys_session_get_info to learn the repro session's own workspace and reads
+    # the full uncommitted test off that worktree's disk (the session transcript
+    # truncates large tool args, so the file — not the transcript — is the source
+    # of truth); for --ci-link it recovers the test from the run's artifacts. The
+    # branch is named from the pointer you actually passed (the session id or the
+    # CI run id), so it never shows a phantom slug.
     slug = branch_slug(session=args.session, ci_link=args.ci_link)
-    base = _git("rev-parse", "HEAD").strip()
-    if not base:
-        _die(f"could not resolve HEAD of {_REPO_ROOT}")
-
+    base = _resolve_base_ref()
     branch = _unique_branch(slug)
+
+    # Confirm BEFORE creating the worktree, so answering "no" doesn't leave an
+    # orphaned fix/<slug> worktree + branch on disk.
+    _confirm_launch(payload, branch, base, skip_push=args.skip_push, assume_yes=args.yes)
+
     try:
         created = create_worktree(repo_path=str(_REPO_ROOT), branch_name=branch, base_branch=base)
     except WorktreeError as exc:
@@ -278,20 +326,12 @@ def main() -> None:
     worktree = Path(created.worktree_path)
     print(f"→ worktree: {worktree}  (branch {created.branch})")
 
-    _confirm_launch(
-        payload,
-        worktree,
-        created.branch,
-        skip_push=args.skip_push,
-        assume_yes=args.yes,
-    )
-
     # Pass the agent by ABSOLUTE path from this (main) checkout. `omnigent run`
     # resolves a relative agent path against its cwd — which we set to the fresh
-    # fix worktree below — but that worktree is branched off the repro commit and
-    # does not contain dev/resolve-agent, so a relative path would 404. The main
-    # checkout always has the agent files; cwd stays the worktree so the agent
-    # still edits there.
+    # fix worktree below — but that worktree is a bare checkout of `main` and does
+    # not necessarily contain dev/resolve-agent (e.g. run before this lands, or
+    # from an older base), so a relative path could 404. The main checkout always
+    # has the agent files; cwd stays the worktree so the agent still edits there.
     agent_arg = str(_REPO_ROOT / _AGENT_REL)
     cmd = ["omnigent", "run", agent_arg, "-p", payload]
     if args.server is not None:
