@@ -29,6 +29,20 @@ from omnigent.git_credential_github import fetch_broker_token
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.spec.types import MCPServerConfig
 
+#: Branded button image for PR bodies (the Omnigent star + "Open in Omnigent").
+#: GitHub renders PR-body images through its camo proxy, which fetches
+#: server-side and cannot reach a deployment behind Cloudflare Access / bot
+#: protection — so the image is NOT served from the deployment's own origin.
+#: Instead it points at a fixed, publicly camo-reachable URL (GitHub's own CDN
+#: by default), like Cursor's PR-footer button: the image is the same for every
+#: deployment, only the anchor ``href`` is the per-session URL. Override per
+#: deployment with :data:`BUTTON_IMAGE_URL_ENV_VAR`; set it empty to fall back
+#: to a plain markdown link.
+_DEFAULT_BUTTON_IMAGE_URL = (
+    "https://raw.githubusercontent.com/omnigent-ai/omnigent/HEAD/web/public/open-in-omnigent.svg"
+)
+BUTTON_IMAGE_URL_ENV_VAR = "OMNIGENT_PR_BUTTON_IMAGE_URL"
+
 #: GitHub's hosted (remote) MCP server. Reachable over the sandbox's outbound
 #: network; needs only an ``Authorization: Bearer <token>`` header.
 GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
@@ -68,9 +82,35 @@ def github_mcp_available() -> bool:
     return github_mcp_token() is not None
 
 
+def _button_image_url() -> str | None:
+    """The configured button image URL, or ``None`` to use a plain link.
+
+    Defaults to the Omnigent logo on GitHub's CDN (camo-reachable everywhere);
+    :data:`BUTTON_IMAGE_URL_ENV_VAR` overrides it, and an explicit empty value
+    disables the image.
+    """
+    override = os.environ.get(BUTTON_IMAGE_URL_ENV_VAR)
+    if override is not None:
+        override = override.strip()
+        return override or None
+    return _DEFAULT_BUTTON_IMAGE_URL
+
+
 def open_in_omnigent_link(session_url: str) -> str:
-    """The canonical 'Open in Omnigent' markdown link for a PR body."""
-    return f"[Open in Omnigent]({session_url})"
+    """A branded 'Open in Omnigent' button for a PR body.
+
+    Renders like Cursor's PR-footer button: a fixed Omnigent star image (from a
+    camo-reachable CDN, not the deployment's own origin) linking back to the
+    session. The session URL is kept verbatim in the anchor ``href`` so the
+    session-PR panel still associates the PR by substring match. Falls back to a
+    plain markdown link when no image URL is configured.
+    """
+    image_url = _button_image_url()
+    if image_url is None:
+        return f"[Open in Omnigent]({session_url})"
+    return (
+        f'<a href="{session_url}"><img alt="Open in Omnigent" src="{image_url}" height="28"></a>'
+    )
 
 
 def inject_session_link(arguments: dict, session_url: str | None) -> dict:
@@ -134,6 +174,12 @@ def github_mcp_server_config(
     resolved_session_url = session_url or github_session_url()
     if resolved_session_url:
         env["OMNIGENT_SESSION_URL"] = resolved_session_url
+    # Forward a deployment's button-image override so the proxy stamps the same
+    # image the deployment configured (the proxy process, not the runner, builds
+    # the PR body).
+    button_override = os.environ.get(BUTTON_IMAGE_URL_ENV_VAR)
+    if button_override is not None:
+        env[BUTTON_IMAGE_URL_ENV_VAR] = button_override
     return MCPServerConfig(
         name=GITHUB_MCP_NAME,
         transport="stdio",

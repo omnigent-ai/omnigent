@@ -101,6 +101,52 @@ export async function fetchGithubBranches(fullName: string): Promise<GithubBranc
   return (await res.json()) as GithubBranchList;
 }
 
+/** One PR opened during a session, from ``GET .../sessions/{id}/pull-requests``. */
+export interface GithubSessionPull {
+  /** ``owner/repo`` the PR is in. */
+  repo: string;
+  /** PR number. */
+  number: number;
+  /** PR title, or null. */
+  title: string | null;
+  /** Web URL of the PR, or null. */
+  html_url: string | null;
+  /** Head branch the PR was opened from, or null. */
+  head_ref: string | null;
+  /** Whether the PR is a draft. */
+  draft: boolean;
+  /** ``"open"`` or ``"closed"``, or null. */
+  state: string | null;
+  /** Whether the PR was merged (a merged PR is also ``state: "closed"``). */
+  merged: boolean;
+  /** Login of the PR author, or null. */
+  author_login: string | null;
+  /** ISO-8601 creation time, or null (list is newest-first). */
+  created_at: string | null;
+}
+
+/** Shape of ``GET /v1/integrations/github/sessions/{id}/pull-requests``. */
+export interface GithubSessionPullList {
+  /** False when the user hasn't connected GitHub (pulls is then empty). */
+  connected: boolean;
+  pulls: GithubSessionPull[];
+}
+
+/**
+ * Fetch the PRs opened during *sessionId* across its cloned repos (newest
+ * first). Returns an empty list for non-managed sessions or when GitHub isn't
+ * linked, so callers can render nothing without special-casing.
+ */
+export async function fetchSessionPulls(sessionId: string): Promise<GithubSessionPullList> {
+  const res = await authenticatedFetch(
+    `/v1/integrations/github/sessions/${encodeURIComponent(sessionId)}/pull-requests`,
+  );
+  if (!res.ok) {
+    throw new Error(`GitHub session PRs failed: ${res.status}`);
+  }
+  return (await res.json()) as GithubSessionPullList;
+}
+
 /** Disconnect the current user's GitHub account. */
 export async function disconnectGithub(): Promise<void> {
   const res = await authenticatedFetch("/v1/integrations/github/disconnect", {

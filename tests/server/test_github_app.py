@@ -169,3 +169,141 @@ async def test_list_branches_non_200_raises() -> None:
 
     with pytest.raises(GitHubAppError):
         await _client(handler).list_branches("ghu_bad", "caffeinelabs/nope")
+
+
+@pytest.mark.asyncio
+async def test_list_pulls_projects_fields_and_stops_on_short_page() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert request.url.path == "/repos/caffeinelabs/app/pulls"
+        # All states so merged/closed PRs surface too.
+        assert request.url.params.get("state") == "all"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "number": 7,
+                    "title": "feat: thing",
+                    "html_url": "https://github.com/caffeinelabs/app/pull/7",
+                    "head": {"ref": "feat-thing"},
+                    "user": {"login": "octocat"},
+                    "draft": False,
+                    "state": "closed",
+                    "merged_at": "2026-07-29T02:00:00Z",
+                    "created_at": "2026-07-29T00:00:00Z",
+                    "body": "does the thing\n\n[Open in Omnigent](https://omni.example/c/conv_1)",
+                    "extra": "ignored",
+                },
+                {"no_number": "skipped"},
+            ],
+        )
+
+    pulls = await _client(handler).list_pulls("ghu_x", "caffeinelabs/app")
+    assert calls == ["/repos/caffeinelabs/app/pulls"]
+    # A merged PR: state closed + merged True, and it is still returned.
+    assert pulls == [
+        {
+            "number": 7,
+            "title": "feat: thing",
+            "html_url": "https://github.com/caffeinelabs/app/pull/7",
+            "head_ref": "feat-thing",
+            "draft": False,
+            "state": "closed",
+            "merged": True,
+            "author_login": "octocat",
+            "created_at": "2026-07-29T00:00:00Z",
+            "body": "does the thing\n\n[Open in Omnigent](https://omni.example/c/conv_1)",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_pulls_non_200_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"message": "Forbidden"})
+
+    with pytest.raises(GitHubAppError):
+        await _client(handler).list_pulls("ghu_bad", "caffeinelabs/app")
+
+
+@pytest.mark.asyncio
+async def test_search_pulls_maps_search_items() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/search/issues"
+        assert request.url.params.get("q") == "sess123 in:body type:pr author:octocat"
+        return httpx.Response(
+            200,
+            json={
+                "total_count": 2,
+                "items": [
+                    {
+                        "number": 9,
+                        "title": "via MCP",
+                        "html_url": "https://github.com/caffeinelabs/other/pull/9",
+                        "state": "closed",
+                        "draft": False,
+                        "user": {"login": "octocat"},
+                        "created_at": "2026-07-29T03:00:00Z",
+                        "body": "…/c/sess123",
+                        "repository_url": "https://api.github.com/repos/caffeinelabs/other",
+                        "pull_request": {"merged_at": "2026-07-29T04:00:00Z"},
+                    },
+                    {"no_number": "skipped"},
+                ],
+            },
+        )
+
+    pulls = await _client(handler).search_pulls("ghu_x", "sess123 in:body type:pr author:octocat")
+    assert pulls == [
+        {
+            "number": 9,
+            "title": "via MCP",
+            "html_url": "https://github.com/caffeinelabs/other/pull/9",
+            "head_ref": None,
+            "draft": False,
+            "state": "closed",
+            "merged": True,  # from pull_request.merged_at
+            "author_login": "octocat",
+            "created_at": "2026-07-29T03:00:00Z",
+            "body": "…/c/sess123",
+            "repo": "caffeinelabs/other",  # parsed from repository_url
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_pulls_non_200_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"message": "Validation Failed"})
+
+    with pytest.raises(GitHubAppError):
+        await _client(handler).search_pulls("ghu_bad", "sess in:body type:pr")
+
+
+@pytest.mark.asyncio
+async def test_list_pull_commit_messages_extracts_messages() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/caffeinelabs/app/pulls/7/commits"
+        return httpx.Response(
+            200,
+            json=[
+                {"commit": {"message": "feat: x\n\nOmnigent-Session: conv_abc"}},
+                {"commit": {"message": "fix: y"}},
+                {"no_commit": True},
+            ],
+        )
+
+    msgs = await _client(handler).list_pull_commit_messages("ghu_x", "caffeinelabs/app", 7)
+    assert msgs == ["feat: x\n\nOmnigent-Session: conv_abc", "fix: y"]
+    assert any("Omnigent-Session: conv_abc" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_list_pull_commit_messages_non_200_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    with pytest.raises(GitHubAppError):
+        await _client(handler).list_pull_commit_messages("ghu_bad", "caffeinelabs/app", 9)

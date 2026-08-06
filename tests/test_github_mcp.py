@@ -25,7 +25,7 @@ _COORD_VARS = ("RUNNER_SERVER_URL", HOST_ID_ENV_VAR, HOST_TOKEN_ENV_VAR)
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in (*_COORD_VARS, "OMNIGENT_SESSION_URL"):
+    for var in (*_COORD_VARS, "OMNIGENT_SESSION_URL", "OMNIGENT_PR_BUTTON_IMAGE_URL"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -110,6 +110,32 @@ def test_inject_session_link_noop_without_url() -> None:
 def test_inject_session_link_empty_body() -> None:
     args = inject_session_link({"title": "x"}, _SESSION_URL)
     assert args["body"] == open_in_omnigent_link(_SESSION_URL)
+
+
+def test_open_in_omnigent_link_default_image_is_camo_reachable() -> None:
+    from omnigent.github_mcp import _DEFAULT_BUTTON_IMAGE_URL
+
+    link = open_in_omnigent_link(_SESSION_URL)
+    # Fixed image on a camo-reachable CDN (not the deployment's own origin).
+    assert f'src="{_DEFAULT_BUTTON_IMAGE_URL}"' in link
+    assert "raw.githubusercontent.com" in link
+    # The session URL stays verbatim in the href exactly once → detection intact.
+    assert f'href="{_SESSION_URL}"' in link
+    assert link.count(_SESSION_URL) == 1
+
+
+def test_open_in_omnigent_link_honors_image_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_PR_BUTTON_IMAGE_URL", "https://cdn.example/star.svg")
+    link = open_in_omnigent_link(_SESSION_URL)
+    assert 'src="https://cdn.example/star.svg"' in link
+
+
+def test_open_in_omnigent_link_empty_override_falls_back_to_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_PR_BUTTON_IMAGE_URL", "")
+    link = open_in_omnigent_link(_SESSION_URL)
+    assert link == f"[Open in Omnigent]({_SESSION_URL})"
 
 
 def test_opencode_block_translates_stdio_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
