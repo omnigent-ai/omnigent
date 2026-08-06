@@ -457,6 +457,10 @@ function hasFoldableShape(
  * the trailing bubble keeps its actions. True here always means the trace
  * folded — never the reverse, which would strip actions off a visible
  * answer.
+ *
+ * Shape and liveness only — no debounce. Across `BlockRenderer`'s settle
+ * window the two answers may differ for a beat; on a bubble with no
+ * answer to anchor them to, that costs nothing visible.
  */
 export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);

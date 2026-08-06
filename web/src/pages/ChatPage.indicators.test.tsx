@@ -158,7 +158,9 @@ describe("RunnerStartingIndicator", () => {
 
 describe("BubbleView dispatch", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test" });
+    // Explicitly settled: the fold-only cases below turn on `possiblyLive`
+    // being false, so they must not ride on the store's default status.
+    useChatStore.setState({ conversationId: "conv_test", sessionStatus: "idle" });
   });
 
   type AssistantBubble = Extract<Bubble, { kind: "assistant" }>;
