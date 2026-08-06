@@ -1,19 +1,41 @@
 import { useEffect, useState } from "react";
 
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { isIOSShell, NATIVE_READY_EVENT, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 
 /**
  * Tracks whether `surface` is the frontmost element at its own centre — i.e.
  * not covered by a drawer / sidebar / sheet. Returns false when inactive,
- * outside the iOS shell, or while obscured. Re-checks on the layout signals a
- * drawer transition emits (mutations, transitions, viewport changes). Both the
- * native server switcher and the native Chat/Terminal bar hide off this signal
- * so neither floats over an opened panel.
+ * off the shell selected by `onShell` (iOS by default), or while obscured.
+ * Re-checks on the layout signals a drawer transition emits (mutations,
+ * transitions, viewport changes). The native server switcher and the native
+ * Chat/Terminal bar hide off this signal so neither floats over an opened
+ * panel.
  */
-export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean): boolean {
-  const [frontmost, setFrontmost] = useState(false);
+/**
+ * Whether `onShell` reports the native shell as present. The shell's bridge
+ * can attach after mount (Android's page-finished fallback), so an off-shell
+ * answer is re-checked once the shell announces itself.
+ */
+export function useShellReady(onShell: () => boolean): boolean {
+  const [shellReady, setShellReady] = useState(onShell);
   useEffect(() => {
-    if (!isIOSShell() || !active) {
+    if (shellReady) return;
+    const handleReady = () => setShellReady(onShell());
+    window.addEventListener(NATIVE_READY_EVENT, handleReady);
+    return () => window.removeEventListener(NATIVE_READY_EVENT, handleReady);
+  }, [shellReady, onShell]);
+  return shellReady;
+}
+
+export function useSurfaceFrontmost(
+  surface: HTMLElement | null,
+  active: boolean,
+  onShell: () => boolean = isIOSShell,
+): boolean {
+  const [frontmost, setFrontmost] = useState(false);
+  const shellReady = useShellReady(onShell);
+  useEffect(() => {
+    if (!shellReady || !active) {
       setFrontmost(false);
       return;
     }
@@ -63,7 +85,7 @@ export function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean
       window.visualViewport?.removeEventListener("scroll", schedule);
       setFrontmost(false);
     };
-  }, [active, surface]);
+  }, [active, surface, shellReady]);
   return frontmost;
 }
 

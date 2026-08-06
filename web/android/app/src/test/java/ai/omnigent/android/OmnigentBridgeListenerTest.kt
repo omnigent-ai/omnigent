@@ -25,6 +25,8 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
+    private val receivedBands = mutableListOf<ServerSwitcherBand>()
+    private val receivedSwitcherVisibility = mutableListOf<Boolean>()
 
     private val badgeId = 1
 
@@ -36,6 +38,8 @@ class OmnigentBridgeListenerTest {
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
+                onServerSwitcherBand = { receivedBands += it },
+                onServerSwitcherHidden = { receivedSwitcherVisibility += it },
             )
         shadow =
             shadowOf(
@@ -131,5 +135,66 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    @Test
+    fun `setServerSwitcherBand dispatches valid normalized fractions`() {
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":0.25,"rightFraction":0.8}""",
+        )
+
+        assertEquals(listOf(ServerSwitcherBand(0.25, 0.8)), receivedBands)
+    }
+
+    @Test
+    fun `setServerSwitcherBand drops missing and wrong-type fields`() {
+        listener.handle("""{"method":"setServerSwitcherBand","leftFraction":0.25}""")
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":"0.25","rightFraction":0.8}""",
+        )
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":0.25,"rightFraction":null}""",
+        )
+
+        assertEquals(emptyList<ServerSwitcherBand>(), receivedBands)
+    }
+
+    @Test
+    fun `setServerSwitcherBand drops non-finite out-of-range and reversed fractions`() {
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":0.2,"rightFraction":1e400}""",
+        )
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":-0.1,"rightFraction":0.8}""",
+        )
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":0.2,"rightFraction":1.1}""",
+        )
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":0.8,"rightFraction":0.2}""",
+        )
+        listener.handle(
+            """{"method":"setServerSwitcherBand","leftFraction":0.5,"rightFraction":0.5}""",
+        )
+
+        assertEquals(emptyList<ServerSwitcherBand>(), receivedBands)
+    }
+
+    @Test
+    fun `setServerSwitcherHidden dispatches booleans`() {
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":true}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":false}""")
+
+        assertEquals(listOf(true, false), receivedSwitcherVisibility)
+    }
+
+    @Test
+    fun `setServerSwitcherHidden rejects missing and non-boolean values`() {
+        listener.handle("""{"method":"setServerSwitcherHidden"}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":"true"}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":1}""")
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":null}""")
+
+        assertEquals(emptyList<Boolean>(), receivedSwitcherVisibility)
     }
 }

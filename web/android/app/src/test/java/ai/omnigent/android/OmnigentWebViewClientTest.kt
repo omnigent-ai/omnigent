@@ -23,6 +23,23 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `page start resets native layout before the new page finishes`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var navigationStarts = 0
+        val client =
+            client(
+                shouldInjectBridgeAtPageReady = false,
+                onNavigationStarted = { navigationStarts++ },
+            )
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        assertEquals(1, navigationStarts)
+
+        client.onPageFinished(webView, PINNED_URL)
+        assertEquals(1, navigationStarts)
+    }
+
+    @Test
     fun `fallback injects the facade before declaring the page ready`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var readyUrl: String? = null
@@ -40,14 +57,17 @@ class OmnigentWebViewClientTest {
         assertEquals(PINNED_URL, readyUrl)
     }
 
+    // onPageReady stays last so callers can pass it as a trailing lambda.
     private fun client(
         shouldInjectBridgeAtPageReady: Boolean,
+        onNavigationStarted: () -> Unit = {},
         onPageReady: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { PINNED_ORIGIN },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = {},
+        onNavigationStarted = onNavigationStarted,
     )
 
     private class RecordingWebView(

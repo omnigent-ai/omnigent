@@ -94,6 +94,11 @@ interface NativeShellApi {
    */
   setServerSwitcherHidden?: (hidden: boolean) => void;
   /**
+   * Horizontal band the native server switcher may occupy, as normalized
+   * fractions of the layout viewport width.
+   */
+  setServerSwitcherBand?: (leftFraction: number, rightFraction: number) => void;
+  /**
    * Legacy iOS bridge name from the sidebar-only implementation. Kept as a
    * fallback so a newer SPA can still ask an older shell to hide the switcher.
    */
@@ -329,6 +334,14 @@ export function isMacElectronShell(): boolean {
   return isElectronShell() && navigator.userAgent.includes("Macintosh");
 }
 
+/**
+ * Dispatched on `window` by a native shell once its bridge object is installed.
+ * The Android bridge can attach after the app mounts (an injected-script
+ * fallback runs at page-finished), so shell checks made at mount can go stale
+ * until this fires.
+ */
+export const NATIVE_READY_EVENT = "omnigent:native-ready";
+
 /** True when running inside the iOS WKWebView native shell. */
 export function isIOSShell(): boolean {
   return nativeApi()?.kind === "ios";
@@ -531,6 +544,20 @@ export function setNativeServerSwitcherHidden(hidden: boolean): void {
 /** @deprecated Use setNativeServerSwitcherHidden. */
 export function setNativeSidebarOpen(open: boolean): void {
   setNativeServerSwitcherHidden(open);
+}
+
+/**
+ * Publish normalized horizontal bounds for native switcher positioning.
+ * Older shells lack the method and keep whole-window centring.
+ */
+export function setNativeServerSwitcherBand(leftFraction: number, rightFraction: number): void {
+  const setter = nativeApi()?.setServerSwitcherBand;
+  if (!setter) return;
+  try {
+    setter(leftFraction, rightFraction);
+  } catch (err) {
+    console.warn("[nativeBridge] native setServerSwitcherBand failed:", err);
+  }
 }
 
 /**

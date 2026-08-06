@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -36,6 +37,34 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import java.lang.ref.WeakReference
+
+internal fun systemSafeAreaInsets(insets: WindowInsetsCompat): Insets =
+    insets.getInsets(
+        WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+    )
+
+internal fun androidSafeAreaScript(
+    insets: Insets,
+    density: Float,
+): String =
+    """
+    (() => {
+      const s = document.documentElement.style;
+      const top = '${insets.top / density}px';
+      const bottom = '${insets.bottom / density}px';
+      const left = '${insets.left / density}px';
+      const right = '${insets.right / density}px';
+      s.setProperty('--omnigent-safe-top', top);
+      s.setProperty('--omnigent-safe-bottom', bottom);
+      s.setProperty('--omnigent-safe-left', left);
+      s.setProperty('--omnigent-safe-right', right);
+      s.setProperty('--omnigent-android-safe-area-top', top);
+      s.setProperty('--omnigent-android-safe-area-bottom', bottom);
+      s.setProperty('--omnigent-android-safe-area-left', left);
+      s.setProperty('--omnigent-android-safe-area-right', right);
+    })();
+    """.trimIndent()
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -65,7 +94,11 @@ class MainActivity : AppCompatActivity() {
     // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
     // visible so it's always available as a recovery path (backward compatible
     // with older web builds). Theme-aware via brand colors (light/dark XML).
-    private lateinit var switchButton: View
+    private lateinit var switchButton: TextView
+
+    // Null before each page publishes, preserving whole-window centring.
+    private var switcherBand: ServerSwitcherBand? = null
+    private var switcherHidden = false
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -144,6 +177,7 @@ class MainActivity : AppCompatActivity() {
                         },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
+                        onNavigationStarted = ::clearServerSwitcherBand,
                     )
                 webChromeClient =
                     OmnigentWebChromeClient(
@@ -162,7 +196,7 @@ class MainActivity : AppCompatActivity() {
         val dp = resources.displayMetrics.density
         switchButton =
             TextView(this).apply {
-                text = hostLabelOf(serverUrl)
+                applyHostLabel(serverUrl)
                 background =
                     ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_floating_switch)
                 setTextColor(ContextCompat.getColor(this@MainActivity, R.color.brand_foreground))
@@ -171,8 +205,12 @@ class MainActivity : AppCompatActivity() {
                 elevation = 6 * dp
                 isClickable = true
                 isFocusable = true
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.MIDDLE
                 setOnClickListener { showServerSwitcherMenu(it) }
             }
+        // Same helper the runtime path uses, so the no-band defaults agree.
+        applyServerSwitcherWidthBounds(containerWidth = 0, band = null)
         switchButton.layoutParams =
             FrameLayout
                 .LayoutParams(
@@ -185,6 +223,12 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
+        // The pill's own bounds can stay unchanged when only its parent resizes,
+        // so observe both views.
+        val repositionOnLayout =
+            View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> positionServerSwitcher() }
+        container.addOnLayoutChangeListener(repositionOnLayout)
+        switchButton.addOnLayoutChangeListener(repositionOnLayout)
         setContentView(container)
         applySystemBarContrast()
         installBridge()
@@ -194,7 +238,7 @@ class MainActivity : AppCompatActivity() {
         // alone (unreliable < API 30 and across OEM builds). Cached so the first
         // post-load emit (in onPageReady) isn't lost to the pre-load race.
         ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val bars = systemSafeAreaInsets(insets)
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
             // manifest's adjustResize: the window no longer shrinks when the IME
@@ -225,9 +269,13 @@ class MainActivity : AppCompatActivity() {
             // Push the floating switch button below the status bar so it doesn't
             // disappear under the notch/status icons on edge-to-edge layouts.
             (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.topMargin = bars.top + (8 * dp).toInt()
-                switchButton.layoutParams = lp
+                val topMargin = bars.top + (8 * dp).toInt()
+                if (lp.topMargin != topMargin) {
+                    lp.topMargin = topMargin
+                    switchButton.layoutParams = lp
+                }
             }
+            positionServerSwitcher()
             emitInsets()
             insets
         }
@@ -282,10 +330,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
+            webView.post(::positionServerSwitcher)
         }
     }
 
@@ -299,6 +348,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun installBridge() {
         val origin = pinnedOrigin ?: return
+        // Weak so the long-lived listener cannot pin this Activity.
+        val host = WeakReference(this)
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
         try {
             WebViewCompat.addWebMessageListener(
@@ -308,6 +359,10 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onServerSwitcherBand = { band -> host.get()?.receiveServerSwitcherBand(band) },
+                    onServerSwitcherHidden = { hidden ->
+                        host.get()?.receiveServerSwitcherHidden(hidden)
+                    },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -329,9 +384,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applySystemBarContrast() {
+    /** Reads the config the framework hands us; `resources` lags a change. */
+    private fun applySystemBarContrast(config: Configuration = resources.configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            config.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
@@ -453,6 +509,100 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** The visible text is middle-ellipsized, so the description carries the full host. */
+    private fun TextView.applyHostLabel(url: String) {
+        val label = hostLabelOf(url)
+        text = label
+        contentDescription = label
+    }
+
+    private fun receiveServerSwitcherBand(band: ServerSwitcherBand) {
+        runOnUiThread {
+            if (isDestroyed || isFinishing) return@runOnUiThread
+            switcherBand = band
+            positionServerSwitcher()
+        }
+    }
+
+    private fun receiveServerSwitcherHidden(hidden: Boolean) {
+        runOnUiThread {
+            if (isDestroyed || isFinishing) return@runOnUiThread
+            switcherHidden = hidden
+            if (hidden) switcherBand = null
+            positionServerSwitcher()
+        }
+    }
+
+    /** Forget the web-published band; the pill returns to the window centre. */
+    private fun clearServerSwitcherBand() {
+        if (switcherBand == null && !switcherHidden) return
+        switcherBand = null
+        switcherHidden = false
+        positionServerSwitcher()
+    }
+
+    /** Centre in the latest band, or in the whole window before publication. */
+    private fun positionServerSwitcher() {
+        if (!::switchButton.isInitialized) return
+        val lp = switchButton.layoutParams as? FrameLayout.LayoutParams ?: return
+        val band = switcherBand
+        // The pill's leftMargin is relative to its parent, so the band fraction
+        // must resolve against the parent's width.
+        val containerWidth = (switchButton.parent as? View)?.width ?: 0
+        val bandCanFit = applyServerSwitcherWidthBounds(containerWidth, band)
+        val visibility = if (!switcherHidden && bandCanFit) View.VISIBLE else View.INVISIBLE
+        if (switchButton.visibility != visibility) switchButton.visibility = visibility
+        val switcherWidth = switchButton.width
+
+        val gravity: Int
+        val leftMargin: Int
+        if (band == null || containerWidth <= 0 || switcherWidth <= 0) {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            leftMargin = 0
+        } else {
+            // The band uses physical viewport coordinates, so it must not mirror in RTL.
+            gravity = Gravity.TOP or Gravity.LEFT
+            leftMargin =
+                serverSwitcherLeftMargin(
+                    containerWidth,
+                    switcherWidth,
+                    band,
+                    switcherControlReservePx(),
+                )
+        }
+        if (lp.gravity == gravity && lp.leftMargin == leftMargin) return
+        lp.gravity = gravity
+        lp.leftMargin = leftMargin
+        switchButton.layoutParams = lp
+    }
+
+    /** Shared dp→px conversion so the fit test and margin math can't drift. */
+    private fun switcherControlReservePx(): Int =
+        (SWITCHER_CONTROL_RESERVE_DP * resources.displayMetrics.density).toInt()
+
+    private fun applyServerSwitcherWidthBounds(
+        containerWidth: Int,
+        band: ServerSwitcherBand?,
+    ): Boolean {
+        val dp = resources.displayMetrics.density
+        val defaultMax = (SWITCHER_MAX_WIDTH_DP * dp).toInt()
+        val defaultMin = (SWITCHER_MIN_WIDTH_DP * dp).toInt()
+        val controlReserve = switcherControlReservePx()
+        val max =
+            if (band == null || containerWidth <= 0) {
+                defaultMax
+            } else {
+                val usableWidth = serverSwitcherUsableWidth(containerWidth, band, controlReserve)
+                maxOf(defaultMin, minOf(defaultMax, usableWidth))
+            }
+        // Floors the WIDTH only — the height stays the text's — so this bounds how
+        // far a label can shrink, not the full touch target.
+        if (switchButton.minWidth != defaultMin) switchButton.minWidth = defaultMin
+        if (switchButton.maxWidth != max) switchButton.maxWidth = max
+        return band == null ||
+            serverSwitcherBandCanFit(containerWidth, band, controlReserve, defaultMin)
+    }
+
     /**
      * Extract a short host[:port] label from a URL for the server switcher pill.
      * Mirrors the iOS `URL.omnigentHostLabel` in `URL+Omnigent.swift`.
@@ -524,7 +674,7 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
-        (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
+        switchButton.applyHostLabel(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
     }
@@ -645,7 +795,7 @@ class MainActivity : AppCompatActivity() {
         // pins to a user-supplied server whose web build may PRE-DATE the Android
         // shell's CSS — it can't be assumed to carry the `[data-android-native]`
         // fold:
-        //   1. `--omnigent-safe-top/bottom` — the app's OWN base inset vars. Every
+        //   1. `--omnigent-safe-*` — the app's OWN base inset vars. Every
         //      build already derives `--omnigent-inset-*` and its layout from
         //      these, defaulting them to `env(safe-area-inset-*)`, which Android
         //      WebView reports as 0. Setting them inline (highest priority)
@@ -659,21 +809,7 @@ class MainActivity : AppCompatActivity() {
         // the safe area there would mis-assign it to a bar-footprint variable.
         val bars = lastInsets ?: return
         val d = resources.displayMetrics.density
-        val js =
-            """
-            (() => {
-              const s = document.documentElement.style;
-              const top = '${bars.top / d}px';
-              const bottom = '${bars.bottom / d}px';
-              s.setProperty('--omnigent-safe-top', top);
-              s.setProperty('--omnigent-safe-bottom', bottom);
-              s.setProperty('--omnigent-android-safe-area-top', top);
-              s.setProperty('--omnigent-android-safe-area-bottom', bottom);
-              s.setProperty('--omnigent-android-safe-area-left', '${bars.left / d}px');
-              s.setProperty('--omnigent-android-safe-area-right', '${bars.right / d}px');
-            })();
-            """.trimIndent()
-        webView.evaluateJavascript(js, null)
+        webView.evaluateJavascript(androidSafeAreaScript(bars, d), null)
     }
 
     private fun hasPermission(permission: String): Boolean =
@@ -781,6 +917,11 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val MAX_LOGIN_ATTEMPTS = 3
+
+        // The 48dp floor is tap safety, not the iOS 120dp visual floor.
+        const val SWITCHER_MAX_WIDTH_DP = 172
+        const val SWITCHER_MIN_WIDTH_DP = 48
+        const val SWITCHER_CONTROL_RESERVE_DP = 48
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it

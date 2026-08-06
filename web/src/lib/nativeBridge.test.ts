@@ -9,6 +9,7 @@ import {
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   setBadgeCount as bridgeSetBadge,
+  setNativeServerSwitcherBand,
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsBrowser,
@@ -30,6 +31,7 @@ const iosOnSidebarDragUnsubscribe = vi.fn();
 const iosOnSidebarDrag = vi.fn().mockReturnValue(iosOnSidebarDragUnsubscribe);
 const iosSetServerSwitcherHidden = vi.fn();
 const iosSetSidebarOpen = vi.fn();
+const iosSetServerSwitcherBand = vi.fn();
 
 // The Android WebView bridge mock, installed on window.omnigentNative. The MVP
 // Android shell exposes the shell-agnostic subset (notifications + badge); the
@@ -39,6 +41,7 @@ const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
 const androidSetColorScheme = vi.fn();
+const androidSetServerSwitcherBand = vi.fn();
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -77,6 +80,7 @@ function setIOS(on: boolean, withClickRouting = true): void {
       notify: (...args: unknown[]) => iosNotify(...args),
       setServerSwitcherHidden: (...args: unknown[]) => iosSetServerSwitcherHidden(...args),
       setSidebarOpen: (...args: unknown[]) => iosSetSidebarOpen(...args),
+      setServerSwitcherBand: (...args: unknown[]) => iosSetServerSwitcherBand(...args),
       onSidebarDrag: (...args: unknown[]) => iosOnSidebarDrag(...args),
       ...(withClickRouting
         ? {
@@ -96,6 +100,7 @@ function setAndroid(on: boolean, withClickRouting = true): void {
       kind: "android",
       setBadgeCount: (...args: unknown[]) => androidSetBadge(...args),
       setColorScheme: (...args: unknown[]) => androidSetColorScheme(...args),
+      setServerSwitcherBand: (...args: unknown[]) => androidSetServerSwitcherBand(...args),
       notify: (...args: unknown[]) => androidNotify(...args),
       ...(withClickRouting
         ? {
@@ -456,5 +461,32 @@ describe("setNativeServerSwitcherHidden", () => {
       throw new Error("bridge down");
     });
     expect(() => setNativeServerSwitcherHidden(true)).not.toThrow();
+  });
+});
+
+describe("setNativeServerSwitcherBand", () => {
+  it("is a no-op outside a native shell", () => {
+    setNativeServerSwitcherBand(0.2, 0.8);
+    expect(androidSetServerSwitcherBand).not.toHaveBeenCalled();
+    expect(iosSetServerSwitcherBand).not.toHaveBeenCalled();
+  });
+
+  it("routes normalized bounds through Android and iOS bridges", () => {
+    setAndroid(true);
+    setNativeServerSwitcherBand(0.25, 0.75);
+    expect(androidSetServerSwitcherBand).toHaveBeenCalledWith(0.25, 0.75);
+
+    setAndroid(false);
+    setIOS(true);
+    setNativeServerSwitcherBand(0.3, 0.6);
+    expect(iosSetServerSwitcherBand).toHaveBeenCalledWith(0.3, 0.6);
+  });
+
+  it("does not throw when the bridge setter throws", () => {
+    setAndroid(true);
+    androidSetServerSwitcherBand.mockImplementationOnce(() => {
+      throw new Error("bridge down");
+    });
+    expect(() => setNativeServerSwitcherBand(0.2, 0.8)).not.toThrow();
   });
 });
