@@ -60,63 +60,84 @@ describe("smartRoutingUnavailableReason", () => {
     ).toEqual({ kind: "not-gateway-backed", harnesses: ["codex-native"] });
   });
 
-  // Off the gateway is only a loss for the external router. With the built-in
-  // judge configured it answers for that arm instead, so routing proceeds.
-  it("is null for an off-gateway arm when the built-in judge can answer", () => {
+  // Picking the harness is the external router's job. A deployment whose only
+  // source is the built-in judge keeps per-harness routing and loses this row,
+  // and it says so rather than blaming the host.
+  it("reports the missing external router, gateway backing notwithstanding", () => {
+    expect(
+      smartRoutingUnavailableReason({
+        routingEnabled: true,
+        wrappersRegistered: true,
+        unreadyHarnesses: [],
+        notGatewayBackedHarnesses: [],
+        externalRoutingAvailable: false,
+      }),
+    ).toEqual({ kind: "external-router-required" });
+  });
+
+  // Omitting the field keeps the pre-source answer (an older server that only
+  // reports `smart_routing_enabled` must lose nothing); only an explicit false
+  // takes the row away.
+  it.each([
+    [undefined, null],
+    [true, null],
+    [false, { kind: "external-router-required" }],
+  ] as const)("externalRoutingAvailable %s yields %j", (externalRoutingAvailable, expected) => {
+    expect(
+      smartRoutingUnavailableReason({
+        routingEnabled: true,
+        wrappersRegistered: true,
+        unreadyHarnesses: [],
+        ...(externalRoutingAvailable === undefined ? {} : { externalRoutingAvailable }),
+      }),
+    ).toEqual(expected);
+  });
+
+  // Routing being off is the more fundamental cause, so it still wins.
+  it("reports routing being off ahead of the missing external router", () => {
+    expect(
+      smartRoutingUnavailableReason({
+        routingEnabled: false,
+        wrappersRegistered: true,
+        unreadyHarnesses: [],
+        externalRoutingAvailable: false,
+      }),
+    ).toEqual({ kind: "routing-disabled" });
+  });
+
+  // ...and the missing router outranks anything about the host: no external
+  // router means no fully-auto row however well the machine is set up.
+  it.each([
+    [
+      "a wrapper agent is missing",
+      { routingEnabled: true, wrappersRegistered: false, unreadyHarnesses: [] },
+    ],
+    [
+      "an arm isn't ready",
+      { routingEnabled: true, wrappersRegistered: true, unreadyHarnesses: ["claude-native"] },
+    ],
+  ] as const)("reports the missing external router ahead of %s", (_case, inputs) => {
+    expect(
+      smartRoutingUnavailableReason({
+        ...inputs,
+        notGatewayBackedHarnesses: ["codex-native"],
+        externalRoutingAvailable: false,
+      }),
+    ).toEqual({ kind: "external-router-required" });
+  });
+
+  // The built-in judge does not cover an off-gateway arm here — it can't pick
+  // the harness — so the gateway cause stands even with the judge configured.
+  it("still reports an off-gateway arm with the external router present", () => {
     expect(
       smartRoutingUnavailableReason({
         routingEnabled: true,
         wrappersRegistered: true,
         unreadyHarnesses: [],
         notGatewayBackedHarnesses: SMART_ROUTING_ARMS,
-        ossRoutingAvailable: true,
+        externalRoutingAvailable: true,
       }),
-    ).toBeNull();
-  });
-
-  // Omitting the field keeps the pre-source behaviour, and an explicit false
-  // reads the same — only the judge being available lifts the cause.
-  it.each([
-    [undefined, { kind: "not-gateway-backed", harnesses: ["codex-native"] }],
-    [false, { kind: "not-gateway-backed", harnesses: ["codex-native"] }],
-    [true, null],
-  ] as const)("ossRoutingAvailable %s yields %j", (ossRoutingAvailable, expected) => {
-    expect(
-      smartRoutingUnavailableReason({
-        routingEnabled: true,
-        wrappersRegistered: true,
-        unreadyHarnesses: [],
-        notGatewayBackedHarnesses: ["codex-native"],
-        ...(ossRoutingAvailable === undefined ? {} : { ossRoutingAvailable }),
-      }),
-    ).toEqual(expected);
-  });
-
-  // The judge lifts only the gateway cause; the more fundamental ones stand.
-  it.each([
-    [
-      "routing is off",
-      { routingEnabled: false, wrappersRegistered: true, unreadyHarnesses: [] },
-      { kind: "routing-disabled" },
-    ],
-    [
-      "a wrapper agent is missing",
-      { routingEnabled: true, wrappersRegistered: false, unreadyHarnesses: [] },
-      { kind: "wrappers-missing" },
-    ],
-    [
-      "an arm isn't ready",
-      { routingEnabled: true, wrappersRegistered: true, unreadyHarnesses: ["claude-native"] },
-      { kind: "harnesses-unready", harnesses: ["claude-native"] },
-    ],
-  ] as const)("still reports %s with the judge available", (_case, inputs, expected) => {
-    expect(
-      smartRoutingUnavailableReason({
-        ...inputs,
-        notGatewayBackedHarnesses: ["codex-native"],
-        ossRoutingAvailable: true,
-      }),
-    ).toEqual(expected);
+    ).toEqual({ kind: "not-gateway-backed", harnesses: ["claude-native", "codex-native"] });
   });
 
   // An arm that isn't installed can't have an inference config to judge, so
@@ -202,6 +223,16 @@ describe("smartRoutingDroppedMessage", () => {
   it("blames the server flag, not the host, when routing is off", () => {
     const message = smartRoutingDroppedMessage({ kind: "routing-disabled" }, context);
     expect(message).toBe("Smart Routing is turned off on this server — switched to Claude Code.");
+    expect(message).not.toContain("machine-2");
+  });
+
+  // Judge-only: blame the server's router set, not the host — the machine is
+  // fine, and "set up your CLI" would send the user down the wrong path.
+  it("blames the server's router set when only the built-in judge is configured", () => {
+    const message = smartRoutingDroppedMessage({ kind: "external-router-required" }, context);
+    expect(message).toBe(
+      "Smart Routing across harnesses needs the workspace AI gateway router on this server — switched to Claude Code.",
+    );
     expect(message).not.toContain("machine-2");
   });
 

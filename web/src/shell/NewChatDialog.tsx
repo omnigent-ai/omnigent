@@ -1912,7 +1912,7 @@ export function NewChatLandingScreen() {
   // Unfiltered brain-harness labels: safe for membership checks and for
   // labelling an existing pick, but the OPTIONS offered in the gear modal use
   // the gated `brainHarnessLabels` below, which drops the fully-auto row when
-  // the gateway cannot back both arms.
+  // neither router can back both arms.
   const brainHarnessLabelsAll = useBrainHarnessLabels(smartRoutingEnabled);
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
@@ -2686,25 +2686,28 @@ export function NewChatLandingScreen() {
         unreadyHarnesses: SMART_ROUTING_ARMS.filter((harness) =>
           harnessUnconfiguredOnHost(harness, harnessWarningHost),
         ),
-        // The five-arm menu the top-level row drives needs BOTH families on the
-        // gateway for the external router, so either one the host doesn't back
-        // takes the row away — unless the built-in judge can route it instead.
+        // Picking the harness is the external router's job alone, so the row
+        // needs it configured AND both families on the gateway its apply layer
+        // rewrites through. The built-in judge routes a model inside one
+        // harness and can't stand in here.
+        externalRoutingAvailable: externalRoutingConfigured,
         notGatewayBackedHarnesses: SMART_ROUTING_ARMS.filter(
           (harness) => !hostBacksHarnessWithGateway(harnessWarningHost, harness),
         ),
-        ossRoutingAvailable: ossRoutingConfigured,
       }),
-    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, ossRoutingConfigured],
+    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, externalRoutingConfigured],
   );
   const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
   // The fully-auto brain needs SOME router able to answer for both model
   // families — the router may land the session's work on either, and an arm the
   // external router can't reach (off the workspace AI gateway) is only a loss
-  // when the built-in judge can't cover it either. Source availability ONLY:
-  // unlike the top-level row, the bundle brain routes across SDK harnesses, so
-  // the native wrappers/CLIs are deliberately not required here. Gates the
-  // OPTIONS map only — membership checks and the summary label for an existing
-  // pick keep reading `brainHarnessLabelsAll`.
+  // when the built-in judge can't cover it either. The judge picks the bundle
+  // brain's harness as well as its model, so unlike the native-pane row above
+  // this surface stays on a judge-only deployment. Source availability ONLY:
+  // the bundle brain routes across SDK harnesses, so the native wrappers/CLIs
+  // are deliberately not required here. Gates the OPTIONS map only — membership
+  // checks and the summary label for an existing pick keep reading
+  // `brainHarnessLabelsAll`.
   const brainRoutable = SMART_ROUTING_ARMS.every(
     (harness) =>
       smartRoutingSourceFor({
