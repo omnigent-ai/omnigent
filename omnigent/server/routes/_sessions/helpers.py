@@ -1649,11 +1649,21 @@ def _resolve_llm_model(conv: Conversation | None) -> str | None:
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         return loaded.spec.llm.model if loaded.spec.llm else None
-    except (KeyError, AttributeError, ValueError, ImportError, OSError, RuntimeError):
+    except (
+        KeyError,
+        AttributeError,
+        ValueError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        SQLAlchemyError,
+    ):
         # ``RuntimeError`` covers ``get_agent_cache()`` before the runtime is
         # initialized: this is a best-effort display resolver (now also called
         # on native cost-only broadcasts), so an uninitialized runtime must
         # degrade to "model unknown" — the cost still records, just unattributed.
+        # ``SQLAlchemyError`` covers bind failures (e.g. non-uuid test agent ids
+        # against a real store left in runtime globals by another test).
         return None
 
 
@@ -1721,7 +1731,19 @@ def _resolve_harness_impl(conv: Conversation | None) -> str | None:
             or executor.type
         )
         return canonicalize_harness(harness) or harness
-    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+    except (
+        KeyError,
+        AttributeError,
+        ValueError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        SQLAlchemyError,
+    ):
+        # Same best-effort contract as ``_resolve_llm_model``: snapshot
+        # building must not fail when the global agent store rejects an id
+        # (common in unit tests that inject a stub store but leave a SQL
+        # store in runtime globals).
         return None
 
 
