@@ -6,20 +6,30 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { useSyncExternalStore } from "react";
+import {
+  type PointerEvent as ReactPointerEvent,
+  type ReactElement,
+  type ReactNode,
+  useSyncExternalStore,
+} from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
-// Controllable rename mutation so the double-click test can assert the
-// committed title was forwarded to the PATCH. `isMobile` toggles the mocked
-// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
-// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
-// factories (hoisted above imports) can reference them.
+// Hoisted controls drive row mutations, viewport layout, and coarse-pointer
+// capability independently inside mock factories.
 const mocks = vi.hoisted(() => {
   // Tiny reactive store for the server-authoritative pinned set, so a quick-pin
   // click re-renders the sidebar (mirrors the real query's refetch). Holds ids;
@@ -46,12 +56,20 @@ const mocks = vi.hoisted(() => {
   return {
     rename: { mutate: vi.fn() },
     isMobile: false,
+    hasCoarsePointer: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
     moveToProject: { mutate: vi.fn() },
     conversations: [] as unknown[],
     pinnedStore,
+    // Archive + stop mutations, so the swipe tests can assert the swipe→archive
+    // path drives the same stop→archive handler the kebab uses.
+    archive: { mutate: vi.fn() },
+    stopSession: { mutate: vi.fn() },
+    // Stop-and-delete, so the swipe→delete test can assert the row deletes only
+    // after the confirm dialog is accepted.
+    del: { mutate: vi.fn(), reset: vi.fn() },
   };
 });
 
@@ -62,12 +80,16 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
+vi.mock("@/hooks/useCoarsePointer", () => ({
+  useCoarsePointer: () => mocks.hasCoarsePointer,
+}));
+
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
+    mutate: mocks.del.mutate,
+    reset: mocks.del.reset,
     isPending: false,
     isError: false,
     variables: undefined,
@@ -92,11 +114,11 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
+  useArchiveConversation: () => mocks.archive,
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
+  useStopSession: () => mocks.stopSession,
   useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
@@ -130,9 +152,56 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // the tabs the shared-session row actions rely on.
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
+// Settings uses a Radix Select portal that jsdom cannot drive. Render a native
+// select so these tests can exercise the real swipe preference control.
+vi.mock("@/components/ui/select", async () => {
+  const { Children, isValidElement } = await import("react");
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
+  // The trigger carries the data-testid the tests query for; lift it onto the
+  // native <select> and keep the trigger itself out of the option list.
+  const isTrigger = (child: ReactNode): child is ReactElement<{ "data-testid"?: string }> =>
+    isValidElement(child) && child.type === SelectTrigger;
+  const Select = ({
+    value,
+    onValueChange,
+    children,
+  }: {
+    value: string;
+    onValueChange: (value: string) => void;
+    children: ReactNode;
+  }) => {
+    const kids = Children.toArray(children);
+    return (
+      <select
+        data-testid={kids.find(isTrigger)?.props["data-testid"]}
+        value={value}
+        onChange={(event) => onValueChange(event.target.value)}
+      >
+        {kids.filter((child) => !isTrigger(child))}
+      </select>
+    );
+  };
+  return {
+    Select,
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
+    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+      <option value={value}>{typeof children === "string" ? children : value}</option>
+    ),
+  };
+});
+
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
-import { Sidebar } from "./Sidebar";
+import {
+  readSwipeActions,
+  type SwipeAction,
+  type SwipeDirection,
+  writeSwipeActions,
+} from "@/lib/swipeActionPreferences";
+import { SettingsPage } from "@/pages/SettingsPage";
+import { Sidebar, useRowSwipe } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -195,6 +264,12 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
+// Exposes the router's current pathname so tests can assert whether a click on
+// a row link actually navigated (e.g. the swipe suite's trailing-click guard).
+function LocationProbe() {
+  return <div data-testid="location-probe">{useLocation().pathname}</div>;
+}
+
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
 // Route so `useParams` populates), making that row the active one — the
 // rest of the suite renders at `/` where no row is active. `info` pins the
@@ -217,6 +292,7 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
             ) : (
               sidebar
             )}
+            <LocationProbe />
           </MemoryRouter>
         </TooltipProvider>
       </QueryClientProvider>
@@ -231,12 +307,46 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
 }
 
+// Pick an action for one direction through the real Appearance settings control
+// (the Radix Select is mocked to a native <select> above), then unmount so the
+// sidebar can render against the preference the page just wrote.
+function chooseSwipeActionInSettings(direction: SwipeDirection, action: SwipeAction) {
+  render(
+    <TooltipProvider>
+      <MemoryRouter initialEntries={["/settings/appearance"]}>
+        <SettingsPage />
+      </MemoryRouter>
+    </TooltipProvider>,
+  );
+  fireEvent.change(screen.getByTestId(`swipe-action-${direction}`), { target: { value: action } });
+  cleanup();
+}
+
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   mocks.moveToProject.mutate.mockReset();
+  // Resolve archive callbacks synchronously so the transient "Archiving…"
+  // status row settles back to the interactive row within the test.
+  mocks.archive.mutate.mockReset();
+  mocks.archive.mutate.mockImplementation(
+    (_args: unknown, opts?: { onSuccess?: () => void; onSettled?: () => void }) => {
+      opts?.onSuccess?.();
+      opts?.onSettled?.();
+    },
+  );
+  // The stop that precedes archiving (runArchive) fires its `onSettled` once
+  // the runner stop resolves; invoke it synchronously so the follow-on
+  // archive.mutate runs in tests.
+  mocks.stopSession.mutate.mockReset();
+  mocks.stopSession.mutate.mockImplementation((_id: string, opts?: { onSettled?: () => void }) => {
+    opts?.onSettled?.();
+  });
+  mocks.del.mutate.mockReset();
+  mocks.del.reset.mockReset();
   mocks.projects = [];
-  // Default every test to the desktop viewport; the mobile flyout test opts in.
+  // Default to a desktop viewport with no coarse pointer; cases opt in independently.
   mocks.isMobile = false;
+  mocks.hasCoarsePointer = false;
   useConvMock.mockReset();
   localStorage.clear();
   // Reset the server pinned set between tests.
@@ -905,6 +1015,528 @@ describe("right-click context menu", () => {
       relatedTarget: document.body,
     });
     expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session B/);
+  });
+});
+
+describe("touch swipe actions", () => {
+  // jsdom has no real touch, so drive the gesture with pointer events. The row
+  // handlers gate on a primary, non-mouse pointer (see useRowSwipe); default
+  // jsdom PointerEvents omit those, so set them explicitly. A swipe is a
+  // down → horizontal move past the commit threshold → up on the row's <li>.
+  const POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+
+  beforeEach(() => {
+    mocks.hasCoarsePointer = true;
+  });
+
+  // Drag the row and hold at `dx`, so a test can inspect the reveal mid-gesture.
+  // `release` finishes it, carrying the same dx the drag ended on.
+  function moveSwipeRow(dx: number) {
+    const link = screen.getByRole("link", { name: /My Session/ });
+    const li = link.closest("li")!;
+    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    // First move locks the axis; the second carries it past the commit point.
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + Math.sign(dx) * 20, clientY: 100 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+    return {
+      li,
+      release() {
+        fireEvent.pointerUp(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+        // Include the browser's trailing click, un-prevented: the row itself
+        // must suppress it (see the trailing-click tests) — never the test.
+        fireEvent.click(link);
+      },
+    };
+  }
+
+  function swipeRow(dx: number) {
+    moveSwipeRow(dx).release();
+  }
+
+  // The reveal sitting behind the row is inert and shows only the icon for the
+  // action that direction commits to.
+  function expectRevealIcons(li: Element, icons: { shows: string; hides: string }) {
+    const reveal = li.firstElementChild!;
+    expect(reveal).toHaveClass("pointer-events-none");
+    expect(reveal.querySelector(icons.shows)).not.toBeNull();
+    expect(reveal.querySelector(icons.hides)).toBeNull();
+  }
+
+  it("maps the Settings swipe-left selection to the row's left-swipe action", () => {
+    chooseSwipeActionInSettings("left", "delete");
+    expect(readSwipeActions()).toEqual({ left: "delete", right: "none" });
+
+    renderSidebar();
+    swipeRow(-90);
+
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps the Settings swipe-right selection to the row's right-swipe action", () => {
+    chooseSwipeActionInSettings("right", "archive");
+    expect(readSwipeActions()).toEqual({ left: "archive", right: "archive" });
+
+    renderSidebar();
+    swipeRow(90);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("reveals the same action that fires in both configured directions", () => {
+    writeSwipeActions({ left: "delete", right: "archive" });
+    renderSidebar();
+
+    const leftSwipe = moveSwipeRow(-90);
+    expectRevealIcons(leftSwipe.li, { shows: ".lucide-trash-2", hides: ".lucide-archive" });
+    leftSwipe.release();
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    const rightSwipe = moveSwipeRow(90);
+    expectRevealIcons(rightSwipe.li, { shows: ".lucide-archive", hides: ".lucide-trash-2" });
+    rightSwipe.release();
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("runs the archive path when swiping the archive-configured direction", () => {
+    // Default: swipe-left → archive. Swipe left past the commit threshold.
+    renderSidebar();
+
+    swipeRow(-90);
+
+    // Archiving is a single PATCH — the server stops the runner once the flag
+    // commits, so a client-side stop would race it (see runArchive).
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.stopSession.mutate).not.toHaveBeenCalled();
+    // Archive never routes through delete.
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("opens the delete confirm dialog (no immediate delete) when swiping the delete direction", () => {
+    // Map swipe-right → delete, then swipe right.
+    writeSwipeActions({ left: "archive", right: "delete" });
+    renderSidebar();
+
+    swipeRow(90);
+
+    // The confirm dialog opens — delete stays behind it, so no mutation yet.
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+
+    // Confirming in the dialog fires the same delete the kebab flow uses.
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(mocks.del.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", deleteBranch: false },
+      expect.anything(),
+    );
+    expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("suppresses the trailing click after a committed swipe so it doesn't navigate", () => {
+    // Browsers can synthesize a click on the row link after the drag; the
+    // row's click-capture guard must swallow it (no test-side preventDefault),
+    // or a swipe-to-archive would also open the session it just archived.
+    renderSidebar();
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
+
+    swipeRow(-90);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+  });
+
+  it("suppresses the trailing click after a below-threshold swipe as well", () => {
+    // Even an uncommitted (beyond-slop) swipe is a drag, not a tap — its
+    // trailing click must not navigate either.
+    renderSidebar();
+
+    swipeRow(-40);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location-probe")).toHaveTextContent(/^\/$/);
+  });
+
+  it("keeps a plain tap navigating (the suppression is scoped to swipes)", () => {
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_1");
+  });
+
+  it("shows the unarchive glyph when swiping an archived row", () => {
+    // runArchive toggles, so on an archived row the gesture restores the
+    // session — the reveal must mirror the kebab's Unarchive affordance, not
+    // promise a re-archive.
+    mockConversations([{ ...CONV, archived: true }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-archived"));
+
+    const swipe = moveSwipeRow(-90);
+    expectRevealIcons(swipe.li, {
+      shows: ".lucide-archive-restore",
+      hides: ".lucide-archive",
+    });
+    swipe.release();
+
+    // Releasing runs the same toggle the kebab's Unarchive item uses.
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+  });
+
+  it("claims the horizontal touch axis only while a swipe action is configured", () => {
+    // With an action armed, the row must override touch-action so the browser
+    // doesn't take the horizontal pan mid-gesture...
+    const { unmount } = renderSidebar();
+    const li = () => screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    expect(li()).toHaveClass("touch-pan-y");
+    unmount();
+
+    // ...but with BOTH directions inert there is no gesture to protect, so the
+    // override is dropped and the browser keeps its own horizontal gestures.
+    writeSwipeActions({ left: "none", right: "none" });
+    renderSidebar();
+    expect(li()).not.toHaveClass("touch-pan-y");
+  });
+
+  it("does nothing when swiping a direction mapped to none", () => {
+    // Default: swipe-right → none. Swipe right; nothing should fire.
+    renderSidebar();
+
+    swipeRow(90);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("supports both directions mapped to the same action", () => {
+    // Both directions archive — a swipe either way runs the archive path.
+    writeSwipeActions({ left: "archive", right: "archive" });
+    renderSidebar();
+
+    swipeRow(90);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+
+    mocks.archive.mutate.mockClear();
+    swipeRow(-90);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+  });
+
+  it("does not fire the action for a short swipe below the commit threshold", () => {
+    renderSidebar();
+
+    // Past the activation lock (20px) but short of the commit distance (72px).
+    swipeRow(-40);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not fire at 71px, immediately below the commit boundary", () => {
+    renderSidebar();
+
+    swipeRow(-71);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("fires exactly once at the 72px commit boundary", () => {
+    renderSidebar();
+
+    swipeRow(-72);
+
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits the configured action on a wide viewport with a coarse pointer", () => {
+    expect(mocks.isMobile).toBe(false);
+    expect(mocks.hasCoarsePointer).toBe(true);
+    renderSidebar();
+
+    swipeRow(-90);
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores touch swipes when only fine pointers are available", () => {
+    mocks.hasCoarsePointer = false;
+    renderSidebar();
+
+    swipeRow(-90);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("ignores non-touch pointers when a coarse pointer also exists", () => {
+    // A touchscreen laptop's pen and mouse paths remain inert.
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    for (const [pointerId, pointerType] of ["pen", "mouse"].entries()) {
+      const pointer = { pointerId, isPrimary: true, pointerType };
+      fireEvent.pointerDown(li, { ...pointer, clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(li, { ...pointer, clientX: 120, clientY: 100 });
+      fireEvent.pointerMove(li, { ...pointer, clientX: 190, clientY: 100 });
+      fireEvent.pointerUp(li, { ...pointer, clientX: 190, clientY: 100 });
+    }
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("yields a primarily-vertical drag to scroll (no action)", () => {
+    // A mostly-vertical move is scroll intent — the gesture bails and never
+    // fires, even though it travels well past the commit distance horizontally.
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    // First move is dominated by the vertical axis → decided="other".
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 105, clientY: 140 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 10, clientY: 180 });
+    fireEvent.pointerUp(li, { ...POINTER, clientX: 10, clientY: 180 });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("useRowSwipe — dnd coexistence", () => {
+  // Focused hook tests: driving real dnd-kit dragging in jsdom is unreliable,
+  // so control `isDragging` directly to prove the swipe yields to the drag.
+  const ACTIONS = { left: "archive", right: "none" } as const;
+
+  // Row stand-in: pointer-capture no-ops (jsdom's are stubbed in test-setup)
+  // plus `contains`, which the hook uses to reject events bubbling out of a
+  // portal. Defaults to containing everything (the normal in-row case).
+  const PORTAL_ROW = {
+    setPointerCapture: () => {},
+    releasePointerCapture: () => {},
+    hasPointerCapture: () => false,
+    contains: () => true,
+  };
+
+  function makePointer(over: {
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+    target?: unknown;
+    currentTarget?: unknown;
+  }) {
+    // Minimal ReactPointerEvent stand-in — only the fields useRowSwipe reads.
+    return {
+      pointerType: "touch",
+      isPrimary: true,
+      preventDefault: () => {},
+      target: document.createElement("div"),
+      currentTarget: PORTAL_ROW,
+      ...over,
+    } as unknown as ReactPointerEvent;
+  }
+
+  it("(a) yields a primarily-vertical move: decided=other, no translate, no action", () => {
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    act(() => {
+      // Vertical dominates → the gesture hands off to scroll/drag.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
+    });
+    // No translate offset accumulated.
+    expect(result.current.dx).toBe(0);
+
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
+    });
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("(b) bails once a dnd-kit drag begins mid-gesture: dx resets, no action on release", () => {
+    const onAction = vi.fn();
+    let isDragging = false;
+    const { result, rerender } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    act(() => {
+      // A real horizontal swipe left (the archive-configured direction) locks
+      // in and translates the row.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 70, clientY: 100 }));
+    });
+    expect(result.current.dx).not.toBe(0);
+
+    // dnd-kit's long-press drag activates; re-render with isDragging=true.
+    isDragging = true;
+    rerender();
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
+    });
+    // The swipe bailed: translate snaps back to rest.
+    expect(result.current.dx).toBe(0);
+
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
+    });
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("(c) commits a fast flick that releases before the last move renders", () => {
+    // A quick flick can lift the finger before React commits the render for the
+    // final pointermove. Release must decide on where the finger actually ended,
+    // so the move + up are dispatched inside ONE act() — no render in between.
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
+      // Lock the gesture, then travel well past the 72px commit threshold and
+      // release — all before the hook re-renders with the final offset.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 180, clientY: 100 }));
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+
+    // -100px past the threshold in the archive-configured direction.
+    expect(onAction).toHaveBeenCalledWith("archive");
+    expect(onAction).toHaveBeenCalledTimes(1);
+    expect(result.current.dx).toBe(0);
+  });
+
+  it("(d) does not commit a flick that snaps back under the threshold before release", () => {
+    // The mirror case: travel past the threshold, then return under it and
+    // release, again with no render between the moves. Nothing should fire.
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 200, clientY: 100 }));
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+      // Back to only -10px: under the commit threshold at the moment of release.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 190, clientY: 100 }));
+    });
+
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("(f) tracks 1:1 to the commit point, then resists so the title stays in panel", () => {
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 400, clientY: 100 }));
+    });
+    // Up to the threshold the row follows the finger exactly.
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 340, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(-60);
+
+    // A 300px drag is damped and hard-capped — the row can't be dragged far
+    // enough to push its title out of the panel.
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(-96);
+
+    // Still commits — damping is visual only.
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    expect(onAction).toHaveBeenCalledWith("archive");
+  });
+
+  it("(g) rests at 0 when a locked swipe reverses into a direction mapped to none", () => {
+    // ACTIONS maps right to "none": a swipe locked going left that overshoots
+    // back past its origin must clamp at rest, not slide the row rightward over
+    // bare canvas with no hint behind it (release there already no-ops).
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    act(() => {
+      // Lock the gesture leftward (the archive direction).
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 70, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(-30);
+
+    act(() => {
+      // Reverse well past the origin into the inert right direction.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 150, clientY: 100 }));
+    });
+    expect(result.current.dx).toBe(0);
+
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 150, clientY: 100 }));
+    });
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("(e) ignores a pointerdown that bubbled out of a portal (open dialog)", () => {
+    // The row's dialogs render in portals but are React children, so their
+    // events bubble to the row's handlers. A drag inside the open delete dialog
+    // must not start a swipe on the row behind it.
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    // currentTarget is the row; target is portal content it does NOT contain.
+    const outside = document.createElement("div");
+    act(() => {
+      result.current.onPointerDown(
+        makePointer({
+          pointerId: 1,
+          clientX: 200,
+          clientY: 100,
+          target: outside,
+          currentTarget: { ...PORTAL_ROW, contains: () => false },
+        }),
+      );
+    });
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+
+    expect(result.current.dx).toBe(0);
+    expect(onAction).not.toHaveBeenCalled();
   });
 });
 
