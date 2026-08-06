@@ -7061,19 +7061,22 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(sinks).toHaveLength(2);
 
     const state = useChatStore.getState();
-    // The window was replaced wholesale with the newest page, exactly as a
-    // cold bind would load it — not left with a mid-transcript hole.
+    // The window was replaced wholesale with one fresh window fetch, exactly
+    // as a cold bind loads it — not left with a mid-transcript hole, and not
+    // paged in over several requests (which would shift the transcript under
+    // a reader who never asked for this).
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      gap.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id),
     );
     // The cursor was rewound to the fresh window's top, so everything older
-    // (the rest of the gap included) is reachable again by paging up.
-    expect(state.oldestItemId).toBe(gap.at(-SESSION_HISTORY_PAGE_SIZE)!.id);
+    // (the pre-gap transcript included) is reachable again by paging up.
+    expect(state.oldestItemId).toBe(gap.at(-INITIAL_WINDOW_ITEMS)!.id);
     expect(state.hasMoreHistory).toBe(true);
 
+    // Scroll-up still pages from the window's top, one page at a time.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
     );
 
     const last = sinks[1]!;
@@ -7290,7 +7293,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // The fresh fetch returns ITEMS only — dropping these blocks would lose
     // the pending ApprovalCard (and the failure reason) with no way back.
     expect(state.blocks.map((b) => b.ctx.itemId ?? b.type)).toEqual([
-      ...gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...gap.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id),
       "elicitation",
       "error",
     ]);
