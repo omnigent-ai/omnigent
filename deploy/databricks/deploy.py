@@ -34,7 +34,6 @@ import sys
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -672,19 +671,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--profile-token-auth",
-        action="store_true",
-        help=(
-            "Read the --profile's cached OAuth token and use bearer auth "
-            "(DATABRICKS_HOST + DATABRICKS_TOKEN) for the SDK and CLI instead "
-            "of profile auth. Use when the SDK's forced token refresh fails "
-            "in a spawned subprocess (macOS keychain write denied, "
-            "'cache update: exit status 161'). Host and token are both read "
-            "from --profile after any ambient DATABRICKS_HOST/_TOKEN is "
-            "cleared, so it cannot route to a different workspace."
-        ),
-    )
-    parser.add_argument(
         "--version",
         default=None,
         help=(
@@ -773,111 +759,10 @@ def _host_env_keep(args: argparse.Namespace) -> set[str]:
     return set() if args.profile else {"DATABRICKS_HOST"}
 
 
-# A deploy (build → wheel upload → bundle deploy → run → smoke check) can run
-# for several minutes. The bearer token below is captured ONCE and never
-# refreshed (unlike profile auth, which the SDK/CLI refresh transparently), so
-# it must have enough runway to outlast the whole deploy. Refuse a token with
-# less than this remaining rather than 401 partway through.
-_MIN_TOKEN_RUNWAY_S = 10 * 60
-
-# When --profile-token-auth is used, the bearer token is stored here instead
-# of os.environ so it's only passed to subprocesses that need it (the
-# `databricks` CLI and the SDK), not to build.sh / uv / git / etc.
-_TOKEN_AUTH: dict[str, str] = {}
-
-
-def _setup_profile_token_auth(profile: str) -> None:
-    """Switch to bearer auth using the profile's cached OAuth token.
-
-    The SDK's ``databricks-cli`` credential strategy force-refreshes the
-    token on every init, which writes to the macOS keychain — denied for
-    a spawned subprocess ("cache update: exit status 161"). Reading the
-    *cached* token (no ``--force-refresh``) succeeds, and exporting it as
-    ``DATABRICKS_TOKEN`` makes both the SDK and the CLI use bearer auth,
-    skipping the refresh entirely.
-
-    Both the host and the token are read from ``profile``, so this cannot
-    authenticate against a different workspace — but only because any ambient
-    ``DATABRICKS_HOST``/``DATABRICKS_TOKEN`` is dropped *first*: ``databricks
-    auth env`` echoes an ambient host back instead of the profile's, which
-    would pin the wrong workspace for every later CLI/SDK call.
-
-    The token is stored in ``_TOKEN_AUTH`` (not ``os.environ``) so it's only
-    passed to subprocesses that need it (the ``databricks`` CLI and the SDK),
-    not to ``build.sh`` / ``uv`` / ``git`` etc.
-    """
-    for name in ("DATABRICKS_HOST", "DATABRICKS_TOKEN"):
-        if os.environ.pop(name, None) is not None:
-            _log(f"--profile-token-auth: unsetting ambient {name}; {profile} decides")
-    token_data = json.loads(
-        subprocess.run(
-            ["databricks", "auth", "token", "--profile", profile],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-    )
-    token = token_data["access_token"]
-    _assert_token_runway(token_data.get("expiry"), profile)
-    host = subprocess.run(
-        ["databricks", "auth", "env", "--profile", profile],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    host_url = json.loads(host).get("env", {}).get("DATABRICKS_HOST", "")
-    if not host_url:
-        raise SystemExit(f"could not resolve DATABRICKS_HOST for profile {profile!r}")
-    # DATABRICKS_HOST stays in os.environ (it's a hostname, not a secret) so the
-    # SDK and CLI resolve the right workspace. The token is kept out of
-    # os.environ and injected only into subprocesses that need it.
-    os.environ["DATABRICKS_HOST"] = host_url
-    _TOKEN_AUTH["DATABRICKS_HOST"] = host_url
-    _TOKEN_AUTH["DATABRICKS_TOKEN"] = token
-    _log(f"--profile-token-auth: using cached bearer token for {profile} ({host_url})")
-
-
-def _assert_token_runway(expiry: str | None, profile: str) -> None:
-    """Refuse a cached token that won't outlast a deploy.
-
-    ``expiry`` is the absolute ISO-8601 timestamp from ``databricks auth
-    token`` — the true remaining runway (``expires_in`` is the original
-    lifetime, not what's left on a token cached a while ago).
-    """
-    if not expiry:
-        _log("--profile-token-auth: token has no expiry field; skipping runway check")
-        return
-    expires_at = datetime.fromisoformat(expiry)
-    if expires_at.tzinfo is None:
-        # The CLI emits an RFC3339 offset, but a naive timestamp would make the
-        # subtraction below raise TypeError instead of a usable error; the CLI
-        # mints these in UTC, so assume UTC.
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
-    if remaining < _MIN_TOKEN_RUNWAY_S:
-        raise SystemExit(
-            f"cached token for {profile!r} has {int(remaining)}s left "
-            f"(< {_MIN_TOKEN_RUNWAY_S}s); it may expire mid-deploy. "
-            f"Run `databricks auth login --profile {profile}` and retry."
-        )
-    _log(f"--profile-token-auth: token runway {int(remaining)}s")
-
-
 def _workspace_client(args: argparse.Namespace) -> WorkspaceClient:
-    """Construct the SDK client, honoring --profile-token-auth.
-
-    With token auth, the host is in the env and the token is in
-    ``_TOKEN_AUTH``; pass it explicitly so the SDK uses bearer auth
-    and skips the profile refresh, without leaking the token to
-    unrelated subprocesses.
-    """
+    """Construct the SDK client."""
     from databricks.sdk import WorkspaceClient as _WorkspaceClient
 
-    if getattr(args, "profile_token_auth", False):
-        return _WorkspaceClient(
-            host=_TOKEN_AUTH["DATABRICKS_HOST"],
-            token=_TOKEN_AUTH["DATABRICKS_TOKEN"],
-        )
     return _WorkspaceClient(profile=args.profile) if args.profile else _WorkspaceClient()
 
 
@@ -922,7 +807,6 @@ def _ensure_bound(args: argparse.Namespace) -> None:
             *_bundle_vars(args),
         ],
         cwd=_deploy_dir(),
-        env=_token_env(args),
         capture_output=True,
         text=True,
     )
@@ -986,26 +870,7 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
     ]
 
 
-def _token_env(args: argparse.Namespace) -> dict[str, str] | None:
-    """Return an env dict with DATABRICKS_TOKEN for `databricks` CLI calls.
-
-    With --profile-token-auth the token lives in ``_TOKEN_AUTH`` (not
-    os.environ) to avoid leaking it to build.sh / uv / git. This helper
-    builds the env for the CLI subprocesses that do need it.
-    """
-    if getattr(args, "profile_token_auth", False):
-        env = os.environ.copy()
-        env["DATABRICKS_TOKEN"] = _TOKEN_AUTH["DATABRICKS_TOKEN"]
-        return env
-    return None
-
-
 def _profile_arg(args: argparse.Namespace) -> list[str]:
-    # With --profile-token-auth the CLI authenticates via DATABRICKS_HOST +
-    # DATABRICKS_TOKEN; passing --profile too would re-trigger the
-    # keychain refresh we're avoiding.
-    if getattr(args, "profile_token_auth", False):
-        return []
     return ["--profile", args.profile] if args.profile else []
 
 
@@ -1050,7 +915,6 @@ def _ensure_app_sp_uc_traversal(
                 check=True,
                 capture_output=True,
                 text=True,
-                env=_token_env(args),
             )
         except subprocess.CalledProcessError as exc:
             # SP may already have access via group inheritance, or the
@@ -1061,17 +925,7 @@ def _ensure_app_sp_uc_traversal(
 
 def main() -> int:
     args = _parse_args()
-    # Clear ambient auth vars *before* any Databricks call so a stale
-    # DATABRICKS_HOST can't pin the wrong workspace — including inside
-    # _setup_profile_token_auth, which shells out to `databricks auth`.
     _clear_env_vars(keep=_host_env_keep(args))
-    if args.profile_token_auth:
-        if not args.profile:
-            raise SystemExit("--profile-token-auth requires --profile")
-        # Re-populates DATABRICKS_HOST in env and stores DATABRICKS_TOKEN
-        # in _TOKEN_AUTH (not os.environ) so it's only passed to the SDK and
-        # `databricks` CLI subprocesses that need it, not to build.sh / uv / git.
-        _setup_profile_token_auth(args.profile)
     _assert_clean_tree(skip=args.allow_dirty)
 
     base_version = _read_base_version()
@@ -1161,7 +1015,6 @@ def main() -> int:
         ],
         cwd=_deploy_dir(),
         check=True,
-        env=_token_env(args),
     )
 
     # 5) databricks bundle run <key> --target <target> (starts/restarts
@@ -1180,7 +1033,6 @@ def main() -> int:
         ],
         cwd=_deploy_dir(),
         check=True,
-        env=_token_env(args),
     )
 
     # 6) Resolve URL + smoke-check.

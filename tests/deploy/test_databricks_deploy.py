@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -132,62 +131,6 @@ def test_profileless_deploy_keeps_host_env_auth(
     deploy_mod._clear_env_vars(keep=deploy_mod._host_env_keep(args))
     assert deploy_mod.os.environ["DATABRICKS_HOST"] == "https://env-auth.cloud.databricks.com"
     assert "DATABRICKS_TOKEN" not in deploy_mod.os.environ
-
-
-def test_token_auth_ignores_ambient_host(
-    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`databricks auth env` echoes an ambient host; the profile must win."""
-    monkeypatch.setenv("DATABRICKS_HOST", "https://wrong.cloud.databricks.com")
-    monkeypatch.setenv("DATABRICKS_TOKEN", "stale")
-
-    expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-
-    class _Result:
-        def __init__(self, stdout: str) -> None:
-            self.stdout = stdout
-
-    def fake_run(cmd: list[str], **_: object) -> _Result:
-        import json
-        import os
-
-        profile = cmd[-1]
-        if cmd[1:3] == ["auth", "token"]:
-            return _Result(json.dumps({"access_token": f"tok-{profile}", "expiry": expiry}))
-        assert cmd[1:3] == ["auth", "env"]
-        # Mirror the CLI: an ambient host is echoed back verbatim.
-        host = os.environ.get("DATABRICKS_HOST") or f"https://{profile}.cloud.databricks.com"
-        return _Result(json.dumps({"env": {"DATABRICKS_HOST": host}}))
-
-    monkeypatch.setattr(deploy_mod.subprocess, "run", fake_run)
-    deploy_mod._setup_profile_token_auth("myprof")
-
-    assert deploy_mod.os.environ["DATABRICKS_HOST"] == "https://myprof.cloud.databricks.com"
-    assert "DATABRICKS_TOKEN" not in deploy_mod.os.environ
-    assert deploy_mod._TOKEN_AUTH["DATABRICKS_TOKEN"] == "tok-myprof"
-
-
-@pytest.mark.parametrize("naive", [True, False])
-def test_token_runway_accepts_naive_and_aware_expiry(
-    deploy_mod: ModuleType, naive: bool, capsys: pytest.CaptureFixture[str]
-) -> None:
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    expiry = (expires_at.replace(tzinfo=None) if naive else expires_at).isoformat()
-    deploy_mod._assert_token_runway(expiry, "myprof")
-    assert "token runway" in capsys.readouterr().out
-
-
-def test_token_runway_rejects_short_lived_token(deploy_mod: ModuleType) -> None:
-    expiry = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
-    with pytest.raises(SystemExit, match="may expire mid-deploy"):
-        deploy_mod._assert_token_runway(expiry, "myprof")
-
-
-def test_token_runway_skips_missing_expiry(
-    deploy_mod: ModuleType, capsys: pytest.CaptureFixture[str]
-) -> None:
-    deploy_mod._assert_token_runway(None, "myprof")
-    assert "skipping runway check" in capsys.readouterr().out
 
 
 def test_bundle_vars_are_comma_free(
