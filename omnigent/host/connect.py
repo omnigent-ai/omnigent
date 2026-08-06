@@ -4025,6 +4025,14 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
+    # Executor-agnostic GitHub setup: point git at the server's credential
+    # broker and attribute commits to the owner. Best-effort; the host runs in
+    # every executor and holds the launch token, so no launcher needs to inject
+    # anything GitHub-specific.
+    from omnigent.git_credential_github import configure_host_git
+
+    configure_host_git(server_url, identity.host_id)
+
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
