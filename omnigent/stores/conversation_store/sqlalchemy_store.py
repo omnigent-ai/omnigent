@@ -3054,6 +3054,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             for r in ap_rows
         ]
 
+    def count_conversations_by_host_id(self, host_id: str) -> int:
+        """
+        Return the number of conversations bound to the given ``host_id``.
+
+        Counts in SQL rather than materializing rows — the admin fleet
+        view only needs the size per host.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: Count of conversations whose ``host_id`` matches.
+        """
+        with self._session("count_conversations_by_host") as session:
+            return (
+                session.query(SqlConversationMetadata)
+                .filter(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == host_id,
+                )
+                .count()
+            )
+
     def set_host_id(
         self,
         conversation_id: str,

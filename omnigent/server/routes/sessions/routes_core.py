@@ -62,6 +62,7 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.audit import audit_event
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -435,7 +436,12 @@ def register_core_routes(
         if launch_host_id is not None and resp.runner_id is None:
             host_registry = getattr(request.app.state, "host_registry", None)
             host_store_inst = getattr(request.app.state, "host_store", None)
-            if host_registry is not None and host_store_inst is not None:
+            host_permission_store = getattr(request.app.state, "host_permission_store", None)
+            if (
+                host_registry is not None
+                and host_store_inst is not None
+                and host_permission_store is not None
+            ):
                 from omnigent.host.frames import (
                     HostLaunchRunnerFrame,
                     encode_host_frame,
@@ -452,6 +458,7 @@ def register_core_routes(
                     host_registry=host_registry,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
+                    host_permission_store=host_permission_store,
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)
@@ -818,6 +825,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        all: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -881,6 +889,27 @@ def register_core_routes(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # Admin fleet view: drop the ACL filter so every owner's sessions
+        # are returned. Fail closed — a non-admin asking for all=true gets
+        # 403, never a silently owner-scoped list. Audit the disclosure.
+        fleet_view = False
+        if all:
+            # Security: union ``admin_list`` with ``permission_store.is_admin``
+            # so the fleet view agrees with the hosts router's ``_is_admin_caller``.
+            # A config-roster admin whose ``users.is_admin`` was never flipped by
+            # a login promotion gets 200 on ``GET /v1/hosts?all=true`` but would
+            # get 403 here without the union (PR review: "admin gate disagrees").
+            is_admin = False
+            if permission_store is not None and user_id is not None:
+                is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
+            if not is_admin:
+                _admin_list = getattr(request.app.state, "admin_list", None)
+                if _admin_list is not None and user_id is not None:
+                    is_admin = await asyncio.to_thread(_admin_list.is_admin, user_id)
+            if not is_admin:
+                raise HTTPException(status_code=403, detail="admin privileges required")
+            fleet_view = True
+            audit_event("session.fleet.list", actor=user_id, target="*")
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
@@ -888,7 +917,7 @@ def register_core_routes(
         # the store resolves the project NAME to the caller's own project id.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        owned_by = None if fleet_view else (user_id if project else None)
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -896,7 +925,7 @@ def register_core_routes(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
+            accessible_by=None if fleet_view else user_id,
             owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API

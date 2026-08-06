@@ -4221,7 +4221,7 @@ async def _validate_session_workspace(
 
     The caller's host ownership is checked BEFORE the ``host.stat``
     round-trip the validation performs, so a non-owner never reaches
-    another user's host (raises 403/404 via ``resolve_host_owner``).
+    another user's host (raises 403/404 via ``resolve_host_access``).
 
     :param user_id: Authenticated caller, e.g.
         ``"alice@example.com"``, or ``None`` when auth is disabled.
@@ -4253,6 +4253,8 @@ async def _validate_session_workspace(
         agent_cache=agent_cache,
         host_store=getattr(request.app.state, "host_store", None),
         host_registry=getattr(request.app.state, "host_registry", None),
+        host_permission_store=getattr(request.app.state, "host_permission_store", None),
+        permission_store=getattr(request.app.state, "permission_store", None),
     )
 
 
@@ -6874,11 +6876,7 @@ def _build_evaluation_context(
     else:
         text = str(data)
     text_str = text if isinstance(text, str) else json.dumps(text)
-    # REQUEST content is the structured dict ({"user_content", "attachments"}) so
-    # every request reaches policies in one shape, whatever the entry point. This
-    # native/terminal path carries no uploads, so ``attachments`` is always empty;
-    # the web input gate (_evaluate_input_policy) is what populates it. RESPONSE
-    # stays a plain string — attachments are an input-only concern.
+    # REQUEST content is structured so every input reaches policies in one shape.
     request_or_response_content: Any = (
         {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
     )

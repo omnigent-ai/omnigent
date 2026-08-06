@@ -25,6 +25,9 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.server.auth import create_auth_provider
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -116,6 +119,7 @@ def _build_app(
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_url),
         auth_provider=auth_provider,
         account_store=account_store,
     )
