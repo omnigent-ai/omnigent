@@ -154,6 +154,29 @@ def test_key_provider_resolves_to_inline_family() -> None:
     assert provider.model == "claude-sonnet-4-6"
 
 
+def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
+    """A managed picker value resolves its provider-local model id."""
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-test-literal",
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(
+        model="omnigent/claude-opus-4-7", config_loader=lambda: config
+    )
+
+    assert provider is not None
+    assert provider.model == "claude-opus-4-7"
+
+
 def test_subscription_default_returns_none() -> None:
     """A subscription (CLI-login) default isn't reusable by Pi → None."""
     config = {"providers": {"claude": {"kind": "subscription", "default": True, "cli": "claude"}}}
@@ -281,6 +304,99 @@ def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
     _env, args = creds.pi_native_provider_launch(agent_dir, provider)
 
     assert args == ["--provider", "omnigent", "--model", "omnigent/moonshotai/kimi-k2.5"]
+
+
+def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) -> None:
+    """A start-picker selection chooses its generated Pi provider and model."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        additional_providers={
+            "omnigent-openai": {
+                "baseUrl": "https://api.openai.com/v1",
+                "api": "openai-responses",
+                "apiKey": "sk-openai",
+                "models": [{"id": "gpt-5.6-sol"}],
+            }
+        },
+    )
+
+    _, args = creds.pi_native_provider_launch(
+        tmp_path / "pi-agent",
+        provider,
+        selection="omnigent-openai/gpt-5.6-sol",
+    )
+
+    assert args == [
+        "--provider",
+        "omnigent-openai",
+        "--model",
+        "gpt-5.6-sol",
+        "--thinking",
+        "off",
+    ]
+
+
+def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path) -> None:
+    """A stale picker value must not silently launch the provider default."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "pi-agent"
+
+    with pytest.raises(ValueError, match="not available"):
+        creds.pi_native_provider_launch(
+            agent_dir,
+            provider,
+            selection="omnigent-openai/gpt-missing",
+        )
+
+    assert not agent_dir.exists()
+
+
+def test_pi_native_model_options_lists_only_managed_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-launch choices come only from the provider built by ``omni setup``."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        additional_providers={
+            "omnigent-openai": {
+                "baseUrl": "https://api.openai.com/v1",
+                "api": "openai-responses",
+                "apiKey": "sk-openai",
+                "models": [{"id": "gpt-5.6-sol", "name": "GPT 5.6 Sol"}],
+            }
+        },
+    )
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: provider)
+
+    assert creds.pi_native_model_options() == [
+        {
+            "id": "omnigent-openai/gpt-5.6-sol",
+            "model": "omnigent-openai/gpt-5.6-sol",
+            "displayName": "GPT 5.6 Sol",
+        },
+        {
+            "id": "omnigent/claude-sonnet-4-6",
+            "model": "omnigent/claude-sonnet-4-6",
+            "displayName": "claude-sonnet-4-6",
+        },
+    ]
 
 
 def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:

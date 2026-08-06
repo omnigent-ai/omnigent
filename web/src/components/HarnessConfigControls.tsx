@@ -127,10 +127,12 @@ export function ConfigRow({
   label,
   description,
   children,
+  controlClassName,
 }: {
   label: string;
   description?: string;
   children: ReactNode;
+  controlClassName?: string;
 }) {
   return (
     // Stacked on mobile (label above a full-width control) so the label never
@@ -141,7 +143,7 @@ export function ConfigRow({
         <div className="text-ui font-medium">{label}</div>
         {description && <div className="text-sm text-muted-foreground">{description}</div>}
       </div>
-      <div className="w-full sm:w-52 sm:shrink-0">{children}</div>
+      <div className={cn("w-full sm:w-52 sm:shrink-0", controlClassName)}>{children}</div>
     </div>
   );
 }

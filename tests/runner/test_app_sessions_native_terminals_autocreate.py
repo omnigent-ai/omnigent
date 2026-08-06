@@ -257,7 +257,7 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     monkeypatch.setattr(
         pi_native_credentials,
         "pi_native_provider_launch",
-        lambda _agent_dir, _provider: ({}, []),
+        lambda _agent_dir, _provider, **_kwargs: ({}, []),
     )
 
     async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
