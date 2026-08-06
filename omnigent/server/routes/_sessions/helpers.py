@@ -8708,7 +8708,7 @@ async def _handle_mcp_tools_list(
 
     # Omnigent extension (not part of the MCP tools/list schema): pass through
     # InitializeResult.instructions captured on the runner so ProxyMcpManager
-    # can append them to the system prompt (omnigent-ai/omnigent#4038).
+    # can append them to the system prompt.
     server_instructions = result.get("server_instructions") or {}
     if not isinstance(server_instructions, dict):
         server_instructions = {}

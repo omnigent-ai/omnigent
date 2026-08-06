@@ -133,9 +133,9 @@ async def test_schemas_for_empty_spec_returns_empty_without_network() -> None:
 
     result = await manager.schemas_for(_empty_spec())
 
-    assert result == McpSchemasResult(schemas=[], tool_names=set(), failures={}), (
-        "Empty spec must return empty McpSchemasResult without calling the proxy"
-    )
+    assert result == McpSchemasResult(
+        schemas=[], tool_names=set(), failures={}, server_instructions={}
+    ), "Empty spec must return empty McpSchemasResult without calling the proxy"
     assert transport.calls == [], "No HTTP request should be sent when mcp_servers is empty"
 
 
@@ -182,6 +182,7 @@ async def test_schemas_for_happy_path_parses_tools() -> None:
         "Both tool names must appear in tool_names set"
     )
     assert result.failures == {}, "No failures expected on a clean response"
+    assert result.server_instructions == {}, "No serverInstructions in response → empty map"
     assert len(result.schemas) == 2, "One schema per tool must be returned"
 
     search_schema = next(s for s in result.schemas if s["name"] == "github__search")
@@ -197,6 +198,41 @@ async def test_schemas_for_happy_path_parses_tools() -> None:
     assert call.body["method"] == "tools/list"
     assert call.body["jsonrpc"] == "2.0"
     assert "/v1/sessions/conv_test/mcp" in call.url
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_parses_server_instructions() -> None:
+    """``serverInstructions`` from the proxy must become ``McpSchemasResult.server_instructions``.
+
+    Non-string / blank entries are dropped so prompt assembly only sees usable text.
+    """
+    rpc_resp = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {
+                        "name": "pipeshub__chat",
+                        "description": "Chat",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+                "serverInstructions": {
+                    "PipesHub": " Prefer pipeshub_chat. ",
+                    "blank": "   ",
+                    "bad": 123,
+                },
+            },
+        }
+    )
+    transport = _StubTransport([rpc_resp])
+    manager = _make_manager(transport)
+
+    result = await manager.schemas_for(_make_spec("pipeshub"))
+
+    assert result.server_instructions == {"PipesHub": "Prefer pipeshub_chat."}
+    assert result.tool_names == {"pipeshub__chat"}
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,7 @@ SHARED_SESSION_AUTHORSHIP_INSTRUCTION = (
 )
 SHARED_MESSAGE_ATTRIBUTION_ENV = "OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED"
 # Kill switch for injecting MCP InitializeResult.instructions into the system
-# prompt (omnigent-ai/omnigent#4038). Default on; set to 0/false/no/off to disable.
+# prompt. Default on; set to 0/false/no/off to disable.
 MCP_INSTRUCTIONS_ENV = "OMNIGENT_MCP_INSTRUCTIONS_ENABLED"
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 

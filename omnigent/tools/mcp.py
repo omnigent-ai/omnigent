@@ -444,8 +444,8 @@ class McpServerConnection:
     )
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
     # Captured from InitializeResult after session.initialize(); used by the
-    # runner to append MCP server routing guidance into the system prompt
-    # (omnigent-ai/omnigent#4038). Cleared on close/reconnect.
+    # runner to append MCP server routing guidance into the system prompt.
+    # Cleared on close/reconnect.
     _initialize_instructions: str | None = field(default=None, init=False, repr=False)
     _server_info_name: str | None = field(default=None, init=False, repr=False)
     _breaker: _CircuitBreaker = field(init=False, repr=False)

@@ -5357,11 +5357,9 @@ def create_runner_app(
                         conv,
                         exc_info=True,
                     )
-            # Append after MCP connect so initialize.instructions are available
-            # (omnigent-ai/omnigent#4038). Agent AGENTS.md stays first.
-            mcp_guidance = format_mcp_routing_guidance(
-                _session_mcp_instructions.get(conv, {})
-            )
+            # Append after MCP connect so initialize.instructions are available.
+            # Agent AGENTS.md stays first.
+            mcp_guidance = format_mcp_routing_guidance(_session_mcp_instructions.get(conv, {}))
             if mcp_guidance:
                 combined = append_framework_instructions(
                     cast(str | None, harness_body.get("instructions")),

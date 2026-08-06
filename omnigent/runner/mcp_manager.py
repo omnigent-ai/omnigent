@@ -83,8 +83,8 @@ class McpSchemasResult:
     schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
-    # Display name → InitializeResult.instructions from each healthy server
-    # (omnigent-ai/omnigent#4038). Empty when no server returned instructions.
+    # Display name → InitializeResult.instructions from each healthy server.
+    # Empty when no server returned instructions.
     server_instructions: dict[str, str] = field(default_factory=dict)
 
 
@@ -393,9 +393,12 @@ class RunnerMcpManager:
                     if isinstance(schema_name, str):
                         tool_names.add(schema_name)
                 conn = server.connection
-                if conn is not None and conn.initialize_instructions:
-                    display = conn.server_info_name or ref.config.name
-                    server_instructions[display] = conn.initialize_instructions
+                instructions = getattr(conn, "initialize_instructions", None) if conn else None
+                if isinstance(instructions, str) and instructions.strip():
+                    display = getattr(conn, "server_info_name", None) or ref.config.name
+                    if not isinstance(display, str) or not display.strip():
+                        display = ref.config.name
+                    server_instructions[display] = instructions.strip()
             return McpSchemasResult(
                 schemas=schemas,
                 tool_names=tool_names,
