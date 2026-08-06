@@ -80,12 +80,17 @@ The repro worktree is gone, so recover from the run's artifacts and logs with th
 and fall back rather than assuming a fixed structure:
 
 1. `gh run view <ci_link> --log` (and `--json` for metadata) to read the job
-   output. The repro-agent's final ```json handoff block is echoed in its step
-   log — parse `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`
-   from it there.
-2. `gh run download <run-id>` to pull artifacts. The reproduction test's content
-   lives here — either as an authored test file or inside a diff/patch artifact.
-   Materialize it into your checkout at `test_path`.
+   output. repro-agent's final message is echoed in its step log **untruncated**,
+   so the log carries two things you need: the final ```json handoff block (parse
+   `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id` from it) and,
+   immediately before it, the **complete verbatim source of the e2e test** pasted
+   as a path-labelled code block (repro-agent's contract). Prefer reading the test
+   body from that inline block in the log — unlike a live session transcript, the
+   CI log is not truncated, so the pasted test is complete here.
+2. `gh run download <run-id>` to pull artifacts as a fallback for the test's
+   content — an authored test file or a diff/patch artifact — if the log's inline
+   block is unavailable or was clipped. Either way, materialize the full test into
+   your checkout at `test_path`.
 3. If the run also recorded a shareable `session_id` you can reach, read it with
    `sys_session_get_history` for richer context.
 4. If neither the artifacts nor the logs yield the test's content, **stop with
