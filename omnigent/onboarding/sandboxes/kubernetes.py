@@ -477,6 +477,7 @@ def build_pod_manifest(
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     secret_mounts: Sequence[Mapping[str, object]] | None = None,
+    runtime_class: str | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -515,6 +516,10 @@ def build_pod_manifest(
       container start. Refresh is eventually consistent (kubelet sync, up to
       ~1 min), so the in-sandbox consumer must re-read the file each use — a
       value cached at start defeats the rotation.
+    - An operator *runtime_class* becomes ``spec.runtimeClassName``, scheduling
+      the Pod onto a sandboxed container runtime the cluster provides via a
+      ``RuntimeClass`` object (e.g. Kata Containers micro-VMs, gVisor). Unset
+      keeps the cluster's default runtime — today's behaviour exactly.
 
     :param pod_name: DNS-label-safe Pod name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Pod is created in.
@@ -549,6 +554,8 @@ def build_pod_manifest(
     :param secret_mounts: Normalized Secret mounts (``{secret_name,
         mount_path}``) added as read-only ``secret`` volumes on the host
         container only, or ``None``.
+    :param runtime_class: ``RuntimeClass`` name set as ``spec.runtimeClassName``,
+        or ``None`` to keep the cluster's default container runtime.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -690,6 +697,10 @@ def build_pod_manifest(
         "initContainers": [init_container],
         "containers": [host_container],
     }
+    if runtime_class is not None:
+        # Opt-in only: an absent key (not an explicit None/null) keeps the
+        # manifest byte-compatible with pre-runtime_class deployments.
+        spec["runtimeClassName"] = runtime_class
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -885,6 +896,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        runtime_class: str | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -913,6 +925,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             (validated at parse time), or ``None`` for none.
         :param secret_mounts: Normalized ``sandbox.kubernetes.secret_mounts``
             entries (validated at parse time), or ``None`` for none.
+        :param runtime_class: ``sandbox.kubernetes.runtime_class`` — the
+            ``RuntimeClass`` name Pods are scheduled under (e.g. ``kata``,
+            ``gvisor``), or ``None`` for the cluster's default runtime.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -925,6 +940,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._runtime_class = runtime_class
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1222,6 +1238,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
+                    runtime_class=self._runtime_class,
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in

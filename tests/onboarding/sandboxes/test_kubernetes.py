@@ -251,6 +251,18 @@ def test_build_pod_manifest_node_selector_can_override_arch() -> None:
     assert selector["disktype"] == "ssd"
 
 
+def test_build_pod_manifest_omits_runtime_class_by_default() -> None:
+    """No runtime_class → no runtimeClassName key: the cluster default runtime."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert "runtimeClassName" not in manifest["spec"]
+
+
+def test_build_pod_manifest_runtime_class_sets_runtime_class_name() -> None:
+    """An operator runtime_class lands verbatim as spec.runtimeClassName."""
+    manifest = build_pod_manifest(**{**_MANIFEST_KW, "runtime_class": "kata"})
+    assert manifest["spec"]["runtimeClassName"] == "kata"
+
+
 def test_build_pod_manifest_pvc_mounts_land_on_host_container_only() -> None:
     """Each pvc_mounts entry becomes a persistentVolumeClaim volume mounted on host only."""
     manifest = build_pod_manifest(
