@@ -249,12 +249,14 @@ def _build_default_databricks_routing_client(
 def _build_external_routing_client(
     routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
     settings: Any = None,  # type: ignore[explicit-any]  # RoutingSettings | None
+    cfg: Any = None,  # type: ignore[explicit-any]  # parsed server config
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
     an explicit, provider-agnostic ``api_key`` (``${ENV}`` expanded) wins,
-    else the Databricks ``profile`` convenience, else unauthenticated.
+    else the Databricks ``profile`` convenience, else the deployment's own
+    ``kind: databricks`` provider profile, else unauthenticated.
     Optional ``model_prefix`` (a single prefix or a list of prefixes) is
     stripped from catalog model ids sent to the router (and restored on its
     answer) — e.g. ``"databricks-"`` when serving-endpoint names carry that
@@ -266,6 +268,8 @@ def _build_external_routing_client(
     :param settings: The parsed routing settings, supplying the extraction
         model, scenario menus, and model prefixes. ``None`` parses them from
         *routing_cfg*.
+    :param cfg: The parsed server ``--config`` mapping, read only for the
+        provider profile fallback. ``None`` skips that fallback.
     :returns: A configured client, or ``None`` when required config is
         missing (a warning is logged; routing stays off rather than raising).
     """
@@ -298,6 +302,13 @@ def _build_external_routing_client(
         auth = _bearer_auth(expand_env_vars({"api_key": api_key})["api_key"])
     elif profile:
         databricks_profile = profile
+    else:
+        # Named nowhere in ``routing:``, but the deployment's own Databricks
+        # provider names one. Take it rather than falling through to the
+        # ambient SDK chain: ambient resolves by host or [DEFAULT], and a
+        # workspace with two profiles on one host then has the router
+        # authenticating as a different identity than the panes it routes.
+        databricks_profile = _databricks_provider_profile(cfg) if cfg is not None else None
 
     from omnigent.server.smart_routing import ExternalRoutingClient
 
@@ -372,7 +383,7 @@ def _build_routing_backends(
         return RoutingBackends()
     external: Any = None  # type: ignore[explicit-any]
     if provider == "external":
-        external = _build_external_routing_client(routing_cfg, settings)
+        external = _build_external_routing_client(routing_cfg, settings, cfg)
     elif not isinstance(routing_cfg, dict):
         external = _build_default_databricks_routing_client(cfg, settings)
     return RoutingBackends(external=external, local=_build_local_llm_routing_client(server_llm))

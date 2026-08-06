@@ -1949,12 +1949,54 @@ def _ucode_config_for_profile(
     # rejects.
     return ClaudeNativeUcodeConfig(
         env=env,
-        api_key_helper=agent_state.auth_command,
+        api_key_helper=_profile_pinned_auth_command(
+            agent_state.auth_command, workspace_url, profile
+        ),
         model=default_model
         or configured_default
         or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         routable_models=routable_models,
     )
+
+
+def _profile_pinned_auth_command(
+    auth_command: str,
+    workspace_url: str,
+    profile: str,
+) -> str:
+    """Pin a Databricks-CLI token helper to the profile the config named.
+
+    ucode writes its own token command into ``~/.ucode/state.json``, and it
+    selects the workspace however ucode was configured — often by host. The
+    server's router client instead authenticates as the ``kind: databricks``
+    provider's named profile. When two ``~/.databrickscfg`` profiles point at
+    one host, those are two different identities: re-authing one leaves the
+    other's token expired, and the pane and the router disagree about whether
+    the workspace is reachable. The named profile is the authority, so the
+    helper is regenerated against it.
+
+    Only the recognizable ``databricks auth token`` shape is rewritten — an
+    enterprise deployment can configure a wholly different token command, and
+    this has no business guessing at its selector.
+
+    :param auth_command: The token command ucode recorded for this agent.
+    :param workspace_url: The profile's workspace, e.g.
+        ``"https://example.databricks.com"``.
+    :param profile: The ``~/.databrickscfg`` profile the config named.
+    :returns: The command to install as ``apiKeyHelper``.
+    """
+    if "databricks auth token" not in auth_command:
+        return auth_command
+    from omnigent.inner.claude_sdk_executor import _databricks_claude_auth_command
+
+    pinned = _databricks_claude_auth_command(workspace_url, profile)
+    if pinned != auth_command:
+        _logger.info(
+            "native-claude: pinning the token helper to Databricks profile %r "
+            "(ucode's recorded command selects the workspace its own way)",
+            profile,
+        )
+    return pinned
 
 
 def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:

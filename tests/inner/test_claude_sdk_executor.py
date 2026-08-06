@@ -552,12 +552,14 @@ class TestConstructor(unittest.TestCase):
         self.assertIn('databricks auth token --profile "oss"', helper)
         self.assertNotIn("--host", helper)
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # must be applied via a `--help` capability probe ($force), never
-        # passed unconditionally — an older CLI rejects the unknown flag and
-        # yields an empty token → silent 401.
+        # stays behind a `--help` capability probe — an older CLI rejects the
+        # unknown flag and yields an empty token → silent 401.
         self.assertIn("databricks auth token --help", helper)
-        self.assertIn("force=--force-refresh", helper)
-        self.assertNotIn('oss" --force-refresh', helper)
+        # And even where it exists it is only ATTEMPTED: it fails outright on a
+        # stale refresh token, so an empty result must fall back to the cached
+        # token rather than turning a usable credential into an auth failure.
+        self.assertIn("--force-refresh", helper)
+        self.assertIn('if [ -z "$token" ]; then', helper)
 
     def test_databricks_flag_no_creds_raises(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
