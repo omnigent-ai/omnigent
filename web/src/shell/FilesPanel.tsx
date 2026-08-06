@@ -39,6 +39,7 @@ import {
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
 import { useScrollRestore } from "./useScrollRestore";
+import { SessionPullRequests } from "./SessionPullRequests";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
@@ -524,6 +525,7 @@ export function FilesPanel({
           )}
         </div>
       )}
+      <SessionPullRequests conversationId={conversationId} />
       <section
         ref={scrollRef}
         className={cn(
