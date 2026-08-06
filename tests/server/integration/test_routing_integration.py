@@ -1160,6 +1160,129 @@ async def test_child_create_stamp_inherits_the_parents_switch_not_its_cost_contr
     assert child.subagent_routing_override == stamped
 
 
+# ── 7c. A pinned parent cannot create an out-of-family child ───────
+
+
+async def _pinned_parent(
+    client: httpx.AsyncClient,
+    *,
+    agent_name: str,
+    harness: str,
+    routing_on: bool = True,
+) -> str:
+    """Create a parent pinned to *harness*, with Smart Routing on or off.
+
+    :param client: Test HTTP client.
+    :param agent_name: Agent name to register.
+    :param harness: The parent agent's harness, e.g. ``"codex"``.
+    :param routing_on: Whether the parent routes its spawns.
+    :returns: The parent session id.
+    """
+    agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    body: dict[str, Any] = {"agent_id": agent["id"]}
+    if routing_on:
+        body["cost_control_mode_override"] = "on"
+    parent = await client.post("/v1/sessions", json=body)
+    assert parent.status_code == 201, parent.text
+    return str(parent.json()["id"])
+
+
+async def _create_child(
+    client: httpx.AsyncClient,
+    parent_id: str,
+    *,
+    agent_name: str,
+    harness: str,
+) -> httpx.Response:
+    """POST a child create bound to an agent running *harness*.
+
+    :param client: Test HTTP client.
+    :param parent_id: The parent session id.
+    :param agent_name: Agent name to register for the child.
+    :param harness: The child agent's harness, e.g. ``"claude-sdk"``.
+    :returns: The raw create response.
+    """
+    child_agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    return await client.post(
+        "/v1/sessions",
+        json={"agent_id": child_agent["id"], "parent_session_id": parent_id},
+    )
+
+
+async def test_pinned_parent_cannot_create_a_child_in_another_family(
+    client: httpx.AsyncClient,
+) -> None:
+    parent_id = await _pinned_parent(
+        client, agent_name="family-gate-pinned-parent", harness="codex"
+    )
+    child = await _create_child(
+        client, parent_id, agent_name="family-gate-claude-child", harness="claude-sdk"
+    )
+    assert child.status_code == 400, child.text
+    assert "model family" in child.text
+
+
+async def test_pinned_parent_still_creates_children_in_its_own_family(
+    client: httpx.AsyncClient,
+) -> None:
+    parent_id = await _pinned_parent(
+        client, agent_name="family-gate-same-family-parent", harness="codex"
+    )
+    child = await _create_child(
+        client, parent_id, agent_name="family-gate-codex-child", harness="codex"
+    )
+    assert child.status_code == 201, child.text
+
+
+async def test_auto_parent_may_create_a_child_in_another_family(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        name="family-gate-auto-parent",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    child = await _create_child(
+        client,
+        str(parent.json()["id"]),
+        agent_name="family-gate-auto-claude-child",
+        harness="claude-sdk",
+    )
+    assert child.status_code == 201, child.text
+
+
+async def test_plain_parent_may_create_a_child_in_another_family(
+    client: httpx.AsyncClient,
+) -> None:
+    parent_id = await _pinned_parent(
+        client,
+        agent_name="family-gate-plain-parent",
+        harness="codex",
+        routing_on=False,
+    )
+    child = await _create_child(
+        client, parent_id, agent_name="family-gate-plain-claude-child", harness="claude-sdk"
+    )
+    assert child.status_code == 201, child.text
+
+
 # ── 8. Truthful record on a claude-native turn ─────────────────────
 
 

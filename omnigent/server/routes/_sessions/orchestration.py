@@ -4151,6 +4151,59 @@ def _native_pane_harness(conv: Conversation) -> str | None:
     return native.harness if native is not None else harness
 
 
+def _pinned_spawn_family(parent: Conversation | None) -> str | None:
+    """Return the family a parent's spawns are confined to, if any.
+
+    Only a Smart Routing parent on a PINNED harness confines them — its
+    spawns are routed inside its own family. An auto-harness parent hands
+    the family choice to the router, and a parent that routes no spawns at
+    all confines nothing.
+
+    :param parent: The parent session's row, or ``None`` for a top-level
+        create (nothing to stay in family with).
+    :returns: ``"claude"`` / ``"gpt"`` / ``"pi"``, or ``None`` when the
+        parent's spawns may land in any family.
+    """
+    if parent is None or not subagent_routing_enabled(parent.subagent_routing_override):
+        return None
+    if auto_harness_session(parent):
+        return None
+    return harness_family(_resolve_harness(parent))
+
+
+def _reject_out_of_family_child(
+    parent: Conversation | None,
+    child_harness: str | None,
+) -> None:
+    """Refuse a pinned parent's create of a child in another family.
+
+    The primary defense for the family rule: a pinned codex Smart Routing
+    session must not be able to stand up a claude child at all, rather than
+    standing one up and having routing decline it afterwards. The child is
+    refused here, at the create, where the caller still sees the reason.
+
+    :param parent: The parent session's row, or ``None`` for a top-level
+        create.
+    :param child_harness: The harness the child would run, e.g.
+        ``"claude-native"``. ``None`` (unresolvable) is allowed through —
+        nothing proves it is out of family.
+    :raises OmnigentError: 400 ``INVALID_INPUT`` when the child's family
+        differs from the family the parent's spawns are confined to.
+    """
+    family = _pinned_spawn_family(parent)
+    child_family = harness_family(child_harness)
+    if family is None or child_family is None or family == child_family:
+        return
+    parent_harness = _resolve_harness(parent)
+    raise OmnigentError(
+        f"A {parent_harness} session with Smart Routing spawns only agents in its own "
+        f"model family; {child_harness} is not one. Pick an agent that runs on "
+        f"{parent_harness}, or start the session in Smart Routing (auto) harness mode "
+        "to let the router choose the family.",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _out_of_family_spawn_notice(
     conv: Conversation,
     parent: Conversation | None,
@@ -4158,11 +4211,14 @@ def _out_of_family_spawn_notice(
 ) -> str | None:
     """Why a pinned parent's cross-family spawn is not routed, if it is not.
 
-    Cross-family picks belong to sessions whose harness the router owns (Smart
-    Routing / auto): a pinned codex session's spawns stay on codex, so a child
-    pane running another family's CLI has no candidate the parent's family can
-    serve. Same predicate the in-harness spawn gate uses, so "auto" means one
-    thing on both spawn paths.
+    The fail-safe behind :func:`_reject_out_of_family_child`, which refuses
+    the out-of-family child at its create: a pane that exists anyway (a
+    legacy row, an unresolvable harness at create time) still must not be
+    routed. Cross-family picks belong to sessions whose harness the router
+    owns (Smart Routing / auto): a pinned codex session's spawns stay on
+    codex, so a child pane running another family's CLI has no candidate the
+    parent's family can serve. Same predicate the in-harness spawn gate uses,
+    so "auto" means one thing on both spawn paths.
 
     :param conv: The child session's row.
     :param parent: The parent session's row, or ``None`` for a top-level
@@ -7223,6 +7279,18 @@ async def _create_session_from_existing_agent(
                 # Non-omnigent agent (e.g. a native wrapper) — can't route
                 # harness; leave the orchestrator's choice untouched.
                 _force_auto_for_child = False
+        # A pinned Smart Routing parent may only spawn inside its own model
+        # family, so the child that could never be routed is refused here
+        # rather than created and declined afterwards. Auto parents are
+        # unaffected (the router owns their family) and so is a parent that
+        # routes no spawns — neither resolves the child's harness at all.
+        if _pinned_spawn_family(_parent_for_routing) is not None:
+            _reject_out_of_family_child(
+                _parent_for_routing,
+                await asyncio.to_thread(
+                    _create_resolved_harness, agent, body.harness_override, agent_cache
+                ),
+            )
 
     # A session that starts on Smart Routing routes the subagents it spawns.
     # Stamped here, once, so the spawn gate reads one explicit switch instead
