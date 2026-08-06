@@ -888,7 +888,9 @@ def test_route_turn_falls_open_on_the_ladders_own_request_budget(
 
     assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
     assert seen == [HOOK_REQUEST_TIMEOUT_S]
-    assert HOOK_REQUEST_TIMEOUT_S < 10.0
+    # Must outlast a healthy route (catalog prep + router call), capped at the
+    # owner's 15s ceiling.
+    assert HOOK_REQUEST_TIMEOUT_S <= 15.0
     assert capsys.readouterr().out == ""
     assert not (bridge_dir / MARKER_FILE).exists()
 
