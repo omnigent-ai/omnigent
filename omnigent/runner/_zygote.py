@@ -205,6 +205,7 @@ def _maybe_run_test_seam() -> None:
     if test_exit is not None:
         sys.stdout.write(f"marker={os.environ.get('OMNIGENT_ZYGOTE_MARKER', '')}\n")
         sys.stdout.write(f"tty_fd={os.environ.get(LOG_TTY_FD_ENV_VAR, '')}\n")
+        sys.stdout.write(f"cwd={os.getcwd()}\n")
         sys.stdout.flush()
         if env_truthy(os.environ.get(_ZYGOTE_TEST_CHILD_RAISE_ENV_VAR)):
             raise SystemExit(int(test_exit))
