@@ -71,13 +71,13 @@ describe("routing decision — harness / scope / raw pick", () => {
   // Harness + which sub-agent the decision covers: without the badge a
   // native-subagent decision is indistinguishable from a session one, and a
   // badge on a session/turn decision would invent a sub-agent that has none.
-  // Sub-agent chips also shorten the harness id: "-native" is how the spawn
-  // runs, not something a spawn chip needs to say. Session/turn chips keep it.
+  // Every chip also shortens the harness id: "-native" is how the pane runs,
+  // not something a chip needs to say, whatever scope took the decision.
   it.each([
-    ["native_subagent", "subagent: researcher", "claude"],
-    ["turn", null, "claude-native"],
-    ["session", null, "claude-native"],
-  ] as const)("card: %s scope renders the sub-agent badge as %s", (scope, badge, harnessText) => {
+    ["native_subagent", "subagent: researcher"],
+    ["turn", null],
+    ["session", null],
+  ] as const)("card: %s scope renders the sub-agent badge as %s", (scope, badge) => {
     render(
       <RoutingDecisionCard
         model="databricks-claude-sonnet-5"
@@ -87,7 +87,8 @@ describe("routing decision — harness / scope / raw pick", () => {
         routing={{ harness: "claude-native", scope }}
       />,
     );
-    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent(harnessText);
+    // Anchored: a bare "claude" would also match the unshortened id.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent(/^· claude$/);
     if (badge === null) {
       expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
     } else {

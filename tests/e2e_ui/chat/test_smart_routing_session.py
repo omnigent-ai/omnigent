@@ -111,7 +111,9 @@ def test_routed_session_renders_one_routing_chip(
     # The pick itself, and who made it.
     expect(chip).to_contain_text("opus")
     expect(chip.get_by_test_id("routing-decision-source-databricks")).to_be_visible()
-    expect(chip.get_by_test_id("routing-decision-harness")).to_contain_text("claude-native")
+    session_harness = chip.get_by_test_id("routing-decision-harness")
+    expect(session_harness).to_contain_text("claude")
+    expect(session_harness).not_to_contain_text("claude-native")
     # The turn chip is the survivor, so the scope reads as the turn's.
     expect(chip).to_have_attribute("data-applied", "true")
 
@@ -122,8 +124,8 @@ def test_spawn_chip_says_the_short_harness_name(
 ) -> None:
     """A sub-agent spawn chip says "codex", not the "-native" implementation id.
 
-    The session's own session/turn chips keep the full harness id (covered
-    above); the shortening applies only to the sub-agent scopes.
+    Every chip shortens the id this way; the session's own chip is covered
+    above.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed

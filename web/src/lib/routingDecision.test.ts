@@ -139,25 +139,25 @@ describe("showsRoutingDecisionChip", () => {
 });
 
 describe("harnessDisplayLabel", () => {
-  it("shortens native harness ids on subagent-scoped chips", () => {
-    expect(harnessDisplayLabel("native_subagent", "claude-native")).toBe("claude");
-    expect(harnessDisplayLabel("native_subagent", "codex-native")).toBe("codex");
-    expect(harnessDisplayLabel("child_session", "codex-native")).toBe("codex");
+  it("shortens native harness ids", () => {
+    expect(harnessDisplayLabel("claude-native")).toBe("claude");
+    expect(harnessDisplayLabel("codex-native")).toBe("codex");
   });
 
-  it("leaves SDK-brain subagents and session chips unchanged", () => {
+  it("leaves SDK ids unchanged", () => {
     // A bundle agent's (Polly/Debby) SDK children carry no -native suffix.
-    expect(harnessDisplayLabel("child_session", "codex")).toBe("codex");
-    expect(harnessDisplayLabel("child_session", "claude-sdk")).toBe("claude-sdk");
-    expect(harnessDisplayLabel("child_session", "auto")).toBe("auto");
-    // The session's own chips keep the full harness id.
-    expect(harnessDisplayLabel("session", "claude-native")).toBe("claude-native");
-    expect(harnessDisplayLabel("turn", "codex-native")).toBe("codex-native");
-    expect(harnessDisplayLabel(null, "codex-native")).toBe("codex-native");
+    expect(harnessDisplayLabel("codex")).toBe("codex");
+    expect(harnessDisplayLabel("claude-sdk")).toBe("claude-sdk");
+    expect(harnessDisplayLabel("auto")).toBe("auto");
+  });
+
+  it("shortens only a trailing suffix", () => {
+    expect(harnessDisplayLabel("native-brain")).toBe("native-brain");
   });
 
   it("returns null when the decision has no harness", () => {
-    expect(harnessDisplayLabel("native_subagent", null)).toBeNull();
-    expect(harnessDisplayLabel("turn", "  ")).toBeNull();
+    expect(harnessDisplayLabel(null)).toBeNull();
+    expect(harnessDisplayLabel(undefined)).toBeNull();
+    expect(harnessDisplayLabel("  ")).toBeNull();
   });
 });

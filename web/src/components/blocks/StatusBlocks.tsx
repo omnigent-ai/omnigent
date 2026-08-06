@@ -180,7 +180,7 @@ export function RoutingDecisionCard({
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
   const scopeLabel = subagentScopeLabel(scope, agent);
-  const harnessLabel = harnessDisplayLabel(scope, harness);
+  const harnessLabel = harnessDisplayLabel(harness);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
     () =>
