@@ -83,6 +83,9 @@ class McpSchemasResult:
     schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
+    # Display name → InitializeResult.instructions from each healthy server
+    # (omnigent-ai/omnigent#4038). Empty when no server returned instructions.
+    server_instructions: dict[str, str] = field(default_factory=dict)
 
 
 def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
@@ -348,7 +351,9 @@ class RunnerMcpManager:
         """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
         configs = list(spec.mcp_servers or [])
         if not configs:
-            return McpSchemasResult(schemas=[], tool_names=set(), failures={})
+            return McpSchemasResult(
+                schemas=[], tool_names=set(), failures={}, server_instructions={}
+            )
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
         async with self._lock:
             entry = self._ensure_entry(spec_hash, configs)
@@ -372,6 +377,7 @@ class RunnerMcpManager:
             schemas: list[_JsonObject] = []
             tool_names: set[str] = set()
             failures: dict[str, str] = {}
+            server_instructions: dict[str, str] = {}
             for ref in refs:
                 server = ref.entry
                 if server.error is not None:
@@ -386,7 +392,16 @@ class RunnerMcpManager:
                     schema_name = schema["name"]
                     if isinstance(schema_name, str):
                         tool_names.add(schema_name)
-            return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
+                conn = server.connection
+                if conn is not None and conn.initialize_instructions:
+                    display = conn.server_info_name or ref.config.name
+                    server_instructions[display] = conn.initialize_instructions
+            return McpSchemasResult(
+                schemas=schemas,
+                tool_names=tool_names,
+                failures=failures,
+                server_instructions=server_instructions,
+            )
         finally:
             async with self._lock:
                 for ref in refs:

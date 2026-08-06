@@ -443,6 +443,11 @@ class McpServerConnection:
         default=None, init=False, repr=False
     )
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
+    # Captured from InitializeResult after session.initialize(); used by the
+    # runner to append MCP server routing guidance into the system prompt
+    # (omnigent-ai/omnigent#4038). Cleared on close/reconnect.
+    _initialize_instructions: str | None = field(default=None, init=False, repr=False)
+    _server_info_name: str | None = field(default=None, init=False, repr=False)
     _breaker: _CircuitBreaker = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -453,6 +458,16 @@ class McpServerConnection:
             failure_threshold=_CIRCUIT_BREAKER_THRESHOLD,
             cooldown_seconds=_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
         )
+
+    @property
+    def initialize_instructions(self) -> str | None:
+        """Non-empty ``InitializeResult.instructions`` from the last connect, if any."""
+        return self._initialize_instructions
+
+    @property
+    def server_info_name(self) -> str | None:
+        """``InitializeResult.serverInfo.name`` from the last connect, if any."""
+        return self._server_info_name
 
     async def connect(self) -> list[McpToolDef]:
         """
@@ -727,7 +742,8 @@ class McpServerConnection:
                     ),
                 )
                 await stack.enter_async_context(session)
-                await session.initialize()
+                init_result = await session.initialize()
+                self._capture_initialize_result(init_result)
                 self._session = session
                 discovered = await self._discover_or_use_cache()
                 ready.set_result(discovered)
@@ -754,6 +770,39 @@ class McpServerConnection:
             )
         finally:
             self._session = None
+            self._initialize_instructions = None
+            self._server_info_name = None
+
+    def _capture_initialize_result(self, init_result: object) -> None:
+        """Persist ``instructions`` / ``serverInfo.name`` from an initialize result.
+
+        Tolerates both attribute access (MCP SDK pydantic models) and
+        mapping-shaped mocks used in unit tests. Empty / whitespace-only
+        instructions are stored as ``None``.
+
+        :param init_result: Value returned by ``ClientSession.initialize()``.
+        """
+        instructions: object | None
+        if isinstance(init_result, dict):
+            instructions = init_result.get("instructions")
+            server_info = init_result.get("serverInfo") or init_result.get("server_info")
+        else:
+            instructions = getattr(init_result, "instructions", None)
+            server_info = getattr(init_result, "serverInfo", None)
+            if server_info is None:
+                server_info = getattr(init_result, "server_info", None)
+
+        if isinstance(instructions, str) and instructions.strip():
+            self._initialize_instructions = instructions.strip()
+        else:
+            self._initialize_instructions = None
+
+        name: object | None = None
+        if isinstance(server_info, dict):
+            name = server_info.get("name")
+        elif server_info is not None:
+            name = getattr(server_info, "name", None)
+        self._server_info_name = name.strip() if isinstance(name, str) and name.strip() else None
 
     async def _discover_or_use_cache(
         self,
