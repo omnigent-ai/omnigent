@@ -19,6 +19,7 @@ from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
     AUTO_HARNESS_LABEL_KEY,
     PLAIN_SESSION,
+    ROUTING_DECISION_LABEL_KEY,
     SessionRoutingClass,
     SubagentRouteDecision,
     SubagentRouteRequest,
@@ -1118,20 +1119,25 @@ def test_subagent_routing_enabled_is_two_state(override: str | None, expected: b
         (None, None, {}, SessionRoutingClass()),
         ("off", "codex-native", {}, SessionRoutingClass()),
         # Pinned: Smart Routing as the model, codex chosen as the harness.
-        ("on", "codex-native", {}, SessionRoutingClass(routing_enabled=True)),
+        (
+            "on",
+            "codex-native",
+            {},
+            SessionRoutingClass(routing_enabled=True, turn_routing=True),
+        ),
         # Auto-harness, before first-message routing replaces the sentinel.
         (
             "on",
             "auto",
             {},
-            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
         ),
         # …and after: the sentinel is gone, the durable label is not.
         (
             "on",
             "codex-native",
             {AUTO_HARNESS_LABEL_KEY: "1"},
-            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
         ),
         # An auto-harness session is a Smart Routing session by construction,
         # so the label alone implies routing is on.
@@ -1139,7 +1145,27 @@ def test_subagent_routing_enabled_is_two_state(override: str | None, expected: b
             None,
             None,
             {AUTO_HARNESS_LABEL_KEY: "1"},
-            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
+        ),
+        # Already routed — a web create pinned the model before the pane
+        # launched. The session keeps every other routing affordance; only the
+        # first-message hook is dropped, since it could only say "already
+        # routed" once per prompt.
+        (
+            "on",
+            "claude-native",
+            {ROUTING_DECISION_LABEL_KEY: "rd_1"},
+            SessionRoutingClass(routing_enabled=True),
+        ),
+        # Routing off plus a stale decision label is still plain.
+        ("off", "claude-native", {ROUTING_DECISION_LABEL_KEY: "rd_1"}, SessionRoutingClass()),
+        # An auto session the create could not route keeps its hook: the first
+        # message is its retry.
+        (
+            "on",
+            "auto",
+            {AUTO_HARNESS_LABEL_KEY: "1"},
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
         ),
     ],
 )

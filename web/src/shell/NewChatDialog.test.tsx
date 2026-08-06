@@ -3316,6 +3316,53 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  // The prompt rides along on a PINNED native create too, so the server routes
+  // the model before the pane launches. Routing after the fact means holding
+  // the first prompt inside the harness and replaying it, which the user sees
+  // as their own message vanishing for seconds.
+  it.each([
+    ["Claude Code", "a1"],
+    ["Codex", "a2"],
+  ] as const)("sends the routing message on a pinned %s create", async (_label, agentId) => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pinned_routed" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentConfig(agentId);
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+
+    const { body } = await submitAndReadBody("refactor the auth module");
+    expect(body.agent_id).toBe(agentId);
+    expect(body.cost_control_mode_override).toBe("on");
+    // Routes only — the real message is still delivered after navigation.
+    expect(body.smart_routing_message).toBe("refactor the auth module");
+    // The harness is the user's own pick — the bound wrapper agent names it —
+    // so only the model is routed, and nothing pins one.
+    expect(body.harness_override).not.toBe("auto");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("sends no routing message on a pinned harness with routing off", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pinned_plain" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const { body } = await submitAndReadBody("refactor the auth module");
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+  });
+
   // Sticky Smart Routing: the pick is remembered per harness in the same
   // localStorage store as the mode/model/effort knobs, so a returning user's
   // next session on that harness starts routed.
@@ -4444,6 +4491,9 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       expect(body.reasoning_effort).toBeUndefined();
       expect(body.labels).toBeUndefined();
       expect(body.terminal_launch_args).toBeUndefined();
+      // A bundle agent arms at create and routes on the first message event —
+      // its harness isn't decided yet, so there is nothing to route here.
+      expect(body.smart_routing_message).toBeUndefined();
       expect(raw).not.toContain("permission");
     },
   );

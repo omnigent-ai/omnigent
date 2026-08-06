@@ -229,10 +229,18 @@ class SessionRoutingClass:
         model.
     :param auto_harness: The session also let Smart Routing pick the
         harness, so the router may move its spawns across families.
+    :param turn_routing: The session still needs the ``UserPromptSubmit``
+        first-message routing hook. False once something has already routed
+        the session — a web create that routed the model before the pane
+        launched, or an earlier turn — because the hook's only remaining
+        answer is "already routed", paid for with a round trip per prompt.
+        Independent of ``routing_enabled``: a routed session keeps the
+        extended catalog and its spawn routing.
     """
 
     routing_enabled: bool = False
     auto_harness: bool = False
+    turn_routing: bool = False
 
 
 #: The class a session with no recorded routing state is treated as. Read by
@@ -255,7 +263,8 @@ def routing_class_from_snapshot(
     :param harness_override: ``harness_override``; the ``"auto"`` sentinel
         marks auto-harness until first-message routing replaces it.
     :param labels: Conversation labels, which carry the durable
-        :data:`AUTO_HARNESS_LABEL_KEY` record.
+        :data:`AUTO_HARNESS_LABEL_KEY` record and the
+        :data:`ROUTING_DECISION_LABEL_KEY` a completed route stamps.
     :returns: The session's class.
     """
     auto = harness_override == "auto" or (
@@ -264,9 +273,16 @@ def routing_class_from_snapshot(
     # An auto-harness session is a Smart Routing session by construction, so
     # the label implies routing is on even for a row whose cost-control field
     # was never stamped.
+    routes = routing_enabled(cost_control_mode) or auto
+    # The same label the turn hook reads as its "route once" gate: when it is
+    # already there the hook can only ever answer "already routed", so the
+    # launch omits it instead of registering a per-prompt round trip. A create
+    # whose routing failed stamps nothing, and keeps the hook as its retry.
+    already_routed = bool(labels is not None and labels.get(ROUTING_DECISION_LABEL_KEY))
     return SessionRoutingClass(
-        routing_enabled=routing_enabled(cost_control_mode) or auto,
+        routing_enabled=routes,
         auto_harness=auto,
+        turn_routing=routes and not already_routed,
     )
 
 

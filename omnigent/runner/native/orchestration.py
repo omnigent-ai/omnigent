@@ -421,6 +421,10 @@ class _CodexNativeLaunchConfig:
         turn may need; and the spawn-routing endpoint, whose advertisement
         gates the generated ``spawn_agent`` hook and the routed-spawn tool
         pre-approvals a routed spawn cannot run without.
+    :param turn_routing: ``True`` when the first-message turn-routing endpoint
+        still has work to do. False on a session something already routed —
+        a web create that pinned the model before the pane launched — so the
+        ``UserPromptSubmit`` hook is never registered and no prompt is held.
     """
 
     workspace: Path
@@ -434,6 +438,7 @@ class _CodexNativeLaunchConfig:
     bypass_sandbox: bool
     auto_harness: bool = False
     routing_enabled: bool = False
+    turn_routing: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -563,23 +568,25 @@ def _start_turn_router_for_native_session(
     bridge_dir: Path,
     harness: str,
     server_client: httpx.AsyncClient | None,
-    routing_enabled: bool,
+    turn_routing: bool,
 ) -> TurnRouter | None:
     """Start the first-message turn-routing endpoint for a native session.
 
-    Installed only for a session that launched with Smart Routing on. The
-    advertisement it writes is also the switch the harness launch reads to
+    Installed only for a session whose first prompt still has to be routed.
+    The advertisement it writes is also the switch the harness launch reads to
     decide whether to register the ``UserPromptSubmit`` routing hook at all,
-    so an unrouted session's prompts never pay the round trip.
+    so a session that will never route pays no round trip — neither one with
+    routing off, nor one a web create already routed before the pane launched.
 
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Session bridge directory the hook discovers.
     :param harness: Harness the endpoint is being installed for.
     :param server_client: Runner→server client the relay forwards on, and
         the replay delivers through.
-    :param routing_enabled: The session's launch-time Smart Routing state.
-    :returns: The router handle, or ``None`` when routing is off for this
-        session or the endpoint could not start.
+    :param turn_routing: Whether this session still needs first-message
+        routing (:class:`~omnigent.runner.subagent_routing.SessionRoutingClass`).
+    :returns: The router handle, or ``None`` when nothing is left to route
+        for this session or the endpoint could not start.
     """
     from omnigent.runner.turn_routing import ensure_session_turn_router
 
@@ -588,7 +595,7 @@ def _start_turn_router_for_native_session(
         bridge_dir=bridge_dir,
         server_client=server_client,
         harness=harness,
-        routing_enabled=routing_enabled,
+        routing_enabled=turn_routing,
     )
 
 
@@ -1013,6 +1020,7 @@ async def _codex_native_launch_config(
         bypass_sandbox=bypass_sandbox,
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
+        turn_routing=routing_class.turn_routing,
     )
 
 
@@ -3999,7 +4007,7 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         harness="codex-native",
         server_client=server_client,
-        routing_enabled=launch_config.routing_enabled,
+        turn_routing=launch_config.turn_routing,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
@@ -5759,6 +5767,10 @@ class _ClaudeSessionLaunchMetadata:
     #: sessions get the routed-spawn system-prompt note and tool pre-approval;
     #: a pinned session's argv stays byte-identical.
     auto_harness: bool = False
+    #: The first-message routing hook still has work to do. False once the
+    #: session carries a routing decision — a web create routes the model
+    #: before the pane launches — so no prompt is ever held and replayed.
+    turn_routing: bool = False
 
 
 def _claude_launch_metadata_from_envelope(
@@ -5781,6 +5793,7 @@ def _claude_launch_metadata_from_envelope(
     return _ClaudeSessionLaunchMetadata(
         routing_enabled=routing_class.routing_enabled,
         auto_harness=routing_class.auto_harness,
+        turn_routing=routing_class.turn_routing,
         reasoning_effort=snapshot.reasoning_effort,
         model_override=snapshot.model_override,
         terminal_launch_args=snapshot.terminal_launch_args,
@@ -5835,6 +5848,7 @@ async def _load_legacy_claude_launch_metadata(
     metadata = _ClaudeSessionLaunchMetadata(
         routing_enabled=routing_class.routing_enabled,
         auto_harness=routing_class.auto_harness,
+        turn_routing=routing_class.turn_routing,
         reasoning_effort=effort if isinstance(effort, str) and effort else None,
         model_override=(
             model_override if isinstance(model_override, str) and model_override else None
@@ -6363,7 +6377,7 @@ async def _auto_create_claude_terminal(
         bridge_dir=bridge_dir,
         harness="claude-native",
         server_client=server_client,
-        routing_enabled=launch_metadata.routing_enabled,
+        turn_routing=launch_metadata.turn_routing,
     )
     # Crash recovery for a blocked-but-never-replayed prompt is not wired here:
     # the pending record on disk is the seam if it ever is, and the recovery's

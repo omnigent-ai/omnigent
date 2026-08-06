@@ -3317,6 +3317,16 @@ export function NewChatLandingScreen() {
       // sending both would silently disable routing for the whole session. Never
       // pin a model or an effort alongside routing, whatever the UI state says.
       const routingOwnsModel = costControlOverride === "on";
+      // A pinned native pane routes its MODEL at create too: the terminal
+      // launches with the session row and its turns start in the TUI, so
+      // routing after the fact means blocking the first prompt and replaying
+      // it. Sending the prompt here pins `model_override` before the pane
+      // exists. Bundle agents are excluded — they route on the first message
+      // event by design.
+      const pinnedNativeRoutes =
+        routingOwnsModel &&
+        !smartRoutingHarnessSelected &&
+        SMART_ROUTING_ARMS.some((harness) => harness === nativeAgent?.harness);
 
       // Prepend each "@"-tagged path as an attachment marker on its own line —
       // the same wording the native executors emit and that title-seeding
@@ -3481,7 +3491,8 @@ export function NewChatLandingScreen() {
             harness_override: smartRoutingHarnessSelected
               ? AUTO_HARNESS_ID
               : (pickedHarness ?? undefined),
-            smart_routing_message: smartRoutingHarnessSelected ? initialPrompt : undefined,
+            smart_routing_message:
+              smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
           }),
         });
         // The create doesn't answer until the host has spawned a runner — a

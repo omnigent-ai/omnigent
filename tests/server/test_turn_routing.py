@@ -1891,3 +1891,87 @@ def test_the_claude_sdk_spawn_hook_is_registered_outside_its_own_request() -> No
     assert "timeout=subagent_router.HOOK_TIMEOUT_S" in source
     assert "timeout=subagent_router.REQUEST_TIMEOUT_S" not in source
     assert HOOK_TIMEOUT_S > REQUEST_TIMEOUT_S
+
+
+# ── Hook omission for an already-routed session ─────────────────────────
+#
+# A web create routes a pinned native pane's model before the terminal exists,
+# and stamps the routing-decision label. Registering the ``UserPromptSubmit``
+# hook on top of that buys nothing — its only answer is "already routed" — and
+# costs a held prompt plus a round trip. The advertisement is the switch, so
+# not starting the router is what leaves the hook out of the payload.
+
+
+def _hook_settings_after_launch(
+    tmp_path: Path,
+    *,
+    harness: str,
+    labels: dict[str, str],
+    session_id: str,
+) -> dict[str, Any]:
+    """Generate a native launch's hook settings for one session snapshot."""
+    from omnigent.codex_native_app_server import (
+        _codex_policy_hooks_settings,
+        _turn_router_advertised,
+    )
+    from omnigent.runner.native.orchestration import _start_turn_router_for_native_session
+    from omnigent.runner.subagent_routing import routing_class_from_snapshot
+
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode="on", harness_override=harness, labels=labels
+    )
+    router = _start_turn_router_for_native_session(
+        session_id,
+        bridge_dir=tmp_path,
+        harness=harness,
+        server_client=_FakeServerClient(),
+        turn_routing=routing_class.turn_routing,
+    )
+    try:
+        if harness == "codex-native":
+            return _codex_policy_hooks_settings(
+                tmp_path, "/venv/bin/python", turn_routing=_turn_router_advertised(tmp_path)
+            )
+        from omnigent.claude_native_bridge import build_hook_settings
+
+        return build_hook_settings(tmp_path, turn_routing=router is not None)
+    finally:
+        shutdown_session_turn_router(session_id, router)
+
+
+def _prompt_submit_commands(settings: dict[str, Any]) -> list[str]:
+    """Every ``UserPromptSubmit`` command in a generated hook payload."""
+    return [
+        hook.get("command", "")
+        for entry in settings["hooks"].get("UserPromptSubmit", [])
+        for hook in entry.get("hooks", [])
+    ]
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_a_create_routed_session_launches_without_the_turn_hook(
+    tmp_path: Path, harness: str
+) -> None:
+    from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
+
+    settings = _hook_settings_after_launch(
+        tmp_path,
+        harness=harness,
+        labels={ROUTING_DECISION_LABEL_KEY: "decision-1"},
+        session_id=f"conv_routed_{harness}",
+    )
+    assert not any("route-turn" in command for command in _prompt_submit_commands(settings))
+    assert not (tmp_path / ADVERTISEMENT_FILE).exists()
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_a_declined_create_route_keeps_the_turn_hook(tmp_path: Path, harness: str) -> None:
+    # Fail-open: the create emitted a declined chip and pinned nothing, so no
+    # decision label. The first message is this session's second chance.
+    settings = _hook_settings_after_launch(
+        tmp_path,
+        harness=harness,
+        labels={},
+        session_id=f"conv_declined_{harness}",
+    )
+    assert any("route-turn" in command for command in _prompt_submit_commands(settings))
