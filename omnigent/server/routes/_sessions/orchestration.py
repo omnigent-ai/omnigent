@@ -4525,23 +4525,29 @@ async def _forward_event_to_runner(
                     route_session_harness,
                 )
 
-                # A child may only leave its parent's harness family when the
-                # parent is in Smart Routing (auto) harness mode; otherwise the
-                # candidate set is the parent's family, so a codex session's
-                # children stay on codex. Same family rule the native-subagent
-                # hook path applies to in-harness spawns.
-                _child_family = (
-                    None
-                    if auto_harness_session(conv, _parent_conv)
-                    else harness_family(_resolve_harness(_parent_conv))
-                )
-                # Which families the pick may land on decides whose gateway
+                # Confine the pick to the harness this CHILD runs. A child that
+                # reaches here has one: either its sub-agent spec declares it
+                # (a named worker like polly's ``pi``) or the spawn pinned it —
+                # an unpinned child of a Smart Routing parent carries the
+                # "auto" sentinel and was resolved by the auto block above.
+                # Read off the PARENT before, which offered a pi worker the
+                # brain's claude family and a claude worker the codex family;
+                # under an auto parent it dropped the restriction entirely, so
+                # a pi child could be handed a codex verdict it then ran pi on.
+                _child_harness = _resolve_harness(conv)
+                _child_pinned = _child_harness is not None and _child_harness != "auto"
+                _child_family = harness_family(_child_harness) if _child_pinned else None
+                # A single-harness candidate set is the honest offer for a
+                # pinned child: the family filter alone still admits the other
+                # harnesses in that family (a ``codex-native`` child would be
+                # offered SDK ``codex``), and it cannot narrow a harness whose
+                # family is unknown at all.
+                _child_candidates = (_child_harness,) if _child_pinned else None
+                # Which harnesses the pick may land on decides whose gateway
                 # backing must hold: a cross-harness child can go either way, a
-                # family-restricted one only where its parent already runs.
+                # pinned one only where it already runs.
                 _child_gateway_harnesses = (
-                    AUTO_NATIVE_ROUTING_HARNESSES
-                    if _child_family is None
-                    else (_resolve_harness(_parent_conv) or "",)
+                    (_child_harness or "",) if _child_pinned else AUTO_NATIVE_ROUTING_HARNESSES
                 )
                 _child_host = await _session_routing_host(conv, host_store)
                 if _child_host is None and _parent_conv is not None:
@@ -4557,6 +4563,7 @@ async def _forward_event_to_runner(
                     catalog_session_id=conv.parent_conversation_id,
                     runner_client=runner_client,
                     allowed_family=_child_family,
+                    harness_candidates=_child_candidates,
                     gateway_backed=_child_backed,
                     allow_static_fallback=_child_backed,
                 )
@@ -6786,6 +6793,40 @@ def _spec_routes_its_own_harness(
     return _validated_spec_smart_routing_harness(loaded.spec) is not None
 
 
+def _spawn_pins_its_harness(
+    body: SessionCreateRequest,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> bool:
+    """Whether this child create already names the harness the child runs on.
+
+    Two pins count, and both come from outside the router: an explicit
+    ``harness_override`` on the spawn, and a declared sub-agent whose spec
+    carries its own harness (polly's ``pi`` / ``claude_code`` workers). Either
+    way the child's CLI is decided before any message is routed, so handing the
+    router the whole multi-harness catalog can only produce a verdict the pane
+    will not honor.
+
+    :param body: The validated create request.
+    :param agent: The parent agent row whose bundle holds the sub-agent specs.
+    :param agent_cache: Cache for loading the parsed parent bundle. ``None``
+        cannot resolve a sub-agent spec, so only the explicit pin is seen.
+    :returns: ``True`` when the child's harness is already chosen.
+    """
+    if body.harness_override is not None:
+        return True
+    if not body.sub_agent_name:
+        return False
+    from omnigent.model_catalog import spec_harness
+
+    sub_spec = _resolve_subagent_spec(
+        agent=agent,
+        sub_agent_name=body.sub_agent_name,
+        agent_cache=agent_cache,
+    )
+    return sub_spec is not None and spec_harness(sub_spec) is not None
+
+
 async def _resolve_fixed_native_model_routing(
     body: SessionCreateRequest,
     request: Request,
@@ -7154,6 +7195,15 @@ async def _create_session_from_existing_agent(
     # child, so a codex session ends up with claude children. Those children
     # keep the harness they were created with and are routed in-family (see
     # the child-routing call in ``_forward_event_to_runner``).
+    #
+    # Nor is a spawn that NAMED its harness forced: a declared sub-agent
+    # (polly's ``pi``) and an explicit ``harness_override`` both pin the CLI the
+    # child boots on, which the sentinel does not move — it only re-decides the
+    # row. Forcing them handed the router the whole catalog for a pane already
+    # committed to one harness, so a ``pi`` worker could be stamped with an
+    # applied codex verdict while running pi, and a ``claude-native`` worker
+    # lost its terminal labels (skipped for forced-auto children below). Those
+    # children route in their own family instead.
     _force_auto_for_child = False
     _parent_for_routing: Conversation | None = None
     if body.parent_session_id is not None:
@@ -7164,6 +7214,7 @@ async def _create_session_from_existing_agent(
             _parent_for_routing is not None
             and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
             and auto_harness_session(_parent_for_routing)
+            and not await asyncio.to_thread(_spawn_pins_its_harness, body, agent, agent_cache)
         ):
             try:
                 await asyncio.to_thread(_validated_harness_override_executor_type, agent)

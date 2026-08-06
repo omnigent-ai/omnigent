@@ -2081,6 +2081,27 @@ async def route_session_harness(
         if result.harness
         else harness_for_model(chosen_model, harness_models, prefixes=prefixes)
     )
+    if chosen_harness is not None and chosen_harness not in harness_models:
+        # A harness this call never offered is not a verdict — it is a pick the
+        # caller cannot honor. A child confined to one harness would otherwise
+        # have another family's harness written to its row and stamped
+        # "applied" while its pane keeps running the harness it booted on.
+        # A verdict may still spell an offered harness as its WORKER name
+        # (``claude_code``), which is the same harness, not an escape.
+        from omnigent.harness_aliases import canonicalize_harness
+
+        _spelled = _WORKER_NAME_TO_HARNESS.get(chosen_harness) or canonicalize_harness(
+            chosen_harness
+        )
+        if _spelled in harness_models:
+            chosen_harness = _spelled
+        else:
+            _logger.info(
+                "smart_routing: dropping verdict harness=%s; offered=%s",
+                chosen_harness,
+                offered,
+            )
+            chosen_harness = None
     if chosen_harness is None and result.harness in harness_models:
         # Every offered harness bars the pick, and the family the caller allowed
         # is not negotiable — swap the model instead of the harness.
