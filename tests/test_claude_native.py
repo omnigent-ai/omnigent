@@ -8,6 +8,7 @@ import importlib.metadata
 import io
 import json
 import os
+import shlex
 import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -353,17 +354,21 @@ def test_ucode_config_pins_the_token_helper_to_the_named_profile(
     uses the ``kind: databricks`` provider's profile. Two profiles on one host
     are two identities, so host selection is how a pane and the router end up
     disagreeing about whether the workspace is reachable.
+
+    The preference is not exclusive: the recorded command survives as the
+    helper's last resort, for the config that names a credential-less profile.
     """
+    recorded = (
+        'databricks auth token --host "https://example.databricks.com" '
+        "--output json | jq -r '.access_token'"
+    )
     monkeypatch.setattr(
         "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
         lambda profile: "https://example.databricks.com",
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_state.read_ucode_state",
-        lambda workspace_url: _ucode_state_with_auth_command(
-            'databricks auth token --host "https://example.databricks.com" '
-            "--output json | jq -r '.access_token'"
-        ),
+        lambda workspace_url: _ucode_state_with_auth_command(recorded),
     )
 
     config = claude_native._ucode_config_for_profile("agent", refresh_models=False)
@@ -371,8 +376,11 @@ def test_ucode_config_pins_the_token_helper_to_the_named_profile(
     assert config is not None
     helper = config.api_key_helper
     assert helper is not None
+    # The mint selects by profile; the only --host left is the quoted fallback.
     assert '--profile "agent"' in helper
-    assert "--host" not in helper
+    mint, _, fallback = helper.partition("eval ")
+    assert "--host" not in mint
+    assert fallback.startswith(shlex.quote(recorded))
 
 
 def test_ucode_config_leaves_a_non_databricks_token_command_alone(

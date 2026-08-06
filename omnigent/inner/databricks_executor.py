@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
@@ -229,7 +230,11 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
     return None
 
 
-def databricks_bearer_token_command(host: str, profile: str | None = None) -> str:
+def databricks_bearer_token_command(
+    host: str,
+    profile: str | None = None,
+    fallback_command: str | None = None,
+) -> str:
     """Build the shell command a harness runs to mint a workspace bearer token.
 
     The one definition of the generated helper, so the claude and codex
@@ -254,16 +259,31 @@ def databricks_bearer_token_command(host: str, profile: str | None = None) -> st
     failure is still visible. ``--force-refresh`` only exists in Databricks CLI
     >= v0.296.0, so it stays behind the ``--help`` capability probe.
 
+    **Fallback command.** The named profile is the identity we *want*, but the
+    user may have authenticated under a different profile on the same host — a
+    config naming a credential-less profile would otherwise 401 every turn.
+    When the caller knows a token command that already worked (the one ucode
+    recorded, say), it runs last, once the named profile has yielded nothing.
+
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``, or
         ``None`` to select the workspace by host.
+    :param fallback_command: Shell command printing a bearer token on stdout,
+        run only when the profile above yields an empty token.
     :returns: Shell command that prints a bearer token on stdout.
     """
     selector = (
         f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
     )
     mint = f"env -u DATABRICKS_CONFIG_PROFILE databricks auth token {selector}"
+    fallback = (
+        # ``eval`` on a quoted string: the recorded command is opaque shell,
+        # and inlining it bare would let its own quoting reshape this script.
+        f'if [ -z "$token" ]; then token=$(eval {shlex.quote(fallback_command)}); fi; '
+        if fallback_command
+        else ""
+    )
     return (
         # An injected bearer wins: the runner already resolved one.
         'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
@@ -276,6 +296,7 @@ def databricks_bearer_token_command(host: str, profile: str | None = None) -> st
         'if [ -z "$token" ]; then '
         f"token=$({mint} --output json | jq -r '.access_token // empty'); "
         "fi; "
+        f"{fallback}"
         'printf "%s\\n" "$token"; fi'
     )
 

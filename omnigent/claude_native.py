@@ -1975,6 +1975,11 @@ def _profile_pinned_auth_command(
     the workspace is reachable. The named profile is the authority, so the
     helper is regenerated against it.
 
+    Preference, not exclusion: the named profile may itself hold no usable
+    credential (the config names ``DEFAULT`` while the user authenticated under
+    another profile), so ucode's recorded command stays in the helper as the
+    last resort. Without it the pane 401s on the first turn.
+
     Only the recognizable ``databricks auth token`` shape is rewritten — an
     enterprise deployment can configure a wholly different token command, and
     this has no business guessing at its selector.
@@ -1987,16 +1992,17 @@ def _profile_pinned_auth_command(
     """
     if "databricks auth token" not in auth_command:
         return auth_command
-    from omnigent.inner.claude_sdk_executor import _databricks_claude_auth_command
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
 
-    pinned = _databricks_claude_auth_command(workspace_url, profile)
-    if pinned != auth_command:
-        _logger.info(
-            "native-claude: pinning the token helper to Databricks profile %r "
-            "(ucode's recorded command selects the workspace its own way)",
-            profile,
-        )
-    return pinned
+    pinned = databricks_bearer_token_command(workspace_url, profile)
+    if pinned == auth_command:
+        return auth_command
+    _logger.info(
+        "native-claude: pinning the token helper to Databricks profile %r "
+        "(ucode's recorded command selects the workspace its own way)",
+        profile,
+    )
+    return databricks_bearer_token_command(workspace_url, profile, fallback_command=auth_command)
 
 
 def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
