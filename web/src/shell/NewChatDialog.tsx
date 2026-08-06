@@ -2347,6 +2347,59 @@ export function NewChatLandingScreen() {
     [homeListing, homeListingIsPlaceholder],
   );
 
+  // Fill the branch field with a unique auto-generated name so the user can
+  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
+  // available in every browser the app targets; the short prefix keeps the
+  // dir/branch readable (worktree-1a2b3c4d).
+  const generateBranchName = useCallback(() => {
+    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    setBranchName(`worktree-${suffix}`);
+  }, []);
+  // The project's stored default base branch (Project settings), trimmed. Wins
+  // over the user-global default (Settings › Git); an unset project default
+  // falls through to the global one, then to blank (fork from current branch).
+  const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
+
+  // The path the once-per-host auto-seed WOULD land on: the most-recent path,
+  // else the derived home. Exposed as a memo so we can probe its repo for
+  // worktrees before committing to it (see the fork-fresh redirect below).
+  const autoSeedCandidate = useMemo(() => recent[0] ?? derivedHome ?? null, [recent, derivedHome]);
+  // "Fork fresh from default": when the project defines a default base branch,
+  // a fresh new-chat must NOT silently continue in the last-used worktree — it
+  // should fork a new branch off that default. The auto-seed can land on a
+  // linked worktree (a recent path that happens to be one), which prefills its
+  // branch and suppresses the base-branch fill. So when a default is set, probe
+  // the seed candidate's repo and redirect the seed to the MAIN work tree. Only
+  // armed until the host is seeded (the once-per-host guard), and skipped for
+  // sandboxes (no host worktrees).
+  const forkFreshArmed =
+    prefillSettled &&
+    selectedHostId !== null &&
+    !sandboxSelected &&
+    projectBaseBranch !== null &&
+    seededHostRef.current !== selectedHostId &&
+    autoSeedCandidate !== null;
+  const { data: seedWorktrees, isPlaceholderData: seedWorktreesArePlaceholder } = useHostWorktrees(
+    forkFreshArmed ? selectedHostId : null,
+    forkFreshArmed ? autoSeedCandidate : null,
+  );
+  // Resolve the fork-fresh redirect to a STABLE value so the seed effect can
+  // depend on the decision, not the worktree array (whose identity churns every
+  // render). `undefined` = probe still loading (wait); `null` = not armed or no
+  // redirect (seed the candidate as-is); a string = the MAIN repo path to
+  // redirect the seed to (the candidate is a linked worktree we should fork off
+  // the project default instead of reusing).
+  const forkFreshMainPath = useMemo<string | null | undefined>(() => {
+    if (!forkFreshArmed) return null;
+    if (seedWorktreesArePlaceholder || seedWorktrees === undefined) return undefined;
+    const norm = normalizeWorkspacePath(autoSeedCandidate);
+    const candIsLinkedWorktree = seedWorktrees.some(
+      (w) => !w.is_main && normalizeWorkspacePath(w.path) === norm,
+    );
+    const mainPath = seedWorktrees.find((w) => w.is_main)?.path ?? null;
+    return candIsLinkedWorktree && mainPath !== null ? mainPath : null;
+  }, [forkFreshArmed, seedWorktrees, seedWorktreesArePlaceholder, autoSeedCandidate]);
+
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the
   // derived home (which can arrive a render later, hence the dep). Holds
@@ -2355,11 +2408,22 @@ export function NewChatLandingScreen() {
     if (!prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
-    const candidate = recent[0] ?? derivedHome;
-    if (!candidate) return;
+    if (autoSeedCandidate === null) return;
+    // Fork-fresh redirect pending: wait for the probe rather than seeding the
+    // wrong path (and locking the once-per-host guard).
+    if (forkFreshMainPath === undefined) return;
+
+    const didForkFresh = forkFreshMainPath !== null;
+    const candidate = didForkFresh ? forkFreshMainPath : autoSeedCandidate;
     seededHostRef.current = selectedHostId;
     setWorkspace((cur) => (cur === "" ? candidate : cur));
-  }, [selectedHostId, recent, derivedHome, prefillSettled]);
+    if (didForkFresh) {
+      // Preempt the opt-in-worktree effect so it can't also seed a branch, then
+      // name one here to fork fresh off the project default.
+      worktreeSeededForRef.current = normalizeWorkspacePath(candidate);
+      generateBranchName();
+    }
+  }, [selectedHostId, autoSeedCandidate, prefillSettled, forkFreshMainPath, generateBranchName]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -2856,7 +2920,6 @@ export function NewChatLandingScreen() {
   // current default. The project's stored default (Project settings) wins over
   // the user-global one (Settings › Git); an unset project default falls
   // through to the global one, then to blank (fork from current branch).
-  const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
   useEffect(() => {
     if (!shouldCreateWorktree) {
       // No base field shown: reset so the next named branch re-seeds cleanly.
@@ -2880,14 +2943,6 @@ export function NewChatLandingScreen() {
       (w) => (w.branch ?? "").toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
     );
   }, [linkedWorktrees, branchName]);
-  // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
-  const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-    setBranchName(`worktree-${suffix}`);
-  }, []);
   // Project prefill: seed host / workspace / agent from the project's stored
   // config, then settle so the generic defaults fill any slot the config left
   // unset. An opt-in worktree is generated by the dedicated effect below once
