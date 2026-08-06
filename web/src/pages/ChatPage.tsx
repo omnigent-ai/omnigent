@@ -3499,7 +3499,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       {text && (
         <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-            {isCopied ? <CheckIcon size={12} /> : <CopyIcon size={12} />}
+            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
           </MessageAction>
         </MessageActions>
       )}
@@ -3580,7 +3580,7 @@ function AssistantBubble({
         {markdownText && (
           <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-              {isCopied ? <CheckIcon size={12} /> : <CopyIcon size={12} />}
+              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
             {/* Fork from this response: clone the session with history
                 truncated after this turn. Hidden while the response is
@@ -3593,7 +3593,7 @@ function AssistantBubble({
                 data-testid="fork-from-response"
                 onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
               >
-                <GitForkIcon size={12} />
+                <GitForkIcon size={14} />
               </MessageAction>
             )}
           </MessageActions>

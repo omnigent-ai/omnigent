@@ -396,3 +396,14 @@ describe("index.css mobile sidebar opacity", () => {
     expect(mobileRule).toContain(".dark[data-theme] .conversations-sidebar");
   });
 });
+
+describe("index.css text selection colors", () => {
+  const selectionRule = cssSource.match(/::selection\s*\{([^}]*)\}/)?.[1];
+
+  it("matches the active sidebar item in every color mode", () => {
+    expect(selectionRule).toContain("background: var(--sidebar-active)");
+    expect(selectionRule).toContain("color: var(--sidebar-active-foreground)");
+    expect(selectionRule).not.toContain("--brand-accent");
+    expect(cssSource).not.toContain(".dark ::selection");
+  });
+});

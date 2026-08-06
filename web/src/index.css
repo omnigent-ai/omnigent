@@ -874,16 +874,11 @@ html:not(.dark) .conversations-sidebar {
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection tracks the palette's brand accent so it stays cohesive
-   * across themes (pink on Omni, blue on GitHub, coral on Claude, …). Light:
-   * gentle accent wash + accent-colored text. Dark: solid accent + white. */
+  /* Text selection mirrors the sidebar's active-item treatment in every
+   * palette and color mode. */
   ::selection {
-    background: color-mix(in srgb, var(--brand-accent) 22%, transparent);
-    color: var(--brand-accent);
-  }
-  .dark ::selection {
-    background: var(--brand-accent);
-    color: #ffffff;
+    background: var(--sidebar-active);
+    color: var(--sidebar-active-foreground);
   }
 }
 

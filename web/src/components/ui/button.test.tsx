@@ -83,7 +83,7 @@ describe("buttonVariants icon geometry", () => {
     expect(classes).toContain("button-standard-icons");
   });
 
-  it("makes icon-xxs a transparent 14px container with a 12px glyph", () => {
+  it("makes icon-xxs a transparent 14px container with a 14px glyph", () => {
     render(
       <Button variant="ghost" size="icon-xxs" aria-label="Tiny icon">
         <svg aria-hidden />
@@ -95,7 +95,7 @@ describe("buttonVariants icon geometry", () => {
       "bg-transparent",
       "hover:bg-transparent",
       "dark:hover:bg-transparent",
-      "[&_svg]:size-3!",
+      "[&_svg]:size-3.5!",
       "[&_svg]:p-0!",
     );
   });

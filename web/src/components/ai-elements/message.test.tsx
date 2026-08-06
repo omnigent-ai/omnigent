@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MessageAction, MessageContent, MessageResponse } from "./message";
+import { MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -44,6 +44,14 @@ describe("MessageAction", () => {
       "text-muted-foreground",
       "hover:text-foreground",
     );
+  });
+});
+
+describe("MessageActions", () => {
+  it("uses 12px spacing between actions", () => {
+    render(<MessageActions data-testid="message-actions">Actions</MessageActions>);
+
+    expect(screen.getByTestId("message-actions")).toHaveClass("gap-3");
   });
 });
 
