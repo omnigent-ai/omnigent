@@ -1378,35 +1378,17 @@ function SearchableModelPicker({
   onValueChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
   const selectedLabel =
     value === MODEL_SELECT_DEFAULT
       ? "Default"
       : (options.find((option) => option.id === value)?.displayName ?? value);
-  const keywords = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
-  const filteredOptions =
-    keywords.length === 0
-      ? options
-      : options.filter((option) => {
-          const haystack = `${option.displayName} ${option.id}`.toLocaleLowerCase();
-          return keywords.every((keyword) => haystack.includes(keyword));
-        });
   const select = (nextValue: string) => {
     onValueChange(nextValue);
     setOpen(false);
-    setQuery("");
   };
 
   return (
-    <Popover
-      open={open}
-      onOpenChange={(nextOpen) => {
-        setOpen(nextOpen);
-        if (!nextOpen) {
-          setQuery("");
-        }
-      }}
-    >
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
           type="button"
@@ -1425,10 +1407,8 @@ function SearchableModelPicker({
         align="start"
         className="max-h-[var(--radix-popover-content-available-height)] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0"
       >
-        <Command shouldFilter={false} className="h-auto min-h-0">
+        <Command className="h-auto min-h-0">
           <CommandInput
-            value={query}
-            onValueChange={setQuery}
             placeholder="Search models…"
             data-testid="new-chat-landing-config-model-search"
           />
@@ -1443,10 +1423,11 @@ function SearchableModelPicker({
             >
               Default
             </CommandItem>
-            {filteredOptions.map((option) => (
+            {options.map((option) => (
               <CommandItem
                 key={option.id}
                 value={option.id}
+                keywords={[option.displayName]}
                 title={option.displayName}
                 data-model-id={option.id}
                 data-checked={value === option.id}
@@ -1455,9 +1436,7 @@ function SearchableModelPicker({
                 <span className="min-w-0 truncate">{option.displayName}</span>
               </CommandItem>
             ))}
-            {!loading && filteredOptions.length === 0 && (
-              <CommandEmpty>No models found</CommandEmpty>
-            )}
+            {!loading && <CommandEmpty>No models found</CommandEmpty>}
             {loading && (
               <div className="px-2 py-3 text-center text-xs text-muted-foreground">
                 Loading models…

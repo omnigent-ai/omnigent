@@ -1018,8 +1018,7 @@ async function postModelOptions(config, ctx) {
   for (const model of models) {
     const modelId = model && typeof model.id === "string" ? model.id : "";
     const id = modelReference(model);
-    if (!id) continue;
-    if (seen.has(id)) continue;
+    if (!id || seen.has(id)) continue;
     seen.add(id);
     const name =
       model && typeof model.name === "string" && model.name ? model.name : modelId;
