@@ -3,12 +3,13 @@
 // the new-chat composer pre-fill host / working directory / agent and the
 // isolated-worktree default when starting a session in the project.
 //
-// Scope mirrors what the composer prefills today: host, workspace, agent, and
-// whether new sessions start in a fresh git worktree. Model / reasoning-effort
-// / harness are per-agent run config, and the worktree BASE branch is a global
-// preference (Settings › Git) — both deliberately out of scope here. The host
-// and agent pickers reuse the composer's components; the working directory
-// reuses its filesystem browser (inline, so it scrolls inside the modal).
+// Scope mirrors what the composer prefills today: host, workspace, agent,
+// whether new sessions start in a fresh git worktree, and the base branch a
+// worktree forks from (which overrides the user-global default in Settings ›
+// Git). Model / reasoning-effort / harness are per-agent run config,
+// deliberately out of scope here. The host and agent pickers reuse the
+// composer's components; the working directory reuses its filesystem browser
+// (inline, so it scrolls inside the modal).
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
@@ -117,6 +118,10 @@ export function ProjectSettingsDialog({
   // stored (as use_worktree:true), which the composer honors by creating a
   // fresh worktree for new sessions in the project.
   const [useWorktree, setUseWorktree] = useState(false);
+  // Base branch a new worktree forks from; blank stores no default (falls
+  // through to the user-global default in Settings › Git). Only meaningful
+  // alongside the worktree default, but kept independent so it survives toggling.
+  const [baseBranch, setBaseBranch] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
 
@@ -161,6 +166,7 @@ export function ProjectSettingsDialog({
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
     setUseWorktree(c.use_worktree ?? false);
+    setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
@@ -185,6 +191,11 @@ export function ProjectSettingsDialog({
     // Worktrees are opt-in: only an explicit ON is stored (as use_worktree:true);
     // leaving it OFF stores nothing, so an all-default dialog still clears to {}.
     if (useWorktree) config.use_worktree = true;
+    // A base branch only forks a worktree, so it's only meaningful when the
+    // worktree default is on — drop it otherwise so it can't linger as a stale,
+    // invisible default after the toggle is turned off.
+    const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
+    if (base) config.base_branch = base;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -366,6 +377,24 @@ export function ProjectSettingsDialog({
               />
             </div>
           </Field>
+
+          {useWorktree && (
+            <Field
+              label="Base branch"
+              hint="Branch new worktrees fork from; blank uses the current branch"
+              htmlFor="project-settings-base-branch"
+            >
+              <input
+                id="project-settings-base-branch"
+                data-testid="project-settings-base-branch"
+                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                placeholder="e.g. main"
+                value={baseBranch}
+                onChange={(e) => setBaseBranch(e.target.value)}
+                disabled={isLoading}
+              />
+            </Field>
+          )}
 
           <Field label="Agent" hint="Default agent / harness for new sessions">
             <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">

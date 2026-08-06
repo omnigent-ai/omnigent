@@ -2849,11 +2849,14 @@ export function NewChatLandingScreen() {
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
-  // Auto-fill the base branch from the configured default (Settings › Git) when
-  // a new-worktree branch is named, but only until the user touches the base
-  // field — then their choice (including a cleared field) stands. Clearing the
-  // branch name (so the base field goes away) re-arms the auto-fill, so naming
-  // a branch again starts fresh from the current default.
+  // Auto-fill the base branch when a new-worktree branch is named, but only
+  // until the user touches the base field — then their choice (including a
+  // cleared field) stands. Clearing the branch name (so the base field goes
+  // away) re-arms the auto-fill, so naming a branch again starts fresh from the
+  // current default. The project's stored default (Project settings) wins over
+  // the user-global one (Settings › Git); an unset project default falls
+  // through to the global one, then to blank (fork from current branch).
+  const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
   useEffect(() => {
     if (!shouldCreateWorktree) {
       // No base field shown: reset so the next named branch re-seeds cleanly.
@@ -2862,9 +2865,9 @@ export function NewChatLandingScreen() {
       return;
     }
     if (!baseBranchEdited) {
-      _setBaseBranch(readDefaultBaseBranch() ?? "");
+      _setBaseBranch(projectBaseBranch ?? readDefaultBaseBranch() ?? "");
     }
-  }, [shouldCreateWorktree, baseBranchEdited]);
+  }, [shouldCreateWorktree, baseBranchEdited, projectBaseBranch]);
   // The branch input doubles as a combobox: focusing it reveals existing
   // worktrees, and what the user types filters them (match on branch or path
   // substring, case-insensitive). Typing a name that matches none = a new
