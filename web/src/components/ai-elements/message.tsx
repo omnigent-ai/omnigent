@@ -80,12 +80,19 @@ export const MessageAction = ({
   tooltip,
   children,
   label,
+  className,
   variant = "ghost",
   size = "icon-sm",
   ...props
 }: MessageActionProps) => {
   const button = (
-    <Button size={size} type="button" variant={variant} {...props}>
+    <Button
+      size={size}
+      type="button"
+      variant={variant}
+      className={cn("text-muted-foreground hover:text-foreground", className)}
+      {...props}
+    >
       {children}
       <span className="sr-only">{label || tooltip}</span>
     </Button>
