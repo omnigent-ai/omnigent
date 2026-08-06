@@ -879,6 +879,11 @@ def _bound_conv(
         # sub-agent (spawned by an already-live runner) still is not.
         ("default", "idle", None, False, True, True),
         ("sub_agent", "idle", None, False, True, False),
+        # A crash report never downgrades an interrupted turn: a mid-turn
+        # sub-agent is failed under either flag.
+        ("sub_agent", "waiting", None, False, True, True),
+        # An intentional teardown still wins over the crash-report flag.
+        ("default", "idle", None, True, True, False),
     ],
 )
 async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
