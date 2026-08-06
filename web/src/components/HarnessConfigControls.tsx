@@ -119,16 +119,24 @@ export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
-// The reasoning-effort levels the GitHub Copilot SDK accepts (its session
-// literal has no "max"; mirrors COPILOT_EFFORTS server-side). Per-model
-// support is enforced by the Copilot backend — an unsupported pick is
-// dropped with a warning at run time rather than failing the turn.
-export const COPILOT_EFFORTS: { value: string; label: string }[] = [
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "xHigh" },
-];
+// User-facing labels for the Copilot reasoning-effort ladder. Which subset a
+// given model accepts comes from the model-options probe
+// (`supportedReasoningEfforts` per model); the modal renders only those, so
+// this map only spells labels and never gates a level.
+export const COPILOT_EFFORT_LABELS: Record<string, string> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "xHigh",
+  max: "Max",
+};
+
+/** Label for a Copilot effort value; unknown values pass through verbatim. */
+export function copilotEffortLabel(value: string): string {
+  return COPILOT_EFFORT_LABELS[value] ?? value;
+}
 
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,

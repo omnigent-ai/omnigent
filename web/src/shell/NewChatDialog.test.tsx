@@ -165,6 +165,28 @@ const CODEX_MODEL_OPTIONS_RESULT = {
   isLoading: false,
   isError: false,
 };
+// Mirrors the host's copilot model-options probe after policy filtering: the
+// auto router (default, no efforts), a reasoning model with its own ladder
+// (incl. "max", which only some models take), and an effort-less model.
+const COPILOT_MODEL_OPTIONS_RESULT = {
+  data: [
+    { id: "auto", displayName: "Auto", isDefault: true },
+    {
+      id: "claude-sonnet-5",
+      displayName: "Claude Sonnet 5",
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low" },
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "xhigh" },
+        { reasoningEffort: "max" },
+      ],
+    },
+    { id: "claude-haiku-4.5", displayName: "Claude Haiku 4.5" },
+  ],
+  isLoading: false,
+  isError: false,
+};
 
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
@@ -739,6 +761,44 @@ function setupLandingMocks() {
   ]);
 }
 
+/** Add the seeded copilot chat agent and its host-resolved model catalog. */
+function setupCopilotMocks() {
+  useHostModelOptionsMock.mockImplementation(
+    (_hostId, harness) =>
+      (harness === "copilot"
+        ? COPILOT_MODEL_OPTIONS_RESULT
+        : harness === "codex-native"
+          ? CODEX_MODEL_OPTIONS_RESULT
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+  );
+  mockAgents([
+    {
+      id: "a1",
+      name: "claude-native-ui",
+      display_name: "Claude Code",
+      description: null,
+      harness: "claude-native",
+      skills: [],
+    },
+    {
+      id: "a2",
+      name: "codex-native-ui",
+      display_name: "Codex",
+      description: null,
+      harness: "codex-native",
+      skills: [],
+    },
+    {
+      id: "a3",
+      name: "copilot",
+      display_name: "Copilot",
+      description: null,
+      harness: "copilot",
+      skills: [],
+    },
+  ]);
+}
+
 function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -843,6 +903,12 @@ function selectUnconfiguredAgent(agentId: string): void {
  */
 function openAgentConfig(agentId: string): void {
   selectAgent(agentId);
+  fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+}
+
+/** Like openAgentConfig, for entries that may fold into "More" (e.g. Copilot). */
+function openMoreAgentConfig(agentId: string): void {
+  selectUnconfiguredAgent(agentId);
   fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
 }
 
@@ -1454,6 +1520,63 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+  });
+
+  it("shows the Copilot catalog in the gear modal and no effort row on Default", () => {
+    setupCopilotMocks();
+    renderLanding();
+    openMoreAgentConfig("a3");
+    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
+    // Default rides the backend's auto pick, which takes no effort; the
+    // Effort row is absent entirely, not just empty.
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    // The model select offers the host-resolved (policy-filtered) catalog.
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getByText("Auto")).toBeTruthy();
+    expect(screen.getByText("Claude Sonnet 5")).toBeTruthy();
+    expect(screen.getByText("Claude Haiku 4.5")).toBeTruthy();
+    closeMenu();
+  });
+
+  it("offers the selected Copilot model's own effort ladder", () => {
+    setupCopilotMocks();
+    renderLanding();
+    openMoreAgentConfig("a3");
+    pickSelectOption("new-chat-landing-config-model", "Claude Sonnet 5");
+    // The row appears with exactly the model's advertised levels, including
+    // "max", which the old static four-level list never offered.
+    openSelect("new-chat-landing-config-effort");
+    expect(screen.getByText("xHigh")).toBeTruthy();
+    expect(screen.getByText("Max")).toBeTruthy();
+    closeMenu();
+  });
+
+  it("drops a stale Copilot effort when switching to an effort-less model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setupCopilotMocks();
+    renderLanding();
+
+    openMoreAgentConfig("a3");
+    pickSelectOption("new-chat-landing-config-model", "Claude Sonnet 5");
+    pickSelectOption("new-chat-landing-config-effort", "Max");
+    // Haiku advertises no reasoning efforts: the row disappears and the
+    // drafted "max" must not ride along into the create call.
+    pickSelectOption("new-chat-landing-config-model", "Claude Haiku 4.5");
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    saveConfig();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.model_override).toBe("claude-haiku-4.5");
+    expect(body.reasoning_effort).toBeUndefined();
   });
 
   it("arms codex full bypass via the Approval dropdown and shows the warning banner", () => {

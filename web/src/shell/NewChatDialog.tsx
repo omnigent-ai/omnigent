@@ -48,7 +48,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   CLAUDE_NATIVE_EFFORTS,
-  COPILOT_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -56,7 +55,9 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  copilotEffortLabel,
 } from "@/components/HarnessConfigControls";
+import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -1392,7 +1393,10 @@ function HarnessConfigModal({
   claudeModelsLoading: boolean;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
-  copilotModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  copilotModelOptions: readonly Pick<
+    NativeModelOption,
+    "id" | "displayName" | "isDefault" | "supportedReasoningEfforts"
+  >[];
   copilotModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
@@ -1479,6 +1483,13 @@ function HarnessConfigModal({
     () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
     [codexModelOptions],
   );
+  // Efforts for the drafted Copilot model, advertised per model by the
+  // backend's own catalog. Empty for a model without reasoning effort and for
+  // the Default pick (Copilot's auto router takes no effort), which hides the
+  // Effort row entirely.
+  const copilotEffortValues = hasModelPicker
+    ? codexEffortLevelsForModel(copilotModelOptions, draftModel)
+    : [];
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRouting("on");
@@ -1491,10 +1502,22 @@ function HarnessConfigModal({
       // "Default" = no override; defer routing to the spec default (null,
       // omitted from create) — never emit an explicit "on"/"off".
       setDraftRouting(null);
+      // Copilot's Default rides the backend's auto pick, which takes no
+      // effort; a stale effort draft must not ride along into the create.
+      if (hasModelPicker) setDraftEffort("");
     } else {
       setDraftModel(value);
       // Picking an explicit model turns routing off (mutually exclusive).
       setDraftRouting(null);
+      // Efforts are per model on Copilot: drop a draft the new model can't
+      // honor rather than sending a value the backend would reject.
+      if (
+        hasModelPicker &&
+        draftEffort &&
+        !codexEffortLevelsForModel(copilotModelOptions, value).includes(draftEffort)
+      ) {
+        setDraftEffort("");
+      }
     }
   };
 
@@ -1731,8 +1754,9 @@ function HarnessConfigModal({
           )}
 
           {/* Model + effort for the chat-mode Copilot entry. The catalog comes
-          from the host's model-options probe (the Copilot backend's own list
-          for the signed-in seat); efforts are the SDK's fixed literal. */}
+          from the host's model-options probe (the Copilot backend's own,
+          policy-filtered list for the signed-in seat), and each model carries
+          the efforts it accepts; no effort row for a model without any. */}
           {hasModelPicker && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
@@ -1769,32 +1793,34 @@ function HarnessConfigModal({
                 </Select>
               </ConfigRow>
 
-              <ConfigRow label="Effort" description="Reasoning depth vs. speed">
-                <Select
-                  value={draftEffort || EFFORT_SELECT_NONE}
-                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
-                >
-                  <SelectTrigger
-                    className="w-full"
-                    data-testid="new-chat-landing-config-effort"
-                    aria-label="Reasoning effort"
+              {copilotEffortValues.length > 0 && (
+                <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+                  <Select
+                    value={draftEffort || EFFORT_SELECT_NONE}
+                    onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
                   >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="[&_[data-slot=select-item]]:pl-2.5"
-                  >
-                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                    {COPILOT_EFFORTS.map((e) => (
-                      <SelectItem key={e.value} value={e.value}>
-                        {e.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </ConfigRow>
+                    <SelectTrigger
+                      className="w-full"
+                      data-testid="new-chat-landing-config-effort"
+                      aria-label="Reasoning effort"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent
+                      position="popper"
+                      align="start"
+                      className="[&_[data-slot=select-item]]:pl-2.5"
+                    >
+                      <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                      {copilotEffortValues.map((value) => (
+                        <SelectItem key={value} value={value}>
+                          {copilotEffortLabel(value)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </ConfigRow>
+              )}
             </>
           )}
 
@@ -2736,9 +2762,7 @@ export function NewChatLandingScreen() {
       const modelValue =
         copilotModelOptions.find((m) => m.id === pickedModel)?.displayName ??
         (pickedModel || "Default");
-      const effortValue = pickedEffort
-        ? (COPILOT_EFFORTS.find((e) => e.value === pickedEffort)?.label ?? pickedEffort)
-        : "Default";
+      const effortValue = pickedEffort ? copilotEffortLabel(pickedEffort) : "Default";
       return [
         { label: "Model", value: modelValue },
         { label: "Effort", value: effortValue },
