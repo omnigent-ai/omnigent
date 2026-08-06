@@ -598,11 +598,12 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     return schemas
 
 
-# sys_agent_list: locally-authored agent config YAMLs live under this
-# subdirectory of the agent's os_env cwd, so the list tool can find them
-# and the agent can read/edit them via sys_os_* (configs are authored with
-# sys_os_write, e.g. following the ``build-omnigent`` skill).
-_AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
+# sys_agent_list: locally-authored agent config YAMLs live under the
+# ``omnigent.spec.workspace_agents.AGENT_CONFIG_SUBDIR`` subdirectory of the
+# agent's os_env cwd, so the list tool can find them and the agent can
+# read/edit them via sys_os_* (configs are authored with sys_os_write,
+# e.g. following the ``build-omnigent`` skill). Imported lazily at the use
+# site — this module keeps spec imports off its import path.
 
 # Broad page size for the sys_agent_list fan-out reads. Orchestrators want
 # the full launchable surface in one call, not a 20-row default page.
@@ -4417,7 +4418,9 @@ async def _agent_list_via_rest(
     sessions_raw = await _agent_list_fetch("/v1/sessions", server_client)
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
-    configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
+    from omnigent.spec.workspace_agents import AGENT_CONFIG_SUBDIR
+
+    configs_dir = Path(spec.cwd) / AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
     listing = _project_agent_list(builtins_raw, sessions_raw, local_configs)
     listing["builtins"] = _in_spawn_family(

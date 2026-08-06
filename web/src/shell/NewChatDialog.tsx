@@ -3777,17 +3777,18 @@ export function NewChatLandingScreen() {
         : null;
       const bundleInput =
         repoBundleInput ?? (effectiveAgentId === PENDING_AGENT_ID ? pendingAgent : null);
+      // A repo config launches from its packaged (consented) File; the other
+      // bundled paths build the tar client-side from an AgentBundleInput.
+      const bundleSource: File | AgentBundleInput | null = repoConfigBundle?.file ?? bundleInput;
 
-      if (repoConfigBundle !== null || bundleInput) {
+      if (bundleSource !== null) {
         // Custom agent path: build bundle client-side and use multipart POST.
         // The multipart create only stores the agent + session rows — it does
         // NOT launch a runner on the host. We must follow up with launchRunner
         // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
         // same way the fork-resume path does.
         const bundle =
-          repoConfigBundle !== null
-            ? repoConfigBundle.file
-            : await buildAgentBundle(bundleInput as AgentBundleInput);
+          bundleSource instanceof File ? bundleSource : await buildAgentBundle(bundleSource);
         const metadata: Record<string, unknown> = {};
         if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
         // Born-filed: stamp the project's `omni_project` label so a bundled

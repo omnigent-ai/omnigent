@@ -17,6 +17,7 @@ from the DB so a host connected to replica B reads back as
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import secrets
@@ -897,11 +898,9 @@ def create_hosts_router(
                 status_code=502,
                 detail=str(result.get("error") or "workspace agent packaging failed"),
             )
-        import base64
-
         try:
             bundle = base64.b64decode(bundle_b64, validate=True)
-        except Exception as exc:
+        except ValueError as exc:
             raise HTTPException(
                 status_code=502,
                 detail="host returned malformed bundle bytes",

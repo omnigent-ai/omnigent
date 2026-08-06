@@ -141,8 +141,6 @@ export interface WorkspaceDiscovery {
   agentConfigs: WorkspaceAgentConfigEntry[];
 }
 
-const EMPTY_DISCOVERY: WorkspaceDiscovery = { agents: [], agentConfigs: [] };
-
 async function fetchWorkspaceHarnesses(
   hostId: string,
   workspace: string,
@@ -161,20 +159,15 @@ async function fetchWorkspaceHarnesses(
 /**
  * Agents the selected workspace's repo declares — ACP commands from
  * `.omnigent/config.yaml` plus agent configs under
- * `.omnigent/agent-configs/` — resolved on the selected host. Errors
- * (offline host, older host daemon that doesn't speak the frame)
- * degrade to empty lists.
+ * `.omnigent/agent-configs/` — resolved on the selected host. Failures
+ * (offline host, older host daemon that doesn't speak the frame) land in
+ * the query's error state; consumers default to empty lists, so
+ * discovery degrades silently in the picker.
  */
 export function useWorkspaceHarnesses(hostId: string | null, workspace: string, enabled = true) {
   return useQuery({
     queryKey: ["workspace-harnesses", hostId, workspace],
-    queryFn: async (): Promise<WorkspaceDiscovery> => {
-      try {
-        return await fetchWorkspaceHarnesses(hostId as string, workspace);
-      } catch {
-        return EMPTY_DISCOVERY;
-      }
-    },
+    queryFn: () => fetchWorkspaceHarnesses(hostId as string, workspace),
     enabled: enabled && hostId !== null && workspace.length > 0,
     staleTime: 30_000,
     retry: false,

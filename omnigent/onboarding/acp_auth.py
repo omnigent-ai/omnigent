@@ -141,12 +141,14 @@ def workspace_acp_agents(workspace: Path) -> list[AcpAgentEntry]:
     :param workspace: The working directory the repo config lives under.
     :returns: The repo-declared agents (possibly empty).
     """
+    import yaml
+
     from omnigent.config import load_local_config
 
     try:
         config_path = Path(workspace).expanduser() / ".omnigent" / "config.yaml"
         return acp_agents(config=load_local_config(path=config_path))
-    except Exception:
+    except (OSError, ValueError, yaml.YAMLError):
         return []
 
 
