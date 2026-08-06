@@ -20,9 +20,11 @@ from omnigent.server.routing_backend import (
     RoutingBackends,
     backends_from_caps,
     gateway_backs_all,
+    route_with_fallback,
     routing_available,
     routing_sources,
     select_router,
+    usable_external,
 )
 
 _HOST_ID = "aabbccddeeff00112233445566778899"
@@ -255,3 +257,145 @@ def test_routing_unavailable_when_nothing_is_configured(caps: Any) -> None:
 def test_availability_is_exactly_some_source_can_answer(caps: Any) -> None:
     """The invariant that keeps the flag and the source map from drifting."""
     assert routing_available(caps) is any(routing_sources(caps).values())
+
+
+# ── a latched permanent failure reads as "no external router" ───────────────
+#
+# A workspace whose account never had the routing API enabled answers every
+# ``routes:select`` with the same 404. The client latches that, and this
+# deployment is a judge-only one for as long as the process lives.
+
+
+@dataclass
+class _Tripped:
+    """A client that has latched an account-level permanent failure."""
+
+    name: str = "external"
+    permanently_unavailable: bool = True
+
+
+def test_select_router_skips_a_router_that_latched_a_permanent_failure() -> None:
+    tripped = _Tripped()
+    choice = select_router(RoutingBackends(external=tripped, local=_LOCAL), gateway_backed=True)
+    assert choice is not None
+    assert (choice.client, choice.source) == (_LOCAL, "oss-llm")
+    # Nothing left to answer with once the judge is absent too.
+    assert select_router(RoutingBackends(external=tripped), gateway_backed=True) is None
+
+
+def test_usable_external_hides_a_tripped_client() -> None:
+    assert usable_external(RoutingBackends(external=_EXTERNAL)) is _EXTERNAL
+    assert usable_external(RoutingBackends(external=_Tripped())) is None
+    assert usable_external(RoutingBackends(local=_LOCAL)) is None
+
+
+def test_routing_sources_stops_advertising_a_tripped_router() -> None:
+    caps = _caps(
+        routing_backends=RoutingBackends(external=_Tripped(), local=_LOCAL),
+        routing_client=None,
+        policy_llm_connection_factory=None,
+    )
+    assert routing_sources(caps) == {"external": False, "oss": True}
+    assert routing_available(caps) is True
+
+
+# ── route_with_fallback: the external router first, the judge behind it ─────
+
+
+class _Recording:
+    """Routing-client double recording how many calls it took.
+
+    :param result: What :meth:`route` returns.
+    :param error: Raised from :meth:`route` instead of returning.
+    :param last_error: The protocol's reason field for a ``None`` result.
+    """
+
+    def __init__(
+        self,
+        result: Any = None,  # type: ignore[explicit-any]  # a RoutingResult stand-in
+        *,
+        error: Exception | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        self.result = result
+        self.error = error
+        self.last_error = last_error
+        self.calls = 0
+
+    async def route(
+        self,
+        _message: str,
+        _available: dict[str, list[str]],
+    ) -> Any:  # type: ignore[explicit-any]  # a RoutingResult stand-in
+        """Record the call and answer with the canned verdict (or raise)."""
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+_MENU = {"claude-sdk": ["databricks-claude-opus-4-8"]}
+_VERDICT = "verdict"
+
+
+async def test_route_with_fallback_prefers_the_external_router() -> None:
+    external, local = _Recording(_VERDICT), _Recording(_VERDICT)
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local), "hi", _MENU, gateway_backed=True
+    )
+    assert call is not None
+    assert (call.result, call.source, call.client) == (_VERDICT, "databricks-aigw", external)
+    assert local.calls == 0
+
+
+async def test_route_with_fallback_asks_the_judge_when_the_router_declines() -> None:
+    external = _Recording(None, last_error="router returned HTTP 404: not enabled")
+    local = _Recording(_VERDICT)
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local), "hi", _MENU, gateway_backed=True
+    )
+    assert call is not None
+    assert (call.result, call.source, call.client) == (_VERDICT, "oss-llm", local)
+
+
+async def test_route_with_fallback_asks_the_judge_when_the_router_raises() -> None:
+    external = _Recording(error=RuntimeError("connection reset"))
+    local = _Recording(_VERDICT)
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local), "hi", _MENU, gateway_backed=True
+    )
+    assert call is not None
+    assert (call.result, call.source) == (_VERDICT, "oss-llm")
+
+
+async def test_route_with_fallback_reports_the_last_router_asked() -> None:
+    """Both declined: the caller reads its reason off whoever answered last."""
+    external = _Recording(None, last_error="router returned HTTP 404: not enabled")
+    local = _Recording(None, last_error="the judge had no opinion")
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local), "hi", _MENU, gateway_backed=True
+    )
+    assert call is not None
+    assert (call.result, call.source, call.client) == (None, "oss-llm", local)
+
+
+async def test_route_with_fallback_lets_a_lone_router_fail_the_way_it_always_did() -> None:
+    """No judge behind it: the caller's own fail-open handling still sees the raise."""
+    external = _Recording(error=RuntimeError("connection reset"))
+    with pytest.raises(RuntimeError):
+        await route_with_fallback(
+            RoutingBackends(external=external), "hi", _MENU, gateway_backed=True
+        )
+
+
+async def test_route_with_fallback_uses_the_judge_off_the_gateway() -> None:
+    external, local = _Recording(_VERDICT), _Recording(_VERDICT)
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local), "hi", _MENU, gateway_backed=False
+    )
+    assert call is not None
+    assert (call.source, external.calls) == ("oss-llm", 0)
+
+
+async def test_route_with_fallback_reports_an_unconfigured_deployment() -> None:
+    assert await route_with_fallback(RoutingBackends(), "hi", _MENU, gateway_backed=True) is None

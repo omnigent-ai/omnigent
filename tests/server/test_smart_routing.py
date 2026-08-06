@@ -1382,6 +1382,55 @@ async def test_external_routing_client_records_last_error_on_http_failure() -> N
     assert "Credential was not sent" in client.last_error
 
 
+@pytest.mark.asyncio
+async def test_a_routing_api_that_is_not_enabled_is_asked_exactly_once() -> None:
+    """The 404 is account-level configuration, so retrying it only adds latency."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    served = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal served
+        served += 1
+        return httpx.Response(
+            404,
+            json={
+                "error_code": "NOT_FOUND",
+                "message": "routing/v1/routes:select is not enabled for this account.",
+            },
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+        assert client.permanently_unavailable is True
+        assert await client.route("hi again", {"h": ["m"]}) is None
+    assert served == 1
+    # The reason survives the short circuit, so the chip still says why.
+    assert client.last_error is not None
+    assert "not enabled" in client.last_error
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_404_is_not_latched() -> None:
+    """Only the account-level message is permanent; a stray 404 is retried."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json={"error_code": "NOT_FOUND", "message": "no route"})
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+    assert client.permanently_unavailable is False
+
+
 def test_router_error_detail_unwraps_nested_message() -> None:
     from omnigent.server.smart_routing import _router_error_detail
 

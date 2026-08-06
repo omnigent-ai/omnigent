@@ -1319,6 +1319,45 @@ async def test_a_gateway_backed_spawn_is_routed_by_the_external_router() -> None
     assert local.calls == []
 
 
+async def test_a_spawn_falls_back_to_the_judge_when_the_router_fails() -> None:
+    """A workspace with no routing API must not cost every spawn its decision."""
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(
+        None, last_error="router returned HTTP 404: routes:select is not enabled"
+    )
+    local = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="local"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+    decision = await resolve_subagent_route(
+        "conv_fallback", _request(), caps=caps, gateway_backed=True
+    )
+    assert decision.router_source == "oss-llm"
+    assert decision.model == CLAUDE_MODEL
+    assert external.calls != []
+
+
+async def test_a_spawn_keeps_the_routers_reason_when_nothing_can_answer() -> None:
+    """Fail-open is unchanged: the spawn runs, the chip carries the reason."""
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(None, last_error="router returned HTTP 404: not enabled")
+    local = FakeRoutingClient(None, last_error="the judge had no opinion")
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+    decision = await resolve_subagent_route(
+        "conv_none", _request(), caps=caps, gateway_backed=True
+    )
+    assert decision.action == "allow"
+    assert decision.model is None
+    assert decision.router_source is None
+    assert "the judge had no opinion" in decision.rationale
+
+
 async def test_an_external_only_deployment_cannot_route_an_off_gateway_spawn() -> None:
     from omnigent.server.routing_backend import RoutingBackends
 

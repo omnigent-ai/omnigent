@@ -6369,6 +6369,42 @@ def _oss_routing_available(caps: Any = None) -> bool:  # type: ignore[explicit-a
     return backends_from_caps(caps).local is not None
 
 
+def _external_router_usable(caps: Any = None) -> bool:  # type: ignore[explicit-any]
+    """Whether the external ``routes:select`` router can still answer here.
+
+    False for a deployment that configures none, and for one whose router has
+    latched a permanent failure (its workspace has no routing API) — the
+    surfaces that need a task_v1 menu then take their judge-only shape.
+
+    :param caps: A ``RuntimeCaps``-shaped object. ``None`` reads the globals.
+    :returns: ``True`` when an external routing client can serve a call.
+    """
+    from omnigent.server.routing_backend import backends_from_caps, usable_external
+
+    if caps is None:
+        try:
+            from omnigent.runtime._globals import _caps
+        except ImportError:
+            return False
+        caps = _caps
+    return usable_external(backends_from_caps(caps)) is not None
+
+
+def _judge_only_harness_note(harness: str, verdict: dict[str, Any]) -> str:
+    """Explain on the chip why only the model was routed.
+
+    :param harness: The pane the create kept, e.g. ``"claude-native"``.
+    :param verdict: The routing verdict whose rationale is being extended.
+    :returns: The rationale to show, with the harness note appended.
+    """
+    rationale = str(verdict.get("rationale") or "").strip()
+    note = (
+        f"Harness routing needs the workspace router, which is unavailable here; "
+        f"kept {harness} and routed the model with the built-in judge."
+    )
+    return f"{rationale} {note}".strip()
+
+
 async def _session_routing_host(
     conv: Conversation,
     host_store: HostStore | None,
@@ -6820,6 +6856,9 @@ async def _resolve_native_smart_routing(
 
     Falls back to the first installed candidate when routing is unavailable, so
     the session still lands on a terminal (with the CLI's own default model).
+    Same candidate when only the built-in judge is configured: choosing between
+    two panes is the workspace router's job, so a judge-only deployment routes
+    the default pane's MODEL and says so on the chip.
 
     :param body: The create request; ``smart_routing_message`` carries the
         routing text and ``host_id`` selects whose CLIs are on offer.
@@ -6838,7 +6877,11 @@ async def _resolve_native_smart_routing(
     :raises HTTPException: 404 if ``host_id`` is unknown, 403 if it belongs
         to another user.
     """
-    from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES, route_session_harness
+    from omnigent.server.smart_routing import (
+        AUTO_NATIVE_ROUTING_HARNESSES,
+        models_in_family,
+        route_session_harness,
+    )
 
     host = await _routing_host_for_create(body, request, user_id)
     # Both arms must be gateway-backed before the WORKSPACE router may choose
@@ -6854,13 +6897,46 @@ async def _resolve_native_smart_routing(
     if not installed:
         return None, None, None, "No native CLI is installed on this host."
 
+    # Choosing BETWEEN native panes belongs to the workspace router: its menu is
+    # what ranks two CLIs against one task, and the pick is baked into the
+    # terminal launch. With no external router usable, this create keeps the
+    # default pane and routes only its model with the built-in judge — a normal
+    # Smart Routing session, minus the harness half — instead of declining.
+    judge_only = not _external_router_usable()
+    candidates = (installed[0],) if judge_only else installed
     harness, model, verdict, error = await route_session_harness(
         body.smart_routing_message or "",
-        harness_candidates=installed,
-        catalog=await _pre_session_model_catalog(request, host, installed),
+        harness_candidates=candidates,
+        catalog=await _pre_session_model_catalog(request, host, candidates),
         gateway_backed=backed,
         allow_static_fallback=backed,
     )
+    if judge_only:
+        kept = native_coding_agent_for_harness(candidates[0])
+        kept_name = kept.agent_name if kept is not None else None
+        if model is None or verdict is None:
+            return (
+                kept_name,
+                None,
+                None,
+                error or "Routing unavailable; using the default native harness.",
+            )
+        if not models_in_family(candidates[0], [model]):
+            # One pane on offer, so the seam resolves any pick onto it — and an
+            # out-of-family model would reach the launch as a ``--model`` this
+            # CLI cannot run. Keep the pane, pin nothing, say why.
+            return (
+                kept_name,
+                None,
+                None,
+                f"Not applied: this {candidates[0]} session cannot run {model}.",
+            )
+        return (
+            kept_name,
+            model,
+            {**verdict, "rationale": _judge_only_harness_note(candidates[0], verdict)},
+            None,
+        )
     native_agent = native_coding_agent_for_harness(harness) if harness is not None else None
     if native_agent is None:
         # Routing unavailable (or it named something that is not a native

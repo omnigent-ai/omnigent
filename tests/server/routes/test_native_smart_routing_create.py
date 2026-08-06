@@ -1126,7 +1126,9 @@ async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() ->
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
-    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+    # An external router is what puts both panes on the menu; unknown gateway
+    # backing must not take it away.
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=False)):
         agent_name, model, _verdict, error = await _resolve_native_smart_routing(
             cast("Any", body),
             cast("Any", _routing_request(_host_reporting(None))),
@@ -1135,6 +1137,55 @@ async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() ->
 
     assert error is None
     assert (agent_name, model) == ("codex-native-ui", GPT_MODEL)
+
+
+async def test_a_judge_only_deployment_keeps_the_default_pane_and_routes_its_model() -> None:
+    """Choosing BETWEEN panes needs the workspace router; the model does not.
+
+    A native create bakes its harness into the terminal launch, so with no
+    external router the create keeps the default pane and routes only its
+    model — a normal Smart Routing session minus the harness half — rather
+    than declining into a session with no terminal.
+    """
+    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    judge = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)):
+        agent_name, model, verdict, error = await _resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host_reporting(None))),
+            "alice@example.com",
+        )
+
+    assert error is None
+    assert (agent_name, model) == ("claude-native-ui", CLAUDE_MODEL)
+    assert verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+    # The chip says why the harness did not move.
+    assert "Harness routing" in verdict["rationale"]
+    # Only the kept pane was ever on the menu.
+    assert list(judge.offered[0]) == ["claude-native"]
+
+
+async def test_a_judge_only_create_pins_nothing_when_the_pick_is_out_of_family() -> None:
+    """One pane on offer means any pick resolves onto it — so check the family."""
+    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    judge = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)):
+        agent_name, model, verdict, error = await _resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host_reporting(None))),
+            "alice@example.com",
+        )
+
+    # The session still opens a terminal; it just keeps the CLI's own model.
+    assert agent_name == "claude-native-ui"
+    assert (model, verdict) == (None, None)
+    assert error is not None
+    assert GPT_MODEL in error
 
 
 async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_serve(
@@ -1234,6 +1285,56 @@ async def test_fixed_harness_routing_create_succeeds_off_the_gateway_with_the_ju
     items = (await client.get(f"/v1/sessions/{created.json()['id']}/items")).json()["data"]
     decisions = [i for i in items if i["type"] == "routing_decision"]
     assert decisions and decisions[0]["router_source"] == "oss-llm"
+
+
+@pytest.mark.parametrize("harness", list(AUTO_NATIVE_ROUTING_HARNESSES))
+async def test_a_pane_create_routes_with_the_judge_when_the_router_is_not_enabled(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+) -> None:
+    """Picking Smart Routing in the CLI's model menu, on a workspace with no router.
+
+    The gateway backing is fine here — the workspace simply never had the
+    routing API enabled, so ``routes:select`` 404s. The session must still get
+    a normal Smart Routing decision, from the judge.
+    """
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routing_backend import RoutingBackends
+
+    wrappers = await _native_wrappers(client, db_uri)
+    pick = _OFF_GATEWAY_CATALOG[harness][0]
+    external = FakeRoutingClient(
+        None, last_error="router returned HTTP 404: routes:select is not enabled for this account."
+    )
+    judge = FakeRoutingClient(RoutingResult(model=pick, rationale="sized task"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=judge),
+    )
+    body = {
+        "agent_id": wrappers[harness],
+        "cost_control_mode_override": "on",
+        "smart_routing_message": ROUTING_MESSAGE,
+    }
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        patch.object(orchestration, "_routing_host_for_create", return_value=_host_reporting({})),
+        patch.object(
+            orchestration,
+            "_pre_session_model_catalog",
+            AsyncMock(return_value={harness: [pick]}),
+        ),
+    ):
+        created = await client.post("/v1/sessions", json=body)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["model_override"] == pick
+    decisions = _routing_decision_items(db_uri, created.json()["id"])
+    assert decisions and decisions[0]["router_source"] == "oss-llm"
+    assert decisions[0]["applied"] is True
+    # The router was asked first — the judge is the fallback, not the default.
+    assert external.calls != []
 
 
 @pytest.mark.parametrize(
