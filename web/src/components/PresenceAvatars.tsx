@@ -55,7 +55,7 @@ export function PresenceAvatars() {
       {overflow.length > 0 && (
         <Tooltip>
           <TooltipTrigger asChild>
-            <AvatarGroupCount data-testid="presence-overflow" className="size-6 text-xs">
+            <AvatarGroupCount data-testid="presence-overflow" className="size-6 text-sm">
               +{overflow.length}
             </AvatarGroupCount>
           </TooltipTrigger>

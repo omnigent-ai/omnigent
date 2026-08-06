@@ -54,6 +54,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
 from omnigent.json_types import JsonObject as _JsonObject
@@ -98,6 +99,7 @@ from omnigent.runner.native import (
     _claude_native_terminal_arrives_via_transfer,
     _codex_ensure_response_with_policy_notice,
     _codex_native_model_from_spec,
+    _codex_native_terminal_arrives_via_transfer,
     _codex_session_needs_runner_terminal,
     _CodexNativeModelOptionsNotReady,
     _delete_native_bridge_dirs,
@@ -134,6 +136,14 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
+)
+from omnigent.runner.subagent_routing import (
+    PLAIN_SESSION,
+    SessionRoutingClass,
+    forget_session_routing_class,
+    remember_session_routing_class,
+    routing_class_from_snapshot,
+    session_routing_class,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
@@ -613,6 +623,23 @@ class _SessionInitContext:
     def labels(self) -> Mapping[str, str] | None:
         """Return server-supplied labels, or ``None`` on the legacy path."""
         return self.envelope.snapshot.labels if self.envelope is not None else None
+
+    @property
+    def routing_class(self) -> SessionRoutingClass:
+        """Return the session's Smart Routing class.
+
+        The legacy path carries no snapshot, so it reads as plain — a
+        session whose routing state cannot be established must not pay any
+        routing-path cost.
+        """
+        if self.envelope is None:
+            return PLAIN_SESSION
+        snapshot = self.envelope.snapshot
+        return routing_class_from_snapshot(
+            cost_control_mode=snapshot.cost_control_mode_override,
+            harness_override=snapshot.harness_override,
+            labels=snapshot.labels,
+        )
 
 
 # Language constant the omnigent YAML translator stamps on callable-backed
@@ -2118,11 +2145,15 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
-    def _publish_session_status(session_id: str, status: str) -> None:
-        _publish_event(
-            session_id,
-            {"type": "session.status", "status": status},
-        )
+    def _publish_session_status(
+        session_id: str,
+        status: str,
+        blocked_on: str | None = None,
+    ) -> None:
+        event: dict[str, object] = {"type": "session.status", "status": status}
+        if blocked_on is not None:
+            event["blocked_on"] = blocked_on
+        _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
 
@@ -2600,6 +2631,14 @@ def create_runner_app(
                 },
             )
 
+        # Stamp the session's Smart Routing class before anything reads it: the
+        # spawn env is rebuilt on every harness respawn, long after this
+        # envelope is gone, and on the codex family the class decides whether
+        # the session gets the extended model catalog and the spawn-routing
+        # endpoint at all.
+        _routing_class = init_context.routing_class
+        remember_session_routing_class(session_id, _routing_class)
+
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
         if spec_resolver is not None:
@@ -2646,11 +2685,18 @@ def create_runner_app(
                 if _start_verdict.data is not None:
                     _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
 
+            await _ensure_session_subagent_router(
+                session_id,
+                harness_name,
+                server_client=server_client,
+                routing_class=_routing_class,
+            )
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
+                session_id=session_id,
             )
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
@@ -2819,6 +2865,20 @@ def create_runner_app(
 
                 async def _codex_pre_launch(has_terminal: bool) -> PreLaunchResult:
                     needs = await _codex_session_needs_runner_terminal(server_client, session_id)
+                    if not has_terminal:
+                        inbound = await _codex_native_terminal_arrives_via_transfer(
+                            server_client=server_client,
+                            session_id=session_id,
+                            resource_registry=resource_registry,
+                        )
+                        _logger.info(
+                            "Codex terminal transfer-inbound check: session=%s "
+                            "terminal_inbound=%s",
+                            session_id,
+                            inbound,
+                        )
+                        if inbound:
+                            return PreLaunchResult(skip=True)
                     if not needs and not has_terminal:
                         _logger.info(
                             "Skipping codex terminal auto-create for %s; session "
@@ -3192,6 +3252,14 @@ def create_runner_app(
             server_client=server_client,
             session_id=session_id,
         )
+
+        # The SDK harnesses' router is started here (not by a terminal launch
+        # path), so this is its only teardown: without it the session leaks an
+        # HTTP server, its thread, and a live bearer token on disk.
+        from omnigent.runner.subagent_routing import shutdown_session_router
+
+        await asyncio.to_thread(shutdown_session_router, session_id)
+        forget_session_routing_class(session_id)
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
@@ -3961,6 +4029,7 @@ def create_runner_app(
         effort: str | None,
     ) -> Response:
         from omnigent.claude_native_bridge import (
+            EFFORT_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -3975,12 +4044,16 @@ def create_runner_app(
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         command = f"/effort {effort}"
         try:
+            # An effort switch invalidates the prompt cache on a session with
+            # history, so Claude Code asks to confirm; the chat UI cannot render
+            # that TUI dialog, so answer it by its own title.
             await asyncio.to_thread(
                 inject_slash_command,
                 bridge_dir,
                 command=command,
                 timeout_s=1.0,
                 auto_confirm=True,
+                confirm_hint=EFFORT_DIALOG_HINT,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
@@ -3998,12 +4071,15 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
+        from omnigent.claude_model_vocabulary import claude_model_command_arg
         from omnigent.claude_native import (
             resolve_claude_native_model_selection,
         )
         from omnigent.claude_native_bridge import (
+            SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             inject_slash_command,
+            read_model_env,
         )
 
         if model is None or not model.strip():
@@ -4014,18 +4090,47 @@ def create_runner_app(
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         selected_model = model.strip()
-        resolved_model = resolve_claude_native_model_selection(
-            selected_model,
-            await _resolve_session_claude_launch_config(conv_id),
+        claude_config = await _resolve_session_claude_launch_config(conv_id)
+        resolved_model = (
+            resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        command = f"/model {resolved_model}"
+        # ``/model`` takes only this session's own picker vocabulary — its
+        # family aliases and its one custom slot. Typing a bare catalog id
+        # outside it leaves the pane on its old model while this handler
+        # reports success, so fail loud instead. Same translation the routed
+        # turn path and the executor apply.
+        env = read_model_env(bridge_dir) or None
+        model_arg = claude_model_command_arg(resolved_model, env)
+        if model_arg is None:
+            _logger.warning(
+                "claude-native model change: %r has no spelling session=%s accepts (pins=%s)",
+                resolved_model,
+                conv_id,
+                sorted(env or ()),
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_unsupported",
+                    "detail": (
+                        f"This Claude terminal cannot switch to {resolved_model}: "
+                        "its /model picker has no spelling for that model."
+                    ),
+                },
+            )
+        command = f"/model {model_arg}"
         try:
+            # Accepted trade-off: ``/model <id>`` also saves the pick as the
+            # person's global default in ``~/.claude/settings.json``. Driving
+            # the interactive picker instead avoided that write but needed
+            # ~35s of fragile tmux automation, so the write stands.
             await asyncio.to_thread(
                 inject_slash_command,
                 bridge_dir,
                 command=command,
                 timeout_s=1.0,
                 auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
@@ -5124,6 +5229,7 @@ def create_runner_app(
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
+                session_id=conv,
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -5155,6 +5261,19 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        # The routed model rides in-band on the forwarded message. This body is
+        # built field by field (not copied), so it must be threaded explicitly:
+        # the harness forwards it onto CreateResponseRequest.model_override and
+        # the executor adapter into ExecutorConfig.model, which is how a native
+        # terminal learns to switch models for this turn.
+        _model_override = msg_body.get("model_override")
+        if isinstance(_model_override, str) and _model_override:
+            harness_body["model_override"] = _model_override
+            _logger.info(
+                "_run_turn_bg: conv=%s received model_override=%s (forwarding to harness)",
+                conv,
+                _model_override,
+            )
         if _session_histories[conv]:
             history = _session_histories[conv]
             if any("created_by" in item for item in history):
@@ -5932,7 +6051,8 @@ def create_runner_app(
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
         _logger.info(
-            "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s",
+            "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
+            "model_override=%s",
             conversation_id,
             body_type,
             conversation_id in _active_turns,
@@ -5940,6 +6060,7 @@ def create_runner_app(
             [b.get("type") for b in body.get("content", []) if isinstance(b, dict)]
             if isinstance(body, dict)
             else "N/A",
+            body.get("model_override") if isinstance(body, dict) else None,
         )
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
@@ -8679,7 +8800,12 @@ async def _resolve_harness_config(
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
-                spec, harness, cwd=cwd, workdir=workdir, model_override=model_override
+                spec,
+                harness,
+                cwd=cwd,
+                workdir=workdir,
+                model_override=model_override,
+                session_id=session_id,
             )
             return harness, spawn_env
 
@@ -8729,6 +8855,51 @@ class _ModelCopyValue(Protocol):
     def model_copy(self, *, update: Mapping[str, object]) -> object: ...
 
 
+async def _ensure_session_subagent_router(
+    session_id: str,
+    harness: str | None,
+    *,
+    server_client: httpx.AsyncClient | None,
+    routing_class: SessionRoutingClass | None = None,
+) -> None:
+    """Start this session's subagent-routing endpoint.
+
+    Only for the SDK harness families: the native terminals know their own
+    bridge directory and start the router from their launch paths, where
+    the harness's hooks are also pointed at it.
+
+    Started for Smart Routing sessions only: a plain session must not carry
+    the loopback server, its on-disk bearer token, or an in-process hook on
+    every ``Task`` for a verdict the server never routes. On the codex SDK
+    arm the advertisement also turns generated hooks and the routed-spawn
+    tool pre-approvals on, and those spawns already route through
+    session-create, so there it takes auto-harness.
+
+    Never raises: ``ensure_session_router_quietly`` owns the bridge-dir
+    resolution too, so a hostile or pre-existing ``$TMPDIR`` root cannot
+    fail session creation for harnesses that do not even use routing.
+
+    :param session_id: Session/conversation identifier.
+    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :param server_client: Runner→server client the relay forwards on.
+        ``None`` (in-process tests) skips the start.
+    :param routing_class: The session's Smart Routing class. ``None``
+        reads whatever was stamped at session init, which for an unknown
+        session is the plain class.
+    """
+    from omnigent.runner.subagent_routing import ensure_session_router_quietly
+
+    if is_native_harness(harness):
+        return
+    resolved = routing_class if routing_class is not None else session_routing_class(session_id)
+    ensure_session_router_quietly(
+        session_id,
+        server_client=server_client,
+        harness=harness,
+        routing_class=resolved,
+    )
+
+
 def _build_spawn_env_from_spec(
     spec: AgentSpec,
     harness: str,
@@ -8736,6 +8907,7 @@ def _build_spawn_env_from_spec(
     cwd: Path | None = None,
     workdir: Path | None = None,
     model_override: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -8743,6 +8915,8 @@ def _build_spawn_env_from_spec(
     :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
     :param cwd: Runtime working directory for harnesses that need it.
     :param workdir: Bundle workdir, threaded to the builders.
+    :param session_id: Session/conversation id, used to hand the harness
+        this session's subagent-routing endpoint. ``None`` omits it.
     :param model_override: The per-session ``/model`` override, e.g.
         ``"claude-sonnet-4-6"``, or ``None``. When set, it overrides the
         ``HARNESS_<H>_MODEL`` the builder baked in (spec model / provider
@@ -8828,6 +9002,25 @@ def _build_spawn_env_from_spec(
                 return None
     except ImportError:
         return None
+
+    # Point the harness process at this session's subagent-routing endpoint
+    # when one is running (started at session init). Scoped to *harness* so a
+    # codex executor beneath a claude session never sees the codex router vars
+    # carrying the parent's session id. Empty when the session has no router.
+    if env is not None and session_id:
+        from omnigent.runner.subagent_routing import session_router_env
+
+        env.update(session_router_env(session_id, harness))
+        if harness in CODEX_CANONICAL_HARNESSES:
+            # A Smart Routing turn or spawn can land on a gateway arm codex's
+            # bundled catalog has no entry for, so the session replaces that
+            # catalog. Plain sessions get nothing here and never pay the
+            # ``codex debug models`` probe.
+            from omnigent.inner.codex_executor import codex_extended_catalog_env
+
+            env.update(
+                codex_extended_catalog_env(session_routing_class(session_id).routing_enabled)
+            )
 
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the

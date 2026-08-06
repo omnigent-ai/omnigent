@@ -1765,6 +1765,41 @@ async def test_download_session_file_content(
 
 
 @pytest.mark.asyncio
+async def test_download_session_file_content_is_revalidatable(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Content is immutable per file id, so it must be cacheable and revalidate to 304.
+
+    Transcripts re-render the same attachments on every session load and
+    the originals run to megabytes; without these headers the browser
+    re-downloads all of them each time.
+    """
+    upload = await file_client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+        files={"file": ("shot.png", b"pretend-png-bytes", "image/png")},
+    )
+    file_id = upload.json()["id"]
+    url = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}/content"
+
+    resp = await file_client.get(url)
+    assert resp.status_code == 200
+    etag = resp.headers["etag"]
+    assert etag == f'"{file_id}"'
+    assert resp.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+    # A conditional re-request must skip the bytes entirely.
+    cached = await file_client.get(url, headers={"If-None-Match": etag})
+    assert cached.status_code == 304
+    assert cached.content == b""
+    assert cached.headers["etag"] == etag
+
+    # A stale validator still gets the full body back.
+    stale = await file_client.get(url, headers={"If-None-Match": '"file_gone"'})
+    assert stale.status_code == 200
+    assert stale.content == b"pretend-png-bytes"
+
+
+@pytest.mark.asyncio
 async def test_download_session_file_html_is_attachment_not_inline(
     file_client: httpx.AsyncClient,
 ) -> None:

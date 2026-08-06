@@ -4,7 +4,7 @@
  * Renders into the AppShell chat outlet (see App.tsx) so the conversations
  * sidebar stays put when you enter settings — only the main area swaps to
  * this view. Inside, a section nav (left) drives a content panel (right),
- * modeled on a desktop-app settings window; a "← Back to Omnigent" link
+ * modeled on a desktop-app settings window; a Back link
  * returns to the composer.
  *
  * Sections:
@@ -23,7 +23,8 @@
  *   entering them stays inside settings — the sidebar keeps the section nav
  *   instead of snapping back to the conversation list.
  * - **Archived sessions** — archived sessions, moved out of the sidebar
- *   list. Not clickable; each row reveals Delete / Unarchive on hover.
+ *   list. Not clickable; each row reveals Delete / Unarchive on hover, and
+ *   Unarchive opens the restored session.
  */
 
 import {
@@ -91,6 +92,7 @@ import {
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
+import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import {
   normalizeResolvedTheme,
@@ -716,7 +718,7 @@ function ColorThemeControl() {
               <output
                 htmlFor="custom-theme-contrast"
                 data-testid="custom-theme-contrast-value"
-                className="w-7 text-right text-xs font-medium tabular-nums"
+                className="w-7 text-right text-sm font-medium tabular-nums"
               >
                 {editableTheme.contrast}
               </output>
@@ -1431,10 +1433,10 @@ function LocalCliSection() {
 
           {status.path ? (
             <div className="flex flex-col gap-1">
-              <span className="text-xs text-muted-foreground">
+              <span className="text-sm text-muted-foreground">
                 {status.source === "configured" ? "Path (custom)" : "Path (auto-detected)"}
               </span>
-              <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+              <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
                 {status.path}
               </code>
             </div>
@@ -1445,14 +1447,14 @@ function LocalCliSection() {
                 screen:
               </p>
               {status.installCommand && (
-                <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+                <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
                   {status.installCommand}
                 </code>
               )}
             </div>
           )}
 
-          <p className="text-xs text-muted-foreground">
+          <p className="text-sm text-muted-foreground">
             For security, a custom path can only be set from the connect screen — this prevents a
             connected server from pointing the app at a different binary. Open it from the Server
             menu (Change Server…) and use the settings gear.
@@ -1586,7 +1588,7 @@ function UpdatesSection() {
           <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
             <div className="flex flex-col gap-1">
               <span className="text-ui font-medium">Install downloaded updates on next quit</span>
-              <span className="text-xs text-muted-foreground">
+              <span className="text-sm text-muted-foreground">
                 Applies only after you choose to download an update.
               </span>
             </div>
@@ -1602,7 +1604,7 @@ function UpdatesSection() {
             <Button onClick={() => void onCheck()} loading={checking}>
               Check for updates now
             </Button>
-            {saving && <span className="text-xs text-muted-foreground">Saving…</span>}
+            {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
           </div>
 
           {lastCheckError && (
@@ -1703,7 +1705,7 @@ function AccountSection() {
             <div className="truncate font-medium">
               {me.id}
               {me.is_admin && (
-                <span className="ml-1 text-xs font-normal text-muted-foreground">(admin)</span>
+                <span className="ml-1 text-sm font-normal text-muted-foreground">(admin)</span>
               )}
             </div>
           </div>
@@ -1967,7 +1969,7 @@ function ArchivedSection() {
             <div className="flex flex-col gap-4">
               {groupedArchived.map((group) => (
                 <div key={group.label}>
-                  <h3 className="mb-1 px-3 text-xs font-medium text-muted-foreground">
+                  <h3 className="mb-1 px-3 text-sm font-medium text-muted-foreground">
                     {group.label}
                   </h3>
                   <ul className="flex flex-col gap-0.5">
@@ -2017,8 +2019,10 @@ function ArchivedSection() {
  * One archived-session row. Not clickable (archived sessions aren't a
  * navigation target here); the title + timestamp read as a record, and the
  * Delete / Unarchive controls reveal on hover (always visible on touch).
+ * Unarchive navigates to the restored session once the PATCH lands.
  */
 function ArchivedRow({ conversation }: { conversation: Conversation }) {
+  const navigate = useNavigate();
   const archive = useArchiveConversation();
   const del = useStopAndDeleteConversation();
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -2034,7 +2038,7 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
         <div className="truncate text-ui font-medium" title={label}>
           {label}
         </div>
-        <div className="text-xs text-muted-foreground">
+        <div className="text-sm text-muted-foreground">
           {absoluteTime(conversation.updated_at * 1000)}
         </div>
       </div>
@@ -2061,7 +2065,14 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
           className="gap-1.5 dark:bg-secondary dark:hover:bg-secondary/80"
           data-testid="unarchive-conversation"
           disabled={busy}
-          onClick={() => archive.mutate({ id: conversation.id, archived: false })}
+          onClick={() =>
+            archive.mutate(
+              { id: conversation.id, archived: false },
+              // Unarchiving is how a user brings a session back into play, so
+              // land them in it — the row leaves this list either way.
+              { onSuccess: () => navigate(`/c/${conversation.id}`) },
+            )
+          }
         >
           <ArchiveRestoreIcon className="size-3.5" />
           Unarchive

@@ -63,7 +63,7 @@ function Field({
     <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
       <label htmlFor={htmlFor} className="flex flex-col pt-1.5">
         <span className="font-medium text-ui">{label}</span>
-        {hint && <span className="text-muted-foreground text-xs">{hint}</span>}
+        {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
       </label>
       <div className="sm:w-64">{children}</div>
     </div>
@@ -407,7 +407,7 @@ export function ProjectSettingsDialog({
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-auto p-0 text-muted-foreground text-xs hover:bg-transparent"
+                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
                   onClick={() => setAgentId(null)}
                 >
                   Clear

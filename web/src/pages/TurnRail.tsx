@@ -390,11 +390,11 @@ export function TurnRail({
       >
         {hovered && (
           <>
-            <p className="line-clamp-2 text-[0.8125rem] font-medium text-foreground">
+            <p className="line-clamp-2 text-sm font-medium text-foreground">
               {hovered.userText || "(no text)"}
             </p>
             {hovered.responsePreview && (
-              <p className="mt-1 line-clamp-3 text-xs text-muted-foreground">
+              <p className="mt-1 line-clamp-3 text-sm text-muted-foreground">
                 {hovered.responsePreview}
               </p>
             )}

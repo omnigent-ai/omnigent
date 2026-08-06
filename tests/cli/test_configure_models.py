@@ -2509,18 +2509,18 @@ def test_add_key_does_not_steal_pi_from_fallback_default(isolated_config) -> Non
 # ── cli-config labels + entry builder ───────────────────────────────────────
 
 
-def test_credential_label_cli_config_uses_display_name() -> None:
-    """A cli-config credential labels as the provider's own display name.
+def test_credential_label_cli_config_uses_provider_name() -> None:
+    """A cli-config credential labels from the provider entry name.
 
-    Failure means configure-harnesses shows the raw entry id instead of
-    the friendly name isaac wrote into the provider table.
+    The display_name is ignored so cli-config providers show consistently
+    alongside other kinds (e.g. isaac-databricks-codex → Isaac-Databricks-Codex).
     """
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "codex-databricks", display_name="Databricks AI Gateway"
+        "cli-config", "isaac-databricks-codex", display_name="Databricks AI Gateway"
     )
-    assert label == "Databricks AI Gateway"
+    assert label == "Isaac-Databricks-Codex"
 
 
 def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
@@ -2530,7 +2530,7 @@ def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
     """
     from omnigent.onboarding.configure_models import credential_label
 
-    assert credential_label("cli-config", "codex-myproxy") == "codex-myproxy"
+    assert credential_label("cli-config", "codex-myproxy") == "Codex-Myproxy"
 
 
 def test_build_cli_config_provider_entry_shapes() -> None:

@@ -113,7 +113,7 @@ export function ApprovePage() {
       {state.kind === "resolved" && (
         <Alert className="flex flex-col gap-2 border-muted py-4 px-5">
           <AlertTitle className="text-ui">Elicitation resolved</AlertTitle>
-          <AlertDescription className="text-xs">
+          <AlertDescription className="text-sm">
             This approval request is no longer pending. It may have been resolved, timed out, or
             cancelled.
           </AlertDescription>
@@ -123,7 +123,7 @@ export function ApprovePage() {
       {state.kind === "error" && (
         <Alert variant="destructive" className="flex flex-col gap-2 py-4 px-5">
           <AlertTitle className="text-ui">Error</AlertTitle>
-          <AlertDescription className="text-xs">{state.message}</AlertDescription>
+          <AlertDescription className="text-sm">{state.message}</AlertDescription>
         </Alert>
       )}
 
@@ -142,7 +142,7 @@ export function ApprovePage() {
               </>
             )}
           </AlertTitle>
-          <AlertDescription className="text-xs">You can close this page.</AlertDescription>
+          <AlertDescription className="text-sm">You can close this page.</AlertDescription>
         </Alert>
       )}
 
@@ -152,21 +152,21 @@ export function ApprovePage() {
             <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
             Approval required
             {state.data.policy_name && (
-              <span className="text-muted-foreground text-xs">· {state.data.policy_name}</span>
+              <span className="text-muted-foreground text-sm">· {state.data.policy_name}</span>
             )}
             {state.data.phase && (
-              <span className="text-muted-foreground text-xs">({state.data.phase})</span>
+              <span className="text-muted-foreground text-sm">({state.data.phase})</span>
             )}
           </AlertTitle>
           <AlertDescription className="flex flex-col gap-2">
             {state.data.can_approve === false && (
-              <span className="text-xs text-muted-foreground" role="note">
+              <span className="text-sm text-muted-foreground" role="note">
                 Only the session owner or a delegated approver can approve. You can still reject.
               </span>
             )}
             <span>{state.data.message}</span>
             {state.data.content_preview && (
-              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
+              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formatPreview(state.data.content_preview)}
               </pre>
             )}

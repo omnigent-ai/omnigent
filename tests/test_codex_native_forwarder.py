@@ -156,6 +156,75 @@ def test_refresh_model_from_config_updates_state(tmp_path: Path) -> None:
     assert state.model == "gpt-5.4"
 
 
+def test_refresh_prefers_pushed_settings_model_over_stale_config(tmp_path: Path) -> None:
+    """An unchanged config.toml must not roll back a live thread-settings model.
+
+    Regression for the routed-model reversion: routing switched the running
+    thread via ``thread/settings/update`` (notified as
+    ``thread/settings/updated``), but config.toml still held the pinned
+    launch model; the next ``turn/started`` re-read the stale file and
+    mirrored the default back over ``model_override`` — reverting the routed
+    model one turn after it applied.
+    """
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    # Subscription-time read adopts the pinned launch model (baseline).
+    fwd._refresh_model_from_config(tmp_path, state)
+    assert state.model == "databricks-gpt-5-5"
+    # Omnigent pushes a routed model thread-level; the live notification wins.
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+
+    # turn/started re-read: config.toml is UNCHANGED — the pushed model holds.
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "databricks-gpt-5-6-luna"
+
+
+def test_refresh_adopts_changed_config_over_settings_model(tmp_path: Path) -> None:
+    """A config.toml that changed since the last read wins over settings.
+
+    An in-TUI ``/model`` (or the executor's mirror write) rewrites the file —
+    that is the freshest signal and must not be masked by an older
+    ``thread/settings/updated`` value.
+    """
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_model_from_config(tmp_path, state)
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+    # The user picks a third model in the TUI: /model rewrites config.toml.
+    _write_codex_config(tmp_path, 'model = "gpt-5.6-sol"\n')
+
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "gpt-5.6-sol"
+
+
+def test_refresh_launch_race_ends_on_routed_model(tmp_path: Path) -> None:
+    """Launch-race scenario: the pinned default ends up on the routed model.
+
+    The terminal launch pins the default into config.toml before first-turn
+    routing runs. The executor then pushes the routed model thread-level AND
+    mirrors it into config.toml (``write_codex_config_model``); the next
+    ``turn/started`` re-read must adopt the routed model — with or without
+    the mirror write having succeeded.
+    """
+    from omnigent.codex_native_bridge import write_codex_config_model
+
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_model_from_config(tmp_path, state)
+    # First routed turn: settings push (notification) + executor mirror write.
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+    assert write_codex_config_model(tmp_path, "databricks-gpt-5-6-luna") is True
+
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "databricks-gpt-5-6-luna"
+    # Later turns stay on the routed model (no reversion churn).
+    fwd._refresh_model_from_config(tmp_path, state)
+    assert state.model == "databricks-gpt-5-6-luna"
+
+
 def test_note_resume_response_records_model_without_seeding_baseline() -> None:
     """The startup/resume model is recorded but the baseline stays unset.
 

@@ -55,6 +55,7 @@ from typing import Any, Literal
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
+    is_unresolved_invocation,
     real_invocation_tokens,
     split_command_segments,
     unwrap_shell_command,
@@ -338,7 +339,10 @@ def block_working_dir_changes(
 
         Splits the command into segments, unwraps shell-interpreter / ``eval``
         wrappers recursively, and returns the most restrictive decision across
-        all gated ops found (DENY > ASK > abstain).
+        all gated ops found (DENY > ASK > abstain). A segment whose real command
+        cannot be resolved — it does not tokenize, or a wrapper's own flags left
+        an option as the head — takes the configured action when it looks like a
+        dir op, rather than abstaining.
 
         :param command: The shell command string, e.g. ``"cd /etc && ls"``.
         :param _depth: Internal recursion guard for nested shell wrappers;
@@ -350,11 +354,21 @@ def block_working_dir_changes(
             return None
         worst: PolicyResponse | None = None
         for segment in split_command_segments(command):
+            unreadable = False
             try:
                 tokens = shlex.split(segment)
             except ValueError:
                 # Unbalanced quotes etc.: if it looks like a gated command, surface
                 # it via the configured action rather than letting it through.
+                unreadable = True
+                tokens = []
+            else:
+                tokens = real_invocation_tokens(tokens)
+                # A leading option means some wrapper's own flags were not
+                # modelled, so the real command was never reached. Same fail-safe
+                # as an un-tokenizable segment rather than a silent abstain.
+                unreadable = is_unresolved_invocation(tokens)
+            if unreadable:
                 if _looks_like_dir_op(segment, block_cd, block_worktree):
                     worst = _worse(
                         worst,
@@ -364,7 +378,6 @@ def block_working_dir_changes(
                         ),
                     )
                 continue
-            tokens = real_invocation_tokens(tokens)
             if not tokens:
                 continue
             inner = unwrap_shell_command(tokens)

@@ -60,8 +60,10 @@ with `git worktree remove <path>` when done.
    `sys_session_*` / HTTP for backend bugs — until it observes the failure.
 3. Authors a durable e2e test (`tests/e2e_ui/` for UI, `tests/e2e/` for backend)
    keyed to the concrete failure, so a fix has a fail→pass regression guard.
-4. Emits a structured verdict (`reproduced` / `not_reproduced` / `already_fixed`
-   / `needs_more_info`) with the test path, session id, journey, and evidence.
+4. Emits a single fenced ```json block (the machine-readable handoff) whose
+   `verdict` is exactly one of `reproduced` / `not_reproduced` / `already_fixed`
+   / `needs_more_info`, alongside the per-facet breakdown, test path, session id,
+   journey, and evidence. Parse `verdict` from that block to label the issue.
 
 It does **not** fix the bug, merge, or push — it produces a live-confirmed
 reproduction plus the test and hands off. The authored test lands in your working

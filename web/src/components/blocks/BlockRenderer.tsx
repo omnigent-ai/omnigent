@@ -232,7 +232,7 @@ function PlainTextFallback({ text }: { text: string }) {
   const truncated = text.length > MAX_PLAINTEXT_DISPLAY_LENGTH;
   const shown = truncated ? text.slice(0, MAX_PLAINTEXT_DISPLAY_LENGTH) : text;
   return (
-    <div className="whitespace-pre-wrap break-all font-mono text-xs">
+    <div className="whitespace-pre-wrap break-all font-mono text-sm">
       {shown}
       {truncated && (
         <span className="text-muted-foreground">
@@ -371,6 +371,8 @@ interface BlockRendererProps {
   hasPendingElicitation?: boolean;
   /** Server epoch seconds of the turn's newest item (`Bubble.lastActivityAtS`). */
   lastActivityAtS?: number;
+  /** Whether this final bubble is still part of a visible active turn. */
+  showsWorking?: boolean;
 }
 
 type ToolRunFragment =
@@ -394,9 +396,19 @@ export function BlockRenderer({
   isLastAssistant = false,
   hasPendingElicitation = false,
   lastActivityAtS,
+  showsWorking = false,
 }: BlockRendererProps) {
   const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
-  const isTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
+  // The bubble's OWN turn is live (streaming into it). Distinct from
+  // POSSIBLY live below: only this clears the shown-fold latch.
+  const isOwnTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
+  // The last assistant bubble while the session works or parks on an
+  // elicitation MAY be the live turn even when its lifecycle reads
+  // settled (a mid-turn (re)connect can miss the edge that names the
+  // turn) — treat it as live for render affordances and fold gating.
+  const possiblyLive =
+    isLastAssistant && (showsWorking || sessionStatus === "running" || hasPendingElicitation);
+  const isTurnLive = isOwnTurnLive || possiblyLive;
 
   // Fold a turn that did work AND either answered here or continues in a
   // later bubble: the trace collapses behind the "Worked for" row, exempt
@@ -410,14 +422,19 @@ export function BlockRenderer({
   // to await sub-agents), and it keeps a stray narration- or
   // reasoning-only fragment of a split turn from folding into a lone
   // "Worked" row with nothing behind it.
+  // Once the fold has SHOWN on a settled bubble, possibly-live no
+  // longer reopens it. A scheduled wake (a /loop cron or wakeup
+  // firing) flips the session to running — Working shimmer included —
+  // while the settled bubble is still the last one and the new turn
+  // has no items yet; without the latch that item-less gap popped the
+  // fold open every iteration. Only this bubble's OWN turn going live
+  // again (a revive) clears the latch and re-expands the trace.
+  const foldLatchedRef = useRef(false);
   const foldEligible =
-    !isTurnLive &&
-    // The last assistant bubble of a RUNNING session — or one parked on
-    // a pending elicitation — is (or may be) the live turn even when its
-    // lifecycle reads settled: a mid-turn (re)connect can miss the edge
-    // that names the turn. Never fold it until the session settles AND
-    // the card is answered; the terminal status edge folds it.
-    !(isLastAssistant && (sessionStatus === "running" || hasPendingElicitation)) &&
+    !isOwnTurnLive &&
+    // Never fold a possibly-live bubble whose fold hasn't shown yet:
+    // the terminal status edge is what folds it (see possiblyLive).
+    (!possiblyLive || foldLatchedRef.current) &&
     !isProvisionalTrace(items) &&
     process.length > 0 &&
     (final.length > 0 || (continued && process.some(isToolItem)));
@@ -465,6 +482,8 @@ export function BlockRenderer({
   useEffect(() => {
     mountedRef.current = true;
     foldShownRef.current = showFold;
+    if (isOwnTurnLive) foldLatchedRef.current = false;
+    else if (showFold) foldLatchedRef.current = true;
   });
 
   if (showFold) {
@@ -473,13 +492,17 @@ export function BlockRenderer({
         <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
           {renderSequence(process, { liveEdge: false, canApprove })}
         </TurnWorkedFold>
-        {exempt.map(({ item, index }) => renderItem(item, index, false, false, canApprove))}
+        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false, canApprove))}
         {renderSequence(final, { liveEdge: false, canApprove, indexBase: finalStart })}
       </>
     );
   }
 
-  return renderSequence(items, { liveEdge: isTurnLive, canApprove });
+  return renderSequence(items, {
+    liveEdge: isTurnLive,
+    canApprove,
+    suppressReasoningDuration: showsWorking,
+  });
 }
 
 /**
@@ -491,7 +514,7 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, canApprove, indexBase = 0 }: TurnSequenceOptions,
+  { liveEdge, canApprove, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -547,7 +570,14 @@ function renderSequence(
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
     rendered.push(
-      renderItem(item, indexBase + i, i === reasoningStreamingIdx, followsText, canApprove),
+      renderItem(
+        item,
+        indexBase + i,
+        i === reasoningStreamingIdx,
+        suppressReasoningDuration,
+        followsText,
+        canApprove,
+      ),
     );
     previousRenderedItemWasText = item.kind === "text";
   }
@@ -558,6 +588,7 @@ function renderSequence(
 interface TurnSequenceOptions {
   liveEdge: boolean;
   canApprove: boolean;
+  suppressReasoningDuration?: boolean;
   indexBase?: number;
 }
 
@@ -746,7 +777,7 @@ function TurnWorkedFold({
       data-testid="turn-worked-fold"
     >
       <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
+        <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-1 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
           <span className="shrink-0">{label}</span>
           <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
           <span aria-hidden className="ml-1 flex-1 border-border border-t" />
@@ -877,6 +908,7 @@ function renderItem(
   item: RenderItem,
   index: number,
   isReasoningStreaming: boolean,
+  suppressReasoningDuration = false,
   followsText = false,
   canApprove = true,
 ): ReactNode {
@@ -898,7 +930,7 @@ function renderItem(
           key={key}
           text={item.text}
           isStreaming={isReasoningStreaming}
-          duration={item.duration}
+          duration={suppressReasoningDuration ? undefined : item.duration}
         />
       );
     case "tool":

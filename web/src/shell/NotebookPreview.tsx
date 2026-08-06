@@ -125,7 +125,7 @@ function AnsiText({ text, className }: { text: string; className?: string }) {
   return (
     <pre
       className={cn(
-        "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-xs p-2",
+        "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-sm p-2",
         className,
       )}
     >
@@ -178,10 +178,10 @@ function OutputView({ output }: { output: NotebookOutput }) {
   return (
     <div>
       {imageError && (
-        <div className="text-xs text-muted-foreground italic px-2 pt-1">{imageError}</div>
+        <div className="text-sm text-muted-foreground italic px-2 pt-1">{imageError}</div>
       )}
       {suppressedHtml && (
-        <div className="text-xs text-muted-foreground italic px-2 pt-1">
+        <div className="text-sm text-muted-foreground italic px-2 pt-1">
           Rich HTML output hidden — showing plain text.
         </div>
       )}
@@ -194,11 +194,11 @@ function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLan
   const count = cell.execution_count;
   return (
     <div className="flex gap-2">
-      <div className="w-14 shrink-0 pt-1 text-right font-mono text-xs text-muted-foreground select-none">
+      <div className="w-14 shrink-0 pt-1 text-right font-mono text-sm text-muted-foreground select-none">
         In [{count ?? " "}]:
       </div>
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="rounded border bg-muted/30 text-xs">
+        <div className="rounded border bg-muted/30 text-sm">
           <CodeBlockContent code={joinSource(cell.source)} language={language} />
         </div>
         {(cell.outputs ?? []).map((output, i) => (

@@ -297,7 +297,13 @@ class HostStore:
                 # host_id is now part of the PK, so we can't UPDATE it via the
                 # ORM — delete the old row and insert a fresh one that carries
                 # the new host_id while preserving created_at.
-                row = self._rotate_host_id(session, existing_by_name, host_id, now, harnesses_json)
+                row = self._rotate_host_id(
+                    session,
+                    existing_by_name,
+                    host_id,
+                    now,
+                    harnesses_json,
+                )
                 return _row_to_host(row)
 
             # Genuinely new host: plain INSERT.
