@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -67,6 +68,8 @@ from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins.os_env import build_os_env_tools
+
+_logger = logging.getLogger(__name__)
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
@@ -3598,6 +3601,12 @@ def _handler_factory(
     return _ControlHandler
 
 
+# Cap for the upstream-failure detail echoed in the policy-eval proxy's 502
+# body. Applied to the detail before the fixed prefix so the leading cause is
+# never cut mid-reason by the truncation.
+_POLICY_PROXY_ERROR_DETAIL_MAX = 400
+
+
 def _tool_relay_handler_factory(
     token: str,
     tool_executor: ToolExecutor,
@@ -3701,8 +3710,16 @@ def _tool_relay_handler_factory(
             """
             reason = str(exc).strip()
             detail = f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
+            # Truncate the detail (not the composed message) so the leading
+            # cause always survives intact instead of being cut mid-reason once
+            # the fixed prefix is prepended.
+            if len(detail) > _POLICY_PROXY_ERROR_DETAIL_MAX:
+                detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
             message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
-            body = message[:500].encode("utf-8", "replace")
+            # Keep the full exception (with traceback) in the runner log; the
+            # user-facing body is capped and can drop a diagnostically useful tail.
+            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
+            body = message.encode("utf-8", "replace")
             self.send_response(HTTPStatus.BAD_GATEWAY)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
