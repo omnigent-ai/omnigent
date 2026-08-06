@@ -8860,7 +8860,10 @@ def _stop_daemon_sessions(
         if force:
             click.echo(f"{record.target}: skipping session stop: {result.error}", err=True)
             return 0
-        raise click.ClickException(f"{record.target}: {result.error}")
+        raise click.ClickException(
+            f"{record.target}: {result.error} — retry with --force to stop the "
+            f"daemon anyway, or --daemon-only to skip the session stop entirely."
+        )
     if result.base_url is None:
         return 0
     stopped = 0
