@@ -696,7 +696,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
         <>
-          <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between pr-3 pl-5">
+          <div className="flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -773,7 +773,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="flex flex-col gap-0 px-3 pt-2 pb-0" data-testid="sidebar-primary-nav">
+          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -883,7 +883,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-3 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -2084,7 +2084,7 @@ function SectionHeader({
                 "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
