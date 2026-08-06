@@ -1531,6 +1531,7 @@ def register_hooks_routes(
             _native_turn_catalog,
             _publish_routed_model,
             _stamp_routing_decision_label,
+            _unavailable_routing_card,
         )
         from omnigent.server.smart_routing import route_turn as _route_turn_seam
 
@@ -1629,6 +1630,23 @@ def register_hooks_routes(
             )
             await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
 
+        async def _record_decline(cause: str) -> None:
+            """Persist the declined chip for a failed routing call.
+
+            The card, not the label: a failure must stay visible without
+            claiming the route-once gate, or one outage would make this the
+            session's routing decision forever.
+            """
+            model, verdict = _unavailable_routing_card(cause)
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                model,
+                verdict,
+                scope=decision_scope(),
+                harness=route_request.harness,
+            )
+
         async def _reuse_create_route() -> bool:
             """Claim the create-time decision as this session's routing decision.
 
@@ -1659,6 +1677,7 @@ def register_hooks_routes(
             reuse_create_route=_reuse_create_route,
             pin=_pin,
             persist=_persist,
+            record_decline=_record_decline,
         )
         _logger.info(
             "route-turn: session=%s harness=%s live_model=%s pinned=%s action=%s model=%s",

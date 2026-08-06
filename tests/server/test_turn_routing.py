@@ -275,6 +275,11 @@ async def test_a_router_outage_allows_the_turn_unrouted() -> None:
         del harness, prompt
         raise RuntimeError("router down")
 
+    declines: list[str] = []
+
+    async def _decline(cause: str) -> None:
+        declines.append(cause)
+
     rec = _Recorder()
     decision = await resolve_turn_route(
         "conv_1",
@@ -283,11 +288,15 @@ async def test_a_router_outage_allows_the_turn_unrouted() -> None:
         route_turn=_boom,
         pin=rec.pin,
         persist=rec.persist,
+        record_decline=_decline,
     )
     assert decision.action == "allow"
     assert "routing unavailable" in decision.rationale
     assert rec.pinned == []
     assert rec.chips == []
+    # The failure is visible: a declined chip names the cause, without
+    # claiming the route-once label (the persist/pin seams stayed silent).
+    assert declines == ["Routing call failed: RuntimeError"]
 
 
 async def test_no_verdict_allows_the_turn_unrouted() -> None:
@@ -295,12 +304,63 @@ async def test_no_verdict_allows_the_turn_unrouted() -> None:
         del harness, prompt
         return None, None
 
+    declines: list[str] = []
+
+    async def _decline(cause: str) -> None:
+        declines.append(cause)
+
     rec = _Recorder()
     decision = await resolve_turn_route(
-        "conv_1", _request(), conv=_FakeConv(), route_turn=_none, pin=rec.pin, persist=rec.persist
+        "conv_1",
+        _request(),
+        conv=_FakeConv(),
+        route_turn=_none,
+        pin=rec.pin,
+        persist=rec.persist,
+        record_decline=_decline,
     )
     assert decision.action == "allow"
     assert rec.chips == []
+    assert declines == ["Routing unavailable (router returned no verdict)"]
+
+
+async def test_benign_allows_record_no_decline_chip() -> None:
+    """Already-routed / routing-off are not failures — they stay chipless."""
+    declines: list[str] = []
+
+    async def _decline(cause: str) -> None:
+        declines.append(cause)
+
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(),
+        conv=_FakeConv(labels={"omnigent.routing.decision_id": "dec_1"}),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+        record_decline=_decline,
+    )
+    assert decision.action == "allow"
+    assert declines == []
+
+
+async def test_a_failing_decline_record_does_not_change_the_verdict() -> None:
+    """The chip is a record, not a gate — its own failure must be swallowed."""
+
+    async def _boom(harness: str | None, prompt: str) -> tuple[str | None, dict[str, Any] | None]:
+        del harness, prompt
+        raise RuntimeError("router down")
+
+    async def _decline(cause: str) -> None:
+        del cause
+        raise OSError("store down")
+
+    decision = await resolve_turn_route(
+        "conv_1", _request(), conv=_FakeConv(), route_turn=_boom, record_decline=_decline
+    )
+    assert decision.action == "allow"
+    assert decision.terminal is False
 
 
 async def test_a_failed_pin_declines_the_route() -> None:

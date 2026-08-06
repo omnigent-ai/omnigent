@@ -539,6 +539,29 @@ def create_route_covers_prompt(conv: Any, prompt: str) -> bool:
     return bool(recorded) and recorded == create_route_prompt_fingerprint(prompt)
 
 
+async def _record_turn_decline(
+    record_decline: Callable[[str], Awaitable[None]] | None,
+    cause: str,
+    session_id: str,
+) -> None:
+    """Persist the declined chip for a failed routing call, best-effort.
+
+    The chip is a record, not a gate: a persist failure must not change the
+    fail-open verdict, so every error is swallowed into a log line.
+
+    :param record_decline: The caller's persistence coroutine, or ``None``.
+    :param cause: Why nothing was routed, e.g. ``"Routing call failed: 401"``.
+    :param session_id: Session the decline belongs to, for the log line.
+    :returns: None.
+    """
+    if record_decline is None:
+        return
+    try:
+        await record_decline(cause)
+    except Exception:
+        _logger.exception("route-turn: decline record failed for session=%s", session_id)
+
+
 async def resolve_turn_route(
     session_id: str,
     req: TurnRouteRequest,
@@ -550,6 +573,7 @@ async def resolve_turn_route(
     reuse_create_route: Callable[[], Awaitable[bool]] | None = None,
     pin: Callable[[str], Awaitable[bool]] | None = None,
     persist: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    record_decline: Callable[[str], Awaitable[None]] | None = None,
 ) -> TurnRouteDecision:
     """Decide what happens to one submitted prompt.
 
@@ -577,6 +601,10 @@ async def resolve_turn_route(
         skips the pin (unit tests).
     :param persist: Coroutine recording the decision chip, called as
         ``persist(model, verdict)``. ``None`` skips persistence.
+    :param record_decline: Coroutine persisting a declined chip when a
+        routing CALL failed, called with the cause. Only the failure
+        branches use it — the benign allows (already routed, routing off,
+        family guard) are not failures and stay chipless. ``None`` skips it.
     :returns: The verdict the hook enforces.
     """
     from omnigent.codex_model_vocabulary import comparable_model_id
@@ -625,11 +653,14 @@ async def resolve_turn_route(
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])
-    except Exception:  # noqa: BLE001 — a router outage must never block a turn
+    except Exception as exc:  # noqa: BLE001 — a router outage must never block a turn
         _logger.warning(
             "route-turn: router call failed for session=%s; allowing unrouted",
             session_id,
             exc_info=True,
+        )
+        await _record_turn_decline(
+            record_decline, f"Routing call failed: {type(exc).__name__}", session_id
         )
         return _allow("routing unavailable (router call failed)")
     if not model or verdict is None:
@@ -637,6 +668,9 @@ async def resolve_turn_route(
             "route-turn: no verdict for session=%s harness=%s; allowing unrouted",
             session_id,
             req.harness,
+        )
+        await _record_turn_decline(
+            record_decline, "Routing unavailable (router returned no verdict)", session_id
         )
         return _allow("routing unavailable (no verdict)")
     # Spelling-insensitive: codex reports its live model as a dotted slug
