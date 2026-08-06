@@ -223,8 +223,8 @@ export function TerminalsPanel({
                 onClick={() => setActiveKey(isActive ? null : key)}
               >
                 <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                {t.session && <span className="shrink-0 text-xs font-medium">{t.session}</span>}
-                <span className="truncate text-xs text-muted-foreground/70">{t.name}</span>
+                {t.session && <span className="shrink-0 text-sm font-medium">{t.session}</span>}
+                <span className="truncate text-sm text-muted-foreground/70">{t.name}</span>
                 <span className="flex-1" />
                 <TerminalStatusBadge status={getStatus(t)} />
               </button>

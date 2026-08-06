@@ -174,7 +174,7 @@ function ZoomViewer({ image }: { image: LightboxImage }) {
         <button
           type="button"
           aria-label="Reset zoom"
-          className="min-w-[3ch] cursor-pointer text-center text-xs tabular-nums text-muted-foreground hover:text-foreground"
+          className="min-w-[3ch] cursor-pointer text-center text-sm tabular-nums text-muted-foreground hover:text-foreground"
           onClick={resetView}
         >
           {Math.round(zoom * 100)}%

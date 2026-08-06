@@ -630,6 +630,12 @@ _MAX_TERMINAL_LAUNCH_ARG_LEN = 4096
 COST_CONTROL_OVERRIDE_VALUES = frozenset({"on", "off"})
 
 
+# Per-session subagent-routing switch. Two-state: only ``"on"`` routes
+# spawns, and ``"off"`` / absent both read as Default. Creates that start
+# on Smart Routing are stamped ``"on"``, so absent is never an inherit.
+SUBAGENT_ROUTING_OVERRIDE_VALUES = frozenset({"on", "off"})
+
+
 _CHILD_PREVIEW_LIMIT = 150
 
 
@@ -711,6 +717,7 @@ def get_server_host_registry() -> HostRegistry | None:
 
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
+    "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_APPROVAL_TYPE",

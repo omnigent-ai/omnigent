@@ -334,6 +334,7 @@ from omnigent.server.routes._sessions.common import (
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
+    FILE_CONTENT_CACHE_CONTROL as FILE_CONTENT_CACHE_CONTROL,
     SessionLiveness as SessionLiveness,
     _HostLaunchAttempt as _HostLaunchAttempt,
     _NativeTerminalEnsureOutcome as _NativeTerminalEnsureOutcome,
@@ -384,6 +385,7 @@ from omnigent.server.routes._sessions.helpers import (
     _extract_persistent_item_from_sse as _extract_persistent_item_from_sse,
     _extract_user_text_for_routing as _extract_user_text_for_routing,
     _extract_user_text_from_event as _extract_user_text_from_event,
+    _file_content_etag as _file_content_etag,
     _find_claude_native_subagent_child as _find_claude_native_subagent_child,
     _find_codex_native_subagent_child as _find_codex_native_subagent_child,
     _find_subagent_child_by_title as _find_subagent_child_by_title,
@@ -394,6 +396,7 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_external_session_todos as _handle_external_session_todos,
     _handle_mcp_tools_list as _handle_mcp_tools_list,
     _host_model_options_via_registry as _host_model_options_via_registry,
+    _if_none_match_matches as _if_none_match_matches,
     _invalidate_runner_backed_snapshot_state as _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent as _is_codex_native_subagent,
     _is_kiro_native_session as _is_kiro_native_session,

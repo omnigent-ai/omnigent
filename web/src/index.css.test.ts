@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { transform } from "lightningcss";
 import { describe, expect, it } from "vitest";
 
-import { UI_FONT_SIZE_DEFAULT } from "./lib/uiFontPreferences";
+import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
@@ -227,8 +227,9 @@ describe("index.css sidebar canvas", () => {
 /* Regression test for the "inline <code> renders at 9.75px" bug.
  *
  * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
- * parent's step. Anchoring the ramp factors to the raw 13px preference instead
- * of a 16px-equivalent shrank text-xs to 9.75px and every <code> under it.
+ * parent's step. Anchoring the title ratios to the raw 13px preference instead
+ * of a 16px-equivalent shrank every step ~19%, dragging the <code> under them
+ * down to 9.75px.
  */
 describe("index.css desktop typography ramp", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
@@ -250,23 +251,82 @@ describe("index.css desktop typography ramp", () => {
   });
 
   it.each([
-    ["--text-xs", 0.75, 12],
-    ["--text-sm", 0.9, 14.4],
     ["--text-lg", 1.125, 18],
-  ])("scales %s off the anchor, not the raw preference", (token, factor, expectedPx) => {
+    ["--text-xl", 1.25, 20],
+    ["--text-2xl", 1.5, 24],
+  ])("scales the %s title step off the anchor, not the raw preference", (token, factor, px) => {
     // Multiplying --desktop-ui-font-size directly is the bug: it is the body
     // step, not the 16px base the ratios were calibrated against.
     expect(desktopMap).toContain(`${token}: calc(var(--ui-ramp-anchor) * ${factor})`);
     // At the default preference the step must land back on the design value.
-    expect((UI_FONT_SIZE_DEFAULT * (16 / anchorDivisor) * factor).toFixed(2)).toBe(
-      expectedPx.toFixed(2),
-    );
+    expect((UI_FONT_SIZE_DEFAULT * (16 / anchorDivisor) * factor).toFixed(2)).toBe(px.toFixed(2));
   });
 
   it("keeps the body steps on the raw preference", () => {
     // text-ui/text-base ARE the body step, so they must not be re-anchored.
     expect(desktopMap).toContain("--text-ui: var(--desktop-ui-font-size)");
     expect(desktopMap).toContain("--text-base: var(--desktop-ui-font-size)");
+  });
+});
+
+/* Contract for the two body text steps.
+ *
+ * text-sm used to be derived from --ui-ramp-anchor, which put it at 14.4px
+ * against a 13px body — a caption tier LARGER than the text it captions. It
+ * must come off the body step so it stays proportional at every size the
+ * Appearance setting allows.
+ */
+describe("index.css body text tokens", () => {
+  const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
+  const mobileMap = cssSource.match(
+    /@media \(width < 48rem\) \{\s*\/\*[^*]*\*\/\s*:root \{[^}]*\}/,
+  )?.[0];
+  const CAPTION_RATIO = 0.9;
+  const LINE_HEIGHT_RATIO = 1.6;
+
+  it("derives the caption step from the body step on desktop", () => {
+    expect(desktopMap).toContain(`--text-sm: calc(var(--desktop-ui-font-size) * ${CAPTION_RATIO})`);
+    // The anchor is the 16px-equivalent grid for TITLE ratios only. Routing the
+    // caption factor through it is the inverted-hierarchy bug.
+    expect(desktopMap).not.toContain(`--text-sm: calc(var(--ui-ramp-anchor) * ${CAPTION_RATIO})`);
+  });
+
+  it("derives the caption step from the body step on mobile too", () => {
+    expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
+    expect(mobileMap).toContain(`--text-sm: calc(var(--mobile-ui-font-size) * ${CAPTION_RATIO})`);
+    expect(mobileMap).toContain("--text-ui: var(--mobile-ui-font-size)");
+  });
+
+  it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX])(
+    "keeps the caption step smaller than the body step at %ipx",
+    (px) => {
+      expect(px * CAPTION_RATIO).toBeLessThan(px);
+    },
+  );
+
+  it("aliases the retired text-xs onto the caption step", () => {
+    // Left on Tailwind's 0.75rem it would be a hard 12px against the fixed
+    // 16px root, silently ignoring the Appearance setting — including in
+    // vendor markup (streamdown) this app does not control.
+    expect(cssSource).toContain("--text-xs: var(--text-sm)");
+    expect(cssSource).toContain("--text-xs--line-height: var(--text-sm--line-height)");
+    // And it must NOT be remapped in the media queries, or the alias is moot.
+    expect(desktopMap).not.toContain("--text-xs:");
+    expect(mobileMap).not.toContain("--text-xs:");
+  });
+
+  it("gives both steps a unitless line height so the rhythm scales", () => {
+    // Unitless, not px: a fixed pair would re-freeze the line box at the
+    // larger settings. 1.6 puts the 13px default on ~21px.
+    const themeBlock = cssSource.match(/@theme \{[^}]*--text-ui:[^}]*\}/)?.[0];
+    expect(themeBlock).toContain(`--text-ui--line-height: ${LINE_HEIGHT_RATIO}`);
+    expect(themeBlock).toContain(`--text-sm--line-height: ${LINE_HEIGHT_RATIO}`);
+  });
+
+  it("retires the duplicate 13px and caption tokens", () => {
+    // text-13 duplicated text-ui; text-caption was a dead fixed 12px step.
+    expect(cssSource).not.toContain("--text-13:");
+    expect(cssSource).not.toContain("--text-caption:");
   });
 });
 

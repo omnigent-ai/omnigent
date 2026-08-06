@@ -3366,7 +3366,7 @@ async def test_sys_session_send_model_rejected_for_unplumbed_harness(
         pytest.param(
             "codex-native",
             "databricks-claude-sonnet-4-6",
-            "only runs GPT models",
+            "only runs codex-compatible models",
             id="claude-on-codex",
         ),
         pytest.param(

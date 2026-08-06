@@ -32,15 +32,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Runner-side status vocabulary the file maps onto. ``busy`` and
-# ``waiting`` both mean "the turn is not finished" from the session's
-# point of view, so both map to ``running`` (Option A — ``waiting`` is
-# not yet surfaced as a distinct "needs input" state).
+# ``waiting`` both mean "the turn is not finished" from the session's point
+# of view, so both map to ``running``; ``waiting`` is distinguished for the
+# UI by the ``waitingFor`` reason rather than by a separate status. (The
+# session vocabulary's own ``waiting`` means something else entirely —
+# "turn ended, background work remains" — and must not be reused here.)
 RUNNING = "running"
 IDLE = "idle"
 
-# Claude interactive-session status literals (writer ``b3f`` in the
-# bundle). ``running``/``completed``/``failed`` belong to background jobs
-# and are not expected here, but map defensively rather than crash.
+# Claude interactive-session status literals. The interactive writer emits
+# exactly ``busy`` / ``shell`` / ``idle`` / ``waiting``: ``busy`` while the
+# turn is loading or a delegate is active, and ``waiting`` while a dialog
+# owns the input.
 _STATUS_TO_RUNNER: dict[str, str] = {
     "busy": RUNNING,
     "waiting": RUNNING,
@@ -78,11 +81,15 @@ class SessionStatus:
         "needs input" surfacing.
     :param status_updated_at: The file's ``statusUpdatedAt`` epoch-ms
         value, or ``None`` when absent.
+    :param blocked_on: The file's ``waitingFor`` reason when the raw status
+        is ``waiting`` — a short human phrase, e.g. ``"permission prompt"``,
+        ``"input needed"``, ``"dialog open"``. ``None`` otherwise.
     """
 
     runner_status: str
     raw_status: str
     status_updated_at: int | None
+    blocked_on: str | None = None
 
 
 def sessions_dir(config_dir: Path | None = None) -> Path:
@@ -229,10 +236,14 @@ def read_session_status(path: Path) -> SessionStatus | None:
         return None
     updated = record.get("statusUpdatedAt")
     status_updated_at = updated if isinstance(updated, int) else None
+    # Only meaningful alongside ``waiting`` — the writer merges updates into
+    # the existing record, so ignore any reason left over from an earlier one.
+    reason = record.get("waitingFor") if raw_status == "waiting" else None
     return SessionStatus(
         runner_status=runner_status,
         raw_status=raw_status,
         status_updated_at=status_updated_at,
+        blocked_on=reason if isinstance(reason, str) and reason else None,
     )
 
 
@@ -257,17 +268,21 @@ class SessionStatusPoller:
 
     - **Resolving:** each :meth:`tick` retries :func:`resolve_status_file`
       until it locks on or :data:`_MAX_RESOLVE_ATTEMPTS` is exhausted.
-      While resolving, :attr:`active` is ``False`` and the caller keeps
-      the PTY watcher authoritative for status.
-    - **Active:** once resolved, :attr:`active` is ``True`` (the caller
-      mutes PTY-derived status) and each tick reads the file and fires the
-      callback on a changed runner status.
+    - **Active:** once resolved, :attr:`active` is ``True`` and each tick
+      reads the file and fires the callback on a changed runner status.
     - **Exhausted:** if resolution never succeeds, :attr:`active` stays
-      ``False`` permanently and the PTY watcher remains the status source.
+      ``False`` permanently and the file contributes nothing.
 
-    :param on_status: Callback invoked with :data:`RUNNING` / :data:`IDLE`
-        on each status transition (and once on first read). Must not block
-        the watcher thread for long.
+    The poller never displaces the PTY watcher: it supplies an *additional*
+    status edge at Claude's real turn boundary, plus the freshness-bounded
+    :meth:`asserts_running` level the watcher consults before declaring a
+    quiet pane idle.
+
+    :param on_status: Callback invoked as ``(runner_status, blocked_on)``
+        on each transition (and once on first read). Fires when either part
+        changes, so ``busy`` → ``waiting`` still delivers its reason even
+        though both map to :data:`RUNNING`. Must not block the watcher
+        thread for long.
     :param pane_pid_getter: Returns the terminal's current pane pid, or
         ``None``. Called during resolution; on the omnigent launch path
         this pid names the status file.
@@ -280,7 +295,7 @@ class SessionStatusPoller:
     def __init__(
         self,
         *,
-        on_status: Callable[[str], None],
+        on_status: Callable[[str, str | None], None],
         pane_pid_getter: Callable[[], int | None],
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
@@ -293,18 +308,17 @@ class SessionStatusPoller:
         self._attempts = 0
         self._exhausted = False
         self._last_mtime: float | None = None
-        self._last_runner_status: str | None = None
+        self._last_edge: tuple[str, str | None] | None = None
+        self._last_status: SessionStatus | None = None
 
     @property
     def active(self) -> bool:
-        """Whether the file is currently the authoritative status source.
+        """Whether a resolved file is still being read.
 
-        ``True`` only while a resolved file is still being read. The caller
-        reads this to decide whether to suppress the PTY-derived status
-        edges (file is authoritative) or keep them (still resolving, gave
-        up, or the file vanished). Goes back to ``False`` once the file
-        disappears — clean exit unlinks it — so the PTY watcher cleanly
-        reclaims status and exit detection.
+        ``False`` while resolving, once resolution gave up, or after the
+        file disappears (clean exit unlinks it). Status edges from the PTY
+        watcher are published regardless — this only reports whether the
+        file is contributing.
         """
         return self._path is not None and not self._exhausted
 
@@ -336,6 +350,47 @@ class SessionStatusPoller:
         if self._attempts >= _MAX_RESOLVE_ATTEMPTS:
             self._exhausted = True
 
+    def asserts_running(self, *, ttl_s: float, now: float | None = None) -> bool:
+        """Whether the file *recently* reported the session as running.
+
+        The file is written only when its value changes, so its status is a
+        level that can outlive the truth — Claude keeps reporting ``busy``
+        while a delegate or background task is active, long after the turn
+        itself ended. Callers therefore treat it as authoritative only for
+        *ttl_s* after the write, and fall back to the pane watcher once it
+        goes stale rather than pinning the session to ``running`` forever.
+
+        :param ttl_s: How long after ``statusUpdatedAt`` the level is still
+            trusted, in seconds.
+        :param now: Wall-clock override (tests); uses :func:`time.time`
+            when ``None``.
+        :returns: ``True`` when the last read said running and is still fresh.
+        """
+        status = self._last_status
+        if status is None or status.runner_status != RUNNING:
+            return False
+        # ``waiting`` does not decay: a dialog owns Claude's input until it
+        # closes, and closing it changes the value — so a new write is
+        # guaranteed. ``busy`` decays, because a delegate or background task
+        # keeps it set long after the turn it belongs to has ended.
+        if status.raw_status == "waiting":
+            return True
+        if status.status_updated_at is None:
+            return False
+        clock = time.time() if now is None else now
+        return clock - status.status_updated_at / 1000.0 <= ttl_s
+
+    @property
+    def blocked_on(self) -> str | None:
+        """Why Claude is parked, when it is parked on a dialog.
+
+        ``None`` unless the last read was ``waiting`` and carried a reason.
+        """
+        status = self._last_status
+        if status is None or status.raw_status != "waiting":
+            return None
+        return status.blocked_on
+
     def _read_and_publish(self) -> None:
         """Read the resolved file and fire the callback on a status change."""
         assert self._path is not None
@@ -351,8 +406,16 @@ class SessionStatusPoller:
         self._last_mtime = mtime
         status = read_session_status(self._path)
         if status is None:
+            # An unrecognized literal — the file is an undocumented internal
+            # detail whose vocabulary can grow. We are now blind to this
+            # transition, so drop the dedup baseline: the next readable
+            # status must publish rather than be swallowed as a duplicate.
+            self._last_status = None
+            self._last_edge = None
             return
-        if status.runner_status == self._last_runner_status:
+        self._last_status = status
+        edge = (status.runner_status, status.blocked_on)
+        if edge == self._last_edge:
             return
-        self._last_runner_status = status.runner_status
-        self._on_status(status.runner_status)
+        self._last_edge = edge
+        self._on_status(status.runner_status, status.blocked_on)

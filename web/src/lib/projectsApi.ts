@@ -41,7 +41,7 @@ export interface Project {
   id: string;
   name: string;
   /** Owner user id; `null` in single-user / OSS mode. */
-  owner_user_id?: string | null;
+  user_id?: string | null;
   created_at?: number;
   updated_at?: number | null;
   /** Stored default session settings; `{}` when the project has none. */
