@@ -206,6 +206,22 @@ describe("useDictationInsert", () => {
       expect(composer.value).toBe("Ship it today, please.");
     });
 
+    it("sits flush inside an opening delimiter", () => {
+      const composer = renderComposer("call(arg)");
+      composer.click(5); // just after "("
+      composer.appendFinal("the");
+      expect(composer.value).toBe("call(the arg)");
+    });
+
+    it("keeps a space before an opening quote", () => {
+      // Quotes are ambiguous, so they are spaced like any other character
+      // rather than guessed at; fusing words is the worse failure.
+      const composer = renderComposer('say "quoted"');
+      composer.click(4); // before the opening quote
+      composer.appendFinal("please");
+      expect(composer.value).toBe('say please "quoted"');
+    });
+
     it("respects a newline boundary without adding a space", () => {
       const composer = renderComposer("intro\nPASTED");
       composer.click(6);
@@ -257,6 +273,41 @@ describe("useDictationInsert", () => {
       composer.click(2);
       composer.appendFinal("End.");
       expect(composer.value).toBe("ab End.");
+    });
+
+    it("follows a moved caret after the mic's end-of-take interim clear", () => {
+      // ComposerMicButton ends a take with onInterim(""), which lands here as
+      // a no-op once the preceding final has cleared the region. A same-value
+      // setDraft can bail out without committing, so requesting a caret on that
+      // path would leave the request outstanding forever and pin every later
+      // utterance to the tail, ignoring wherever the user clicked.
+      const composer = renderComposer("PASTED");
+      composer.click(0);
+      composer.appendFinal("Hello");
+      expect(composer.value).toBe("Hello PASTED");
+      composer.replaceInterim(""); // end of take
+      expect(composer.value).toBe("Hello PASTED");
+      composer.click(0);
+      composer.appendFinal("Second.");
+      expect(composer.value).toBe("Second. Hello PASTED");
+    });
+
+    it("does not resurrect a spent region when the draft returns to its text", () => {
+      // Undo (or retyping the same string) restores value equality with what
+      // dictation produced, but those characters now belong to the user. A
+      // value-equality ownership check would slice the old interim span back
+      // out of the middle of the draft.
+      const composer = renderComposer("KEEP");
+      composer.click(0);
+      composer.replaceInterim("partial");
+      const produced = composer.value;
+      expect(produced).toBe("partial KEEP");
+      composer.setRaw("something else"); // user edits away
+      composer.setRaw(produced); // ...and undoes back
+      composer.replaceInterim("next");
+      // "partial" is the user's text now, so it must survive.
+      expect(composer.value).toContain("partial");
+      expect(composer.value).toContain("next");
     });
 
     it("starts clean after an Esc discard reverts the draft", () => {

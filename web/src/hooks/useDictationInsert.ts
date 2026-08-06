@@ -2,7 +2,7 @@
 //
 // The mic button emits two kinds of text (see ComposerMicButton):
 //   - final utterances (onTranscript), pinned permanently, and
-//   - interim partials (onInterim, server dictation only) — a revisable
+//   - interim partials (onInterim, server dictation only), a revisable
 //     region that forms live while the user speaks and is rewritten on
 //     every update until an utterance finalizes.
 //
@@ -24,11 +24,12 @@
 // plain value assignment, pure by construction under StrictMode.
 //
 // Offsets this hook derives are only meaningful against the draft they were
-// measured in, so they are stored with the exact string it produced and used
-// only while the draft is still verbatim that string. A send, an Esc revert,
-// or the user editing all fail that check, and the hook falls back to the
-// live caret. Dictation must never delete or displace text it didn't write,
-// and string identity is what proves nothing else has landed since.
+// measured in, so they live together in one "produced" record that is dropped
+// the moment a draft arrives that the hook didn't write. Ownership is tracked
+// rather than re-derived by comparing text: an edit away and back (an undo, or
+// the same string retyped) restores equality, and acting on that would slice a
+// spent interim span out of characters that by then belong to the user.
+// Dictation must never delete or displace text it didn't write.
 
 import { type RefObject, useCallback, useLayoutEffect, useRef } from "react";
 
@@ -48,9 +49,17 @@ interface Produced {
   tail: number;
 }
 
-/** Leading whitespace, or punctuation that hugs the word before it. No
- *  separating space is wanted when dictated text lands ahead of these. */
-const HUGS_LEFT = /^[\s,.;:!?)\]}>'"]/;
+/** What follows the insertion point when no separating space belongs after the
+ *  dictated text: whitespace, or punctuation that hugs the word before it.
+ *  Quotes are deliberately absent. They are ambiguous (`"` opens as often as it
+ *  closes) and guessing wrong fuses words, so they get a space like any other
+ *  character. */
+const HUGS_LEFT = /^[\s,.;:!?)\]}>]/;
+
+/** What precedes the insertion point when no separating space belongs before
+ *  the dictated text: start of draft, whitespace, or an opening delimiter the
+ *  text should sit flush against. */
+const HUGS_RIGHT = /[\s([{<]$/;
 
 /**
  * Splice *text* into *base* at *at*, padded with single spaces so dictated
@@ -68,7 +77,7 @@ function splice(
   const start = Math.min(Math.max(at, 0), base.length);
   const before = base.slice(0, start);
   const after = base.slice(start);
-  const lead = text && before && !/\s$/.test(before) ? " " : "";
+  const lead = text && before && !HUGS_RIGHT.test(before) ? " " : "";
   const trail = text && after && !HUGS_LEFT.test(after) ? " " : "";
   const body = lead + text + trail;
   return {
@@ -94,12 +103,23 @@ export function useDictationInsert(
   // win, and written on insert so a second transcript in the same batch
   // doesn't read a pre-render value.
   const draftRef = useRef(draft);
-  draftRef.current = draft;
+  // What this hook last wrote, or null when it doesn't own the draft. Ownership
+  // is tracked rather than inferred by comparing text: an edit away and back
+  // (an undo, or the same string retyped) restores equality, and trusting that
+  // would resurrect a spent region whose characters are by then the user's own
+  // and slice them out of the middle of the draft.
   const producedRef = useRef<Produced | null>(null);
+  if (draftRef.current !== draft) {
+    // The draft changed under us. Released here rather than in an effect so a
+    // transcript arriving before effects flush can't act on a dead region.
+    if (producedRef.current?.value !== draft) producedRef.current = null;
+    draftRef.current = draft;
+  }
   // Whether the textarea has ever held focus. Until it has, its selectionStart
   // is 0 by default rather than a caret the user placed and can see.
   const focusedRef = useRef(false);
-  // Caret to apply once React has rendered the spliced draft.
+  // Caret this hook has asked for but not yet applied, or null when none is
+  // outstanding. Non-null means the DOM caret is stale.
   const wantCaretRef = useRef<number | null>(null);
 
   // Applied in a layout effect because the draft is React state: setting the
@@ -109,16 +129,25 @@ export function useDictationInsert(
     const position = wantCaretRef.current;
     if (position === null) return;
     wantCaretRef.current = null;
+    const ta = textareaRef?.current;
+    if (!ta) return;
     // Deliberately does not focus: a take is usually driven from the mic
     // button, and stealing focus drops its Enter-commit / Esc-cancel keys.
-    textareaRef?.current?.setSelectionRange(position, position);
+    // Some browsers scroll an unfocused element to reveal the new selection,
+    // so the scroll position is restored around the write; a dictating user
+    // watching one part of a long draft shouldn't get yanked elsewhere.
+    const { scrollTop, scrollLeft } = ta;
+    ta.setSelectionRange(position, position);
+    if (ta !== document.activeElement) {
+      ta.scrollTop = scrollTop;
+      ta.scrollLeft = scrollLeft;
+    }
   });
 
   const insert = useCallback(
     (text: string, pin: boolean) => {
       const current = draftRef.current;
-      // Our bookkeeping only holds while the draft is verbatim what we wrote.
-      const mine = producedRef.current?.value === current ? producedRef.current : null;
+      const mine = producedRef.current;
       const region = mine?.region ?? null;
       // Lift a pending interim out so this update replaces it.
       const base = region
@@ -128,19 +157,23 @@ export function useDictationInsert(
       // The live caret, or null while the field has never been focused (where
       // selectionStart's default 0 is not a caret the user placed).
       const live = focusedRef.current && ta ? ta.selectionStart : null;
-      // While a caret write is still pending, the DOM caret is stale: several
-      // transcripts can land in one React batch and the write is a layout
-      // effect that runs only after the batch flushes. The remembered tail is
-      // then the only offset that advances per utterance. A stale caret and a
-      // caret the user just moved are indistinguishable by value, so this
-      // tracks the outstanding write rather than comparing offsets.
-      const stale = wantCaretRef.current !== null;
       // Where this insert goes, most specific first: a pending interim keeps
-      // its start so partials revise in place; then our tail while the caret
-      // is stale; then the user's caret; then the end of the draft, which is
-      // what dictation did before it was positional.
-      const at = region?.start ?? (stale ? (mine?.tail ?? base.length) : (live ?? base.length));
+      // its start so partials revise in place; then our own tail while a caret
+      // write is still outstanding (several transcripts can land in one React
+      // batch, and until it flushes the DOM caret is stale, so the tail is the
+      // only offset that advances per utterance); then the user's caret; then
+      // the end of the draft, dictation's pre-positional behavior.
+      const stale = mine !== null && wantCaretRef.current !== null;
+      const at = region?.start ?? (stale ? mine.tail : (live ?? base.length));
       const spliced = splice(base, at, text);
+
+      // Nothing to write. Reached by the empty-interim clear the mic emits at
+      // the end of a take, once the preceding final has already cleared the
+      // region. setDraft would be a same-value update, which React can bail out
+      // of without committing, so the layout effect would never run to clear a
+      // caret request made here and every later utterance would read the DOM
+      // caret as stale, pinning inserts to the tail and ignoring the user.
+      if (spliced.next === current) return;
 
       draftRef.current = spliced.next;
       producedRef.current = {
