@@ -53,17 +53,16 @@ jobs:
           script: |
             const script = require(".github/workflows/demo-check.js");
             await script({ context, github, core });
-      # LIMIT bounds how many contributors a single run may comment on. It is
-      # deliberately low while the wording gets its first real-world read, and can
-      # be raised once the first live comments look right. Setting ENFORCE back to
-      # "false" returns to a dry run, which enumerates every verdict into the step
-      # summary and writes nothing.
+      # LIMIT bounds how many contributors a single run may comment on, so a
+      # mistake in the wording or the predicate cannot reach the whole queue in one
+      # sweep. Setting ENFORCE back to "false" returns to a dry run, which
+      # enumerates every verdict into the step summary and writes nothing.
       - name: Issue-link check
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           ENFORCE: "true"
-          LIMIT: "3"
+          LIMIT: "25"
         with:
           retries: 3
           script: |
