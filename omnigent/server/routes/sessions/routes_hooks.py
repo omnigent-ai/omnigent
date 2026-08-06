@@ -94,6 +94,38 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
 
+def _create_route_decision_id(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """Return the decision id of a session's create-time routing card.
+
+    The create emits the card but leaves the route-once label unclaimed,
+    because the prompt the user finally submits may not be the one it routed.
+    When it IS the same prompt, the first-prompt hook claims this decision
+    rather than making a second one.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store exposing ``list_items``.
+    :returns: The applied ``"session"``-scope decision id, or ``None`` when
+        the session has none.
+    """
+    try:
+        page = conversation_store.list_items(session_id, type="routing_decision", order="asc")
+    except (OSError, ValueError):
+        _logger.warning(
+            "route-turn: could not read session=%s routing decisions", session_id, exc_info=True
+        )
+        return None
+    for item in page.data:
+        data = item.data
+        if getattr(data, "scope", None) == "session" and getattr(data, "applied", False):
+            decision_id = getattr(data, "decision_id", None)
+            if isinstance(decision_id, str) and decision_id:
+                return decision_id
+    return None
+
+
 def register_hooks_routes(
     router: APIRouter,
     *,
@@ -1597,6 +1629,24 @@ def register_hooks_routes(
             )
             await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
 
+        async def _reuse_create_route() -> bool:
+            """Claim the create-time decision as this session's routing decision.
+
+            No second chip: the create's own row already says what was picked,
+            and the pane launched on it. Claiming the route-once label is what
+            makes this the session's decision, so a later prompt does not ask
+            again.
+
+            :returns: ``True`` when the create's decision was claimed.
+            """
+            decision_id = await asyncio.to_thread(
+                _create_route_decision_id, session_id, conversation_store
+            )
+            if decision_id is None:
+                return False
+            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+            return True
+
         decision = await resolve_turn_route(
             session_id,
             route_request,
@@ -1606,6 +1656,7 @@ def register_hooks_routes(
             # the pane's own family is not the only one that matters.
             parent_harness=_resolve_harness(parent) if parent is not None else None,
             route_turn=_route,
+            reuse_create_route=_reuse_create_route,
             pin=_pin,
             persist=_persist,
         )

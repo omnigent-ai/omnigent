@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import secrets
@@ -194,6 +195,11 @@ _SCOPE = "turn"
 
 #: Prompt text handed to the router, capped like the subagent path.
 _PROMPT_CAP = 4000
+
+#: Hex characters kept from a create-route prompt fingerprint. Long enough
+#: that two prompts in one session never collide, short enough to keep the
+#: label small.
+_FINGERPRINT_CHARS = 32
 
 #: Coroutine that returns ``(model, verdict)`` for one turn — the
 #: ``omnigent.server.smart_routing.route_turn`` seam, injected so the
@@ -496,6 +502,43 @@ def out_of_parent_family(
     return parent_family is not None and own_family is not None and parent_family != own_family
 
 
+def create_route_prompt_fingerprint(prompt: str) -> str:
+    """Fingerprint a prompt for the create-route reuse check.
+
+    Whitespace-insensitive at the edges only: the harness submits the prompt
+    the create routed, but a launcher may add or drop a trailing newline.
+    Anything else is a different prompt and must route on its own.
+
+    :param prompt: The prompt text.
+    :returns: A hex digest, empty for a blank prompt.
+    """
+    text = prompt.strip()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:_FINGERPRINT_CHARS]
+
+
+def create_route_covers_prompt(conv: Any, prompt: str) -> bool:
+    """Report whether a create-time route already scored *prompt*.
+
+    A native Smart Routing create routes the landing screen's prompt and pins
+    what it picked; the harness then submits that same prompt, and this hook
+    would score it again — a second router call, seconds later, for a verdict
+    the session is already running on. The create records a fingerprint of what
+    it routed, so the repeat is recognizable; a prompt the user edited before
+    sending does not match and routes on its own.
+
+    :param conv: Conversation row for the session.
+    :param prompt: The submitted prompt.
+    :returns: ``True`` when this prompt was already routed at create.
+    """
+    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+
+    labels = getattr(conv, "labels", None) or {}
+    recorded = labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY)
+    return bool(recorded) and recorded == create_route_prompt_fingerprint(prompt)
+
+
 async def resolve_turn_route(
     session_id: str,
     req: TurnRouteRequest,
@@ -504,6 +547,7 @@ async def resolve_turn_route(
     parent: Any = None,
     parent_harness: str | None = None,
     route_turn: RouteTurnFn,
+    reuse_create_route: Callable[[], Awaitable[bool]] | None = None,
     pin: Callable[[str], Awaitable[bool]] | None = None,
     persist: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
 ) -> TurnRouteDecision:
@@ -522,6 +566,11 @@ async def resolve_turn_route(
         guard. ``None`` skips it (nothing to compare against).
     :param route_turn: The routing seam, called as
         ``route_turn(harness, prompt)``.
+    :param reuse_create_route: Coroutine claiming the create-time decision as
+        this session's routing decision, for a prompt the create already
+        routed; returns ``False`` when there is nothing to claim (or the
+        claim failed), and the prompt is then routed normally. ``None``
+        skips the reuse path.
     :param pin: Coroutine persisting ``model_override``; returns ``False``
         when the write failed (routing is then declined, because an
         unpinned route would re-route on every later prompt). ``None``
@@ -561,6 +610,18 @@ async def resolve_turn_route(
             req.harness,
         )
         return _allow("this session's parent routes only its own model family")
+    if create_route_covers_prompt(conv, req.prompt) and (
+        reuse_create_route is None or await reuse_create_route()
+    ):
+        # The create already routed this exact prompt and pinned what it
+        # picked, so the pane is running the verdict. Routing again would cost
+        # a second judge call for the same answer — and block the prompt to
+        # "switch" onto the model it is already on.
+        _logger.info(
+            "route-turn: session=%s reuses the create-time decision for this prompt",
+            session_id,
+        )
+        return _allow("this session was routed at create on this prompt", terminal=True)
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])

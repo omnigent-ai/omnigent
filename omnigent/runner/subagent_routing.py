@@ -99,6 +99,16 @@ HOOK_REQUEST_TIMEOUT_S = 15.0
 #: a new column or a transcript scan.
 ROUTING_DECISION_LABEL_KEY = "omnigent.routing.decision_id"
 
+#: Conversation label fingerprinting the prompt a create-time route scored.
+#: A native Smart Routing create routes the prompt the user typed on the
+#: landing screen, and that same prompt is then submitted inside the harness —
+#: where the first-prompt hook would score it a second time, seconds later, for
+#: the same verdict. The fingerprint lets that hook recognize its own prompt
+#: and reuse the create's decision. A hash, not the text: a label is metadata
+#: that travels into listings and telemetry, and the user's prompt does not
+#: belong there.
+CREATE_ROUTE_PROMPT_LABEL_KEY = "omnigent.routing.create_prompt"
+
 #: Conversation label marking a session created in auto-harness mode. The
 #: ``harness_override`` sentinel is replaced the moment first-message routing
 #: resolves a harness, so this label is the durable record that the router

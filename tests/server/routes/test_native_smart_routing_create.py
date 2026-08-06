@@ -486,6 +486,124 @@ async def test_smart_routing_session_keeps_cross_harness_subagents(
     assert resp.json()["harness"] == "codex-native"
 
 
+# ── The create's verdict is not re-derived on the first prompt ──────────────
+#
+# The prompt the landing screen routed is submitted again inside the harness,
+# where the first-prompt hook used to score it a second time — one more judge
+# call, tens of seconds later, for the verdict the pane was already running.
+
+
+async def _route_turn(
+    client: httpx.AsyncClient,
+    session_id: str,
+    routing_client: FakeRoutingClient | None,
+    *,
+    harness: str,
+    prompt: str,
+) -> httpx.Response:
+    """POST the in-harness first-prompt hook for *session_id*.
+
+    :param client: Test HTTP client.
+    :param session_id: The session whose prompt was submitted.
+    :param routing_client: Stub router the hook may call.
+    :param harness: The pane's harness, e.g. ``"codex-native"``.
+    :param prompt: The submitted prompt text.
+    :returns: The raw hook response.
+    """
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=False)):
+        return await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-turn",
+            json={"harness": harness, "prompt": prompt},
+        )
+
+
+async def test_the_first_prompt_reuses_the_creates_verdict(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    created = await _create_smart_routing_session(client, wrappers, routing_client)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    route = await _route_turn(
+        client,
+        session_id,
+        routing_client,
+        harness="codex-native",
+        prompt=ROUTING_MESSAGE,
+    )
+    assert route.status_code == 200, route.text
+    # Nothing to switch to and nothing to replay: the pane launched on the pick.
+    assert route.json()["action"] == "allow"
+    assert route.json()["terminal"] is True
+    # One router call for the whole session, not two.
+    assert len(routing_client.offered) == 1
+
+    # One chip, and it is the create's — now claimed as the session's decision,
+    # so a later prompt does not ask again either.
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert len(decisions) == 1
+    assert decisions[0]["scope"] == "session"
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get(ROUTING_DECISION_LABEL_KEY) == decisions[0]["decision_id"]
+
+
+async def test_a_prompt_the_create_did_not_route_still_routes(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    created = await _create_smart_routing_session(client, wrappers, routing_client)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    # The user edited the prompt in the pane before sending it, so the create's
+    # verdict was reached on text nobody submitted.
+    route = await _route_turn(
+        client,
+        session_id,
+        routing_client,
+        harness="codex-native",
+        prompt="actually, just fix the failing test",
+    )
+    assert route.status_code == 200, route.text
+    assert route.json()["action"] == "route"
+    assert len(routing_client.offered) == 2
+
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert [d["scope"] for d in decisions] == ["session", "turn"]
+
+
+async def test_an_outage_at_create_leaves_the_first_prompt_free_to_route(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    created = await _create_smart_routing_session(client, wrappers, None)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    healthy = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    route = await _route_turn(
+        client,
+        session_id,
+        healthy,
+        harness="claude-native",
+        prompt=ROUTING_MESSAGE,
+    )
+    assert route.status_code == 200, route.text
+    # Nothing was routed at create, so there is no verdict to reuse.
+    assert route.json()["action"] == "route"
+    assert route.json()["model"] == CLAUDE_MODEL
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override == CLAUDE_MODEL
+
+
 async def test_bundle_agent_auto_path_is_unchanged(
     client: httpx.AsyncClient,
     db_uri: str,
