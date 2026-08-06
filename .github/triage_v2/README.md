@@ -40,7 +40,9 @@ and writes ranking plus proposed label mutations to the managed
 `issue_priority_artifacts` volume. Dry-run never changes GitHub issues.
 `issue_scores_latest` always exposes the newest complete run for dashboard queries.
 
-Force a classifier refresh after prompt changes or for a backfill:
+The classifier rubric lives in
+`src/issue_prioritization/classification_prompt.txt`. After editing it, force a
+classifier refresh with a regrade run:
 
 ```bash
 databricks bundle run issue_prioritization --target dev --profile <profile> \

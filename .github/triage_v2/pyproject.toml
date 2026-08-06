@@ -24,7 +24,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-issue_prioritization = ["default_scoring.json"]
+issue_prioritization = ["classification_prompt.txt", "default_scoring.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
