@@ -384,8 +384,16 @@ const elicitationBubble = (id: string, phase: string): Bubble => ({
     },
   ],
 });
+const routingChipBubble = (id: string, scope: RoutingScope): Bubble => ({
+  kind: "routing_decision",
+  itemId: id,
+  model: "databricks-claude-sonnet-5",
+  applied: true,
+  rationale: "trivial task -> cheapest arm",
+  routing: { scope },
+});
 const bubbleIds = (bubbles: Bubble[]): string[] =>
-  bubbles.map((b) => (b.kind === "user" ? b.itemId : b.kind === "assistant" ? b.stableId : ""));
+  bubbles.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId));
 
 describe("mergePendingBubbles", () => {
   it("appends pending bubbles at the end when nothing trails", () => {
@@ -429,6 +437,40 @@ describe("mergePendingBubbles", () => {
       "e1",
       "e2",
     ]);
+  });
+
+  it("splices the pending prompt ABOVE a create-time routing chip", () => {
+    // A pinned Smart Routing create routes before the pane launches, so the
+    // session-scope chip is the whole committed timeline while the landing
+    // composer's prompt is still optimistic. Appending after it would show
+    // the chip above the message — and move it below a beat later, when the
+    // server persists the message and the walker pairs them.
+    const committed = [routingChipBubble("rd_create", "session")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "rd_create"]);
+  });
+
+  it("splices above a create whose session AND turn chip both landed first", () => {
+    const committed = [
+      routingChipBubble("rd_create", "session"),
+      routingChipBubble("rd_turn", "turn"),
+    ];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "rd_create", "rd_turn"]);
+  });
+
+  it("does NOT lift a new prompt above a chip already paired with its message", () => {
+    const committed = [userBubble("u1"), routingChipBubble("rd_1", "turn")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "rd_1", "pend_1"]);
+  });
+
+  it("does NOT lift a new prompt above a trailing sub-agent chip", () => {
+    // Sub-agent chips render standalone where the spawn happened — they are
+    // not a verdict on the message being typed.
+    const committed = [routingChipBubble("rd_spawn", "native_subagent")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["rd_spawn", "pend_1"]);
   });
 
   it("does NOT reorder for a tool_call-phase elicitation (message already committed)", () => {
@@ -620,7 +662,14 @@ describe("stripGatedSubagentRoutingChips", () => {
     const shown = stripGatedSubagentRoutingChips(bubbles, null);
     expect(chipIds(shown)).toEqual(["rd_session", "rd_turn", "rd_legacy", "rd_child"]);
     // Everything else keeps its place and its reference (BubbleView's memo).
-    expect(bubbleIds(shown)).toEqual(["", "", "", "", "u1", "a1"]);
+    expect(bubbleIds(shown)).toEqual([
+      "rd_session",
+      "rd_turn",
+      "rd_legacy",
+      "rd_child",
+      "u1",
+      "a1",
+    ]);
   });
 
   it("hides spawn chips on an explicit off", () => {

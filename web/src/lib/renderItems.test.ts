@@ -2174,6 +2174,64 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
     });
   });
 
+  // The rows a web create pinned to claude-native actually persisted: the
+  // session-scope decision is written AT CREATE, so for a while it is the
+  // session's only item and the prompt exists only as an optimistic pending
+  // bubble (spliced above the chip by `mergePendingBubbles`, tested in
+  // ChatPage.test.ts). These pin the walker's half: one chip throughout, and
+  // it lands below the message with no second position once it is persisted.
+  describe("pinned create routed before its pane launches", () => {
+    function createChip(applied = true): ConversationItem {
+      return routingDecisionItem({
+        id: "rd_create",
+        response_id: "routing_0181ee7e17fa4fa8aa8b18c2d41555e1",
+        model: "databricks-claude-sonnet-5",
+        applied,
+        rationale: "Routed to claude-sonnet-5 because trivial task -> cheapest arm.",
+        harness: "claude-native",
+        scope: "session",
+        decision_id: "2fc19175-929e-41e4-ab4a-6b1c07a0cbe7",
+      });
+    }
+    function prompt(): ConversationItem {
+      return {
+        id: "msg_user",
+        type: "message",
+        role: "user",
+        response_id: "resp_1",
+        status: "completed",
+        content: [{ type: "input_text", text: "what is 2+2?" }],
+      } as unknown as ConversationItem;
+    }
+
+    it("renders the lone create chip while no message has been persisted", () => {
+      const bubbles = buildBubbles(itemsToBlocks([createChip()]), null);
+      expect(kinds(bubbles)).toEqual(["routing_decision"]);
+      expect(chipIds(bubbles)).toEqual(["rd_create"]);
+    });
+
+    it("keeps a DECLINED create chip visible with no message", () => {
+      // Routing failed and the session launched unrouted — the user still has
+      // to see that a decision was attempted.
+      const bubbles = buildBubbles(itemsToBlocks([createChip(false)]), null);
+      expect(kinds(bubbles)).toEqual(["routing_decision"]);
+      expect(bubbles[0]).toMatchObject({ kind: "routing_decision", applied: false });
+    });
+
+    it("renders the chip once, below the prompt, when the message is appended", () => {
+      // Same block list plus the persisted message, through the incremental
+      // cache: the held-and-released region must not paint a stale position.
+      const cache = createBubbleCache();
+      const f1 = itemsToBlocks([createChip()]);
+      expect(kinds(buildBubbles(f1, null, cache))).toEqual(["routing_decision"]);
+      const f2 = [...f1, ...itemsToBlocks([prompt()])];
+      const second = buildBubbles(f2, null, cache);
+      expect(kinds(second)).toEqual(["user", "routing_decision"]);
+      expect(chipIds(second)).toEqual(["rd_create"]);
+      expect(second).toEqual(buildBubbles(f2, null));
+    });
+  });
+
   it("static reload: the itemsToBlocks funnel defers the persisted decision too", () => {
     const items: ConversationItem[] = [
       routingDecisionItem({

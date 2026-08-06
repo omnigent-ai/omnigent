@@ -155,7 +155,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
-import { showsRoutingDecisionChip } from "@/lib/routingDecision";
+import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
   DialogContent,
@@ -456,23 +456,48 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
   return result ?? committed;
 }
 
+// Insertion point above a run of create-time routing chips — session-scope
+// decisions recorded before the session had any conversation, so they open
+// the committed timeline. Only a run that STARTS the timeline qualifies: a
+// chip anywhere else already sits where it belongs (below its message, or
+// standalone for a sub-agent spawn), and lifting a prompt above it would
+// reorder history.
+function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
+  let start = end;
+  while (start > 0) {
+    const chip = committed[start - 1]!;
+    if (chip.kind !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope)) break;
+    start -= 1;
+  }
+  return start === 0 ? start : end;
+}
+
 // Place optimistic pending user bubbles into the committed timeline.
 //
 // Pending sends normally trail everything (the input should be visible
 // immediately, and they migrate into `blocks` once their
-// `session.input.consumed` event lands). The exception is a REQUEST-phase
-// policy ASK: that message never gets a consumed event until approval, so
-// it stays pending while its elicitation card renders as a committed
-// bubble — appending the pending bubble after the card would show the
-// approval prompt ABOVE the message that triggered it. When the timeline
-// ends in a run of such request-elicitation bubbles, splice the pending
-// bubbles in just before that run so the prompt stays on top.
+// `session.input.consumed` event lands). Two exceptions put committed
+// bubbles below the pending prompt:
+//
+//   • a REQUEST-phase policy ASK — that message never gets a consumed event
+//     until approval, so it stays pending while its elicitation card renders
+//     as a committed bubble, and appending after the card would show the
+//     approval prompt ABOVE the message that triggered it;
+//   • a create-time routing chip — a pinned Smart Routing create routes
+//     before the pane launches, so the chip is committed while the prompt it
+//     decides is still pending, and `buildBubbles` cannot see a pending
+//     message. Splicing above the chip renders it below the prompt from the
+//     first paint, where the persisted message will pair it anyway.
+//
+// When the timeline ends in a run of either, splice the pending bubbles in
+// just before that run so the prompt stays on top.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
   while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
+  insertAt = liftAboveCreateRoutingChips(committed, insertAt);
   if (insertAt === committed.length) return [...committed, ...pending];
   return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
 }
