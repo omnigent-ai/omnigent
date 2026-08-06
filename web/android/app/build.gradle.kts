@@ -114,9 +114,12 @@ dependencies {
     implementation(libs.androidx.activity)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.webkit)
+    implementation(libs.androidx.work.runtime.ktx)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
+    testImplementation(libs.androidx.work.testing)
+    testImplementation(libs.androidx.room.runtime)
 
     // Instrumented (androidTest) screenshot tests. Run via connectedDebugAndroidTest
     // against a device/emulator; see the `recordScreenshots` Gradle task. UI Automator

@@ -8,7 +8,6 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Local (foreground) notifications + best-effort badge, mirroring the iOS
@@ -23,12 +22,17 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class NativeNotificationManager(
     private val context: Context,
+    notificationOrigin: String?,
 ) {
     private val manager = NotificationManagerCompat.from(context)
 
-    // Ids at/above BADGE_NOTIFICATION_ID + 1 so per-session toasts never collide
-    // with the reserved badge-summary notification.
-    private val nextId = AtomicInteger(BADGE_NOTIFICATION_ID + 1)
+    // Persist allocation so a new Activity or process cannot reuse an unread
+    // notification's id.
+    private val notificationIds =
+        context.getSharedPreferences(NOTIFICATION_PREFS, Context.MODE_PRIVATE)
+
+    @Volatile
+    private var notificationOrigin = notificationOrigin
 
     // Last badge state from the web layer, kept so a grant of the API 33+
     // notification permission can replay a badge that was computed (and
@@ -38,6 +42,7 @@ class NativeNotificationManager(
         val navigatePath: String?,
         val title: String?,
         val body: String?,
+        val origin: String?,
     )
 
     @Volatile
@@ -51,6 +56,7 @@ class NativeNotificationManager(
                 NotificationManager.IMPORTANCE_HIGH,
             )
         manager.createNotificationChannel(channel)
+        claimNotificationOrigin(notificationOrigin)
     }
 
     fun notify(
@@ -58,7 +64,7 @@ class NativeNotificationManager(
         body: String?,
         navigatePath: String?,
     ) {
-        val id = nextId.getAndIncrement()
+        val id = nextNotificationId()
         val builder =
             NotificationCompat
                 .Builder(context, CHANNEL_ID)
@@ -69,7 +75,9 @@ class NativeNotificationManager(
                 .setDefaults(NotificationCompat.DEFAULT_ALL)
 
         if (navigatePath != null && navigatePath.startsWith("/")) {
-            builder.setContentIntent(activationIntent(navigatePath, id))
+            notificationOrigin?.let { origin ->
+                builder.setContentIntent(activationIntent(navigatePath, id, origin))
+            }
         }
 
         post(id, builder.build())
@@ -96,8 +104,13 @@ class NativeNotificationManager(
         title: String? = null,
         body: String? = null,
     ) {
-        lastBadge = BadgeState(count, navigatePath, title, body)
-        if (count <= 0) {
+        val badge = BadgeState(count, navigatePath, title, body, notificationOrigin)
+        lastBadge = badge
+        postBadge(badge)
+    }
+
+    private fun postBadge(badge: BadgeState) {
+        if (badge.count <= 0) {
             manager.cancel(BADGE_NOTIFICATION_ID)
             return
         }
@@ -105,18 +118,27 @@ class NativeNotificationManager(
             NotificationCompat
                 .Builder(context, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(title ?: context.getString(R.string.app_name))
+                .setContentTitle(badge.title ?: context.getString(R.string.app_name))
                 .setContentText(
-                    body ?: context.resources.getQuantityString(R.plurals.badge_text, count, count),
-                ).setNumber(count)
+                    badge.body
+                        ?: context.resources.getQuantityString(
+                            R.plurals.badge_text,
+                            badge.count,
+                            badge.count,
+                        ),
+                ).setNumber(badge.count)
                 .setSilent(true)
                 .setOngoing(false)
-        if (navigatePath != null && navigatePath.startsWith("/")) {
+        if (badge.navigatePath != null && badge.navigatePath.startsWith("/")) {
             // Tap opens the app and routes. Deliberately NOT setAutoCancel: this
             // is an ambient count, not a one-off event — clearing it on tap would
             // drop the only Android count surface while sessions are still
             // pending, and a later poll with the same count won't repost it.
-            builder.setContentIntent(activationIntent(navigatePath, BADGE_NOTIFICATION_ID))
+            badge.origin?.let { origin ->
+                builder.setContentIntent(
+                    activationIntent(badge.navigatePath, BADGE_NOTIFICATION_ID, origin),
+                )
+            }
         }
         post(BADGE_NOTIFICATION_ID, builder.build())
     }
@@ -128,7 +150,17 @@ class NativeNotificationManager(
      */
     fun replayBadge() {
         val badge = lastBadge ?: return
-        setBadgeCount(badge.count, badge.navigatePath, badge.title, badge.body)
+        postBadge(badge)
+    }
+
+    fun setOrigin(origin: String?) {
+        notificationOrigin = origin
+        rememberNotificationOrigin(origin)
+    }
+
+    fun cancelAll() {
+        lastBadge = null
+        cancelSessionNotifications()
     }
 
     /**
@@ -155,11 +187,13 @@ class NativeNotificationManager(
     private fun activationIntent(
         navigatePath: String,
         requestCode: Int,
+        origin: String,
     ): PendingIntent {
         val intent =
             Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 putExtra(EXTRA_NAVIGATE_PATH, navigatePath)
+                putExtra(EXTRA_NOTIFICATION_ORIGIN, origin)
             }
         return PendingIntent.getActivity(
             context,
@@ -169,9 +203,60 @@ class NativeNotificationManager(
         )
     }
 
+    private fun nextNotificationId(): Int =
+        synchronized(ID_LOCK) {
+            val storedId =
+                notificationIds.getInt(KEY_NEXT_NOTIFICATION_ID, FIRST_NOTIFICATION_ID)
+            val id = storedId.takeIf { it >= FIRST_NOTIFICATION_ID } ?: FIRST_NOTIFICATION_ID
+            // apply(), not commit(): this runs on the UI thread with every
+            // notification, and the in-memory value is updated synchronously.
+            notificationIds.edit().putInt(KEY_NEXT_NOTIFICATION_ID, id + 1).apply()
+            id
+        }
+
+    private fun claimNotificationOrigin(origin: String?) {
+        synchronized(ID_LOCK) {
+            if (notificationIds.contains(KEY_LAST_PINNED_ORIGIN) &&
+                notificationIds.getString(KEY_LAST_PINNED_ORIGIN, null) != origin
+            ) {
+                cancelSessionNotifications()
+            }
+            rememberNotificationOriginLocked(origin)
+        }
+    }
+
+    private fun rememberNotificationOrigin(origin: String?) {
+        synchronized(ID_LOCK) { rememberNotificationOriginLocked(origin) }
+    }
+
+    private fun rememberNotificationOriginLocked(origin: String?) {
+        val editor = notificationIds.edit()
+        if (origin == null) {
+            editor.remove(KEY_LAST_PINNED_ORIGIN)
+        } else {
+            editor.putString(KEY_LAST_PINNED_ORIGIN, origin)
+        }
+        editor.commit()
+    }
+
+    private fun cancelSessionNotifications() {
+        val platformManager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // Session notifications are untagged; download completion uses a dedicated tag.
+        platformManager.activeNotifications
+            .filter { notification -> notification.tag == null }
+            .forEach { notification -> manager.cancel(notification.id) }
+    }
+
     companion object {
         const val EXTRA_NAVIGATE_PATH = "ai.omnigent.android.NAVIGATE_PATH"
+        const val EXTRA_NOTIFICATION_ORIGIN = "ai.omnigent.android.NOTIFICATION_ORIGIN"
         private const val CHANNEL_ID = "omnigent.sessions"
         private const val BADGE_NOTIFICATION_ID = 1
+        private const val FIRST_NOTIFICATION_ID = BADGE_NOTIFICATION_ID + 1
+        private const val NOTIFICATION_PREFS = "ai.omnigent.android.notifications"
+        private const val KEY_NEXT_NOTIFICATION_ID = "next_notification_id"
+        private const val KEY_LAST_PINNED_ORIGIN = "last_pinned_origin"
+        private val ID_LOCK = Any()
     }
 }

@@ -3,7 +3,15 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -65,6 +73,7 @@ vi.mock("./Sidebar", () => ({
   Sidebar: ({ open }: { open: boolean }) => (
     <div data-testid="sidebar" data-open={open ? "true" : "false"} />
   ),
+  isMobileViewport: () => true,
 }));
 vi.mock("./FilesPanel", () => ({
   // Scope-only stand-in matching the real FilesPanel after the open-file tabs
@@ -223,6 +232,7 @@ import type { Agent } from "@/hooks/useAgents";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
+import { useNativeServerSwitcherBand } from "@/hooks/useNativeServerSwitcherBand";
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
@@ -485,6 +495,304 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe("native server switcher band", () => {
+  class TestResizeObserver {
+    static instances: TestResizeObserver[] = [];
+
+    readonly observed = new Set<Element>();
+    readonly callback: ResizeObserverCallback;
+    observe = vi.fn((element: Element) => this.observed.add(element));
+    disconnect = vi.fn();
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback;
+      TestResizeObserver.instances.push(this);
+    }
+
+    trigger() {
+      const entries = [...this.observed].map(
+        (target) => ({ target }) as unknown as ResizeObserverEntry,
+      );
+      this.callback(entries, this as unknown as ResizeObserver);
+    }
+  }
+
+  function installShell(
+    kind: "android" | "ios" | null,
+    setter: ReturnType<typeof vi.fn>,
+    hiddenSetter = vi.fn(),
+  ) {
+    if (kind === null) {
+      delete (window as unknown as Record<string, unknown>).omnigentNative;
+      return;
+    }
+    (window as unknown as Record<string, unknown>).omnigentNative = {
+      kind,
+      setBadgeCount: vi.fn(),
+      notify: vi.fn().mockResolvedValue(true),
+      setServerSwitcherBand: setter,
+      setServerSwitcherHidden: hiddenSetter,
+    };
+  }
+
+  function installLayoutRects(mainWidth: number, contentWidth = 680) {
+    const rects = {
+      mainLeft: 320,
+      mainWidth,
+      contentLeft: 320,
+      contentWidth,
+    };
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (this.tagName === "MAIN") {
+        return {
+          x: rects.mainLeft,
+          y: 0,
+          left: rects.mainLeft,
+          right: rects.mainLeft + rects.mainWidth,
+          top: 0,
+          bottom: 600,
+          width: rects.mainWidth,
+          height: 600,
+          toJSON: () => ({}),
+        };
+      }
+      if (this.parentElement?.classList.contains("app-shell")) {
+        return {
+          x: rects.contentLeft,
+          y: 0,
+          left: rects.contentLeft,
+          right: rects.contentLeft + rects.contentWidth,
+          top: 0,
+          bottom: 600,
+          width: rects.contentWidth,
+          height: 600,
+          toJSON: () => ({}),
+        };
+      }
+      return {
+        x: 0,
+        y: 0,
+        left: 0,
+        right: 0,
+        top: 0,
+        bottom: 0,
+        width: 0,
+        height: 0,
+        toJSON: () => ({}),
+      };
+    });
+    return rects;
+  }
+
+  beforeEach(() => {
+    TestResizeObserver.instances = [];
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1000 });
+    // jsdom has no elementFromPoint; frontmost tracking probes it. Report the
+    // sidebar mock while it's open (it overlays the column), else the column.
+    (
+      document as unknown as { elementFromPoint: (x: number, y: number) => Element | null }
+    ).elementFromPoint = () => {
+      const sidebar = document.querySelector('[data-testid="sidebar"]');
+      if (sidebar?.getAttribute("data-open") === "true") return sidebar;
+      return document.querySelector("main");
+    };
+  });
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentNative;
+    delete (document as unknown as Record<string, unknown>).elementFromPoint;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("publishes the main column fractions in an Android shell", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    installLayoutRects(400);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).toHaveBeenCalledWith(0.32, 0.72);
+  });
+
+  it("does not publish outside a native mobile shell", () => {
+    const setBand = vi.fn();
+    installShell(null, setBand);
+    installLayoutRects(400);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).not.toHaveBeenCalled();
+  });
+
+  it("publishes even a sliver column; native owns the too-small-to-fit policy", () => {
+    // The shell's control reserve + minimum pill width decide "too narrow";
+    // the web layer publishes the geometry as-is so the policy lives once.
+    const setBand = vi.fn();
+    const setHidden = vi.fn();
+    installShell("android", setBand, setHidden);
+    installLayoutRects(63);
+    mockConversations([]);
+
+    renderShell("/");
+
+    expect(setBand).toHaveBeenCalledWith(0.32, 0.383);
+    expect(setHidden).toHaveBeenLastCalledWith(false);
+  });
+
+  it("does not publish when both observed elements are absent", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+
+    renderHook(() => useNativeServerSwitcherBand(null));
+
+    expect(setBand).not.toHaveBeenCalled();
+  });
+
+  it("observes the chat column and republishes changed fractions", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    const rects = installLayoutRects(400);
+    mockConversations([]);
+
+    renderShell("/");
+
+    const main = document.querySelector("main");
+    // The live observer is the latest instance — the effect re-ran once
+    // frontmost tracking settled and replaced its first observer.
+    const observer = TestResizeObserver.instances.at(-1)!;
+    expect(observer.observe).toHaveBeenCalledWith(main);
+    expect(observer.observe).toHaveBeenCalledOnce();
+
+    rects.mainLeft = 400;
+    rects.mainWidth = 300;
+    act(() => observer.trigger());
+
+    expect(setBand).toHaveBeenLastCalledWith(0.4, 0.7);
+  });
+
+  it("keeps a collapsed chat column hidden when surrounding content changes", () => {
+    const setBand = vi.fn();
+    const setHidden = vi.fn();
+    installShell("android", setBand, setHidden);
+    const rects = installLayoutRects(0);
+    mockConversations([]);
+    renderShell("/");
+    setBand.mockClear();
+
+    rects.contentLeft = 500;
+    rects.contentWidth = 500;
+    act(() => TestResizeObserver.instances[0].trigger());
+
+    expect(setBand).not.toHaveBeenCalled();
+    expect(setHidden).toHaveBeenLastCalledWith(true);
+  });
+
+  it("hides the band while the mobile sidebar overlay is open", async () => {
+    const setBand = vi.fn();
+    const setHidden = vi.fn();
+    installShell("android", setBand, setHidden);
+    installLayoutRects(400);
+    mockConversations([]);
+
+    renderShell("/?sidebar=open");
+    // The sidebar opens in an effect; frontmost tracking re-checks on the DOM
+    // mutation, which is delivered on a microtask — flush it before asserting.
+    await act(async () => {});
+
+    expect(setHidden).toHaveBeenLastCalledWith(true);
+  });
+
+  it("disconnects the layout observer on unmount", () => {
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    installLayoutRects(400);
+    mockConversations([]);
+    const { unmount } = renderShell("/");
+    const observer = TestResizeObserver.instances.at(-1)!;
+    expect(observer.disconnect).not.toHaveBeenCalled();
+
+    unmount();
+
+    expect(observer.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("publishes after the Android bridge is installed at page ready", () => {
+    const setBand = vi.fn();
+    installShell(null, setBand);
+    const rects = installLayoutRects(400);
+    mockConversations([]);
+    renderShell("/");
+    expect(setBand).not.toHaveBeenCalled();
+
+    installShell("android", setBand);
+
+    act(() => window.dispatchEvent(new Event("omnigent:native-ready")));
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
+
+    rects.mainLeft = 400;
+    rects.mainWidth = 300;
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(setBand).toHaveBeenLastCalledWith(0.4, 0.7);
+  });
+
+  it("coalesces each window resize source through an animation frame", () => {
+    // Honor cancellation: schedule() replaces a pending frame, so the mock
+    // must drop cancelled callbacks or coalescing can't be observed.
+    const callbacks = new Map<number, FrameRequestCallback>();
+    let nextFrameId = 1;
+    vi.mocked(window.requestAnimationFrame).mockImplementation((callback) => {
+      callbacks.set(nextFrameId, callback);
+      return nextFrameId++;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((handle) => {
+      callbacks.delete(handle);
+    });
+    // Frontmost tracking schedules frames of its own, so drain the queue (new
+    // frames can be enqueued by flushed ones) and assert on publish counts.
+    const flushFrames = () => {
+      while (callbacks.size > 0) {
+        const [handle, callback] = callbacks.entries().next().value!;
+        callbacks.delete(handle);
+        act(() => callback(0));
+      }
+    };
+    const setBand = vi.fn();
+    installShell("android", setBand);
+    installLayoutRects(400);
+    mockConversations([]);
+    renderShell("/");
+
+    flushFrames();
+    expect(setBand).toHaveBeenCalledTimes(1);
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
+
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    flushFrames();
+    expect(setBand).toHaveBeenCalledTimes(2);
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
+
+    act(() => window.dispatchEvent(new Event("orientationchange")));
+
+    flushFrames();
+    expect(setBand).toHaveBeenCalledTimes(3);
+    expect(setBand).toHaveBeenLastCalledWith(0.32, 0.72);
+  });
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -1796,7 +2104,7 @@ describe("Right workspace card visibility", () => {
     const headerGroup = panel.parentElement;
     expect(headerGroup?.querySelector("header")).not.toBeNull();
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
-      `${panelWidth + 16}px`,
+      `${panelWidth}px`,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));

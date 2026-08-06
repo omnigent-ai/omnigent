@@ -2,8 +2,24 @@
 <resources>
     <string name="app_name">Omnigent</string>
     <string name="notification_channel_name">Sessions</string>
+    <string name="download_notification_channel_name">Downloads</string>
+    <string name="download_in_progress_title">Downloading %1$s</string>
+    <string name="download_in_progress_body">Download in progress</string>
+    <string name="download_queued_body">Download queued: %1$s</string>
+    <string name="download_complete_title">Download complete</string>
+    <string name="download_complete_body_downloads">Saved %1$s to Downloads</string>
+    <string name="download_complete_body_app_storage">Saved %1$s to app storage</string>
+    <string name="download_failed_title">Download failed</string>
+    <string name="download_failed_body">Couldn\'t download %1$s</string>
+    <string name="download_sign_in_again_body">Couldn\'t download %1$s. Sign in again and retry.</string>
     <string name="signed_in_title">Signed in to Omnigent</string>
     <string name="signed_in_body">Tap to return to the app.</string>
+    <string name="login_failed_title">Sign-in failed</string>
+    <string name="login_failed_body">Couldn\'t sign in to %1$s</string>
+    <string name="login_failed_retry">Retry</string>
+    <string name="renderer_failed_title">Something went wrong</string>
+    <string name="renderer_failed_body">The app\'s browser engine stopped responding.</string>
+    <string name="renderer_failed_retry">Try again</string>
     <plurals name="badge_text">
         <item quantity="one">%1$d pending</item>
         <item quantity="other">%1$d pending</item>
@@ -16,5 +32,12 @@
     <string name="connect_recents">Recent servers</string>
     <string name="connect_invalid">Enter a valid http(s) server URL</string>
     <string name="menu_reload">Reload</string>
+    <string name="menu_open_in_browser">Trouble signing in? Open in browser</string>
     <string name="menu_connect_new">Connect to New Server</string>
+    <string name="proxy_auth_refused_title">Sign-in needs a browser</string>
+    <string name="proxy_auth_refused_body">This server\'s sign-in provider doesn\'t allow signing in inside an app. Open %1$s in your browser to continue. Signing in there won\'t sign you in here.</string>
+    <string name="proxy_auth_open_browser">Open browser</string>
+    <string name="proxy_auth_cancel">Cancel</string>
+    <string name="proxy_auth_no_browser_body">No browser is available. Install or enable a browser to continue.</string>
+    <string name="proxy_auth_no_browser_toast">No browser is available.</string>
 </resources>

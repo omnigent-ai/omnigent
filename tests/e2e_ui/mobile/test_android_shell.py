@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, ViewportSize, expect
 
+from tests.e2e_ui.conftest import open_right_rail
+
 # A phone-sized viewport: the Android shell is a mobile surface, and the narrow
 # width is where the sidebar behaves as an overlay drawer (the
 # ``[data-android-native]`` drawer rules this change adds). The
@@ -134,6 +136,66 @@ def test_no_android_tag_or_fold_in_plain_browser(
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
 
 
+# Inject all four OS insets the way the shell does (distinct per edge, so an
+# edge-for-edge mapping error can't cancel out): status bar top, gesture-nav
+# bottom, display-cutout left/right.
+_INJECT_FOUR_EDGE_INSETS = """
+() => {
+  const s = document.documentElement.style;
+  s.setProperty('--omnigent-android-safe-area-top', '17px');
+  s.setProperty('--omnigent-android-safe-area-bottom', '23px');
+  s.setProperty('--omnigent-android-safe-area-left', '11px');
+  s.setProperty('--omnigent-android-safe-area-right', '13px');
+}
+"""
+
+_READ_RAIL_PADDING = """
+() => {
+  const rail = document.querySelector('aside[aria-label="Workspace"]');
+  if (!rail) return null;
+  const cs = getComputedStyle(rail);
+  return {
+    top: cs.paddingTop,
+    bottom: cs.paddingBottom,
+    left: cs.paddingLeft,
+    right: cs.paddingRight,
+  };
+}
+"""
+
+
+def test_workspace_rail_folds_inset_on_all_four_edges(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The md+ Workspace rail pads itself by the injected OS inset, edge for edge.
+
+    The rail only exists at desktop width (hidden below 48rem), outside the
+    mobile drawer rules, so it needs its own safe-area rule: on a landscape
+    phone / tablet with a display cutout its content would otherwise start
+    under the cutout and the gesture-nav bar. Asserts the full chain: injected
+    bridge -> ``data-android-native`` -> the ``--omnigent-android-safe-area-*``
+    fold -> computed four-edge padding on the real rail.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    page.evaluate(_INJECT_FOUR_EDGE_INSETS)
+    assert page.evaluate(_READ_RAIL_PADDING) == {
+        "top": "17px",
+        "bottom": "23px",
+        "left": "11px",
+        "right": "13px",
+    }
+
+
 # Bridge stub that also CAPTURES the notification-activation callback the SPA
 # registers (``useIdleNotifications`` -> ``onNativeNotificationActivated``), so a
 # test can fire it the way the Android shell does when its badge notification is
@@ -212,3 +274,71 @@ def test_sidebar_open_param_reveals_drawer_and_strips_itself(
     page.goto(f"{base_url}/?sidebar=open")
     expect(drawer).not_to_have_attribute("data-collapsed", "true")
     page.wait_for_function("() => !window.location.search.includes('sidebar')")
+
+
+# Bridge stub that also CAPTURES the server-switcher band/visibility calls the
+# SPA makes (``useNativeServerSwitcherBand`` -> ``setServerSwitcherBand`` /
+# ``setServerSwitcherHidden``), so a test can assert what geometry the native
+# pill would receive and when it would be hidden.
+_ANDROID_BAND_INIT_SCRIPT = """
+window.__omnigentBandCalls = [];
+window.__omnigentHiddenCalls = [];
+window.omnigentNative = {
+  kind: "android",
+  setBadgeCount: function () {},
+  notify: function () { return Promise.resolve(false); },
+  onNotificationActivated: function () { return function () {}; },
+  onNativeInsets: function () { return function () {}; },
+  setServerSwitcherHidden: function (hidden) {
+    window.__omnigentHiddenCalls.push(hidden);
+  },
+  setServerSwitcherBand: function (left, right) {
+    window.__omnigentBandCalls.push([left, right]);
+  },
+};
+"""
+
+
+def test_switcher_band_publishes_and_hides_under_the_drawer(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The chat column's band reaches the shell, and an overlay hides the pill.
+
+    The native server switcher is a native view stacked above the WebView, so
+    wherever it lands it swallows taps. The web layer publishes the chat
+    column's horizontal extent (viewport fractions) for the pill to centre in,
+    and must hide the pill whenever an overlay covers the column — otherwise
+    the pill floats above the drawer and steals its taps. This drives the real
+    frontmost-tracking chain a unit test can't: bridge -> band publication ->
+    drawer open -> hidden(true) -> drawer closed -> re-shown.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.add_init_script(_ANDROID_BAND_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # The column is frontmost on load: a band arrives and the pill is shown.
+    page.wait_for_function(
+        "() => window.__omnigentBandCalls.length > 0"
+        " && window.__omnigentHiddenCalls.includes(false)"
+    )
+    left, right = page.evaluate("() => window.__omnigentBandCalls.at(-1)")
+    assert 0 <= left < right <= 1
+
+    # Opening the phone-width drawer covers the column; the pill must hide
+    # rather than float above the drawer and steal its taps.
+    page.evaluate("() => { window.__omnigentHiddenCalls = []; }")
+    page.get_by_role("button", name="Open sidebar").click()
+    expect(page.locator('aside[aria-label="Conversations"]')).not_to_have_attribute(
+        "data-collapsed", "true"
+    )
+    page.wait_for_function("() => window.__omnigentHiddenCalls.at(-1) === true")
+
+    # Dismissing the drawer restores the pill.
+    page.get_by_role("button", name="Close sidebar").click()
+    page.wait_for_function("() => window.__omnigentHiddenCalls.at(-1) === false")
