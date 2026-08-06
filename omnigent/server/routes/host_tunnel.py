@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostModelOptionsResultFrame,
+    HostPackageWorkspaceAgentResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -698,6 +699,19 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "agents": frame.agents,
+                        "agent_configs": frame.agent_configs,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostPackageWorkspaceAgentResultFrame):
+            package_future = conn.pending_package_workspace_agents.pop(frame.request_id, None)
+            if package_future is not None and not package_future.done():
+                package_future.set_result(
+                    {
+                        "status": frame.status,
+                        "bundle_b64": frame.bundle_b64,
                         "error": frame.error,
                     }
                 )

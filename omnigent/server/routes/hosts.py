@@ -22,7 +22,7 @@ import os
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
@@ -36,6 +36,7 @@ from omnigent.host.frames import (
     HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
+    HostPackageWorkspaceAgentFrame,
     HostStoreSecretFrame,
     HostWorkspaceHarnessesFrame,
     encode_host_frame,
@@ -76,6 +77,9 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # small YAML file on the host is cheap; a short cap also bounds the wait
 # when an older host daemon silently ignores the unknown frame kind.
 _WORKSPACE_HARNESSES_TIMEOUT_S = 10.0
+# Per-call timeout for host.package_workspace_agent round-trips. Tarring a
+# text-config bundle is fast; the 10 MB packager ceiling bounds the work.
+_PACKAGE_WORKSPACE_AGENT_TIMEOUT_S = 15.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -156,6 +160,50 @@ async def _proxy_workspace_harnesses(
             ) from exc
     finally:
         host_conn.pending_workspace_harnesses.pop(request_id, None)
+
+
+async def _proxy_package_workspace_agent(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    path: str,
+    config_path: str,
+) -> dict[str, Any]:
+    """Ask a host to package a repo-declared agent config for upload."""
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_package_workspace_agents[request_id] = future
+    frame = encode_host_frame(
+        HostPackageWorkspaceAgentFrame(
+            request_id=request_id,
+            path=path,
+            config_path=config_path,
+        ),
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(
+                future,
+                timeout=_PACKAGE_WORKSPACE_AGENT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not package the workspace agent "
+                    f"within {_PACKAGE_WORKSPACE_AGENT_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        host_conn.pending_package_workspace_agents.pop(request_id, None)
 
 
 async def _proxy_list_dir(
@@ -442,6 +490,18 @@ async def _proxy_detect_credentials(
             ) from exc
     finally:
         host_conn.pending_credential_detects.pop(request_id, None)
+
+
+class PackageWorkspaceAgentRequest(BaseModel):
+    """Body for ``POST /v1/hosts/{id}/workspace-agents/package``.
+
+    :param path: Absolute workspace path on the host.
+    :param config_path: Workspace-relative path of a discovered config,
+        e.g. ``".omnigent/agent-configs/helper.yaml"``.
+    """
+
+    path: str
+    config_path: str
 
 
 class CreateDirectoryRequest(BaseModel):
@@ -784,7 +844,69 @@ def create_hosts_router(
                 detail=str(result.get("error") or "workspace harness discovery failed"),
             )
         agents = result.get("agents")
-        return {"agents": agents if isinstance(agents, list) else []}
+        agent_configs = result.get("agent_configs")
+        return {
+            "agents": agents if isinstance(agents, list) else [],
+            "agent_configs": agent_configs if isinstance(agent_configs, list) else [],
+        }
+
+    @router.post("/hosts/{host_id}/workspace-agents/package")
+    async def package_host_workspace_agent(
+        request: Request,
+        host_id: str,
+        body: PackageWorkspaceAgentRequest,
+    ) -> Response:
+        """Package a repo-declared agent config into bundle bytes.
+
+        The host materializes ``<path>/<config_path>`` (a discovered
+        single-file YAML or bundle directory) into a deterministic
+        ``.tar.gz`` and returns the bytes. The client hashes them for
+        the consent grant and uploads them verbatim via the standard
+        multipart session create, so what the user approved is exactly
+        what the server validates and runs.
+
+        :returns: The raw ``application/gzip`` bundle bytes.
+        :raises HTTPException: 404 (host missing), 403 (not owner), 409
+            (offline), 400 (path validation), 504 (timeout), 502 (host
+            failure).
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        if not body.path or "\x00" in body.path or "\x00" in body.config_path:
+            raise HTTPException(
+                status_code=400,
+                detail="path and config_path must be non-empty and NUL-free",
+            )
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        result = await _proxy_package_workspace_agent(
+            host_registry=host_registry,
+            host_conn=conn,
+            path=body.path,
+            config_path=body.config_path,
+        )
+        bundle_b64 = result.get("bundle_b64")
+        if result.get("status") != "ok" or not isinstance(bundle_b64, str):
+            raise HTTPException(
+                status_code=502,
+                detail=str(result.get("error") or "workspace agent packaging failed"),
+            )
+        import base64
+
+        try:
+            bundle = base64.b64decode(bundle_b64, validate=True)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="host returned malformed bundle bytes",
+            ) from exc
+        return Response(content=bundle, media_type="application/gzip")
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(

@@ -141,13 +141,21 @@ import {
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import {
+  packageWorkspaceAgent,
   useHostModelOptions,
   useHosts,
   useWorkspaceHarnesses,
   type Host,
   type WorkspaceAcpAgent,
+  type WorkspaceAgentConfigEntry,
 } from "@/hooks/useHosts";
-import { isRepoCommandTrusted, trustRepoCommand } from "@/lib/repoHarnessTrust";
+import {
+  digestBundleBytes,
+  isRepoCommandTrusted,
+  isRepoDigestTrusted,
+  trustRepoCommand,
+  trustRepoDigest,
+} from "@/lib/repoHarnessTrust";
 import {
   controlHost,
   getHostIdentity,
@@ -349,9 +357,13 @@ const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sand
 // `.omnigent/config.yaml`. UI-local only — never sent to the server; the
 // launch path embeds the discovered entry into a generated agent bundle.
 const REPO_ACP_ID_PREFIX = "repo-acp:";
+// Picker-row id prefix for agent configs discovered under the selected
+// workspace's `.omnigent/agent-configs/` (single-file YAMLs or bundle dirs).
+const REPO_CFG_ID_PREFIX = "repo-cfg:";
 // Stable default for the picker's optional repoAgents prop (a literal default
 // would be re-created per render and defeat memoization downstream).
 const NO_REPO_AGENTS: WorkspaceAcpAgent[] = [];
+const NO_REPO_AGENT_CONFIGS: WorkspaceAgentConfigEntry[] = [];
 
 const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
 const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
@@ -927,6 +939,8 @@ export function AgentHarnessPicker({
   sandboxSelected,
   repoAgents = NO_REPO_AGENTS,
   onSelectRepoAgent,
+  repoAgentConfigs = NO_REPO_AGENT_CONFIGS,
+  onSelectRepoAgentConfig,
   allowCreateCustomAgent = true,
   onOpenChange,
   dropdownModal = true,
@@ -957,6 +971,11 @@ export function AgentHarnessPicker({
   repoAgents?: WorkspaceAcpAgent[];
   /** Selection callback for a repo-declared harness row. */
   onSelectRepoAgent?: (agent: WorkspaceAcpAgent) => void;
+  /** Agent configs declared under the workspace's `.omnigent/agent-configs/`.
+   *  Rendered at the top of the Agents group with a "From this repo" badge. */
+  repoAgentConfigs?: WorkspaceAgentConfigEntry[];
+  /** Selection callback for a repo-declared agent-config row. */
+  onSelectRepoAgentConfig?: (entry: WorkspaceAgentConfigEntry) => void;
   /** Whether to offer the "Create custom agent" action. Defaults true; an
    *  embedder that only picks an existing agent (e.g. project settings) can
    *  hide it since it has no interactive create flow. */
@@ -1071,6 +1090,39 @@ export function AgentHarnessPicker({
           variant="outline"
           className="ml-auto self-center border-sky-300 bg-sky-50 text-[11px] text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400"
           data-testid={`new-chat-landing-repo-badge-${agent.slug}`}
+        >
+          From this repo
+        </Badge>
+      </DropdownMenuItem>
+    );
+  };
+
+  // Repo-declared agent-config rows — full agent definitions (tools,
+  // sub-agents, skills) discovered under `.omnigent/agent-configs/`, so
+  // they lead the Agents group with a provenance badge.
+  const renderRepoConfigEntry = (entry: WorkspaceAgentConfigEntry): ReactNode => {
+    const id = REPO_CFG_ID_PREFIX + entry.slug;
+    const active = id === effectiveAgentId;
+    return (
+      <DropdownMenuItem
+        key={id}
+        data-testid={`new-chat-landing-agent-${id}`}
+        data-active={active ? "true" : undefined}
+        onSelect={() => onSelectRepoAgentConfig?.(entry)}
+        className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+      >
+        <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+          <span className="truncate">{entry.name}</span>
+          {entry.description && (
+            <span className="truncate text-[11px] text-muted-foreground/70">
+              {entry.description}
+            </span>
+          )}
+        </div>
+        <Badge
+          variant="outline"
+          className="ml-auto self-center border-sky-300 bg-sky-50 text-[11px] text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400"
+          data-testid={`new-chat-landing-repo-cfg-badge-${entry.slug}`}
         >
           From this repo
         </Badge>
@@ -1344,8 +1396,10 @@ export function AgentHarnessPicker({
                 <DropdownMenuSeparator />
               </>
             )}
-            {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
+            {/* Agents group — repo-declared agent configs lead, then the
+            built-in bundle agents (Polly / Debby) inline. */}
             <PickerSectionHeader>Agents</PickerSectionHeader>
+            {repoAgentConfigs.map(renderRepoConfigEntry)}
             {bundleEntries.map(renderEntry)}
             {/* Existing custom agents fold into a "Custom agents" submenu (with
             the pending upload and the create action). With no custom agents the
@@ -2091,22 +2145,37 @@ export function NewChatLandingScreen() {
     () => landingDraft?.sandboxRepoBranch ?? "",
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
-  // Harnesses declared by the selected workspace's repo (`.omnigent/config.yaml`),
-  // read on the selected host. Suggest-and-rank only: rows lead the picker's
-  // Harnesses group but nothing is auto-selected.
-  const { data: repoAcpAgentsData } = useWorkspaceHarnesses(
+  // Agents the selected workspace's repo declares — ACP commands from
+  // `.omnigent/config.yaml` plus agent configs under
+  // `.omnigent/agent-configs/`. Suggest-and-rank only: rows lead their
+  // picker groups but nothing is auto-selected.
+  const { data: workspaceDiscovery } = useWorkspaceHarnesses(
     selectedHostId,
     workspace.trim(),
     !sandboxSelected,
   );
-  const repoAcpAgents = useMemo(() => repoAcpAgentsData ?? [], [repoAcpAgentsData]);
+  const repoAcpAgents = useMemo(() => workspaceDiscovery?.agents ?? [], [workspaceDiscovery]);
+  const repoAgentConfigs = useMemo(
+    () => workspaceDiscovery?.agentConfigs ?? [],
+    [workspaceDiscovery],
+  );
   // First-use consent for a repo-declared command (arbitrary shell from a
   // cloned repo). Non-null = the consent dialog is open for that agent;
   // the ref is a one-shot bypass so the dialog's confirm can re-enter
   // handleCreate without re-prompting.
   const [repoConsentAgent, setRepoConsentAgent] = useState<WorkspaceAcpAgent | null>(null);
+  // Same consent flow for a repo-declared agent config: the dialog holds the
+  // packaged bytes + digest so confirm uploads exactly what was approved.
+  const [repoConsentConfig, setRepoConsentConfig] = useState<{
+    entry: WorkspaceAgentConfigEntry;
+    bytes: ArrayBuffer;
+    digest: string;
+  } | null>(null);
   const [repoConsentAlways, setRepoConsentAlways] = useState(false);
   const repoConsentGrantedRef = useRef(false);
+  // Bytes approved in the consent dialog, carried into the re-entered
+  // handleCreate so the upload is byte-identical to what was shown.
+  const approvedRepoBundleRef = useRef<{ bytes: ArrayBuffer; digest: string } | null>(null);
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -2597,10 +2666,14 @@ export function NewChatLandingScreen() {
     !sandboxSelected && pickedAgentId?.startsWith(REPO_ACP_ID_PREFIX)
       ? (repoAcpAgents.find((a) => REPO_ACP_ID_PREFIX + a.slug === pickedAgentId) ?? null)
       : null;
+  const pickedRepoConfig =
+    !sandboxSelected && pickedAgentId?.startsWith(REPO_CFG_ID_PREFIX)
+      ? (repoAgentConfigs.find((e) => REPO_CFG_ID_PREFIX + e.slug === pickedAgentId) ?? null)
+      : null;
   const effectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
-      : pickedRepoAgent
+      : pickedRepoAgent || pickedRepoConfig
         ? pickedAgentId
         : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
           null);
@@ -2624,8 +2697,17 @@ export function NewChatLandingScreen() {
               harness: "acp",
               skills: [],
             } satisfies AvailableAgent)
-          : agentList.find((a) => a.id === effectiveAgentId),
-    [agentList, effectiveAgentId, pendingAgent, pickedRepoAgent],
+          : pickedRepoConfig
+            ? ({
+                id: REPO_CFG_ID_PREFIX + pickedRepoConfig.slug,
+                name: pickedRepoConfig.name,
+                display_name: pickedRepoConfig.name,
+                description: pickedRepoConfig.description,
+                harness: pickedRepoConfig.harness,
+                skills: [],
+              } satisfies AvailableAgent)
+            : agentList.find((a) => a.id === effectiveAgentId),
+    [agentList, effectiveAgentId, pendingAgent, pickedRepoAgent, pickedRepoConfig],
   );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
@@ -3468,6 +3550,10 @@ export function NewChatLandingScreen() {
     setPickedAgentId(REPO_ACP_ID_PREFIX + agent.slug);
     setPickedHarness(null);
   };
+  const handleSelectRepoAgentConfig = (entry: WorkspaceAgentConfigEntry) => {
+    setPickedAgentId(REPO_CFG_ID_PREFIX + entry.slug);
+    setPickedHarness(null);
+  };
 
   function selectHost(hostId: string) {
     // Persist the explicit pick even when it matches the current selection, so
@@ -3561,6 +3647,39 @@ export function NewChatLandingScreen() {
           setRepoConsentAgent(pickedRepoAgent);
           return;
         }
+      }
+      // Repo-declared agent config: package on the host (deterministic
+      // bytes), hash, and gate on the digest. The consent dialog holds the
+      // exact bytes so confirm uploads what was approved — a repo edit
+      // between consent and create can't swap the content.
+      let repoConfigBundle: { file: File; digest: string } | null = null;
+      if (pickedRepoConfig && selectedHostId !== null) {
+        let approved = approvedRepoBundleRef.current;
+        approvedRepoBundleRef.current = null;
+        if (approved === null) {
+          const bytes = await packageWorkspaceAgent(
+            selectedHostId,
+            workspace.trim(),
+            pickedRepoConfig.path,
+          );
+          approved = { bytes, digest: await digestBundleBytes(bytes) };
+        }
+        const trusted =
+          repoConsentGrantedRef.current ||
+          isRepoDigestTrusted(
+            selectedHostId,
+            workspace.trim(),
+            pickedRepoConfig.slug,
+            approved.digest,
+          );
+        if (!trusted) {
+          setRepoConsentConfig({ entry: pickedRepoConfig, ...approved });
+          return;
+        }
+        repoConfigBundle = {
+          file: new File([approved.bytes], "agent.tar.gz", { type: "application/gzip" }),
+          digest: approved.digest,
+        };
       }
       repoConsentGrantedRef.current = false;
       const trimmedBranch = branchName.trim();
@@ -3659,13 +3778,16 @@ export function NewChatLandingScreen() {
       const bundleInput =
         repoBundleInput ?? (effectiveAgentId === PENDING_AGENT_ID ? pendingAgent : null);
 
-      if (bundleInput) {
+      if (repoConfigBundle !== null || bundleInput) {
         // Custom agent path: build bundle client-side and use multipart POST.
         // The multipart create only stores the agent + session rows — it does
         // NOT launch a runner on the host. We must follow up with launchRunner
         // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
         // same way the fork-resume path does.
-        const bundle = await buildAgentBundle(bundleInput);
+        const bundle =
+          repoConfigBundle !== null
+            ? repoConfigBundle.file
+            : await buildAgentBundle(bundleInput as AgentBundleInput);
         const metadata: Record<string, unknown> = {};
         if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
         // Born-filed: stamp the project's `omni_project` label so a bundled
@@ -3691,7 +3813,7 @@ export function NewChatLandingScreen() {
         }
         // Clear pending agent after successful creation (repo-declared
         // launches leave the pending custom agent untouched).
-        if (!repoBundleInput) setPendingAgent(null);
+        if (!repoBundleInput && repoConfigBundle === null) setPendingAgent(null);
       } else {
         // Normal path: bind to an existing registered agent.
         // Which pushed row is ours: the one this tab has never seen, bound
@@ -3907,11 +4029,22 @@ export function NewChatLandingScreen() {
   // granted ref so this run doesn't re-prompt.
   async function confirmRepoConsent() {
     const agent = repoConsentAgent;
-    if (agent === null) return;
+    const config = repoConsentConfig;
+    if (agent === null && config === null) return;
     if (repoConsentAlways && selectedHostId !== null) {
-      await trustRepoCommand(selectedHostId, workspace.trim(), agent.slug, agent.command);
+      if (agent !== null) {
+        await trustRepoCommand(selectedHostId, workspace.trim(), agent.slug, agent.command);
+      } else if (config !== null) {
+        trustRepoDigest(selectedHostId, workspace.trim(), config.entry.slug, config.digest);
+      }
+    }
+    if (config !== null) {
+      // Carry the approved bytes into the re-entered create so the upload
+      // is byte-identical to what the dialog showed.
+      approvedRepoBundleRef.current = { bytes: config.bytes, digest: config.digest };
     }
     setRepoConsentAgent(null);
+    setRepoConsentConfig(null);
     setRepoConsentAlways(false);
     repoConsentGrantedRef.current = true;
     await handleCreate();
@@ -4255,6 +4388,8 @@ export function NewChatLandingScreen() {
                     sandboxSelected={sandboxSelected}
                     repoAgents={sandboxSelected ? [] : repoAcpAgents}
                     onSelectRepoAgent={handleSelectRepoAgent}
+                    repoAgentConfigs={sandboxSelected ? [] : repoAgentConfigs}
+                    onSelectRepoAgentConfig={handleSelectRepoAgentConfig}
                     triggerTooltip={
                       smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
                     }
@@ -4965,10 +5100,11 @@ export function NewChatLandingScreen() {
           runs. "Always allow" persists per (host, workspace, agent, command
           hash) — editing the command in the repo re-prompts. */}
       <Dialog
-        open={repoConsentAgent !== null}
+        open={repoConsentAgent !== null || repoConsentConfig !== null}
         onOpenChange={(open) => {
           if (!open) {
             setRepoConsentAgent(null);
+            setRepoConsentConfig(null);
             setRepoConsentAlways(false);
           }
         }}
@@ -4977,21 +5113,52 @@ export function NewChatLandingScreen() {
           <DialogHeader>
             <DialogTitle>Run an agent declared by this repo?</DialogTitle>
             <DialogDescription>
-              “{repoConsentAgent?.name}” comes from <code>.omnigent/config.yaml</code> in{" "}
-              {workspaceTrimmed || "the selected workspace"}. Starting the session runs this command
-              on {selectedHost?.name ?? "the selected host"}:
+              “{repoConsentAgent?.name ?? repoConsentConfig?.entry.name}” comes from{" "}
+              <code>
+                {repoConsentAgent !== null
+                  ? ".omnigent/config.yaml"
+                  : repoConsentConfig?.entry.path}
+              </code>{" "}
+              in {workspaceTrimmed || "the selected workspace"}.{" "}
+              {repoConsentAgent !== null
+                ? `Starting the session runs this command on ${selectedHost?.name ?? "the selected host"}:`
+                : `Starting the session uploads and runs this agent definition on ${selectedHost?.name ?? "the selected host"}:`}
             </DialogDescription>
           </DialogHeader>
-          <pre className="overflow-x-auto rounded-md border bg-muted/50 px-3 py-2 font-mono text-xs">
-            {repoConsentAgent?.command}
-          </pre>
+          {repoConsentAgent !== null ? (
+            <pre className="overflow-x-auto rounded-md border bg-muted/50 px-3 py-2 font-mono text-xs">
+              {repoConsentAgent.command}
+            </pre>
+          ) : repoConsentConfig !== null ? (
+            <ul
+              className="rounded-md border bg-muted/50 px-3 py-2 text-xs text-muted-foreground [&>li]:py-0.5"
+              data-testid="repo-config-consent-summary"
+            >
+              <li>
+                Kind: {repoConsentConfig.entry.kind === "bundle" ? "agent bundle" : "agent YAML"}
+              </li>
+              {repoConsentConfig.entry.harness && (
+                <li>Harness: {repoConsentConfig.entry.harness}</li>
+              )}
+              {repoConsentConfig.entry.sub_agents.length > 0 && (
+                <li>Sub-agents: {repoConsentConfig.entry.sub_agents.join(", ")}</li>
+              )}
+              {repoConsentConfig.entry.has_local_tools && (
+                <li>Declares local (Python/TypeScript) tools</li>
+              )}
+              {repoConsentConfig.entry.has_mcp_servers && <li>Declares MCP servers</li>}
+              <li className="font-mono">digest {repoConsentConfig.digest.slice(0, 12)}…</li>
+            </ul>
+          ) : null}
           <label className="flex items-center gap-2 text-13 text-muted-foreground">
             <Switch
               checked={repoConsentAlways}
               onCheckedChange={setRepoConsentAlways}
               data-testid="repo-harness-consent-always"
             />
-            Always allow this command for this repo
+            {repoConsentAgent !== null
+              ? "Always allow this command for this repo"
+              : "Always allow this exact agent version for this repo"}
           </label>
           <DialogFooter>
             <Button
@@ -4999,6 +5166,7 @@ export function NewChatLandingScreen() {
               variant="ghost"
               onClick={() => {
                 setRepoConsentAgent(null);
+                setRepoConsentConfig(null);
                 setRepoConsentAlways(false);
               }}
             >

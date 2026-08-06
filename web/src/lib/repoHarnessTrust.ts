@@ -61,3 +61,41 @@ export async function trustRepoCommand(
     // Quota/private-mode failures just mean re-prompting next time.
   }
 }
+
+/** SHA-256 hex of raw bundle bytes — the identity a bundle grant is keyed on. */
+export async function digestBundleBytes(bytes: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function digestKey(hostId: string, workspace: string, slug: string, digestHex: string): string {
+  return `${hostId}|${workspace}|${slug}|${digestHex}`;
+}
+
+/** Whether this exact bundle digest was previously granted "always allow". */
+export function isRepoDigestTrusted(
+  hostId: string,
+  workspace: string,
+  slug: string,
+  digestHex: string,
+): boolean {
+  return readGrants()[digestKey(hostId, workspace, slug, digestHex)] === true;
+}
+
+/** Persist an "always allow" grant for this exact bundle digest. */
+export function trustRepoDigest(
+  hostId: string,
+  workspace: string,
+  slug: string,
+  digestHex: string,
+): void {
+  const grants = readGrants();
+  grants[digestKey(hostId, workspace, slug, digestHex)] = true;
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(grants));
+  } catch {
+    // Quota/private-mode failures just mean re-prompting next time.
+  }
+}

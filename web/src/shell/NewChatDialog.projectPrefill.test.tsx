@@ -43,7 +43,7 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
-  useWorkspaceHarnesses: vi.fn(() => ({ data: [] })),
+  useWorkspaceHarnesses: vi.fn(() => ({ data: { agents: [], agentConfigs: [] } })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));

@@ -29,6 +29,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPackageWorkspaceAgentFrame,
+    HostPackageWorkspaceAgentResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -150,6 +152,64 @@ def test_workspace_harnesses_frames_round_trip() -> None:
         status="failed",
         agents=[],
         error="boom",
+    )
+
+
+def test_workspace_harnesses_result_carries_agent_configs() -> None:
+    """Agent-config summaries ride the discovery result; absent decodes empty."""
+    result = decode_host_frame(
+        encode_host_frame(
+            HostWorkspaceHarnessesResultFrame(
+                request_id="req_ws",
+                status="ok",
+                agent_configs=[{"slug": "reviewer", "kind": "bundle"}],
+            )
+        )
+    )
+    assert isinstance(result, HostWorkspaceHarnessesResultFrame)
+    assert result.agent_configs == [{"slug": "reviewer", "kind": "bundle"}]
+
+    # An older host's result (no agent_configs key) decodes to [].
+    legacy = json.loads(
+        encode_host_frame(
+            HostWorkspaceHarnessesResultFrame(request_id="req_ws", status="ok"),
+        )
+    )
+    del legacy["agent_configs"]
+    decoded = decode_host_frame(json.dumps(legacy))
+    assert isinstance(decoded, HostWorkspaceHarnessesResultFrame)
+    assert decoded.agent_configs == []
+
+
+def test_package_workspace_agent_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(
+            HostPackageWorkspaceAgentFrame(
+                request_id="req_pkg",
+                path="/Users/corey/universe",
+                config_path=".omnigent/agent-configs/reviewer",
+            ),
+        )
+    )
+    assert request == HostPackageWorkspaceAgentFrame(
+        request_id="req_pkg",
+        path="/Users/corey/universe",
+        config_path=".omnigent/agent-configs/reviewer",
+    )
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostPackageWorkspaceAgentResultFrame(
+                request_id="req_pkg",
+                status="ok",
+                bundle_b64="aGk=",
+            )
+        )
+    )
+    assert result == HostPackageWorkspaceAgentResultFrame(
+        request_id="req_pkg",
+        status="ok",
+        bundle_b64="aGk=",
     )
 
 

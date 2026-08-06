@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPackageWorkspaceAgentFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -577,6 +578,71 @@ async def test_handle_workspace_harnesses_reads_repo_config(
             }
         ],
     )
+
+
+async def test_handle_workspace_harnesses_includes_agent_configs(tmp_path: Path) -> None:
+    """Agent configs under .omnigent/agent-configs/ ride the discovery result."""
+    import yaml
+
+    configs = tmp_path / ".omnigent" / "agent-configs"
+    configs.mkdir(parents=True)
+    (configs / "helper.yaml").write_text(
+        yaml.safe_dump(
+            {"name": "Repo Helper", "prompt": "hi", "executor": {"harness": "claude-sdk"}}
+        )
+    )
+    host = _make_host_process()
+
+    result = await host._handle_workspace_harnesses(
+        HostWorkspaceHarnessesFrame(request_id="req_ws", path=str(tmp_path)),
+    )
+
+    assert result.status == "ok"
+    assert result.agents == []
+    assert [(c["slug"], c["kind"]) for c in result.agent_configs] == [("repo-helper", "file")]
+
+
+async def test_handle_package_workspace_agent_round_trips(tmp_path: Path) -> None:
+    """Packaged bytes decode as a tar.gz containing the materialized config."""
+    import base64
+    import io
+    import tarfile
+
+    import yaml
+
+    configs = tmp_path / ".omnigent" / "agent-configs"
+    configs.mkdir(parents=True)
+    (configs / "helper.yaml").write_text(
+        yaml.safe_dump({"name": "helper", "prompt": "hi", "executor": {"harness": "claude-sdk"}})
+    )
+    host = _make_host_process()
+
+    result = await host._handle_package_workspace_agent(
+        HostPackageWorkspaceAgentFrame(
+            request_id="req_pkg",
+            path=str(tmp_path),
+            config_path=".omnigent/agent-configs/helper.yaml",
+        ),
+    )
+
+    assert result.status == "ok"
+    assert result.bundle_b64 is not None
+    bundle = base64.b64decode(result.bundle_b64)
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+        assert tar.getnames() == ["helper.yaml"]
+
+
+async def test_handle_package_workspace_agent_rejects_escape(tmp_path: Path) -> None:
+    host = _make_host_process()
+    result = await host._handle_package_workspace_agent(
+        HostPackageWorkspaceAgentFrame(
+            request_id="req_pkg",
+            path=str(tmp_path),
+            config_path="../outside.yaml",
+        ),
+    )
+    assert result.status == "failed"
+    assert result.bundle_b64 is None
 
 
 async def test_handle_workspace_harnesses_empty_when_unconfigured(tmp_path: Path) -> None:

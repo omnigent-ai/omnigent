@@ -120,37 +120,88 @@ export interface WorkspaceAcpAgent {
   command_found: boolean;
 }
 
+/** One agent config declared under a workspace's `.omnigent/agent-configs/`. */
+export interface WorkspaceAgentConfigEntry {
+  slug: string;
+  name: string;
+  /** Workspace-relative path, e.g. ".omnigent/agent-configs/helper.yaml". */
+  path: string;
+  /** "file" (single-file YAML) or "bundle" (directory image). */
+  kind: "file" | "bundle";
+  description: string | null;
+  harness: string | null;
+  sub_agents: string[];
+  has_local_tools: boolean;
+  has_mcp_servers: boolean;
+}
+
+/** Everything a workspace's repo declares as runnable. */
+export interface WorkspaceDiscovery {
+  agents: WorkspaceAcpAgent[];
+  agentConfigs: WorkspaceAgentConfigEntry[];
+}
+
+const EMPTY_DISCOVERY: WorkspaceDiscovery = { agents: [], agentConfigs: [] };
+
 async function fetchWorkspaceHarnesses(
   hostId: string,
   workspace: string,
-): Promise<WorkspaceAcpAgent[]> {
+): Promise<WorkspaceDiscovery> {
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/workspace-harnesses?path=${encodeURIComponent(workspace)}`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { agents?: WorkspaceAcpAgent[] };
-  return body.agents ?? [];
+  const body = (await res.json()) as {
+    agents?: WorkspaceAcpAgent[];
+    agent_configs?: WorkspaceAgentConfigEntry[];
+  };
+  return { agents: body.agents ?? [], agentConfigs: body.agent_configs ?? [] };
 }
 
 /**
- * Harnesses declared by the selected workspace's repo (`.omnigent/config.yaml`),
- * resolved on the selected host. Errors (offline host, older host daemon that
- * doesn't speak the frame) degrade to an empty list.
+ * Agents the selected workspace's repo declares — ACP commands from
+ * `.omnigent/config.yaml` plus agent configs under
+ * `.omnigent/agent-configs/` — resolved on the selected host. Errors
+ * (offline host, older host daemon that doesn't speak the frame)
+ * degrade to empty lists.
  */
 export function useWorkspaceHarnesses(hostId: string | null, workspace: string, enabled = true) {
   return useQuery({
     queryKey: ["workspace-harnesses", hostId, workspace],
-    queryFn: async () => {
+    queryFn: async (): Promise<WorkspaceDiscovery> => {
       try {
         return await fetchWorkspaceHarnesses(hostId as string, workspace);
       } catch {
-        return [];
+        return EMPTY_DISCOVERY;
       }
     },
     enabled: enabled && hostId !== null && workspace.length > 0,
     staleTime: 30_000,
     retry: false,
   });
+}
+
+/**
+ * Package a repo-declared agent config into deterministic `.tar.gz`
+ * bytes on the host. The caller hashes these bytes for the consent
+ * grant and uploads them verbatim, so what the user approved is exactly
+ * what the server validates and runs.
+ */
+export async function packageWorkspaceAgent(
+  hostId: string,
+  workspace: string,
+  configPath: string,
+): Promise<ArrayBuffer> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/workspace-agents/package`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: workspace, config_path: configPath }),
+    },
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.arrayBuffer();
 }
 
 interface InstallHarnessResult {
