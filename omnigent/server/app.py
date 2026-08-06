@@ -936,6 +936,13 @@ def create_app(
     server_metrics = ServerPerformanceMetrics()
     server_metrics_otel = ServerMetricsOtelPublisher()
 
+    if host_store is not None and host_permission_store is None:
+        from omnigent.stores.host_permission_store.sqlalchemy_store import (
+            SqlAlchemyHostPermissionStore,
+        )
+
+        host_permission_store = SqlAlchemyHostPermissionStore(str(host_store._engine.url))
+
     @asynccontextmanager
     async def _lifespan(
         app_inst: FastAPI,
@@ -1074,24 +1081,24 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
-            on_fire = build_on_fire(
-                FireDeps(
-                    scheduled_task_store=scheduled_task_store,
-                    agent_store=agent_store,
-                    conversation_store=conversation_store,
-                    permission_store=permission_store,
-                    host_store=host_store,
-                    host_registry=host_registry,
-                    host_permission_store=host_permission_store,
-                    agent_cache=agent_cache,
-                    runner_router=runner_router,
-                    tunnel_registry=tunnel_registry,
-                    file_store=file_store,
-                    artifact_store=artifact_store,
-                )
+            fire_deps = FireDeps(
+                scheduled_task_store=scheduled_task_store,
+                agent_store=agent_store,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                host_permission_store=host_permission_store,
+                agent_cache=agent_cache,
+                runner_router=runner_router,
+                tunnel_registry=tunnel_registry,
+                file_store=file_store,
+                artifact_store=artifact_store,
             )
+            on_fire = build_on_fire(fire_deps)
+            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
                 on_fire=on_fire,
@@ -1159,13 +1166,6 @@ def create_app(
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
-    if host_store is not None and host_permission_store is None:
-        from omnigent.stores.host_permission_store.sqlalchemy_store import (
-            SqlAlchemyHostPermissionStore,
-        )
-
-        host_permission_store = SqlAlchemyHostPermissionStore(str(host_store._engine.url))
-
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store

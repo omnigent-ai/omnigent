@@ -6638,9 +6638,14 @@ def _build_evaluation_context(
         text = data.get("text") or data.get("content") or str(data)
     else:
         text = str(data)
+    text_str = text if isinstance(text, str) else json.dumps(text)
+    # REQUEST content is structured so every input reaches policies in one shape.
+    request_or_response_content: Any = (
+        {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
+    )
     return EvaluationContext(
         phase=phase,
-        content=text if isinstance(text, str) else json.dumps(text),
+        content=request_or_response_content,
         actor=actor,
         model=hook_model,
         harness=hook_harness,
