@@ -6827,7 +6827,7 @@ def test_confirm_tui_dialog_polls_instead_of_sleeping_a_fixed_interval(
     took 1.861s), leaving it open until the next injection failed.
     """
     dialog = "  Switch model?\n"
-    sends = _fake_tmux(monkeypatch, ["", "", dialog])
+    sends = _fake_tmux(monkeypatch, ["", "", dialog, _IDLE_PANE])
 
     assert (
         claude_native_bridge._confirm_tui_dialog(
@@ -6837,17 +6837,19 @@ def test_confirm_tui_dialog_polls_instead_of_sleeping_a_fixed_interval(
         )
         is True
     )
-    # Exactly one Enter: the fast path must not also send the blind fallback.
+    # Exactly one Enter: the dialog verifiably closed on the first press, so
+    # neither a verify retry nor the blind fallback may add another.
     assert [args[-1] for args in sends] == ["Enter"]
 
 
 def test_a_matched_hint_confirms_before_the_poll_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The fast path stops capturing the moment the dialog is on screen."""
+    """The watch presses the moment the dialog is on screen, then only
+    captures long enough to see it close."""
     captures: list[int] = []
     dialog = "  Switch model?\n"
-    frames = ["", dialog, dialog]
+    frames = ["", dialog, _IDLE_PANE]
 
     def _fake_capture(socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
@@ -6856,7 +6858,7 @@ def test_a_matched_hint_confirms_before_the_poll_times_out(
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *a: None)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
-    monkeypatch.setattr(claude_native_bridge.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
 
     assert (
         claude_native_bridge._confirm_tui_dialog(
@@ -6866,7 +6868,8 @@ def test_a_matched_hint_confirms_before_the_poll_times_out(
         )
         is True
     )
-    assert len(captures) == 2
+    # Two watch captures (blank, dialog) + one verify capture (closed).
+    assert len(captures) == 3
 
 
 def test_a_dialog_whose_title_drifted_still_gets_the_blind_fallback_enter(
@@ -6967,6 +6970,74 @@ def test_a_foreign_dialog_already_open_at_the_start_gets_no_enter(
         is False
     )
     assert sends == []
+
+
+def test_a_swallowed_confirm_enter_is_retried_while_the_dialog_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Enter the busy TUI dropped is re-sent while the dialog stays up.
+
+    The load that renders the dialog ~1.9s late also drops keystrokes
+    mid-repaint. A single unverified Enter then leaves the dialog parked and
+    every later delivery failing the readiness gate — the same wedge the poll
+    fixed, one step later. Each retry fires only while the dialog is
+    verifiably still on screen, so none can leak onto the returned composer.
+    """
+    sends = _fake_tmux(
+        monkeypatch,
+        [_EFFORT_DIALOG_PANE] * 6 + [_IDLE_PANE],
+    )
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is True
+    )
+    enters = [args[-1] for args in sends]
+    assert enters == ["Enter", "Enter"], (
+        f"Expected the swallowed Enter to be retried exactly once before the "
+        f"dialog closed; got {enters}."
+    )
+
+
+def test_a_torn_capture_does_not_end_the_confirm_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty capture means "unknown", never "the dialog closed".
+
+    ``capture-pane`` returns "" on a torn read under a busy repaint — the very
+    load that swallows the Enter. If that blank frame ended the verify, the
+    confirm would report success with the dialog still parked on the pane.
+    """
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _EFFORT_DIALOG_PANE,
+            "",
+            _EFFORT_DIALOG_PANE,
+            "",
+            _EFFORT_DIALOG_PANE,
+            "",
+            _IDLE_PANE,
+        ],
+    )
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is True
+    )
+    enters = [args[-1] for args in sends]
+    assert enters == ["Enter", "Enter"], (
+        f"A blank frame must keep the retry alive, not declare the dialog "
+        f"closed after the first Enter; got {enters}."
+    )
 
 
 def test_auto_confirm_without_a_dialog_hint_is_rejected(tmp_path: Path) -> None:

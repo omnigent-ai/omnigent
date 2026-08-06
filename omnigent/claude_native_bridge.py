@@ -204,6 +204,14 @@ _FOREIGN_DIALOG_HINTS = (
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
 _CONFIRM_DIALOG_TIMEOUT_S = 4.0
+# Once a matched dialog got its Enter, how long to keep re-pressing while it
+# verifiably remains on screen before leaving it there.
+_CONFIRM_DIALOG_ACCEPT_TIMEOUT_S = 3.0
+# Minimum spacing between those repeated accept Enters — long enough for the
+# TUI to dismiss the dialog after a successful press, short enough that a
+# swallowed one is retried promptly (same reasoning as
+# ``_SUBMIT_RETRY_INTERVAL_S``).
+_CONFIRM_DIALOG_RETRY_INTERVAL_S = 0.75
 # When Claude Code's input prompt never renders (it failed to boot), the
 # readiness gate attaches the tail of the captured pane to its error so
 # the real cause — often Claude Code's own startup crash, e.g. a
@@ -3162,6 +3170,13 @@ def _confirm_tui_dialog(
     withheld only when the pane shows a :data:`_FOREIGN_DIALOG_HINTS` surface,
     where taking the default answer would commit something unasked-for.
 
+    The same load that renders the dialog late can also swallow the confirm
+    Enter outright (the TUI drops keystrokes mid-repaint), so a matched-hint
+    Enter is verified: while the dialog verifiably remains on screen it is
+    re-sent, spaced by :data:`_CONFIRM_DIALOG_RETRY_INTERVAL_S`. An empty
+    capture is a torn read under that very repaint — it means "unknown", not
+    "dialog gone", so it never ends the retry.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param hint: Text the dialog renders, e.g.
@@ -3174,7 +3189,7 @@ def _confirm_tui_dialog(
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         if hint in pane:
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            _confirm_and_verify_dialog_closed(socket_path, tmux_target, hint=hint)
             return True
         if time.monotonic() >= deadline:
             break
@@ -3190,6 +3205,43 @@ def _confirm_tui_dialog(
         return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
+
+
+def _confirm_and_verify_dialog_closed(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    hint: str,
+) -> None:
+    """
+    Press Enter on the *hint* dialog, re-pressing while it stays on screen.
+
+    A single Enter is enough in the common case, but under a busy repaint the
+    TUI can drop it — leaving the dialog parked, the composer gone, and every
+    later delivery failing the readiness gate. Each retry fires only while the
+    dialog is verifiably still up, so a stray Enter can never reach the
+    composer that replaces it. A dialog outliving the budget is left on
+    screen; the persisted session value remains the authoritative fallback.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param hint: Text the dialog renders, e.g.
+        :data:`SWITCH_MODEL_DIALOG_HINT`.
+    :returns: None.
+    """
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    last_enter = time.monotonic()
+    deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        pane = _capture_pane(socket_path, tmux_target)
+        # A torn (empty) capture proves nothing — only a pane that renders
+        # WITHOUT the hint shows the dialog actually closed.
+        if pane.strip() and hint not in pane:
+            return
+        if time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = time.monotonic()
 
 
 def display_cost_approval_popup(
