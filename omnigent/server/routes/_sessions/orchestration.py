@@ -4520,29 +4520,58 @@ async def _forward_event_to_runner(
                 # Child sessions: use route_session_harness to pick both harness
                 # and model, overriding whatever the orchestrator specified in
                 # sys_session_send.
-                from omnigent.server.smart_routing import (
-                    AUTO_NATIVE_ROUTING_HARNESSES,
-                    route_session_harness,
-                )
+                from omnigent.harness_aliases import is_native_harness
 
                 # A child may only leave its parent's harness family when the
                 # parent is in Smart Routing (auto) harness mode; otherwise the
                 # candidate set is the parent's family, so a codex session's
                 # children stay on codex. Same family rule the native-subagent
                 # hook path applies to in-harness spawns.
-                _child_family = (
-                    None
-                    if auto_harness_session(conv, _parent_conv)
-                    else harness_family(_resolve_harness(_parent_conv))
+                #
+                # When the parent is in auto-harness mode, preserve the child's
+                # harness class: a child whose spec declares a native harness
+                # routes within the native pool (keeps its terminal); a child
+                # with an SDK spec routes within the SDK pool. This prevents the
+                # router from switching a codex-native child to the codex SDK
+                # harness mid-dispatch (harness mismatch / respawn).
+                # Read the spec harness from the durable label (stamped at create
+                # time) rather than conv.harness_override, which routing overwrites
+                # with its pick after the first message.
+                from omnigent.runner.subagent_routing import SPEC_HARNESS_LABEL_KEY
+                from omnigent.server.smart_routing import (
+                    _AUTO_ROUTING_HARNESSES,
+                    AUTO_NATIVE_ROUTING_HARNESSES,
+                    route_session_harness,
                 )
-                # Which families the pick may land on decides whose gateway
-                # backing must hold: a cross-harness child can go either way, a
-                # family-restricted one only where its parent already runs.
-                _child_gateway_harnesses = (
-                    AUTO_NATIVE_ROUTING_HARNESSES
-                    if _child_family is None
-                    else (_resolve_harness(_parent_conv) or "",)
+
+                _child_spec_harness = conv.labels.get(SPEC_HARNESS_LABEL_KEY)
+                _child_spec_is_native = bool(
+                    _child_spec_harness and is_native_harness(_child_spec_harness)
                 )
+                if not auto_harness_session(conv, _parent_conv):
+                    _child_family = harness_family(_resolve_harness(_parent_conv))
+                    _child_harness_candidates: tuple[str, ...] | None = None
+                    _child_gateway_harnesses: tuple[str, ...] = (
+                        _resolve_harness(_parent_conv) or "",
+                    )
+                else:
+                    _child_family = None
+                    # Constrain the routing candidate pool to the child's harness
+                    # class so the router can't switch a native sub-agent to an
+                    # SDK harness (or vice-versa). When the spec harness is "auto"
+                    # or absent, fall through to the default native pool.
+                    _child_harness_candidates = (
+                        AUTO_NATIVE_ROUTING_HARNESSES
+                        if _child_spec_is_native
+                        else _AUTO_ROUTING_HARNESSES
+                        if _child_spec_harness and _child_spec_harness != "auto"
+                        else None  # unresolved: default pool in route_session_harness
+                    )
+                    _child_gateway_harnesses = (
+                        AUTO_NATIVE_ROUTING_HARNESSES
+                        if _child_family is None
+                        else (_resolve_harness(_parent_conv) or "",)
+                    )
                 _child_host = await _session_routing_host(conv, host_store)
                 if _child_host is None and _parent_conv is not None:
                     _child_host = await _session_routing_host(_parent_conv, host_store)
@@ -4557,6 +4586,7 @@ async def _forward_event_to_runner(
                     catalog_session_id=conv.parent_conversation_id,
                     runner_client=runner_client,
                     allowed_family=_child_family,
+                    harness_candidates=_child_harness_candidates,
                     gateway_backed=_child_backed,
                     allow_static_fallback=_child_backed,
                 )
@@ -7328,6 +7358,28 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv
+    # Stamp the spec-declared harness as a durable label when the runner sent
+    # a concrete native harness_override. Routing later overwrites harness_override
+    # in session_overrides with its pick, but the child routing path needs the
+    # original spec harness to decide the correct candidate pool.
+    # Use body.harness_override (runner-supplied spec harness), not the local
+    # harness_override variable which may have been changed to "auto" by
+    # _force_auto_for_child. The label must capture the spec harness before
+    # routing overwrites it so the child routing path can use the original.
+    from omnigent.harness_aliases import is_native_harness as _is_native_harness
+
+    _body_harness = body.harness_override
+    if _body_harness is not None and _body_harness != "auto" and _is_native_harness(_body_harness):
+        from omnigent.runner.subagent_routing import SPEC_HARNESS_LABEL_KEY
+
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {SPEC_HARNESS_LABEL_KEY: _body_harness},
+        )
+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if updated_conv is not None:
+            conv = updated_conv
     # Set wrapper labels at creation time if the agent is a native
     # terminal wrapper, so all messages
     # (including early ones sent before the runner connects) take

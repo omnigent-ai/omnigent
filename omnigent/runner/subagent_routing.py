@@ -95,6 +95,10 @@ HOOK_REQUEST_TIMEOUT_S = 8.0
 #: ``model_override``, so the child-sessions API can join the two without
 #: a new column or a transcript scan.
 ROUTING_DECISION_LABEL_KEY = "omnigent.routing.decision_id"
+# Label stamped at session create with the spec-declared harness so the
+# routing path can use the original spec harness even after routing has
+# overwritten harness_override with its pick.
+SPEC_HARNESS_LABEL_KEY = "omnigent.routing.spec_harness"
 
 #: Conversation label marking a session created in auto-harness mode. The
 #: ``harness_override`` sentinel is replaced the moment first-message routing

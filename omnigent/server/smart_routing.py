@@ -1820,7 +1820,7 @@ _AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "codex", "pi")
 # Both families are on the menu, so the pick maps onto the matching native
 # wrapper agent (claude-native-ui / codex-native-ui). The caller narrows them to
 # the host's installed CLIs and resolves their models pre-launch.
-AUTO_NATIVE_ROUTING_HARNESSES: tuple[str, ...] = ("claude-native", "codex-native")
+AUTO_NATIVE_ROUTING_HARNESSES: tuple[str, ...] = ("claude-native", "codex-native", "pi-native")
 
 # The live runner catalog keys rows by WORKER name — the sub-agent names declared
 # in the parent spec (e.g. "claude_code") plus "self" for the session's own
