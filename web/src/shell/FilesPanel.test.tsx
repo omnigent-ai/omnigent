@@ -28,6 +28,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   RunnerOfflineError: class RunnerOfflineError extends Error {},
 }));
 
+// The session-PRs panel runs its own react-query fetch; these tests render
+// FilesPanel without a QueryClientProvider, so stub it out (it has its own
+// test coverage).
+vi.mock("./SessionPullRequests", () => ({
+  SessionPullRequests: () => null,
+}));
+
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
