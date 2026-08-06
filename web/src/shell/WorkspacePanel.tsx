@@ -186,7 +186,7 @@ function NewTabMenu({
       )}
       <span className="whitespace-nowrap">{isReconnecting ? "Reconnecting…" : "Shell"}</span>
       {connectState === "offline" && (
-        <span className="ml-auto pl-4 text-xs text-muted-foreground">Offline</span>
+        <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
       )}
     </>
   );
@@ -324,7 +324,7 @@ function FileTabsStrip({
               // sets. `group/tab` drives the hover-revealed close overlay below.
               // `overflow-hidden` clips the hover-close gradient overlay to the
               // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -423,14 +423,14 @@ function TerminalTabsStrip({
             className={cn(
               // Match FileTabsStrip's pill metrics so shell and file tabs line
               // up in the same strip.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
             )}
           >
             <TerminalIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate text-[11px]">{name}</span>
+            <span className="min-w-0 truncate text-sm">{name}</span>
             <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"

@@ -438,7 +438,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
               e.currentTarget.blur();
             }
           }}
-          className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input/30"
+          className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input/30"
         />
         <button
           type="button"

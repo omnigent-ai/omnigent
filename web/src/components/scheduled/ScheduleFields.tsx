@@ -336,7 +336,7 @@ export function ScheduleFields({
                   data-testid={`weekday-${code}`}
                   onClick={() => toggleWeekday(code)}
                   className={cn(
-                    "h-8 min-w-11 rounded-md border px-2 text-xs font-medium transition-colors",
+                    "h-8 min-w-11 rounded-md border px-2 text-sm font-medium transition-colors",
                     selected
                       ? "border-primary bg-primary text-primary-foreground"
                       : "border-border bg-background text-muted-foreground hover:bg-muted",
@@ -353,7 +353,7 @@ export function ScheduleFields({
       {/* describeSchedule/buildRRule stay in the lib for list rows and possible
           future previews; only the inline validation error renders here now. */}
       {error && (
-        <p className="text-xs text-destructive" data-testid="schedule-error">
+        <p className="text-sm text-destructive" data-testid="schedule-error">
           {error}
         </p>
       )}

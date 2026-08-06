@@ -291,7 +291,7 @@ class TestPromptExtraction(unittest.TestCase):
         # ``{"type": "image", "source": {"type": "base64", ...}}`` — raw base64
         # with no ``data:`` URI prefix. Redaction must catch this shape too, or a
         # replayed image tool result flattens hundreds of KB into prompt text.
-        from omnigent.inner.claude_sdk_executor import _render_prior_content
+        from omnigent.inner.claude_sdk_executor import _render_prior_content_blocks
 
         image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
         content = [
@@ -305,7 +305,7 @@ class TestPromptExtraction(unittest.TestCase):
             }
         ]
 
-        rendered = _render_prior_content(content)
+        rendered = self._text_of(_render_prior_content_blocks(content))
 
         self.assertNotIn(image_payload, rendered)
         self.assertIn(

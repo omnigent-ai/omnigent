@@ -13,7 +13,7 @@ import socket
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -40,6 +40,7 @@ from omnigent.codex_native_process_registry import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -49,7 +50,13 @@ from omnigent.inner.codex_executor import (
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
+    codex_extended_catalog_requested,
+    codex_router_bridge_dir,
+    codex_router_hooks_settings,
+    codex_router_session_id,
+    codex_routing_hook_skip_reason,
     materialize_codex_provider_config,
+    write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 
@@ -57,6 +64,9 @@ _logger = logging.getLogger(__name__)
 
 CodexMessage: TypeAlias = _JsonObject
 CodexParams: TypeAlias = _JsonObject
+# A bound app-server JSON-RPC request coroutine (``client.request`` or the
+# SDK executor's ``_request``), so the trust helpers work over either transport.
+CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -95,9 +105,9 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
-# Added in openai/codex PR #21768, shipped in rust-v0.131.0 (2026-05-18).
-# Below this the flag is unknown and codex exits immediately with an error,
-# so we skip it and fall back to the old behaviour (trust prompt may appear).
+# Older binaries exit immediately on the unknown flag, so below this floor
+# (including a version we could not parse) the flag is omitted and the
+# interactive trust prompt may appear instead.
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 
 
@@ -180,9 +190,45 @@ def _remove_toml_table(text: str, table_name: str) -> str:
     return "".join(kept).rstrip()
 
 
+#: Omnigent tools the framework calls on every session's behalf, pre-approved
+#: so codex never raises an interactive prompt for them. The rename keeps a
+#: session's title current, which the framework does unprompted on any session.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+
+#: Additionally pre-approved for an auto-harness Smart Routing session, whose
+#: spawns the router may move onto the counterpart harness family: these four
+#: carry out that cross-harness redirect end to end — discover the agent, start
+#: the routed child, deliver the task, collect its result. Without the last one
+#: the redirect stalls on an approval prompt nobody is watching. A plain or
+#: pinned session can never receive a redirect, so it gets none of them and its
+#: approval surface stays a plain codex session's. Mirrors the claude-native
+#: ``_ROUTED_SPAWN_ALLOWED_TOOLS`` gate.
+_ROUTED_SPAWN_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_create",
+    "sys_agent_list",
+    "sys_session_send",
+    "sys_read_inbox",
+)
+
+
+def framework_approved_tools(*, routed_spawns: bool) -> tuple[str, ...]:
+    """
+    Name the Omnigent tools this session pre-approves in codex.
+
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which also needs the cross-harness redirect toolkit.
+    :returns: Tool names, in the order their approval tables are written.
+    """
+    if not routed_spawns:
+        return _FRAMEWORK_APPROVED_TOOLS
+    return (*_FRAMEWORK_APPROVED_TOOLS, *_ROUTED_SPAWN_APPROVED_TOOLS)
+
+
 def _codex_mcp_server_config_section(
     bridge_dir: Path,
     python_executable: str | None = None,
+    *,
+    routed_spawns: bool = False,
 ) -> str:
     """
     Build the generated Codex MCP server TOML section.
@@ -192,8 +238,10 @@ def _codex_mcp_server_config_section(
     :param python_executable: Python executable for serve-mcp, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
         :data:`sys.executable`.
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which pre-approves the cross-harness redirect tools too.
     :returns: TOML text for ``[mcp_servers.omnigent]`` and its
-        framework-managed rename-tool approval.
+        framework-managed tool approvals.
     """
     python = python_executable or sys.executable
     args = [
@@ -205,13 +253,21 @@ def _codex_mcp_server_config_section(
         str(bridge_dir),
     ]
     args_toml = ", ".join(json.dumps(a) for a in args)
+    approvals = "\n".join(
+        f'[mcp_servers.omnigent.tools.{tool}]\napproval_mode = "approve"\n'
+        for tool in framework_approved_tools(routed_spawns=routed_spawns)
+    )
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
         f"args = [{args_toml}]\n\n"
-        "[mcp_servers.omnigent.tools.sys_session_rename]\n"
-        'approval_mode = "approve"\n'
+        f"{approvals}"
     )
+
+
+# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
+# it can be clamped to one the pinned model accepts. Tolerates a trailing comment.
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
@@ -230,6 +286,8 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param model: Validated model id to pin.
     """
+    from omnigent.reasoning_effort import clamp_effort_for_model
+
     config_path = codex_home / "config.toml"
     # Same symlink-materialization dance as the MCP injection: never edit
     # the user's real config.toml through the link.
@@ -250,7 +308,15 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
         if re.match(r"^model\s*=", line):
             lines[i] = pin_line
             replaced = True
-            break
+            continue
+        # The config copies the user's default effort (e.g. xhigh), which the
+        # pinned model may reject (GLM has no xhigh). Clamp it to a value the
+        # model accepts rather than 400 the turn.
+        effort_match = _EFFORT_KEY_RE.match(line)
+        if effort_match:
+            clamped = clamp_effort_for_model(effort_match.group(2), model)
+            if clamped and clamped != effort_match.group(2):
+                lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
     if not replaced:
         lines.insert(0, pin_line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -323,6 +389,8 @@ def _inject_mcp_server_config(
     codex_home: Path,
     bridge_dir: Path,
     python_executable: str | None = None,
+    *,
+    routed_spawns: bool = False,
 ) -> None:
     """
     Upsert Omnigent MCP server config into ``config.toml``.
@@ -338,6 +406,8 @@ def _inject_mcp_server_config(
         and ``tool_relay.json``.
     :param python_executable: Python executable for serve-mcp.
         ``None`` uses :data:`sys.executable`.
+    :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
+        which pre-approves the cross-harness redirect tools too.
     :returns: None.
     """
     config_path = codex_home / "config.toml"
@@ -355,7 +425,9 @@ def _inject_mcp_server_config(
     else:
         existing = ""
     updated = _remove_toml_table(existing, "mcp_servers.omnigent")
-    section = _codex_mcp_server_config_section(bridge_dir, python_executable)
+    section = _codex_mcp_server_config_section(
+        bridge_dir, python_executable, routed_spawns=routed_spawns
+    )
     rendered = f"{updated}\n\n{section}" if updated else section
     config_path.write_text(rendered, encoding="utf-8")
 
@@ -801,6 +873,7 @@ class CodexNativeAppServer:
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
+    router_hooks_registered: bool = False
 
     async def start(self) -> None:
         """
@@ -813,16 +886,61 @@ class CodexNativeAppServer:
         if self.listen_url is None or self.listen_url.startswith("unix://"):
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()
-        _populate_codex_home_config(
+        # Native policy enforcement needs codex's hook-trust protocol
+        # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
+        # codex 0.129. Below that the hook can never be trusted, so
+        # registering it would only fail at the trust gate. Probed before
+        # the home is populated: on an unsupported codex no hooks file is
+        # generated at all, so the user's hooks.json must still be
+        # symlinked in rather than left missing. A version we cannot parse
+        # (``None``) is treated as supported so a flaky probe never
+        # silently disables enforcement — a genuine trust failure is then
+        # caught below.
+        codex_version = await _codex_cli_version(self.codex_path)
+        self.codex_cli_version = codex_version
+        policy_hooks_supported = (
+            codex_version is None or codex_version >= _MIN_POLICY_HOOK_CODEX_VERSION
+        )
+        # When the runner advertises a route-subagent endpoint, the generated
+        # hooks file owns hooks.json, so the user's copy is merged in rather
+        # than symlinked over. The runner advertises it for auto-harness Smart
+        # Routing sessions only, so its presence is also this session class's
+        # signature — see ``ensure_session_router_quietly``.
+        router_bridge_dir = codex_router_bridge_dir(self.env)
+        if router_bridge_dir is not None:
+            # A CLI too old for the spawn gate gets no routing hooks at all, so
+            # routing no-ops instead of blocking the launch. Everything keyed
+            # off the advertisement below (generated hooks.json, the routed-spawn
+            # tool pre-approvals) then falls back to the plain shape.
+            skip_reason = codex_routing_hook_skip_reason(codex_version)
+            if skip_reason is not None:
+                _logger.warning("%s", skip_reason)
+                router_bridge_dir = None
+        self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
+        routed_spawns = router_bridge_dir is not None
+        config_source = _codex_home_config_source_from_env()
+        # Off the loop: this copies/symlinks a home AND (on a Smart Routing
+        # session) shells out to ``codex debug models`` with a 10s timeout. Run
+        # inline it stalled every other session sharing this event loop for that
+        # long — which is also why a plain session must never reach the probe.
+        await asyncio.to_thread(
+            _populate_codex_home_config,
             self.codex_home,
-            _codex_home_config_source_from_env(),
+            config_source,
+            inject_hooks=self.router_hooks_registered,
+            extend_model_catalog=codex_extended_catalog_requested(self.env),
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
         # by `codex app-server`, so we write directly to the file.
-        _inject_mcp_server_config(self.codex_home, self.bridge_dir, self.python_executable)
+        _inject_mcp_server_config(
+            self.codex_home,
+            self.bridge_dir,
+            self.python_executable,
+            routed_spawns=routed_spawns,
+        )
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
         _sync_codex_developer_instructions(
@@ -833,18 +951,7 @@ class CodexNativeAppServer:
             self.codex_home,
             self.config_overrides,
         )
-        # Native policy enforcement needs codex's hook-trust protocol
-        # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
-        # codex 0.129. Below that the hook can never be trusted, so
-        # registering it would only fail at the trust gate. Detect the
-        # version up front; below the minimum we skip registration and
-        # degrade to "no enforcement" with a surfaced reason. A version we
-        # cannot parse (``None``) is treated as supported so a flaky probe
-        # never silently disables enforcement — a genuine trust failure is
-        # then caught below.
-        codex_version = await _codex_cli_version(self.codex_path)
-        self.codex_cli_version = codex_version
-        if codex_version is not None and codex_version < _MIN_POLICY_HOOK_CODEX_VERSION:
+        if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
                 f"{_format_codex_version(_MIN_POLICY_HOOK_CODEX_VERSION)}; upgrade "
@@ -858,7 +965,17 @@ class CodexNativeAppServer:
             # ap_server_url the hook is still registered + trusted but
             # no-ops.
             _write_codex_policy_hooks_file(
-                self.codex_home, self.bridge_dir, self.python_executable
+                self.codex_home,
+                self.bridge_dir,
+                self.python_executable,
+                router_bridge_dir=router_bridge_dir,
+                router_session_id=codex_router_session_id(self.env),
+                user_hooks_source=config_source / _CODEX_HOOKS_FILE,
+                # The runner only advertises a route-turn endpoint for a
+                # session that launched with Smart Routing on, so its presence
+                # is the switch for the first-message routing hook. Same
+                # rendezvous-as-switch shape as the subagent router above.
+                turn_routing=_turn_router_advertised(self.bridge_dir),
             )
             if self.ap_server_url:
                 write_policy_hook_config(
@@ -908,6 +1025,13 @@ class CodexNativeAppServer:
             self._stderr_loop(),
             name="codex-native-app-server-stderr",
         )
+        # Ordering invariant: hooks.json is written before the spawn above,
+        # and the trust handshake must complete before the first turn — codex
+        # resolves trust when it dispatches a hook, so trust landing after the
+        # spawn is fine, but a turn started before it runs unhooked. The
+        # handshake cannot precede the spawn (``hooks/list`` is an app-server
+        # RPC), so callers must not launch the TUI or dispatch a turn until
+        # ``start()`` returns.
         # Readiness failure (the app-server never came up) is fatal and
         # tears down the subprocess so it is not orphaned. Policy-hook
         # trust, by contrast, is best-effort: a trust failure degrades the
@@ -957,6 +1081,18 @@ class CodexNativeAppServer:
         await client.connect()
         try:
             await trust_native_policy_hooks(client, cwd=str(self.cwd))
+            # Routing hooks live in the same generated file but under a
+            # different module, so they need their own trust pass. Best
+            # effort: a routing-trust failure must not disable the policy
+            # gate, so it is logged instead of raised.
+            if self.router_hooks_registered:
+                try:
+                    await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
+                except Exception:  # noqa: BLE001 - routing trust never blocks startup
+                    _logger.warning(
+                        "codex subagent-routing hook trust failed; routing will not be enforced",
+                        exc_info=True,
+                    )
         except RuntimeError as exc:
             raise RuntimeError(f"{exc}{self._codex_config_error_hint()}") from exc
         finally:
@@ -1115,21 +1251,56 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
     """
     Build the shell command codex runs for the policy hook.
 
+    Runs python in isolated mode (``-I``): codex executes hooks with the
+    session's workspace as cwd, and ``-m`` would otherwise put that
+    workspace first on ``sys.path``. A workspace holding a directory named
+    like one of our packages (the omnigent checkout itself, most obviously)
+    then shadows the installed one and the hook dies on an import error
+    that codex discards — a silent fail-open. Mirrors the ``-I`` the
+    bridge's MCP server command already uses.
+
     :param bridge_dir: Native Codex bridge directory passed to the hook
         via ``--bridge-dir``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
     :returns: A shell-escaped command string, e.g.
-        ``"/path/python -m omnigent.codex_native_hook evaluate-policy
+        ``"/path/python -I -m omnigent.codex_native_hook evaluate-policy
         --bridge-dir /home/u/.omnigent/codex-native/abc"``.
     """
     python = python_executable or sys.executable
     return shlex.join(
-        [python, "-m", _POLICY_HOOK_MODULE, "evaluate-policy", "--bridge-dir", str(bridge_dir)]
+        [
+            python,
+            "-I",
+            "-m",
+            _POLICY_HOOK_MODULE,
+            "evaluate-policy",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
     )
 
 
-def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
+def _turn_router_advertised(bridge_dir: Path) -> bool:
+    """
+    Report whether the runner advertised a ``route-turn`` endpoint here.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` when a usable ``turn_router.json`` is present, i.e. the
+        session launched with Smart Routing on.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
+
+    return read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE) is not None
+
+
+def _codex_policy_hooks_settings(
+    bridge_dir: Path,
+    python_executable: str | None,
+    *,
+    turn_routing: bool = False,
+) -> _JsonObject:
     """
     Build the ``hooks.json`` payload registering the policy hook.
 
@@ -1144,115 +1315,131 @@ def _codex_policy_hooks_settings(bridge_dir: Path, python_executable: str | None
 
     :param bridge_dir: Native Codex bridge directory.
     :param python_executable: Python executable for the hook command.
+    :param turn_routing: ``True`` when the runner advertised a ``route-turn``
+        endpoint for this session, i.e. it launched with Smart Routing on.
+        ``False`` leaves the first-message routing hook unregistered, so a
+        session that will never route pays no per-prompt round trip.
     :returns: A ``hooks.json``-shaped dict.
     """
-    hook = {
+    hook: _JsonObject = {
         "type": "command",
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
+    prompt_submit: list[_JsonObject] = [hook]
+    if turn_routing:
+        prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
     return {
         "hooks": {
             "PreToolUse": [{"hooks": [hook]}],
             "PostToolUse": [{"hooks": [hook]}],
-            "UserPromptSubmit": [{"hooks": [hook]}],
+            "UserPromptSubmit": [{"hooks": prompt_submit}],
         }
     }
 
 
-def _merge_user_hooks(policy_payload: _JsonObject, user_hooks_path: Path) -> _JsonObject:
+def _codex_route_turn_hook(bridge_dir: Path, python_executable: str | None) -> _JsonObject:
     """
-    Merge user-declared hooks into the policy hooks payload.
+    Build the ``UserPromptSubmit`` entry for first-message model routing.
 
-    When a symlinked ``hooks.json`` exists in the private ``CODEX_HOME``
-    (the user's real ``~/.codex/hooks.json``), its hook entries are
-    appended after Omnigent's policy hooks for each shared event, and any
-    events declared only by the user are added wholesale. This preserves
-    all user hooks while keeping the Omnigent policy hooks in first
-    position so they always run before user hooks.
+    A second command alongside the policy gate rather than a module of its
+    own: codex trusts hooks by command, and the trust pass filters on
+    :data:`_POLICY_HOOK_MODULE`, so keeping the subcommand there rides the
+    existing handshake. It no-ops (exit 0, no output) unless the runner has
+    advertised a ``route-turn`` endpoint and nothing has pinned the
+    session's model yet; when it does route, it blocks the prompt and the
+    runner replays it on the routed model. See
+    :mod:`omnigent.runner.turn_routing`.
 
-    :param policy_payload: The ``hooks.json``-shaped dict built by
-        :func:`_codex_policy_hooks_settings`.
-    :param user_hooks_path: Path to the user's real ``hooks.json``; must
-        be readable.
-    :returns: Merged payload, or *policy_payload* unchanged on any read
-        or parse error (best-effort — policy enforcement must never fail
-        because the user's hooks file is malformed).
+    :param bridge_dir: Native Codex bridge directory, holding both the
+        endpoint advertisement and the marker file.
+    :param python_executable: Python executable for the hook command.
+    :returns: One ``hooks.json`` command-hook entry.
     """
-    try:
-        decoded: object = json.loads(user_hooks_path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return policy_payload
-    user_data = _string_object_dict(decoded)
-    user_hooks = _string_object_dict(user_data.get("hooks")) if user_data is not None else None
-    if not user_hooks:
-        return policy_payload
-    policy_hooks = _string_object_dict(policy_payload.get("hooks"))
-    if policy_hooks is None:
-        return policy_payload
-    merged: _JsonObject = dict(policy_payload)
-    merged_hooks: _JsonObject = dict(policy_hooks)
-    merged["hooks"] = merged_hooks
-    for event, entries in user_hooks.items():
-        user_entries = _object_list(entries)
-        if user_entries is None:
-            continue
-        existing_entries = _object_list(merged_hooks.get(event))
-        if existing_entries is not None:
-            merged_hooks[event] = existing_entries + user_entries
-        else:
-            merged_hooks[event] = user_entries
-    return merged
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    return {
+        "type": "command",
+        "command": shlex.join(
+            [
+                python_executable or sys.executable,
+                "-I",
+                "-m",
+                _POLICY_HOOK_MODULE,
+                "route-turn",
+                "--bridge-dir",
+                str(bridge_dir),
+                "--harness",
+                "codex-native",
+            ]
+        ),
+        "timeout": HARNESS_HOOK_TIMEOUT_S,
+    }
 
 
 def _write_codex_policy_hooks_file(
-    codex_home: Path, bridge_dir: Path, python_executable: str | None
+    codex_home: Path,
+    bridge_dir: Path,
+    python_executable: str | None,
+    *,
+    router_bridge_dir: Path | None = None,
+    router_session_id: str | None = None,
+    user_hooks_source: Path | None = None,
+    turn_routing: bool = False,
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
 
-    When ``_populate_codex_home_config`` has symlinked the user's
-    ``hooks.json`` into the private home, its entries are merged into the
-    policy hooks payload before the file is written so user hooks fire
-    alongside Omnigent's policy hooks. The symlink is replaced by a
-    regular merged file.
+    This file is the only ``hooks.json`` codex loads, so the policy hooks,
+    the subagent-routing hooks and the user's own hooks all go through the
+    shared :func:`write_codex_hooks_file` into one payload — written
+    separately, whichever ran last would erase the other.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param bridge_dir: Native Codex bridge directory for the hook command.
     :param python_executable: Python executable for the hook command.
+    :param router_bridge_dir: Directory advertising the route-subagent
+        endpoint. ``None`` leaves native subagent spawns unrouted.
+    :param router_session_id: Session id baked into the routing hook
+        commands.
+    :param user_hooks_source: The user's real ``hooks.json`` to merge when
+        the private home holds no symlink to it (the routing path unlinks
+        it before this runs).
+    :param turn_routing: ``True`` when the session launched with Smart Routing
+        on, which registers the ``UserPromptSubmit`` first-message routing
+        hook.
     :returns: None.
     """
-    codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = codex_home / _CODEX_HOOKS_FILE
-    payload = _codex_policy_hooks_settings(bridge_dir, python_executable)
-    if path.is_symlink() and path.exists():
-        payload = _merge_user_hooks(payload, path.resolve())
-        path.unlink()
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{_CODEX_HOOKS_FILE}.", dir=str(codex_home))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    payloads: list[Mapping[str, object]] = [
+        _codex_policy_hooks_settings(bridge_dir, python_executable, turn_routing=turn_routing)
+    ]
+    if router_bridge_dir is not None:
+        payloads.append(
+            codex_router_hooks_settings(
+                router_bridge_dir,
+                session_id=router_session_id,
+                harness="codex-native",
+                python_executable=python_executable,
+            )
+        )
+    _ = write_codex_hooks_file(codex_home, payloads, user_hooks_source=user_hooks_source)
 
 
-def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObject]:
+def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_JsonObject]:
     """
-    Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
+    Extract the hooks for *cwd* whose command runs *module*.
 
-    Filters to hooks whose command references :data:`_POLICY_HOOK_MODULE`
-    so the trust step never touches hooks the user's symlinked
-    ``config.toml`` might declare.
+    Filtering by module keeps the trust step from ever touching hooks the
+    user's own ``hooks.json`` contributed to the merged file.
 
     :param listed: Parsed ``hooks/list`` response envelope, with
         ``result.data`` a list of ``{cwd, hooks: [...]}`` entries.
     :param cwd: The cwd whose hook set to read, e.g.
         ``"/home/user/repo"``.
-    :returns: The matching Omnigent hook metadata dicts (possibly
-        empty), each with ``key``, ``currentHash``, ``trustStatus``.
+    :param module: Hook-script module marker, e.g.
+        ``"omnigent.codex_native_hook"``.
+    :returns: The matching hook metadata dicts (possibly empty), each
+        with ``key``, ``currentHash``, ``trustStatus``.
     """
     result = _string_object_dict(listed.get("result"))
     if result is None:
@@ -1266,9 +1453,21 @@ def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObje
                 hook
                 for raw_hook in hooks
                 if (hook := _string_object_dict(raw_hook)) is not None
-                and _POLICY_HOOK_MODULE in str(hook.get("command", ""))
+                and module in str(hook.get("command", ""))
             ]
     return []
+
+
+def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObject]:
+    """
+    Extract *our* policy hooks for *cwd* from a ``hooks/list`` response.
+
+    :param listed: Parsed ``hooks/list`` response envelope.
+    :param cwd: The cwd whose hook set to read, e.g.
+        ``"/home/user/repo"``.
+    :returns: The matching Omnigent policy-hook metadata dicts.
+    """
+    return _our_hooks_from_list(listed, cwd, _POLICY_HOOK_MODULE)
 
 
 def _hooks_list_diagnostics(listed: _JsonObject, cwd: str) -> str:
@@ -1340,6 +1539,104 @@ def _untrusted_hook_detail(hooks: Sequence[_JsonObject]) -> str:
     )
 
 
+async def _persist_hook_trust(request: CodexRequestFn, untrusted: Sequence[_JsonObject]) -> None:
+    """
+    Write ``hooks.state.<key>.trusted_hash`` for each untrusted hook.
+
+    Persisted trust is the *only* mechanism that makes a hook run under
+    ``codex app-server``: the ``--dangerously-bypass-hook-trust`` CLI flag
+    is honored by the interactive/exec paths only, so app-server threads
+    silently skip anything left ``untrusted``.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request``.
+    :param untrusted: Hook metadata dicts from ``hooks/list`` carrying
+        ``key`` and ``currentHash``.
+    :returns: None.
+    """
+    trust_value = {
+        str(h["key"]): {"trusted_hash": h["currentHash"]}
+        for h in untrusted
+        if h.get("key") and h.get("currentHash")
+    }
+    if not trust_value:
+        return
+    await request(
+        "config/batchWrite",
+        {
+            "edits": [
+                {
+                    "keyPath": "hooks.state",
+                    "mergeStrategy": "upsert",
+                    "value": trust_value,
+                }
+            ],
+            "reloadUserConfig": True,
+        },
+    )
+
+
+async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
+    """
+    Trust the generated subagent-routing hooks so codex runs them.
+
+    Codex skips untrusted hooks without a word, which for the routing gate
+    is a fail-open, and app-server threads honor persisted trust only (the
+    ``--dangerously-bypass-hook-trust`` flag covers the interactive /
+    ``exec`` paths, not this one), so the handshake is the only way in.
+
+    The routing gate (``PreToolUse`` on the spawn tool) lives in the same
+    generated ``hooks.json`` as the policy hook but under a different
+    module, so the policy trust pass leaves it ``untrusted``. Same
+    ``hooks/list`` → ``config/batchWrite`` flow, but best-effort: a
+    routing-trust failure must not disable policy enforcement, so it is
+    reported instead of raised.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request`` (or the SDK executor's ``_request``).
+    :param cwd: The session cwd the hooks are scoped to, e.g.
+        ``"/home/user/repo"``.
+    :returns: Keys of routing hooks still untrusted afterwards; empty when
+        every routing hook is trusted (or none are registered).
+    """
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    ours = _our_hooks_from_list(listed, cwd, _CODEX_ROUTER_HOOK_MODULE)
+    if not ours:
+        _logger.info(
+            "codex subagent-routing hooks: none discovered for cwd %s (%s)",
+            cwd,
+            _hooks_list_diagnostics(listed, cwd),
+        )
+        return []
+    untrusted = [h for h in ours if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
+    if not untrusted:
+        _logger.info(
+            "codex subagent-routing hooks: all %d already trusted for cwd %s", len(ours), cwd
+        )
+        return []
+    await _persist_hook_trust(request, untrusted)
+    relisted = await request("hooks/list", {"cwds": [cwd]})
+    still_untrusted = [
+        h
+        for h in _our_hooks_from_list(relisted, cwd, _CODEX_ROUTER_HOOK_MODULE)
+        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    ]
+    if still_untrusted:
+        _logger.warning(
+            "codex subagent-routing hooks still untrusted after config/batchWrite; "
+            "native subagent routing will NOT be enforced: %s",
+            _untrusted_hook_detail(still_untrusted),
+        )
+        return [str(h.get("key")) for h in still_untrusted]
+    _logger.info(
+        "codex subagent-routing hooks trusted (%d of %d newly): %s",
+        len(untrusted),
+        len(ours),
+        ", ".join(sorted(str(h.get("eventName")) for h in ours)),
+    )
+    return []
+
+
 async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -> None:
     """
     Trust the Omnigent policy hook so codex actually runs it.
@@ -1370,24 +1667,7 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
     untrusted = [h for h in ours if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
     if not untrusted:
         return
-    trust_value = {
-        str(h["key"]): {"trusted_hash": h["currentHash"]}
-        for h in untrusted
-        if h.get("key") and h.get("currentHash")
-    }
-    await client.request(
-        "config/batchWrite",
-        {
-            "edits": [
-                {
-                    "keyPath": "hooks.state",
-                    "mergeStrategy": "upsert",
-                    "value": trust_value,
-                }
-            ],
-            "reloadUserConfig": True,
-        },
-    )
+    await _persist_hook_trust(client.request, untrusted)
     relisted = await client.request("hooks/list", {"cwds": [cwd]})
     still_untrusted = [
         h
@@ -1620,6 +1900,44 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     if launch.profile is not None:
         return "omnigent_databricks"
     return "openai"
+
+
+def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
+    """Inference base URL a resolved launch pins, or None when it defers to Codex's own login.
+
+    Mirrors how the launch is actually applied: the Databricks-profile branch of
+    :func:`build_native_codex_app` derives the base URL from the profile host,
+    while a generic provider carries it inside the generated
+    ``model_providers.…`` config override.
+
+    :param launch: Resolved native-Codex launch, e.g. one returned by
+        :func:`resolve_native_codex_launch`.
+    :returns: The base URL the launch routes through, or ``None`` when the
+        launch pins none.
+    """
+    if launch.profile is not None:
+        host = _databricks_gateway_host(launch.profile)
+        if not host:
+            return None
+        return _databricks_codex_base_url(host.rstrip("/"))
+    for override in launch.config_overrides:
+        _, sep, table = override.partition("=")
+        if not sep or not override.startswith("model_providers."):
+            continue
+        marker = "base_url="
+        index = table.find(marker)
+        if index < 0:
+            continue
+        decoder = json.JSONDecoder()
+        try:
+            base_url, _ = decoder.raw_decode(table[index + len(marker) :])
+        except ValueError:
+            continue
+        if isinstance(base_url, str):
+            return base_url
+    # A cli-config entry pins only a provider *name*; its table lives in the
+    # user's ~/.codex/config.toml, which this process does not read.
+    return None
 
 
 def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCodexLaunch | None:

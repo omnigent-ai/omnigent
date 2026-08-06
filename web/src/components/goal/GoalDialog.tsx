@@ -72,7 +72,7 @@ function GoalSummary({ loading, goal }: GoalSummaryProps) {
       data-testid="goal-current"
       className="space-y-1 rounded-lg border border-border bg-muted/30 p-3"
     >
-      <div className="flex items-center justify-between gap-3 text-xs">
+      <div className="flex items-center justify-between gap-3 text-sm">
         <span className="font-medium text-foreground">{formatGoalStatus(goal.status)}</span>
         <span className="shrink-0 text-muted-foreground">{formatGoalUsage(goal)}</span>
       </div>
@@ -135,7 +135,7 @@ function GoalEditor({
   return (
     <>
       <div className="space-y-1.5">
-        <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-objective">
+        <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-objective">
           Objective
         </label>
         <Textarea
@@ -150,7 +150,7 @@ function GoalEditor({
       </div>
 
       <div className="space-y-1.5">
-        <label className="text-xs font-medium text-muted-foreground">Mode</label>
+        <label className="text-sm font-medium text-muted-foreground">Mode</label>
         <div
           role="radiogroup"
           aria-label="Goal mode"
@@ -199,7 +199,7 @@ function GoalEditor({
       </div>
 
       <div className="space-y-1.5">
-        <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-token-budget">
+        <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-token-budget">
           Token budget
         </label>
         <Input

@@ -18,7 +18,7 @@ function AgentFlyoutBody({ agent }: { agent: AvailableAgent }) {
   return (
     <div className="text-ui">
       <p className="font-semibold leading-snug">{agent.display_name}</p>
-      <p className="mt-1 text-xs leading-snug text-muted-foreground">{agent.description}</p>
+      <p className="mt-1 text-sm leading-snug text-muted-foreground">{agent.description}</p>
     </div>
   );
 }

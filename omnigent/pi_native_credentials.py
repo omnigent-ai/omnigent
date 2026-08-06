@@ -31,6 +31,11 @@ from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
 from omnigent import model_catalog
+from omnigent.databricks_ai_gateway import (
+    DATABRICKS_AI_GATEWAY_LABEL,
+    DATABRICKS_TRUSTED_HOST_SUFFIXES,
+    is_databricks_ai_gateway_url,
+)
 from omnigent.model_metadata import ModelWireAPI
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
@@ -89,22 +94,12 @@ _DATABRICKS_ANTHROPIC_GATEWAY_PATH = "/ai-gateway/anthropic"
 _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
 
-# Trusted parent domain suffixes for a Databricks-owned host. The AI Gateway
-# lives under a per-workspace subdomain of one of these (the canonical form is
-# ``<workspace>.ai-gateway.cloud.databricks.com``); the Azure / GCP control
-# planes serve workspaces under their own parent domains. We anchor on the
-# leading "." so a look-alike like ``...cloud.databricks.com.evil.test`` (which
-# ends in ``.evil.test``) is rejected.
-_DATABRICKS_TRUSTED_HOST_SUFFIXES = (
-    ".cloud.databricks.com",  # AWS workspaces + ai-gateway (incl. *.staging.cloud.databricks.com)
-    ".azuredatabricks.net",  # Azure Databricks
-    ".gcp.databricks.com",  # GCP Databricks
-)
-
-# A genuine AI Gateway host carries the ``ai-gateway`` DNS label; we require it
-# (alongside a trusted suffix) so a non-gateway Databricks host isn't routed as
-# the gateway's Anthropic surface.
-_DATABRICKS_AI_GATEWAY_LABEL = "ai-gateway"
+# Aliases for the canonical Databricks AI Gateway predicate and its constants,
+# which live in :mod:`omnigent.databricks_ai_gateway` so every surface that must
+# recognize the gateway agrees.
+_DATABRICKS_TRUSTED_HOST_SUFFIXES = DATABRICKS_TRUSTED_HOST_SUFFIXES
+_DATABRICKS_AI_GATEWAY_LABEL = DATABRICKS_AI_GATEWAY_LABEL
+_is_databricks_ai_gateway_url = is_databricks_ai_gateway_url
 
 
 class _PiModelEntry(TypedDict):
@@ -144,44 +139,6 @@ _PiModelLists: TypeAlias = tuple[
 
 def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:
     return isinstance(value, dict) and all(isinstance(key, str) for key in value)
-
-
-def _is_databricks_ai_gateway_url(base_url: str) -> bool:
-    """Return ``True`` only for a genuine Databricks AI Gateway base URL.
-
-    Two URL shapes are accepted:
-
-    1. **Dedicated AI Gateway subdomain** — ``ai-gateway`` is a full DNS label
-       in the hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``). Used by
-       the standard ``isaac configure codex`` setup.
-    2. **Workspace-hosted gateway** — the hostname is a plain Databricks
-       workspace (ends with a trusted suffix) and the path starts with
-       ``/ai-gateway/`` (e.g. ``<workspace>.cloud.databricks.com/ai-gateway/...``).
-       Used by ucode / Codex app profile setups.
-
-    Both cases require ``https`` and a hostname ending with a trusted
-    Databricks-owned domain suffix to prevent token-forwarding attacks.
-
-    :param base_url: The codex provider table's ``base_url``.
-    :returns: ``True`` iff the URL is an https Databricks AI Gateway endpoint.
-    """
-    parsed = urlparse(base_url)
-    if parsed.scheme != "https":
-        return False
-    hostname = parsed.hostname
-    if not hostname:
-        return False
-    hostname = hostname.lower()
-    trusted = any(hostname.endswith(suffix) for suffix in _DATABRICKS_TRUSTED_HOST_SUFFIXES)
-    if not trusted:
-        return False
-    # Shape 1: ``ai-gateway`` is a full DNS label in the hostname.
-    labels = hostname.split(".")
-    if _DATABRICKS_AI_GATEWAY_LABEL in labels:
-        return True
-    # Shape 2: workspace hostname + /ai-gateway/ path prefix.
-    path = parsed.path or ""
-    return path.startswith("/ai-gateway/")
 
 
 def _databricks_workspace_url_for_gateway(

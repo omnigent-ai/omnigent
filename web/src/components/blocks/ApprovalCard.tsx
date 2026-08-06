@@ -415,19 +415,19 @@ export function ApprovalCard({
         <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
           {label}
-          {policyName && <span className="text-muted-foreground text-xs">· {policyName}</span>}
+          {policyName && <span className="text-muted-foreground text-sm">· {policyName}</span>}
         </AlertTitle>
-        <AlertDescription className="flex flex-col gap-1 text-xs">
+        <AlertDescription className="flex flex-col gap-1 text-sm">
           {isCodexCommandApproval ? (
             <>
               {codexCommand.reason && <span>{codexCommand.reason}</span>}
-              <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">
+              <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap">
                 {codexCommand.command}
               </pre>
               {codexCommand.cwd && (
                 <span>
                   <span className="text-muted-foreground">cwd: </span>
-                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-sm">
                     {codexCommand.cwd}
                   </code>
                 </span>
@@ -481,15 +481,15 @@ export function ApprovalCard({
                 ? "Choose an option"
                 : "Approval required"}
         {policyName && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">· {policyName}</span>
+          <span className="text-muted-foreground text-sm">· {policyName}</span>
         )}
         {phase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">({phase})</span>
+          <span className="text-muted-foreground text-sm">({phase})</span>
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
         {!canApprove && (
-          <span className="text-xs text-muted-foreground" role="note">
+          <span className="text-sm text-muted-foreground" role="note">
             Only the session owner or a delegated approver can approve. You can still reject.
           </span>
         )}
@@ -515,11 +515,11 @@ export function ApprovalCard({
           <>
             <span>Codex wants to run this command.</span>
             {codexCommand.reason && <span className="text-foreground">{codexCommand.reason}</span>}
-            <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs text-foreground whitespace-pre-wrap">
+            <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap">
               {codexCommand.command}
             </pre>
             {codexCommand.cwd && (
-              <span className="text-xs">
+              <span className="text-sm">
                 cwd:{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono">{codexCommand.cwd}</code>
               </span>
@@ -530,7 +530,7 @@ export function ApprovalCard({
           <>
             <span>{message}</span>
             {formattedPreview && (
-              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
+              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
               </pre>
             )}

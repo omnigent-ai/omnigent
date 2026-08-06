@@ -91,7 +91,7 @@ describe("ChatHeader — deployed Share presentation", () => {
       "gap-1",
       "rounded-[6px]",
       "px-2",
-      "text-[13px]",
+      "text-ui",
       "share-button-glassy",
       "md:inline-flex",
     );
@@ -115,7 +115,7 @@ describe("ChatHeader — deployed Share presentation", () => {
       "gap-1",
       "rounded-[6px]",
       "px-2",
-      "text-[13px]",
+      "text-ui",
       "share-button-glassy",
     );
     expect(share.querySelector(".lucide-user-plus")).not.toBeNull();

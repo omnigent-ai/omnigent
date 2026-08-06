@@ -128,9 +128,9 @@ export function PreviewSearchBar({
           }
         }}
         placeholder="Find…"
-        className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+        className="min-w-0 flex-1 bg-transparent text-sm outline-none"
       />
-      <span className="shrink-0 text-xs text-muted-foreground">
+      <span className="shrink-0 text-sm text-muted-foreground">
         {query.trim() ? (matchCount > 0 ? `${safeIndex + 1} / ${matchCount}` : "No results") : ""}
       </span>
       <button
