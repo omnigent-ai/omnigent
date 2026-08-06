@@ -1302,33 +1302,42 @@ function ConversationList({
     // by when they were pinned (the `omnigent.pinned` label's epoch-ms value;
     // oldest pin at the top, newest at the bottom), NOT by `updated_at`, so a
     // pinned session holds its slot when a new message bumps its `updated_at`.
-    // Pins are ownership-agnostic, so a pinned shared session floats to Pinned
-    // on the Shared tab just like an owned one on My sessions.
-    const pinned = orderByPinnedTimestamp(tabScoped.filter((c) => pinnedSet.has(c.id)));
+    // Pins are ownership-agnostic, so the Pinned section always shows every
+    // non-archived pin regardless of the My/Shared/All/Archived filter — it's
+    // scoped to notArchived (not tabScoped), so an owned pin stays visible on
+    // the Shared tab, a shared pin stays visible on My sessions, and the pins
+    // don't vanish on the Archived tab either. (An archived session is never
+    // pinned into the live sections — hence notArchived, not allWithPinned.)
+    const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
-    // Filing is owner-only, so Shared renders no folders; Archived is flat too
-    // (archived outranks project membership). Elsewhere each folder holds its
+    // The Projects section renders the same folders on every filter (scope to
+    // notArchived, not tabScoped, so folders don't empty out on Shared or
+    // Archived). Filing is owner-only, though — UNLIKE pins — so membership is
+    // gated on ownership: a folder only ever holds the viewer's OWNED sessions.
+    // Without the guard the legacy label arm would match a shared session by
+    // project name alone, pulling a foreign session into the viewer's folder
+    // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
     const filedIds = new Set<string>();
     const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
-      activeTab === "shared" || activeTab === "archived"
-        ? []
-        : projects.map(({ id, name }) => {
-            // Dual-read membership: a session belongs to this folder if it has
-            // the first-class id OR the legacy omni_project label of this name.
-            const inProject = tabScoped.filter(
-              (c) =>
-                ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-                !pinnedIdSet.has(c.id),
-            );
-            inProject.forEach((c) => filedIds.add(c.id));
-            return {
-              id,
-              name,
-              conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
-            };
-          });
+      projects.map(({ id, name }) => {
+        // Dual-read membership: a session belongs to this folder if it has
+        // the first-class id OR the legacy omni_project label of this name,
+        // and (filing being owner-only) the viewer owns it.
+        const inProject = notArchived.filter(
+          (c) =>
+            isOwnedByViewer(c, viewerId) &&
+            ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
+            !pinnedIdSet.has(c.id),
+        );
+        inProject.forEach((c) => filedIds.add(c.id));
+        return {
+          id,
+          name,
+          conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+        };
+      });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
@@ -1771,70 +1780,69 @@ function ConversationList({
               a collapsible folder row nested beneath it. Folders default
               collapsed; an empty folder shows "No sessions". The folder icon marks
               a project row; the group/section headers carry no icon or count.
-              Shown on the "mine" tab even with zero projects, so "New project"
-              (create-empty) is discoverable — projects are a My-sessions tool. */}
-                {activeTab !== "shared" && (
-                  <SectionGroup
-                    title="Projects"
-                    collapsed={effectiveCollapsedSections.includes("Projects")}
-                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                    afterHeader={
-                      projectsSelecting ? (
-                        <BulkActionBar
-                          selectedIds={selectedIds}
-                          allConversations={projectSessionPool}
-                          onDeselectAll={onDeselectAll}
-                          onExit={onExitSelectionMode}
-                        />
-                      ) : undefined
-                    }
-                    headerAction={
-                      !selectionMode ? (
-                        <ProjectHeaderActions
-                          projectNames={sections.projectGroups.map((group) => group.name)}
-                          collapsed={effectiveCollapsedSections.includes("Projects")}
-                          expandedProjects={expandedProjects}
-                          hasProjectSessions={sections.projectGroups.some(
-                            (group) => group.conversations.length > 0,
-                          )}
-                          onExpandAll={expandAllProjects}
-                          onCollapseAll={collapseAllProjects}
-                          onProjectCreated={expandProject}
-                          onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                        />
-                      ) : undefined
-                    }
-                  >
-                    {sections.projectGroups.map((group) => (
-                      <ProjectFolder
-                        key={group.name}
-                        name={group.name}
-                        projectId={group.id}
-                        windowConversations={group.conversations}
-                        expanded={expandedProjects.includes(group.name)}
-                        // Best-effort marker from the globally-loaded window: a
-                        // collapsed folder hasn't fetched its own sessions yet.
-                        marker={projectMarkerState(group.conversations)}
-                        onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                        pinnedConversationIds={pinnedConversationIds}
-                        activeOverride={activeOverride}
-                        frozenSortKeys={frozenKeys}
-                        scrollRoot={scrollContainerRef}
-                        onRowClick={onRowClick}
-                        onTogglePinned={onTogglePinned}
-                        selectionMode={projectsSelecting}
+              Always shown (even with zero projects), unaffected by the filter, so
+              "New project" (create-empty) stays discoverable and folders don't
+              vanish when switching to Shared or Archived. */}
+                <SectionGroup
+                  title="Projects"
+                  collapsed={effectiveCollapsedSections.includes("Projects")}
+                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                  afterHeader={
+                    projectsSelecting ? (
+                      <BulkActionBar
                         selectedIds={selectedIds}
-                        onToggleSelected={onToggleSelected}
-                        onProjectAssigned={expandProject}
-                        onConversationsLoaded={handleFolderConversationsLoaded}
+                        allConversations={projectSessionPool}
+                        onDeselectAll={onDeselectAll}
+                        onExit={onExitSelectionMode}
                       />
-                    ))}
-                    {sections.projectGroups.length === 0 &&
-                      !effectiveCollapsedSections.includes("Projects") && (
-                        <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
-                      )}
-                  </SectionGroup>
-                )}
+                    ) : undefined
+                  }
+                  headerAction={
+                    !selectionMode ? (
+                      <ProjectHeaderActions
+                        projectNames={sections.projectGroups.map((group) => group.name)}
+                        collapsed={effectiveCollapsedSections.includes("Projects")}
+                        expandedProjects={expandedProjects}
+                        hasProjectSessions={sections.projectGroups.some(
+                          (group) => group.conversations.length > 0,
+                        )}
+                        onExpandAll={expandAllProjects}
+                        onCollapseAll={collapseAllProjects}
+                        onProjectCreated={expandProject}
+                        onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                      />
+                    ) : undefined
+                  }
+                >
+                  {sections.projectGroups.map((group) => (
+                    <ProjectFolder
+                      key={group.name}
+                      name={group.name}
+                      projectId={group.id}
+                      windowConversations={group.conversations}
+                      expanded={expandedProjects.includes(group.name)}
+                      // Best-effort marker from the globally-loaded window: a
+                      // collapsed folder hasn't fetched its own sessions yet.
+                      marker={projectMarkerState(group.conversations)}
+                      onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                      pinnedConversationIds={pinnedConversationIds}
+                      activeOverride={activeOverride}
+                      frozenSortKeys={frozenKeys}
+                      scrollRoot={scrollContainerRef}
+                      onRowClick={onRowClick}
+                      onTogglePinned={onTogglePinned}
+                      selectionMode={projectsSelecting}
+                      selectedIds={selectedIds}
+                      onToggleSelected={onToggleSelected}
+                      onProjectAssigned={expandProject}
+                      onConversationsLoaded={handleFolderConversationsLoaded}
+                    />
+                  ))}
+                  {sections.projectGroups.length === 0 &&
+                    !effectiveCollapsedSections.includes("Projects") && (
+                      <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
+                    )}
+                </SectionGroup>
                 {/* Always rendered, even with no rows: the header carries the
                     filter menu, so hiding it on an empty slice would strand the
                     viewer with no way to pick another filter. */}

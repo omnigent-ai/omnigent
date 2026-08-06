@@ -1627,7 +1627,9 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
     status_edges: list[_StatusEdge] = []
     registry.set_terminal_activity_publisher(lambda _sid, _tid: None)
     registry.set_session_status_publisher(
-        lambda sid, status: status_edges.append(_StatusEdge(session_id=sid, status=status))
+        lambda sid, status, _reason=None: status_edges.append(
+            _StatusEdge(session_id=sid, status=status)
+        )
     )
 
     await registry.launch_required_terminal(
@@ -1755,7 +1757,7 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
     registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
     # The idle-reset behaviour is only wired for the claude-native role, so
     # the status publisher must be installed to exercise on_idle.
-    registry.set_session_status_publisher(lambda _sid, _status: None)
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
 
     await registry.launch_required_terminal(
         session_id="conv_throttle",

@@ -928,35 +928,44 @@ describe("Sidebar tabs", () => {
     expect(screen.queryByText("conv_mine")).toBeNull();
   });
 
-  it("gives a pinned shared session a Pinned section under Shared, not My sessions", () => {
-    // Pins are ownership-agnostic (localStorage), so every filter reuses the
-    // same Pinned section — scoped to that filter's conversations. A pinned
-    // shared session floats to Pinned under Shared and never leaks onto My
-    // sessions (which shows only owned sessions).
+  it("shows every pinned session in Pinned regardless of the My/Shared filter", () => {
+    // Pins are ownership-agnostic, so the Pinned section always includes all
+    // pinned sessions — an owned pin stays visible on the Shared tab and a
+    // shared pin stays visible on My sessions. Only the unpinned rows re-scope
+    // with the filter.
     mockConversations([
       conv("conv_mine", "Claude Code"),
       conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
-    seedPins(["conv_shared"]);
+    seedPins(["conv_mine", "conv_shared"]);
     renderSidebar();
 
-    // "My sessions": owned session is unpinned (no Pinned section), and the
-    // pinned shared row doesn't appear here at all.
+    // "My sessions": both pins show under Pinned even though conv_shared is not
+    // owned by the viewer.
     selectSessionFilter("mine");
-    expect(screen.queryByText("Pinned")).toBeNull();
-    expect(screen.getByText("conv_mine")).toBeInTheDocument();
-    expect(screen.queryByText("conv_shared")).toBeNull();
+    const minePinned = screen.getByText("Pinned").closest("section")!;
+    expect(within(minePinned).getByText("conv_mine")).toBeInTheDocument();
+    expect(within(minePinned).getByText("conv_shared")).toBeInTheDocument();
 
-    // "Shared sessions": the shared session shows under its own Pinned section.
+    // "Shared sessions": both pins still show under Pinned even though
+    // conv_mine is owned by the viewer.
     showSharedTab();
-    const pinnedSection = screen.getByText("Pinned").closest("section")!;
-    expect(within(pinnedSection).getByText("conv_shared")).toBeInTheDocument();
+    const sharedPinned = screen.getByText("Pinned").closest("section")!;
+    expect(within(sharedPinned).getByText("conv_mine")).toBeInTheDocument();
+    expect(within(sharedPinned).getByText("conv_shared")).toBeInTheDocument();
+
+    // "Archived sessions": the (non-archived) pins still show under Pinned —
+    // switching to Archived doesn't empty the section.
+    selectSessionFilter("archived");
+    const archivedPinned = screen.getByText("Pinned").closest("section")!;
+    expect(within(archivedPinned).getByText("conv_mine")).toBeInTheDocument();
+    expect(within(archivedPinned).getByText("conv_shared")).toBeInTheDocument();
   });
 
-  it("does not render project folders on the Shared tab (projects are owner-only)", () => {
-    // Filing into a project is owner-only, so the Shared tab shows no Projects
-    // group; a shared session that carries a project label just lands in the
-    // flat Sessions list there.
+  it("keeps the Projects section and its folders on the Shared tab", () => {
+    // Projects are ownership-agnostic like pins: the Projects group and its
+    // folders always render, unaffected by the filter, so a filed session
+    // stays in its folder on the Shared tab rather than the folder vanishing.
     projectsMock.push("Alpha");
     mockConversations([
       conv("conv_mine", "Claude Code", { labels: { omni_project: "Alpha" } }),
@@ -967,10 +976,39 @@ describe("Sidebar tabs", () => {
     // My sessions tab carries the Projects group.
     expect(screen.getByText("Projects")).toBeInTheDocument();
 
-    // Shared tab: no Projects group; the shared session shows in Sessions.
+    // Shared tab: the Projects group still renders with its Alpha folder, and
+    // the shared session shows in Sessions.
     showSharedTab();
-    expect(screen.queryByText("Projects")).toBeNull();
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.getByText("Alpha")).toBeInTheDocument();
     expect(screen.getByText("conv_shared")).toBeInTheDocument();
+  });
+
+  it("keeps a shared session in the flat list on a project-name collision", () => {
+    // Filing is owner-only (UNLIKE pins), so `projectGroups` membership is
+    // ownership-gated. A session shared with the viewer that carries its own
+    // owner's `omni_project` label colliding with one of the viewer's folder
+    // names must NOT be treated as filed — otherwise `filedIds` would swallow
+    // it and it would vanish from the flat Sessions list. (The folder's own
+    // expanded contents come from the owner-scoped `?project=` server fetch,
+    // so this asserts the parent-level flat-list scoping the fix changed.)
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("conv_owned", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      // Shared (owner set) with the SAME project-name label — the collision.
+      conv("conv_shared_alpha", "Claude Code", {
+        owner: "other@example.com",
+        labels: { omni_project: "Alpha" },
+      }),
+    ]);
+    renderSidebar();
+
+    // The owned session is filed (peeled out of the flat list into its
+    // collapsed folder), but the shared collision stays in the flat Sessions
+    // list rather than being pulled into the viewer's folder.
+    const sessionsSection = screen.getByText("Sessions").closest("section")!;
+    expect(within(sessionsSection).queryByText("conv_owned")).toBeNull();
+    expect(within(sessionsSection).getByText("conv_shared_alpha")).toBeInTheDocument();
   });
 
   it("keeps paginating when the shared tab is empty on the loaded page but more exist", () => {

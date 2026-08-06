@@ -142,6 +142,7 @@ def test_pipeline_reclassifies_changed_content() -> None:
     classifier = FakeClassifier(classification)
     classifications = FakeClassifications({1: stale})
     sink = CaptureSink()
+    progress = []
     area = Area("db", "comp:db", Decimal("1.2"))
     catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
     pipeline = IssuePrioritizationPipeline(
@@ -152,6 +153,7 @@ def test_pipeline_reclassifies_changed_content() -> None:
         artifacts=sink,
         engine=ScoreEngine(ScoringConfig.default(), catalog),
         maintainers=set(),
+        classification_progress=lambda completed, total: progress.append((completed, total)),
     )
 
     run = pipeline.run("run-2")
@@ -159,6 +161,7 @@ def test_pipeline_reclassifies_changed_content() -> None:
     assert classifier.calls == 1
     assert classifications.updated == [classification]
     assert run.classifications_updated == 1
+    assert progress == [(0, 1), (1, 1)]
 
 
 def test_pipeline_can_force_regrade_cached_content() -> None:

@@ -11,7 +11,7 @@ from issue_prioritization.databricks_io import (
     SparkIssueSource,
     SparkScoreSink,
     VolumeArtifactSink,
-    ai_query_classifier,
+    serving_endpoint_classifier,
 )
 from issue_prioritization.github import (
     GitHubClient,
@@ -26,6 +26,13 @@ from issue_prioritization.scoring import ScoreEngine
 
 def _enabled(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes"}
+
+
+def _print_classification_progress(completed: int, total: int) -> None:
+    if completed == 0:
+        print(f"Refreshing {total} issue classifications", flush=True)
+    elif completed % 10 == 0 or completed == total:
+        print(f"Classified {completed}/{total} issues", flush=True)
 
 
 def validate_github_write_gate(
@@ -127,7 +134,7 @@ def main() -> None:
     }
     pipeline = IssuePrioritizationPipeline(
         source=SparkIssueSource(spark, args.source_table, args.github_repo),
-        classifier=ai_query_classifier(spark, args.model_endpoint, areas),
+        classifier=serving_endpoint_classifier(args.model_endpoint, areas),
         classifications=SparkClassificationRepository(spark, args.classifications_table),
         scores=SparkScoreSink(spark, args.scores_table, args.latest_scores_view),
         artifacts=VolumeArtifactSink(args.artifact_dir, config),
@@ -135,6 +142,7 @@ def main() -> None:
         maintainers=maintainers,
         mutation_planner=planner,
         mutation_sink=mutation_sink,
+        classification_progress=_print_classification_progress,
     )
     run = pipeline.run(
         args.run_id,

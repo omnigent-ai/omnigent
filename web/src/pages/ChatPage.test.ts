@@ -791,6 +791,24 @@ describe("shouldShowWorkingIndicator", () => {
 
 // ── workingIndicatorLabel ───────────────────────────────────────────────────
 
+describe("workingIndicatorLabel — parked on a dialog", () => {
+  it("names what the agent is waiting on", () => {
+    expect(workingIndicatorLabel(0, 0, "permission prompt")).toBe("Blocked on: permission prompt");
+  });
+
+  it("outranks the background tally and the rotation", () => {
+    // Being blocked on the user is the one state that needs an action, and the
+    // dialog may exist only in the terminal tab — so it must not be buried
+    // under a rotating "Cooking…" or a background-shell count.
+    expect(workingIndicatorLabel(3, 2, "dialog open")).toBe("Blocked on: dialog open");
+  });
+
+  it("falls back to the normal label when not parked", () => {
+    expect(workingIndicatorLabel(0, 0, null)).toBe("Working…");
+    expect(workingIndicatorLabel(1, 0, null)).toBe("1 background task still running");
+  });
+});
+
 describe("workingIndicatorLabel", () => {
   it("shows the plain Working label when no background tasks remain", () => {
     expect(workingIndicatorLabel(0)).toBe("Working…");

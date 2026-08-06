@@ -3470,6 +3470,9 @@ requires-dist = [
 name = "omnigent-issue-prioritization"
 version = "0.1.0"
 source = { editable = ".github/triage_v2" }
+dependencies = [
+    { name = "databricks-sdk" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -3478,6 +3481,7 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "databricks-sdk", specifier = ">=0.56.0,<1" }]
 
 [package.metadata.requires-dev]
 dev = [

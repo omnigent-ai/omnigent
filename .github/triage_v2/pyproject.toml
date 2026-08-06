@@ -7,6 +7,7 @@ name = "omnigent-issue-prioritization"
 version = "0.1.0"
 description = "Deterministic issue-prioritization pipeline for Omnigent"
 requires-python = ">=3.12"
+dependencies = ["databricks-sdk>=0.56.0,<1"]
 
 [project.scripts]
 issue-priority = "issue_prioritization.cli:main"

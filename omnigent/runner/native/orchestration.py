@@ -7486,6 +7486,61 @@ async def _antigravity_native_terminal_arrives_via_transfer(
     return terminal_registry.get(state.session_id, "antigravity", "main") is not None
 
 
+async def _codex_native_terminal_arrives_via_transfer(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+) -> bool:
+    """
+    Return whether a live Codex terminal will be transferred into a session.
+
+    The Codex mirror of
+    :func:`_antigravity_native_terminal_arrives_via_transfer`. A native
+    ``/new`` starts a fresh Codex thread in the SAME terminal, and the
+    forwarder rotates ownership onto a fresh session before transferring
+    that terminal onto it. Binding the runner to the new session triggers
+    auto-create, and a second ``codex:main`` makes the rotation's transfer
+    409 — leaving the terminal (and its tmux status link) owned by the old
+    session while the web session streams from the new one. The shared
+    bridge state still names the terminal-owning session at bind time
+    (rotation rewrites it only AFTER the transfer), detected here so the
+    caller skips auto-create and lets the transfer deliver the terminal.
+
+    :param server_client: Omnigent client to resolve the bridge id label;
+        ``None`` can't confirm a rotation, so returns ``False``.
+    :param session_id: Newly-bound session id, e.g. ``"conv_new"``.
+    :param resource_registry: Registry probed for the original session's
+        live ``codex:main`` terminal.
+    :returns: ``True`` when a different session on the same bridge owns a
+        live ``codex:main`` terminal (transfer inbound), else ``False``.
+    """
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is None or server_client is None:
+        return False
+    # Lazy import keeps codex-native out of the generic runner import graph.
+    from omnigent.codex_native_bridge import (
+        CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.codex_native_bridge import (
+        bridge_dir_for_bridge_id as codex_bridge_dir_for_bridge_id,
+    )
+    from omnigent.codex_native_bridge import (
+        read_bridge_state as read_codex_bridge_state,
+    )
+
+    labels = await _session_labels_for_runner_spawn(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
+    state = read_codex_bridge_state(codex_bridge_dir_for_bridge_id(bridge_id))
+    # Fresh bridge, or the new session is already active — nothing transfers in.
+    if state is None or state.session_id == session_id:
+        return False
+    return terminal_registry.get(state.session_id, "codex", "main") is not None
+
+
 _SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS = 1.0
 
 

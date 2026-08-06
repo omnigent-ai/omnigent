@@ -314,6 +314,13 @@ export interface ChatState {
   sessionStatus: SessionStatus;
   backgroundTaskCount: number;
   /**
+   * Why a still-`running` session is parked, e.g. "permission prompt".
+   * Terminal-backed agents can block on a dialog the web UI does not
+   * mirror, so the working indicator names it instead of shimmering with
+   * no explanation. `null` whenever the session is not parked.
+   */
+  blockedOn: string | null;
+  /**
    * Whether the active session is a native-terminal wrapper
    * (claude-native / codex-native), derived from the `omnigent.wrapper`
    * label on bind. Web messages on these sessions are NOT persisted at
@@ -934,6 +941,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   status: "idle",
   sessionStatus: "idle",
   backgroundTaskCount: 0,
+  blockedOn: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
   boundAgentId: null,
@@ -1227,6 +1235,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // count is sticky (see the `session_status` handler) precisely so a
       // trailing idle can't wipe it, so it has to be cleared explicitly here.
       backgroundTaskCount: 0,
+      blockedOn: null,
     }));
 
     // Pin the destination before joining the send chain: a stalled prior
@@ -1375,7 +1384,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             // instead of being left on a silent, empty composer.
             set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
           }
-          set({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0 });
+          set({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0, blockedOn: null });
         }
       }
     } finally {
@@ -1535,6 +1544,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status: "idle",
         sessionStatus: "idle",
         backgroundTaskCount: 0,
+        blockedOn: null,
       };
       if (s.activeResponse?.state === "streaming") {
         patch.activeResponse = {
@@ -1626,6 +1636,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status: "idle",
         sessionStatus: "idle",
         backgroundTaskCount: 0,
+        blockedOn: null,
         isNativeTerminalSession: false,
         nativeVendorOwnsModel: false,
         boundAgentId: null,
@@ -2592,6 +2603,7 @@ async function bindStream(
         // live SSE edge that set this is long gone, so the count rides in on
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
+        blockedOn: null,
         selectedEffort: effectiveEffort,
         selectedModel:
           catalogWonBindRace && preservedModelValid ? state.selectedModel : effectiveModel,
@@ -4402,7 +4414,13 @@ export function handleSessionEvent(event: StreamEvent): void {
         // runner's PTY-activity watcher); the client must not second-guess it.
         // The bubble lifecycle below (`status`/`activeResponse`) still defers
         // to response_end, but that is separate from the session-level status.
-        const patch: Partial<ChatState> = { sessionStatus: event.status };
+        const patch: Partial<ChatState> = {
+          sessionStatus: event.status,
+          // Not sticky, unlike the background tally: every edge carries the
+          // current reason (the runner re-attaches it to its own pane edges),
+          // so an absent one means "no longer parked".
+          blockedOn: event.blockedOn ?? null,
+        };
         // The background-shell tally is STICKY. Only the Stop-hook-derived
         // status carries an authoritative count (the forwarder relabels its
         // `idle` to `waiting` and attaches `background_task_count`); the

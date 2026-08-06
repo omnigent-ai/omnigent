@@ -461,6 +461,13 @@ export interface SessionStatusEvent {
   status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
   backgroundTaskCount?: number;
+  /**
+   * Short phrase naming what a still-`running` session is parked on, e.g.
+   * "permission prompt". Terminal-backed agents can block on a dialog the
+   * web UI does not mirror; this says why nothing is moving. Absent when
+   * the session is not parked.
+   */
+  blockedOn?: string;
   /** Structured failure detail; only present when `status === "failed"`. */
   error?: { code: string; message: string };
 }

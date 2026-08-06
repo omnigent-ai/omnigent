@@ -2108,6 +2108,7 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
 function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
   const { isAtBottom } = useStickToBottomContext();
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const blockedOn = useChatStore((s) => s.blockedOn);
   const tick = useWorkingLabelTick();
   const visible = show && !isAtBottom && !suppress;
   return (
@@ -2148,7 +2149,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm font-mono" duration={1.5}>
-              {workingIndicatorLabel(bgCount, tick)}
+              {workingIndicatorLabel(bgCount, tick, blockedOn)}
             </Shimmer>
           </div>
         )}
@@ -2747,12 +2748,22 @@ export const WORKING_MESSAGES = [
 ] as const;
 
 /**
- * The label shown next to the working spinner. When background shells outlive
- * the turn (`bgCount > 0`) it names how many are still running (the tick is
- * ignored — that count is information, not decoration). Otherwise it rotates
- * through `WORKING_MESSAGES` by wall-clock `tick`.
+ * The label shown next to the working spinner. When the agent is parked on a
+ * dialog (`blockedOn`) it says so — that outranks everything else, because it
+ * is the one case where the session needs the user rather than time, and the
+ * dialog may live only in the terminal tab. Otherwise, when background shells
+ * outlive the turn (`bgCount > 0`) it names how many are still running (the
+ * tick is ignored — that count is information, not decoration). Failing both
+ * it rotates through `WORKING_MESSAGES` by wall-clock `tick`.
  */
-export function workingIndicatorLabel(bgCount: number, tick = 0): string {
+export function workingIndicatorLabel(
+  bgCount: number,
+  tick = 0,
+  blockedOn: string | null = null,
+): string {
+  if (blockedOn) {
+    return `Blocked on: ${blockedOn}`;
+  }
   if (bgCount > 0) {
     return bgCount === 1
       ? "1 background task still running"
@@ -2763,8 +2774,9 @@ export function workingIndicatorLabel(bgCount: number, tick = 0): string {
 
 function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const blockedOn = useChatStore((s) => s.blockedOn);
   const tick = useWorkingLabelTick();
-  const label = workingIndicatorLabel(bgCount, tick);
+  const label = workingIndicatorLabel(bgCount, tick, blockedOn);
   return (
     <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
       <MessageContent>
