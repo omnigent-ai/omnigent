@@ -4448,6 +4448,11 @@ async def _forward_event_to_runner(
     # before the routing card, matching the message routing path).
     _auto_card_model: str | None = None
     _auto_card_verdict: dict[str, Any] | None = None
+    # Set when the auto-harness routing call itself failed. The card still
+    # says so, but the route-once label is left unclaimed — the same rule the
+    # turn, native-pane and child-spawn paths follow, so one outage at create
+    # cannot be the reason this session never routes again.
+    _auto_route_failed = False
     # The resolved harness, read back at card-emission time below.
     _auto_harness: str | None = None
     if conv.harness_override == "auto" and body.type == "message":
@@ -4506,8 +4511,8 @@ async def _forward_event_to_runner(
                 _auto_card_verdict = _auto_verdict
             elif _auto_error is not None:
                 # Routing failed — surface why auto-harness fell back to defaults.
-                _auto_card_model = "unavailable"
-                _auto_card_verdict = {"rationale": _auto_error, "applied": False}
+                _auto_card_model, _auto_card_verdict = _unavailable_routing_card(_auto_error)
+                _auto_route_failed = True
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
     # call the judge LLM on the FIRST message to pick the model for
@@ -4748,7 +4753,14 @@ async def _forward_event_to_runner(
                 scope="session",
                 harness=_auto_harness,
             )
-            await _stamp_routing_decision_label(session_id, conversation_store, _auto_decision_id)
+            if not _auto_route_failed:
+                # A failed call is NOT this session's routing decision: the
+                # label is the route-once gate, so claiming it would make one
+                # create-time outage the reason nothing routes this session
+                # again. The card still shows what happened.
+                await _stamp_routing_decision_label(
+                    session_id, conversation_store, _auto_decision_id
+                )
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,

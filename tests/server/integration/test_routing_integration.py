@@ -2167,3 +2167,68 @@ async def test_a_routing_outage_still_delivers_a_child_spawns_turn(
     assert decisions[0].data.model == UNAVAILABLE_MODEL
     assert decisions[0].data.applied is False
     assert decisions[0].data.rationale
+
+
+@pytest.mark.parametrize(
+    ("label", "failure"), ROUTING_FAILURES, ids=[f[0] for f in ROUTING_FAILURES]
+)
+async def test_an_auto_harness_outage_leaves_the_route_once_label_unclaimed(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """One outage at create must not disable this session's routing for good.
+
+    The auto-harness path stamped the decision label on its own "unavailable"
+    card, and the label is the route-once gate — so a router that was merely
+    down when the session started meant the in-harness hook declined every
+    later prompt as "already routed".
+    """
+    agent = await create_test_agent(
+        client,
+        name=f"routing-outage-auto-{label}",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert created.status_code == 201, created.text
+    session_id = str(created.json()["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.harness_override == "auto"
+
+    await _send_child_message(conv, conv_store, FakeRoutingClient(None, error=failure), "hi")
+
+    after_outage = conv_store.get_conversation(session_id)
+    assert after_outage is not None
+    # The failure is visible…
+    decisions = _routing_decisions(conv_store, session_id)
+    assert len(decisions) == 1
+    assert decisions[0].data.model == UNAVAILABLE_MODEL
+    assert decisions[0].data.applied is False
+    # …but it claimed neither the model nor the route-once label.
+    assert after_outage.model_override is None
+    assert not after_outage.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+    # So the session's first in-harness prompt still routes.
+    healthy = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=healthy)):
+        route = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-turn",
+            json={"harness": "codex-native", "prompt": "refactor auth"},
+        )
+    assert route.status_code == 200, route.text
+    assert route.json()["action"] == "route"
+    assert route.json()["model"] == GPT_MODEL
+    routed = conv_store.get_conversation(session_id)
+    assert routed is not None
+    assert routed.model_override == GPT_MODEL
+    assert routed.labels.get(ROUTING_DECISION_LABEL_KEY)
