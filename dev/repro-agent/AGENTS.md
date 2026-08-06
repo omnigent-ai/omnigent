@@ -211,13 +211,18 @@ before/after fix proof — that is the fix step's job (it builds a candidate fix
 and verifies the same test goes fail→pass).
 
 **Show the test inline in your final message.** After you write the file to
-disk, also paste its full source into your final message as a fenced code block
-(labelled with the path), so anyone browsing this session sees the reproduction
-test directly without opening the file. Place it **immediately before** the JSON
-handoff block (see Output) — i.e. the test code block is the last thing in the
-message before the final ```json fence. The parser reads only the *last* ```json
-fence, so a preceding code block for the test is safe. If you authored more than
-one test file, include each, back to back, still before the JSON block.
+disk, also paste its **complete, verbatim source** into your final message as a
+fenced code block (labelled with the path), so anyone browsing this session sees
+the reproduction test directly without opening the file. Reproduce the file
+**byte-for-byte from the first line to the last** — every import, fixture, and
+assertion. Do **not** truncate, summarize, elide, or replace any part with a
+placeholder like `# ...`, `# (see full file)`, or `# unchanged`; a reader must be
+able to copy the block back into the file and get exactly what you wrote. Place
+it **immediately before** the JSON handoff block (see Output) — i.e. the test
+code block is the last thing in the message before the final ```json fence. The
+parser reads only the *last* ```json fence, so a preceding code block for the
+test is safe. If you authored more than one test file, include each in full, back
+to back, still before the JSON block.
 
 ## Output — the reproduction artifacts
 
@@ -229,9 +234,10 @@ choice:
 
 - You may write comprehensive prose above the block (a human-readable summary,
   the journey, the per-facet notes) — that's fine and encouraged. Then, as the
-  last thing before the JSON block, paste the **full source of the e2e test(s)
-  you authored** as a fenced, path-labelled code block, so the reproduction test
-  is visible inline when browsing the session (see Step 3). But all of this is
+  last thing before the JSON block, paste the **complete, verbatim source of the
+  e2e test(s) you authored** as a fenced, path-labelled code block — the whole
+  file, never truncated or elided with `# ...` placeholders — so the reproduction
+  test is visible inline when browsing the session (see Step 3). But all of this is
   **context, not the contract**: everything the parser needs lives *inside* the
   JSON block, and the ```json block is the **last chunk** of the message, with
   nothing after its closing fence.
