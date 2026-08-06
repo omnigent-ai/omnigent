@@ -3806,6 +3806,8 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     C-u kills any draft the user is mid-typing — otherwise the paste
     concatenates and Enter submits ``<draft>/effort high``. ``-l`` is
     required so tmux pastes ``/`` and spaces literally; Enter submits.
+    Every capture here is blank, so this also pins the fail-soft path:
+    a never-identifiable draft still gets the single blind submit.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -3830,14 +3832,17 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         return _FakeCompleted()
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    # Three tmux calls in order: C-u (clear), literal paste, Enter.
+    # Three keystroke calls in order: C-u (clear), literal paste, Enter.
     # 2 = C-u was dropped (draft can concatenate); 4+ = duplicated send.
-    assert len(captured) == 3, (
-        f"Expected 3 tmux send-keys calls (C-u + paste + Enter), got {len(captured)}."
+    # capture-pane calls (the delivery-verification polls) are not keystrokes.
+    keystrokes = [cmd for cmd in captured if "send-keys" in cmd]
+    assert len(keystrokes) == 3, (
+        f"Expected 3 tmux send-keys calls (C-u + paste + Enter), got {len(keystrokes)}."
     )
-    clear, paste, submit = captured
+    clear, paste, submit = keystrokes
     assert clear == [
         "tmux",
         "-S",
@@ -6714,6 +6719,16 @@ _IDLE_PANE = """\
 """
 
 
+def _draft_pane(command: str) -> str:
+    """A pane whose composer holds *command*, typed but not yet submitted."""
+    return f"""\
+──────────────────────────────
+❯ {command}
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
 def _picker_bridge_dir(tmp_path: Path) -> Path:
     """
     Create a bridge dir advertising a tmux pane.
@@ -6791,7 +6806,12 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
-    sends = _fake_tmux(monkeypatch, [dialog, _IDLE_PANE])
+    sends = _fake_tmux(
+        monkeypatch,
+        # Typed command renders, the submit pops the dialog, the accept
+        # clears it — one capture per delivery stage.
+        [_draft_pane("/model databricks-claude-sonnet-5"), dialog, dialog, _IDLE_PANE],
+    )
 
     claude_native_bridge.inject_slash_command(
         bridge_dir,
@@ -7040,6 +7060,87 @@ def test_a_torn_capture_does_not_end_the_confirm_retry(
     )
 
 
+def test_a_slash_command_submit_waits_for_the_command_to_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The submit Enter is withheld until the typed command is in the box.
+
+    The TUI coalesces rapid stdin bursts: an Enter arriving while it is still
+    consuming the command folds in as a newline and the command sits unsent —
+    while the persisted session value claims the switch applied.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    events: list[str] = []
+    frames = ["", _IDLE_PANE, _draft_pane("/effort high"), _IDLE_PANE]
+    served = {"n": 0}
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        events.append(f"send:{args[-1]}")
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        events.append("capture")
+        frame = frames[min(served["n"], len(frames) - 1)]
+        served["n"] += 1
+        return frame
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    first_enter = events.index("send:Enter")
+    captures_before = sum(1 for event in events[:first_enter] if event == "capture")
+    # Blank + idle + draft: three captures before the Enter may fire.
+    assert captures_before == 3, (
+        f"Enter must wait for the command to render (expected 3 captures first); events: {events}"
+    )
+
+
+def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A submit Enter the busy TUI dropped is re-sent while the command sits.
+
+    Without the retry the command stays drafted, the session's persisted
+    effort diverges from the pane, and the next injection's C-u destroys the
+    only evidence. Retries fire only while the command is verifiably still in
+    the box, so none can reach the cleared composer or a dialog.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [_draft_pane("/effort high")] * 8 + [_IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    tails = [args[-1] for args in sends]
+    assert tails == ["C-u", "/effort high", "Enter", "Enter"], (
+        f"Expected the swallowed submit Enter to be retried once; got {tails}."
+    )
+
+
+def test_a_slash_command_stuck_in_the_composer_fails_loud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command that never submits raises instead of reporting success.
+
+    The runner turns this into a 503 and the persisted session value stays
+    the authoritative fallback — an honest failure, not a silent divergence.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    _fake_tmux(monkeypatch, [_draft_pane("/effort high")])
+
+    with pytest.raises(RuntimeError, match="was not delivered"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+
 def test_auto_confirm_without_a_dialog_hint_is_rejected(tmp_path: Path) -> None:
     """A confirm Enter with nothing to aim at is what hit foreign dialogs."""
     bridge_dir = _picker_bridge_dir(tmp_path)
@@ -7058,7 +7159,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
 ) -> None:
     """The no-dialog case: the fallback Enter lands on an empty prompt, harmlessly."""
     bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+    sends = _fake_tmux(monkeypatch, [_draft_pane("/effort high"), _IDLE_PANE])
 
     claude_native_bridge.inject_slash_command(
         bridge_dir,

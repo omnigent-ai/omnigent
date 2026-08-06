@@ -3124,7 +3124,8 @@ def inject_slash_command(
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
     :raises RuntimeError: If the tmux target is not advertised in
-        time, or if a ``tmux send-keys`` invocation fails.
+        time, if a ``tmux send-keys`` invocation fails, or if the typed
+        command verifiably never left the input box (submit swallowed).
     """
     if not command or not command.startswith("/"):
         raise ValueError(f"slash command must start with '/'; got {command!r}")
@@ -3136,16 +3137,54 @@ def inject_slash_command(
             raise ValueError("auto_confirm needs the confirm_hint its dialog renders")
         dialog_hint = confirm_hint
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-u")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-    _run_tmux(info["socket_path"], "send-keys", "-l", "-t", info["tmux_target"], command)
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+    # Same delivery hazards as inject_user_message: a coalesced or dropped
+    # Enter leaves the command drafted while the persisted session value
+    # claims it applied. Wait for the command to render, submit, verify it
+    # left the box; an unidentifiable draft falls through to a blind submit.
+    needle = _submit_needle(command)
+    draft_seen = False
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+            draft_seen = True
+            break
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    time.sleep(_PASTE_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    if draft_seen:
+        # Re-send only while the command verifiably still sits in the box —
+        # a one-poll-stale retry can at worst hit the empty composer (no-op)
+        # or our own confirm dialog (the intended answer), never a foreign
+        # surface. The command leaving the box is the submit signal; the
+        # dialog replacing the composer counts, since submission pops it.
+        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        last_enter = time.monotonic()
+        submitted = False
+        while time.monotonic() < deadline:
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+                submitted = True
+                break
+            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+                last_enter = time.monotonic()
+        if not submitted:
+            raise RuntimeError(
+                f"Claude Code did not accept the slash command within "
+                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
+                "input box). The command was not delivered."
+            )
     if dialog_hint is not None:
-        _confirm_tui_dialog(info["socket_path"], info["tmux_target"], hint=dialog_hint)
+        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
 
 
 def _confirm_tui_dialog(
@@ -3219,9 +3258,10 @@ def _confirm_and_verify_dialog_closed(
     A single Enter is enough in the common case, but under a busy repaint the
     TUI can drop it — leaving the dialog parked, the composer gone, and every
     later delivery failing the readiness gate. Each retry fires only while the
-    dialog is verifiably still up, so a stray Enter can never reach the
-    composer that replaces it. A dialog outliving the budget is left on
-    screen; the persisted session value remains the authoritative fallback.
+    dialog is verifiably still up; a one-poll-stale retry can at worst land
+    on the empty composer that replaces it (a no-op), never a foreign
+    surface. A dialog outliving the budget is left on screen; the persisted
+    session value remains the authoritative fallback.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
