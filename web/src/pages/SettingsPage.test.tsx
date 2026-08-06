@@ -5,7 +5,7 @@
 
 import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -93,7 +93,15 @@ vi.mock("@/hooks/useConversations", async () => {
     // Picker options are sourced from this dedicated scan, decoupled from the
     // loaded rows so archived-only projects on later pages still appear.
     useArchivedProjectNames: () => ({ data: mocks.projectNames }),
-    useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
+    // Mirrors react-query's mutate: per-call `onSuccess` runs once the
+    // mutation settles, which is what drives the post-unarchive navigation.
+    useArchiveConversation: () => ({
+      mutate: (vars: { id: string; archived: boolean }, opts?: { onSuccess?: () => void }) => {
+        mocks.archiveMutate(vars, opts);
+        opts?.onSuccess?.();
+      },
+      isPending: false,
+    }),
     useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
   };
 });
@@ -164,11 +172,17 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   };
 }
 
+/** Exposes the router location so navigation assertions read the real URL. */
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
+}
+
 function renderPage(path = "/settings") {
   return render(
     <TooltipProvider>
       <MemoryRouter initialEntries={[path]}>
         <SettingsPage />
+        <LocationProbe />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -792,7 +806,12 @@ describe("SettingsPage", () => {
     expect(within(rows[0]).getByText("Old chat")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("unarchive-conversation"));
-    expect(mocks.archiveMutate).toHaveBeenCalledWith({ id: "conv_archived", archived: false });
+    expect(mocks.archiveMutate.mock.calls[0][0]).toEqual({
+      id: "conv_archived",
+      archived: false,
+    });
+    // Unarchiving opens the restored session (the mock mutate runs onSuccess).
+    expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
   });
 
   it("deletes an archived session after confirming, with no row-click navigation", () => {

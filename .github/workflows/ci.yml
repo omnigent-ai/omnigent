@@ -133,12 +133,14 @@ jobs:
               --ignore=tests/runner
               --ignore=tests/stores
             dist: worksteal
-          # Databricks-coupled tests (Lakebase token engine, psycopg). This is
-          # the only lane that installs the `databricks` extra; the
-          # @pytest.mark.databricks marker keeps these tests off the lean lanes
-          # (which run -m "not databricks") and selects them here.
+          # Databricks-coupled tests (Lakebase token engine, psycopg, the
+          # router's ambient workspace-credential chain). This is the only lane
+          # that installs the `databricks` extra; the @pytest.mark.databricks
+          # marker keeps these tests off the lean lanes (which run
+          # -m "not databricks") and selects them here. Paths carrying marked
+          # tests must be listed here or those tests run nowhere.
           - group: databricks
-            paths: tests/db tests/deploy
+            paths: tests/db tests/deploy tests/server/test_smart_routing.py
             extra: databricks
             markexpr: databricks
           # Slack integration (integrations/slack). Its tests live outside the

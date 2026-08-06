@@ -32,6 +32,8 @@ class SessionCreatedEvent:
     :param agent_name: Agent name for known multi-agent orchestrators
         (e.g. ``"polly"``, ``"debby"``); ``None`` for all other agents to
         avoid leaking user-defined agent names.
+    :param routing_enabled: ``True`` when smart routing is on for this
+        session at creation time.
     """
 
     installation_id: str | None
@@ -44,6 +46,7 @@ class SessionCreatedEvent:
     is_fork: bool
     is_sub_agent: bool
     agent_name: str | None = None
+    routing_enabled: bool = False
 
 
 @dataclass

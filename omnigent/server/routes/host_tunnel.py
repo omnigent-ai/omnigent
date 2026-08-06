@@ -262,6 +262,10 @@ def create_host_tunnel_router(
                 frame,
                 owner=tunnel_owner,
             )
+            # Delivered on the handshake, never persisted: a replica that just
+            # started learns the host's gateway backing here, so a server
+            # restart converges as soon as each host reconnects.
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
@@ -419,7 +423,9 @@ async def _receive_loop(
     :param host_id: Host id for logging.
     :param host_store: Persistent store receiving live readiness updates.
     :param host_registry: Live host registry, so a frame only refreshes
-        liveness while ``conn`` is still the registered generation.
+        liveness while ``conn`` is still the registered generation; it also
+        receives the reported gateway-inference map (held in memory, never
+        persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
@@ -484,6 +490,10 @@ async def _receive_loop(
                 frame.configured_harnesses,
             )
             conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            conn.hello.gateway_inference = (
+                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
+            )
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)
@@ -628,6 +638,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -640,6 +651,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -672,6 +684,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "models": frame.models,
+                        "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
                 )

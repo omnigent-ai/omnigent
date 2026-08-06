@@ -129,7 +129,7 @@ function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
 
 function Kbd({ children }: { children: ReactNode }) {
   return (
-    <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-border bg-muted px-1.5 font-sans text-xs font-medium text-muted-foreground">
+    <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-border bg-muted px-1.5 font-sans text-sm font-medium text-muted-foreground">
       {children}
     </kbd>
   );
@@ -147,7 +147,7 @@ export function KeyboardShortcutsList() {
     <>
       {groups.map((group) => (
         <section key={group.title} className="mb-4 last:mb-0">
-          <h3 className="mb-1 text-xs font-medium text-muted-foreground">
+          <h3 className="mb-1 text-sm font-medium text-muted-foreground">
             {group.title}
             {group.note ? (
               <span className="ml-1.5 font-normal text-muted-foreground/70">· {group.note}</span>

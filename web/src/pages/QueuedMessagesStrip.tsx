@@ -75,7 +75,7 @@ function QueuedRow({
     <div
       ref={setDropRef}
       className={cn(
-        "flex items-center gap-1.5 text-xs text-muted-foreground",
+        "flex items-center gap-1.5 text-sm text-muted-foreground",
         isDragging && "opacity-40",
         isOver && "rounded bg-foreground/5",
       )}

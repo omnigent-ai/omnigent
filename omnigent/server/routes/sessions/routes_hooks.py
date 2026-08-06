@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, NamedTuple
 
@@ -58,6 +59,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -68,7 +70,9 @@ from omnigent.server.routes._sessions.helpers import (
     _build_evaluation_context,
     _claude_native_remember_host,
     _client_supplied_hook_elicitation_id,
+    _emit_server_routing_decision,
     _forward_session_change_to_runner,
+    _get_runner_client,
     _native_ask_gate_lock,
     _publish_policy_denied,
     _structured_ask_user_question,
@@ -76,6 +80,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
+    _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
 )
 from omnigent.server.schemas import (
@@ -1290,5 +1295,330 @@ def register_hooks_routes(
             )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
+            media_type="application/json",
+        )
+
+    async def _route_subagent_catalog(session_id: str) -> dict[str, list[str]] | None:
+        """
+        Fetch the session's live model catalog for subagent routing.
+
+        :param session_id: Parent session/conversation id.
+        :returns: Worker → servable model ids, or ``None`` when the runner
+            is unreachable (callers fall back to the static table).
+        """
+        from omnigent.server.smart_routing import fetch_runner_models
+
+        try:
+            runner_client = await _get_runner_client(
+                session_id, runner_router or get_server_runner_router()
+            )
+            if runner_client is None:
+                return None
+            return await fetch_runner_models(session_id, runner_client)
+        except Exception:
+            _logger.debug(
+                "route-subagent: live catalog unavailable for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
+    @router.post(
+        "/sessions/{session_id}/hooks/route-subagent",
+        # Internal runner relay — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def route_subagent_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Decide the model/harness a native subagent spawn may use.
+
+        The runner's loopback router (advertised to harness
+        ``PreToolUse`` hooks via ``subagent_router.json``) relays here
+        because ``RuntimeCaps.routing_client`` only lives in the server
+        process. Request and response follow the frozen route-subagent
+        contract; every routed verdict also lands as a
+        ``routing_decision`` transcript item.
+
+        The session's subagent-routing switch is two-state and re-read on
+        every call (it is togglable mid-session): only an explicit ``"on"``
+        routes, and every other session gets its spawn allowed unchanged
+        without calling the router. Sessions that start on Smart Routing
+        are stamped ``"on"`` at create, so nothing is inherited here.
+        Candidate models stay inside the session's own harness family
+        unless the session started in auto-harness mode.
+
+        :param request: FastAPI request — body is the route-subagent
+            request JSON.
+        :param session_id: Parent session/conversation id from the path.
+        :returns: The route-subagent decision as JSON.
+        :raises OmnigentError: 400 when the body is not a JSON object or
+            omits ``harness``.
+        """
+        from omnigent.runner.subagent_routing import (
+            SubagentRouteDecision,
+            SubagentRouteRequest,
+            auto_harness_session,
+            resolve_subagent_route,
+            store_persister,
+            subagent_routing_enabled,
+        )
+        from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+        user_id = _get_user_id(request, auth_provider)
+        # LEVEL_EDIT, like POST /events: a routed verdict mutates the session
+        # (a persisted ``routing_decision`` item, and on the sibling route-turn
+        # relay a ``model_override`` pin). A read-only viewer must not be able
+        # to steer somebody else's spawns.
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in route-subagent body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "route-subagent body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            route_request = SubagentRouteRequest.from_payload(payload)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        # A relayed spawn is evidence the harness ran its routing hook, but it
+        # is deliberately NOT turned into a clear here: the same warning code
+        # also carries the spawn-audit verdict ("started on a model the router
+        # never approved"), which a relay does not disprove — and every spawn
+        # that produces such a verdict is itself relayed, so clearing here
+        # wiped exactly the warnings the publisher had just raised (it only
+        # re-posts on a transition, so the wipe was permanent). The publisher
+        # owns the clear: its next check sees the canary and posts the repair.
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        parent = None
+        if conv is not None and conv.parent_conversation_id is not None:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        if conv is None or not subagent_routing_enabled(conv.subagent_routing_override):
+            # Allowed unchanged, and deliberately not persisted: an
+            # unrouted spawn is not a decision worth a transcript item.
+            _logger.info(
+                "route-subagent: subagent routing disabled for session=%s harness=%s",
+                session_id,
+                route_request.harness,
+            )
+            unrouted = SubagentRouteDecision(
+                action="allow",
+                rationale="subagent routing disabled for this session",
+            )
+            return Response(
+                content=json.dumps(unrouted.to_payload()),
+                media_type="application/json",
+            )
+
+        # Only a session started in auto-harness mode may be moved across
+        # harness families; everyone else is offered their own family, so a
+        # Claude Code session never gets a Codex suggestion.
+        cross_harness = auto_harness_session(conv, parent)
+        # Which families the spawn may land on decides which router can serve it:
+        # off the AI Gateway the built-in judge answers, from the live catalog
+        # alone (the static table's databricks-* ids are unreachable there).
+        gateway_backed = await _spawn_gateway_backed(
+            request,
+            conv,
+            (AUTO_NATIVE_ROUTING_HARNESSES if cross_harness else (route_request.harness,)),
+        )
+        # Offer the live catalog: the static table lags model generations, and
+        # a pick the workspace serves must not look unservable and get
+        # substituted down a tier.
+        catalog = await _route_subagent_catalog(session_id)
+        decision = await resolve_subagent_route(
+            session_id,
+            route_request,
+            caps=get_caps(),
+            catalog=catalog,
+            cross_harness=cross_harness,
+            gateway_backed=gateway_backed,
+            allow_static_fallback=gateway_backed,
+            persist=store_persister(session_id, conversation_store),
+        )
+        return Response(
+            content=json.dumps(decision.to_payload()),
+            media_type="application/json",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/hooks/route-turn",
+        # Internal runner relay — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def route_turn_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Decide the model a session's first real prompt should run on.
+
+        The in-harness sibling of ``route-subagent``: a harness
+        ``UserPromptSubmit`` hook relays here (through the runner's
+        loopback endpoint, advertised as ``turn_router.json``) because
+        ``RuntimeCaps.routing_client`` only lives in the server process.
+        It closes the bare-launch gap — a session started with no prompt,
+        whose first message is typed straight into the TUI and so is
+        invisible to the composer turn gate. Everything else about routing
+        is unchanged: same decision seam, same chip, same
+        ``model_override`` pin, and that pin is what stops a session from
+        ever routing twice.
+
+        :param request: FastAPI request — body is the route-turn request
+            JSON.
+        :param session_id: Session/conversation id from the path.
+        :returns: The route-turn decision as JSON.
+        :raises OmnigentError: 400 when the body is not a JSON object or
+            omits ``harness`` / ``prompt``.
+        """
+        from omnigent.runner.turn_routing import (
+            TurnRouteRequest,
+            decision_scope,
+            resolve_turn_route,
+        )
+        from omnigent.server.routes._sessions.orchestration import (
+            _native_turn_catalog,
+            _publish_routed_model,
+            _stamp_routing_decision_label,
+        )
+        from omnigent.server.smart_routing import route_turn as _route_turn_seam
+
+        user_id = _get_user_id(request, auth_provider)
+        # LEVEL_EDIT, like POST /events: this route writes ``model_override``
+        # for the rest of the session and persists a decision item. LEVEL_READ
+        # let a read-only viewer repin somebody else's model.
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in route-turn body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "route-turn body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            route_request = TurnRouteRequest.from_payload(payload)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        parent = None
+        if conv is not None and conv.parent_conversation_id is not None:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        runner_client = None
+        catalog = None
+        if conv is not None:
+            try:
+                runner_client = await _get_runner_client(
+                    session_id, runner_router or get_server_runner_router()
+                )
+                catalog = await _native_turn_catalog(session_id, conv, runner_client)
+            except Exception:
+                _logger.debug(
+                    "route-turn: live catalog unavailable for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+
+        # This pane's own family decides which router can serve its first turn.
+        # A create off the AI Gateway now succeeds (the built-in judge answers),
+        # so this hook must make the same choice the composer path does.
+        turn_gateway_backed = (
+            await _spawn_gateway_backed(request, conv, (route_request.harness,))
+            if conv is not None
+            else True
+        )
+
+        async def _route(
+            harness: str | None, prompt: str
+        ) -> tuple[str | None, dict[str, Any] | None]:
+            return await _route_turn_seam(
+                harness,
+                prompt,
+                session_id=session_id,
+                runner_client=runner_client,
+                catalog=catalog,
+                gateway_backed=turn_gateway_backed,
+                allow_static_fallback=turn_gateway_backed,
+            )
+
+        async def _pin(model: str) -> bool:
+            try:
+                await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    session_id,
+                    model_override=model,
+                )
+            except (OSError, ValueError):
+                _logger.warning(
+                    "route-turn: could not pin model_override for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+            _publish_routed_model(session_id, model)
+            return True
+
+        async def _persist(model: str, verdict: dict[str, Any]) -> None:
+            decision_id = await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                model,
+                verdict,
+                scope=decision_scope(),
+                harness=route_request.harness,
+            )
+            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+
+        decision = await resolve_turn_route(
+            session_id,
+            route_request,
+            conv=conv,
+            parent=parent,
+            route_turn=_route,
+            pin=_pin,
+            persist=_persist,
+        )
+        _logger.info(
+            "route-turn: session=%s harness=%s live_model=%s pinned=%s action=%s model=%s",
+            session_id,
+            route_request.harness,
+            route_request.model,
+            conv.model_override if conv is not None else None,
+            decision.action,
+            decision.model,
+        )
+        # The rationale paraphrases the user's prompt, so it stays off INFO —
+        # the same invariant ``omnigent.server.smart_routing`` keeps at each of
+        # its own three log sites.
+        _logger.debug("route-turn: session=%s rationale=%s", session_id, decision.rationale)
+        return Response(
+            content=json.dumps(decision.to_payload()),
             media_type="application/json",
         )

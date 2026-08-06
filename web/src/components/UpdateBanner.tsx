@@ -173,7 +173,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
                 Omnigent {visibleStatus.info?.version ?? "update"} is ready to install
               </p>
               {autoInstall && (
-                <p className="mt-0.5 text-xs text-muted-foreground">
+                <p className="mt-0.5 text-sm text-muted-foreground">
                   Installs automatically on next quit.
                 </p>
               )}
@@ -183,7 +183,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
             <>
               <p className="font-medium text-foreground">Update check failed</p>
               {visibleStatus.lastError && (
-                <p className="mt-0.5 line-clamp-3 text-xs text-muted-foreground">
+                <p className="mt-0.5 line-clamp-3 text-sm text-muted-foreground">
                   {visibleStatus.lastError}
                 </p>
               )}
@@ -191,7 +191,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
           )}
 
           {releaseNotes && visibleStatus.state !== "downloading" && (
-            <details className="mt-1.5 text-xs text-muted-foreground">
+            <details className="mt-1.5 text-sm text-muted-foreground">
               <summary className="cursor-pointer select-none text-foreground hover:underline">
                 Release notes
               </summary>

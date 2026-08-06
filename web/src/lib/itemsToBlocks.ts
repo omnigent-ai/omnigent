@@ -51,6 +51,7 @@ import {
   isSlashCommandItem,
   isTerminalCommandItem,
 } from "./conversationItems";
+import { routingExtrasFromWire } from "./routingDecision";
 
 /**
  * Walk persisted items in arrival order and emit a flat block list.
@@ -309,6 +310,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
     applied: item.applied,
     rationale: typeof item.rationale === "string" ? item.rationale : "",
     ...(item.agent !== undefined && { agent: item.agent }),
+    routing: routingExtrasFromWire(item as unknown as Record<string, unknown>),
   };
 }
 

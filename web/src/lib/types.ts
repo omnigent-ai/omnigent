@@ -315,6 +315,13 @@ export interface Session {
    * "Cost Optimized" toggle.
    */
   costControlModeOverride?: "on" | "off" | null;
+  /**
+   * Per-session routing switch for the sub-agents this session spawns:
+   * `"on"` routes them intelligently, and `"off"` or `null` both run them
+   * on the default model. Sessions that start on Smart Routing are stamped
+   * `"on"` at create, so `null` means Default rather than "inherit".
+   */
+  subagentRoutingOverride?: "on" | "off" | null;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
   /**

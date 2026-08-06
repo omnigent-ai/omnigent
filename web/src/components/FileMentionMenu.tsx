@@ -47,12 +47,12 @@ export function FileMentionMenu({
   return (
     <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
       <div className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
-        <div className="flex items-center justify-between gap-2 px-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
+        <div className="flex items-center justify-between gap-2 px-2 pb-0.5 pt-1.5 text-sm font-medium text-muted-foreground">
           <span className="truncate">{currentDir ? `/${currentDir}` : "Workspace"}</span>
           <span className="shrink-0 text-[10px]">↵ open · ⇥ attach</span>
         </div>
         {entries.length === 0 && loading ? (
-          <div className="px-3 py-2 text-[13px] text-muted-foreground">Loading…</div>
+          <div className="px-3 py-2 text-ui text-muted-foreground">Loading…</div>
         ) : (
           <div ref={listRef} role="listbox" className="max-h-80 overflow-y-auto p-1">
             {entries.map((entry, i) => {
@@ -65,7 +65,7 @@ export function FileMentionMenu({
                   data-testid={`file-mention-item-${i}`}
                   data-active={i === activeIndex ? "true" : undefined}
                   className={cn(
-                    "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-foreground",
+                    "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-ui text-foreground",
                     i === activeIndex && "bg-accent",
                   )}
                 >
@@ -92,7 +92,7 @@ export function FileMentionMenu({
                       type="button"
                       onMouseDown={(e) => e.preventDefault()}
                       onClick={() => onAttach(entry.path, true)}
-                      className="flex shrink-0 items-center gap-0.5 rounded-md border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                      className="flex shrink-0 items-center gap-0.5 rounded-md border border-border px-1.5 py-0.5 text-sm text-muted-foreground hover:bg-accent hover:text-foreground"
                       aria-label={`Attach whole folder ${entry.name}`}
                       title={`Attach whole folder ${entry.name}`}
                     >

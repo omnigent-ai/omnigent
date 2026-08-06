@@ -1,7 +1,7 @@
 """Visual-regression snapshot of a *populated* sidebar ("/").
 
 The empty-landing baseline (``test_landing_snapshot.py``) stubs the session list
-empty, so its sidebar only ever shows the top nav + "No active sessions" — the
+empty, so its sidebar only ever shows the top nav + "No sessions" — the
 row-alignment surface (section headers, flat session rows, project folders and
 their nested chats) is never rendered, so a padding regression there sails
 through the gate. This baseline fills that gap: a fixed session list that lays

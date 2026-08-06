@@ -1,0 +1,50 @@
+name: Reopen PR on /reopen comment
+
+# A PR author comments `/reopen` to undo an automated close. Reopening needs
+# Triage+ on the base repo, which fork contributors don't have, so the bot does
+# it for them. All logic + safety notes live in reopen-pr.js (offline unit test:
+# reopen-pr.test.js).
+#
+# Runs on the trusted default branch with the repo GITHUB_TOKEN; it reads no
+# PR-authored code, only the issues/PRs API.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reopen-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  reopen:
+    if: >-
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event.issue.pull_request
+      && contains(github.event.comment.body, '/reopen')
+      && !endsWith(github.event.comment.user.login, '[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Job-level permissions REPLACE the workflow-level block, so restate read.
+      contents: read
+      pull-requests: write # reopen the PR
+      issues: write # post the outcome comment
+    steps:
+      # Trusted default branch, .github only (the script). Never PR head.
+      - name: Check out .github
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Reopen if eligible
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          retries: 3
+          script: |
+            const script = require('./.github/workflows/reopen-pr.js');
+            await script({ github, context, core });
