@@ -268,6 +268,18 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
   );
 }
 
+describe("ChatHeader — copy-resume-command placement", () => {
+  it("offers the resume action for an open session", () => {
+    renderHeaderWithSession(makeTerminalFirstCtx());
+    expect(screen.getByTestId("copy-resume-command")).toBeInTheDocument();
+  });
+
+  it("omits the resume action on the landing composer", () => {
+    renderHeader({ sidebarOpen: true });
+    expect(screen.queryByTestId("copy-resume-command")).toBeNull();
+  });
+});
+
 describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("mounts the ViewModeToggle for a terminal-first session", () => {
     renderHeaderWithSession(makeTerminalFirstCtx());
