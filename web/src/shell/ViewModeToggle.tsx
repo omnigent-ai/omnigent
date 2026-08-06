@@ -63,10 +63,10 @@ export function ViewModeToggle() {
               <Button
                 type="button"
                 variant="ghost"
-                size="default"
+                size="icon-xs"
                 aria-label="Switch between chat and terminal"
                 data-testid="view-mode-toggle"
-                className="h-8 w-11 gap-1 px-0 text-muted-foreground hover:text-foreground"
+                className="w-11 gap-1 px-0 text-muted-foreground hover:text-foreground border-none"
               >
                 <MessagesSquareIcon className="size-4" />
                 <ChevronDownIcon className="size-3 opacity-60" />

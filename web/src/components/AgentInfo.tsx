@@ -1569,10 +1569,10 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
             <Button
               type="button"
               variant="ghost"
-              size="icon"
+              size="icon-xs"
               aria-label="Agent tools and policies"
               data-testid="agent-info-trigger"
-              className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
+              className="hidden text-muted-foreground hover:text-foreground md:inline-flex border-none"
               onPointerEnter={openOnHover}
               onPointerLeave={scheduleCloseOnLeave}
               onFocus={() => {
