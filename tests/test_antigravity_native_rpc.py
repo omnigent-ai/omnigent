@@ -2177,6 +2177,34 @@ def test_pid_listen_ports_falls_back_to_lsof_when_psutil_denied(
     assert rpc._pid_listen_ports(72753) == [52548]
 
 
+def test_pid_listen_ports_falls_back_to_lsof_on_psutil_without_net_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A psutil too old to have ``net_connections`` degrades to lsof, not an error.
+
+    ``net_connections`` is the 6.0 rename of ``connections``, and the dependency
+    floor still admits 5.9 (only reachable via ``--resolution lowest`` or a
+    downstream pin, but admitted). The missing attribute raises ``AttributeError``
+    — neither ``psutil.Error`` nor ``OSError`` — so an un-widened ``except`` lets
+    it escape and discovery fails outright on a host where lsof would have
+    answered, which is strictly worse than the pre-psutil behaviour.
+    """
+
+    class _OldProc:
+        """psutil 5.9's surface: ``connections``, no ``net_connections``."""
+
+        def __init__(self, _pid: int) -> None:
+            pass
+
+        def connections(self, kind: str = "inet") -> list[object]:
+            raise AssertionError("the deprecated 5.9 spelling must not be called")
+
+    monkeypatch.setattr(rpc.psutil, "Process", _OldProc)
+    monkeypatch.setattr(rpc, "_run_lsof_listen_ports", lambda _pid: "TCP 127.0.0.1:52548 (LISTEN)")
+    assert rpc._pid_listen_ports(72753) == [52548]
+
+
 def test_pid_listen_ports_empty_when_neither_source_attributes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
