@@ -6,12 +6,22 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
+import { notifyResizeObservers, resetMockViewportWidth, setMockViewportWidth } from "@/test-setup";
+
+// Controllable coarse-pointer capability, defaulting to true: the recognizer
+// touch tests need it (the global matchMedia stub reports no coarse pointer),
+// and fine-pointer cases opt out explicitly.
+const coarsePointer = vi.hoisted(() => ({ current: true }));
+vi.mock("@/hooks/useCoarsePointer", () => ({
+  useCoarsePointer: () => coarsePointer.current,
+}));
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -233,6 +243,105 @@ function selectSessionFilter(value: "all" | "mine" | "shared" | "archived") {
   fireEvent.click(screen.getByTestId(`session-filter-${value}`));
 }
 
+function dndRect(top: number, height: number): DOMRect {
+  return {
+    x: 0,
+    y: top,
+    width: 240,
+    height,
+    top,
+    right: 240,
+    bottom: top + height,
+    left: 0,
+    toJSON: () => ({}),
+  } as DOMRect;
+}
+
+/** Spy getBoundingClientRect, serving rects by data-testid from the returned
+    mutable table (mutate it to shift layout mid-test); LI rows share one rect
+    and everything else parks off-screen. */
+function mockRectsByTestId(rects: Record<string, DOMRect>): Record<string, DOMRect> {
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ): DOMRect {
+    const rect = rects[this.getAttribute("data-testid") ?? ""];
+    if (rect) return rect;
+    if (this.tagName === "LI") return dndRect(20, 32);
+    return dndRect(-1_000, 1);
+  });
+  return rects;
+}
+
+function mockSidebarDropLayout(): void {
+  mockRectsByTestId({
+    "sidebar-chats-drop-zone": dndRect(100, 120),
+    "sidebar-ungroup-drop-zone": dndRect(260, 40),
+  });
+}
+
+function mockShiftingUngroupLayout(): { shift: () => void } {
+  const rects = mockRectsByTestId({
+    "sidebar-project-drop-zone": dndRect(100, 120),
+    "sidebar-ungroup-drop-zone": dndRect(260, 40),
+  });
+  return {
+    shift: () => {
+      rects["sidebar-project-drop-zone"] = dndRect(100, 220);
+      rects["sidebar-ungroup-drop-zone"] = dndRect(360, 40);
+    },
+  };
+}
+
+/** Rect mock for the seam-placement logic: a 400px-tall list frame with the
+    inline slot at a controllable offset, plus a floating strip parked at the
+    frame's bottom edge (360–390) for drop targeting. */
+function mockSeamLayout({ slotTop }: { slotTop: number }): {
+  frameTop: number;
+  frameBottom: number;
+  floatingCenterY: number;
+  setSlotTop: (top: number) => void;
+} {
+  const frameTop = 0;
+  const frameBottom = 400;
+  const rects = mockRectsByTestId({
+    "sidebar-scroll-frame": dndRect(frameTop, frameBottom - frameTop),
+    "sidebar-ungroup-drop-zone": dndRect(slotTop, 30),
+    "sidebar-ungroup-floating-strip": dndRect(360, 30),
+  });
+  return {
+    frameTop,
+    frameBottom,
+    floatingCenterY: 375,
+    setSlotTop: (top: number) => {
+      rects["sidebar-ungroup-drop-zone"] = dndRect(top, 30);
+    },
+  };
+}
+
+function startMouseDrag(row: HTMLElement): void {
+  fireEvent.mouseDown(row, { button: 0, buttons: 1, clientX: 10, clientY: 20 });
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 20, clientY: 30 });
+}
+
+/** Drag to `y` in two steps: dnd-kit needs a move to measure before it collides. */
+function moveMouseTo(y: number): void {
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: y - 1 });
+  fireEvent.mouseMove(document, { buttons: 1, clientX: 120, clientY: y });
+}
+
+function touchAt(target: Element, y: number): TouchInit {
+  return {
+    identifier: 1,
+    target,
+    clientX: 120,
+    clientY: y,
+    pageX: 120,
+    pageY: y,
+    screenX: 120,
+    screenY: y,
+  };
+}
+
 /** Show only sessions others shared with the viewer. */
 function showSharedTab() {
   selectSessionFilter("shared");
@@ -275,7 +384,11 @@ beforeEach(() => {
 function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetMockViewportWidth();
+  vi.restoreAllMocks();
+});
 
 describe("Sidebar session list", () => {
   it("uses the interface text token for the empty session-list state", () => {
@@ -1253,9 +1366,7 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when the project pencil is tapped", () => {
-    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
-    // true: a plain pencil tap must close the full-screen sidebar overlay,
-    // otherwise the pre-filed new-session page is left hidden behind it.
+    setMockViewportWidth(375);
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -1522,14 +1633,15 @@ describe("Sidebar project sections", () => {
     // Pencil stays in the tree but is hidden below the md breakpoint.
     expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
 
-    // Open the kebab → a mobile-only "New session" item linking to the same
-    // pre-filed composer.
+    // Open the kebab → a "New session" item linking to the same pre-filed
+    // composer. This file mocks a coarse pointer, so the item stays visible
+    // at every width — hover can't reveal the pencil there.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).toHaveClass("md:hidden");
+    expect(menuItem).not.toHaveClass("md:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 });
@@ -1734,6 +1846,225 @@ describe("Sidebar move-to-project action", () => {
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" }),
     );
     expect(screen.queryByText(/the project will be removed as well/i)).toBeNull();
+  });
+});
+
+/** Render a single pinned session filed under `project` and return its row. */
+function renderPinnedFiledSession(id: string, project = "Sprint 42"): HTMLElement {
+  projectsMock.push(project);
+  seedPins([id]);
+  mockConversations([conv(id, "Claude Code", { labels: { omni_project: project } })]);
+  renderSidebar();
+  return screen.getByRole("link", { name: id }).closest("li")!;
+}
+
+describe("Sidebar ungroup drag target", () => {
+  beforeEach(() => setMockViewportWidth(375));
+
+  it("mounts at the seam: after the projects group, before the unfiled sessions", async () => {
+    projectsMock.push("Sprint 42");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
+      conv("conv_flat", "Codex"),
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
+    const list = screen.getByTestId("sidebar-conversation-list");
+    const rowsBefore = Array.from(list.querySelectorAll("li"));
+    const filedRow = screen.getByRole("link", { name: "conv_filed" }).closest("li")!;
+
+    startMouseDrag(filedRow);
+
+    const dropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    // The slot lands where the drop will: below the projects, above the flat
+    // "Chats" list. Rows themselves must not reorder around it.
+    const projectsHeader = screen.getByRole("button", { name: "Sprint 42" });
+    expect(
+      dropZone.compareDocumentPosition(projectsHeader) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+    expect(dropZone.nextElementSibling).toBe(screen.getByTestId("sidebar-chats-drop-zone"));
+    expect(Array.from(list.querySelectorAll("li"))).toEqual(rowsBefore);
+
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("mounts the strip during a desktop drag", async () => {
+    // The strip is the advertised ungroup target at every width and pointer
+    // type; ChatsDropZone remains an additional desktop target.
+    setMockViewportWidth(1024);
+    const row = renderPinnedFiledSession("conv_desktop_filed");
+
+    startMouseDrag(row);
+    await waitFor(() => expect(screen.getAllByText("conv_desktop_filed")).toHaveLength(2));
+    expect(screen.getByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("keeps the slot in flow with no floating fallback while the seam is visible", async () => {
+    const row = renderPinnedFiledSession("conv_mobile_filed");
+
+    startMouseDrag(row);
+    const slot = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    // In flow at the seam — the drop lands where the eye is told it will.
+    expect(slot).not.toHaveClass("fixed");
+    expect(slot).not.toHaveClass("sticky");
+    expect(screen.queryByTestId("sidebar-ungroup-floating-strip")).toBeNull();
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("floats a fixed strip at the bottom edge while the seam is below the fold", async () => {
+    const layout = mockSeamLayout({ slotTop: 900 });
+    const row = renderPinnedFiledSession("conv_below_fold");
+
+    startMouseDrag(row);
+    await screen.findByTestId("sidebar-ungroup-drop-zone");
+    const floating = await screen.findByTestId("sidebar-ungroup-floating-strip");
+    expect(floating).toHaveClass("fixed");
+    expect(floating.style.bottom).toBe(`${window.innerHeight - layout.frameBottom + 8}px`);
+    expect(floating.style.top).toBe("");
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("floats the strip at the top edge when the seam is scrolled above the view", async () => {
+    const layout = mockSeamLayout({ slotTop: -200 });
+    const row = renderPinnedFiledSession("conv_above_view");
+
+    startMouseDrag(row);
+    const floating = await screen.findByTestId("sidebar-ungroup-floating-strip");
+    expect(floating).toHaveClass("fixed");
+    expect(floating.style.top).toBe(`${layout.frameTop + 8}px`);
+    expect(floating.style.bottom).toBe("");
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("latches back to the inline slot once the seam scrolls into view", async () => {
+    const layout = mockSeamLayout({ slotTop: 900 });
+    const row = renderPinnedFiledSession("conv_latching");
+
+    startMouseDrag(row);
+    await screen.findByTestId("sidebar-ungroup-floating-strip");
+
+    layout.setSlotTop(200);
+    fireEvent.scroll(screen.getByTestId("sidebar-scroll-frame"));
+
+    await waitFor(() => expect(screen.queryByTestId("sidebar-ungroup-floating-strip")).toBeNull());
+    // The inline slot itself never unmounted — the fallback just stood down.
+    expect(screen.getByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("promotes the floating strip when the seam moves off-screen without a scroll", async () => {
+    const layout = mockSeamLayout({ slotTop: 200 });
+    const row = renderPinnedFiledSession("conv_layout_shift");
+
+    startMouseDrag(row);
+    await screen.findByTestId("sidebar-ungroup-drop-zone");
+    expect(screen.queryByTestId("sidebar-ungroup-floating-strip")).toBeNull();
+
+    // Rows inserted above the seam push it below the fold with no scroll event.
+    layout.setSlotTop(900);
+    act(() => notifyResizeObservers(screen.getByTestId("sidebar-conversation-list")));
+
+    expect(await screen.findByTestId("sidebar-ungroup-floating-strip")).toBeInTheDocument();
+    fireEvent.mouseUp(document, { button: 0, clientX: 20, clientY: 30 });
+  });
+
+  it("resolves an ungroup drop on the floating strip", async () => {
+    const layout = mockSeamLayout({ slotTop: 900 });
+    const row = renderPinnedFiledSession("conv_floating_drop");
+
+    startMouseDrag(row);
+    const floating = await screen.findByTestId("sidebar-ungroup-floating-strip");
+
+    moveMouseTo(layout.floatingCenterY);
+    await waitFor(() => expect(floating).toHaveClass("bg-[var(--sidebar-active)]"));
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: layout.floatingCenterY });
+
+    await waitFor(() => {
+      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_floating_drop", project: "" });
+    });
+  });
+
+  it("ungroups and unpins a pinned project session dropped on the bottom strip", async () => {
+    mockSidebarDropLayout();
+    const pinnedRow = renderPinnedFiledSession("conv_pinned_filed");
+
+    startMouseDrag(pinnedRow);
+    const dropZone = await screen.findByTestId("sidebar-ungroup-drop-zone");
+
+    moveMouseTo(280);
+    await waitFor(() => expect(dropZone).toHaveClass("bg-[var(--sidebar-active)]"));
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 280 });
+
+    await waitFor(() => {
+      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_pinned_filed", project: "" });
+    });
+    expect(pinnedIdsRef.current).toEqual([]);
+  });
+
+  it("remeasures a strip that moves without resizing", async () => {
+    const layout = mockShiftingUngroupLayout();
+    const row = renderPinnedFiledSession("conv_shifted", "Source");
+
+    startMouseDrag(row);
+    const strip = await screen.findByTestId("sidebar-ungroup-drop-zone");
+    const project = screen.getByTestId("sidebar-project-drop-zone");
+
+    await act(async () => {
+      layout.shift();
+      notifyResizeObservers(project);
+      // dnd-kit debounces its resize-driven remeasure by 25ms.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 35);
+      });
+    });
+
+    moveMouseTo(380);
+    await waitFor(() => expect(strip).toHaveClass("bg-[var(--sidebar-active)]"));
+    fireEvent.mouseUp(document, { button: 0, clientX: 120, clientY: 380 });
+
+    await waitFor(() => expect(moveToProjectSpy).toHaveBeenCalledTimes(1));
+    expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_shifted", project: "" });
+  });
+
+  it("completes an ungroup drop through the touch sensor", () => {
+    // The unified row recognizer owns touch drags: a press must hold still for
+    // ROW_GESTURE_HOLD_MS to arm, and only then does movement start the drag.
+    vi.useFakeTimers();
+    try {
+      mockSidebarDropLayout();
+      const row = renderPinnedFiledSession("conv_touch_filed");
+      const touch = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+      const start = touchAt(row, 20);
+      fireEvent.pointerDown(row, { ...touch, clientX: 120, clientY: 20 });
+      fireEvent.touchStart(row, {
+        touches: [start],
+        targetTouches: [start],
+        changedTouches: [start],
+      });
+      act(() => vi.advanceTimersByTime(ROW_GESTURE_HOLD_MS + 1));
+
+      const approaching = touchAt(row, 279);
+      const destination = touchAt(row, 280);
+      fireEvent.pointerMove(row, { ...touch, clientX: 120, clientY: 279 });
+      fireEvent.touchMove(row, { touches: [approaching], changedTouches: [approaching] });
+      const strip = screen.getByTestId("sidebar-ungroup-drop-zone");
+      fireEvent.pointerMove(row, { ...touch, clientX: 120, clientY: 280 });
+      fireEvent.touchMove(row, { touches: [destination], changedTouches: [destination] });
+      expect(strip).toHaveClass("bg-[var(--sidebar-active)]");
+      fireEvent.pointerUp(row, { ...touch, clientX: 120, clientY: 280 });
+      fireEvent.touchEnd(row, { touches: [], targetTouches: [], changedTouches: [destination] });
+
+      expect(moveToProjectSpy).toHaveBeenCalledTimes(1);
+      expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_touch_filed", project: "" });
+      expect(pinnedIdsRef.current).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

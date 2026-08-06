@@ -67,27 +67,144 @@ if (!("IntersectionObserver" in globalThis)) {
   });
 }
 
-// cmdk (the command-palette primitive) constructs a ResizeObserver on mount,
-// which jsdom doesn't implement. A no-op stub lets command-palette/selector
-// component tests render without throwing.
-if (typeof globalThis.ResizeObserver === "undefined") {
-  globalThis.ResizeObserver = class {
-    observe(): void {}
-    unobserve(): void {}
-    disconnect(): void {}
+const resizeObserverInstances = new Set<MockResizeObserver>();
+
+function resizeObserverEntry(target: Element): ResizeObserverEntry {
+  const contentRect = target.getBoundingClientRect();
+  const boxSize = { inlineSize: contentRect.width, blockSize: contentRect.height };
+  return {
+    target,
+    contentRect,
+    borderBoxSize: [boxSize],
+    contentBoxSize: [boxSize],
+    devicePixelContentBoxSize: [boxSize],
   };
+}
+
+class MockResizeObserver implements ResizeObserver {
+  private readonly targets = new Set<Element>();
+  private readonly callback: ResizeObserverCallback;
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+  }
+
+  // Registering on observe (not construct) also re-registers an observer that
+  // starts observing again after a disconnect.
+  observe(target: Element): void {
+    resizeObserverInstances.add(this);
+    this.targets.add(target);
+    this.callback([resizeObserverEntry(target)], this);
+  }
+
+  unobserve(target: Element): void {
+    this.targets.delete(target);
+  }
+
+  disconnect(): void {
+    this.targets.clear();
+    resizeObserverInstances.delete(this);
+  }
+
+  notify(target: Element): void {
+    if (this.targets.has(target)) this.callback([resizeObserverEntry(target)], this);
+  }
+}
+
+/** Deliver a resize notification to observers watching the target. */
+export function notifyResizeObservers(target: Element): void {
+  for (const observer of resizeObserverInstances) observer.notify(target);
+}
+
+Object.defineProperty(globalThis, "ResizeObserver", {
+  writable: true,
+  configurable: true,
+  value: MockResizeObserver,
+});
+
+let mockViewportWidth: number | null = null;
+
+function mediaQueryMatches(query: string): boolean {
+  const viewportWidth = mockViewportWidth;
+  if (viewportWidth === null) return false;
+  const conditions = [...query.matchAll(/\((min|max)-width:\s*(\d+(?:\.\d+)?)px\)/g)];
+  if (conditions.length === 0) return false;
+  return conditions.every(([, boundary, rawWidth]) => {
+    const width = Number(rawWidth);
+    return boundary === "min" ? viewportWidth >= width : viewportWidth <= width;
+  });
+}
+
+type MediaQueryListener = (event: MediaQueryListEvent) => unknown;
+
+class MockMediaQueryList {
+  readonly media: string;
+  matches: boolean;
+  onchange: ((this: MediaQueryList, event: MediaQueryListEvent) => unknown) | null = null;
+  private readonly listeners = new Set<MediaQueryListener>();
+
+  constructor(query: string) {
+    this.media = query;
+    this.matches = mediaQueryMatches(query);
+  }
+
+  addListener(listener: MediaQueryListener): void {
+    this.listeners.add(listener);
+  }
+
+  removeListener(listener: MediaQueryListener): void {
+    this.listeners.delete(listener);
+  }
+
+  addEventListener(_type: string, listener: MediaQueryListener): void {
+    this.addListener(listener);
+  }
+
+  removeEventListener(_type: string, listener: MediaQueryListener): void {
+    this.removeListener(listener);
+  }
+
+  dispatchEvent(event: Event): boolean {
+    for (const listener of this.listeners) listener(event as MediaQueryListEvent);
+    return true;
+  }
+
+  update(): void {
+    const matches = mediaQueryMatches(this.media);
+    if (matches === this.matches) return;
+    this.matches = matches;
+    const event = { matches, media: this.media } as MediaQueryListEvent;
+    this.onchange?.call(this as unknown as MediaQueryList, event);
+    this.dispatchEvent(event);
+  }
+}
+
+const mediaQueryLists = new Map<string, MockMediaQueryList>();
+
+function applyMockViewportWidth(width: number | null): void {
+  mockViewportWidth = width;
+  for (const mediaQueryList of mediaQueryLists.values()) mediaQueryList.update();
+}
+
+/** Set the viewport width used by matchMedia for the current test. */
+export function setMockViewportWidth(width: number): void {
+  applyMockViewportWidth(width);
+}
+
+/** Restore matchMedia's default all-false behavior. */
+export function resetMockViewportWidth(): void {
+  applyMockViewportWidth(null);
 }
 
 Object.defineProperty(window, "matchMedia", {
   writable: true,
-  value: (query: string) => ({
-    matches: false,
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  }),
+  configurable: true,
+  value: (query: string): MediaQueryList => {
+    let mediaQueryList = mediaQueryLists.get(query);
+    if (!mediaQueryList) {
+      mediaQueryList = new MockMediaQueryList(query);
+      mediaQueryLists.set(query, mediaQueryList);
+    }
+    return mediaQueryList as unknown as MediaQueryList;
+  },
 });
