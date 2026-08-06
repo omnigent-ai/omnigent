@@ -49,7 +49,7 @@ export function GoalControl(props: GoalControlProps) {
             size="sm"
             variant={goal ? "secondary" : "ghost"}
             className={cn(
-              "h-9 gap-1.5 px-2 text-xs md:h-8",
+              "h-9 gap-1.5 px-2 text-sm md:h-8",
               goal && "border border-ring/30 text-foreground",
             )}
             disabled={!conversationId || (commandMode && readOnly)}
@@ -96,7 +96,7 @@ export function GoalStatusPill({ goal }: { goal: Goal }) {
   return (
     <span
       data-testid="composer-goal-mode"
-      className="inline-flex items-center gap-1 text-xs font-medium text-foreground"
+      className="inline-flex items-center gap-1 text-sm font-medium text-foreground"
     >
       <TargetIcon className="size-3.5 shrink-0" />
       <span>Goal {formatGoalStatus(goal.status)}</span>

@@ -247,20 +247,20 @@ export function ChatHeader({
               <BotIcon className="size-4 shrink-0 text-muted-foreground" />
               {boundAgent?.name ? (
                 <div className="flex min-w-0 flex-col leading-tight">
-                  <span className="truncate text-sm font-semibold text-foreground">
+                  <span className="truncate text-ui font-semibold text-foreground">
                     {boundAgent.name}
                   </span>
-                  <span className="text-xs text-muted-foreground">Sub-agent</span>
+                  <span className="text-sm text-muted-foreground">Sub-agent</span>
                 </div>
               ) : (
-                <span className="text-sm font-semibold text-foreground">Sub-agent</span>
+                <span className="text-ui font-semibold text-foreground">Sub-agent</span>
               )}
             </div>
           </>
         )}
       </div>
 
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-2">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -301,7 +301,7 @@ export function ChatHeader({
                   disabled={shareDisabled}
                   data-testid="mobile-share-session"
                   title={shareDisabledReason}
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <ShareIcon className="size-4" />
                   Share
@@ -311,7 +311,7 @@ export function ChatHeader({
                 <DropdownMenuItem
                   onSelect={onAgentInfo}
                   data-testid="mobile-agent-info"
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <InfoIcon className="size-4" />
                   Agent info
@@ -337,7 +337,7 @@ export function ChatHeader({
                   title={shareDisabledReason}
                   // share-button-glassy (index.css) paints the pink gradient,
                   // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white"
+                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white"
                 >
                   <span className="flex size-4 shrink-0 items-center justify-center">
                     <UserPlusIcon />
@@ -355,7 +355,7 @@ export function ChatHeader({
             onClick={onShare}
             // share-button-glassy (index.css) paints the pink gradient,
             // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white md:inline-flex"
+            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white md:inline-flex"
           >
             <span className="flex size-4 shrink-0 items-center justify-center">
               <UserPlusIcon />
@@ -369,10 +369,10 @@ export function ChatHeader({
               <Button
                 type="button"
                 variant="ghost"
-                size="icon"
+                size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
                 onClick={onToggleRightPanel}
-                className="hidden md:inline-flex text-muted-foreground hover:text-foreground"
+                className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
               >
                 {rightPanelOpen ? (
                   <PanelRightCloseIcon className="size-4" />
@@ -421,7 +421,7 @@ export function ChatHeader({
                 {showFilesPanel && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenFiles}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <FileIcon className="size-4" />
                     Files
@@ -439,7 +439,7 @@ export function ChatHeader({
                     main agent included. */}
                 <DropdownMenuItem
                   onSelect={mobileMenu.onOpenSubagents}
-                  className="gap-2.5 px-2.5 py-2 text-base"
+                  className="gap-2.5 px-2.5 py-2 text-ui"
                 >
                   <BotIcon className="size-4" />
                   Agents
@@ -464,7 +464,7 @@ export function ChatHeader({
                 {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenShells}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <TerminalIcon className="size-4" />
                     Shells
@@ -480,7 +480,7 @@ export function ChatHeader({
                 {mobileMenu.todosSupported && mobileMenu.todosTotal > 0 && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenTodos}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ListTodoIcon className="size-4" />
                     Tasks
@@ -492,7 +492,7 @@ export function ChatHeader({
                 {mobileMenu.debugMode && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenMainExecutionLog}
-                    className="gap-2.5 px-2.5 py-2 text-base"
+                    className="gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ListIcon className="size-4" />
                     Logs

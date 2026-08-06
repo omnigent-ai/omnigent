@@ -586,7 +586,7 @@ def test_seed_creates_listable_corpus(tmp_path: Path) -> None:
     assert len(conv.list_items(listing.data[0].id, limit=100).data) == 4
 
     # Projects were seeded (owner-scoped to "local") and sessions filed into them.
-    projects = SqlAlchemyProjectStore(db_uri).list(owner_user_id=RESERVED_USER_LOCAL)
+    projects = SqlAlchemyProjectStore(db_uri).list(user_id=RESERVED_USER_LOCAL)
     assert len(projects) == 2
     # 3 of 6 sessions filed (0.5), listable via the owner-scoped ?project= filter.
     filed = conv.list_conversations(

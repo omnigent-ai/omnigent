@@ -25,6 +25,9 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
+)
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -887,6 +890,13 @@ def register_events_routes(
                 and raw_bg_count >= 0
                 else None
             )
+            # Why a still-running session is parked, e.g. a permission prompt
+            # the web UI does not mirror. Absent or blank = not parked, so the
+            # indicator falls back to its ordinary working label.
+            raw_blocked_on = body.data.get("blocked_on")
+            blocked_on = (
+                raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
+            )
             # A sub-agent's background-task ``waiting`` must deliver as ``idle``
             # so the parent's terminal-delivery branch below fires (otherwise
             # the orchestrator hangs); the tally still drives the child spinner.
@@ -900,6 +910,7 @@ def register_events_routes(
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
+                blocked_on=blocked_on,
             )
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
@@ -1274,6 +1285,31 @@ def register_events_routes(
                             created_by=created_by,
                         )
                         return {"queued": True, "item_id": item_id}
+                    if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
+                        # The host refused: the workspace directory no longer
+                        # exists (e.g. the worktree was deleted). Consume the
+                        # message and persist an actionable error banner so the
+                        # user knows to start a new session with a valid
+                        # workspace — instead of timing out into a generic
+                        # RUNNER_UNAVAILABLE.
+                        item_id = await _persist_native_terminal_failure(
+                            session_id,
+                            conv,
+                            body,
+                            conversation_store,
+                            ErrorData(
+                                source="execution",
+                                code="runner_failed_to_start",
+                                message=(
+                                    launch_attempt.error
+                                    or "The session workspace no longer exists on the host. "
+                                    "Start a new session with a valid workspace."
+                                ),
+                            ),
+                            runner_router,
+                            created_by=created_by,
+                        )
+                        return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
                 else:
                     relaunched_runner_id = None
@@ -1462,6 +1498,9 @@ def register_events_routes(
             author_attribution_required=(access.level is not None and access.level < LEVEL_OWNER),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            # Read only for the gateway-backing check that decides which router
+            # serves this turn; absent, routing keeps its default posture.
+            host_store=getattr(request.app.state, "host_store", None),
         )
         if pending_background_title is not None:
             pending_background_title.schedule()

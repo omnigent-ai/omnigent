@@ -570,6 +570,64 @@ def reset_mock_llm(mock_url: str) -> None:
     resp.raise_for_status()
 
 
+def seed_committed_turn(
+    session_id: str,
+    *,
+    prompt: str,
+    reply: str,
+    response_id: str = "resp_seeded",
+) -> None:
+    """Write one committed user+assistant exchange straight into the store.
+
+    For tests that need a settled transcript to act on (per-message actions
+    anchor on a committed assistant response) but not the model's behaviour.
+    Skips the runner and the LLM entirely, so the test neither waits on a turn
+    nor inherits the mock-LLM harness's flakiness. Seed BEFORE navigating —
+    the chat hydrates its history on load.
+
+    Items are appended through the same store the server writes with, so they
+    are indistinguishable from a real turn's (same shape, ids, FTS rows).
+
+    :param session_id: Session to append to, e.g. ``"conv_abc123"``.
+    :param prompt: User message text, e.g. ``"ping"``.
+    :param reply: Assistant message text, e.g. ``"pong"``.
+    :param response_id: Response id shared by both items — per-message
+        actions pass it as the turn anchor (e.g. a fork's truncation point).
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "seed_committed_turn needs the spawned server's database; it is "
+            "unavailable when running against --ui-base-url."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": prompt}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": reply}],
+                    agent="hello_world",
+                ),
+            ),
+        ],
+    )
+
+
 def set_fallback_mock_llm(
     mock_url: str,
     key: str,
@@ -1032,6 +1090,9 @@ def live_server(
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
     _server_state["mock_llm_url"] = mock_url
+    # Exposed so a test can seed a committed transcript straight into the
+    # store (see :func:`seed_committed_turn`) instead of driving the LLM.
+    _server_state["database_uri"] = f"sqlite:///{db_path}"
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.

@@ -1,6 +1,6 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff, Pyrefly, TypeScript lint, custom
+# Runs the project's pre-commit hooks (ruff, Pyrefly, TypeScript lint/type-check, custom
 # anti-pattern grep hooks, etc.) on every non-draft PR and on push to main.
 # Surfaces as the `Pre-commit checks` check, a REQUIRED gate entry in
 # merge-ready.yml. Draft PRs are skipped; `ready_for_review` refires so the
@@ -82,12 +82,12 @@ jobs:
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
-      - name: Install web dependencies
-        # Pin the npm registry to the npmjs default; limit to the web package
-        # so Electron's large native devDependencies are not fetched.
+      - name: Install TypeScript dependencies
+        # Pin the npm registry to the npmjs default; limit installs to packages
+        # checked here so Electron's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: pnpm install --frozen-lockfile --filter web
+        run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
 
       # The pnpm equivalent of the `uv sync --locked` gate above.
       # `pnpm install --frozen-lockfile` only checks the lockfile is CONSISTENT

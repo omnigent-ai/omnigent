@@ -127,8 +127,14 @@
         font-weight: 500;
         color: var(--muted-foreground);
       }
-      .recent-btn {
+      .recent-row {
+        display: flex;
+        gap: 8px;
         margin-top: 6px;
+      }
+      .recent-btn {
+        flex: 1;
+        min-width: 0;
         padding: 8px 12px;
         text-align: left;
         border: 1px solid var(--border);
@@ -138,7 +144,34 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      .recent-btn:hover {
+      .recent-copy {
+        width: 36px;
+        flex: 0 0 36px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--foreground);
+      }
+      .recent-copy svg {
+        width: 16px;
+        height: 16px;
+        fill: none;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 2;
+      }
+      .recent-copy .copied-icon,
+      .recent-copy[data-copied="true"] .copy-icon {
+        display: none;
+      }
+      .recent-copy[data-copied="true"] .copied-icon {
+        display: block;
+      }
+      .recent-btn:hover,
+      .recent-copy:hover {
         background: color-mix(in srgb, var(--foreground) 5%, transparent);
       }
       .err {
@@ -454,10 +487,9 @@
       }
 
       // Recently-connected servers (persisted by the main process on every
-      // successful non-ephemeral Connect). Clicking one fills the input and
-      // connects immediately; the plain-http warning in connect() still
-      // applies. An empty/unavailable list keeps the section hidden — the
-      // form works without it.
+      // successful non-ephemeral Connect). The URL keeps its one-click Connect
+      // behavior; the adjacent clipboard action copies without navigating.
+      // An empty/unavailable list keeps the section hidden.
       const recentsSection = document.getElementById("recents");
       const recentsList = document.getElementById("recents-list");
       setup
@@ -465,17 +497,53 @@
         .then((recents) => {
           if (!Array.isArray(recents) || recents.length === 0) return;
           for (const url of recents) {
-            const btn = document.createElement("button");
-            btn.type = "button";
-            btn.className = "recent-btn";
-            // textContent, never innerHTML: the URL comes from disk and must
-            // be rendered as inert text.
-            btn.textContent = url;
-            btn.addEventListener("click", () => {
+            const row = document.createElement("div");
+            row.className = "recent-row";
+
+            const serverButton = document.createElement("button");
+            serverButton.type = "button";
+            serverButton.className = "recent-btn";
+            serverButton.textContent = url;
+            serverButton.title = url;
+            serverButton.setAttribute("aria-label", `Connect to recent server ${url}`);
+            serverButton.addEventListener("click", () => {
               input.value = url;
-              connect();
+              void connect();
             });
-            recentsList.appendChild(btn);
+
+            const copyButton = document.createElement("button");
+            copyButton.type = "button";
+            copyButton.className = "recent-copy";
+            copyButton.title = "Copy URL";
+            copyButton.setAttribute("aria-label", `Copy recent server URL ${url}`);
+            copyButton.innerHTML = `
+              <svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect width="8" height="4" x="8" y="2" rx="1"></rect>
+                <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+              </svg>
+              <svg class="copied-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m5 12 4 4L19 6"></path>
+              </svg>`;
+            copyButton.addEventListener("click", async (event) => {
+              event.stopPropagation();
+              err.textContent = "";
+              try {
+                await setup.copyText(url);
+                copyButton.dataset.copied = "true";
+                copyButton.title = "Copied";
+                copyButton.setAttribute("aria-label", `Copied recent server URL ${url}`);
+                setTimeout(() => {
+                  delete copyButton.dataset.copied;
+                  copyButton.title = "Copy URL";
+                  copyButton.setAttribute("aria-label", `Copy recent server URL ${url}`);
+                }, 1500);
+              } catch {
+                err.textContent = "Could not copy recent server URL.";
+              }
+            });
+
+            row.append(serverButton, copyButton);
+            recentsList.appendChild(row);
           }
           recentsSection.hidden = false;
         })

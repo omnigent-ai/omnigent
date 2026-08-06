@@ -20,6 +20,14 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
+  /**
+   * Whether each harness family's launch on this host resolves an
+   * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
+   * "codex": false}`. Smart Routing's apply layer only works on gateway-backed
+   * inference. `null`/absent (or a missing key) means unknown — an older host
+   * or server — and must not gate anything away; only an explicit `false` does.
+   */
+  gateway_inference?: Record<string, boolean> | null;
 }
 
 interface HostsResponse {

@@ -156,6 +156,75 @@ def test_refresh_model_from_config_updates_state(tmp_path: Path) -> None:
     assert state.model == "gpt-5.4"
 
 
+def test_refresh_prefers_pushed_settings_model_over_stale_config(tmp_path: Path) -> None:
+    """An unchanged config.toml must not roll back a live thread-settings model.
+
+    Regression for the routed-model reversion: routing switched the running
+    thread via ``thread/settings/update`` (notified as
+    ``thread/settings/updated``), but config.toml still held the pinned
+    launch model; the next ``turn/started`` re-read the stale file and
+    mirrored the default back over ``model_override`` — reverting the routed
+    model one turn after it applied.
+    """
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    # Subscription-time read adopts the pinned launch model (baseline).
+    fwd._refresh_model_from_config(tmp_path, state)
+    assert state.model == "databricks-gpt-5-5"
+    # Omnigent pushes a routed model thread-level; the live notification wins.
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+
+    # turn/started re-read: config.toml is UNCHANGED — the pushed model holds.
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "databricks-gpt-5-6-luna"
+
+
+def test_refresh_adopts_changed_config_over_settings_model(tmp_path: Path) -> None:
+    """A config.toml that changed since the last read wins over settings.
+
+    An in-TUI ``/model`` (or the executor's mirror write) rewrites the file —
+    that is the freshest signal and must not be masked by an older
+    ``thread/settings/updated`` value.
+    """
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_model_from_config(tmp_path, state)
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+    # The user picks a third model in the TUI: /model rewrites config.toml.
+    _write_codex_config(tmp_path, 'model = "gpt-5.6-sol"\n')
+
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "gpt-5.6-sol"
+
+
+def test_refresh_launch_race_ends_on_routed_model(tmp_path: Path) -> None:
+    """Launch-race scenario: the pinned default ends up on the routed model.
+
+    The terminal launch pins the default into config.toml before first-turn
+    routing runs. The executor then pushes the routed model thread-level AND
+    mirrors it into config.toml (``write_codex_config_model``); the next
+    ``turn/started`` re-read must adopt the routed model — with or without
+    the mirror write having succeeded.
+    """
+    from omnigent.codex_native_bridge import write_codex_config_model
+
+    _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_model_from_config(tmp_path, state)
+    # First routed turn: settings push (notification) + executor mirror write.
+    state.note_thread_settings_updated({"threadSettings": {"model": "databricks-gpt-5-6-luna"}})
+    assert write_codex_config_model(tmp_path, "databricks-gpt-5-6-luna") is True
+
+    fwd._refresh_model_from_config(tmp_path, state)
+
+    assert state.model == "databricks-gpt-5-6-luna"
+    # Later turns stay on the routed model (no reversion churn).
+    fwd._refresh_model_from_config(tmp_path, state)
+    assert state.model == "databricks-gpt-5-6-luna"
+
+
 def test_note_resume_response_records_model_without_seeding_baseline() -> None:
     """The startup/resume model is recorded but the baseline stays unset.
 
@@ -2265,6 +2334,168 @@ async def test_thread_active_status_does_not_settle_round(tmp_path: Path) -> Non
         event={
             "method": "thread/status/changed",
             "params": {"threadId": "thread_1", "status": {"type": "active", "activeFlags": []}},
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_model_output_item_settles_synthesized_round(tmp_path: Path) -> None:
+    """
+    The first model-produced item resolves the synthesized round mid-turn.
+
+    Codex defers turn execution until MCP startup settles, so an
+    assistant-side item proves the round is over while the turn is still
+    running. Without this signal, a server stuck ``starting`` (e.g. a
+    misconfigured command that never handshakes) pins the "Starting MCP
+    servers" band under a visibly working agent until the turn ends or
+    the config-derived window elapses.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_1",
+                "item": {"id": "item_1", "type": "agentMessage", "text": ""},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {}
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_mcp_startup", "data": {"servers": {}}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_output_settles_the_round_only_once(tmp_path: Path) -> None:
+    """
+    Only the first model item pays the settle path; later items skip it.
+
+    The round is seeded once per forwarder connection (never on thread
+    rotation), so once model output settles it the outcome cannot change
+    — every later item in the session would otherwise re-read the bridge
+    file for nothing. The state flag short-circuits them, which this
+    pins by re-populating the map behind the flag: a second item must
+    leave it untouched.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    item_event = {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_1",
+            "item": {"id": "item_1", "type": "agentMessage", "text": "hi"},
+        },
+    }
+
+    async def deliver() -> None:
+        """Feed the model-output item through the forwarder dispatch."""
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=item_event,
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            expected_thread_id="thread_1",
+            forwarder_state=state,
+        )
+
+    await deliver()
+    assert state.mcp_startup_settled is True
+    settle_posts = [p for p in client.posts if p[1]["type"] == "external_mcp_startup"]
+    assert len(settle_posts) == 1
+
+    # Re-populate the map behind the flag: without the short-circuit the
+    # next item would read it, settle again, and post a second time.
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+    await deliver()
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert len([p for p in client.posts if p[1]["type"] == "external_mcp_startup"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_user_message_item_does_not_settle_round(tmp_path: Path) -> None:
+    """
+    The turn's ``userMessage`` item must not settle the round.
+
+    Like the thread-active edge, the user message materializes when a
+    turn is merely ACCEPTED — which happens mid-startup — so settling on
+    it would clear the band during the genuine pre-turn wait.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_1",
+                "item": {"id": "item_0", "type": "userMessage", "text": "hi"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_other_thread_item_does_not_settle_round(tmp_path: Path) -> None:
+    """
+    An item on an unrecognized thread must not settle the parent round.
+
+    MCP startup is bridge-level state surfaced on the parent session;
+    another thread's activity proves nothing about this round.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_other",
+                "item": {"id": "item_1", "type": "agentMessage", "text": ""},
+            },
         },
         usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
         elicitation_tracker=fwd._CodexElicitationTaskTracker(),

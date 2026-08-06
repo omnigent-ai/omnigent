@@ -414,6 +414,67 @@ async def test_patch_session_pins_and_unpins(
     assert user_key not in conv.labels
 
 
+async def test_archiving_clears_the_callers_pin(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Archiving a session drops the caller's own pin: a pinned row shouldn't
+    linger if the session is later unarchived. Only the requester's per-user key
+    is cleared."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    user_key = pinned_label_key(None)
+
+    # Pin, then archive.
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.pinned": "1721760000000"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get(user_key) == "1721760000000"
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"archived": True},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.archived is True
+    assert user_key not in conv.labels
+
+
+async def test_archiving_wins_over_a_same_request_pin(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """A single PATCH carrying both ``archived: true`` and a pin is
+    contradictory; archive is authoritative. The pin-clear runs after the label
+    upsert, so the session ends up archived and unpinned, not re-pinned."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    user_key = pinned_label_key(None)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"archived": True, "labels": {"omnigent.pinned": "1721760000000"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.archived is True
+    assert user_key not in conv.labels
+
+
 async def test_patch_rejects_client_supplied_per_user_pin_key(
     client: httpx.AsyncClient,
     session_id: str,

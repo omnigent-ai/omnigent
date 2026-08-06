@@ -221,7 +221,6 @@ export function shouldEchoSynchronously(byteLength: number, msSinceLastInput: nu
  * synchronous ``writeSync`` method that the public types don't expose
  * (see {@link TerminalSession.writeOutput}).
  */
-// eslint-disable-next-line no-underscore-dangle
 interface TerminalCore {
   _core?: {
     writeSync?: (data: Uint8Array, maxSubsequentCalls?: number) => void;

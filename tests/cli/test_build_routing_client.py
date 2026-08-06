@@ -29,7 +29,11 @@ def test_external_builds_client() -> None:
     assert client._url == "https://host/ai-gateway/routing/v1/routes:select"
     assert client._router_name == "task_v0"
     assert client._auth is None  # no profile -> unauthenticated
-    assert client._model_prefixes == []  # no prefix -> catalog ids sent verbatim
+    # No prefix configured -> the module's shared catalog-prefix list, so the
+    # client and the server-side seam can't disagree about a catalog id.
+    from omnigent.server.smart_routing import MODEL_ID_PREFIXES
+
+    assert client._model_prefixes == list(MODEL_ID_PREFIXES)
 
 
 def test_external_threads_model_prefix_scalar() -> None:

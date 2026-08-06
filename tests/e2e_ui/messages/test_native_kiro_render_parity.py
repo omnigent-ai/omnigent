@@ -43,6 +43,7 @@ from .test_message_render_parity import (
     _assert_no_duplicate_render,
     _assert_transcript_parity,
     _ensure_chat_view,
+    _select_view_mode,
     _send,
     _turn_prompt,
 )
@@ -82,12 +83,10 @@ pytestmark = pytest.mark.skipif(
 
 def _open_terminal_view(page: Page) -> None:
     """Switch a terminal-first session to its Terminal (TUI) view."""
-    view_mode = page.get_by_test_id("view-mode-toggle")
-    expect(view_mode).to_be_visible(timeout=_TERMINAL_READY_TIMEOUT_MS)
-    view_mode.click()
-    terminal_item = page.get_by_role("menuitemradio", name="Terminal")
-    expect(terminal_item).to_be_visible(timeout=30_000)
-    terminal_item.click()
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
+        timeout=_TERMINAL_READY_TIMEOUT_MS
+    )
+    _select_view_mode(page, "Terminal")
 
 
 def _wait_terminal_connected(page: Page) -> None:

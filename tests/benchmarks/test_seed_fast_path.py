@@ -70,7 +70,7 @@ def _item_data_ordered(engine):
 def _projects_ordered(engine):
     """(id, name, owner) for every project, sorted — project ids are deterministic."""
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT id, name, owner_user_id FROM projects")).all()
+        rows = conn.execute(text("SELECT id, name, user_id FROM projects")).all()
     return sorted((pid, name, owner) for pid, name, owner in rows)
 
 
@@ -127,7 +127,7 @@ def test_seed_fast_path_row_counts_and_read_path(tmp_path: Path) -> None:
             )
         ).scalar_one()
         assert filed == 30
-        owners = conn.execute(text("SELECT DISTINCT owner_user_id FROM projects")).all()
+        owners = conn.execute(text("SELECT DISTINCT user_id FROM projects")).all()
         assert owners == [(RESERVED_USER_LOCAL,)]
         # Round-robin: each of the 5 projects holds 30/5 = 6 sessions.
         per_project = conn.execute(

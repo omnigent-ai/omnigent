@@ -1,0 +1,78 @@
+name: Clear needs-info on author response
+
+# When the issue AUTHOR comments on an issue that carries `needs-info`, remove
+# the label — the reporter has (presumably) supplied the missing detail. That
+# removal is the signal the rest of the pipeline is built around:
+#
+#   author comments  ->  this workflow removes `needs-info`
+#                     ->  issue-triage.yml's `unlabeled` trigger re-triages
+#                         (reads the follow-up comments, classifies + assigns,
+#                          or re-adds `needs-info` if it is still too vague)
+#   author never responds  ->  stale.yml closes the issue after inactivity
+#
+# CRITICAL: the label MUST be removed with the omnigent-ci App token, not the
+# default GITHUB_TOKEN. GitHub does not re-trigger workflows from events made
+# by GITHUB_TOKEN, so a default-token removal would NOT fire issue-triage's
+# `unlabeled` re-triage. The App token is a distinct actor, so its `unlabeled`
+# event does re-trigger. If the App isn't configured, we skip (fail-closed):
+# leaving the label is safer than removing it and stranding the issue.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: needs-info-response-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  clear-needs-info:
+    runs-on: ubuntu-latest
+    # Only when a NON-bot commenter who IS the issue author comments on an OPEN
+    # issue (not a PR — issue_comment fires for PRs too) that still carries
+    # `needs-info`.
+    if: >-
+      !endsWith(github.event.sender.login, '[bot]') &&
+      !github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      github.event.comment.user.login == github.event.issue.user.login &&
+      contains(github.event.issue.labels.*.name, 'needs-info')
+    steps:
+      - name: Mint omnigent-ci App token
+        id: app-token
+        if: vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+
+      - name: Warn when the omnigent-ci App is unconfigured
+        # The feature no-ops without the App (see above). Surface it so a dormant
+        # setup is distinguishable from a broken one.
+        if: steps.app-token.outputs.token == ''
+        run: echo "::notice::omnigent-ci App not configured; needs-info re-triage is dormant (label left in place)."
+
+      - name: Remove needs-info label
+        # Skip when the App isn't configured: removing with GITHUB_TOKEN would
+        # not re-trigger re-triage, so the label would just silently vanish.
+        if: steps.app-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          # Re-check the live labels before removing: the job gate reads the
+          # (possibly stale) event payload, and `gh --remove-label` errors on a
+          # label that is already gone. This keeps the step idempotent under a
+          # race (e.g. two quick comments, or a concurrent removal).
+          if gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels \
+               --jq '.labels[].name' | grep -qx needs-info; then
+            echo "Author responded on #$ISSUE_NUMBER; removing needs-info to re-triage."
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-info
+          else
+            echo "needs-info already cleared on #$ISSUE_NUMBER; nothing to do."
+          fi

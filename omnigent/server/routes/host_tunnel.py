@@ -262,6 +262,10 @@ def create_host_tunnel_router(
                 frame,
                 owner=tunnel_owner,
             )
+            # Delivered on the handshake, never persisted: a replica that just
+            # started learns the host's gateway backing here, so a server
+            # restart converges as soon as each host reconnects.
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
@@ -284,6 +288,7 @@ def create_host_tunnel_router(
                     conn,
                     host_id,
                     host_store,
+                    host_registry,
                     runner_exit_reports,
                     on_runner_exited,
                     on_host_update,
@@ -326,8 +331,10 @@ def create_host_tunnel_router(
                     receive_task,
                     return_exceptions=True,
                 )
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                # If the host already reconnected, this handler's connection
+                # was replaced; only the current one may mark it offline.
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -345,8 +352,8 @@ def create_host_tunnel_router(
             # connects with another owner's host_id — must not deregister
             # or flip that owner's host offline (cross-user DoS).
             if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -359,8 +366,8 @@ def create_host_tunnel_router(
             _logger.exception("Host tunnel error for %s", host_id)
             # Same guard as above: don't touch a host we never registered.
             if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
 
     return router
 
@@ -404,6 +411,7 @@ async def _receive_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
@@ -414,6 +422,10 @@ async def _receive_loop(
     :param conn: Host connection for resolving pending requests.
     :param host_id: Host id for logging.
     :param host_store: Persistent store receiving live readiness updates.
+    :param host_registry: Live host registry, so a frame only refreshes
+        liveness while ``conn`` is still the registered generation; it also
+        receives the reported gateway-inference map (held in memory, never
+        persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
@@ -432,7 +444,10 @@ async def _receive_loop(
         if not isinstance(raw, str):
             continue
 
-        conn.last_frame_at = time.time()
+        if not host_registry.mark_frame_seen(conn):
+            # This connection was replaced or removed, so stop reading: marking
+            # it alive would keep a host that nothing can reach looking healthy.
+            return
 
         try:
             frame = decode_host_frame(raw)
@@ -475,6 +490,10 @@ async def _receive_loop(
                 frame.configured_harnesses,
             )
             conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            conn.hello.gateway_inference = (
+                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
+            )
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)
@@ -619,6 +638,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -631,6 +651,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -663,6 +684,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "models": frame.models,
+                        "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
                 )

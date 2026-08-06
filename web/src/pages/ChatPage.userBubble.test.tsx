@@ -127,6 +127,43 @@ describe("UserBubble system messages", () => {
     expect(screen.queryByTestId("system-message")).toBeNull();
     expect(screen.getByText("build finished")).toBeInTheDocument();
   });
+
+  it("renders a steering interrupt as a muted marker and its uploads as their own bubble", () => {
+    // The two items a mid-tool-use steer produces, once the pending-input
+    // drain stops handing the uploads to the marker: Claude's own interrupt
+    // record (text-only) and the user's attachments-only message.
+    renderBubble(userBubble("[Request interrupted by user for tool use]"));
+    const marker = screen.getByTestId("system-message");
+    expect(marker.getAttribute("data-system-kind")).toBe("interrupted");
+    expect(marker).toHaveTextContent("Interrupted");
+    // The raw record must not survive as user-bubble text.
+    expect(screen.queryByText(/\[Request interrupted by user/)).toBeNull();
+    expect(screen.queryByTestId("message-bubble")).toBeNull();
+
+    cleanup();
+
+    renderBubble(
+      userBubble("[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]", {
+        content: [
+          { type: "input_image", file_id: "file_1", filename: "shot1.png" },
+          { type: "input_image", file_id: "file_2", filename: "shot2.png" },
+          {
+            type: "input_text",
+            text: "[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]",
+          },
+        ],
+      }),
+    );
+    // A real bubble with both screenshots — not the blank pill the stolen
+    // file blocks used to leave behind.
+    expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
+    expect(screen.getByAltText("shot1.png")).toBeInTheDocument();
+    expect(screen.getByAltText("shot2.png")).toBeInTheDocument();
+    // Upload markers are stripped from the text, and an empty text renders
+    // nothing rather than an empty markdown block.
+    expect(screen.queryByText(/\[Attached:/)).toBeNull();
+    expect(screen.queryByTestId("system-message")).toBeNull();
+  });
 });
 
 describe("AssistantBubble lifecycle rendering", () => {

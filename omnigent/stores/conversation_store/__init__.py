@@ -763,6 +763,8 @@ class ConversationStore(ABC):
         _unset_model_override: bool = False,
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
@@ -772,7 +774,8 @@ class ConversationStore(ABC):
         Update mutable fields on a conversation.
 
         For ``reasoning_effort``, ``model_override``,
-        ``cost_control_mode_override``, and ``harness_override``,
+        ``cost_control_mode_override``, ``subagent_routing_override``,
+        and ``harness_override``,
         ``None`` means "leave unchanged". To explicitly clear them
         back to ``None``, pass
         the matching ``_unset_*`` flag.
@@ -796,6 +799,12 @@ class ConversationStore(ABC):
         :param _unset_cost_control_mode_override: When ``True``, set
             ``cost_control_mode_override`` to ``None`` regardless of
             the ``cost_control_mode_override`` param value.
+        :param subagent_routing_override: Per-session subagent-routing
+            switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
+        :param _unset_subagent_routing_override: When ``True``, set
+            ``subagent_routing_override`` to ``None`` regardless of the
+            ``subagent_routing_override`` param value. Unset reads as
+            Default (the switch is two-state; nothing is inherited).
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged. No ``_unset``
             variant — the override is set once at session create and
@@ -1460,6 +1469,7 @@ class ConversationStore(ABC):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1534,6 +1544,11 @@ class ConversationStore(ABC):
             transcript; when the response is the source's last one, the
             copy is equivalent to a full fork and the directive is kept.
             ``None`` (default) copies the full history.
+        :param project_id: First-class project to file the fork into
+            (``metadata.project_id``), or ``None`` (default) to leave it
+            unfiled. The caller resolves whether the fork keeps the
+            source's project — projects are owner-private, so the route
+            passes the source's id only when the forker owns it.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
