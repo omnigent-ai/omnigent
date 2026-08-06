@@ -397,6 +397,74 @@ async def test_cursor_permission_request_hook_stamps_ask_user_question_extra(
     assert resp.status_code == 200, resp.text
 
 
+async def test_native_permission_request_hook_stamps_ask_user_question_extra(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The generic ``/hooks/native-permission-request`` forwards a structured
+    ``ask_user_question`` body onto the published elicitation params (uncapped),
+    exactly like the cursor hook — so opencode's blocking ``question`` tool
+    renders as the interactive web form rather than the ≤1024-char preview card.
+
+    This is the native-hook analog of
+    ``test_cursor_permission_request_hook_stamps_ask_user_question_extra``. The
+    opencode-native forwarder POSTs the question here (agent ``OpenCode``,
+    policy ``opencode_native_question``); without the passthrough the multi-
+    question payload is dropped and the web shows only a raw approve/reject card.
+    """
+    agent = await create_test_agent(client, "test-native-askquestion")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"que_{session_id}_q1"
+    ask_user_question = {
+        "questions": [
+            {
+                "id": "0",
+                "question": "What kind of example would you like to see?",
+                "options": [
+                    {"label": "A coding-related question"},
+                    {"label": "A workflow question"},
+                ],
+                "multiSelect": False,
+            },
+            {
+                "id": "1",
+                "question": "Pick tools",
+                "options": [{"label": "ripgrep"}, {"label": "fd"}],
+                "multiSelect": True,
+            },
+        ]
+    }
+    payload = {
+        "elicitation_id": elicitation_id,
+        "operation_type": "question",
+        "agent": "OpenCode",
+        "policy_name": "opencode_native_question",
+        "message": "OpenCode is asking a question",
+        "content_preview": "What kind of example would you like to see?",
+        "ask_user_question": ask_user_question,
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/native-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    params = event["params"]
+    assert params["policy_name"] == "opencode_native_question"
+    # The structured payload rode through verbatim as the params extra (uncapped).
+    assert params["ask_user_question"] == ask_user_question
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+
+
 async def test_top_level_elicitations_route_is_not_mounted(
     app: FastAPI,
     client: httpx.AsyncClient,
