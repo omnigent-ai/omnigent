@@ -103,6 +103,9 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _TITLE_SOURCE_AGENT,
+    _TITLE_SOURCE_LABEL_KEY,
+    _TITLE_SOURCE_USER,
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
@@ -1411,7 +1414,16 @@ def register_core_routes(
         session_id: str,
         body: AutomaticSessionRenameRequest,
     ) -> AutomaticSessionRenameResponse:
-        """Replace the deterministic first-message title when still current."""
+        """Rename a session on the agent's behalf, unless a person owns the title.
+
+        The first rename may only replace the deterministic first-message
+        seed. After that the row is marked agent-titled, so later renames
+        are allowed — a session's subject changes as work moves on, and a
+        one-shot rename would freeze the sidebar on the opening topic. A
+        manual rename (``PATCH /sessions/{id}``) marks the row user-titled
+        and ends agent renaming for good. Both paths write conditionally on
+        the title read in this request, so a concurrent rename still wins.
+        """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
             user_id,
@@ -1433,32 +1445,47 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        page = await asyncio.to_thread(
-            conversation_store.list_items,
-            session_id,
-            100,
-            None,
-            None,
-            "asc",
-            None,
-        )
-        seed_title: str | None = None
-        for item in page.data:
-            seed_title = synthesize_conversation_title(_title_content_from_item(item))
-            if seed_title is not None:
-                break
-        if seed_title is None:
-            return AutomaticSessionRenameResponse(renamed=False, reason="no_seed")
-        if conv.title != seed_title:
+        # Untitled rows store "", never NULL; the fallback only satisfies
+        # the type and still names the value the write must find in place.
+        current_title = conv.title or ""
+        title_source = conv.labels.get(_TITLE_SOURCE_LABEL_KEY)
+        if title_source == _TITLE_SOURCE_USER:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        if title_source != _TITLE_SOURCE_AGENT:
+            # Unmarked row: the only title the agent may take over is the
+            # deterministic seed. Anything else was typed by a person
+            # before provenance was tracked.
+            page = await asyncio.to_thread(
+                conversation_store.list_items,
+                session_id,
+                100,
+                None,
+                None,
+                "asc",
+                None,
+            )
+            seed_title: str | None = None
+            for item in page.data:
+                seed_title = synthesize_conversation_title(_title_content_from_item(item))
+                if seed_title is not None:
+                    break
+            if seed_title is None:
+                return AutomaticSessionRenameResponse(renamed=False, reason="no_seed")
+            if current_title != seed_title:
+                return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         updated = await asyncio.to_thread(
             conversation_store.rename_conversation_if_title_matches,
             session_id,
-            seed_title,
+            current_title,
             title,
         )
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {_TITLE_SOURCE_LABEL_KEY: _TITLE_SOURCE_AGENT},
+        )
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.patch(
@@ -1584,6 +1611,11 @@ def register_core_routes(
                 )
             requested_codex_collaboration_mode = body.collaboration_mode
         labels_to_set = dict(body.labels or {})
+        # A title arriving on PATCH was typed by a person (the sidebar's
+        # inline rename), so mark the row user-titled — that is what stops
+        # the agent's auto-title endpoint from overwriting it later.
+        if body.title is not None:
+            labels_to_set[_TITLE_SOURCE_LABEL_KEY] = _TITLE_SOURCE_USER
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries

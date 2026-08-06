@@ -145,6 +145,19 @@ _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY = "omnigent.claude_native.tool_use_id"
 _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description"
 
 
+# Who owns a session's current title. The auto-title endpoint may replace
+# the deterministic first-message seed and, thereafter, a title it wrote
+# itself — but never a title a person typed. Absent on legacy rows, which
+# fall back to the seed comparison.
+_TITLE_SOURCE_LABEL_KEY = "omnigent.title.source"
+
+
+_TITLE_SOURCE_AGENT = "agent"
+
+
+_TITLE_SOURCE_USER = "user"
+
+
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE: str = "external_codex_subagent_start"
 
 
@@ -831,6 +844,9 @@ __all__ = [
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
+    "_TITLE_SOURCE_AGENT",
+    "_TITLE_SOURCE_LABEL_KEY",
+    "_TITLE_SOURCE_USER",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
     "_UPLOAD_READ_CHUNK_BYTES",

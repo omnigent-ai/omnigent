@@ -735,12 +735,18 @@ class ChildSessionSummary(BaseModel):
         children this is derived from the prefix of ``title`` before
         the first ``":"``, e.g. ``"researcher"``. For Codex-native
         children this is the Codex-assigned ``agent_nickname`` when
-        available, then ``agent_role``, then ``"Codex"``. Falls back
-        to the raw title for legacy / malformed rows; ``None`` only
-        when ``title`` itself is ``None`` or empty.
+        available, then ``agent_role``, then ``"Codex"``. For
+        Claude-native children this is the Task tool's ``description``
+        (e.g. ``"wave-worker-696"``), then the agent type's trailing
+        segment (``"rpw-published:debug-lead"`` → ``"debug-lead"``) —
+        their title is an opaque uniqueness key, not a display string.
+        Falls back to the raw title for legacy / malformed rows;
+        ``None`` only when nothing readable exists.
     :param session_name: Sub-agent instance name, the suffix of
-        ``title`` after the first ``":"``, e.g. ``"auth"``. ``None``
-        if ``title`` is ``None`` or missing a colon.
+        ``title`` after the first ``":"``, e.g. ``"auth"``. For
+        Claude-native children this is the raw Claude ``subagent_id``,
+        kept for correlation rather than display. ``None`` if
+        ``title`` is ``None`` or missing a colon.
     :param kind: Conversation kind discriminator, always
         ``"sub_agent"`` for rows surfaced by this endpoint.
     :param created_at: Unix epoch timestamp of child creation.
@@ -2028,7 +2034,12 @@ class UpdateSessionRequest(BaseModel):
 class AutomaticSessionRenameRequest(BaseModel):
     """Request body for the current-agent automatic rename endpoint."""
 
-    title: str = Field(min_length=2, max_length=60)
+    # 120 chars: a summary title needs ~60, but operators also title
+    # sessions structurally (``repo::branch::date::role``), and a real
+    # repo + branch pair already runs past 70. The stored column holds
+    # 768, so this bound is about keeping titles readable, not about
+    # storage.
+    title: str = Field(min_length=2, max_length=120)
 
     model_config = ConfigDict(extra="forbid")
 

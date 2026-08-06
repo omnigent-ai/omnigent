@@ -884,11 +884,11 @@ async def test_external_subagent_start_mints_child_session(
     # The session_name half encodes ``subagent_id`` so two children
     # with the same agent_type + description don't collide on the
     # ``(parent, title)`` unique index (the LLM routinely emits the
-    # same description for parallel Task spawns).
-    assert child["tool"] == "Explore"
+    # same description for parallel Task spawns) — which is exactly why
+    # ``tool`` is the Task description instead of a slice of the title.
+    assert child["title"] == "Explore:a5c7effac5a9a35ab"
+    assert child["tool"] == "Trace the auth flow"
     assert child["session_name"] == "a5c7effac5a9a35ab"
-    # Description is preserved on the row's labels for surfaces that
-    # want it; the rail's row UI ignores ``session_name``.
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
 
 
@@ -949,6 +949,49 @@ async def test_external_subagent_start_handles_duplicate_agent_type_and_descript
     children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
     child_ids = {c["id"] for c in children}
     assert {first_id, second_id} <= child_ids
+    # Two rows, one shared display label: the id lives in ``session_name``,
+    # so the rail can still tell them apart without showing hex to the user.
+    spawned = [c for c in children if c["id"] in {first_id, second_id}]
+    assert [c["tool"] for c in spawned] == ["Tell a joke", "Tell a joke"]
+    assert {c["session_name"] for c in spawned} == {"a03186614301289fb", "aefb9a13a81715740"}
+
+
+async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Without a description, the row's label is the agent type's trailing
+    segment. Plugin-namespaced agent types arrive as
+    ``"rpw-published:debug-lead"``, whose own colon used to leak the
+    hex id into the rail when the title was split on the first colon.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "a361e6a6aa05689cb",
+                "agent_type": "rpw-published:debug-lead",
+                "description": "",
+                "tool_use_id": "toolu_namespaced",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+    child_id = resp.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["title"] == "rpw-published:debug-lead:a361e6a6aa05689cb"
+    assert child["tool"] == "debug-lead"
+    assert child["session_name"] == "a361e6a6aa05689cb"
 
 
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
@@ -1846,6 +1889,7 @@ async def test_patch_session_updates_labels(
 async def test_auto_title_replaces_only_the_deterministic_seed(
     client: httpx.AsyncClient,
 ) -> None:
+    """A manual rename is final: the agent may take the seed, never a user title."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     seeded = await client.post(
@@ -1944,6 +1988,99 @@ async def test_auto_title_declines_when_no_seed_exists(
         "title": None,
         "reason": "no_seed",
     }
+
+
+async def _seed_first_message(client: httpx.AsyncClient, session_id: str, text: str) -> None:
+    """Append the first user message, which seeds the deterministic title."""
+    seeded = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+
+async def test_auto_title_renames_again_after_its_own_earlier_rename(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A session the agent already titled can be titled again.
+
+    The first rename leaves the stored title unequal to the seed, so a
+    seed-only guard refuses every later rename — an agent whose session
+    moved from triage to a fix could never say so, and the sidebar stayed
+    frozen on the opening topic.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    await _seed_first_message(client, session["id"], "start working through the backlog")
+
+    first = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Triage backlog issues"},
+    )
+    assert first.json() == {"renamed": True, "title": "Triage backlog issues", "reason": None}
+
+    second = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Fix session rename guard"},
+    )
+    assert second.json() == {
+        "renamed": True,
+        "title": "Fix session rename guard",
+        "reason": None,
+    }
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["title"] == "Fix session rename guard"
+
+
+async def test_auto_title_round_trips_a_structured_title(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A ``::``-delimited structured title survives rename and storage.
+
+    At 75 characters this is past the old 60-char bound, which forced
+    callers to drop a segment (usually the branch) to fit — the exact
+    information the structured title exists to carry.
+    """
+    structured = "rpw-agent-marketplace::wave/2026-08-02-backlog::2026-08-04::wave_supervisor"
+    assert len(structured) == 75
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    await _seed_first_message(client, session["id"], "start working through the backlog")
+
+    renamed = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": structured},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json() == {"renamed": True, "title": structured, "reason": None}
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["title"] == structured
+
+
+async def test_auto_title_rejects_a_title_past_the_cap(
+    client: httpx.AsyncClient,
+) -> None:
+    """The raised bound is still a bound: 121 characters is rejected."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "x" * 121},
+    )
+    assert resp.status_code == 422, resp.text
 
 
 async def test_auto_title_declines_child_sessions(

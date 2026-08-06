@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
 import type { NativeCodingAgentSpec } from "./nativeCodingAgents";
 import {
+  CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
+  CLAUDE_NATIVE_SUBAGENT_WRAPPER,
   NATIVE_CODING_AGENTS,
   UI_MODE_LABEL_KEY,
   UI_MODE_TERMINAL_VALUE,
   WRAPPER_LABEL_KEY,
+  claudeNativeSubagentLabel,
   isFullySupportedNativeCodingAgent,
   isNativeTerminalSession,
   isRecentHarness,
@@ -185,5 +188,51 @@ describe("isRecentHarness", () => {
     expect(isRecentHarness({ name: "polly", harness: "claude-sdk" }, ["claude-sdk"])).toBe(false);
     expect(isRecentHarness(null, ["pi-native"])).toBe(false);
     expect(isRecentHarness(pi, ["not-a-harness"])).toBe(false);
+  });
+});
+
+describe("claudeNativeSubagentLabel", () => {
+  const claudeLabels = (over: Record<string, string> = {}) => ({
+    [WRAPPER_LABEL_KEY]: CLAUDE_NATIVE_SUBAGENT_WRAPPER,
+    ...over,
+  });
+
+  it("uses the Task description when one was forwarded", () => {
+    expect(
+      claudeNativeSubagentLabel(
+        claudeLabels({ [CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY]: "wave-worker-696" }),
+        "general-purpose",
+      ),
+    ).toBe("wave-worker-696");
+  });
+
+  it("drops the plugin namespace from a description-less agent type", () => {
+    // "rpw-published:debug-lead" is a real shape; only the agent name reads.
+    expect(claudeNativeSubagentLabel(claudeLabels(), "rpw-published:debug-lead")).toBe(
+      "debug-lead",
+    );
+  });
+
+  it("keeps a plain agent type intact", () => {
+    expect(claudeNativeSubagentLabel(claudeLabels(), "Explore")).toBe("Explore");
+  });
+
+  it("ignores a blank description rather than rendering an empty row", () => {
+    expect(
+      claudeNativeSubagentLabel(
+        claudeLabels({ [CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY]: "   " }),
+        "Explore",
+      ),
+    ).toBe("Explore");
+  });
+
+  it("returns null for rows that are not Claude sub-agents", () => {
+    // Leaves the caller's own fallbacks in charge.
+    expect(claudeNativeSubagentLabel({ [WRAPPER_LABEL_KEY]: "codex-native-ui" }, "x")).toBeNull();
+    expect(claudeNativeSubagentLabel(undefined, "x")).toBeNull();
+  });
+
+  it("returns null when the row carries neither description nor agent type", () => {
+    expect(claudeNativeSubagentLabel(claudeLabels(), null)).toBeNull();
   });
 });

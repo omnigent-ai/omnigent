@@ -57,7 +57,11 @@ import { cn } from "@/lib/utils";
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
-import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  CLAUDE_NATIVE_SUBAGENT_WRAPPER,
+  nativeCodingAgentForWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import {
   activityDotClassName,
   childStatus,
@@ -411,9 +415,13 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
   // rejects "ui" as a sub-agent name.
   const isUserAdded = child.title?.startsWith("ui:") ?? false;
   const childWrapper = child.labels?.[WRAPPER_LABEL_KEY];
+  // Native-harness children title themselves from opaque runtime ids
+  // (a Codex thread id, a Claude sub-agent hex id), so their readable
+  // label is the server-derived ``tool`` — never the title's suffix.
   const isNativeSubagent =
     childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER;
+    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER ||
+    childWrapper === CLAUDE_NATIVE_SUBAGENT_WRAPPER;
   if (isNativeSubagent && !isUserAdded) {
     return child.tool ?? child.title ?? child.id;
   }
