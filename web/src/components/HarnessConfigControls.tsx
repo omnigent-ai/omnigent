@@ -82,7 +82,7 @@ export function RoutingModelSelect({
       <SelectContent
         position="popper"
         align="start"
-        className={cn("w-(--radix-select-trigger-width)", contentClassName)}
+        className={cn("w-max min-w-(--radix-select-trigger-width) max-w-[300px]", contentClassName)}
       >
         {offerSmartRouting && (
           <SelectItem value={MODEL_SELECT_SMART}>{SMART_ROUTING_LABEL}</SelectItem>
