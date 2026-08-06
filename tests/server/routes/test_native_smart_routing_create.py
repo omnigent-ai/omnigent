@@ -7,9 +7,9 @@ the session row, so the harness is decided during the create — not on the firs
 message event the way the bundle-agent auto path does — and the session is
 rebound to the wrapper the router picked.
 
-A create pinned to one native harness (the CLI's ``omni claude --smart-routing``,
-or the web UI picking a harness with routing on) routes on the same seam for the
-same reason, but only the MODEL: its turns originate in the TUI, so the server
+A create pinned to one native harness (the web UI picking a harness with routing
+on) routes on the same seam for the same reason, but only the MODEL: its turns
+originate in the TUI, so the server
 never sees the first message pre-inference and the turn gate would never fire.
 """
 
@@ -179,9 +179,9 @@ async def _create_fixed_harness_session(
 ) -> httpx.Response:
     """POST a Smart Routing create for a session pinned to one harness.
 
-    The CLI's ``omni claude --smart-routing`` shape: a fixed harness (the native
-    wrapper agent, no ``harness_override``) plus routing on and the prompt as
-    ``smart_routing_message``.
+    The web UI's "Claude Code + Smart Routing" shape: a fixed harness (the
+    native wrapper agent, no ``harness_override``) plus routing on and the
+    prompt as ``smart_routing_message``.
 
     :param client: Test HTTP client.
     :param agent_id: Agent to bind.
@@ -2095,7 +2095,7 @@ async def test_a_routing_outage_still_creates_the_fixed_harness_session(
     failure: Exception,
 ) -> None:
     """
-    ``omni claude --smart-routing`` creates and launches unrouted, with a card.
+    A fixed-harness create launches unrouted, with a card.
 
     The harness was the caller's own choice, so only the model was ever at
     stake: nothing is pinned, the session opens on the CLI's default, and the
