@@ -564,13 +564,13 @@ describe("Sidebar session list", () => {
     }
   });
 
-  it("opens the command palette when the Search button is clicked", () => {
+  it("opens session search when the Search button is clicked", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     const onOpenSearch = vi.fn();
     renderSidebar(true, "/", onOpenSearch);
 
-    // Session search moved into the command palette: the sidebar box is now a
-    // button that opens it rather than an inline filter input.
+    // Session search is its own overlay (⌘⇧F): the sidebar box is a button
+    // that opens it rather than an inline filter input.
     fireEvent.click(screen.getByTestId("sidebar-search-button"));
     expect(onOpenSearch).toHaveBeenCalledTimes(1);
   });

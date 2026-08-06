@@ -11,8 +11,8 @@ import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebar
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
-import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
+import { useCommandPaletteHotkey, useSessionSearchHotkey } from "@/hooks/usePaletteHotkeys";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
@@ -106,7 +106,7 @@ import {
 import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
-import { CommandPalette } from "./CommandPalette";
+import { CommandPalette, type CommandPaletteMode } from "./CommandPalette";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -1304,12 +1304,24 @@ export function AppShell() {
     onToggleRight: toggleRightPanel,
   });
 
-  // ⌘K (Ctrl+K) toggles the command palette. Bound capture-phase, so in the
-  // embedded build we claim the chord ahead of any host-page ⌘K listener.
-  // Bound here where the palette's open-state lives.
+  // ⌘K (Ctrl+K) toggles the command palette; ⌘⇧F (Ctrl+Shift+F) toggles session
+  // search. Both drive the same overlay in different modes, so they share one
+  // open-state and the chord that fired last sets the mode. Disabled embedded,
+  // where those chords belong to the host page. Bound here, where the state is.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [commandPaletteMode, setCommandPaletteMode] = useState<CommandPaletteMode>("commands");
   const isEmbedded = useIsEmbedded();
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
+  // Re-pressing the chord for the mode already showing closes the overlay;
+  // pressing the other chord switches to it rather than closing.
+  const togglePalette = useCallback(
+    (mode: CommandPaletteMode) => () => {
+      setCommandPaletteOpen((prev) => !(prev && commandPaletteMode === mode));
+      setCommandPaletteMode(mode);
+    },
+    [commandPaletteMode],
+  );
+  useCommandPaletteHotkey(togglePalette("commands"), !isEmbedded);
+  useSessionSearchHotkey(togglePalette("sessions"), !isEmbedded);
   useNewSessionHotkey(!isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes
@@ -1754,7 +1766,10 @@ export function AppShell() {
                     }
                     setSidebarPeek(false);
                   }}
-                  onOpenSearch={() => setCommandPaletteOpen(true)}
+                  onOpenSearch={() => {
+                    setCommandPaletteMode("sessions");
+                    setCommandPaletteOpen(true);
+                  }}
                   // Dwell-to-peek moves here with the button: on mac this cluster
                   // replaces ChatHeader's collapsed-state toggle, which is where
                   // peek was armed, so without this the affordance would vanish.
@@ -1783,7 +1798,10 @@ export function AppShell() {
                 setSidebarOpen(false);
                 setSidebarPeek(false);
               }}
-              onOpenSearch={() => setCommandPaletteOpen(true)}
+              onOpenSearch={() => {
+                setCommandPaletteMode("sessions");
+                setCommandPaletteOpen(true);
+              }}
             />
 
             {/* Content region (everything right of the sidebar): a relative
@@ -2082,13 +2100,14 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
-          {/* Global command palette (⌘K). Ungated so it works on every route
-              and in embedded mode — the sidebar's "Search" button opens it
-              there even though the ⌘K hotkey is disabled (it belongs to the
-              host page). */}
+          {/* Command palette (⌘K) / session search (⌘⇧F), one overlay in two
+              modes. Ungated so it works on every route and in embedded mode —
+              the sidebar's magnifier opens session search there even though the
+              hotkeys are disabled (those chords belong to the host page). */}
           <CommandPalette
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
+            mode={commandPaletteMode}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
           />

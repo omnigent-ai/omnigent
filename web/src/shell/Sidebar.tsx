@@ -290,9 +290,9 @@ interface SidebarProps {
    */
   dragProgress?: number | null;
   /**
-   * Open the global command palette (⌘K). The sidebar's "Search" button routes
-   * here rather than filtering inline: session search (title + chat content)
-   * lives in the palette, which the box now doubles as an entry point for.
+   * Open session search (⌘⇧F). The sidebar's "Search" button routes here
+   * rather than filtering inline: session search covers title *and* chat
+   * content, which needs the server, not a filter over the loaded page.
    * Optional (defaults to a no-op) so the sidebar renders standalone in tests.
    */
   onOpenSearch?: () => void;
@@ -575,8 +575,8 @@ export function Sidebar({
   // connection state, so the sidebar fetches a single undifferentiated
   // list. Archived sessions are included (`includeArchived: true`) and
   // peeled into their own "Archived" section at the bottom of the list.
-  // Session search now lives in the command palette (the "Search" button
-  // below), so the sidebar list itself is unfiltered.
+  // Session search is its own overlay (⌘⇧F, or the "Search" button below),
+  // so the sidebar list itself is unfiltered.
   const conversationsQuery = useConversations("", true, {
     reconcileWhileConnected: true,
   });
