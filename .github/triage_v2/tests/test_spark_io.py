@@ -54,10 +54,12 @@ class FakeSpark:
     def __init__(self):
         self.catalog = FakeCatalog()
         self.schemas = []
+        self.rows = []
         self.frames = []
         self.statements = []
 
     def createDataFrame(self, rows, schema):
+        self.rows.append(rows)
         self.schemas.append(schema)
         frame = FakeFrame()
         self.frames.append(frame)
@@ -83,6 +85,7 @@ def test_classification_schema_handles_empty_arrays() -> None:
     repository.upsert([classification])
 
     assert spark.schemas[0].count("ARRAY<STRING>") == 2
+    assert spark.rows[0][0]["issue_type"] == "Bug"
 
 
 def test_score_sink_uses_schema_evolution() -> None:
@@ -92,7 +95,14 @@ def test_score_sink_uses_schema_evolution() -> None:
         "main.team.scores",
         "main.team.scores_latest",
     )
-    issue = Issue(1, "Title", "url", IssueType.BUG, Severity.S3)
+    issue = Issue(
+        1,
+        "Title",
+        "url",
+        IssueType.ENHANCEMENT,
+        Severity.S3,
+        classification_reasoning="Useful but has a workaround.",
+    )
     ranked = RankedIssue(
         rank=1,
         previous_rank=1,
@@ -113,6 +123,9 @@ def test_score_sink_uses_schema_evolution() -> None:
     assert spark.schemas[0].count("ARRAY<STRING>") == 5
     assert "upvote_count BIGINT" in spark.schemas[0]
     assert "duplicate_count BIGINT" in spark.schemas[0]
+    assert "classification_reasoning STRING" in spark.schemas[0]
+    assert spark.rows[0][0]["issue_type"] == "Feature"
+    assert spark.rows[0][0]["classification_reasoning"] == "Useful but has a workaround."
     assert spark.frames[0].write.options == {"mergeSchema": "true"}
     assert spark.statements[0].startswith("CREATE OR REPLACE VIEW main.team.scores_latest")
 

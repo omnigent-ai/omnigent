@@ -5,13 +5,9 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
-
-from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.artifacts import write_artifacts
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.classification import Classification, PromptClassifier
+from issue_prioritization.classification import Classification
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.domain import IssueType, Severity
 from issue_prioritization.mutations import BotState
@@ -25,7 +21,7 @@ _SCORE_SCHEMA = """run_id STRING, mode STRING, regrade BOOLEAN,
 adopt_legacy_bot_priorities BOOLEAN, legacy_priorities_adopted BIGINT,
 scored_at TIMESTAMP, rank BIGINT, previous_rank BIGINT, rank_delta BIGINT,
 issue_number BIGINT, title STRING, url STRING, issue_type STRING, severity STRING,
-score DOUBLE, upvote_count BIGINT, duplicate_count BIGINT,
+classification_reasoning STRING, score DOUBLE, upvote_count BIGINT, duplicate_count BIGINT,
 current_priority STRING, proposed_priority STRING,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, breakdown_json STRING,
 labels_add ARRAY<STRING>, labels_remove ARRAY<STRING>, mutation_blocked ARRAY<STRING>"""
@@ -65,7 +61,7 @@ class SparkClassificationRepository:
         return {
             int(row.issue_number): Classification(
                 issue_number=int(row.issue_number),
-                issue_type=IssueType(str(row.issue_type)),
+                issue_type=IssueType.parse(row.issue_type),
                 severity=Severity(str(row.severity)),
                 area_keys=tuple(row.area_keys or ()),
                 component_labels=tuple(row.component_labels or ()),
@@ -79,7 +75,7 @@ class SparkClassificationRepository:
         rows = [
             {
                 "issue_number": item.issue_number,
-                "issue_type": item.issue_type.value,
+                "issue_type": item.issue_type.label,
                 "severity": item.severity.value,
                 "area_keys": list(item.area_keys),
                 "component_labels": list(item.component_labels),
@@ -131,8 +127,9 @@ class SparkScoreSink:
                     "issue_number": issue.number,
                     "title": issue.title,
                     "url": issue.url,
-                    "issue_type": issue.issue_type.value,
+                    "issue_type": issue.issue_type.label,
                     "severity": issue.severity.value,
+                    "classification_reasoning": issue.classification_reasoning,
                     "score": float(result.score),
                     "upvote_count": issue.upvote_count,
                     "duplicate_count": issue.duplicate_count,
@@ -247,33 +244,6 @@ class SparkBotStateRepository:
             WHEN MATCHED THEN UPDATE SET *
             WHEN NOT MATCHED THEN INSERT *"""
         )
-
-
-def serving_endpoint_classifier(
-    endpoint: str,
-    areas: AreaCatalog,
-    workspace: WorkspaceClient | None = None,
-) -> PromptClassifier:
-    if not endpoint:
-        raise ValueError("model_endpoint is required when issue classifications are missing")
-    workspace = workspace or WorkspaceClient()
-
-    def query(prompt: str) -> str:
-        response = workspace.serving_endpoints.query(
-            endpoint,
-            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-            max_tokens=2048,
-        )
-        if not response.choices:
-            raise RuntimeError("model endpoint returned no choices")
-        choice = response.choices[0]
-        if choice.message and choice.message.content:
-            return choice.message.content
-        if choice.text:
-            return choice.text
-        raise RuntimeError("model endpoint returned an empty response")
-
-    return PromptClassifier(query, areas)
 
 
 def _table(value: str) -> str:

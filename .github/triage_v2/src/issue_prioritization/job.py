@@ -11,7 +11,6 @@ from issue_prioritization.databricks_io import (
     SparkIssueSource,
     SparkScoreSink,
     VolumeArtifactSink,
-    serving_endpoint_classifier,
 )
 from issue_prioritization.github import (
     GitHubClient,
@@ -19,6 +18,7 @@ from issue_prioritization.github import (
     GitHubMutationSink,
 )
 from issue_prioritization.labels import LabelManifest
+from issue_prioritization.model_serving import serving_endpoint_classifier
 from issue_prioritization.mutations import MutationPlanner
 from issue_prioritization.pipeline import IssuePrioritizationPipeline, PipelineMode
 from issue_prioritization.scoring import ScoreEngine

@@ -813,3 +813,65 @@ jobs:
             /tmp/triage_result.json
           retention-days: 7
           if-no-files-found: ignore
+
+  prioritize-v2:
+    name: Prioritize new issue with v2
+    needs: triage
+    if: >-
+      needs.triage.result == 'success' &&
+      github.event_name == 'issues' &&
+      github.event.action == 'opened' &&
+      vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' &&
+      !endsWith(github.event.issue.user.login, '[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+
+      - name: Grade and apply labels
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          DATABRICKS_AUTH_TYPE: oauth-m2m
+          GITHUB_TOKEN: ${{ github.token }}
+          MODEL_ENDPOINT: ${{ vars.ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${DATABRICKS_HOST:?Set the DATABRICKS_HOST repository secret}"
+          : "${DATABRICKS_CLIENT_ID:?Set the DATABRICKS_CLIENT_ID repository secret}"
+          : "${DATABRICKS_CLIENT_SECRET:?Set the DATABRICKS_CLIENT_SECRET repository secret}"
+          : "${MODEL_ENDPOINT:?Set the ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT repository variable}"
+          uv run --frozen --project .github/triage_v2 issue-priority-event \
+            --issue-number "${{ github.event.issue.number }}" \
+            --github-repo "${{ github.repository }}" \
+            --model-endpoint "$MODEL_ENDPOINT" \
+            --areas .github/areas.json \
+            --label-manifest .github/issue-prioritization-labels.json \
+            --maintainers .github/MAINTAINER \
+            --output-dir /tmp/issue-priority-v2 \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --source-revision "${{ github.sha }}" \
+            --mode apply
+
+      - name: Upload decision artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: issue-priority-v2-${{ github.event.issue.number }}-${{ github.run_id }}
+          path: /tmp/issue-priority-v2
+          retention-days: 30
+          if-no-files-found: warn

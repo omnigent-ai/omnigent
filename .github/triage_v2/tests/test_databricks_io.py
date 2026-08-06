@@ -13,9 +13,9 @@ from issue_prioritization.config import ScoringConfig
 from issue_prioritization.databricks_io import (
     VolumeArtifactSink,
     latest_scores_view_sql,
-    serving_endpoint_classifier,
 )
 from issue_prioritization.domain import IssueType
+from issue_prioritization.model_serving import serving_endpoint_classifier
 from issue_prioritization.mutations import BotState, MutationPlan, MutationTarget
 from issue_prioritization.pipeline import PipelineMode, PipelineRun
 

@@ -52,6 +52,7 @@ def _manifest() -> LabelManifest:
         labels=(
             LabelDefinition("severity:S1", "000000", ""),
             LabelDefinition("severity:S2", "000000", ""),
+            LabelDefinition("severity:S3", "000000", ""),
             LabelDefinition("comp:db", "000000", ""),
             LabelDefinition("comp:server", "000000", ""),
         )
@@ -96,6 +97,38 @@ def test_apply_preserves_human_priority_changed_after_dry_run() -> None:
 
     assert client.applied == []
     assert states.updated == []
+
+
+def test_apply_can_recompute_target_from_live_labels() -> None:
+    states = FakeStates({})
+    manifest = _manifest()
+    planner = MutationPlanner(manifest, states)
+    proposed = MutationPlan(
+        MutationTarget(1, "P1-high", "severity:S1", ("comp:db",)),
+        (),
+        (),
+        (),
+        BotState(1, None, None, ()),
+    )
+    run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, (proposed,))
+    client = FakeClient()
+    client.labels = ("severity:S3",)
+
+    plans = GitHubMutationSink(
+        client,
+        manifest,
+        planner,
+        states,
+        target_resolver=lambda target, labels, state: MutationTarget(
+            target.issue_number,
+            "P3-low",
+            "severity:S3",
+            target.components,
+        ),
+    ).apply_with_plans(run)
+
+    assert plans[0].target.priority == "P3-low"
+    assert client.applied == [(1, ("P3-low", "comp:db"), ())]
 
 
 def test_apply_preserves_human_label_removals_after_dry_run() -> None:
@@ -181,3 +214,35 @@ def test_legacy_priority_uses_the_latest_label_actor() -> None:
         client,
         {"github-actions[bot]"},
     ).is_bot_owned(1, "P2-medium")
+
+
+def test_client_loads_a_live_open_issue() -> None:
+    payload = {
+        "number": 7,
+        "title": "Session fails",
+        "body": "Cannot start a session",
+        "html_url": "https://github.com/org/repo/issues/7",
+        "user": {"login": "community"},
+        "labels": [{"name": "bug"}],
+        "created_at": "2026-08-06T00:00:00Z",
+        "reactions": {"+1": 3},
+        "state": "open",
+    }
+    client = GitHubClient("token", "org/repo", lambda method, path, body: payload)
+
+    issue = client.open_issue(7)
+
+    assert issue is not None
+    assert issue.number == 7
+    assert issue.author == "community"
+    assert issue.labels == ("bug",)
+    assert issue.upvote_count == 3
+
+
+def test_client_ignores_closed_issues_and_pull_requests() -> None:
+    payload = {"state": "closed"}
+    client = GitHubClient("token", "org/repo", lambda method, path, body: payload)
+    assert client.open_issue(7) is None
+
+    payload = {"state": "open", "pull_request": {}}
+    assert client.open_issue(7) is None

@@ -12,6 +12,7 @@ dependencies = ["databricks-sdk>=0.56.0,<1"]
 [project.scripts]
 issue-priority = "issue_prioritization.cli:main"
 issue-priority-dashboard-draft = "issue_prioritization.dashboard:main"
+issue-priority-event = "issue_prioritization.event:main"
 issue-priority-job = "issue_prioritization.job:main"
 
 [dependency-groups]

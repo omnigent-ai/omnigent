@@ -54,6 +54,7 @@ def test_dry_run_artifacts_are_complete_and_deterministic(tmp_path) -> None:
     ranking = json.loads((first / "ranking.json").read_text())
     assert ranking[0]["upvote_count"] == 3
     assert ranking[0]["duplicate_count"] == 2
+    assert ranking[1]["type"] == "Feature"
 
 
 def test_cli_writes_review_artifacts_without_network(tmp_path) -> None:

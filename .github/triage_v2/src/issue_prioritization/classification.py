@@ -121,14 +121,7 @@ def _parse_json_object(value: str) -> Mapping[str, object]:
 
 
 def _issue_type(value: object) -> IssueType:
-    normalized = str(value).lower()
-    if normalized == "bug":
-        return IssueType.BUG
-    if normalized in {"feature", "enhancement"}:
-        return IssueType.ENHANCEMENT
-    if normalized in {"docs", "documentation"}:
-        return IssueType.DOCUMENTATION
-    raise ValueError(f"unsupported classifier type: {value!r}")
+    return IssueType.parse(value)
 
 
 def _labeled_issue_type(labels: tuple[str, ...]) -> IssueType | None:

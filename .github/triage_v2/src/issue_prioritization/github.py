@@ -7,8 +7,15 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.labels import LabelManifest
-from issue_prioritization.mutations import BotStateRepository, MutationPlanner
+from issue_prioritization.mutations import (
+    BotState,
+    BotStateRepository,
+    MutationPlan,
+    MutationPlanner,
+    MutationTarget,
+)
 from issue_prioritization.pipeline import PipelineRun
 
 
@@ -63,6 +70,14 @@ class GitHubClient:
         return tuple(
             str(label["name"]) for label in labels if isinstance(label, dict) and label.get("name")
         )
+
+    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+        value = self.transport("GET", f"/issues/{issue_number}", None)
+        if not isinstance(value, dict):
+            raise ValueError("GitHub issue response must be an object")
+        if value.get("state") != "open" or "pull_request" in value:
+            return None
+        return BronzeIssue.from_mapping(value)
 
     def apply_labels(
         self,
@@ -169,16 +184,24 @@ class GitHubMutationSink:
         manifest: LabelManifest,
         planner: MutationPlanner,
         states: BotStateRepository,
+        target_resolver: (
+            Callable[[MutationTarget, tuple[str, ...], BotState | None], MutationTarget] | None
+        ) = None,
     ) -> None:
         self.client = client
         self.manifest = manifest
         self.planner = planner
         self.states = states
+        self.target_resolver = target_resolver
 
     def apply(self, run: PipelineRun) -> None:
+        self.apply_with_plans(run)
+
+    def apply_with_plans(self, run: PipelineRun) -> tuple[MutationPlan, ...]:
         self.client.sync_missing_labels(self.manifest)
         states = self.states.load()
         updated = []
+        applied = []
         try:
             for proposed in run.mutations:
                 issue_number = proposed.target.issue_number
@@ -188,13 +211,13 @@ class GitHubMutationSink:
                     current_labels,
                     states.get(issue_number),
                 )
-                plan = self.planner.plan_one(
-                    proposed.target,
-                    current_labels,
-                    state,
-                )
+                target = proposed.target
+                if self.target_resolver is not None:
+                    target = self.target_resolver(target, current_labels, state)
+                plan = self.planner.plan_one(target, current_labels, state)
                 if plan.labels_add or plan.labels_remove:
                     self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
+                applied.append(plan)
                 previous = states.get(issue_number)
                 if plan.next_state != previous and (
                     previous is not None or plan.next_state.has_ownership
@@ -203,3 +226,4 @@ class GitHubMutationSink:
                 states[issue_number] = plan.next_state
         finally:
             self.states.upsert(updated)
+        return tuple(applied)

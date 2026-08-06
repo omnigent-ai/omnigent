@@ -24,6 +24,58 @@ but disabled by default. Duplicate reach is also disabled until the upstream
 triage pipeline exposes confirmed duplicate links as structured data. Community
 demand counts GitHub `+1` reactions only, not all reaction types.
 
+## New-issue grading
+
+When `ISSUE_PRIORITIZATION_V2_ENABLED=true`, the existing Issue Triage workflow
+runs v2 after intake for each new community issue. It calls the configured model
+serving endpoint, applies severity, component, and priority labels, and uploads
+a 30-day decision artifact. The periodic Databricks job remains responsible for
+the complete ranking and dashboard; the issue-open path does not wait for it.
+
+Configure these repository settings before enabling the switch:
+
+| Setting | Kind | Purpose |
+| --- | --- | --- |
+| `DATABRICKS_HOST` | Secret | Workspace URL containing the serving endpoint. |
+| `DATABRICKS_CLIENT_ID` | Secret | OAuth service-principal client ID. |
+| `DATABRICKS_CLIENT_SECRET` | Secret | OAuth service-principal secret. |
+| `ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT` | Variable | Endpoint name, such as `databricks-gpt-5-6-luna`. |
+| `ISSUE_PRIORITIZATION_V2_ENABLED` | Variable | Set to `true` only after the other settings are ready. |
+
+The service principal needs `CAN QUERY` on the endpoint. GitHub supplies the
+issue-write token automatically; no GitHub PAT is stored in Actions. Enable v2
+last:
+
+```bash
+gh secret set DATABRICKS_HOST --repo omnigent-ai/omnigent
+gh secret set DATABRICKS_CLIENT_ID --repo omnigent-ai/omnigent
+gh secret set DATABRICKS_CLIENT_SECRET --repo omnigent-ai/omnigent
+gh variable set ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT \
+  --repo omnigent-ai/omnigent --body databricks-gpt-5-6-luna
+gh variable set ISSUE_PRIORITIZATION_V2_ENABLED \
+  --repo omnigent-ai/omnigent --body true
+```
+
+For a no-write check, export the same Databricks credentials plus
+`GITHUB_TOKEN`, then run:
+
+```bash
+uv run --frozen --project .github/triage_v2 issue-priority-event \
+  --issue-number 2125 \
+  --github-repo omnigent-ai/omnigent \
+  --model-endpoint databricks-gpt-5-6-luna \
+  --areas .github/areas.json \
+  --label-manifest .github/issue-prioritization-labels.json \
+  --maintainers .github/MAINTAINER \
+  --output-dir /tmp/issue-priority-v2 \
+  --run-id local-2125 \
+  --mode dry_run
+```
+
+The output includes the classification, score breakdown, proposed mutations,
+prompt input hash, and model endpoint, so a later Databricks importer can
+consume it without changing the event path.
+
 ## Databricks dry-run
 
 The bundle defines a paused six-hour job. Manual runs default to `mode=dry_run`:
@@ -101,9 +153,11 @@ Keep the write variable false until a dry-run's `ranking.*` and
 `mutations.json` artifacts have been reviewed. Apply mode also creates any
 missing labels declared in `.github/issue-prioritization-labels.json`.
 
-At rollout, set the repository variable `ISSUE_PRIORITIZATION_V2_ENABLED=true`
-at the same time as enabling this job. That stops the legacy issue-triage action
-from writing priority or component labels, so Databricks is the only owner.
+The same repository switch stops legacy intake from writing priority or
+component labels. New-issue v2 becomes their owner, and Databricks runs remain
+available for ranking and backfills. Event ownership is recorded in
+`event.json`, but periodic apply runs preserve those labels until an artifact
+importer shares that ownership with `issue_bot_state`.
 
 ## Tests
 
