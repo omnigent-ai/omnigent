@@ -477,6 +477,68 @@ describe("chatStore — switchTo", () => {
     expect(fetchMock.mock.calls.length).toBe(callsAfterB);
   });
 
+  it("commits a message sent in a backgrounded conversation, in transcript order", async () => {
+    // End-to-end version of the interleaving regression, through the real pump.
+    //
+    // The renderer appends `pendingUserMessages` AFTER committed `blocks`
+    // (ChatPage's `mergePendingBubbles`), so an optimistic bubble is always
+    // visually last. That is correct while it is in flight, and becomes a bug if
+    // it never commits: `session.input.consumed` is the ONLY thing that promotes
+    // it into `blocks`. Drop that event for a background conversation and the
+    // user message stays pinned below assistant output that arrived after it —
+    // which reads as scrambled ordering when the user switches back.
+    const sink = pushableStream();
+    seedSession("conv_bgsend", []);
+    seedSession("conv_other", []);
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_bgsend/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_bgsend");
+    await useChatStore.getState().send("hello from bg", "agent_xyz");
+    // Optimistic bubble is pending: nothing committed yet.
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+
+    // The user navigates away; conv_bgsend keeps its stream.
+    await useChatStore.getState().switchTo("conv_other");
+
+    // The runner commits the message, then streams its reply — the order the
+    // user should see on return.
+    sink.push(
+      sse("session.input.consumed", {
+        // Nested envelope, as the server sends it (see `parseEvent`).
+        data: {
+          item_id: "item_bg_user",
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "hello from bg" }] },
+        },
+      }),
+    );
+    sink.push(sse("response.created", { id: "resp_bg", status: "in_progress", output: [] }));
+    // Past the reducer's flush threshold so the text lands as a block.
+    sink.push(sse("response.output_text.delta", { delta: `${"z".repeat(34)} ` }));
+    await tick();
+    await tick();
+
+    // Back to the backgrounded conversation.
+    await useChatStore.getState().switchTo("conv_bgsend");
+    const state = useChatStore.getState();
+
+    // The bubble was promoted, so nothing trails the transcript...
+    expect(state.pendingUserMessages).toEqual([]);
+    // ...and the user message sits BEFORE the assistant reply that followed it.
+    const kinds = state.blocks.map((b) => b.type);
+    expect(kinds[0]).toBe("user_message");
+    expect(state.blocks[0]!.ctx.itemId).toBe("item_bg_user");
+    expect(kinds.slice(1)).not.toContain("user_message");
+
+    sink.close();
+  });
+
   it("does not abort a conversation's stream when switching away", async () => {
     // Hold conv_a's stream open so the pump doesn't exit and clear its
     // controller (the default mock closes immediately, which reads as a
@@ -4238,45 +4300,63 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   describe("routing by delivering stream", () => {
     // Events are routed by the stream that delivered them, not by their
     // payload: `session.input.consumed`, `session.interrupted` and others carry
-    // no conversation id at all, so their contents cannot say where they
-    // belong. Once background streams stay open, a write that ignores its
-    // source paints a conversation the user is not looking at onto the one they
-    // are. These cases pass an explicit source id — what `tapSessionEvents`
-    // supplies in production — and assert the visible conversation is untouched.
+    // no conversation id at all, so their contents cannot say where they belong.
+    //
+    // Each case asserts BOTH halves of that contract — the background
+    // conversation receives the event, and the visible one is untouched.
+    // Asserting only the second half is what let a bug through: a gate that
+    // dropped every background write also left the visible conversation
+    // untouched, so those events vanished (a user bubble whose consumed event
+    // was dropped never committed, and stayed pinned below the assistant output
+    // that arrived after it).
+    let bg: ReturnType<typeof bindConversationForTest>;
+
     beforeEach(() => {
-      useChatStore.setState({ conversationId: "conv_visible" });
+      // Bind conv_bg first, then conv_visible — so conv_bg is live in the
+      // registry but backgrounded, exactly as after a switch.
+      bg = bindConversationForTest("conv_bg");
+      bindConversationForTest("conv_visible");
     });
 
-    it("drops a status patch delivered by a background conversation's stream", () => {
+    it("applies a status patch to the background conversation, not the visible one", () => {
       useChatStore.setState({ sessionStatus: "idle", status: "idle" });
       handleSessionEvent(
         { type: "session_status", conversationId: "conv_bg", status: "running" },
         "conv_bg",
       );
-      // The visible conversation is idle and must stay idle — otherwise a
-      // background agent's turn lights up this conversation's "Working…".
+      // conv_bg's own turn lifecycle advances...
+      expect(bg.get().sessionStatus).toBe("running");
+      // ...while the visible conversation stays idle: a background agent's turn
+      // must not light up this conversation's "Working…".
       expect(useChatStore.getState().sessionStatus).toBe("idle");
       expect(useChatStore.getState().status).toBe("idle");
     });
 
-    it("drops a todo list delivered by a background conversation's stream", () => {
+    it("applies a todo list to the background conversation, not the visible one", () => {
       useChatStore.setState({ todos: [] });
-      handleSessionEvent(
-        {
-          type: "session_todos",
-          conversationId: "conv_bg",
-          todos: [{ content: "bg work", status: "in_progress", activeForm: "Doing bg work" }],
-        },
-        "conv_bg",
-      );
+      const todos = [
+        { content: "bg work", status: "in_progress" as const, activeForm: "Doing bg work" },
+      ];
+      handleSessionEvent({ type: "session_todos", conversationId: "conv_bg", todos }, "conv_bg");
+      expect(bg.get().todos).toEqual(todos);
       expect(useChatStore.getState().todos).toEqual([]);
     });
 
-    it("drops a consumed-input bubble delivered by a background stream", () => {
-      // `session.input.consumed` carries NO conversation id, so the delivering
-      // stream is the only thing that can route it. Unrouted, a background
-      // conversation's committed message would append to this transcript.
+    it("commits a background conversation's consumed input onto its own transcript", () => {
+      // The regression this covers: `session.input.consumed` is the ONLY thing
+      // that promotes an optimistic user bubble into committed `blocks`. Drop it
+      // for a background conversation and the bubble never commits — it renders
+      // as a permanent trailing bubble, below assistant output that arrived
+      // after it, which reads as scrambled message ordering on return.
+      bindConversationForTest("conv_bg", {
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_bg", content: [{ type: "input_text", text: "from background" }] },
+        ],
+      });
+      bindConversationForTest("conv_visible");
       useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
       handleSessionEvent(
         {
           type: "session_input_consumed",
@@ -4286,10 +4366,15 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         },
         "conv_bg",
       );
+
+      // Promoted on conv_bg: popped off pending, appended to its blocks.
+      expect(bg.get().pendingUserMessages).toEqual([]);
+      expect(bg.get().blocks.map((b) => b.ctx.itemId)).toEqual(["item_bg"]);
+      // The visible conversation never sees it.
       expect(useChatStore.getState().blocks).toEqual([]);
     });
 
-    it("drops a usage update delivered by a background conversation's stream", () => {
+    it("applies a usage update to the background conversation, not the visible one", () => {
       useChatStore.setState({ tokensUsed: 100, sessionCostUsd: 1 });
       handleSessionEvent(
         {
@@ -4300,20 +4385,37 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         },
         "conv_bg",
       );
+      expect(bg.get().tokensUsed).toBe(99_999);
+      expect(bg.get().sessionCostUsd).toBe(42);
       expect(useChatStore.getState().tokensUsed).toBe(100);
       expect(useChatStore.getState().sessionCostUsd).toBe(1);
     });
 
-    it("does not cancel the visible turn when a background stream reports an interrupt", () => {
+    it("cancels the background conversation's own turn, never the visible one", () => {
       // `session.interrupted` also carries no conversation id.
+      bindConversationForTest("conv_bg", {
+        activeResponse: { responseId: "resp_bg", state: "streaming", error: null },
+        interruptedResponseIds: [],
+      });
+      bindConversationForTest("conv_visible");
       useChatStore.setState({
         activeResponse: { responseId: "resp_visible", state: "streaming", error: null },
         interruptedResponseIds: [],
       });
+
       handleSessionEvent(
         { type: "session_interrupted", requestedAt: 0, responseId: "resp_bg" },
         "conv_bg",
       );
+
+      // `toMatchObject`: main's turn lifecycle also stamps `completedAt`.
+      expect(bg.get().activeResponse).toMatchObject({
+        responseId: "resp_bg",
+        state: "cancelled",
+        error: null,
+      });
+      expect(bg.get().interruptedResponseIds).toEqual(["resp_bg"]);
+      // The visible turn keeps streaming.
       expect(useChatStore.getState().activeResponse).toEqual({
         responseId: "resp_visible",
         state: "streaming",
@@ -4323,13 +4425,26 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
 
     it("still applies events delivered by the visible conversation's own stream", () => {
-      // The converse of the above: routing must not make the normal path a
-      // no-op. A guard that always dropped would pass every test above.
+      // Routing must not make the normal path a no-op — a gate that dropped
+      // everything would satisfy the "visible untouched" half of every case
+      // above. This is the positive control for the foreground path.
       handleSessionEvent(
         { type: "session_status", conversationId: "conv_visible", status: "running" },
         "conv_visible",
       );
       expect(useChatStore.getState().sessionStatus).toBe("running");
+    });
+
+    it("drops an event whose conversation has been evicted", () => {
+      // A late event for a conversation the registry has released must not
+      // resurrect its state, and must not fall through onto the visible one.
+      releaseConversation("conv_bg");
+      useChatStore.setState({ sessionStatus: "idle" });
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_bg", status: "running" },
+        "conv_bg",
+      );
+      expect(useChatStore.getState().sessionStatus).toBe("idle");
     });
   });
 });
@@ -5048,6 +5163,14 @@ describe("chatStore — tool_result does not resolve elicitations", () => {
 });
 
 describe("chatStore — elicitation_resolved", () => {
+  // These cases call `handleSessionEvent` directly, with no stream to name the
+  // delivering conversation. Bind one so the write has an entry to land on,
+  // exactly as it would in production (`elicitation_resolved` carries no
+  // conversation id, so it is routed by its delivering stream).
+  beforeEach(() => {
+    bindConversationForTest("conv_elic");
+  });
+
   function elicitationResolvedEvent(id: string): StreamEvent {
     return { type: "elicitation_resolved", elicitationId: id };
   }

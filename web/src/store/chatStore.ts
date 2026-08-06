@@ -2462,8 +2462,11 @@ async function refreshSessionBinding(id: string): Promise<void> {
   } catch {
     return;
   }
-  if (useChatStore.getState().conversationId !== id) return;
-  useChatStore.setState(sessionBindingPatch(session));
+  // Apply to the conversation this refresh was for, not whichever is on screen:
+  // an agent switch in a backgrounded conversation must still re-derive its
+  // binding (most importantly `isNativeTerminalSession`, which gates the
+  // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
+  setterFor(id)(sessionBindingPatch(session));
 }
 
 /**
@@ -4288,17 +4291,19 @@ async function refetchRunnerBackedSessionState(
     // the existing state rather than wiping it on a transient error.
     return;
   }
-  // Re-check after the await — the user may have switched conversations
-  // while the request was in flight; applying now would leak another
-  // session's capabilities into the open composer.
-  if (useChatStore.getState().conversationId !== conversationId) return;
+  // The conversation may have been backgrounded (or evicted) while the request
+  // was in flight. Runner-backed state is conversation-scoped, so apply it to
+  // the conversation it was fetched for rather than dropping it — a background
+  // session's resolved skills / model catalog must be there when the user
+  // returns. `setterForState` / `setterFor` no-op once it has been evicted.
+  const currentState = setterForState(conversationId);
+  if (currentState === null) return;
   if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
     racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
   }
-  const currentState = useChatStore.getState();
   const stickyModel = deferredNativeStickyModel(session);
   const alreadyApplied = stickyModel != null && currentState.sessionModelOverride === stickyModel;
-  const statePatch: Partial<ChatState> =
+  const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
       ? sessionBindingPatch(session)
       : {
@@ -4306,10 +4311,15 @@ async function refetchRunnerBackedSessionState(
           codexModelOptions: session.codexModelOptions ?? [],
         };
   if (stickyModel != null) {
-    statePatch.selectedModel = stickyModel;
     statePatch.sessionModelOverride = stickyModel;
+    // `selectedModel` is the cross-session sticky pick, so recover it only for
+    // the conversation on screen: a backgrounded session's delayed handoff must
+    // not overwrite a model the user has since picked elsewhere.
+    if (useChatStore.getState().conversationId === conversationId) {
+      rootSetState({ selectedModel: stickyModel });
+    }
   }
-  useChatStore.setState(statePatch);
+  setterFor(conversationId)(statePatch);
   if (stickyModel != null && !alreadyApplied) {
     updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
       (err: unknown) => {
@@ -4387,9 +4397,9 @@ function contentKeyOf(content: MessageContentBlock[]): string {
  *
  * :param event: the parsed stream event.
  * :param streamConversationId: the conversation whose stream delivered this
- *     event. Writes to conversation-scoped state are dropped unless it is the
- *     active conversation — see {@link applyToConversation}. Omit only in
- *     tests that mean "as if delivered by the active conversation's stream".
+ *     event — the conversation these writes land on, foreground or background.
+ *     See {@link applyToConversation}. Omit only in tests that mean "as if
+ *     delivered by the active conversation's stream".
  *
  * No-op for events outside the `session.*` family.
  */
@@ -4402,21 +4412,25 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
   const sourceConversationId = streamConversationId ?? useChatStore.getState().conversationId;
 
   /**
-   * Write conversation-scoped state, but only when this event's stream is the
-   * active conversation's.
+   * Write conversation-scoped state onto the conversation whose stream
+   * delivered this event — which may be a BACKGROUND one.
    *
    * Every branch below that touches `ConversationState` must go through this
-   * rather than `useChatStore.setState` directly. Once background streams stay
-   * open, an unguarded write would paint a backgrounded conversation's status,
-   * transcript, or todos onto the one the user is looking at.
+   * rather than `useChatStore.setState` directly. That setter writes the root
+   * store, which is only a projection of the conversation on screen: a
+   * background stream's writes would be dropped there (its events would vanish,
+   * leaving e.g. an optimistic user bubble that never commits), and an
+   * unguarded write would paint its status onto the visible conversation.
+   * Routing to the entry does both jobs at once — the registry mirrors the
+   * active entry back onto the root, so the visible conversation still updates.
+   *
+   * No-op when the conversation is no longer live (evicted / released), so
+   * a late event can't resurrect state for it.
    */
   const applyToConversation = (
     patch: Partial<ConversationState> | ((s: ChatState) => Partial<ConversationState>),
   ): void => {
-    useChatStore.setState((s) => {
-      if (s.conversationId !== sourceConversationId) return {};
-      return typeof patch === "function" ? patch(s) : patch;
-    });
+    setterFor(sourceConversationId)(patch);
   };
 
   /**
@@ -4425,7 +4439,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
    * Most `session.*` events carry a `conversationId`. That payload id is
    * authoritative — a session's stream can carry frames about a DIFFERENT
    * conversation (a sub-agent's, or a rotated-away session's) — so it has to
-   * agree with the active conversation as well as the delivering stream.
+   * agree with the delivering stream before the write applies.
    */
   const applyToNamedConversation = (
     namedConversationId: string,
@@ -5261,22 +5275,23 @@ async function* tapSessionEvents(
 }
 
 /**
- * Force the store's `activeResponse` into a terminal state without
- * needing a closure-scoped setter. Mirrors `finalizeActive` but
- * works from the module-scope `handleSessionEvent` boundary.
+ * Force a conversation's `activeResponse` into a terminal state without
+ * needing a closure-scoped setter. Mirrors `finalizeActive` but works from the
+ * module-scope `handleSessionEvent` boundary.
  *
  * :param conversationId: the conversation whose stream reported this, or
  *     ``null`` to target whichever is active. `activeResponse` is
- *     conversation-scoped, so a mismatch is a no-op — a backgrounded
- *     conversation's interrupt must not cancel the visible turn's bubble.
+ *     conversation-scoped, so this lands on that conversation's entry —
+ *     a background interrupt settles its OWN turn and leaves the visible
+ *     one alone.
  */
 function finalizeCurrentActive(
   state: ActiveResponse["state"],
   responseIdOverride?: string,
   conversationId?: string | null,
 ): void {
-  useChatStore.setState((s) => {
-    if (conversationId != null && s.conversationId !== conversationId) return {};
+  const target = conversationId ?? useChatStore.getState().conversationId;
+  setterFor(target)((s) => {
     if (s.activeResponse === null && responseIdOverride === undefined) return {};
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
