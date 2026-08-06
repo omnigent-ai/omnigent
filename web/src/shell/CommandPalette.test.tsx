@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useRef, useState } from "react";
 import type { ComponentProps } from "react";
 
+import { onComposerFocusRequest, useComposerFocusRequests } from "@/lib/composerFocus";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -347,5 +349,124 @@ describe("CommandPalette — empty state", () => {
     });
 
     expect(screen.getByText("No results found")).toBeTruthy();
+  });
+});
+
+// The palette's focus trap outlives the navigation a selection triggers: it
+// holds until the close animation ends, so a destination that focuses its
+// composer on mount has that focus pulled back and then dropped on <body>.
+// The palette therefore hands focus over itself, once it is actually gone.
+describe("CommandPalette — focus hand-off", () => {
+  /** Stands in for a destination page: mounts on navigate, focuses its
+      composer the way the real landing screen and in-session composer do. */
+  function Destination() {
+    const ref = useRef<HTMLTextAreaElement>(null);
+    useComposerFocusRequests(ref);
+    return <textarea ref={ref} autoFocus data-testid="destination-composer" />;
+  }
+
+  function Harness() {
+    const [open, setOpen] = useState(false);
+    const [navigated, setNavigated] = useState(false);
+    navigate.mockImplementation(() => setNavigated(true));
+    return (
+      <>
+        {navigated ? (
+          <div key="destination">
+            <Destination />
+          </div>
+        ) : (
+          <section key="origin">
+            <textarea data-testid="origin-composer" />
+          </section>
+        )}
+        {/* Stands in for the ⌘K hotkey: Radix pins its restore target when the
+            palette opens, so the origin composer must already hold focus. */}
+        <button type="button" data-testid="open-palette" onClick={() => setOpen(true)}>
+          open
+        </button>
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  /** Radix releases the focus trap a macrotask after the palette unmounts. */
+  async function settle(): Promise<void> {
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+  }
+
+  /** Render with the caret in a composer, then open the palette over it. */
+  async function openOverComposer(): Promise<HTMLElement> {
+    render(<Harness />);
+    const origin = screen.getByTestId("origin-composer");
+    origin.focus();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("open-palette"));
+    });
+    return origin;
+  }
+
+  async function selectAndSettle(label: string): Promise<void> {
+    await openOverComposer();
+    await act(async () => {
+      fireEvent.click(screen.getByText(label));
+    });
+    await settle();
+  }
+
+  it("leaves the caret in the new-session composer after New chat", async () => {
+    await selectAndSettle("New chat");
+
+    expect(navigate).toHaveBeenCalledWith("/");
+    expect(document.activeElement).toBe(screen.getByTestId("destination-composer"));
+  });
+
+  it("leaves the caret in the composer after switching sessions", async () => {
+    setSessions([conv("c1", "Fix the parser")]);
+    await selectAndSettle("Fix the parser");
+
+    expect(navigate).toHaveBeenCalledWith("/c/c1");
+    expect(document.activeElement).toBe(screen.getByTestId("destination-composer"));
+  });
+
+  it("does not grab focus when dismissed without selecting", async () => {
+    const requested = vi.fn();
+    const off = onComposerFocusRequest(requested);
+    await openOverComposer();
+
+    await act(async () => {
+      fireEvent.keyDown(document, { key: "Escape" });
+    });
+    await settle();
+    off();
+
+    // Cancelling is not navigation: Radix's own restore stands, and no
+    // composer is yanked into focus behind the user's back.
+    expect(navigate).not.toHaveBeenCalled();
+    expect(requested).not.toHaveBeenCalled();
+  });
+
+  it("does not grab focus for the non-navigating sidebar toggles", async () => {
+    const requested = vi.fn();
+    const off = onComposerFocusRequest(requested);
+    await openOverComposer();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Toggle conversations sidebar"));
+    });
+    await settle();
+    off();
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(requested).not.toHaveBeenCalled();
   });
 });

@@ -17,7 +17,7 @@
 // groups react to the same input.
 
 import type React from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -29,6 +29,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
+import { requestComposerFocus } from "@/lib/composerFocus";
 import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
@@ -60,6 +61,9 @@ interface ActionCommand {
   icon: LucideIcon;
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
+  /** True when running this leaves the page. The destination claims focus as
+      it mounts, so the palette must not restore focus when it closes. */
+  navigates?: boolean;
   run: () => void;
 }
 
@@ -131,6 +135,7 @@ export function CommandPalette({
         label: "New chat",
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
+        navigates: true,
         run: () => navigate("/"),
       },
       {
@@ -138,6 +143,7 @@ export function CommandPalette({
         label: "Go to Inbox",
         icon: InboxIcon,
         keywords: ["notifications", "comments", "needs response"],
+        navigates: true,
         run: () => navigate("/inbox"),
       },
       {
@@ -145,6 +151,7 @@ export function CommandPalette({
         label: "Go to Automations",
         icon: CalendarClockIcon,
         keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
+        navigates: true,
         run: () => navigate("/tasks"),
       },
       {
@@ -152,6 +159,7 @@ export function CommandPalette({
         label: "Go to Settings",
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
+        navigates: true,
         run: () => navigate("/settings"),
       },
       {
@@ -210,12 +218,24 @@ export function CommandPalette({
     return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
   }, [data, debouncedQuery]);
 
+  // A navigating selection hands the page over to a destination that focuses
+  // its own composer as it mounts — but the palette's focus trap is still up
+  // (it holds until the close animation ends) and pulls that focus straight
+  // back, then drops it on `<body>` as the palette unmounts. So the destination
+  // can't win the race: the palette hands focus over once it is actually gone.
+  // Only for selections — a plain dismiss (Escape, overlay click) doesn't
+  // navigate, so it keeps Radix's own restore and never yanks the caret into a
+  // composer the user didn't ask for.
+  const handedOffRef = useRef(false);
+
   const runAction = (action: ActionCommand): void => {
+    handedOffRef.current = action.navigates === true;
     close();
     action.run();
   };
 
   const goToSession = (id: string): void => {
+    handedOffRef.current = true;
     close();
     navigate(`/c/${id}`);
   };
@@ -249,6 +269,14 @@ export function CommandPalette({
             : undefined
         }
         showCloseButton={false}
+        onCloseAutoFocus={(e) => {
+          if (!handedOffRef.current) return;
+          handedOffRef.current = false;
+          // The pre-open element is gone with the old page; focus the
+          // destination's composer instead of Radix's stale restore target.
+          e.preventDefault();
+          requestComposerFocus();
+        }}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions

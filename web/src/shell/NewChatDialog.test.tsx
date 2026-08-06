@@ -6,7 +6,7 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { Link, MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
@@ -28,6 +28,7 @@ import {
   resetLandingDraft,
 } from "./NewChatDialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { requestComposerFocus } from "@/lib/composerFocus";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import {
@@ -761,11 +762,8 @@ function setupLandingMocks() {
   ]);
 }
 
-function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
-  const info: ServerInfo = {
+function landingServerInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return {
     accounts_enabled: false,
     single_user: false,
     login_url: null,
@@ -781,13 +779,20 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     // gateway-gating cases below were written against (off-gateway family → no
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
-    smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
-    features: { harness_install: infoOverrides.harness_install_enabled === true },
+    smart_routing_sources: { external: overrides.smart_routing_enabled === true, oss: false },
+    features: { harness_install: overrides.harness_install_enabled === true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
-    ...infoOverrides,
+    ...overrides,
   };
+}
+
+function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const info = landingServerInfo(infoOverrides);
   return render(
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
@@ -5264,5 +5269,63 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Smart Routing",
     );
+  });
+});
+
+// The landing screen is where a new prompt gets typed, so it must arrive
+// ready for the keyboard however the user got here — sidebar link, command
+// palette, the per-project pencil, or a pasted URL.
+describe("NewChatLandingScreen composer focus", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    resetLandingDraft();
+    localStorage.clear();
+  });
+
+  it("focuses the composer on arrival", () => {
+    renderLanding();
+
+    expect(document.activeElement).toBe(screen.getByTestId("new-chat-landing-input"));
+  });
+
+  it("takes focus when a closing overlay hands it back", () => {
+    renderLanding();
+    // A dialog that navigated here holds its focus trap until its close
+    // animation ends, so it steals the mount focus and hands it over after.
+    const box = screen.getByTestId("new-chat-landing-input");
+    (document.activeElement as HTMLElement).blur();
+    expect(document.activeElement).not.toBe(box);
+
+    act(() => requestComposerFocus());
+
+    expect(document.activeElement).toBe(box);
+  });
+
+  it("re-focuses the composer when the project pencil switches it in place", () => {
+    // The `?project=` pencils navigate without unmounting the screen, so the
+    // textarea's mount-only autoFocus never re-fires.
+    render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <CapabilitiesProvider info={landingServerInfo()}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/?project=alpha"]}>
+              <Link to="/?project=beta" data-testid="beta-pencil">
+                beta
+              </Link>
+              <NewChatLandingScreen />
+            </MemoryRouter>
+          </TooltipProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+    const box = screen.getByTestId("new-chat-landing-input");
+    (document.activeElement as HTMLElement).blur();
+
+    fireEvent.click(screen.getByTestId("beta-pencil"));
+
+    expect(document.activeElement).toBe(box);
   });
 });
