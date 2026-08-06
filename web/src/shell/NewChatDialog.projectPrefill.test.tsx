@@ -373,4 +373,24 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(git.branch_name).toBe("feature/x");
     expect(git.base_branch).toBeUndefined();
   });
+
+  it("does not fork-fresh when the project config supplies its own workspace", async () => {
+    // The config seeds its own workspace (MAIN_REPO) even though a default base
+    // branch is set and the recent path is a linked worktree. The fork-fresh
+    // redirect must NOT hijack that into a worktree launch: the auto-seed is a
+    // no-op on a non-empty field, so no branch is generated and the session
+    // starts plainly in the configured directory.
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
+    setWorktreeRepo();
+    setProjectConfig({ host_id: "host_1", workspace: MAIN_REPO, base_branch: "develop" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("gamma"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(MAIN_REPO);
+    // Plain launch — no worktree fork was manufactured from the config workspace.
+    expect(body.git).toBeUndefined();
+  });
 });
