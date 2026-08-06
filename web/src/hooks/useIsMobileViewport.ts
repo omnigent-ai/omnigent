@@ -6,23 +6,11 @@
 // `max-md` side of that line to component logic that can't be expressed in
 // CSS alone (e.g. swapping a hover flyout for an in-place page on touch).
 
-import { useSyncExternalStore } from "react";
+import { useMediaQuery } from "./useMediaQuery";
 
 // Mirror Tailwind's `max-md` variant exactly so this hook stays in lockstep
 // with the `max-md:` / `md:` classes already used across the shell.
 const MOBILE_QUERY = "(max-width: 767.98px)";
-
-function subscribe(callback: () => void): () => void {
-  if (typeof window === "undefined" || !window.matchMedia) return () => {};
-  const mql = window.matchMedia(MOBILE_QUERY);
-  mql.addEventListener("change", callback);
-  return () => mql.removeEventListener("change", callback);
-}
-
-function getSnapshot(): boolean {
-  if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia(MOBILE_QUERY).matches;
-}
 
 /**
  * True when the viewport is narrower than Tailwind's `md` breakpoint (768px)
@@ -31,5 +19,5 @@ function getSnapshot(): boolean {
  * (returns `false` on the server, matching `initialSidebarOpen`).
  */
 export function useIsMobileViewport(): boolean {
-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
+  return useMediaQuery(MOBILE_QUERY);
 }

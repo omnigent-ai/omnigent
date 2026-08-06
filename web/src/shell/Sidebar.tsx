@@ -60,7 +60,6 @@ import {
   MeasuringStrategy,
   MouseSensor,
   pointerWithin,
-  TouchSensor,
   useDraggable,
   useDroppable,
   useSensor,
@@ -149,10 +148,19 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
+import { useCoarsePointer } from "@/hooks/useCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import {
+  finishActiveRowGesture,
+  ROW_MENU_SYNTHETIC,
+  ROW_SWIPE_COMMIT_PX,
+  RowGestureTouchSensor,
+  useRowGesture,
+} from "@/hooks/useRowGesture";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
@@ -187,6 +195,8 @@ const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover
 const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
+// Shared sizing for the sidebar's dropdown / context menus so they can't drift.
+const SIDEBAR_MENU_CONTENT_CLASS = "min-w-40";
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -1066,6 +1076,10 @@ function ProjectFolder({
     data: { type: "project", name },
   });
 
+  // One set of rename / settings / delete dialogs, driven by both the header
+  // kebab and the header's right-click / long-press context menu.
+  const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(name, projectId);
+
   return (
     <div
       ref={setNodeRef}
@@ -1099,7 +1113,17 @@ function ProjectFolder({
         emptyMessage={loadingFirstPage ? undefined : "No sessions"}
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} projectId={projectId} onNavigate={onRowClick} />
+          <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
+        }
+        headerContextMenu={
+          <ContextMenuContent className={SIDEBAR_MENU_CONTENT_CLASS}>
+            <ProjectFolderMenuItems
+              components={contextBundle}
+              projectName={name}
+              onNavigate={onRowClick}
+              actions={menuActions}
+            />
+          </ContextMenuContent>
         }
         footer={
           loadingFirstPage ? (
@@ -1115,6 +1139,7 @@ function ProjectFolder({
           )
         }
       />
+      {menuDialogs}
     </div>
   );
 }
@@ -1470,12 +1495,11 @@ function ConversationList({
     project: string | null;
     isPinned: boolean;
   } | null>(null);
-  // Mouse: a small drag threshold so a plain click still navigates / opens the
-  // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
-  // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
+  // Mouse keeps its click-safe distance. Touch is activated only after the row
+  // recognizer resolves a held-and-moved finger to drag.
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
+    useSensor(RowGestureTouchSensor),
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
@@ -1490,6 +1514,7 @@ function ConversationList({
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
       const dragged = activeDrag;
+      finishActiveRowGesture();
       setActiveDrag(null);
       if (!dragged) return;
       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
@@ -1717,7 +1742,10 @@ function ConversationList({
         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragCancel={() => setActiveDrag(null)}
+        onDragCancel={() => {
+          finishActiveRowGesture();
+          setActiveDrag(null);
+        }}
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
@@ -2060,6 +2088,8 @@ function SectionHeader({
   hasAction,
   collapsed,
   onToggleCollapsed,
+  contextMenu,
+  contextMenuDisabled,
 }: {
   title: string;
   icon?: ReactNode;
@@ -2070,72 +2100,135 @@ function SectionHeader({
   hasAction?: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Optional {@link ContextMenuContent} opened by right-clicking (desktop) or
+      long-pressing (touch) the header button — the folder-menu parity path.
+      Radix's own trigger supplies both gestures, so no gesture code lives here. */
+  contextMenu?: ReactNode;
+  /** Suppresses the context menu (bulk-selection mode owns the rows). */
+  contextMenuDisabled?: boolean;
 }) {
+  // A long-press opens the menu mid-gesture and its trailing click would toggle
+  // the folder; a mouse right-click or keyboard Shift+F10 leaves no such click.
+  const swallowClickRef = useRef(false);
+  // True while a pointer that could still long-press is down. The non-mouse gate
+  // and the move/up/cancel clears below mirror Radix's own long-press timer.
+  const longPressPointerRef = useRef(false);
+
+  function clearLongPressPointer() {
+    longPressPointerRef.current = false;
+  }
+
+  const button = (
+    <button
+      type="button"
+      aria-expanded={!collapsed}
+      onPointerDown={(event) => {
+        swallowClickRef.current = false;
+        longPressPointerRef.current = event.pointerType !== "mouse";
+      }}
+      onPointerMove={clearLongPressPointer}
+      onPointerUp={clearLongPressPointer}
+      onPointerCancel={clearLongPressPointer}
+      onClick={() => {
+        if (swallowClickRef.current) {
+          swallowClickRef.current = false;
+          return;
+        }
+        onToggleCollapsed();
+      }}
+      // select-none: a long-press must open the context menu, not start a
+      // native text selection of the header title. The header cannot suppress
+      // it the way session rows do (preventDefault on touch pointerdown) —
+      // that would also cancel Radix's composed long-press timer.
+      className={
+        icon
+          ? cn(
+              SIDEBAR_ROW,
+              "group flex w-full select-none items-center border-0 text-left text-foreground transition-colors",
+              SIDEBAR_HOVER_HIGHLIGHT,
+            )
+          : "group flex w-full select-none items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+      }
+    >
+      {icon ? (
+        // Headers with a leading icon (project folders) swap the folder for a
+        // chevron on desktop hover/focus, so the caret takes the icon's place
+        // rather than trailing the name. Mobile (no hover) keeps the folder
+        // icon and shows the trailing chevron below.
+        <span className="relative flex size-4 shrink-0 items-center justify-center">
+          <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+            {icon}
+          </span>
+          <ChevronRightIcon
+            className={cn(
+              "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+              !collapsed && "rotate-90",
+              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            )}
+          />
+        </span>
+      ) : null}
+      <span className="min-w-0 truncate">{title}</span>
+      {/* Trailing chevron, rotating on expand. Headers without a leading icon
+          reveal it on desktop hover/focus; icon headers show it only on mobile
+          (no hover) since desktop swaps the folder for the chevron above. */}
+      <ChevronRightIcon
+        className={cn(
+          "size-3.5 shrink-0 transition-[transform,opacity]",
+          !collapsed && "rotate-90",
+          icon
+            ? "md:hidden"
+            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+        )}
+      />
+      {/* A hidden row inside this collapsed section carries a marker — surface
+          the exact same badge a row would show, pinned to the right edge. */}
+      {collapsed && marker && (
+        <span
+          className={cn(
+            "ml-auto flex shrink-0 items-center transition-opacity",
+            // When the header also carries a hover-revealed kebab, keep the
+            // marker clear of it the same way a row's time/marker slot does:
+            // reserve space on mobile (kebab always shown) and fade out on
+            // desktop hover so the kebab takes its place.
+            hasAction &&
+              "mr-14 md:mr-0 md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
+          )}
+        >
+          <SessionStateBadge state={marker} />
+        </span>
+      )}
+    </button>
+  );
+
+  // Right-click / long-press parity with the kebab. The trigger wraps the header
+  // BUTTON only — not the section — so a nested session row keeps its own menu.
+  // Radix preventDefaults the native contextmenu and arms a 700ms touch
+  // long-press itself, so both gestures come free; no `style` prop is passed,
+  // which would clobber its WebkitTouchCallout.
   return (
     <h2>
-      <button
-        type="button"
-        aria-expanded={!collapsed}
-        onClick={onToggleCollapsed}
-        className={
-          icon
-            ? cn(
-                SIDEBAR_ROW,
-                "group flex w-full items-center border-0 text-left text-foreground transition-colors",
-                SIDEBAR_HOVER_HIGHLIGHT,
-              )
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
-        }
-      >
-        {icon ? (
-          // Headers with a leading icon (project folders) swap the folder for a
-          // chevron on desktop hover/focus, so the caret takes the icon's place
-          // rather than trailing the name. Mobile (no hover) keeps the folder
-          // icon and shows the trailing chevron below.
-          <span className="relative flex size-4 shrink-0 items-center justify-center">
-            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
-              {icon}
-            </span>
-            <ChevronRightIcon
-              className={cn(
-                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
-                !collapsed && "rotate-90",
-                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-              )}
-            />
-          </span>
-        ) : null}
-        <span className="min-w-0 truncate">{title}</span>
-        {/* Trailing chevron, rotating on expand. Headers without a leading icon
-            reveal it on desktop hover/focus; icon headers show it only on mobile
-            (no hover) since desktop swaps the folder for the chevron above. */}
-        <ChevronRightIcon
-          className={cn(
-            "size-3.5 shrink-0 transition-[transform,opacity]",
-            !collapsed && "rotate-90",
-            icon
-              ? "md:hidden"
-              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
-          )}
-        />
-        {/* A hidden row inside this collapsed section carries a marker — surface
-            the exact same badge a row would show, pinned to the right edge. */}
-        {collapsed && marker && (
-          <span
-            className={cn(
-              "ml-auto flex shrink-0 items-center transition-opacity",
-              // When the header also carries a hover-revealed kebab, keep the
-              // marker clear of it the same way a row's time/marker slot does:
-              // reserve space on mobile (kebab always shown) and fade out on
-              // desktop hover so the kebab takes its place.
-              hasAction &&
-                "mr-14 md:mr-0 md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
-            )}
-          >
-            <SessionStateBadge state={marker} />
-          </span>
-        )}
-      </button>
+      {contextMenu && !contextMenuDisabled ? (
+        <ContextMenu
+          modal={false}
+          onOpenChange={(open) => {
+            if (open) {
+              swallowClickRef.current = longPressPointerRef.current;
+              longPressPointerRef.current = false;
+            } else {
+              // A long-press's trailing click lands while the menu is open; a
+              // gesture with no trailing click (pen right-click, touch release
+              // over the menu) must not strand the swallow past the close.
+              swallowClickRef.current = false;
+            }
+          }}
+        >
+          <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
+          {contextMenu}
+        </ContextMenu>
+      ) : (
+        button
+      )}
     </h2>
   );
 }
@@ -2241,7 +2334,7 @@ function ProjectHeaderActions({
               <MoreHorizontalIcon className="size-3.5" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-40">
+          <DropdownMenuContent align="end" className={SIDEBAR_MENU_CONTENT_CLASS}>
             {/* Gated independently: each hides only when it would be a no-op, so
                 a mixed set offers both. */}
             {showExpandControls && !allExpanded && (
@@ -2341,6 +2434,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  headerContextMenu,
   afterHeader,
   footer,
   onProjectAssigned,
@@ -2367,6 +2461,10 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Optional {@link ContextMenuContent} for the header itself — the same
+      actions as `headerAction`'s kebab, reached by right-click or long-press.
+      Suppressed in selection mode, matching the session rows. */
+  headerContextMenu?: ReactNode;
   /** Optional content rendered directly under the header, above the rows (and
       shown even when collapsed) — e.g. the bulk-selection action bar. */
   afterHeader?: ReactNode;
@@ -2393,6 +2491,9 @@ function ConversationSection({
             hasAction={headerAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            contextMenu={headerContextMenu}
+            // Selection mode owns the rows, so the header menu is suppressed.
+            contextMenuDisabled={selectionMode}
           />
           {headerAction && (
             <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
@@ -2454,6 +2555,8 @@ interface MenuItemProps {
   className?: string;
   disabled?: boolean;
   variant?: "default" | "destructive";
+  // Renders the item as its child element (e.g. a router <Link>).
+  asChild?: boolean;
   // Radix's menu `onSelect` receives a native Event in both families.
   onSelect?: (event: Event) => void;
   "data-testid"?: string;
@@ -2556,6 +2659,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -2608,13 +2712,13 @@ function ConversationMenuItems({
 
   return (
     <>
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
+      {/* Pin/Unpin — desktop uses the hover-revealed quick-pin button, but a
+          coarse-pointer device has no hover at any width, so the menu keeps
+          the item there. Archived rows omit it (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
-          className="md:hidden"
+          className={hasCoarsePointer ? undefined : "md:hidden"}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -2909,6 +3013,7 @@ function ConversationRow({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useIsMobileViewport();
+  const hasCoarsePointer = useCoarsePointer();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
   // resolves — the onSuccess redirect must key off where they are now,
@@ -2921,6 +3026,7 @@ function ConversationRow({
   // session navigated to via `/c/:id`), scroll it toward the center of the
   // sidebar so it's comfortably in view rather than pinned to an edge.
   const rowRef = useRef<HTMLLIElement>(null);
+  const rowLinkRef = useRef<HTMLAnchorElement>(null);
   useEffect(() => {
     if (!isActive) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -2953,6 +3059,9 @@ function ConversationRow({
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
+  // Close the row menu directly so an armed touch never sends Escape through
+  // dnd-kit's document-level sensor listeners.
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -3044,21 +3153,82 @@ function ConversationRow({
         ? { kind: "unseen" as const }
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
 
-  // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
-  // owner-only, like the Move-to-project kebab item), outside selection /
-  // archive / rename modes. Dragging it onto a project folder files it there;
-  // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
-  // routes the drop; the row only advertises itself and its source project +
-  // pinned state via the draggable `data`.
+  // Touch swipe → archive/delete. `useSwipeActions` is a live subscription, so
+  // changing Settings updates open rows without a remount.
+  const swipeActions = useSwipeActions();
+  const swipeActionRef = useRef<(action: Exclude<SwipeAction, "none">) => void>(() => {});
+  useEffect(() => {
+    swipeActionRef.current = (action: Exclude<SwipeAction, "none">) => {
+      if (action === "archive") runArchive();
+      else setDeleteOpen(true);
+    };
+  });
+  const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
+    swipeActionRef.current(action);
+  }, []);
+  const gestureEnabled = hasCoarsePointer && !selectionMode && !isEditing;
+  const swipeEnabled = gestureEnabled && isOwner;
+  const dragEnabled = isOwner && !selectionMode && !isArchived && !isEditing;
+  const openContextMenuAt = useCallback((point: { clientX: number; clientY: number }) => {
+    const event = new globalThis.MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+      clientX: point.clientX,
+      clientY: point.clientY,
+    });
+    // Tagged so the row root can tell this dispatch apart from the OS's own
+    // long-press contextmenu, which it must suppress mid-gesture.
+    Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
+    rowLinkRef.current?.dispatchEvent(event);
+  }, []);
+  const dismissContextMenu = useCallback(() => {
+    setContextMenuOpen(false);
+  }, []);
+  const gesture = useRowGesture({
+    enabled: gestureEnabled,
+    swipeEnabled,
+    dragEnabled: hasCoarsePointer && dragEnabled,
+    actions: swipeActions,
+    onAction: onSwipeAction,
+    onLongPress: openContextMenuAt,
+    onDragStart: dismissContextMenu,
+  });
+
+  // The recognizer state travels with this draggable, so the static touch
+  // activator can make the decision for the row that received the event.
   const {
     listeners: dragListeners,
     setNodeRef: setDragNodeRef,
     isDragging,
   } = useDraggable({
     id: conversation.id,
-    data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing,
+    data: {
+      type: "session",
+      label,
+      project: currentProject,
+      isPinned,
+      rowGesture: gesture.dndData,
+    },
+    disabled: !dragEnabled,
   });
+  const rowGestureListeners = gesture.listeners(dragListeners);
+  // The menu render branches below are mutually exclusive; switching branches
+  // remounts the ContextMenu, and a stale open=true would reopen the fresh
+  // menu anchored at the viewport corner. Reset during render (not in an
+  // effect) so the remounted menu never paints open.
+  const menuBranch = selectionMode
+    ? "none"
+    : projectFlyoutName
+      ? "flyout"
+      : isMobile
+        ? "mobile"
+        : "desktop";
+  const [prevMenuBranch, setPrevMenuBranch] = useState(menuBranch);
+  if (prevMenuBranch !== menuBranch) {
+    setPrevMenuBranch(menuBranch);
+    if (contextMenuOpen) setContextMenuOpen(false);
+  }
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
   // doesn't also navigate into the session. Flagged when a drag finishes,
@@ -3220,8 +3390,23 @@ function ConversationRow({
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
     <Link
+      ref={rowLinkRef}
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      // Links are natively draggable, and Chrome Android hands a stationary
+      // long-press on one to its native drag machinery — an unconditional
+      // pointercancel that kills the row gesture. Not draggable, not claimed.
+      draggable={false}
+      // The recognizer owns touch long-press, so stop the trigger's own 700ms
+      // timer from opening a second menu mid-hold; Radix skips its handler once
+      // this event is defaultPrevented. Scoped to touch because the recognizer
+      // ignores pen, which would otherwise lose its long-press entirely.
+      onPointerDown={(e) => {
+        if (e.pointerType === "touch") e.preventDefault();
+      }}
+      onContextMenu={(e) => {
+        if (isDragging) e.preventDefault();
+      }}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
@@ -3243,8 +3428,8 @@ function ConversationRow({
       )}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
+        // Swallow the click that trails a resolved touch gesture or drag.
+        if (gesture.consumeClick() || justDraggedRef.current) {
           e.preventDefault();
           return;
         }
@@ -3287,15 +3472,114 @@ function ConversationRow({
     </Link>
   );
 
+  // The action revealed behind the row for the direction currently being
+  // swiped, and whether the drag has passed the commit point (drives the hint's
+  // icon and tint). `isSwiping` gates every bit of swipe-only markup/styling, so
+  // a row at rest renders exactly as it did before the gesture existed.
+  const swipingAction: SwipeAction =
+    gesture.dx < 0 ? swipeActions.left : gesture.dx > 0 ? swipeActions.right : "none";
+  const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
+  const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
+  // A held or dragging row owns the pointer outright, so no axis stays native.
+  const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
+
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
       ref={setRowRef}
-      {...dragListeners}
-      className={cn("group relative", isDragging && "opacity-40")}
+      {...rowGestureListeners}
+      // Android's own ~500ms long-press fires a native contextmenu even while
+      // the recognizer holds the pointer — capture retargets it to this li,
+      // bypassing Radix's trigger on the link. Unprevented it starts text
+      // selection and cancels the pointer stream, killing the pending drag.
+      // The recognizer's own tagged re-dispatch passes through.
+      onContextMenu={(e) => {
+        if (ROW_MENU_SYNTHETIC in e.nativeEvent) return;
+        if (ownsPointer || isDragging) e.preventDefault();
+      }}
+      className={cn(
+        "group relative",
+        isDragging && "opacity-40",
+        gesture.phase === "armed" && "z-10 scale-[1.01] shadow-sm",
+        // Keep vertical scrolling native while claiming the horizontal axis for
+        // the swipe: without this the browser can take the horizontal pan (or
+        // back-navigation gesture) and cancel the gesture mid-drag. Only where
+        // a swipe can actually fire, so rows without one keep default behavior.
+        swipeEnabled && !ownsPointer && "touch-pan-y",
+        ownsPointer && "touch-none",
+      )}
     >
-      {/* Right-click anywhere on the row opens the same actions as the kebab.
+      {/* Swipe reveal hint: sits behind the moving surface, showing the
+          configured action's icon on the side being revealed. Inert (no pointer
+          events) and only rendered mid-swipe, so at rest the row markup is
+          exactly what it was before the gesture existed.
+          Archive uses the accent pair (blue in both modes) rather than
+          `--primary`, which is near-black in light mode and reads as a flat grey
+          button instead of a revealed surface. Passing the commit threshold
+          deepens the tint and scales the glyph, so "will fire on release" isn't
+          carried by color alone. */}
+      {isSwiping && (
+        <div
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute inset-0 flex items-center rounded-[var(--radius-otto-sm)] px-4",
+            gesture.dx > 0 ? "justify-start" : "justify-end",
+            "transition-colors",
+            swipingAction === "delete"
+              ? swipeCommitted
+                ? "bg-destructive/20 text-destructive"
+                : "bg-destructive/10 text-destructive/70"
+              : swipeCommitted
+                ? "bg-accent text-accent-foreground"
+                : "bg-accent/50 text-accent-foreground/70",
+          )}
+        >
+          <span
+            className={cn(
+              "flex items-center transition-transform",
+              swipeCommitted ? "scale-110" : "scale-100",
+            )}
+          >
+            {swipingAction === "delete" ? (
+              <Trash2Icon className="size-4" />
+            ) : isArchived ? (
+              // Archiving toggles, so on an archived row the gesture restores —
+              // mirror the kebab's Unarchive glyph rather than promising a re-archive.
+              <ArchiveRestoreIcon className="size-4" />
+            ) : (
+              <ArchiveIcon className="size-4" />
+            )}
+          </span>
+        </div>
+      )}
+      {/* Moving surface: the WHOLE row — link, session-state badge, and the
+          pin/kebab controls — moves together, so the trailing icons travel with
+          the text instead of the text sliding out from under them.
+          It INSETS from the swiped edge rather than translating: a translate
+          would push the title past the panel boundary and cut it mid-word (the
+          hint needs ~48px of gap, but the title only has ~18px of slack). An
+          inset re-truncates the title with its existing ellipsis instead, and
+          keeps every row control inside the panel.
+          `bg-sidebar` only while mid-swipe: an unconditional background would
+          plate every row and cover the sidebar canvas. */}
+      <div
+        className={cn(
+          "relative",
+          isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
+          // Transition only at rest, so the row eases back when the gesture
+          // ends but tracks the finger 1:1 while swiping.
+          gesture.dx === 0 && "transition-[margin] duration-200",
+        )}
+        style={
+          gesture.dx !== 0
+            ? gesture.dx < 0
+              ? { marginRight: -gesture.dx }
+              : { marginLeft: gesture.dx }
+            : undefined
+        }
+      >
+        {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
@@ -3304,10 +3588,38 @@ function ConversationRow({
           hovering surfaces the project flyout — the trigger sits innermost so
           both the context menu and the hover card keep their handlers/refs on
           the Link. */}
-      {selectionMode ? (
-        projectFlyoutName ? (
+        {selectionMode ? (
+          projectFlyoutName ? (
+            <HoverCard openDelay={150} closeDelay={0}>
+              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+              <PinnedProjectFlyoutContent
+                title={conversation.title ?? conversation.id}
+                projectName={projectFlyoutName}
+                gitBranch={gitBranch}
+              />
+            </HoverCard>
+          ) : isMobile ? (
+            rowLink
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+              <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+            </Tooltip>
+          )
+        ) : projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
+              <ContextMenuTrigger asChild>
+                <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+              </ContextMenuTrigger>
+              <ContextMenuContent className="min-w-44">
+                <ConversationMenuItems
+                  components={contextBundle}
+                  setMenuOpen={() => {}}
+                  {...menuItemProps}
+                />
+              </ContextMenuContent>
+            </ContextMenu>
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
@@ -3315,162 +3627,135 @@ function ConversationRow({
             />
           </HoverCard>
         ) : isMobile ? (
-          rowLink
+          <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
+            <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44">
+              <ConversationMenuItems
+                components={contextBundle}
+                setMenuOpen={() => {}}
+                {...menuItemProps}
+              />
+            </ContextMenuContent>
+          </ContextMenu>
         ) : (
           <Tooltip>
-            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+            <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={setContextMenuOpen}>
+              <ContextMenuTrigger asChild>
+                <div className="w-full">
+                  <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+                </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent className="min-w-44">
+                <ConversationMenuItems
+                  components={contextBundle}
+                  setMenuOpen={() => {}}
+                  {...menuItemProps}
+                />
+              </ContextMenuContent>
+            </ContextMenu>
             <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
           </Tooltip>
-        )
-      ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-            gitBranch={gitBranch}
-          />
-        </HoverCard>
-      ) : isMobile ? (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      ) : (
-        <Tooltip>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <div className="w-full">
-                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-              </div>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
-        </Tooltip>
-      )}
-      {selectionMode ? (
-        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
-          {isSelected ? (
-            <SquareCheckIcon className="size-4 text-primary" />
-          ) : (
-            <SquareIcon className="size-4 text-muted-foreground" />
-          )}
-        </span>
-      ) : sessionState !== null ? (
-        <span className={SESSION_STATE_SLOT_CLASS}>
-          <SessionStateBadge state={sessionState} />
-        </span>
-      ) : null}
-      {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
-          row, so their spacing is defined once (gap-0.5) and stays aligned
-          with the project-folder header actions, which use the same pattern.
-          The kebab is the rightmost child (pinned to right-1); the pin sits a
-          gap to its left. Hidden entirely while selecting (bulk mode owns the
-          row controls). */}
-      {!selectionMode && (
-        <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
-          {/* Archived rows omit the pin entirely: pinning is meaningless there
-              (archive outranks pin), so there's no pin action even on hover. */}
-          {!isArchived && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-              data-testid="quick-pin-conversation"
-              className={cn(
-                // Desktop-only quick affordance: hidden on mobile (the kebab's
-                // Pin item below covers that), hover/focus-revealed from `md`
-                // up. Pinned rows no longer keep a persistent pin marker, since
-                // the "Pinned" section header (and pinned-first ordering inside
-                // a project) already conveys the pinned state. Revealed glyph:
-                // unpin if pinned, pin otherwise.
-                //
-                // `md:inline-flex` (not `md:block`): the Button base is
-                // `inline-flex` and relies on it for `items-center
-                // justify-center` to center the icon. `md:block` would override
-                // that display and collapse the centering, leaving the glyph
-                // pinned to the top-left of the button — so keep the flex
-                // display when revealing it.
-                "text-muted-foreground transition-opacity",
-                "hidden md:inline-flex",
-                "md:opacity-0 md:group-hover:opacity-100",
-                "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-              )}
-              onClick={(e) => {
-                // Keep the toggle click off the surrounding Link (no navigation).
-                e.preventDefault();
-                e.stopPropagation();
-                onTogglePinned(conversation.id);
-              }}
-            >
-              {isPinned ? (
-                <PinOffIcon className="size-3.5" data-icon-size="14" />
-              ) : (
-                <PinIcon className="size-3.5" data-icon-size="14" />
-              )}
-            </Button>
-          )}
-          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-            <DropdownMenuTrigger asChild>
+        )}
+        {selectionMode ? (
+          <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
+            {isSelected ? (
+              <SquareCheckIcon className="size-4 text-primary" />
+            ) : (
+              <SquareIcon className="size-4 text-muted-foreground" />
+            )}
+          </span>
+        ) : sessionState !== null ? (
+          <span className={SESSION_STATE_SLOT_CLASS}>
+            <SessionStateBadge state={sessionState} />
+          </span>
+        ) : null}
+        {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
+            row, so their spacing is defined once (gap-0.5) and stays aligned
+            with the project-folder header actions, which use the same pattern.
+            The kebab is the rightmost child (pinned to right-1); the pin sits a
+            gap to its left. Hidden entirely while selecting (bulk mode owns the
+            row controls). */}
+        {!selectionMode && (
+          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+            {/* Archived rows omit the pin entirely: pinning is meaningless there
+                (archive outranks pin), so there's no pin action even on hover. */}
+            {!isArchived && (
               <Button
                 type="button"
                 variant="ghost"
                 size="icon-xs"
-                aria-label="Conversation actions"
-                data-testid="conversation-actions"
-                // On mobile (no hover state) it's always visible. On desktop it
-                // stays hidden until hover / keyboard focus, with `aria-expanded`
-                // keeping it surfaced while the menu is open so the trigger
-                // doesn't vanish under the cursor.
+                aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+                data-testid="quick-pin-conversation"
                 className={cn(
+                  // Desktop-only quick affordance: hidden on mobile (the kebab's
+                  // Pin item below covers that), hover/focus-revealed from `md`
+                  // up. Pinned rows no longer keep a persistent pin marker, since
+                  // the "Pinned" section header (and pinned-first ordering inside
+                  // a project) already conveys the pinned state. Revealed glyph:
+                  // unpin if pinned, pin otherwise.
+                  //
+                  // `md:inline-flex` (not `md:block`): the Button base is
+                  // `inline-flex` and relies on it for `items-center
+                  // justify-center` to center the icon. `md:block` would override
+                  // that display and collapse the centering, leaving the glyph
+                  // pinned to the top-left of the button — so keep the flex
+                  // display when revealing it.
                   "text-muted-foreground transition-opacity",
-                  "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                  "md:aria-expanded:opacity-100",
+                  "hidden md:inline-flex",
+                  "md:opacity-0 md:group-hover:opacity-100",
+                  "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
                 )}
                 onClick={(e) => {
-                  // Keep the trigger click from bubbling into the Link.
+                  // Keep the toggle click off the surrounding Link (no navigation).
                   e.preventDefault();
                   e.stopPropagation();
+                  onTogglePinned(conversation.id);
                 }}
               >
-                <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+                {isPinned ? (
+                  <PinOffIcon className="size-3.5" data-icon-size="14" />
+                ) : (
+                  <PinIcon className="size-3.5" data-icon-size="14" />
+                )}
               </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="min-w-44">
-              <ConversationMenuItems
-                components={dropdownBundle}
-                setMenuOpen={setMenuOpen}
-                {...menuItemProps}
-              />
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      )}
+            )}
+            <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Conversation actions"
+                  data-testid="conversation-actions"
+                  // On mobile (no hover state) it's always visible. On desktop it
+                  // stays hidden until hover / keyboard focus, with `aria-expanded`
+                  // keeping it surfaced while the menu is open so the trigger
+                  // doesn't vanish under the cursor.
+                  className={cn(
+                    "text-muted-foreground transition-opacity",
+                    "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
+                    "md:aria-expanded:opacity-100",
+                  )}
+                  onClick={(e) => {
+                    // Keep the trigger click from bubbling into the Link.
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                >
+                  <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-44">
+                <ConversationMenuItems
+                  components={dropdownBundle}
+                  setMenuOpen={setMenuOpen}
+                  {...menuItemProps}
+                />
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        )}
+      </div>
       <PermissionsModal
         sessionId={conversation.id}
         open={shareOpen}
@@ -3739,15 +4024,14 @@ function ArchivingRow({ label }: { label: string }) {
  */
 function ProjectFolderActions({
   projectName,
-  projectId,
   onNavigate,
+  actions,
 }: {
   projectName: string;
-  /** First-class project id, or null for a label-only folder. */
-  projectId: string | null;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
 }) {
   return (
     // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
@@ -3781,7 +4065,7 @@ function ProjectFolderActions({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session in project</TooltipContent>
       </Tooltip>
-      <ProjectFolderMenu projectName={projectName} projectId={projectId} onNavigate={onNavigate} />
+      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
     </div>
   );
 }
@@ -3789,23 +4073,86 @@ function ProjectFolderActions({
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
 /**
- * The kebab on a project-folder header: "Rename project" (O(1) via
- * `PATCH /v1/projects/{id}` for a first-class project; promotes a label-only
- * folder on demand) and "Delete project" (archives + unfiles all members, then
- * removes the container). Delete is confirmed since it archives sessions.
+ * The project-folder action menu body — authored once and rendered under both
+ * the header kebab {@link DropdownMenu} and the header's right-click /
+ * long-press {@link ContextMenu}, via the {@link MenuComponents} bundle, so the
+ * two menus stay identical (mirrors {@link ConversationMenuItems} for rows).
  */
-function ProjectFolderMenu({
+function ProjectFolderMenuItems({
+  components: C,
   projectName,
-  projectId,
   onNavigate,
+  actions,
 }: {
+  components: MenuComponents;
   projectName: string;
-  projectId: string | null;
   /** Nav handler for the mobile-only "New session" item (desktop uses the
       hover-revealed pencil). Closes the sidebar overlay on mobile. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
 }) {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const hasCoarsePointer = useCoarsePointer();
+  return (
+    <>
+      {/* New session — desktop uses the hover-revealed pencil on the folder
+          header, but a coarse-pointer device has no hover at any width, so
+          the menu keeps the item there. */}
+      <C.Item
+        asChild
+        className={hasCoarsePointer ? undefined : "md:hidden"}
+        data-testid="project-new-session-menu"
+      >
+        <Link
+          to={`/?project=${encodeURIComponent(projectName)}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onNavigate(e);
+          }}
+        >
+          <SquarePenIcon className="size-3.5" />
+          New session
+        </Link>
+      </C.Item>
+      <C.Item data-testid="rename-project" onSelect={actions.openRename}>
+        <PencilIcon className="size-3.5" />
+        Rename project
+      </C.Item>
+      <C.Item data-testid="project-settings" onSelect={actions.openSettings}>
+        <Settings2Icon className="size-3.5" />
+        Project settings
+      </C.Item>
+      <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
+        <Trash2Icon className="size-3.5" />
+        Delete project
+      </C.Item>
+    </>
+  );
+}
+
+/** The dialog-opening handlers the folder menu body drives, owned by
+ *  {@link useProjectFolderMenu} so the kebab and the header context menu share
+ *  one set of dialogs rather than each mounting its own. */
+interface ProjectFolderMenuActions {
+  openRename: () => void;
+  openSettings: () => void;
+  openDelete: () => void;
+}
+
+/**
+ * Owns the project-folder menu's dialogs — "Rename project" (O(1) via
+ * `PATCH /v1/projects/{id}` for a first-class project; promotes a label-only
+ * folder on demand), "Project settings", and "Delete project" (archives +
+ * unfiles all members, then removes the container; confirmed since it archives
+ * sessions).
+ *
+ * Returns the open-handlers plus the rendered dialog elements, so the header can
+ * mount the dialogs once and drive them from either the kebab or the header's
+ * context menu.
+ */
+function useProjectFolderMenu(
+  projectName: string,
+  projectId: string | null,
+): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -3813,62 +4160,17 @@ function ProjectFolderMenu({
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
 
-  return (
+  const actions: ProjectFolderMenuActions = {
+    openRename: () => {
+      setRenameValue(projectName);
+      setRenameOpen(true);
+    },
+    openSettings: () => setSettingsOpen(true),
+    openDelete: () => setDeleteOpen(true),
+  };
+
+  const dialogs = (
     <>
-      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`Project actions for ${projectName}`}
-            data-testid="project-actions"
-            className="text-muted-foreground"
-            // Sits on the folder header; keep its click off the collapse toggle.
-            onClick={(e) => e.stopPropagation()}
-          >
-            <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-40">
-          {/* New session — mobile-only (md:hidden); desktop uses the
-              hover-revealed pencil on the folder header. */}
-          <DropdownMenuItem asChild className="md:hidden" data-testid="project-new-session-menu">
-            <Link
-              to={`/?project=${encodeURIComponent(projectName)}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onNavigate(e);
-              }}
-            >
-              <SquarePenIcon className="size-3.5" />
-              New session
-            </Link>
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            data-testid="rename-project"
-            onSelect={() => {
-              setRenameValue(projectName);
-              setRenameOpen(true);
-            }}
-          >
-            <PencilIcon className="size-3.5" />
-            Rename project
-          </DropdownMenuItem>
-          <DropdownMenuItem data-testid="project-settings" onSelect={() => setSettingsOpen(true)}>
-            <Settings2Icon className="size-3.5" />
-            Project settings
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            data-testid="delete-project"
-            variant="destructive"
-            onSelect={() => setDeleteOpen(true)}
-          >
-            <Trash2Icon className="size-3.5" />
-            Delete project
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>
@@ -3883,17 +4185,11 @@ function ProjectFolderMenu({
               const newName = renameValue.trim();
               if (newName === "" || newName === projectName) {
                 setRenameOpen(false);
-                setMenuOpen(false);
                 return;
               }
               renameProject.mutate(
                 { id: projectId, oldName: projectName, newName },
-                {
-                  onSuccess: () => {
-                    setRenameOpen(false);
-                    setMenuOpen(false);
-                  },
-                },
+                { onSuccess: () => setRenameOpen(false) },
               );
             }}
           >
@@ -3930,10 +4226,7 @@ function ProjectFolderMenu({
       </Dialog>
       <ProjectSettingsDialog
         open={settingsOpen}
-        onOpenChange={(o) => {
-          setSettingsOpen(o);
-          if (!o) setMenuOpen(false);
-        }}
+        onOpenChange={setSettingsOpen}
         projectId={projectId}
         projectName={projectName}
       />
@@ -3971,12 +4264,7 @@ function ProjectFolderMenu({
               onClick={() => {
                 deleteProject.mutate(
                   { id: projectId, name: projectName },
-                  {
-                    onSuccess: () => {
-                      setDeleteOpen(false);
-                      setMenuOpen(false);
-                    },
-                  },
+                  { onSuccess: () => setDeleteOpen(false) },
                 );
               }}
             >
@@ -3986,6 +4274,50 @@ function ProjectFolderMenu({
         </DialogContent>
       </Dialog>
     </>
+  );
+
+  return { actions, dialogs };
+}
+
+/**
+ * The kebab on a project-folder header. Renders {@link ProjectFolderMenuItems}
+ * under the dropdown family; the header's right-click / long-press context menu
+ * renders the same body under the context family (see {@link ConversationSection}).
+ */
+function ProjectFolderMenu({
+  projectName,
+  onNavigate,
+  actions,
+}: {
+  projectName: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label={`Project actions for ${projectName}`}
+          data-testid="project-actions"
+          className="text-muted-foreground"
+          // Sits on the folder header; keep its click off the collapse toggle.
+          onClick={(e) => e.stopPropagation()}
+        >
+          <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className={SIDEBAR_MENU_CONTENT_CLASS}>
+        <ProjectFolderMenuItems
+          components={dropdownBundle}
+          projectName={projectName}
+          onNavigate={onNavigate}
+          actions={actions}
+        />
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
