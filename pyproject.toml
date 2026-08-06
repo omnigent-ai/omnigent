@@ -43,7 +43,7 @@ dependencies = [
     "uvicorn[standard]>=0.30,<1",
     # websockets >=15 asyncio client hangs on macOS before emitting any handshake
     # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
-    "websockets>=10.4,<15",
+    "websockets>=14,<15",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
@@ -207,6 +207,11 @@ dictation = [
     # rather than riding whichever extra happens to pull it in.
     "numpy>=1.24,<3",
 ]
+# Apple Silicon dictation via MLX. Keep this separate from the portable
+# sherpa extra so non-Mac servers do not resolve the native MLX stack.
+dictation-mlx = [
+    "parakeet-mlx>=0.5.1,<0.6; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 # Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
 # harness imports the cursor-sdk lazily on first turn, so only `--harness
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
@@ -270,6 +275,9 @@ loadtest = [
 ]
 dev = [
     "pytest>=7.0",
+    # Dictation engine tests mock optional native runtimes but exercise the
+    # shared PCM normalization path directly.
+    "numpy>=1.24,<3",
     # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
     # memory tool tests import + mock it, so keep it in the dev set.
     "hindsight-client>=0.4.0",

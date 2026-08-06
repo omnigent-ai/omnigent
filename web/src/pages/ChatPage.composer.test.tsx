@@ -4,10 +4,25 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+
+const dictationProps = vi.hoisted(() => ({
+  current: null as {
+    onVoiceStart?: () => void;
+    onVoiceDiscard?: () => void;
+    onTranscript: (text: string) => void;
+    onInterim?: (text: string) => void;
+  } | null,
+}));
+vi.mock("@/components/ComposerMicButton", () => ({
+  ComposerMicButton: (props: NonNullable<typeof dictationProps.current>) => {
+    dictationProps.current = props;
+    return <button type="button">Test dictation</button>;
+  },
+}));
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -111,6 +126,41 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+describe("Composer dictation insertion", () => {
+  afterEach(cleanup);
+
+  it("replaces the selected text and restores text and selection on discard", async () => {
+    render(<Composer {...composerProps()} />);
+    const input = textarea();
+    fireEvent.change(input, { target: { value: "hello cruel world" } });
+    input.setSelectionRange(6, 11);
+
+    act(() => dictationProps.current?.onVoiceStart?.());
+    act(() => dictationProps.current?.onInterim?.("kind"));
+    expect(input.value).toBe("hello kind world");
+
+    act(() => dictationProps.current?.onVoiceDiscard?.());
+    expect(input.value).toBe("hello cruel world");
+    await waitFor(() => {
+      expect(input.selectionStart).toBe(6);
+      expect(input.selectionEnd).toBe(11);
+    });
+  });
+
+  it("dismisses an active file mention before dictation changes the draft", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    render(<Composer {...composerProps()} />);
+    const input = textarea();
+    fireEvent.change(input, { target: { value: "inspect @src" }, currentTarget: input });
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyUp(input, { key: "c" });
+
+    act(() => dictationProps.current?.onVoiceStart?.());
+    act(() => dictationProps.current?.onTranscript("now"));
+    expect(input.value).toBe("inspect @src now");
+  });
+});
 
 describe("Composer Claude goal control", () => {
   afterEach(() => {

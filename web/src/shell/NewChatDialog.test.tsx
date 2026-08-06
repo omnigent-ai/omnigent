@@ -3,7 +3,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -44,6 +44,21 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
+
+const dictationProps = vi.hoisted(() => ({
+  current: null as {
+    onVoiceStart?: () => void;
+    onVoiceDiscard?: () => void;
+    onTranscript: (text: string) => void;
+    onInterim?: (text: string) => void;
+  } | null,
+}));
+vi.mock("@/components/ComposerMicButton", () => ({
+  ComposerMicButton: (props: NonNullable<typeof dictationProps.current>) => {
+    dictationProps.current = props;
+    return <button type="button">Test dictation</button>;
+  },
+}));
 
 // Only authenticatedFetch is stubbed (the create POST under test);
 // the module's other exports stay real for any other consumer in the tree.
@@ -844,6 +859,35 @@ describe("NewChatLandingScreen", () => {
     // the placeholder, the composer input would be absent and this fails.
     expect(screen.getByText("What should we build?")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+  });
+
+  it("inserts dictation at the selection and restores it on discard", async () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "alpha omega" } });
+    input.setSelectionRange(5, 5);
+
+    act(() => dictationProps.current?.onVoiceStart?.());
+    act(() => dictationProps.current?.onTranscript("middle"));
+    expect(input.value).toBe("alpha middle omega");
+
+    act(() => dictationProps.current?.onVoiceDiscard?.());
+    expect(input.value).toBe("alpha omega");
+    await waitFor(() => {
+      expect(input.selectionStart).toBe(5);
+      expect(input.selectionEnd).toBe(5);
+    });
+  });
+
+  it("dismisses an active file mention before dictation changes the draft", () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "inspect @src" } });
+    input.setSelectionRange(input.value.length, input.value.length);
+
+    act(() => dictationProps.current?.onVoiceStart?.());
+    act(() => dictationProps.current?.onTranscript("now"));
+    expect(input.value).toBe("inspect @src now");
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
