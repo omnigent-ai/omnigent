@@ -919,6 +919,25 @@ html:not(.dark) .conversations-sidebar {
   font-size: 0.875em;
 }
 
+/* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
+ * hide the native one so both don't show. */
+.transcript-hide-native-scrollbar {
+  scrollbar-width: none;
+}
+.transcript-hide-native-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Streamdown hard-codes `content-visibility: auto` with a flat 200px intrinsic
+ * size on every code block, so offscreen blocks lay out at 200px and snap to
+ * their real height (100–1700px) as they scroll in — shifting the transcript
+ * under the reader and resizing the scrollbar on every snap. Scoped to the
+ * transcript so the file viewer keeps skipping offscreen blocks in big files.
+ * Overrides an inline style, hence !important. */
+[role="log"] [data-streamdown="code-block"] {
+  content-visibility: visible !important;
+}
+
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
  * Streamdown renders the body with `overflow-x-auto` and the <code> with
  * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`

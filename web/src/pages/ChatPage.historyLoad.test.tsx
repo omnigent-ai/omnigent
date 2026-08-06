@@ -85,7 +85,11 @@ describe("HistoryAutoLoader", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("preserves the visible scroll offset after a scroll-up prepend", () => {
+  // Position across a prepend belongs to native scroll anchoring. These pin
+  // the loader to writing nothing: an imperative scrollTop write cancels
+  // in-flight momentum, so a page landing mid-flick used to yank the
+  // transcript out from under the reader.
+  it("leaves the scroll offset alone when a page prepends", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
@@ -108,10 +112,10 @@ describe("HistoryAutoLoader", () => {
       });
     });
 
-    expect(metrics.scrollTop).toBe(104);
+    expect(metrics.scrollTop).toBe(24);
   });
 
-  it("preserves the offset after the user scrolls again during the request", () => {
+  it("leaves the offset alone when the user scrolls again during the request", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
@@ -136,10 +140,10 @@ describe("HistoryAutoLoader", () => {
       });
     });
 
-    expect(metrics.scrollTop).toBe(800);
+    expect(metrics.scrollTop).toBe(0);
   });
 
-  it("anchors the latest user position across skeleton insertion and removal", () => {
+  it("leaves the offset alone across skeleton insertion and removal", () => {
     const scrollRoot = document.createElement("div");
     const metrics = { scrollTop: 500, scrollHeight: 1000 };
     setScrollMetrics(scrollRoot, metrics);
@@ -154,10 +158,10 @@ describe("HistoryAutoLoader", () => {
     render(<HistoryAutoLoader />);
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
-    expect(metrics.scrollTop).toBe(599);
+    expect(metrics.scrollTop).toBe(499);
 
-    // Preserve a scroll made while loading, then replace the 100px skeleton
-    // with a page that leaves the content 400px taller overall.
+    // Then replace the 100px skeleton with a page that leaves the content
+    // 400px taller overall — still not the loader's to compensate for.
     metrics.scrollTop = 20;
     fireEvent.scroll(scrollRoot);
     metrics.scrollHeight = 1500;
@@ -169,7 +173,7 @@ describe("HistoryAutoLoader", () => {
       });
     });
 
-    expect(metrics.scrollTop).toBe(420);
+    expect(metrics.scrollTop).toBe(20);
   });
 
   it("loads older history when the user scrolls near the top", () => {
@@ -184,6 +188,30 @@ describe("HistoryAutoLoader", () => {
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
 
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  // The fetch fires viewports early so the page settles before the reader
+  // reaches offset 0, where the browser stops anchoring and a prepend would
+  // shift the transcript with nothing to absorb it.
+  it("scales the fetch threshold with the viewport", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory, oldestItemId: "item_0" });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 9000, scrollHeight: 20000, clientHeight: 2000 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    // 2.5 viewports = 5000px. Still outside it on a tall pane.
+    metrics.scrollTop = 6000;
+    fireEvent.scroll(scrollRoot);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // Inside it — yet far enough from the top that a fixed 500px trigger
+    // would not have fired here at all.
+    metrics.scrollTop = 4000;
+    fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
@@ -273,7 +301,9 @@ describe("HistoryAutoLoader", () => {
       loadMoreHistory,
     });
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    // Parked well clear of the fetch threshold (2.5 viewports), so only the
+    // initial-window build may page — not the scroll-driven path.
+    setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);
@@ -303,7 +333,8 @@ describe("HistoryAutoLoader", () => {
     });
 
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    // Clear of the fetch threshold, so the page count below is the cap alone.
+    setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);

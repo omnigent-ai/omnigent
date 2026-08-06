@@ -60,6 +60,7 @@ import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
@@ -1723,9 +1724,11 @@ function MainAgentSurface({
               md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
               the message column so the ticks don't butt against the text; the
               rail is hidden on mobile, so the extra left padding is md-only. */}
-          {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
+          {/* Native scroll anchoring holds position across a history prepend —
+              the browser does it off the main thread, so it can't interrupt an
+              in-flight scroll the way an imperative scrollTop write does. */}
           <ConversationContent
-            scrollClassName="[overflow-anchor:none]"
+            scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
@@ -1835,6 +1838,10 @@ function MainAgentSurface({
             hidden={userMessageIds.length === 0}
           />
         </Conversation>
+        {/* Constant-height scrollbar. Sibling of Conversation for the same
+            reason as JumpToTopButton — outside the chat-scroll-fade mask, which
+            would otherwise dissolve it against the header. */}
+        <TranscriptScrollbar scroller={scroller} />
         {/* Hover the top edge to reveal a pill that loads all older history and
             scrolls to the first message. Rendered here (a wrapper sibling of
             Conversation) rather than inside it so it escapes the chat-scroll-fade
@@ -2141,8 +2148,22 @@ function HistoryLoadingIndicator() {
   );
 }
 
-/** Builds the initial history window, then keeps loading near the top. */
-const HISTORY_LOAD_TOP_THRESHOLD_PX = 500;
+/**
+ * Builds the initial history window, then keeps loading near the top.
+ *
+ * The fetch fires this many viewports from the top. It has to be generous:
+ * the browser suppresses scroll anchoring at offset 0, so a page that lands
+ * while the reader is sitting at the very top shifts the transcript with
+ * nothing to absorb it. Firing viewports early means the prepend settles far
+ * from that edge, where anchoring holds — and out of sight either way.
+ */
+const HISTORY_LOAD_TOP_VIEWPORTS = 2.5;
+/** Floor for very short viewports, where 2.5x would still be a few hundred px. */
+const HISTORY_LOAD_TOP_MIN_PX = 1200;
+
+function historyLoadThreshold(el: HTMLElement): number {
+  return Math.max(HISTORY_LOAD_TOP_MIN_PX, el.clientHeight * HISTORY_LOAD_TOP_VIEWPORTS);
+}
 
 export function HistoryAutoLoader({
   scrollElement,
@@ -2166,24 +2187,17 @@ export function HistoryAutoLoader({
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
-  const loadingMoreHistoryRef = useRef(loadingMoreHistory);
 
-  // Preserve the latest user position across skeleton insertion/removal and
-  // the intervening prepend. Native overflow anchoring is disabled above so
-  // this correction is the single source of truth across browsers.
-  const prevScrollHeightRef = useRef<number | null>(null);
-  const prevScrollTopRef = useRef(0);
-
-  // Register before sibling layout effects can resize the transcript and make
-  // StickToBottom adjust scrollTop; otherwise that first scroll can be missed.
+  // Position across a prepend is held by native scroll anchoring, not by this
+  // component. Writing scrollTop here instead used to interrupt the reader's
+  // gesture — an imperative write cancels in-flight momentum, so a page landing
+  // mid-flick yanked the transcript (measured: corrections up to ~2000px, every
+  // one of them while the wheel was still moving). The browser does the same
+  // correction off the main thread without touching the gesture.
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
-    const handleScroll = () => {
-      prevScrollHeightRef.current = el.scrollHeight;
-      prevScrollTopRef.current = el.scrollTop;
-      setScrollRevision((revision) => revision + 1);
-    };
+    const handleScroll = () => setScrollRevision((revision) => revision + 1);
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
   }, [ctx.scrollRef, scrollElement]);
@@ -2196,18 +2210,14 @@ export function HistoryAutoLoader({
 
     const generationChanged = generationRef.current !== historyGeneration;
     const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
-    const loadingChanged =
-      !generationChanged && loadingMoreHistoryRef.current !== loadingMoreHistory;
     const scrollPositionChanged =
       !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
     oldestItemIdRef.current = oldestItemId;
-    loadingMoreHistoryRef.current = loadingMoreHistory;
     handledScrollRevisionRef.current = scrollRevision;
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
       pagesFetchedRef.current = 1;
-      prevScrollHeightRef.current = null;
     }
 
     const state = useChatStore.getState();
@@ -2218,22 +2228,12 @@ export function HistoryAutoLoader({
     );
     const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
-    if ((itemsChanged || loadingChanged) && prevScrollHeightRef.current !== null) {
-      const nextScrollTop = Math.max(
-        0,
-        el.scrollHeight - prevScrollHeightRef.current + prevScrollTopRef.current,
-      );
-      if (el.scrollTop !== nextScrollTop) el.scrollTop = nextScrollTop;
-    }
-    prevScrollHeightRef.current = el.scrollHeight;
-    prevScrollTopRef.current = el.scrollTop;
-
     if (
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
       (!buildingInitialWindow &&
-        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX))
+        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= historyLoadThreshold(el)))
     ) {
       return;
     }
