@@ -116,6 +116,72 @@ def test_routed_session_renders_one_routing_chip(
     expect(chip).to_have_attribute("data-applied", "true")
 
 
+def test_spawn_chip_says_the_short_harness_name(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A sub-agent spawn chip says "codex", not the "-native" implementation id.
+
+    The session's own session/turn chips keep the full harness id (covered
+    above); the shortening applies only to the sub-agent scopes.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session.
+    :returns: None.
+    """
+    from omnigent.entities import NewConversationItem
+    from omnigent.entities.conversation import parse_item_data
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from tests.e2e_ui.conftest import _server_state
+
+    base_url, session_id = seeded_session
+    database_uri = _server_state.get("database_uri")
+    assert database_uri, "needs the spawned server's database (not --ui-base-url)"
+    store = SqlAlchemyConversationStore(str(database_uri))
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="routing_decision",
+                response_id="routing_e2e_spawn",
+                data=parse_item_data(
+                    "routing_decision",
+                    {
+                        "model": "databricks-gpt-5-6-luna",
+                        "applied": True,
+                        "rationale": "Trivial task; cheapest arm.",
+                        "harness": "codex-native",
+                        "scope": "native_subagent",
+                        "decision_id": "e2e-decision-spawn",
+                        "router_source": "databricks-aigw",
+                        "agent_name": "researcher",
+                    },
+                ),
+            ),
+        ],
+    )
+    seed_committed_turn(session_id, prompt="spawn a researcher", reply="spawned")
+    # The spawn chip renders only while the session's switch is on.
+    patched = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"subagent_routing_override": "on"},
+        timeout=10.0,
+    )
+    patched.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    chip = page.get_by_test_id("routing-decision-card")
+    expect(chip).to_have_count(1, timeout=15_000)
+    harness = chip.get_by_test_id("routing-decision-harness")
+    expect(harness).to_contain_text("codex")
+    expect(harness).not_to_contain_text("codex-native")
+    expect(chip.get_by_test_id("routing-decision-scope")).to_contain_text("subagent")
+
+
 def test_routed_session_config_modal_names_the_routed_model(
     page: Page,
     seeded_session: tuple[str, str],

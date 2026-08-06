@@ -285,9 +285,12 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     :returns: None.
     """
     yield
-    from omnigent.server.smart_routing import _runner_catalog_cache
-
-    _runner_catalog_cache.clear()
+    # sys.modules lookup, not an import: the spec lane blocks omnigent imports
+    # inside some tests, and a lane that never touched smart_routing should not
+    # pay for loading it in every teardown.
+    module = sys.modules.get("omnigent.server.smart_routing")
+    if module is not None:
+        module._runner_catalog_cache.clear()
 
 
 @pytest.fixture(autouse=True)
