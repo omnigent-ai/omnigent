@@ -30,8 +30,16 @@ DATABRICKS_TRUSTED_HOST_SUFFIXES: Final[tuple[str, ...]] = (
 # the gateway's Anthropic surface.
 DATABRICKS_AI_GATEWAY_LABEL: Final[str] = "ai-gateway"
 
+# Databricks-owned parent domain serving Databricks Apps; a workspace app is
+# reached at ``<app>-<id>.<cloud>.databricksapps.com``. Kept separate from
+# DATABRICKS_TRUSTED_HOST_SUFFIXES so the AI Gateway predicate stays exactly as
+# narrow as it is today.
+DATABRICKS_APPS_HOST_SUFFIXES: Final[tuple[str, ...]] = (".databricksapps.com",)
 
-def _under_trusted_domain(hostname: str) -> bool:
+
+def _under_trusted_domain(
+    hostname: str, *, parents: tuple[str, ...] = DATABRICKS_TRUSTED_HOST_SUFFIXES
+) -> bool:
     """Whether *hostname* is a subdomain of a trusted Databricks parent domain.
 
     Compares whole DNS labels from the right, so the parent must be an exact
@@ -40,14 +48,38 @@ def _under_trusted_domain(hostname: str) -> bool:
 
     :param hostname: Lower-cased hostname from a parsed URL, e.g.
         ``"wkspc.ai-gateway.cloud.databricks.com"``.
+    :param parents: Parent domains to accept, written with a leading dot.
     :returns: ``True`` when a trusted parent domain owns *hostname*.
     """
     labels = hostname.split(".")
-    for parent in DATABRICKS_TRUSTED_HOST_SUFFIXES:
+    for parent in parents:
         parent_labels = parent.strip(".").split(".")
         if len(labels) > len(parent_labels) and labels[-len(parent_labels) :] == parent_labels:
             return True
     return False
+
+
+def is_databricks_owned_url(url: str) -> bool:
+    """Whether *url* is an https URL served by a Databricks-owned domain.
+
+    Broader than :func:`is_databricks_ai_gateway_url`: any workspace control
+    plane or Databricks App under a trusted parent domain qualifies. Callers
+    use it to decide whether a Databricks credential may be sent to a URL at
+    all, so it matches whole DNS labels and requires https for the same
+    look-alike-host reasons.
+
+    :param url: An absolute URL, e.g. an Omnigent ``server_url``.
+    :returns: ``True`` iff a Databricks-owned parent domain serves *url*.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return False
+    return _under_trusted_domain(hostname) or _under_trusted_domain(
+        hostname, parents=DATABRICKS_APPS_HOST_SUFFIXES
+    )
 
 
 def is_databricks_ai_gateway_url(base_url: str) -> bool:
