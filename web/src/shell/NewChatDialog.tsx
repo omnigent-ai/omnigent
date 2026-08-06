@@ -3603,7 +3603,6 @@ export function NewChatLandingScreen() {
       >
         {workspaceLabel}
       </span>
-      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
     </button>
   );
 
@@ -4079,7 +4078,6 @@ export function NewChatLandingScreen() {
                     >
                       {hostLabel}
                     </span>
-                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -4239,7 +4237,6 @@ export function NewChatLandingScreen() {
                       >
                         {sandboxRepoLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-96 p-3">
@@ -4349,7 +4346,6 @@ export function NewChatLandingScreen() {
                       >
                         {worktreeLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent
