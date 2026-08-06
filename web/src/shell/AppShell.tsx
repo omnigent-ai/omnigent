@@ -5,7 +5,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
-import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useCommandPaletteHotkey, useSessionSearchHotkey } from "@/hooks/usePaletteHotkeys";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
@@ -83,7 +83,7 @@ import { TerminalsPanel } from "./TerminalsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
-import { CommandPalette } from "./CommandPalette";
+import { CommandPalette, type CommandPaletteMode } from "./CommandPalette";
 import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
@@ -1000,11 +1000,24 @@ export function AppShell() {
     onToggleRight: toggleRightPanel,
   });
 
-  // ⌘K (Ctrl+K) toggles the command palette. Disabled embedded, where ⌘K is the
-  // host page's. Bound here where the palette's open-state lives.
+  // ⌘K (Ctrl+K) toggles the command palette; ⌘⇧F (Ctrl+Shift+F) toggles session
+  // search. Both drive the same overlay in different modes, so they share one
+  // open-state and the chord that fired last sets the mode. Disabled embedded,
+  // where those chords belong to the host page. Bound here, where the state is.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [commandPaletteMode, setCommandPaletteMode] = useState<CommandPaletteMode>("commands");
   const isEmbedded = useIsEmbedded();
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev), !isEmbedded);
+  // Re-pressing the chord for the mode already showing closes the overlay;
+  // pressing the other chord switches to it rather than closing.
+  const togglePalette = useCallback(
+    (mode: CommandPaletteMode) => () => {
+      setCommandPaletteOpen((prev) => !(prev && commandPaletteMode === mode));
+      setCommandPaletteMode(mode);
+    },
+    [commandPaletteMode],
+  );
+  useCommandPaletteHotkey(togglePalette("commands"), !isEmbedded);
+  useSessionSearchHotkey(togglePalette("sessions"), !isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
@@ -1385,7 +1398,10 @@ export function AppShell() {
               open={sidebarOpen}
               dragProgress={sidebarDragProgress}
               onClose={() => setSidebarOpen(false)}
-              onOpenSearch={() => setCommandPaletteOpen(true)}
+              onOpenSearch={() => {
+                setCommandPaletteMode("sessions");
+                setCommandPaletteOpen(true);
+              }}
             />
 
             {/* Content region (everything right of the sidebar): a relative
@@ -1673,13 +1689,14 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
-          {/* Global command palette (⌘K). Ungated so it works on every route
-              and in embedded mode — the sidebar's "Search" button opens it
-              there even though the ⌘K hotkey is disabled (it belongs to the
-              host page). */}
+          {/* Command palette (⌘K) / session search (⌘⇧F), one overlay in two
+              modes. Ungated so it works on every route and in embedded mode —
+              the sidebar's magnifier opens session search there even though the
+              hotkeys are disabled (those chords belong to the host page). */}
           <CommandPalette
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
+            mode={commandPaletteMode}
             onToggleLeftSidebar={() => setSidebarOpen((prev) => !prev)}
             onToggleRightSidebar={toggleRightPanel}
           />
