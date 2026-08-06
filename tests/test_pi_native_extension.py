@@ -2748,6 +2748,7 @@ def test_inbox_model_change_applies_via_set_model(tmp_path: Path) -> None:
         + r"""
 (async () => {
   await handlers.session_start({}, ctx); // starts the inbox poller
+  delete ctx.modelRegistry.find;
   await deliverModelChange("omnigent/databricks-claude-opus-4-1");
 
   assert.equal(setModelCalls.length, 1, JSON.stringify(setModelCalls));
@@ -2878,12 +2879,60 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
     JSON.stringify(models),
   );
   // Display name falls back to the model's ``name``.
-  assert.equal(models[0].displayName, "omnigent/Sonnet");
+  assert.equal(models[0].displayName, "Sonnet");
 
   // The launch model is mirrored so the pill/active-row resolve immediately.
   const changes = posted.filter((e) => e.type === "external_model_change");
   assert.equal(changes.length, 1, JSON.stringify(posted));
   assert.equal(changes[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_models_without_provider_keep_bare_id_behavior(tmp_path: Path) -> None:
+    """Older Pi model objects without ``provider`` still populate and mirror."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const legacyCatalog = catalog.map(({ provider: _provider, ...model }) => model);
+  const legacyCtx = {
+    ...ctx,
+    model: { id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+    modelRegistry: {
+      getAll: () => legacyCatalog,
+      getAvailable: () => legacyCatalog.filter((model) => model.hasKey),
+    },
+  };
+
+  await handlers.session_start({}, legacyCtx);
+  const opts = posted.filter((event) => event.type === "external_model_options");
+  assert.deepEqual(
+    opts[0].data.models.map((model) => model.id),
+    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+  );
+  assert.equal(opts[0].data.models[0].displayName, "Sonnet");
+
+  await handlers.model_select(
+    { source: "set", model: { id: "databricks-claude-opus-4-1" } },
+    legacyCtx,
+  );
+  const changes = posted.filter((event) => event.type === "external_model_change");
+  assert.deepEqual(
+    changes.map((event) => event.data.model),
+    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+  );
   finish();
 })().catch((error) => {
   finish();

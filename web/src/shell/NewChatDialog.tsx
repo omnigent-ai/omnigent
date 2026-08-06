@@ -1444,21 +1444,16 @@ function SearchableModelPicker({
               Default
             </CommandItem>
             {filteredOptions.map((option) => (
-              <div
+              <CommandItem
                 key={option.id}
+                value={option.id}
                 title={option.displayName}
-                data-hover-label={option.displayName}
-                className="relative before:pointer-events-none before:absolute before:inset-x-1 before:top-1/2 before:z-10 before:hidden before:-translate-y-1/2 before:rounded-md before:border before:border-border before:bg-popover before:px-2.5 before:py-2 before:text-xs before:break-all before:text-popover-foreground before:shadow-sm before:content-[attr(data-hover-label)] hover:before:block"
+                data-model-id={option.id}
+                data-checked={value === option.id}
+                onSelect={() => select(option.id)}
               >
-                <CommandItem
-                  value={option.id}
-                  data-model-id={option.id}
-                  data-checked={value === option.id}
-                  onSelect={() => select(option.id)}
-                >
-                  <span className="min-w-0 truncate">{option.displayName}</span>
-                </CommandItem>
-              </div>
+                <span className="min-w-0 truncate">{option.displayName}</span>
+              </CommandItem>
             ))}
             {!loading && filteredOptions.length === 0 && (
               <CommandEmpty>No models found</CommandEmpty>

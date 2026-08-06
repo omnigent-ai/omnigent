@@ -1069,12 +1069,12 @@ describe("NewChatLandingScreen create flow", () => {
         {
           id: "omnigent-openai/system.ai.gpt-5-6-sol",
           model: "omnigent-openai/system.ai.gpt-5-6-sol",
-          displayName: "omnigent-openai/GPT 5.6 Sol",
+          displayName: "GPT 5.6 Sol",
         },
         {
           id: "omnigent/databricks-claude-sonnet-4-6",
           model: "omnigent/databricks-claude-sonnet-4-6",
-          displayName: "omnigent/Claude Sonnet 4.6",
+          displayName: "Claude Sonnet 4.6",
         },
       ],
       isLoading: false,
@@ -1092,16 +1092,13 @@ describe("NewChatLandingScreen create flow", () => {
       '[data-model-id="omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
-    expect((fullNameRow as Element).parentElement).toHaveAttribute(
-      "data-hover-label",
-      "omnigent-openai/GPT 5.6 Sol",
-    );
+    expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
     fireEvent.change(screen.getByTestId("new-chat-landing-config-model-search"), {
       target: { value: "gpt sol" },
     });
-    expect(screen.getByText("omnigent-openai/GPT 5.6 Sol")).toBeInTheDocument();
-    expect(screen.queryByText("omnigent/Claude Sonnet 4.6")).toBeNull();
-    fireEvent.click(screen.getByText("omnigent-openai/GPT 5.6 Sol"));
+    expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
+    expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
+    fireEvent.click(screen.getByText("GPT 5.6 Sol"));
     saveConfig();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));

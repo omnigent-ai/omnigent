@@ -2161,11 +2161,7 @@ async def _auto_create_pi_terminal(
         # Provider-qualified picker values select one of the models rendered
         # from the provider configured through ``omni setup``.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
-        provider = (
-            resolve_pi_native_provider()
-            if spec_model and "/" in spec_model
-            else resolve_pi_native_provider(model=spec_model)
-        )
+        provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(
                 bridge_dir / "pi-agent",

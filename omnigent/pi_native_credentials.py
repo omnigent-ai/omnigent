@@ -95,6 +95,7 @@ _SURFACE_PROVIDER_IDS: dict[DatabricksPiSurface, str] = {
     DatabricksPiSurface.MLFLOW: _PI_MLFLOW_PROVIDER_ID,
 }
 
+_PI_MANAGED_PROVIDER_IDS = frozenset({_PI_PROVIDER_ID, *_SURFACE_PROVIDER_IDS.values()})
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
 # workspace bearer token, so we set ``authHeader`` (Authorization: Bearer).
@@ -118,6 +119,16 @@ _is_databricks_ai_gateway_url = is_databricks_ai_gateway_url
 # Declared in pi_model_compatibility so the harness and interactive paths
 # render byte-identical entries.
 _PiModelEntry: TypeAlias = PiModelEntry
+
+
+def _split_pi_native_model_selection(selection: str | None) -> tuple[str, str] | None:
+    """Split an Omnigent-managed ``provider/model`` picker value."""
+    if not selection:
+        return None
+    provider_id, separator, model_id = selection.partition("/")
+    if separator and provider_id in _PI_MANAGED_PROVIDER_IDS and model_id:
+        return provider_id, model_id
+    return None
 
 
 class _PiProviderCompat(TypedDict):
@@ -370,7 +381,7 @@ def pi_native_model_options() -> list[dict[str, object]]:
             options[qualified] = {
                 "id": qualified,
                 "model": qualified,
-                "displayName": f"{provider_id}/{model.get('name') or model_id}",
+                "displayName": model.get("name") or model_id,
             }
     return [options[model_id] for model_id in sorted(options)]
 
@@ -971,6 +982,9 @@ def resolve_pi_native_provider(
     :returns: The resolved provider config, or ``None`` to fall back to Pi's
         own credentials.
     """
+    selection = _split_pi_native_model_selection(model)
+    if selection is not None:
+        _, model = selection
     try:
         config = config_loader()
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
@@ -1086,6 +1100,7 @@ def pi_native_provider_launch(
 
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
+    :param selection: Optional picker value used to select a generated provider.
     :returns: ``(env, args)`` — the env vars to merge into the terminal spec
         (relocating Pi's config dir) and the ``--provider``/``--model`` args to
         append to the Pi command.
@@ -1093,6 +1108,30 @@ def pi_native_provider_launch(
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
     rendered = provider.to_models_config()
+    # Resolve which provider the selected model lives in. Non-Claude models
+    # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
+    # primary provider. Read the rendered config so family fallbacks agree.
+    selected_model = provider.model
+    model_provider_id = provider.provider_id
+    selection_parts = _split_pi_native_model_selection(selection)
+    if selection_parts is not None:
+        candidate_provider, candidate_model = selection_parts
+        configured = rendered["providers"].get(candidate_provider)
+        if not configured or not any(
+            model.get("id") == candidate_model for model in configured.get("models", [])
+        ):
+            raise ValueError(
+                f"Pi model selection {selection!r} is not available in managed configuration"
+            )
+        model_provider_id = candidate_provider
+        selected_model = candidate_model
+    else:
+        for extra_id, extra_cfg in rendered["providers"].items():
+            if extra_id == provider.provider_id:
+                continue
+            if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
+                model_provider_id = extra_id
+                break
     write_pi_models_config(agent_dir, provider, rendered)
     # Copy the user's global Pi settings but suppress defaultThinkingLevel.
     # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
@@ -1106,28 +1145,6 @@ def pi_native_provider_launch(
 
     prepare_managed_pi_agent_dir(agent_dir, overlay={"defaultThinkingLevel": None})
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
-    # Resolve which provider the selected model lives in. Non-Claude models
-    # (GLM, GPT, Llama…) are in secondary providers (omnigent-openai); Claude
-    # models are in the primary provider (omnigent). Read the *rendered* config
-    # rather than additional_providers so a model routed by the family fallback
-    # gets the same --provider that models.json registered it under.
-    selected_model = provider.model
-    model_provider_id = provider.provider_id
-    if selection and "/" in selection:
-        candidate_provider, _, candidate_model = selection.partition("/")
-        configured = rendered["providers"].get(candidate_provider)
-        if configured and any(
-            model.get("id") == candidate_model for model in configured.get("models", [])
-        ):
-            model_provider_id = candidate_provider
-            selected_model = candidate_model
-    else:
-        for extra_id, extra_cfg in rendered["providers"].items():
-            if extra_id == provider.provider_id:
-                continue
-            if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
-                model_provider_id = extra_id
-                break
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding
     # --provider. Pass the fully-qualified "provider/model" reference so Pi's

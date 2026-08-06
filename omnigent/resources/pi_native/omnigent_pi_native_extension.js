@@ -906,12 +906,26 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
   let model;
   try {
+    const models = listModels();
     const separator = id.indexOf("/");
-    if (separator > 0 && registry && typeof registry.find === "function") {
-      model = registry.find(id.slice(0, separator), id.slice(separator + 1));
-    }
-    if (!model) {
-      model = listModels().find((m) => m && m.id === id);
+    if (separator > 0) {
+      const provider = id.slice(0, separator);
+      const bareId = id.slice(separator + 1);
+      model = models.find(
+        (candidate) =>
+          candidate && candidate.id === bareId && candidate.provider === provider,
+      );
+      if (!model) model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && registry && typeof registry.find === "function") {
+        model = registry.find(provider, bareId);
+      }
+      if (!model) {
+        model = models.find(
+          (candidate) => candidate && candidate.id === bareId && !candidate.provider,
+        );
+      }
+    } else {
+      model = models.find((candidate) => candidate && candidate.id === id);
     }
   } catch (_err) {
     model = undefined;
@@ -958,6 +972,13 @@ async function postModelChangeError(config, message) {
   });
 }
 
+function modelReference(model) {
+  const modelId = model && typeof model.id === "string" ? model.id : "";
+  if (!modelId) return "";
+  const provider = model && typeof model.provider === "string" ? model.provider : "";
+  return provider ? `${provider}/${modelId}` : modelId;
+}
+
 /**
  * Report Pi's live model catalog to Omnigent for the Web UI model picker.
  *
@@ -996,15 +1017,13 @@ async function postModelOptions(config, ctx) {
   const seen = new Set();
   for (const model of models) {
     const modelId = model && typeof model.id === "string" ? model.id : "";
-    const provider =
-      model && typeof model.provider === "string" ? model.provider : "";
-    if (!modelId || !provider) continue;
-    const id = `${provider}/${modelId}`;
+    const id = modelReference(model);
+    if (!id) continue;
     if (seen.has(id)) continue;
     seen.add(id);
     const name =
-      model && typeof model.name === "string" && model.name ? model.name : id;
-    options.push({ id, model: id, displayName: `${provider}/${name}` });
+      model && typeof model.name === "string" && model.name ? model.name : modelId;
+    options.push({ id, model: id, displayName: name });
   }
   if (options.length === 0) return;
   await postEvent(config, {
@@ -1751,16 +1770,11 @@ module.exports = function (pi) {
     // ``/login`` session (no Omnigent ``model_override``, no ``llm_model``)
     // shows no active model until the user switches. Mirrors the
     // ``model_select`` handler, but for the startup value ``ctx.model``.
-    const startupModelId =
-      ctx && ctx.model && typeof ctx.model.id === "string" ? ctx.model.id : "";
-    const startupProvider =
-      ctx && ctx.model && typeof ctx.model.provider === "string"
-        ? ctx.model.provider
-        : "";
-    if (startupProvider && startupModelId) {
+    const startupModel = modelReference(ctx ? ctx.model : undefined);
+    if (startupModel) {
       await postEvent(config, {
         type: "external_model_change",
-        data: { model: `${startupProvider}/${startupModelId}` },
+        data: { model: startupModel },
       });
     }
     await postEvent(config, {
@@ -1787,13 +1801,11 @@ module.exports = function (pi) {
       event && typeof event.source === "string" ? event.source : "";
     if (source === "restore") return;
     const model = event && event.model ? event.model : undefined;
-    const modelId = model && typeof model.id === "string" ? model.id : "";
-    const provider =
-      model && typeof model.provider === "string" ? model.provider : "";
-    if (!provider || !modelId) return;
+    const selectedModel = modelReference(model);
+    if (!selectedModel) return;
     await postEvent(config, {
       type: "external_model_change",
-      data: { model: `${provider}/${modelId}` },
+      data: { model: selectedModel },
     });
   });
 
