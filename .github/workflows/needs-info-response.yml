@@ -20,7 +20,9 @@ permissions:
 
 concurrency:
   group: needs-info-response-${{ github.event.issue.number }}
-  cancel-in-progress: true
+  # An in-flight run may already have removed needs-info and started re-triage.
+  # Cancelling it could leave the issue unlabeled without completing triage.
+  cancel-in-progress: false
 
 jobs:
   clear-needs-info:
