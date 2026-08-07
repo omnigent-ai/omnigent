@@ -340,8 +340,14 @@ class WorkspaceReader:
             # Spend the scan budget on the real tree first, as the runner does.
             kept.sort(key=lambda d: d in _DEFAULT_DEPRIORITIZED_DIRS)
             dirnames[:] = kept
-            scanned += len(kept) + len(filenames)
+            scanned += len(kept)
             for fname in sorted(filenames):
+                # Counted per entry: a per-directory check lets one huge
+                # directory overshoot the budget before `truncated` trips.
+                scanned += 1
+                if scanned >= _SEARCH_SCAN_BUDGET:
+                    truncated = True
+                    break
                 p = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, fname))
                 if exc and any(r.match(p) for r in exc):
                     continue
@@ -369,13 +375,10 @@ class WorkspaceReader:
                 )
                 if len(results) >= limit:
                     break
-            if len(results) >= limit:
-                break
-            # A query matching little or nothing never fills the result cap, so
-            # the walk needs its own bound -- the same one the runner applies,
-            # so a search behaves identically whether the agent is awake.
-            if scanned >= _SEARCH_SCAN_BUDGET:
-                truncated = True
+            # A query matching little or nothing never fills the result cap,
+            # so the walk needs its own bound -- the same one the runner
+            # applies, so search behaves identically whether the agent is awake.
+            if truncated or len(results) >= limit:
                 break
         results.sort(key=lambda entry: cast(str, entry["path"]))
         return {

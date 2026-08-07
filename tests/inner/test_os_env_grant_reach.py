@@ -25,7 +25,7 @@ import pytest
 
 from omnigent.entities.environment_filesystem import PathUnreachable
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import _handle_helper_request
+from omnigent.inner.os_env import _handle_helper_request, create_os_environment
 from omnigent.inner.sandbox import (
     SandboxPolicy,
     is_unconfined,
@@ -536,3 +536,37 @@ def test_browse_target_resolves_traversal_before_authorizing(tmp_path: Path) -> 
 
     with pytest.raises(PathUnreachable):
         resolve_browse_target(escaping, roots, unconfined=False)
+
+
+@pytest.mark.asyncio
+async def test_unconfined_write_inside_a_read_grant_still_succeeds(tmp_path: Path) -> None:
+    """An unconfined environment can write anywhere its shell can -- including
+    a path that happens to sit inside a declared READ grant.
+
+    The routing decision must consider the access being requested, not just
+    containment: a write landing in a read grant is not something the guarded
+    helper will perform, so treating it as "covered" would deny a write the
+    environment is otherwise allowed to make.
+    """
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    read_only = tmp_path / "ro"
+    read_only.mkdir()
+    target = read_only / "note.txt"
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(cwd),
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=[str(read_only)]),
+        )
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env, browse_outside_workspace=True)
+
+    result = await fs.write(str(target), b"written\n")
+
+    assert result.created is True
+    assert target.read_text() == "written\n"

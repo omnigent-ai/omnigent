@@ -429,18 +429,28 @@ class CallerProcessFilesystem:
         """
         return self._allow_absolute and is_absolute_request(path)
 
-    def _within_grants(self, resolved: Path) -> bool:
-        """Whether a resolved path is covered by a declared sandbox grant.
+    def _within_grants(self, resolved: Path, *, need_write: bool = False) -> bool:
+        """Whether a grant covers this path *for the access being requested*.
 
         Grants are what the environment's own file tools can reach, so a
-        path inside one can be served through the helper. A path outside
-        every grant was admitted only because the environment is
+        path a grant covers can be served through the helper. A path no
+        grant covers was admitted only because the environment is
         unconfined, and must not be routed through the helper's guard.
 
+        *need_write* matters because the two are not the same set: a write
+        landing inside a READ grant is not something the helper will do, so
+        routing it there would deny a write that an unconfined environment
+        is otherwise allowed to make (its shell can already do it).
+
         :param resolved: Fully-resolved absolute path.
-        :returns: ``True`` when some grant covers it.
+        :param need_write: ``True`` when the caller intends to mutate.
+        :returns: ``True`` when a grant admits that access.
         """
-        return any(root.contains(resolved) for root in self._roots)
+        return any(
+            root.contains(resolved)
+            for root in self._roots
+            if not need_write or root.access == "write"
+        )
 
     def _entry_path(self, full: Path) -> str:
         """Path to report on a returned entry.
@@ -473,7 +483,7 @@ class CallerProcessFilesystem:
         if not self._absolute(path):
             return _validate_path(path), None
         resolved = self._resolve(path, need_write=True)
-        if self._within_grants(resolved):
+        if self._within_grants(resolved, need_write=True):
             return str(resolved), None
         return str(resolved), resolved
 
@@ -674,9 +684,17 @@ class CallerProcessFilesystem:
                 "    # cache dirs are walked last, and are what a capped scan drops.",
                 "    kept.sort(key=lambda d: d in depri)",
                 "    dirnames[:] = kept",
-                "    scanned += len(kept) + len(filenames)",
+                "    scanned += len(kept)",
                 "    for fname in sorted(filenames):",
-                "        p = os.path.relpath(os.path.join(dirpath, fname), start)",
+                "        # A query matching little or nothing never trips the result",
+                "        # cap, so the walk needs its own bound. Counted per entry:",
+                "        # per-directory would let one huge directory overshoot it.",
+                "        scanned += 1",
+                "        if scanned >= budget:",
+                "            truncated = True",
+                "            break",
+                "        full = os.path.join(dirpath, fname)",
+                "        p = os.path.relpath(full, start)",
                 "        if exc and any(r.match(p) for r in exc):",
                 "            continue",
                 "        if inc and not any(r.match(p) for r in inc):",
@@ -684,19 +702,17 @@ class CallerProcessFilesystem:
                 "        if q not in fname.lower() and q not in p.lower():",
                 "            continue",
                 "        try:",
-                "            st = os.stat(p)",
+                "            # stat the FULL path: p is relative to `start`, but the",
+                "            # helper's cwd is the workspace root, so stat(p) would",
+                "            # miss -- or worse, stat a same-named workspace file.",
+                "            st = os.stat(full)",
                 "            results.append({'n': fname, 'p': p, 's': st.st_size,",
                 "                'm': int(st.st_mtime)})",
                 "        except OSError:",
                 "            results.append({'n': fname, 'p': p, 's': None, 'm': None})",
                 "        if len(results) >= limit:",
                 "            break",
-                "    if len(results) >= limit:",
-                "        break",
-                "    # A query matching little or nothing never trips the result cap,",
-                "    # so the walk needs its own deterministic bound.",
-                "    if scanned >= budget:",
-                "        truncated = True",
+                "    if truncated or len(results) >= limit:",
                 "        break",
                 "print(json.dumps({'r': results, 't': truncated}))",
             ]

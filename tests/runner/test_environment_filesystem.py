@@ -1615,15 +1615,16 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
     """A query matching nothing never fills the result cap, so the walk needs
     its own bound. With the scan budget lowered, a tree larger than the budget
     stops early and says so rather than walking to completion."""
-    import omnigent.runner.environment_filesystem as efs
-
     deep = tmp_path / "many"
     deep.mkdir()
     for i in range(60):
         (deep / f"f{i}.txt").write_text("x")
 
-    monkeypatch.setattr(efs, "_SEARCH_SCAN_BUDGET", 10)
-    fs = efs.CallerProcessFilesystem(
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET",
+        10,
+    )
+    fs = CallerProcessFilesystem(
         create_os_environment(
             OSEnvSpec(
                 type="caller_process",
@@ -1636,6 +1637,39 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
 
     assert entries == []
     assert truncated is True, "a budget-exhausted search must not look like 'no matches'"
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) -> None:
+    """A scoped search must stat the file it actually matched.
+
+    Result paths are relative to the search base, but the helper's cwd is the
+    workspace root -- so statting the relative path either misses or, worse,
+    stats a same-named file under the workspace and reports ITS size/mtime.
+    The workspace decoy here shares the basename and has a very different
+    size, so a regression reports a wrong number rather than merely a null.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "collide.txt").write_text("x" * 500)
+    # Same basename at the workspace root, where a cwd-relative stat lands.
+    (tmp_path / "collide.txt").write_text("y")
+
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+        browse_outside_workspace=True,
+    )
+
+    entries, _truncated = await fs.search_files("collide", path=str(outside))
+
+    assert [e.path for e in entries] == ["collide.txt"]
+    assert entries[0].bytes == 500, "reported the workspace decoy's size, not the matched file's"
 
 
 @pytest.mark.asyncio
