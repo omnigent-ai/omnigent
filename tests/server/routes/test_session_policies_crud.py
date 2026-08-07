@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -255,3 +256,43 @@ async def test_delete_session_policy(client: httpx.AsyncClient, session_id: str)
     # Verify it's gone from the session policies
     get_resp = await client.get(f"/v1/sessions/{session_id}/policies/{pid}")
     assert get_resp.status_code == 404
+
+
+# ── Telemetry ─────────────────────────────────────────────────────────
+
+
+async def test_create_session_policy_emits_telemetry(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """``POST /v1/sessions/{id}/policies`` emits a ``PolicyRegisteredEvent`` with scope='session'."""  # noqa: E501
+    from omnigent.telemetry.events import PolicyRegisteredEvent
+
+    with patch("omnigent.server.routes.session_policies._tel_emit") as mock_emit:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies",
+            json=_policy_payload(),
+        )
+    assert resp.status_code == 200
+
+    mock_emit.assert_called_once()
+    event = mock_emit.call_args[0][0]
+    assert isinstance(event, PolicyRegisteredEvent)
+    assert event.scope == "session"
+    assert event.session_id == session_id
+    assert event.handler == "https://example.com/policies/eval"
+    assert event.policy_type == "url"
+
+
+async def test_create_session_policy_no_telemetry_on_error(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """``POST /v1/sessions/{id}/policies`` does not emit telemetry when the request fails."""
+    with patch("omnigent.server.routes.session_policies._tel_emit") as mock_emit:
+        # Duplicate name → 409 before the emit block is reached.
+        await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload(name="dup"))
+        mock_emit.reset_mock()
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies", json=_policy_payload(name="dup")
+        )
+    assert resp.status_code == 409
+    mock_emit.assert_not_called()
