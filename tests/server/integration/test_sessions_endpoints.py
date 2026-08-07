@@ -8422,3 +8422,69 @@ async def test_message_forward_failure_surfaces_runner_unavailable(
         )
     finally:
         await fake_runner.aclose()
+
+
+async def test_message_forward_rejection_surfaces_failed_with_reason(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner that *rejects* the forward fails the session with the reason.
+
+    Distinct from the transport-failure test above. httpx only raises on
+    transport errors, so a runner that answers ``503 harness_spawn_failed``
+    used to read as a started turn: ``input.consumed`` was published and the
+    session settled ``idle``, masking a real failure as a finished turn. The
+    live runner took nothing, so it must surface as ``failed`` carrying the
+    runner's detail, durably enough to survive a reload.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            return httpx.Response(
+                503,
+                json={
+                    "error": "harness_spawn_failed",
+                    "detail": "harness spawn failed (see runner log)",
+                },
+            )
+        return httpx.Response(202, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        sid = session["id"]
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+        assert resp.status_code == 503, resp.text
+
+        # The rejection is durable: the session reads failed on reload and
+        # last_task_error carries the runner's own reason, not a bare "failed".
+        snap = (await client.get(f"/v1/sessions/{sid}")).json()
+        assert snap["status"] == "failed", snap
+        last_error = snap.get("last_task_error")
+        assert last_error is not None, f"expected a persisted last_task_error, got {snap}"
+        assert last_error["code"] == "runner_rejected_event", last_error
+        assert "harness_spawn_failed" in last_error["message"], last_error
+    finally:
+        await fake_runner.aclose()
