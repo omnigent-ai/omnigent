@@ -40,7 +40,13 @@ from omnigent.inner.os_env import (
     _read_impl,
     _write_impl,
 )
-from omnigent.inner.sandbox import ReachableRoot, is_unconfined, reachable_roots
+from omnigent.inner.sandbox import (
+    ReachableRoot,
+    contained_realpath,
+    containment_prefix,
+    is_unconfined,
+    reachable_roots,
+)
 
 if TYPE_CHECKING:
     from omnigent.inner.os_env import OpResult, OSEnvironment
@@ -289,14 +295,6 @@ def resolve_browse_target(
     """
     if "\x00" in absolute_path:
         raise InvalidPath("Path contains NUL bytes")
-    # Normalize and follow symlinks BEFORE any comparison, so a ".." segment
-    # or a symlink cannot point the final path out of the grant that admitted
-    # it. The resolved path is returned only after the containment check
-    # against `allowed` below. The rule does not recognize that idiom: it is
-    # already open on main for this module's workspace-confined `_resolve`,
-    # which guards the same way.
-    # codeql[py/path-injection]
-    resolved = Path(os.path.normpath(absolute_path)).resolve()
     # An unconfined environment's reach IS the filesystem root — stating it as
     # a root keeps every return below a containment check, rather than having
     # one branch hand back an unchecked path.
@@ -308,8 +306,14 @@ def resolve_browse_target(
     for root in allowed:
         if need_write and root.access != "write":
             continue
-        if root.contains(resolved):
-            return resolved
+        # Resolution happens inside the check, so a ".." segment or symlink
+        # cannot aim the final path out of the grant that admitted it.
+        contained = contained_realpath(absolute_path, root.prefix)
+        if contained is None:
+            continue
+        # A file grant covers exactly one path, not a subtree beneath it.
+        if root.kind == "tree" or contained == str(root.path):
+            return Path(contained)
     raise PathUnreachable(
         f"Path {absolute_path!r} is outside this session's reach",
         [str(root.path) for root in roots],
@@ -376,6 +380,7 @@ class CallerProcessFilesystem:
     def __init__(self, os_env: OSEnvironment, *, browse_outside_workspace: bool = False) -> None:
         self._os_env = os_env
         self._root = Path(os_env.cwd).resolve()
+        self._root_prefix = containment_prefix(self._root)
         policy = getattr(os_env, "sandbox", None)
         if policy is None:
             # Backends that carry no resolved policy keep the historical
@@ -423,16 +428,13 @@ class CallerProcessFilesystem:
         validated = _validate_path(path)
         if not validated:
             return self._root
-        # `_validate_path` above rejects absolute paths and "..", and the
-        # `relative_to` guard below re-checks the RESOLVED path against the
-        # root. An alert for this same line predates this PR on main.
-        # codeql[py/path-injection]
-        full = (self._root / validated).resolve()
-        try:
-            full.relative_to(self._root)
-        except ValueError as exc:
-            raise InvalidPath(f"Path {path!r} escapes the environment root") from exc
-        return full
+        # `_validate_path` rejects absolute paths and "..", but that is a check
+        # on the string; this re-checks the RESOLVED path, which is what stops
+        # an in-workspace symlink pointing outward.
+        contained = contained_realpath(os.path.join(str(self._root), validated), self._root_prefix)
+        if contained is None:
+            raise InvalidPath(f"Path {path!r} escapes the environment root")
+        return Path(contained)
 
     def _absolute(self, path: str) -> bool:
         """Whether this request should be handled as an absolute path.

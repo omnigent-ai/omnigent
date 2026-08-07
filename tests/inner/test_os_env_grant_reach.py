@@ -19,6 +19,7 @@ extension:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,8 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import _handle_helper_request, create_os_environment
 from omnigent.inner.sandbox import (
     SandboxPolicy,
+    contained_realpath,
+    containment_prefix,
     is_unconfined,
     reachable_roots,
     resolve_sandbox,
@@ -570,3 +573,64 @@ async def test_unconfined_write_inside_a_read_grant_still_succeeds(tmp_path: Pat
 
     assert result.created is True
     assert target.read_text() == "written\n"
+
+
+def test_containment_prefix_appends_exactly_one_separator() -> None:
+    """The trailing separator is what makes a prefix comparison sound, so it
+    must be added exactly once — and never doubled on the filesystem root,
+    which would turn "/" into "//" and match nothing."""
+    assert containment_prefix("/data") == "/data" + os.sep
+    assert containment_prefix(Path("/data")) == "/data" + os.sep
+    assert containment_prefix(os.sep) == os.sep
+
+
+def test_contained_realpath_refuses_a_sibling_sharing_a_prefix(tmp_path: Path) -> None:
+    """The classic prefix bug: a boundary at ``/data`` must not admit
+    ``/database``. Guarding with a trailing separator on both sides is exactly
+    what prevents it -- and the boundary directory itself must still match."""
+    root = (tmp_path / "data").resolve()
+    root.mkdir()
+    sibling = (tmp_path / "database").resolve()
+    sibling.mkdir()
+    prefix = containment_prefix(root)
+
+    assert contained_realpath(str(sibling), prefix) is None
+    assert contained_realpath(str(root), prefix) is not None
+
+
+def test_contained_realpath_decides_on_the_symlink_target(tmp_path: Path) -> None:
+    """A symlink INSIDE the boundary that points outside must be refused: the
+    decision is made on the resolved target, not on the path as written."""
+    root = (tmp_path / "ws").resolve()
+    root.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret")
+    (root / "escape.txt").symlink_to(outside)
+    prefix = containment_prefix(root)
+
+    assert contained_realpath(str(root / "escape.txt"), prefix) is None
+    assert contained_realpath(str(root / "ordinary.txt"), prefix) is not None
+
+
+def test_contained_realpath_collapses_dotdot_before_deciding(tmp_path: Path) -> None:
+    """``..`` is resolved before the comparison, so it cannot aim the final
+    path out of the boundary that admitted the string it appeared in."""
+    root = (tmp_path / "ws").resolve()
+    root.mkdir()
+
+    assert contained_realpath(str(root / ".." / "elsewhere"), containment_prefix(root)) is None
+
+
+def test_contained_realpath_returns_an_ordinary_path(tmp_path: Path) -> None:
+    """The trailing separator the comparison needs is an internal detail: it
+    must not leak into the return, or every caller inherits a path shape that
+    breaks string equality against the same path written normally."""
+    root = (tmp_path / "ws").resolve()
+    root.mkdir()
+    target = root / "f.txt"
+    target.write_text("x")
+
+    got = contained_realpath(str(target), containment_prefix(root))
+
+    assert got == str(target)
+    assert not got.endswith(os.sep)

@@ -491,6 +491,57 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     return _get_backend(sandbox_spec.type).resolve(spec, cwd)
 
 
+def containment_prefix(root: str | Path) -> str:
+    """
+    Express *root* as a prefix for a containment test.
+
+    The trailing separator is load-bearing: it is what stops a boundary at
+    ``/data`` from admitting a sibling ``/database``, and — because the
+    candidate is put in the same form — it lets the boundary path itself
+    still match.
+
+    Does NOT resolve: callers pass roots that are already canonical (grant
+    roots are resolved when the policy is built), and re-resolving here
+    would put a filesystem syscall in the agent's per-operation guard.
+
+    :param root: Canonical absolute path, e.g. ``"/data"``.
+    :returns: The same path with one trailing separator, e.g. ``"/data/"``.
+    """
+    text = str(root)
+    return text if text.endswith(os.sep) else text + os.sep
+
+
+def contained_realpath(candidate: str, prefix: str) -> str | None:
+    """
+    Fully resolve *candidate*, returning it only if it stays under *prefix*.
+
+    Resolution happens BEFORE the comparison, so neither a ``..`` segment nor
+    a symlink can aim the final path outside the boundary that admitted it.
+
+    Deliberately ``os.path.realpath`` rather than ``Path.resolve()``: the
+    pathlib form is a filesystem access performed through a path object built
+    from unchecked input, so it acts on the path before this function can vet
+    it. ``realpath`` normalizes the string first. (This is also the shape
+    CodeQL's ``py/path-injection`` recognizes as safe — normalize, then test
+    the prefix — so the guard is machine-checkable rather than a claim in a
+    comment.)
+
+    :param candidate: Path to resolve, e.g. ``"/data/../etc/passwd"``.
+    :param prefix: Boundary from :func:`containment_prefix`.
+    :returns: The resolved absolute path, or ``None`` when it escapes.
+    """
+    # Both sides carry a trailing separator for the comparison — that is what
+    # keeps a boundary at "/data" from admitting "/database", and what lets the
+    # boundary directory itself match. Stripped back off before returning so
+    # callers get an ordinary path.
+    probe = os.path.realpath(candidate)
+    if not probe.endswith(os.sep):
+        probe += os.sep
+    if probe.startswith(prefix):
+        return probe.rstrip(os.sep) or os.sep
+    return None
+
+
 @dataclass(frozen=True)
 class ReachableRoot:
     """
@@ -522,6 +573,17 @@ class ReachableRoot:
     origin: str
     kind: str
 
+    @property
+    def prefix(self) -> str:
+        """
+        This grant's boundary in comparison form — the single definition of
+        "inside", shared by :meth:`contains` and by the callers that must
+        inline the comparison (see :func:`contained_realpath`).
+
+        :returns: :attr:`path` with a trailing separator, e.g. ``"/data/"``.
+        """
+        return containment_prefix(self.path)
+
     def contains(self, resolved: Path) -> bool:
         """
         Whether *resolved* falls inside this grant.
@@ -529,13 +591,12 @@ class ReachableRoot:
         :param resolved: Fully-resolved candidate path.
         :returns: ``True`` when the grant covers it.
         """
-        if self.kind == "file":
-            return resolved == self.path
-        try:
-            resolved.relative_to(self.path)
-        except ValueError:
+        probe = containment_prefix(resolved)
+        if not probe.startswith(self.prefix):
             return False
-        return True
+        # A file grant covers exactly one path; equal prefix lengths means the
+        # candidate IS that path rather than something notionally beneath it.
+        return self.kind == "tree" or len(probe) == len(self.prefix)
 
 
 def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
@@ -559,10 +620,10 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     :param policy: Resolved sandbox policy carrying the declared grants.
     :returns: Grants in precedence order, cwd first. Never empty.
     """
-    # `cwd` is the environment root the runner was launched with, not caller
-    # input; resolving it is what makes the grants comparable to a resolved
-    # candidate path.
-    # codeql[py/path-injection]
+    # Resolving cwd is what makes the grants comparable to a resolved
+    # candidate path. Callers pass a root that is already contained — see
+    # `_session_workspace` / `compute_default_env_root`, which vet it against
+    # the runner workspace before it ever reaches here.
     roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
     roots += [
         ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
