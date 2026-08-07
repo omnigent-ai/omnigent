@@ -222,6 +222,61 @@ def test_non_loopback_single_user_with_auth_enabled_one_keeps_accounts(
     assert _stderr(capsys) == ""
 
 
+@pytest.mark.parametrize("provider", ["accounts", "oidc"])
+def test_non_loopback_single_user_with_explicit_login_provider_is_silent(
+    provider: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit login provider beside the marker suppresses the warning.
+
+    ``OMNIGENT_AUTH_PROVIDER`` wins outright in ``resolve_auth_source``, so
+    identity goes through the cookie path and login *is* required. Claiming
+    unauthenticated exposure here would be false.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", provider)
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    from omnigent.server.auth import resolve_auth_source
+
+    assert resolve_auth_source() == provider
+    assert _stderr(capsys) == ""
+
+
+def test_non_loopback_single_user_with_explicit_header_provider_warns(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit header provider beside the marker still warns.
+
+    Header mode is exactly where the ``"local"`` fallback is reachable, so
+    pinning it deliberately is real exposure — the warning must not be
+    silenced just because the provider was named explicitly.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    assert "unauthenticated" in _stderr(capsys).lower()
+
+
+def test_non_loopback_single_user_with_auth_enabled_zero_warns(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AUTH_ENABLED=0 beside the marker warns: it resolves to header mode.
+
+    The kill-switch is "set" but falsy, so ``resolve_auth_source`` returns
+    ``header`` and the unauthenticated ``"local"`` fallback is live. The
+    exposure is real and must be announced.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    _apply_bind_auth_defaults("0.0.0.0")
+
+    from omnigent.server.auth import resolve_auth_source
+
+    assert resolve_auth_source() == "header"
+    assert "unauthenticated" in _stderr(capsys).lower()
+
+
 def test_loopback_single_user_emits_no_warning(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

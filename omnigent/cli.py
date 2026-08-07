@@ -1141,7 +1141,9 @@ def _apply_bind_auth_defaults(host: str) -> None:
       reachable — 401 on every request and 403 on the host tunnel, i.e. a
       total outage rather than a login prompt. The warning names the
       exposure because this posture serves unauthenticated to anyone who
-      can reach the bind address.
+      can reach the bind address, and fires only when the resolved source
+      is actually ``header`` — an explicit accounts/oidc provider beside
+      the marker still requires login, so there is nothing to warn about.
 
     Uses ``setdefault`` throughout so an operator's explicit value wins.
     Must run before ``create_auth_provider()``, which reads these vars.
@@ -1187,7 +1189,11 @@ def _apply_bind_auth_defaults(host: str) -> None:
             "single-user mode.",
             err=True,
         )
-    elif not _is_loopback_bind and _single_user_requested and not _auth_enabled_explicit:
+    elif not _is_loopback_bind and _single_user_requested and _resolve_auth_source() == "header":
+        # Gated on the *resolved* source, not on whether a provider was pinned:
+        # the exposure exists only in header mode, where the "local" fallback is
+        # reachable. An explicit accounts/oidc provider still requires login, so
+        # warning there would be false.
         click.echo(
             "  ⚠ SECURITY: OMNIGENT_LOCAL_SINGLE_USER=1 is set and you are "
             f"binding to non-local interface {host}.\n"
