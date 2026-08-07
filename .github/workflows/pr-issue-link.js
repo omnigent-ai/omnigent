@@ -126,6 +126,29 @@ const QUERY = `
   }
 `;
 
+// The same node shape as QUERY, for one named PR. `state` and `createdAt` are
+// extra: an event can name a PR that has since closed, or one predating the
+// effective date, and neither should be touched.
+const ONE_PR_QUERY = `
+  query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        number
+        title
+        state
+        createdAt
+        isDraft
+        additions
+        deletions
+        authorAssociation
+        author { login __typename }
+        labels(first: 30) { nodes { name } }
+        body
+      }
+    }
+  }
+`;
+
 // Resolved per PR rather than in the batch search above: the search connection
 // under-reports closingIssuesReferences, and a false "unlinked" verdict is the
 // one mistake that reaches a contributor.
@@ -217,28 +240,49 @@ module.exports = async ({ context, github, core }) => {
       core.warning(`Could not load .github/MAINTAINER: ${err.message}`);
     }
 
-    const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
-    // Never look further back than the effective date, whichever is later.
-    const cutoff = new Date(
-      Math.max(windowStart.getTime(), new Date(EFFECTIVE_FROM).getTime())
-    );
-    const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
-    console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
-
-    let cursor = null;
-    let hasNextPage = true;
+    // One PR when an event names it, the whole window on the cron sweep. Only the
+    // fetch differs: every decision below runs identically either way, so the
+    // instant path and the sweep can never reach different verdicts.
     const allPRs = [];
-    while (hasNextPage) {
-      const response = await github.graphql(QUERY, { cursor, searchQuery });
-      const { remaining, resetAt } = response.rateLimit;
-      console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
-      const { nodes, pageInfo } = response.search;
-      hasNextPage = pageInfo.hasNextPage;
-      cursor = pageInfo.endCursor;
-      allPRs.push(...nodes);
+    const single = Number(process.env.PR_NUMBER) || null;
+    if (single) {
+      const resp = await github.graphql(ONE_PR_QUERY, { owner, repo, number: single });
+      const pr = resp.repository.pullRequest;
+      // The effective date still applies: an event on an older PR is not a licence
+      // to reach into the backlog.
+      if (!pr) {
+        console.log(`#${single} not found; nothing to do.`);
+      } else if (new Date(pr.createdAt) < new Date(EFFECTIVE_FROM)) {
+        console.log(`#${single} predates ${EFFECTIVE_FROM}; skipping.`);
+      } else if (pr.state !== "OPEN") {
+        console.log(`#${single} is ${pr.state}; skipping.`);
+      } else {
+        allPRs.push(pr);
+      }
+      console.log(`Checking #${single} (enforce=${enforce})`);
+    } else {
+      const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+      // Never look further back than the effective date, whichever is later.
+      const cutoff = new Date(
+        Math.max(windowStart.getTime(), new Date(EFFECTIVE_FROM).getTime())
+      );
+      const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+      const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
+      console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
+
+      let cursor = null;
+      let hasNextPage = true;
+      while (hasNextPage) {
+        const response = await github.graphql(QUERY, { cursor, searchQuery });
+        const { remaining, resetAt } = response.rateLimit;
+        console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
+        const { nodes, pageInfo } = response.search;
+        hasNextPage = pageInfo.hasNextPage;
+        cursor = pageInfo.endCursor;
+        allPRs.push(...nodes);
+      }
+      console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
     }
-    console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
 
     const verdicts = [];
     let flagged = 0;

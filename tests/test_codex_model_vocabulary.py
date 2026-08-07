@@ -9,7 +9,7 @@ from omnigent.codex_model_vocabulary import (
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
     clamp_spawn_effort,
-    codex_model_slug,
+    codex_reachable_model_slug,
     codex_spawn_model,
     comparable_model_id,
 )
@@ -105,38 +105,40 @@ def test_comparable_model_id_folds_prefix_dots_and_case() -> None:
 
 
 def test_catalog_id_translates_to_the_codex_slug() -> None:
-    assert codex_model_slug("databricks-gpt-5-6-luna", _CATALOG) == "gpt-5.6-luna"
-    assert codex_model_slug("databricks-gpt-5-6-sol", _CATALOG) == "gpt-5.6-sol"
-    assert codex_model_slug("databricks-gpt-5-5", _CATALOG) == "gpt-5.5"
+    assert codex_reachable_model_slug("databricks-gpt-5-6-luna", _CATALOG) == "gpt-5.6-luna"
+    assert codex_reachable_model_slug("databricks-gpt-5-6-sol", _CATALOG) == "gpt-5.6-sol"
+    assert codex_reachable_model_slug("databricks-gpt-5-5", _CATALOG) == "gpt-5.5"
 
 
 def test_a_codex_slug_translates_to_itself() -> None:
-    assert codex_model_slug("gpt-5.6-luna", _CATALOG) == "gpt-5.6-luna"
+    assert codex_reachable_model_slug("gpt-5.6-luna", _CATALOG) == "gpt-5.6-luna"
 
 
 def test_an_extended_catalog_id_is_already_the_slug() -> None:
     """glm is listed under its catalog spelling, so it must survive intact."""
-    assert codex_model_slug("system.ai.glm-5-2", _CATALOG) == "system.ai.glm-5-2"
-    assert codex_model_slug("glm-5-2", _CATALOG) == "system.ai.glm-5-2"
+    assert codex_reachable_model_slug("system.ai.glm-5-2", _CATALOG) == "system.ai.glm-5-2"
+    assert codex_reachable_model_slug("glm-5-2", _CATALOG) == "system.ai.glm-5-2"
 
 
-def test_an_unknown_id_stays_verbatim() -> None:
-    """Fail-safe: the gateway may still serve it, so send it unchanged."""
-    assert codex_model_slug("databricks-claude-opus-5", _CATALOG) == "databricks-claude-opus-5"
-    assert codex_model_slug("databricks-gpt-5-6-luna", []) == "databricks-gpt-5-6-luna"
+def test_an_id_no_row_names_is_not_reachable() -> None:
+    """A pick outside the live catalog is a decline, not a switch to attempt."""
+    assert codex_reachable_model_slug("databricks-claude-opus-5", _CATALOG) is None
+    # An empty catalog names nothing, so nothing is reachable through it.
+    assert codex_reachable_model_slug("databricks-gpt-5-6-luna", []) is None
+    assert codex_reachable_model_slug("", _CATALOG) is None
 
 
 def test_a_row_naming_a_separate_servable_id_matches_on_either_side() -> None:
     options = [{"id": "gpt-5.5", "model": "databricks-gpt-5-5"}]
 
-    assert codex_model_slug("databricks-gpt-5-5", options) == "gpt-5.5"
-    assert codex_model_slug("gpt-5.5", options) == "gpt-5.5"
+    assert codex_reachable_model_slug("databricks-gpt-5-5", options) == "gpt-5.5"
+    assert codex_reachable_model_slug("gpt-5.5", options) == "gpt-5.5"
 
 
 def test_malformed_rows_are_skipped() -> None:
     options: list[object] = ["nonsense", {"model": "gpt-5.6-luna"}, {"id": "  "}]
 
-    assert codex_model_slug("databricks-gpt-5-6-luna", options) == "databricks-gpt-5-6-luna"  # type: ignore[arg-type]
+    assert codex_reachable_model_slug("databricks-gpt-5-6-luna", options) is None  # type: ignore[arg-type]
 
 
 def test_catalog_prefixes_match_the_claude_vocabulary() -> None:

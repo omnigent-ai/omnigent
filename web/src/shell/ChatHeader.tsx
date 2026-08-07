@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
+import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
@@ -105,6 +106,13 @@ interface ChatHeaderProps {
   conversationId: string | undefined;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
+  /**
+   * The session's ``omnigent.wrapper`` label, or ``null``. Names the vendor
+   * in the sub-agent breadcrumb: a native sub-agent child reuses its
+   * parent's ``<vendor>-native-ui`` agent row, whose name is an Omnigent
+   * internal the user should never see.
+   */
+  wrapperLabel: string | null;
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
   /** Whether the rendered Share controls should be disabled. */
@@ -161,6 +169,7 @@ export function ChatHeader({
   parentSessionId,
   conversationId,
   boundAgent,
+  wrapperLabel,
   canShare,
   shareDisabled = false,
   shareDisabledReason,
@@ -174,6 +183,15 @@ export function ChatHeader({
   onToggleRightPanel,
   mobileMenu,
 }: ChatHeaderProps) {
+  // A native sub-agent (a Claude Code Task, a Codex collab thread) is bound to
+  // its parent's `<vendor>-native-ui` row, so its agent name is an internal
+  // the server itself hides (`public_agent_name`). Name the product instead,
+  // matching the Agents rail and the composer. Every other sub-agent keeps its
+  // own agent name, which is already human-readable. Only the child branch
+  // below reads this, so it stays behind `isChildSession`.
+  const subAgentName = isChildSession
+    ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null)
+    : null;
   return (
     <header
       className={cn(
@@ -236,8 +254,8 @@ export function ChatHeader({
                 <span>Back</span>
               </Link>
             </Button>
-            {/* Divider + sub-agent identity. The agent name (from the bound
-                agent) plus the "Sub-agent" caption make the nesting obvious
+            {/* Divider + sub-agent identity. The name (see ``subAgentName``)
+                plus the "Sub-agent" caption make the nesting obvious
                 on a phone, where the sidebar — and the tree it shows — is
                 collapsed. Falls back to a plain "Sub-agent" label until the
                 agent snapshot resolves, so the two lines never both read
@@ -245,10 +263,10 @@ export function ChatHeader({
             <span aria-hidden className="mx-1 h-5 w-px bg-border" />
             <div className="flex min-w-0 items-center gap-2">
               <BotIcon className="size-4 shrink-0 text-muted-foreground" />
-              {boundAgent?.name ? (
+              {subAgentName ? (
                 <div className="flex min-w-0 flex-col leading-tight">
                   <span className="truncate text-ui font-semibold text-foreground">
-                    {boundAgent.name}
+                    {subAgentName}
                   </span>
                   <span className="text-sm text-muted-foreground">Sub-agent</span>
                 </div>

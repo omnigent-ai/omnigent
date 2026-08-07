@@ -355,6 +355,7 @@ from omnigent.server.routes._sessions.helpers import (
     _attachment_disposition as _attachment_disposition,
     _authorize_bundled_parent_and_inherit_runner as _authorize_bundled_parent_and_inherit_runner,
     _await_settled_managed_launch as _await_settled_managed_launch,
+    _background_task_delivery_status as _background_task_delivery_status,
     _build_actor as _build_actor,
     _build_evaluation_context as _build_evaluation_context,
     _build_new_item as _build_new_item,
@@ -512,7 +513,6 @@ from omnigent.server.routes._sessions.helpers import (
     _stream_live_events as _stream_live_events,
     _strip_pending_author_prefix as _strip_pending_author_prefix,
     _structured_ask_user_question as _structured_ask_user_question,
-    _subagent_delivery_status as _subagent_delivery_status,
     _targeted_elicitation_event as _targeted_elicitation_event,
     _title_content_from_item as _title_content_from_item,
     _truncate_label as _truncate_label,
@@ -527,6 +527,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel as _wait_for_managed_runner_tunnel,
     announce_hosts_changed as announce_hosts_changed,
     cancel_managed_launch_tasks as cancel_managed_launch_tasks,
+    prefetch_session_routing_catalogs as prefetch_session_routing_catalogs,
 )
 
 # Runner-forward / ASK-gate helpers are patched by tests on this facade module
@@ -662,6 +663,9 @@ from omnigent.server.routes._sessions.orchestration import (
     _kick_managed_wake_impl as _kick_managed_wake,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _mark_runner_sessions_offline_impl as _mark_runner_sessions_offline,
+)
+from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
 )
 
@@ -744,6 +748,7 @@ if TYPE_CHECKING:
         "_kick_managed_wake",
         "_launch_runner_on_host",
         "_load_agent_spec_for_session",
+        "_mark_runner_sessions_offline",
         "_poll_request_disconnect",
         "_presentation_labels_for_agent",
         "_publish_runner_recovered_status",

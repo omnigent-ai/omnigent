@@ -1160,6 +1160,129 @@ async def test_child_create_stamp_inherits_the_parents_switch_not_its_cost_contr
     assert child.subagent_routing_override == stamped
 
 
+# ── 7c. A pinned parent cannot create an out-of-family child ───────
+
+
+async def _pinned_parent(
+    client: httpx.AsyncClient,
+    *,
+    agent_name: str,
+    harness: str,
+    routing_on: bool = True,
+) -> str:
+    """Create a parent pinned to *harness*, with Smart Routing on or off.
+
+    :param client: Test HTTP client.
+    :param agent_name: Agent name to register.
+    :param harness: The parent agent's harness, e.g. ``"codex"``.
+    :param routing_on: Whether the parent routes its spawns.
+    :returns: The parent session id.
+    """
+    agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    body: dict[str, Any] = {"agent_id": agent["id"]}
+    if routing_on:
+        body["cost_control_mode_override"] = "on"
+    parent = await client.post("/v1/sessions", json=body)
+    assert parent.status_code == 201, parent.text
+    return str(parent.json()["id"])
+
+
+async def _create_child(
+    client: httpx.AsyncClient,
+    parent_id: str,
+    *,
+    agent_name: str,
+    harness: str,
+) -> httpx.Response:
+    """POST a child create bound to an agent running *harness*.
+
+    :param client: Test HTTP client.
+    :param parent_id: The parent session id.
+    :param agent_name: Agent name to register for the child.
+    :param harness: The child agent's harness, e.g. ``"claude-sdk"``.
+    :returns: The raw create response.
+    """
+    child_agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    return await client.post(
+        "/v1/sessions",
+        json={"agent_id": child_agent["id"], "parent_session_id": parent_id},
+    )
+
+
+async def test_pinned_parent_cannot_create_a_child_in_another_family(
+    client: httpx.AsyncClient,
+) -> None:
+    parent_id = await _pinned_parent(
+        client, agent_name="family-gate-pinned-parent", harness="codex"
+    )
+    child = await _create_child(
+        client, parent_id, agent_name="family-gate-claude-child", harness="claude-sdk"
+    )
+    assert child.status_code == 400, child.text
+    assert "model family" in child.text
+
+
+async def test_pinned_parent_still_creates_children_in_its_own_family(
+    client: httpx.AsyncClient,
+) -> None:
+    parent_id = await _pinned_parent(
+        client, agent_name="family-gate-same-family-parent", harness="codex"
+    )
+    child = await _create_child(
+        client, parent_id, agent_name="family-gate-codex-child", harness="codex"
+    )
+    assert child.status_code == 201, child.text
+
+
+async def test_auto_parent_may_create_a_child_in_another_family(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        name="family-gate-auto-parent",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    child = await _create_child(
+        client,
+        str(parent.json()["id"]),
+        agent_name="family-gate-auto-claude-child",
+        harness="claude-sdk",
+    )
+    assert child.status_code == 201, child.text
+
+
+async def test_plain_parent_may_create_a_child_in_another_family(
+    client: httpx.AsyncClient,
+) -> None:
+    parent_id = await _pinned_parent(
+        client,
+        agent_name="family-gate-plain-parent",
+        harness="codex",
+        routing_on=False,
+    )
+    child = await _create_child(
+        client, parent_id, agent_name="family-gate-plain-claude-child", harness="claude-sdk"
+    )
+    assert child.status_code == 201, child.text
+
+
 # ── 8. Truthful record on a claude-native turn ─────────────────────
 
 
@@ -2044,3 +2167,68 @@ async def test_a_routing_outage_still_delivers_a_child_spawns_turn(
     assert decisions[0].data.model == UNAVAILABLE_MODEL
     assert decisions[0].data.applied is False
     assert decisions[0].data.rationale
+
+
+@pytest.mark.parametrize(
+    ("label", "failure"), ROUTING_FAILURES, ids=[f[0] for f in ROUTING_FAILURES]
+)
+async def test_an_auto_harness_outage_leaves_the_route_once_label_unclaimed(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    label: str,
+    failure: Exception,
+) -> None:
+    """One outage at create must not disable this session's routing for good.
+
+    The auto-harness path stamped the decision label on its own "unavailable"
+    card, and the label is the route-once gate — so a router that was merely
+    down when the session started meant the in-harness hook declined every
+    later prompt as "already routed".
+    """
+    agent = await create_test_agent(
+        client,
+        name=f"routing-outage-auto-{label}",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert created.status_code == 201, created.text
+    session_id = str(created.json()["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.harness_override == "auto"
+
+    await _send_child_message(conv, conv_store, FakeRoutingClient(None, error=failure), "hi")
+
+    after_outage = conv_store.get_conversation(session_id)
+    assert after_outage is not None
+    # The failure is visible…
+    decisions = _routing_decisions(conv_store, session_id)
+    assert len(decisions) == 1
+    assert decisions[0].data.model == UNAVAILABLE_MODEL
+    assert decisions[0].data.applied is False
+    # …but it claimed neither the model nor the route-once label.
+    assert after_outage.model_override is None
+    assert not after_outage.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+    # So the session's first in-harness prompt still routes.
+    healthy = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=healthy)):
+        route = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-turn",
+            json={"harness": "codex-native", "prompt": "refactor auth"},
+        )
+    assert route.status_code == 200, route.text
+    assert route.json()["action"] == "route"
+    assert route.json()["model"] == GPT_MODEL
+    routed = conv_store.get_conversation(session_id)
+    assert routed is not None
+    assert routed.model_override == GPT_MODEL
+    assert routed.labels.get(ROUTING_DECISION_LABEL_KEY)

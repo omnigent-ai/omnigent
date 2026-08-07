@@ -447,9 +447,10 @@ function hasFoldableShape(
  * answer lands in a later bubble.
  *
  * Such a bubble has no visible content to anchor bubble-level chrome to.
- * The copy/fork actions would otherwise hang 40px of near-invisible
- * height off it — but only when the HIDDEN trace happened to contain
- * narration, so consecutive collapsed rows sat 16px or 56px apart with
+ * The copy/fork actions key off ALL the bubble's text, including text
+ * sealed inside the fold, so they would hang a row of hover-only (hence
+ * invisible) height off it — but only when the HIDDEN trace happened to
+ * narrate, leaving consecutive collapsed rows at two different gaps with
  * nothing on screen to explain the difference.
  *
  * Deliberately conservative about the possibly-live last bubble: this

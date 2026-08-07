@@ -13,7 +13,7 @@
 //      hover-revealed trailing chevron and does NOT swap an icon.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -90,12 +90,12 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => withData);
 }
 
-function renderSidebar() {
+function renderSidebar(initialEntry = "/") {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
+        <MemoryRouter initialEntries={[initialEntry]}>
           <Sidebar open={true} onClose={vi.fn()} />
         </MemoryRouter>
       </TooltipProvider>
@@ -179,32 +179,63 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
-  it("matches row height for the centered empty-project container", () => {
+  it("highlights the project row instead of global New session for a project-scoped composer", () => {
+    renderSidebar("/?project=My%20Project");
+
+    const header = headerButton("My Project");
+    expect(header).toHaveAttribute("aria-current", "page");
+    expect(header).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
+    expect(header.querySelector(".lucide-folder")).toHaveClass(
+      "text-[var(--sidebar-active-foreground)]",
+    );
+
+    const newSession = screen.getByTestId("new-chat-button");
+    expect(newSession).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(newSession.querySelector("svg")).toHaveClass("text-muted-foreground");
+  });
+
+  it("shows a left-aligned empty-project message and new-session action", () => {
     renderSidebar();
     fireEvent.click(headerButton("My Project"));
 
-    // Both the flat session list and the expanded project render "No sessions";
-    // this assertion is about the project's indented dashed well.
-    const empty = screen
-      .getAllByText("No sessions")
-      .find((el) => el.classList.contains("sidebar-row"))!;
+    const action = screen
+      .getAllByRole("link", { name: "new session" })
+      .find((link) => link.getAttribute("href") === "/?project=My%20Project")!;
+    const empty = action.closest(".sidebar-row")!;
     expect(empty).toHaveClass(
       "ml-8",
       "mr-2",
       "sidebar-row",
       "h-auto",
       "min-h-0",
-      "py-1.5",
+      "px-0",
+      "py-1",
+      "pb-2",
       "md:py-1",
+      "md:pb-2",
       "justify-center",
       "rounded-[var(--radius-otto-button)]",
-      "border",
-      "border-dashed",
-      "text-center",
-      "text-ui",
+      "items-start",
+      "text-left",
     );
-    // Body tier, not the smaller caption step.
+    expect(empty).not.toHaveClass("border", "border-dashed", "items-center", "text-center");
+    // Both sentences share one body-tier text block.
     expect(empty).not.toHaveClass("min-h-9", "text-sm");
+    const message = empty.querySelector("p")!;
+    expect(message).toHaveClass("text-ui", "text-muted-foreground");
+    const body = message.querySelector("span")!;
+    expect(body).toHaveClass("text-ui");
+    expect(body).toHaveTextContent("No sessions. Start a new session.");
+    expect(body).toContainElement(action);
+    expect(message).toContainElement(action);
+    expect(within(empty as HTMLElement).getByRole("link", { name: "new session" })).toBe(action);
+    expect(action).toHaveAttribute("href", "/?project=My%20Project");
+    expect(action).toHaveClass("text-primary", "hover:underline");
+    expect(action).not.toHaveAttribute("data-slot", "button");
+    expect(action.querySelector("svg")).toBeNull();
   });
 
   it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {

@@ -200,8 +200,9 @@ describe("BubbleView dispatch", () => {
     render(<BubbleView bubble={assistantText("the answer is 42")} />);
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "assistant");
+    expect(bubble).toHaveClass("gap-2");
     expect(bubble).toHaveTextContent("the answer is 42");
-    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
   });
 
   it("uses full-width layout for assistant display math", () => {
@@ -258,8 +259,8 @@ describe("BubbleView dispatch", () => {
 
   it("gives fold-only turns the same chrome whether or not the hidden trace narrated", () => {
     // WHY: the copy/fork row keys off ALL the bubble's text, including text
-    // sealed inside the fold — so an otherwise identical collapsed row grew
-    // 40px of invisible chrome purely because its hidden trace happened to
+    // sealed inside the fold — so an otherwise identical collapsed row grew a
+    // row of hover-only chrome purely because its hidden trace happened to
     // narrate, and consecutive "Worked for" rows sat at two different gaps.
     render(
       <BubbleView

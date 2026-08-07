@@ -14,8 +14,17 @@ import re
 import secrets
 import time
 import urllib.parse
+import weakref
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -93,6 +102,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
+    MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
@@ -152,6 +162,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _MAX_TERMINAL_LAUNCH_ARG_LEN,
     _MAX_TERMINAL_LAUNCH_ARGS,
+    _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
     _MODEL_TOKEN_KEYS,
     _NATIVE_POLICY_NOT_ENFORCED_CODE,
     _NATIVE_TERMINAL_ENSURE_FAILED_CODE,
@@ -169,6 +180,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
     SUBAGENT_ROUTING_OVERRIDE_VALUES,
+    _catalog_prefetch_tasks,
     _logger,
     _managed_launch_tasks,
     _model_options_cache,
@@ -1192,12 +1204,10 @@ def _session_status_with_child_rollup(
     own_status = _session_status_from_cache(conversation_id, db_status)
     if own_status == "running":
         return "running"
-    # A claude-native session can settle to ``idle`` while background shells
-    # keep running; the sticky tally keeps the sidebar spinner lit, matching
-    # the in-chat "N background tasks still running" indicator. (``failed``
-    # clears the tally, so this never masks a failure.)
-    if own_status != "failed" and _session_background_task_count_cache.get(conversation_id, 0) > 0:
-        return "running"
+    # Background shells outliving a turn do NOT make the row running: the
+    # session takes a new message immediately, and the tally only refreshes on
+    # the next ``Stop`` hook, so a spinner keyed off it can outlive the shells.
+    # The in-chat indicator still reports them from the count.
     if any(
         _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
@@ -3125,36 +3135,44 @@ def _is_codex_native_subagent(conv: Conversation) -> bool:
     )
 
 
-def _subagent_delivery_status(
+def _background_task_delivery_status(
     status: str,
     background_task_count: int | None,
     conv: Conversation,
 ) -> str:
-    """Collapse a sub-agent's background-task ``waiting`` back to ``idle``.
+    """Collapse a background-task ``waiting`` back to ``idle``.
 
-    A claude-native session running as an Omnigent sub-agent relabels its
-    ``Stop`` turn-end ``idle`` to ``waiting`` (in the forwarder) when
-    background shells linger, purely so its own UI shows a spinner. But the
-    sub-agent terminal-delivery branch in ``post_event`` keys off
-    ``idle``/``failed``: a ``waiting`` edge would never deliver the child's
-    result to the parent, hanging the orchestrator with no follow-up ``Stop``
-    to recover. The ``background_task_count`` alone already drives the child's
-    spinner at ``idle`` (the in-chat indicator and the sidebar rollup both
-    treat a positive tally as working), so for a sub-agent the turn genuinely
-    ended — deliver ``idle``. Top-level sessions are returned unchanged so the
-    web UI keeps its ``waiting`` shimmer.
+    A claude-native session relabels its ``Stop`` turn-end ``idle`` to
+    ``waiting`` (in the forwarder) while background shells linger. The turn
+    itself is over — the TUI takes a new prompt immediately — so ``waiting``
+    misreports the session as mid-turn everywhere the status is read as a
+    turn gate: the composer queues each send behind "Steer", the sidebar dot
+    spins, and because ``waiting`` keeps ``_session_active_response_cache``
+    populated a reconnect reopens the settled turn's streaming bubble. For a
+    sub-agent it also hangs the orchestrator — the terminal-delivery branch
+    in ``post_event`` keys off ``idle``/``failed`` and no follow-up ``Stop``
+    ever comes.
+
+    The tally alone already drives every background-shell affordance at
+    ``idle`` (the in-chat "N background tasks still running" indicator reads
+    the count, not the status), so deliver ``idle`` and let the count speak
+    for the shells. Normalizing here rather than in the forwarder also covers
+    runners that predate the change.
+
+    Codex-internal children keep ``waiting``: they never emit a claude-native
+    ``Stop`` hook, and their status is consumed inside the app-server thread
+    tree rather than through this delivery branch.
 
     :param status: The incoming external status, e.g. ``"waiting"``.
     :param background_task_count: Parsed background-shell tally, or ``None``.
     :param conv: The conversation the status is for.
-    :returns: ``"idle"`` for a non-codex sub-agent's background-task
-        ``waiting``; otherwise ``status`` unchanged.
+    :returns: ``"idle"`` for a background-task ``waiting`` on any non-codex
+        session; otherwise ``status`` unchanged.
     """
     if (
         status == "waiting"
         and background_task_count is not None
         and background_task_count > 0
-        and conv.kind == "sub_agent"
         and not _is_codex_native_subagent(conv)
     ):
         return "idle"
@@ -3905,7 +3923,13 @@ def _invalidate_runner_backed_snapshot_state(
         the session (agent switch); ``False`` keeps it serving while the
         session has no runner.
     """
+    from omnigent.server.smart_routing import invalidate_runner_catalog
+
     _runner_skills_cache.pop(session_id, None)
+    # Routing's candidate catalog is runner-derived too: a rebind or a relaunch
+    # can change which models the session can be switched onto, so it must not
+    # keep routing off the previous runner's list.
+    invalidate_runner_catalog(session_id)
     if cancel_inflight:
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
@@ -4413,6 +4437,7 @@ async def _provision_managed_sandbox(
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
+    agent_name: str | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -4430,6 +4455,9 @@ async def _provision_managed_sandbox(
     :param host_store: Persistent host registrations.
     :param relaunch_host: Existing host row for a relaunch, or
         ``None`` for a first launch.
+    :param agent_name: Server-resolved built-in agent name the session
+        runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     :returns: The launch result, or ``None`` when the launch failed
         (the tracker entry is already settled with the reason).
     """
@@ -4454,6 +4482,7 @@ async def _provision_managed_sandbox(
                 host=relaunch_host,
                 host_store=host_store,
                 repo=repo,
+                agent_name=agent_name,
                 on_stage=_on_stage,
             )
         return await launch_managed_host(
@@ -4461,6 +4490,7 @@ async def _provision_managed_sandbox(
             owner=owner,
             host_store=host_store,
             repo=repo,
+            agent_name=agent_name,
             on_stage=_on_stage,
         )
     except HTTPException as exc:
@@ -7901,6 +7931,21 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"{PINNED_LABEL_KEY!r} key to pin for yourself",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Sandbox lifecycle labels are written only by server internals and re-read
+    # across a relaunch to rebuild the runner Pod (e.g. the repository it
+    # re-clones). A client seed here would forge that reconstruction state, so
+    # reserve the whole namespace — every current and future key under it —
+    # rather than enumerating one key at a time.
+    sandbox_key = next(
+        (k for k in labels if k.startswith(MANAGED_SANDBOX_LABEL_NAMESPACE)),
+        None,
+    )
+    if sandbox_key is not None:
+        raise OmnigentError(
+            f"label {sandbox_key!r} is in the server-internal "
+            f"{MANAGED_SANDBOX_LABEL_NAMESPACE}* namespace and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _require_cost_control_label_authority(
@@ -8898,6 +8943,126 @@ async def _load_model_options(
         return
 
 
+#: How many sessions may warm their catalogs at once. A tunnel flap reconnects
+#: every session bound to the runner at once, and each warm-up costs a runner
+#: round trip plus a provider listing on a worker thread; the cap keeps that
+#: burst off the executor the concurrent session re-init needs.
+_CATALOG_PREFETCH_CONCURRENCY = 4
+
+#: One semaphore per event loop: the server runs a single loop, but an asyncio
+#: primitive cannot be shared across the loops the test suite creates.
+_catalog_prefetch_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _catalog_prefetch_semaphore() -> asyncio.Semaphore:
+    """
+    Return this loop's catalog-prefetch concurrency gate.
+
+    :returns: The semaphore bounding concurrent prefetches.
+    """
+    loop = asyncio.get_running_loop()
+    semaphore = _catalog_prefetch_semaphores.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(_CATALOG_PREFETCH_CONCURRENCY)
+        _catalog_prefetch_semaphores[loop] = semaphore
+    return semaphore
+
+
+async def _run_catalog_prefetch(
+    coro: Coroutine[Any, Any, Any],
+    session_id: str,
+) -> None:
+    """
+    Run one best-effort catalog prefetch under the concurrency cap.
+
+    Retrieves its own exception: a prefetch is fire-and-forget, so anything it
+    raises (a runner round trip torn down mid-flight, say) would otherwise
+    surface as an unretrieved-task warning and drown real errors. A failure
+    here just leaves a cold cache, which every reader already handles.
+
+    :param coro: The prefetch coroutine to run.
+    :param session_id: Session/conversation identifier, for the log line.
+    """
+    try:
+        async with _catalog_prefetch_semaphore():
+            await coro
+    except asyncio.CancelledError:
+        coro.close()
+        raise
+    except Exception:  # noqa: BLE001 - best-effort warm-up; a cold cache is fine.
+        _logger.debug("Catalog prefetch failed for %s", session_id, exc_info=True)
+
+
+def prefetch_session_routing_catalogs(
+    session_id: str,
+    conv: Conversation,
+    runner_client: httpx.AsyncClient,
+) -> None:
+    """
+    Warm the catalogs routing reads, at session launch instead of at turn time.
+
+    Both are runner-derived, and paying for them while a user's prompt is held
+    is what made a first routed message slow: the native picker vocabulary is
+    awaited by the turn path when its cached entry is stale, and the runner
+    model catalog is a round trip per turn for panes that have no picker
+    vocabulary. Started when the runner binds, both land well before the first
+    prompt; a turn arriving before they finish still falls back to its own
+    inline fetch, so this only ever removes waiting.
+
+    Only routed, live sessions warm anything. Smart Routing is the sole reader
+    of these caches, and the caller reconnects *every* session bound to a
+    runner — a plain-session host with a flapping tunnel would otherwise spend
+    two runner round trips per pane, on nothing, while the session re-init
+    running alongside it waits for the same executor. Archived sessions are
+    skipped for the same reason: nothing is going to route a turn on them.
+
+    Fire-and-forget: a failed prefetch is a cold cache, which every reader
+    already handles.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param conv: Conversation row, read for the routing state and the wrapper
+        label.
+    :param runner_client: HTTP client pointed at the newly bound runner.
+    """
+    from omnigent.runner.subagent_routing import routing_class_from_snapshot
+    from omnigent.server.smart_routing import prefetch_runner_catalog
+
+    if conv.archived:
+        return
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode=conv.cost_control_mode_override,
+        harness_override=conv.harness_override,
+        labels=conv.labels,
+    )
+    if not routing_class.routing_enabled:
+        return
+
+    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(
+        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or ""
+    )
+    if endpoint is not None and session_id not in _model_options_inflight:
+        options_task = asyncio.create_task(
+            _run_catalog_prefetch(
+                _load_model_options(
+                    runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}"
+                ),
+                session_id,
+            )
+        )
+        _model_options_inflight[session_id] = options_task
+        options_task.add_done_callback(
+            lambda _task, sid=session_id: _model_options_inflight.pop(sid, None)
+        )
+    _catalog_prefetch_tasks.add(
+        task := asyncio.create_task(
+            _run_catalog_prefetch(prefetch_runner_catalog(session_id, runner_client), session_id)
+        )
+    )
+    task.add_done_callback(_catalog_prefetch_tasks.discard)
+
+
 async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]] | None:
     """
     Resolve a host's pre-launch claude catalog over its live tunnel.
@@ -8989,6 +9154,7 @@ __all__ = [
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
+    "_background_task_delivery_status",
     "_build_actor",
     "_build_evaluation_context",
     "_build_new_item",
@@ -9161,7 +9327,6 @@ __all__ = [
     "_stream_live_events",
     "_strip_pending_author_prefix",
     "_structured_ask_user_question",
-    "_subagent_delivery_status",
     "_targeted_elicitation_event",
     "_title_content_from_item",
     "_truncate_label",
@@ -9179,4 +9344,5 @@ __all__ = [
     "_wait_for_runner_client",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
+    "prefetch_session_routing_catalogs",
 ]

@@ -13,12 +13,14 @@ import {
   deriveHomeDir,
   deriveRepoName,
   describeCreateError,
+  displayNameForHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   isValidSandboxRepoUrl,
   isValidWorkspace,
   matchSkillInvocation,
   normalizeWorkspacePath,
+  resolveThisMachineHostId,
   sessionsSharingDirectory,
   worktreePathTail,
   NewChatLandingScreen,
@@ -217,6 +219,42 @@ function fsEntry(path: string): HostFilesystemEntry {
 function fakeResponse(status: number, json: () => Promise<unknown>): Response {
   return { status, json } as unknown as Response;
 }
+
+describe("displayNameForHost", () => {
+  const local = { host_id: "host_local", name: "HR4V76FMWY" };
+
+  it("uses an OS-friendly name for a matching host and falls back to its hostname", () => {
+    expect(displayNameForHost(local, "host_local", "Mozilla/5.0 (Macintosh)")).toBe("This Mac");
+    expect(displayNameForHost(local, "host_local", "Mozilla/5.0 (Windows NT 10.0)")).toBe(
+      "This Windows",
+    );
+    expect(displayNameForHost(local, "host_local", "Mozilla/5.0 (X11; Linux x86_64)")).toBe(
+      "This machine",
+    );
+    expect(
+      displayNameForHost(local, "host_local", "Mozilla/5.0 (Linux; Android 15; Pixel 9)"),
+    ).toBe("This Android");
+    expect(
+      displayNameForHost(
+        local,
+        "host_local",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)",
+      ),
+    ).toBe("This iPhone");
+    expect(displayNameForHost(local, "host_local", "Unknown client")).toBe("HR4V76FMWY");
+    expect(displayNameForHost(local, "host_other", "Mozilla/5.0 (Macintosh)")).toBe("HR4V76FMWY");
+    expect(displayNameForHost(local, null, "Mozilla/5.0 (Macintosh)")).toBe("HR4V76FMWY");
+  });
+});
+
+describe("resolveThisMachineHostId", () => {
+  it("prefers Electron identity and only infers a browser host for local single-host servers", () => {
+    expect(resolveThisMachineHostId("host_shell", true, ["host_online"])).toBe("host_shell");
+    expect(resolveThisMachineHostId(null, true, ["host_online"])).toBe("host_online");
+    expect(resolveThisMachineHostId(null, true, ["host_a", "host_b"])).toBeNull();
+    expect(resolveThisMachineHostId(null, false, ["host_online"])).toBeNull();
+  });
+});
 
 // Workspace validation contract — pins the same shape the server
 // validator enforces (per designs/SESSION_WORKSPACE_SELECTION.md):
@@ -842,8 +880,42 @@ describe("NewChatLandingScreen", () => {
     // The home page offers an inline chat box rather than the old
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
-    expect(screen.getByText("What should we build?")).toBeTruthy();
+    expect(screen.getByText("What should we build?")).toHaveClass(
+      "text-[28px]",
+      "leading-8",
+      "font-normal",
+      "tracking-[-0.03em]",
+    );
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+  });
+
+  it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
+    renderLanding();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).toHaveClass(
+      "border-border",
+      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+    );
+    expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
+    expect(composer.className).not.toContain("has-[textarea:focus]:border-");
+  });
+
+  it("matches the session composer internal padding", () => {
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
+      "min-h-[60px]",
+      "max-h-[200px]",
+      "px-4",
+      "pt-3",
+      "pb-2",
+    );
+    expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
+    const footer = screen.getByTestId("new-chat-landing-footer");
+    expect(footer).toHaveClass("py-1.5", "pr-4", "pl-2");
+    expect(footer).not.toHaveClass("-mt-4");
+    expect(footer.parentElement).toHaveClass("gap-1");
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
@@ -1265,7 +1337,10 @@ describe("NewChatLandingScreen", () => {
     mockHosts([]);
     renderLanding();
     // The chip reads the empty state…
-    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("No hosts");
+    const hostChip = screen.getByTestId("new-chat-landing-host-chip");
+    expect(hostChip.textContent).toContain("No hosts");
+    expect(hostChip.querySelector(".bg-success")).toBeNull();
+    expect(hostChip.querySelector(".lucide-monitor")).not.toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     // …and the connect item is still present, so a fresh user can unblock.
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
@@ -1428,7 +1503,7 @@ describe("NewChatLandingScreen", () => {
     expect(banner.textContent).toContain("1 other agent is");
   });
 
-  it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
+  it("keeps footer chip labels compact, muted and truncated", async () => {
     // Land with `?project=` so the branch chip (worktree) renders alongside the
     // others for the truncate-cap assertions.
     renderLanding({}, "/?project=docs");
@@ -1442,9 +1517,25 @@ describe("NewChatLandingScreen", () => {
     // cap would regress the single-row layout this guards.
     const label = (testid: string) => screen.getByTestId(testid).querySelector("span.truncate");
 
+    for (const testid of [
+      "new-chat-landing-workspace-chip",
+      "new-chat-landing-host-chip",
+      "new-chat-landing-branch-chip",
+    ]) {
+      expect(screen.getByTestId(testid)).toHaveClass("text-sm", "text-muted-foreground");
+      expect(label(testid)).toHaveClass("text-sm");
+      expect(label(testid)).not.toHaveClass("text-foreground");
+    }
     expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-40");
     expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
+    expect(
+      screen.getByTestId("new-chat-landing-host-chip").querySelector(".bg-success"),
+    ).not.toBeNull();
+    expect(
+      screen.getByTestId("new-chat-landing-host-chip").querySelector(".lucide-monitor"),
+    ).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent("Worktree");
   });
 
   it("opens the setup dialog and installs an installable harness from it", () => {
@@ -1963,7 +2054,7 @@ describe("NewChatLandingScreen", () => {
     );
     // Sandbox mode chrome comes with the default: repository chip in,
     // workspace/worktree chips out.
-    expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository");
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
   });
 
@@ -2007,7 +2098,7 @@ describe("NewChatLandingScreen", () => {
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
     const hostItem = screen
-      .getAllByText("machine-1")
+      .getAllByText("This machine")
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     expect(
@@ -2017,7 +2108,9 @@ describe("NewChatLandingScreen", () => {
     // worktree chip) — the sandbox default doesn't wedge the normal path.
     fireEvent.click(hostItem!);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
@@ -2942,12 +3035,14 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     const hostItem = screen
-      .getAllByText("machine-1")
+      .getAllByText("This machine")
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     fireEvent.click(hostItem!);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
     );
     // With no custom agents yet, the create item is a top-level row (no
     // "Custom agents" submenu to hide it behind) and opens the dialog.
@@ -2967,11 +3062,13 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     const hostItem = screen
-      .getAllByText("machine-1")
+      .getAllByText("This machine")
       .find((el) => el.closest('[role="menuitem"]') !== null);
     fireEvent.click(hostItem!);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
@@ -3314,6 +3411,53 @@ describe("NewChatLandingScreen smart routing", () => {
     // pinned — a model_override would suppress per-turn routing server-side.
     expect(body.model_override).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  // The prompt rides along on a PINNED native create too, so the server routes
+  // the model before the pane launches. Routing after the fact means holding
+  // the first prompt inside the harness and replaying it, which the user sees
+  // as their own message vanishing for seconds.
+  it.each([
+    ["Claude Code", "a1"],
+    ["Codex", "a2"],
+  ] as const)("sends the routing message on a pinned %s create", async (_label, agentId) => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pinned_routed" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentConfig(agentId);
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+
+    const { body } = await submitAndReadBody("refactor the auth module");
+    expect(body.agent_id).toBe(agentId);
+    expect(body.cost_control_mode_override).toBe("on");
+    // Routes only — the real message is still delivered after navigation.
+    expect(body.smart_routing_message).toBe("refactor the auth module");
+    // The harness is the user's own pick — the bound wrapper agent names it —
+    // so only the model is routed, and nothing pins one.
+    expect(body.harness_override).not.toBe("auto");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("sends no routing message on a pinned harness with routing off", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pinned_plain" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const { body } = await submitAndReadBody("refactor the auth module");
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
   });
 
   // Sticky Smart Routing: the pick is remembered per harness in the same
@@ -4444,6 +4588,9 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       expect(body.reasoning_effort).toBeUndefined();
       expect(body.labels).toBeUndefined();
       expect(body.terminal_launch_args).toBeUndefined();
+      // A bundle agent arms at create and routes on the first message event —
+      // its harness isn't decided yet, so there is nothing to route here.
+      expect(body.smart_routing_message).toBeUndefined();
       expect(raw).not.toContain("permission");
     },
   );

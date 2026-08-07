@@ -55,6 +55,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   }),
 }));
 
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
@@ -368,6 +369,31 @@ describe("composerHarnessLabel", () => {
 
   it("reads SDK agents as '<Agent> (<Harness>)'", () => {
     expect(composerHarnessLabel(null, "polly", "pi")).toBe("Polly (Pi)");
+  });
+
+  // A Claude Code sub-agent's sub_agent_name is the Task tool's
+  // `subagent_type` ("general-purpose"), and the child reuses the parent's
+  // claude-native agent row — so without the wrapper the label reads
+  // "General-purpose" instead of naming the product running it.
+  it("reads a native sub-agent child as its vendor, not the vendor-side agent type", () => {
+    expect(
+      composerHarnessLabel(
+        null,
+        "general-purpose",
+        "claude-native",
+        BRAIN_HARNESS_LABELS,
+        "claude-code-native-ui-subagent",
+      ),
+    ).toBe("Claude Code");
+    expect(
+      composerHarnessLabel(
+        null,
+        "reviewer",
+        null,
+        BRAIN_HARNESS_LABELS,
+        "codex-native-ui-subagent",
+      ),
+    ).toBe("Codex");
   });
 
   it("falls back to the agent name alone when the harness is unmapped", () => {

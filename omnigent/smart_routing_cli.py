@@ -1,22 +1,17 @@
-"""CLI-side Smart Routing: pick a harness/model *before* the TUI launches.
+"""CLI-side Smart Routing: arm a session so its harness routes what you type.
 
-``omnigent claude --smart-routing -p "..."`` (tier 2) and
-``omnigent run --smart-routing -p "..."`` (tier 3) both need a routing verdict
-in hand before a native wrapper starts, because the harness pick is physical
-(a session *is* a live ``claude``/``codex`` process) and the model is applied
-as a launch flag. The web UI gets the same verdict server-side at session
-create; the CLI takes the same path — it creates the session itself through the
-standard JSON ``POST /v1/sessions`` with the routing contract fields, reads the
-resolved ``harness`` / ``model_override`` back off the response, and attaches
-the matching native wrapper to that session. One session, routed at create: the
-row already carries the agent binding, the wrapper's presentation labels, the
-routed model, and the routing decision card, so the launched session shows the
-same chip and provenance the web UI gets.
+``omnigent claude --smart-routing`` and ``omnigent codex --smart-routing`` are
+the only CLI entry points. Neither routes anything before the TUI starts: the
+CLI creates the session through the standard JSON ``POST /v1/sessions`` with
+``cost_control_mode_override="on"`` and no ``smart_routing_message``, then
+attaches the native wrapper to it. The harness's own first-message hook picks
+the model once the user types. Routing a prompt at create time is the web UI's
+job — it is the surface that can show and change the pick before the session
+runs.
 
-A harness that routes its own first typed message needs no prompt up front:
-the create then only turns Smart Routing on for the session (no
-``smart_routing_message``), and the in-harness hook picks the model when the
-user types.
+Because the session is created here rather than bundled by the wrapper, the row
+already carries the agent binding, the wrapper's presentation labels, and the
+Smart Routing mode the hook's server-side gate reads.
 
 Two rules shape everything here:
 
@@ -24,9 +19,9 @@ Two rules shape everything here:
   serve means the pick could not be applied — say so and stop. A family
   whose inference is not AI-Gateway-backed is not that case: it downgrades to the server's built-in
   router, and only fails when there is no built-in router either.
-* **Routing itself fails open.** Once preflight passes, any router failure
-  (missing verdict, HTTP error, unreachable server) returns a decision with a
-  one-line notice and no pick. The launch always happens.
+* **Arming itself fails open.** Once preflight passes, a create the server
+  rejects (or cannot answer) returns a one-line notice and no session, and the
+  wrapper launches its own. The launch always happens.
 """
 
 from __future__ import annotations
@@ -41,19 +36,13 @@ import httpx
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 from omnigent.native_coding_agents import native_coding_agent_for_harness
-
-CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
-
-#: Sentinel ``harness_override`` that asks the server to route the harness too.
-AUTO_HARNESS = "auto"
 
 #: Provenance label on a CLI-routed session. The server merges the wrapper's
 #: own presentation labels (``omnigent.ui`` / ``omnigent.wrapper``) over it.
 ROUTING_SESSION_LABELS = {"omnigent.smart_routing": "cli-route"}
 
-#: Budget for the routed ``POST /v1/sessions``. Generous on the read because
+#: Budget for the armed ``POST /v1/sessions``. Generous on the read because
 #: this is a session CREATE, not a routing call: it validates the workspace on
 #: the host, may cut a worktree, and resolves a pre-launch model catalog. A
 #: short budget here would abandon creates that were merely slow and drop the
@@ -69,45 +58,20 @@ _PREFLIGHT_TIMEOUT = httpx.Timeout(5.0)
 
 
 @dataclass(frozen=True)
-class RoutingDecision:
+class ArmedSession:
     """
-    The routed session the CLI attaches to, and what the router picked.
+    The session the CLI armed for Smart Routing, and what to say about it.
 
     :param session_id: The created session, e.g. ``"conv_abc123"``. The wrapper
         attaches to this instead of bundling its own. ``None`` when the create
         failed — the caller then launches a fresh wrapper session.
-    :param harness: Canonical harness bound to the session, e.g.
-        ``"codex-native"`` (for an ``"auto"`` create the server rebinds the
-        agent to the wrapper it picked). ``None`` when it could not be read.
-    :param model: Routed model id, e.g. ``"databricks-claude-sonnet-4-6"``.
-        ``None`` means launch on the harness default.
-    :param notice: One user-facing line explaining a missing pick, e.g.
-        ``"omnigent: Smart Routing was unavailable (...)"``. ``None`` when the
-        router answered.
+    :param notice: One user-facing line explaining why the session was not
+        armed, e.g. ``"omnigent: Smart Routing was unavailable (...)"``.
+        ``None`` when the create succeeded.
     """
 
     session_id: str | None
-    harness: str | None
-    model: str | None
     notice: str | None
-
-
-def smart_routing_families(harness: str | None) -> tuple[str, ...]:
-    """
-    Harness families whose inference must be gateway-backed for *harness*.
-
-    A fixed-harness route only applies to that harness's pane. The auto route
-    picks across the claude + codex arms, so it needs both — mirroring the web's
-    per-surface gating (top-level Smart Routing needs both; a per-harness
-    Model row needs only its own).
-
-    :param harness: Canonical harness id, or ``None`` / :data:`AUTO_HARNESS`
-        for the auto route.
-    :returns: Harness ids to check, e.g. ``("claude-native", "codex-native")``.
-    """
-    if harness is None or harness == AUTO_HARNESS:
-        return ("claude-native", "codex-native")
-    return (harness,)
 
 
 def local_gateway_inference() -> dict[str, bool]:
@@ -224,52 +188,35 @@ def _routing_sources(info: dict[str, Any]) -> dict[str, bool]:
     return {"external": raw.get("external") is True, "oss": raw.get("oss") is True}
 
 
-def create_smart_routing_session(
+def arm_smart_routing_session(
     *,
     base_url: str,
-    prompt: str | None,
-    harness: str | None,
+    harness: str,
     host_id: str | None = None,
     workspace: str | None = None,
-) -> RoutingDecision:
+) -> ArmedSession:
     """
-    Create the routed session, and read the verdict back off the create.
+    Create the session with Smart Routing on, and nothing routed yet.
 
-    Sends the routing contract — ``cost_control_mode_override="on"``, the
-    ``smart_routing_message`` (prompt-ful create only), and (auto route only)
-    ``harness_override="auto"``; a fixed harness comes from the bound wrapper
-    agent, so it needs no override. The response carries the resolved
-    ``harness`` and ``model_override``, with the session snapshot as a fallback.
-    This is the session the wrapper attaches to — nothing is deleted.
+    Sends ``cost_control_mode_override="on"`` — the mode the harness hook's
+    server-side gate reads — bound to *harness*'s own wrapper agent. No
+    ``smart_routing_message``, so the create routes nothing: the model is picked
+    in-session when the user types their first message. This is the session the
+    wrapper attaches to; nothing is deleted.
 
-    Two modes, split by *prompt*:
-
-    * **With a prompt** the message triggers the create-time route, so the
-      response is expected to carry a model and a missing one earns a notice.
-    * **Without one** only the mode override is sent: Smart Routing is on for
-      the session, but nothing is routed yet — the harness's own first-message
-      hook picks the model in-session, so an empty ``model_override`` is the
-      normal answer and carries no notice.
-
-    Never raises: a create the server rejects (including the auto route's
-    "no native CLI on this host") yields a decision with no session and a
-    notice, and the caller launches a fresh wrapper session instead.
+    Never raises: a create the server rejects yields no session and one notice,
+    and the caller launches a fresh wrapper session instead.
 
     :param base_url: Omnigent server base URL.
-    :param prompt: The user's ``-p`` text. Routed, not dispatched — the TUI
-        delivers it as its own first input. ``None`` creates a bare routed
-        session that routes nothing at create time.
-    :param harness: Canonical harness to pin, or ``None`` for the auto route.
+    :param harness: Canonical native harness to bind, e.g. ``"claude-native"``.
     :param host_id: Host this session will run on, e.g. ``"host_abc123"``.
-        Needed for a real verdict: the server builds the candidate model
-        catalog by round-tripping the bound host's model-options frames, so a
-        hostless create gives the router an empty menu. ``None`` (the server
-        does not know this host yet) still routes, over whatever it can resolve
-        without one.
+        Binding it lets the server resolve the pane's model catalog for the
+        in-session route. ``None`` (the server does not know this host yet)
+        still creates the session.
     :param workspace: Absolute workspace path on *host_id* — the launch cwd.
         Required by the server whenever ``host_id`` is set (it is validated
         against the agent's cwd boundary), so it is sent only with *host_id*.
-    :returns: The :class:`RoutingDecision` to launch on.
+    :returns: The :class:`ArmedSession` to launch on.
     """
     body: dict[str, Any] = {
         "agent_id": _routing_agent_id(harness),
@@ -277,22 +224,11 @@ def create_smart_routing_session(
         "labels": dict(ROUTING_SESSION_LABELS),
         "cost_control_mode_override": "on",
     }
-    if prompt is not None:
-        # The message is what routes at create time; a bare create only turns
-        # Smart Routing on and leaves the pick to the in-harness hook.
-        body["smart_routing_message"] = prompt
-    if harness is None:
-        # Auto route: the sentinel tells the server to pick the harness and
-        # rebind the session's agent to that wrapper.
-        body["harness_override"] = AUTO_HARNESS
     if host_id is not None:
         body["host_id"] = host_id
         # host_id without workspace is a 400 — the server stats the path on the
         # host to validate the agent's cwd boundary.
         body["workspace"] = workspace
-    session_id: str | None = None
-    picked_harness: str | None = None
-    picked_model: str | None = None
     try:
         with httpx.Client(
             base_url=base_url, headers=_headers(base_url), timeout=_TIMEOUT
@@ -303,69 +239,43 @@ def create_smart_routing_session(
             payload = _json_object(resp)
             raw_id = payload.get("id") or payload.get("session_id")
             session_id = raw_id if isinstance(raw_id, str) and raw_id else None
-            # ``harness`` (not ``harness_override``) is the resolved harness on
-            # SessionResponse; native rows leave the override null on purpose.
-            picked_harness = _clean_str(payload.get("harness"))
-            picked_model = _clean_str(payload.get("model_override"))
-            if (picked_model is None or picked_harness is None) and session_id is not None:
-                snapshot = _json_object(client.get(f"/v1/sessions/{session_id}"))
-                picked_harness = picked_harness or _clean_str(snapshot.get("harness"))
-                picked_model = picked_model or _clean_str(snapshot.get("model_override"))
     except httpx.HTTPError as exc:
         return _unavailable(f"could not reach {base_url}: {exc}")
     if session_id is None:
         return _unavailable("the create returned no session id")
-    # A bare create routes nothing yet, so an empty model is expected there and
-    # only a prompt-ful create that came back without one is worth reporting.
-    notice = (
-        None
-        if picked_model is not None or prompt is None
-        else (
-            "omnigent: Smart Routing did not pick a model for this session; "
-            "launching on the harness default."
-        )
-    )
-    return RoutingDecision(
-        session_id=session_id,
-        harness=picked_harness,
-        model=picked_model,
-        notice=notice,
-    )
+    return ArmedSession(session_id=session_id, notice=None)
 
 
-def _unavailable(reason: str) -> RoutingDecision:
+def _unavailable(reason: str) -> ArmedSession:
     """
-    Build the fail-open decision for *reason*.
+    Build the fail-open result for *reason*.
 
     :param reason: Short cause, e.g. ``"the create returned no session id"``.
-    :returns: A decision with no session and one user-facing notice line.
+    :returns: A result with no session and one user-facing notice line.
     """
-    return RoutingDecision(
+    return ArmedSession(
         session_id=None,
-        harness=None,
-        model=None,
         notice=(
-            f"omnigent: Smart Routing was unavailable ({reason}); "
-            "launching on the default harness/model."
+            f"omnigent: Smart Routing was unavailable ({reason}); launching on the default model."
         ),
     )
 
 
-def _routing_agent_id(harness: str | None) -> str:
+def _routing_agent_id(harness: str) -> str:
     """
-    Built-in agent to bind the routing session to.
+    Built-in agent to bind the armed session to.
 
-    The bound agent only has to exist — the routing verdict rides on the
-    session row, not the agent. A fixed harness uses its own ``*-native-ui``
-    built-in; the auto route uses the claude-native built-in, which every
-    server seeds.
+    The bound agent only has to exist and carry the right wrapper — Smart
+    Routing rides on the session row, not the agent.
 
-    :param harness: Canonical harness id, or ``None`` for the auto route.
+    :param harness: Canonical harness id, e.g. ``"codex-native"``.
     :returns: A deterministic built-in agent id.
+    :raises ValueError: When *harness* has no native wrapper agent.
     """
-    native = native_coding_agent_for_harness(harness) if harness else None
-    name = native.agent_name if native is not None else CLAUDE_NATIVE_AGENT_NAME
-    return builtin_agent_id(name)
+    native = native_coding_agent_for_harness(harness)
+    if native is None:
+        raise ValueError(f"{harness!r} has no native wrapper agent to bind")
+    return builtin_agent_id(native.agent_name)
 
 
 def known_host_id(*, base_url: str, host_id: str | None) -> str | None:
@@ -482,13 +392,3 @@ def _json_object(resp: httpx.Response) -> dict[str, Any]:
     except (json.JSONDecodeError, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
-
-
-def _clean_str(value: Any) -> str | None:
-    """
-    Normalize a wire value to a non-empty string.
-
-    :param value: Raw JSON value, e.g. ``"codex-native"`` or ``None``.
-    :returns: The stripped string, or ``None`` when it is not usable.
-    """
-    return value.strip() if isinstance(value, str) and value.strip() else None

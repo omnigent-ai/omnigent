@@ -98,6 +98,7 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     configure_process_logging,
+    display_log_path,
     env_truthy,
     open_process_log_file,
     process_log_dir,
@@ -166,21 +167,6 @@ def _runner_log_dir() -> Path:
         ``<data-dir>/logs/runner``.
     """
     return process_log_dir("runner")
-
-
-def _display_log_path(path: Path) -> str:
-    """Format a log path for display, collapsing the home prefix to ``~``.
-
-    :param path: Absolute path, typically under the user's state dir, e.g.
-        ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
-    :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
-        otherwise ``str(path)``.
-    """
-    try:
-        return f"~/{path.relative_to(Path.home())}"
-    except ValueError:
-        # Not under $HOME (e.g. an OMNIGENT_DATA_DIR outside home).
-        return str(path)
 
 
 # Max bytes read from the end of a dead runner's log when composing an
@@ -280,7 +266,7 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     message = "runner process exited"
     if exit_code is not None:
         message += f" with code {exit_code}"
-    message += f" (log on host: {_display_log_path(log_path)})"
+    message += f" (log on host: {display_log_path(log_path)})"
     tail = _read_log_tail(log_path)
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
@@ -1312,7 +1298,7 @@ class HostProcess:
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
         print(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
-            f"    log: {_display_log_path(log_path)}"
+            f"    log: {display_log_path(log_path)}"
             f"{session_line}",
             flush=True,
         )
@@ -2901,13 +2887,13 @@ def run_host_process(
     # work goes to per-runner files under the runner dir (the exact
     # file is printed when each runner launches). The host process's
     # own diagnostics go to the host destination.
-    print(f"Session logs: {_display_log_path(_runner_log_dir())}/")
-    print(f"This host's log: {_display_log_path(host_log_path)}")
+    print(f"Session logs: {display_log_path(_runner_log_dir())}/")
+    print(f"This host's log: {display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
-        print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
+        print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
     host = HostProcess(identity, server_url)
     try:

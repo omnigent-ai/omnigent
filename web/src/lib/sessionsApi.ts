@@ -11,7 +11,6 @@
 // wire fields.
 
 import type { ConversationItem } from "./conversationItems";
-import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
@@ -829,64 +828,21 @@ export async function fetchSessionItemsPage(
   return { items: [...page.data].reverse(), hasMore: page.has_more };
 }
 
-/** Pages allowed while looking for the previous user-message boundary. */
-export const MAX_INITIAL_PAGES = 8;
-
-/** A real (non-meta) user prompt — the boundary the initial window snaps to. */
-function isUserPrompt(item: ConversationItem): boolean {
-  return isMessageItem(item) && item.role === "user" && !item.is_meta;
-}
-
 /**
- * The prompt boundary is complete after two real prompts or the page cap.
- * The cap applies only to this semantic target, not viewport filling.
+ * Items the initial window requests, in one round trip.
+ *
+ * Opening a session must not keep fetching afterwards: growing the window
+ * from the transcript's layout effect meant the reader watched history land
+ * for seconds after the page had already settled, with the content shifting
+ * under them each time — and they never asked for it. So the open pays for a
+ * single, larger page instead, and older history is fetched only when they
+ * actually scroll up.
+ *
+ * Sized to cover the previous prompt for a normal turn without the walk this
+ * replaces; a tool-heavy turn can still run longer, and reaching further back
+ * is then the reader's scroll, not a background fetch.
  */
-export function initialWindowComplete(userPromptCount: number, pagesFetched: number): boolean {
-  return userPromptCount >= 2 || pagesFetched >= MAX_INITIAL_PAGES;
-}
-
-/**
- * Hydrate the initial conversation window: at least
- * `SESSION_HISTORY_PAGE_SIZE` items, but extended further back when
- * needed so the *previous* user prompt is included — i.e.
- * `max(one page, back-to-previous-user-message)`.
- *
- * Why: the flat page size can land mid-turn for a long turn (many tool
- * calls after the last user message), so the user opens the chat to a
- * response with no visible prompt above it. We page backward until we've
- * collected two non-meta user messages (the last turn's prompt plus the
- * one before it) AND met the item floor, so the last full exchange and
- * its preceding prompt are always on screen.
- *
- * Cost: the common case (a page that already holds ≥2 user prompts) is a
- * single request, identical to `fetchSessionItemsPage`. Extra requests
- * fire only for long single turns — exactly the case this targets.
- * Bounded by `MAX_INITIAL_PAGES`.
- *
- * Returns the same `{ items, hasMore }` shape as `fetchSessionItemsPage`
- * so callers feed `oldestItemId` / `hasMoreHistory` from it unchanged.
- */
-export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
-  let items: ConversationItem[] = [];
-  let hasMore = true;
-  // Each page starts before the cursor returned by the prior page.
-  /* oxlint-disable no-await-in-loop */
-  for (let pagesFetched = 1; pagesFetched <= MAX_INITIAL_PAGES; pagesFetched += 1) {
-    const cursor = items[0]?.id;
-    const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
-    items = [...page.items, ...items]; // prepend the older page
-    hasMore = page.hasMore;
-    if (!hasMore) break; // reached the start of the conversation
-    const userPromptCount = items.filter(isUserPrompt).length;
-    if (initialWindowComplete(userPromptCount, pagesFetched)) break;
-    if (!items[0]?.id) break; // no cursor to page further; avoid a spin
-  }
-  /* oxlint-enable no-await-in-loop */
-  // If the cap stopped us before the previous user prompt (a pathological
-  // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
-  // the rest remains reachable via scroll-up — same fallback as the default.
-  return { items, hasMore };
-}
+export const INITIAL_WINDOW_ITEMS = 100;
 
 /**
  * Flatten a `GET /v1/sessions/{id}` item into the flat

@@ -591,6 +591,7 @@ async def _best_effort_stop(
     try:
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
         status = _session_status_with_child_rollup(session_id, descendant_ids)
+        own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
@@ -599,7 +600,13 @@ async def _best_effort_stop(
         )
         return
 
-    if status != "running":
+    # Background shells outlive their turn without making the session read as
+    # running (the sidebar must not spin for an ended turn), but they are live
+    # work on the runner — a destructive action still has to stop them.
+    has_background_tasks = (
+        own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
+    )
+    if status != "running" and not has_background_tasks:
         return
 
     async def _stop(target_id: str) -> None:
@@ -612,10 +619,6 @@ async def _best_effort_stop(
                 exc_info=True,
             )
 
-    own_status = _session_status_from_cache(session_id)
-    has_background_tasks = (
-        own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
-    )
     if own_status == "running" or has_background_tasks:
         await _stop(session_id)
     for descendant_id in descendant_ids:
@@ -2402,6 +2405,63 @@ async def _publish_runner_recovered_status_impl(
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
+async def _mark_runner_sessions_offline_impl(
+    convs: list[Conversation],
+    error: ErrorDetail,
+    conversation_store: ConversationStore,
+    *,
+    fail_idle_top_level: bool = False,
+) -> None:
+    """
+    Fail the sessions a departed runner actually interrupted, with the cause.
+
+    A runner going away ends in-flight turns; it does not retroactively
+    fail work that already finished. Sub-agents ride their parent's runner,
+    so the departure reaches every child bound to it — marking the idle
+    ones ``failed`` painted a whole Agents rail red for sub-agents that had
+    completed successfully. The runner's absence is already carried by
+    liveness (``clear_runner_liveness``), which is what drives the
+    reconnect affordances, so a session that was not mid-turn needs no
+    status edge at all.
+
+    The sessions that DO get failed carry the cause, persisted as durable
+    labels. The cause is what lets the client render a benign
+    "Disconnected" instead of a red "Failed", and what lets
+    :func:`_publish_runner_recovered_status` clear the state when the
+    runner comes back — that helper only clears a failure it can identify
+    as a disconnect.
+
+    :param convs: Conversations bound to the departed runner, from
+        :meth:`ConversationStore.list_conversations_by_runner_id`.
+    :param error: The cause to publish and persist, e.g.
+        ``ErrorDetail(code="runner_disconnected", message="...")``.
+    :param conversation_store: Store used to persist the error labels.
+    :param fail_idle_top_level: When ``True``, also fail an idle top-level
+        session. A crash report covers the runner that died *before* it
+        could run anything, so its session never reached ``running`` and
+        would otherwise sit silent; a sub-agent is spawned by an
+        already-live runner and can never be in that state, so idle
+        children are skipped either way.
+    :returns: None.
+    """
+    for conv in convs:
+        # An intentional teardown (Stop / archive) drops the tunnel on
+        # purpose. The relay owns that path — it publishes a quiet idle and
+        # consumes the marker — so peek without discarding here.
+        if conv.id in _intentional_stop_sessions:
+            continue
+        # Cache first (this replica holds the runner's tunnel, so it saw the
+        # turn edges), falling back to the row for a session whose live state
+        # was published before a restart.
+        live = _session_status_cache.get(conv.id, conv.live_status)
+        interrupted = live in ("running", "waiting")
+        dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
+        if not interrupted and not dead_on_arrival:
+            continue
+        _publish_status(conv.id, "failed", error)
+        await _persist_session_status_error_labels(conv.id, error, conversation_store)
+
+
 async def _wait_for_host_bound_runner_client(
     session_id: str,
     runner_router: RunnerRouter | None,
@@ -2499,6 +2559,8 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    agent_store: AgentStore | None = None,
+    agent_id: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2547,7 +2609,31 @@ async def _run_managed_launch(
     :param relaunch_host: Existing managed host row to relaunch a new
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
+    The runner's agent classifier is resolved here rather than by the
+    caller, so the read runs on the task that already owns the
+    single-flight claim: the request path keeps no ``await`` between
+    claiming and spawning, and only the winning caller reaches this
+    function, so a losing concurrent message pays nothing for it. It is
+    re-derived on every launch through the built-in gate, so there is no
+    stored classifier to keep in sync — or to forge.
+
+    :param agent_store: Store the classifier is resolved from, or
+        ``None`` (a stripped test wiring) to leave the runner
+        unclassified.
+    :param agent_id: Agent the session is bound to, resolved through the
+        built-in gate into the runner Pod's ``omnigent.ai/agent``
+        classifier, or ``None`` to leave it unstamped.
     """
+    from omnigent.server.managed_hosts import resolve_managed_agent_label
+
+    agent_name: str | None = None
+    if agent_store is not None and agent_id is not None:
+        agent_name = await asyncio.to_thread(
+            resolve_managed_agent_label,
+            agent_store,
+            agent_id,
+            session_id=session_id,
+        )
     managed = await _provision_managed_sandbox(
         session_id=session_id,
         owner=owner,
@@ -2556,6 +2642,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        agent_name=agent_name,
     )
     if managed is None:
         return
@@ -3014,21 +3101,31 @@ def _kick_managed_relaunch(
     """
     Register and spawn the background relaunch for a dead sandbox.
 
-    Recovers the session's create-time repository workspace from its
-    label so the fresh generation re-clones it, registers the tracker
-    entry, and schedules :func:`_run_managed_launch` with the existing
-    host row.
+    Recovers the session's create-time repository workspace from its label so
+    the fresh generation re-clones it, claims the single-flight tracker entry,
+    and schedules :func:`_run_managed_launch` with the existing host row. The
+    new Pod re-hits admission, so its ``omnigent.ai/agent`` classifier is
+    re-stamped — resolved by the launch task through the same built-in gate the
+    initial launch uses, never read from a stored label.
+
+    Stays synchronous so no ``await`` falls between the caller's
+    ``tracker.get`` check and the ``tracker.begin`` claim, and none falls
+    between that claim and the task that settles it.
 
     :param session_id: Session/conversation identifier.
-    :param conv: The session row (supplies the repo label).
+    :param conv: The session row (supplies the repo label and bound agent).
     :param host: The dead managed host row to relaunch.
     :param sandbox_config: The deployment's sandbox config.
     :param tracker: The app's launch tracker.
     :param conversation_store: Store holding the session row.
     :param host_store: Persistent host registrations.
-    :param app_state: ``request.app.state`` — supplies the registries.
+    :param app_state: ``request.app.state`` — supplies the registries and the
+        agent store the classifier is re-derived from.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, parse_repo_workspace
+    from omnigent.server.managed_hosts import (
+        MANAGED_REPO_LABEL_KEY,
+        parse_repo_workspace,
+    )
 
     # Re-clone the repository the session was created with so the
     # fresh generation's workspace matches the create-time state.
@@ -3057,6 +3154,12 @@ def _kick_managed_relaunch(
     # Seed the relaunch's progress indicator immediately — the user is
     # typically watching the session page when "wake the sandbox" runs.
     _publish_sandbox_status(session_id, "provisioning")
+    agent_store = getattr(app_state, "agent_store", None)
+    if agent_store is None:
+        _logger.warning(
+            "session %s: relaunch has no agent store; runner stays unclassified",
+            session_id,
+        )
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
             session_id=session_id,
@@ -3069,6 +3172,8 @@ def _kick_managed_relaunch(
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             relaunch_host=host,
+            agent_store=agent_store,
+            agent_id=conv.agent_id,
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -3973,17 +4078,27 @@ async def _refresh_stale_native_model_options(
     """
     if runner_client is None or session_id not in _model_options_stale:
         return
+    # This wait was the biggest single term in routing's pre-router latency on
+    # a first message, and nothing named it in the logs. Time it, so the ladder
+    # above can be sized against a measurement rather than a guess.
+    started = time.monotonic()
     inflight = _model_options_inflight.get(session_id)
-    if inflight is not None:
-        await _await_briefly(inflight)
-        return
-    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
-    task = asyncio.create_task(
-        _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+    if inflight is None:
+        endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
+        inflight = asyncio.create_task(
+            _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+        )
+        _model_options_inflight[session_id] = inflight
+        inflight.add_done_callback(
+            lambda _t, sid=session_id: _model_options_inflight.pop(sid, None)
+        )
+    await _await_briefly(inflight)
+    _logger.info(
+        "smart_routing: session=%s stale catalog refresh waited %.3fs (still_stale=%s)",
+        session_id,
+        time.monotonic() - started,
+        session_id in _model_options_stale,
     )
-    _model_options_inflight[session_id] = task
-    task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
-    await _await_briefly(task)
 
 
 async def _await_briefly(task: asyncio.Task[None]) -> None:
@@ -4151,6 +4266,59 @@ def _native_pane_harness(conv: Conversation) -> str | None:
     return native.harness if native is not None else harness
 
 
+def _pinned_spawn_family(parent: Conversation | None) -> str | None:
+    """Return the family a parent's spawns are confined to, if any.
+
+    Only a Smart Routing parent on a PINNED harness confines them — its
+    spawns are routed inside its own family. An auto-harness parent hands
+    the family choice to the router, and a parent that routes no spawns at
+    all confines nothing.
+
+    :param parent: The parent session's row, or ``None`` for a top-level
+        create (nothing to stay in family with).
+    :returns: ``"claude"`` / ``"gpt"`` / ``"pi"``, or ``None`` when the
+        parent's spawns may land in any family.
+    """
+    if parent is None or not subagent_routing_enabled(parent.subagent_routing_override):
+        return None
+    if auto_harness_session(parent):
+        return None
+    return harness_family(_resolve_harness(parent))
+
+
+def _reject_out_of_family_child(
+    parent: Conversation | None,
+    child_harness: str | None,
+) -> None:
+    """Refuse a pinned parent's create of a child in another family.
+
+    The primary defense for the family rule: a pinned codex Smart Routing
+    session must not be able to stand up a claude child at all, rather than
+    standing one up and having routing decline it afterwards. The child is
+    refused here, at the create, where the caller still sees the reason.
+
+    :param parent: The parent session's row, or ``None`` for a top-level
+        create.
+    :param child_harness: The harness the child would run, e.g.
+        ``"claude-native"``. ``None`` (unresolvable) is allowed through —
+        nothing proves it is out of family.
+    :raises OmnigentError: 400 ``INVALID_INPUT`` when the child's family
+        differs from the family the parent's spawns are confined to.
+    """
+    family = _pinned_spawn_family(parent)
+    child_family = harness_family(child_harness)
+    if family is None or child_family is None or family == child_family:
+        return
+    parent_harness = _resolve_harness(parent)
+    raise OmnigentError(
+        f"A {parent_harness} session with Smart Routing spawns only agents in its own "
+        f"model family; {child_harness} is not one. Pick an agent that runs on "
+        f"{parent_harness}, or start the session in Smart Routing (auto) harness mode "
+        "to let the router choose the family.",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _out_of_family_spawn_notice(
     conv: Conversation,
     parent: Conversation | None,
@@ -4158,11 +4326,14 @@ def _out_of_family_spawn_notice(
 ) -> str | None:
     """Why a pinned parent's cross-family spawn is not routed, if it is not.
 
-    Cross-family picks belong to sessions whose harness the router owns (Smart
-    Routing / auto): a pinned codex session's spawns stay on codex, so a child
-    pane running another family's CLI has no candidate the parent's family can
-    serve. Same predicate the in-harness spawn gate uses, so "auto" means one
-    thing on both spawn paths.
+    The fail-safe behind :func:`_reject_out_of_family_child`, which refuses
+    the out-of-family child at its create: a pane that exists anyway (a
+    legacy row, an unresolvable harness at create time) still must not be
+    routed. Cross-family picks belong to sessions whose harness the router
+    owns (Smart Routing / auto): a pinned codex session's spawns stay on
+    codex, so a child pane running another family's CLI has no candidate the
+    parent's family can serve. Same predicate the in-harness spawn gate uses,
+    so "auto" means one thing on both spawn paths.
 
     :param conv: The child session's row.
     :param parent: The parent session's row, or ``None`` for a top-level
@@ -4392,6 +4563,11 @@ async def _forward_event_to_runner(
     # before the routing card, matching the message routing path).
     _auto_card_model: str | None = None
     _auto_card_verdict: dict[str, Any] | None = None
+    # Set when the auto-harness routing call itself failed. The card still
+    # says so, but the route-once label is left unclaimed — the same rule the
+    # turn, native-pane and child-spawn paths follow, so one outage at create
+    # cannot be the reason this session never routes again.
+    _auto_route_failed = False
     # The resolved harness, read back at card-emission time below.
     _auto_harness: str | None = None
     if conv.harness_override == "auto" and body.type == "message":
@@ -4450,8 +4626,8 @@ async def _forward_event_to_runner(
                 _auto_card_verdict = _auto_verdict
             elif _auto_error is not None:
                 # Routing failed — surface why auto-harness fell back to defaults.
-                _auto_card_model = "unavailable"
-                _auto_card_verdict = {"rationale": _auto_error, "applied": False}
+                _auto_card_model, _auto_card_verdict = _unavailable_routing_card(_auto_error)
+                _auto_route_failed = True
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
     # call the judge LLM on the FIRST message to pick the model for
@@ -4692,7 +4868,14 @@ async def _forward_event_to_runner(
                 scope="session",
                 harness=_auto_harness,
             )
-            await _stamp_routing_decision_label(session_id, conversation_store, _auto_decision_id)
+            if not _auto_route_failed:
+                # A failed call is NOT this session's routing decision: the
+                # label is the route-once gate, so claiming it would make one
+                # create-time outage the reason nothing routes this session
+                # again. The card still shows what happened.
+                await _stamp_routing_decision_label(
+                    session_id, conversation_store, _auto_decision_id
+                )
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,
@@ -4796,6 +4979,48 @@ async def _stamp_routing_decision_label(
             session_id,
             exc_info=True,
         )
+
+
+async def _record_create_route_prompt(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    prompt: str | None,
+) -> Conversation:
+    """Record which prompt a create-time route scored, as a fingerprint.
+
+    Read by the in-harness first-prompt hook: the same prompt submitted again
+    reuses the create's decision instead of paying a second router call for it
+    (:func:`omnigent.runner.turn_routing.create_route_covers_prompt`).
+
+    Best-effort — a label that cannot be written costs the session one extra
+    routing call, not its turn.
+
+    :param conv: The created conversation row.
+    :param conversation_store: Store exposing ``set_labels``.
+    :param prompt: The routed prompt, e.g. the create's
+        ``smart_routing_message``. Blank records nothing.
+    :returns: The refreshed row, or *conv* when nothing was recorded.
+    """
+    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+    from omnigent.runner.turn_routing import create_route_prompt_fingerprint
+
+    fingerprint = create_route_prompt_fingerprint(prompt or "")
+    if not fingerprint:
+        return conv
+    try:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {CREATE_ROUTE_PROMPT_LABEL_KEY: fingerprint},
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "smart_routing: failed to record the create-time prompt for session=%s",
+            conv.id,
+            exc_info=True,
+        )
+        return conv
+    return await asyncio.to_thread(conversation_store.get_conversation, conv.id) or conv
 
 
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
@@ -7223,6 +7448,18 @@ async def _create_session_from_existing_agent(
                 # Non-omnigent agent (e.g. a native wrapper) — can't route
                 # harness; leave the orchestrator's choice untouched.
                 _force_auto_for_child = False
+        # A pinned Smart Routing parent may only spawn inside its own model
+        # family, so the child that could never be routed is refused here
+        # rather than created and declined afterwards. Auto parents are
+        # unaffected (the router owns their family) and so is a parent that
+        # routes no spawns — neither resolves the child's harness at all.
+        if _pinned_spawn_family(_parent_for_routing) is not None:
+            _reject_out_of_family_child(
+                _parent_for_routing,
+                await asyncio.to_thread(
+                    _create_resolved_harness, agent, body.harness_override, agent_cache
+                ),
+            )
 
     # A session that starts on Smart Routing routes the subagents it spawns.
     # Stamped here, once, so the spawn gate reads one explicit switch instead
@@ -7529,6 +7766,14 @@ async def _create_session_from_existing_agent(
                 _native_routing_verdict,
                 scope="session",
                 harness=_routed_native.harness if _routed_native is not None else None,
+            )
+            # The same prompt is submitted again inside the harness, where the
+            # first-prompt hook would score it a second time for the verdict
+            # this session is already pinned to. Fingerprint what was routed so
+            # that hook reuses this decision — and an edited prompt still
+            # routes on its own.
+            conv = await _record_create_route_prompt(
+                conv, conversation_store, body.smart_routing_message
             )
         elif _native_routing_error is not None:
             await _emit_server_routing_decision(

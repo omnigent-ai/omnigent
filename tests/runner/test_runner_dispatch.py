@@ -1248,12 +1248,14 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
 ) -> None:
     """Spec resolver failures are surfaced as structured 503 errors.
 
     :param caplog: Pytest log capture, used to confirm the raw cause is
         logged server-side (the other half of the log-and-genericize
         contract).
+    :param pinned_runner_log: The log path the detail must name.
     :returns: None.
     """
 
@@ -1289,11 +1291,13 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
 
     assert response.status_code == 503
     body = response.json()
-    # The structured error slug is preserved for the caller; the detail is a
-    # fixed client-safe string. The raw resolver exception text must not leak
-    # into the HTTP body (it is logged on the runner instead).
+    # The structured error slug is preserved for the caller; the detail names
+    # the runner log holding the cause. The raw resolver exception text must
+    # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
-    assert body["detail"] == "Request failed on the runner; see runner logs for details."
+    assert body["detail"] == (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
     assert "spec resolver unavailable" not in body["detail"]
     # The other half of the contract: the raw cause IS logged for operators.
     # If this fails, log-and-genericize logged nothing and the detail is the

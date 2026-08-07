@@ -12,8 +12,10 @@ swap in a different implementation via ``RuntimeCaps``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
@@ -52,13 +54,18 @@ ROUTES_SELECT_PATH = "routes:select"
 #:
 #: Sized from the observed round trip: healthy ``routes:select`` answers land
 #: in ~1.4–3s, and the slowest sample on record (~6.7s) was a gateway 500, not
-#: a verdict. Five seconds therefore covers the healthy case with headroom
-#: while capping the hazard paths — a first-message hook and a subagent spawn
-#: gate — at a blink instead of the 30–45s a wedged server used to cost.
+#: a verdict. Nine seconds covers the healthy case with wide headroom while
+#: still capping the hazard paths — a first-message hook and a subagent spawn
+#: gate — well under the 30–45s a wedged server used to cost.
+#:
+#: This budget covers the CALL only. The hops above it must also absorb the
+#: candidate/catalog preparation that runs before it (~3s measured on a first
+#: message), which is why each of them sits several seconds higher rather than
+#: one second above this value.
 #:
 #: One attempt, no retry: on an interactive path a second try only doubles the
 #: stall, and falling open onto the harness's own model is the better answer.
-ROUTING_REQUEST_TIMEOUT_S = 5.0
+ROUTING_REQUEST_TIMEOUT_S = 9.0
 
 # ── Model lists per harness family ──────────────────────────────────────────
 #
@@ -285,7 +292,89 @@ def _catalog_wire_apis(raw: object) -> frozenset[ModelWireAPI]:
     return frozenset(wire_apis)
 
 
+#: How long a fetched runner catalog stays servable without a re-fetch.
+#:
+#: The catalog is the installed CLI's model list: it changes on a relaunch or a
+#: provider-config edit, both of which invalidate this cache explicitly
+#: (:func:`invalidate_runner_catalog`). The TTL is only the backstop for a
+#: change nothing announced, so it is sized for "a long session should not go
+#: stale for hours", not for freshness per turn.
+RUNNER_CATALOG_TTL_S = 300.0
+
+#: session id → (monotonic deadline, catalog). Process-local, like every other
+#: runner-derived overlay cache on the server.
+_runner_catalog_cache: dict[str, tuple[float, dict[str, list[_RunnerModel]]]] = {}
+
+#: Single-flight per session, so a burst of turns costs one runner round trip.
+_runner_catalog_inflight: dict[str, asyncio.Task[dict[str, list[_RunnerModel]] | None]] = {}
+
+
+def invalidate_runner_catalog(session_id: str | None = None) -> None:
+    """Drop the cached runner catalog for *session_id* (or every session).
+
+    Called from the seam that already invalidates runner-derived snapshot
+    overlays, so a relaunched runner, a rebind, or a refreshed snapshot all
+    re-read the catalog instead of routing off the previous process's models.
+
+    :param session_id: Session/conversation identifier; ``None`` clears all.
+    """
+    if session_id is None:
+        _runner_catalog_cache.clear()
+        return
+    _runner_catalog_cache.pop(session_id, None)
+
+
+async def prefetch_runner_catalog(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> None:
+    """Warm the catalog cache for *session_id* off the turn path.
+
+    Routing's candidate preparation is the runner round trip below, and paying
+    it while a user's prompt is held is what made the first message slow. A
+    launch-time call fills the cache so the first turn reads it instead.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_client: Async HTTP client pointed at the runner.
+    """
+    await _fetch_runner_catalog(session_id, runner_client)
+
+
 async def _fetch_runner_catalog(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> dict[str, list[_RunnerModel]] | None:
+    """Return this session's runner catalog, from cache when one is warm.
+
+    A miss runs :func:`_load_runner_catalog` under a per-session single flight,
+    so concurrent turns share one round trip. Only a parsed, non-empty catalog
+    is cached: an unreachable runner (a booting session) must stay re-fetchable
+    rather than pin "no catalog" for the whole TTL.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_client: Async HTTP client pointed at the runner.
+    :returns: Worker names mapped to ordered model metadata, or ``None``.
+    """
+    cached = _runner_catalog_cache.get(session_id)
+    if cached is not None:
+        deadline, catalog = cached
+        if time.monotonic() < deadline:
+            return catalog
+        _runner_catalog_cache.pop(session_id, None)
+    inflight = _runner_catalog_inflight.get(session_id)
+    if inflight is None:
+        inflight = asyncio.ensure_future(_load_runner_catalog(session_id, runner_client))
+        _runner_catalog_inflight[session_id] = inflight
+        inflight.add_done_callback(
+            lambda _task, sid=session_id: _runner_catalog_inflight.pop(sid, None)
+        )
+    catalog = await asyncio.shield(inflight)
+    if catalog:
+        _runner_catalog_cache[session_id] = (time.monotonic() + RUNNER_CATALOG_TTL_S, catalog)
+    return catalog
+
+
+async def _load_runner_catalog(
     session_id: str,
     runner_client: httpx.AsyncClient,
 ) -> dict[str, list[_RunnerModel]] | None:
@@ -2202,6 +2291,11 @@ async def route_turn(
         return None, None
 
     _logger.info("smart_routing: routing turn session=%s harness=%s", session_id, harness)
+    # Candidate preparation used to be invisible in the logs, so a slow first
+    # message read as a slow router. Time the two phases separately: this is
+    # the number the timeout ladder above the hook has to cover.
+    _prep_started = time.monotonic()
+    _catalog_fetched = False
     # Prefer the live runner catalog, but only its "self" row — the sub-agent
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
@@ -2211,6 +2305,7 @@ async def route_turn(
         if in_vocabulary:
             available = {harness or "self": in_vocabulary}
     if available is None and session_id and runner_client is not None:
+        _catalog_fetched = True
         runner_catalog = await fetch_runner_models(session_id, runner_client)
         if runner_catalog and "self" in runner_catalog:
             # A native terminal's own catalog can list models from other
@@ -2257,8 +2352,18 @@ async def route_turn(
             )
             return None, None
 
+    _prep_s = time.monotonic() - _prep_started
+    _route_started = time.monotonic()
     call = await route_with_fallback(
         backends, user_message, available, gateway_backed=gateway_backed
+    )
+    _logger.info(
+        "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
+        session_id,
+        _prep_s,
+        time.monotonic() - _route_started,
+        _catalog_fetched,
+        sum(len(models) for models in available.values()),
     )
     if call is None or call.result is None:
         return None, None
