@@ -2062,6 +2062,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
+        "CODA_SP_TOKEN_BROKER_URL": "http://127.0.0.1:43210/token",
+        "CODA_VENV_PYTHON": "/app/python/.venv/bin/python",
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
@@ -2119,6 +2121,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert (
         env["OMNIGENT_DATABRICKS_EXTRA_HEADERS"] == '{"x-databricks-route-hint": "instance-abc"}'
     )
+    assert env["CODA_SP_TOKEN_BROKER_URL"] == "http://127.0.0.1:43210/token"
+    assert env["CODA_VENV_PYTHON"] == "/app/python/.venv/bin/python"
     # Process logging controls forward so host-spawned runners honor --debug
     # and --log-to-stderr.
     assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"

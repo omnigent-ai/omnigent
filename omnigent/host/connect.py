@@ -456,6 +456,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # host→runner intrinsically, so the setter need not also list it in
         # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
+        # CoDA's loopback SP broker lets native harness token helpers mint a
+        # fresh workspace bearer without exposing the client secret.
+        "CODA_SP_TOKEN_BROKER_URL",
+        "CODA_VENV_PYTHON",
         # The operator's env-forwarding control var itself. Without it here, the
         # var is stripped before it reaches the daemon in --server mode (the
         # remote daemon prefixes are DATABRICKS_ + LC_/MLFLOW_/OTEL_/OMNIGENT_OTEL_,
