@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import click
 import pytest
 import pytest_asyncio
 from asgiref.testing import ApplicationCommunicator
@@ -589,6 +590,20 @@ async def test_coda_two_sessions_adopt_one_host(
     assert first.runner_id != second.runner_id
     assert first.workspace != second.workspace
     assert len(env.host_store.list_hosts(RESERVED_USER_LOCAL)) == 1
+
+    before_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
+
+    def _allocation_failure(_sandbox_id: str, _session_id: str) -> str:
+        raise click.ClickException("allocation failed")
+
+    monkeypatch.setattr(fake, "allocate_workspace", _allocation_failure)
+    with pytest.raises(click.ClickException, match="allocation failed"):
+        await env.client.post(
+            "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+        )
+    after_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
+    assert after_failure == before_failure
+
     assert (await env.client.delete(f"/v1/sessions/{first.id}")).status_code == 200
     assert env.host_store.get_host(first.host_id) is not None
     assert (await env.client.delete(f"/v1/sessions/{second.id}")).status_code == 200

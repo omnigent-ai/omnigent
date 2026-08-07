@@ -14,7 +14,15 @@ from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 CODA_WORKSPACE_PATH = "/app/python/source_code"
-_SENSITIVE_ERROR_KEYS = ("token", "secret", "authorization", "credential")
+_SENSITIVE_ERROR_KEYS = (
+    "token",
+    "secret",
+    "authorization",
+    "credential",
+    "password",
+    "api_key",
+    "access_key",
+)
 
 
 def _safe_control_error_detail(raw: str) -> str:
@@ -36,6 +44,10 @@ def _safe_control_error_detail(raw: str) -> str:
             }
         if isinstance(value, list):
             return [_redact(item) for item in value]
+        if isinstance(value, str) and any(
+            marker in value.lower() for marker in _SENSITIVE_ERROR_KEYS
+        ):
+            return "<redacted>"
         return value
 
     return json.dumps(_redact(payload), separators=(",", ":"))[:1024]

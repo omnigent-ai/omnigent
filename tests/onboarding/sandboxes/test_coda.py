@@ -45,6 +45,22 @@ def test_control_error_detail_redacts_credentials() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"message":"Authorization: Bearer launch-secret"}',
+        '{"error":"token=launch-secret"}',
+        '{"details":["host token launch-secret"]}',
+        '{"password":"launch-secret"}',
+    ],
+)
+def test_control_error_detail_redacts_credentials_in_values(raw: str) -> None:
+    detail = _safe_control_error_detail(raw)
+
+    assert "launch-secret" not in detail
+    assert "<redacted>" in detail
+
+
 def test_capabilities() -> None:
     caps = launcher(FakeControl()).capabilities
     assert caps.cli_bootstrap is False
