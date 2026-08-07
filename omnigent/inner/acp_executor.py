@@ -1108,57 +1108,66 @@ class AcpExecutor(Executor):
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
 
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
-                return
-
-            # Complete only once the future is resolved AND the queue is drained,
-            # so trailing chunks aren't truncated.
-            if fut.done() and self._queue.empty():
-                try:
-                    response = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    self._session_id = None
-                    self._system_prompt_sent = False
-                    yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
+        # The stdout reader pops ``req_id`` only when it matches a RESPONSE
+        # (see ``_read_stdout``). On the timeout path below, or when the reader
+        # resolves ``fut`` with an exception (EOF / reader error) without a
+        # match, nothing removes ``req_id`` — so ``self._pending`` would grow one
+        # stale entry per silent/failed turn on a long-lived ACP session. Drop
+        # it in ``finally`` on every exit (mirrors ``_rpc``'s timeout cleanup).
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
                     return
-                if "error" in response:
-                    error_msg = response["error"].get("message", "Unknown ACP error")
-                    if "Session not found" in error_msg:
+
+                # Complete only once the future is resolved AND the queue is drained,
+                # so trailing chunks aren't truncated.
+                if fut.done() and self._queue.empty():
+                    try:
+                        response = fut.result()
+                    except Exception as exc:  # noqa: BLE001
                         self._session_id = None
                         self._system_prompt_sent = False
-                    yield ExecutorError(message=error_msg, retryable=True)
+                        yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
+                        return
+                    if "error" in response:
+                        error_msg = response["error"].get("message", "Unknown ACP error")
+                        if "Session not found" in error_msg:
+                            self._session_id = None
+                            self._system_prompt_sent = False
+                        yield ExecutorError(message=error_msg, retryable=True)
+                        return
+                    result = response.get("result", {}) if isinstance(response, dict) else {}
+                    usage = self._usage_from_result(result) if isinstance(result, dict) else None
+                    yield TurnComplete(response="".join(accumulated_text), usage=usage)
                     return
-                result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_from_result(result) if isinstance(result, dict) else None
-                yield TurnComplete(response="".join(accumulated_text), usage=usage)
-                return
 
-            try:
-                notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
-                )
-            except asyncio.TimeoutError:
-                continue
+                try:
+                    notification = await asyncio.wait_for(
+                        self._queue.get(), timeout=min(remaining, 2.0)
+                    )
+                except asyncio.TimeoutError:
+                    continue
 
-            method = notification.get("method", "")
-            params = notification.get("params", {})
+                method = notification.get("method", "")
+                params = notification.get("params", {})
 
-            if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                update = params.get("update", {})
-                for event in self._handle_session_update(update):
-                    if isinstance(event, TextChunk):
-                        accumulated_text.append(event.text)
-                    yield event
-            elif notification.get("id") is not None and notification.get("method"):
-                # Server-initiated request (session/request_permission / fs/*):
-                # routes through policy + elicitation. Blocks while the human decides.
-                await self._respond_to_agent_request(notification)
+                if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                    update = params.get("update", {})
+                    for event in self._handle_session_update(update):
+                        if isinstance(event, TextChunk):
+                            accumulated_text.append(event.text)
+                        yield event
+                elif notification.get("id") is not None and notification.get("method"):
+                    # Server-initiated request (session/request_permission / fs/*):
+                    # routes through policy + elicitation. Blocks while the human decides.
+                    await self._respond_to_agent_request(notification)
 
-            # Inbound message = progress; reset the idle deadline.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+                # Inbound message = progress; reset the idle deadline.
+                deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        finally:
+            self._pending.pop(req_id, None)
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.
