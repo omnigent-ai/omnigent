@@ -6,6 +6,7 @@ database and UC Volumes as the artifact store.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -215,6 +216,10 @@ try:
     if _exposure:
         logger.warning("%s", _exposure)
 
+    app_client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
+    if app_client_secret:
+        runner_secret = hashlib.sha256(f"omnigent-runner:{app_client_secret}".encode()).hexdigest()
+        os.environ.setdefault("OMNIGENT_RUNNER_TOKEN_SECRET", runner_secret)
     auth_provider = create_auth_provider()
     sandbox_config = None
     coda_app_name = os.environ.get("CODA_APP_NAME", "").strip()

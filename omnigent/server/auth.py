@@ -446,6 +446,7 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
+        runner_token_secret: bytes | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -459,6 +460,16 @@ class UnifiedAuthProvider(AuthProvider):
             if header_strip_prefix is not None
             else resolve_auth_header_strip_prefix()
         )
+        if runner_token_secret is None:
+            raw_runner_secret = os.environ.get("OMNIGENT_RUNNER_TOKEN_SECRET", "").strip()
+            if raw_runner_secret:
+                try:
+                    runner_token_secret = bytes.fromhex(raw_runner_secret)
+                except ValueError as exc:
+                    raise RuntimeError("OMNIGENT_RUNNER_TOKEN_SECRET must be valid hex") from exc
+                if len(runner_token_secret) < 32:
+                    raise RuntimeError("OMNIGENT_RUNNER_TOKEN_SECRET must be at least 32 bytes")
+        self._runner_token_secret = runner_token_secret
         self._cookie_cache: dict[str, tuple[str, float]] = {}
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
@@ -511,7 +522,8 @@ class UnifiedAuthProvider(AuthProvider):
         """
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
-        return self._check_header(request)
+        runner_user = self._check_runner_bearer(request)
+        return runner_user if runner_user is not None else self._check_header(request)
 
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
         """
@@ -531,19 +543,40 @@ class UnifiedAuthProvider(AuthProvider):
         """
         if not user_id or user_id in _RESERVED_USERS:
             return None
-        if self._source not in ("oidc", "accounts"):
-            return None
-        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
-        if cookie_config is None:
+        if self._source == "header":
+            secret = self._runner_token_secret
+            provider = "runner"
+        else:
+            cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+            secret = cookie_config.cookie_secret if cookie_config is not None else None
+            provider = self._source
+        if secret is None:
             return None
         from omnigent.server.oidc import mint_session_token
 
-        return mint_session_token(
-            user_id,
-            cookie_config.cookie_secret,
-            ttl_seconds,
-            self._source,
-        )
+        return mint_session_token(user_id, secret, ttl_seconds, provider)
+
+    def _check_runner_bearer(self, request: HTTPConnection) -> str | None:
+        """Validate a server-minted owner token while header auth is active."""
+        import jwt
+
+        if self._runner_token_secret is None:
+            return None
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return None
+        try:
+            payload = jwt.decode(
+                auth_header[7:],
+                self._runner_token_secret,
+                algorithms=["HS256"],
+            )
+        except jwt.InvalidTokenError:
+            return None
+        if payload.get("provider") != "runner":
+            return None
+        user_id = payload.get("sub")
+        return user_id if isinstance(user_id, str) and user_id else None
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
