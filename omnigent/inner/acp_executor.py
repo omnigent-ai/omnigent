@@ -101,6 +101,7 @@ _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+_AGENT_METHOD_SET_MODEL = "session/set_model"
 
 # Notification sent *from* the agent to the client (streaming progress).
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -272,6 +273,14 @@ class AcpExecutor(Executor):
         # operates on a *copied* tree whose path diverges from the agent's cwd.
         self._fs_delegation: bool = os_env is not None and not bool(getattr(os_env, "fork", False))
         self._os_environment: OSEnvironment | None = None
+
+        # ACP SessionModelState from the session/new response
+        # (``{"availableModels": [{"modelId", "name", ...}], "currentModelId"}``),
+        # and the last model we switched to via ``session/set_model``. Agents that
+        # advertise no models leave both unset — the picker then shows nothing and
+        # model overrides are inert (the agent keeps its own configured model).
+        self._model_state: dict[str, Any] | None = None
+        self._applied_model: str | None = None
 
         # Parsed argv; the first token is the binary we resolve / sandbox.
         self._argv: list[str] = shlex.split(config.command)
@@ -611,8 +620,54 @@ class AcpExecutor(Executor):
             raise RuntimeError(
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
+        if isinstance(result, dict) and isinstance(result.get("models"), dict):
+            self._model_state = result["models"]
         self._session_id = session_id
         return self._session_id
+
+    def available_models(self) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
+        """Return the agent's advertised models, or ``[]`` if it offered none.
+
+        Populated from the ``session/new`` response, so it is empty until the
+        first turn creates the session.
+        """
+        if isinstance(self._model_state, dict):
+            models = self._model_state.get("availableModels")
+            if isinstance(models, list):
+                return models
+        return []
+
+    def current_model_id(self) -> str | None:
+        """Return the session's current model id (last switch, else the agent's)."""
+        if self._applied_model is not None:
+            return self._applied_model
+        if isinstance(self._model_state, dict):
+            return self._model_state.get("currentModelId")
+        return None
+
+    async def _apply_model(self, session_id: str, model: str | None) -> None:
+        """Switch the session's model via ``session/set_model`` when it changes.
+
+        No-op when the agent advertised no models, ``model`` is unset, the agent
+        doesn't offer it, or it already matches the current model — so a switch
+        fires only when it will take effect.
+        """
+        if not model or not isinstance(self._model_state, dict):
+            return
+        offered = {
+            m.get("modelId")
+            for m in self._model_state.get("availableModels") or []
+            if isinstance(m, dict)
+        }
+        if model not in offered or model == self.current_model_id():
+            return
+        resp = await self._rpc(
+            _AGENT_METHOD_SET_MODEL,
+            {"sessionId": session_id, "modelId": model},
+            timeout=_INIT_TIMEOUT_SECONDS,
+        )
+        if "error" not in resp:
+            self._applied_model = model
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -1018,7 +1073,7 @@ class AcpExecutor(Executor):
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the interface
+        config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one turn of the agent loop via ACP.
 
@@ -1037,6 +1092,12 @@ class AcpExecutor(Executor):
                 await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()
+            # Apply the per-request /model override live (no respawn) when the
+            # agent supports model switching. Best-effort: a failed switch keeps
+            # the current model rather than aborting the turn.
+            if config is not None and config.model:
+                with contextlib.suppress(Exception):
+                    await self._apply_model(session_id, config.model)
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=str(exc), retryable=False)
             return

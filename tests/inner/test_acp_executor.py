@@ -569,3 +569,51 @@ async def test_end_to_end_denied_permission(tmp_path: Path) -> None:
 
     # Turn still completes even though the tool was rejected.
     assert any(isinstance(e, TurnComplete) for e in events)
+
+
+def test_available_models_and_current_from_session_state() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="fake acp", name="Fake"))
+    ex._model_state = {
+        "availableModels": [
+            {"modelId": "auto", "name": "Auto"},
+            {"modelId": "claude-sonnet-5", "name": "Sonnet 5"},
+            {"modelId": "claude-fable-5", "name": "Fable 5"},
+        ],
+        "currentModelId": "claude-sonnet-5",
+    }
+    assert [m["modelId"] for m in ex.available_models()] == [
+        "auto",
+        "claude-sonnet-5",
+        "claude-fable-5",
+    ]
+    assert ex.current_model_id() == "claude-sonnet-5"
+
+    # No advertised models -> empty list, no current.
+    bare = AcpExecutor(AcpAgentConfig(command="fake acp", name="Fake"))
+    assert bare.available_models() == []
+    assert bare.current_model_id() is None
+
+
+def test_apply_model_switches_only_when_it_takes_effect() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="fake acp", name="Fake"))
+    ex._model_state = {
+        "availableModels": [{"modelId": "auto"}, {"modelId": "claude-fable-5"}],
+        "currentModelId": "auto",
+    }
+    calls: list[tuple[str, str | None]] = []
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        calls.append((method, params.get("modelId")))
+        return {"result": {}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+
+    async def drive() -> None:
+        await ex._apply_model("s1", "claude-fable-5")  # different -> switch
+        await ex._apply_model("s1", "claude-fable-5")  # same -> no-op
+        await ex._apply_model("s1", "gpt-9")  # not offered -> no-op
+        await ex._apply_model("s1", None)  # unset -> no-op
+
+    asyncio.run(drive())
+    assert calls == [("session/set_model", "claude-fable-5")]
+    assert ex.current_model_id() == "claude-fable-5"
