@@ -2492,6 +2492,27 @@
         "title": "OutputTextDeltaEvent",
         "type": "object"
       },
+      "PackageWorkspaceAgentRequest": {
+        "description": "Body for `POST /v1/hosts/{id}/workspace-agents/package`.",
+        "properties": {
+          "config_path": {
+            "description": "Workspace-relative path of a discovered config, e.g. `\".omnigent/agent-configs/helper.yaml\"`.",
+            "title": "Config Path",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute workspace path on the host.",
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "config_path"
+        ],
+        "title": "PackageWorkspaceAgentRequest",
+        "type": "object"
+      },
       "PaginatedList": {
         "description": "A paginated list response following cursor-based pagination.",
         "properties": {
@@ -7792,6 +7813,120 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/workspace-agents/package": {
+      "post": {
+        "description": "Package a repo-declared agent config into bundle bytes.\n\nThe host materializes `<path>/<config_path>` (a discovered\nsingle-file YAML or bundle directory) into a deterministic\n`.tar.gz` and returns the bytes. The client hashes them for\nthe consent grant and uploads them verbatim via the standard\nmultipart session create, so what the user approved is exactly\nwhat the server validates and runs.\n\n**Returns:** The raw `application/gzip` bundle bytes.\n\n**Raises**\n\n- `HTTPException` \u2014 404 (host missing), 403 (not owner), 409 (offline), 400 (path validation), 504 (timeout), 502 (host failure).",
+        "operationId": "package_host_workspace_agent_v1_hosts__host_id__workspace_agents_package_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageWorkspaceAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Package Host Workspace Agent",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/workspace-harnesses": {
+      "get": {
+        "description": "Return the harnesses a workspace's `.omnigent/` declares.\n\nReads `<path>/.omnigent/config.yaml` on the selected host and\nreturns its `acp:` agents so the picker can suggest repo-declared\nharnesses. Owner-scoped like the filesystem endpoints; discovery\nonly \u2014 launching a discovered agent still goes through the client's\nexplicit consent flow.\n\n**Returns:** `{\"agents\": [...]}` (empty when nothing is declared).\n\n**Raises**\n\n- `HTTPException` \u2014 404 (host missing), 403 (not owner), 409 (offline), 400 (path validation), 504 (timeout), 502 (host failure).",
+        "operationId": "get_host_workspace_harnesses_v1_hosts__host_id__workspace_harnesses_get",
+        "parameters": [
+          {
+            "description": "Host identifier.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Absolute or tilde-prefixed workspace path on the host.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response Get Host Workspace Harnesses V1 Hosts  Host Id  Workspace Harnesses Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Workspace Harnesses",
         "tags": [
           "hosts"
         ]
