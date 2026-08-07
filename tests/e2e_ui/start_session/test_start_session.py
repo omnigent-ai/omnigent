@@ -986,6 +986,9 @@ def test_start_session_managed_remembers_host_over_sandbox_default(
 
 async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
     host_id, host_name = _HOST_ALPHA
+    # The loopback E2E server exposes exactly one online host, so the landing
+    # footer intentionally replaces its raw hostname with an OS-aware local label.
+    host_display_name = re.compile(r"This (?:Mac|Windows|Android|iPhone|iPad|machine)")
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -1055,7 +1058,7 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
             # Explicitly pick the connected host instead.
             await chip.click()
             await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
-            await expect(chip).to_contain_text(host_name)
+            await expect(chip).to_contain_text(host_display_name)
 
             # Reload: the host must be restored, NOT reverted to the sandbox
             # default — the exact regression this change fixes.
@@ -1064,7 +1067,7 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(chip).to_contain_text(host_name)
+            await expect(chip).to_contain_text(host_display_name)
             await expect(chip).not_to_contain_text("Databricks Sandbox")
         finally:
             await browser.close()
