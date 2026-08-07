@@ -315,14 +315,13 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     assert mint_calls == []
 
 
-def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
+def test_initial_host_token_immediately_mints_managed_owner_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After the host bearer is rejected, a managed runner falls back to managed mint.
+    """A managed runner uses the host bearer only as mint proxy auth.
 
-    When no SDK/OIDC credential is available (managed sandbox with no user
-    credential), the fallback must reach the managed-mint path rather than
-    returning None and bricking all HTTP callbacks.
+    Application requests must carry the owner-bound minted token, never the
+    CoDA service principal bearer that merely crosses the Apps ingress.
     """
     mint_calls: list[int] = []
 
@@ -347,21 +346,18 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
 
     factory = _make_auth_token_factory()
 
-    assert isinstance(factory, _InitialAuthTokenFactory)
-    assert factory() == "host-bootstrap-token"
-    assert mint_calls == []
+    assert factory is not None
+    assert not isinstance(factory, _InitialAuthTokenFactory)
+    assert factory() == "managed-minted-token"
+    assert len(mint_calls) >= 1
 
     request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
-    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
-    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
-
-    # After the initial bearer is rejected, the fallback must mint via the
-    # managed-mint path rather than returning None and bricking callbacks.
-    assert captured == [
-        "Bearer host-bootstrap-token",
-        "Bearer managed-minted-token",
-    ]
-    assert len(mint_calls) >= 1
+    captured = _drive_auth_flow(
+        _RunnerDatabricksAuth(factory),
+        request,
+        httpx.Response(200),
+    )
+    assert captured == ["Bearer managed-minted-token"]
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(

@@ -523,6 +523,25 @@ def _make_auth_token_factory(
         if _allow_initial_token
         else ""
     )
+    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
+    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+    if (
+        initial_token
+        and _allow_delegated_mint
+        and delegated_auth
+        and resolved_server_url
+        and binding_token
+    ):
+        # The host's SP bearer is only an Apps-ingress credential. Exchange
+        # the binding token immediately so application requests carry the
+        # session owner's token rather than the CoDA service principal.
+        delegated_factory = _make_managed_mint_factory(
+            resolved_server_url,
+            binding_token,
+            proxy_bearer=initial_token,
+        )
+        if delegated_factory is not None:
+            return delegated_factory
     if initial_token and resolved_server_url:
         _logger.info("using host-provided bearer for runner bootstrap")
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
@@ -535,8 +554,6 @@ def _make_auth_token_factory(
 
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
-    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
-    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
         delegated_factory = _make_managed_mint_factory(
             resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
