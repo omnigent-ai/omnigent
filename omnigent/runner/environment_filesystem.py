@@ -291,10 +291,11 @@ def resolve_browse_target(
         raise InvalidPath("Path contains NUL bytes")
     # Normalize and follow symlinks BEFORE any comparison, so a ".." segment
     # or a symlink cannot point the final path out of the grant that admitted
-    # it. codeql[py/path-injection]: the resolved path is returned only after
-    # a containment check against `allowed` below; the same rule already fires
-    # on this module's workspace-confined `_resolve` on main, so it does not
-    # recognize this codebase's containment idiom.
+    # it. The resolved path is returned only after the containment check
+    # against `allowed` below. The rule does not recognize that idiom: it is
+    # already open on main for this module's workspace-confined `_resolve`,
+    # which guards the same way.
+    # codeql[py/path-injection]
     resolved = Path(os.path.normpath(absolute_path)).resolve()
     # An unconfined environment's reach IS the filesystem root — stating it as
     # a root keeps every return below a containment check, rather than having
@@ -422,10 +423,10 @@ class CallerProcessFilesystem:
         validated = _validate_path(path)
         if not validated:
             return self._root
-        # codeql[py/path-injection]: `_validate_path` above rejects absolute
-        # paths and "..", and the `relative_to` guard below re-checks the
-        # RESOLVED path against the root. An open alert for this same line
-        # predates this PR on main.
+        # `_validate_path` above rejects absolute paths and "..", and the
+        # `relative_to` guard below re-checks the RESOLVED path against the
+        # root. An alert for this same line predates this PR on main.
+        # codeql[py/path-injection]
         full = (self._root / validated).resolve()
         try:
             full.relative_to(self._root)

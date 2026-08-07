@@ -559,9 +559,10 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     :param policy: Resolved sandbox policy carrying the declared grants.
     :returns: Grants in precedence order, cwd first. Never empty.
     """
-    # codeql[py/path-injection]: `cwd` is the environment root the runner was
-    # launched with, not caller input; resolving it is what makes the grants
-    # comparable to a resolved candidate path.
+    # `cwd` is the environment root the runner was launched with, not caller
+    # input; resolving it is what makes the grants comparable to a resolved
+    # candidate path.
+    # codeql[py/path-injection]
     roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
     roots += [
         ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
