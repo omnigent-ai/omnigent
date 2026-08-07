@@ -681,6 +681,7 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OPENAI_ORG_ID",
         "OPENAI_ORGANIZATION",
         "OPENROUTER_API_KEY",
+        "ORCAROUTER_API_KEY",
         "PERPLEXITY_API_KEY",
         "TOGETHER_API_KEY",
         "VOYAGE_API_KEY",
