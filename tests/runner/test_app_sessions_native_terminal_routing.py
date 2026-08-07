@@ -16,7 +16,6 @@ from omnigent import (
 )
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _auto_create_repl_terminal,
@@ -206,7 +205,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
 @pytest.mark.asyncio
 async def test_create_session_terminal_ensure_failure_returns_json_without_live_error(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    pinned_runner_log: Path,
 ) -> None:
     """
     Native terminal ensure failures are reported to AP, not published live.
@@ -220,13 +219,10 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     the relay.
 
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Pytest temp dir, standing in for the runner's log file
-        so the surfaced path is deterministic.
+    :param pinned_runner_log: The log path the message must name.
     :returns: None.
     """
     sid = "aefc71354fadf0dd2ae5c224c40e772c"
-    runner_log = tmp_path / "runner-aefc7135.log"
-    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(runner_log))
 
     async def _failing_auto_create(
         session_id: str,
@@ -269,7 +265,8 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     body = resp.json()
     assert body["error"]["code"] == "native_terminal_start_failed"
     assert body["error"]["message"] == (
-        f"Native Claude terminal failed to start; see the runner log for details: {runner_log}"
+        "Native Claude terminal failed to start; "
+        f"see the runner log for details: {pinned_runner_log}"
     )
     assert "requires the 'claude' CLI" not in body["error"]["message"]
 
