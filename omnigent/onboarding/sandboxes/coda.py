@@ -14,6 +14,31 @@ from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 CODA_WORKSPACE_PATH = "/app/python/source_code"
+_SENSITIVE_ERROR_KEYS = ("token", "secret", "authorization", "credential")
+
+
+def _safe_control_error_detail(raw: str) -> str:
+    """Return a bounded CoDA error detail with credential fields redacted."""
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return "upstream control request failed"
+
+    def _redact(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                str(key): (
+                    "<redacted>"
+                    if any(part in str(key).lower() for part in _SENSITIVE_ERROR_KEYS)
+                    else _redact(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact(item) for item in value]
+        return value
+
+    return json.dumps(_redact(payload), separators=(",", ":"))[:1024]
 
 
 def _parse_sandbox_id(sandbox_id: str) -> tuple[str, str]:
@@ -82,11 +107,11 @@ class CodaProvider(SandboxHostLauncher):
             with request.urlopen(req, timeout=30) as response:
                 payload = response.read()
         except error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
+            detail = _safe_control_error_detail(exc.read().decode(errors="replace"))
             if exc.code == 409:
                 raise click.ClickException("CoDA app has no available lease capacity") from exc
             raise click.ClickException(
-                f"CoDA control request failed ({exc.code}): {detail or exc.reason}"
+                f"CoDA control request failed ({exc.code}): {detail}"
             ) from exc
         except error.URLError as exc:
             raise click.ClickException(f"CoDA control request failed: {exc.reason}") from exc

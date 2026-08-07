@@ -134,6 +134,26 @@ uv run python deploy/databricks/deploy.py \
     --volume-name main.omnigent.artifacts
 ```
 
+To enable the managed CoDA provider, pass all three deployment-specific values
+together (partial configuration fails fast):
+
+```bash
+uv run python deploy/databricks/deploy.py \
+    --app-name omnigent \
+    --profile <your-profile> \
+    --lakebase-branch projects/omnigent/branches/production \
+    --lakebase-database projects/omnigent/branches/production/databases/databricks-postgres \
+    --volume-name main.omnigent.artifacts \
+    --coda-app-name coda-main \
+    --coda-app-url https://<coda-app>.databricksapps.com \
+    --omnigent-public-server-url https://<omnigent-app>.databricksapps.com
+```
+
+The Omnigent app service principal needs `CAN_USE` on the CoDA app, and the
+CoDA app service principal needs `CAN_USE` on Omnigent. Configure the CoDA app's
+wheel, server URL, and server-client-ID resources with its
+`grant_omnigent_host.sh` and `attach_omnigent_resources.sh` helpers.
+
 The script builds wheels, classifies them by size, copies wheels into
 `src/`, regenerates `src/pyproject.toml` and `src/uv.lock`, runs
 `databricks bundle deploy --target prod`, runs
@@ -225,6 +245,9 @@ Environment variables read by `src/app.py`:
 | `AP_ARTIFACT_VOLUME_PATH` | app resource `valueFrom: artifact_volume` | UC Volume path for artifacts |
 | `DATABRICKS_APP_PORT` | Databricks runtime | App port (default 8000) |
 | `AP_POOL_RECYCLE_SECONDS` | Optional | Connection pool recycle interval (default 300) |
+| `CODA_APP_NAME` | Bundle variable | Managed CoDA Databricks App name |
+| `CODA_APP_URL` | Bundle variable | Managed CoDA Databricks App URL |
+| `OMNIGENT_PUBLIC_SERVER_URL` | Bundle variable | Public URL CoDA runners use to reach Omnigent |
 
 ## Multi-app safety — one bundle, many apps
 

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import click
 import pytest
 
-from omnigent.onboarding.sandboxes.coda import CodaProvider
+from omnigent.onboarding.sandboxes.coda import CodaProvider, _safe_control_error_detail
 
 
 class FakeControl:
@@ -29,6 +29,19 @@ def launcher(control: FakeControl) -> CodaProvider:
         app_url="https://coda-main.example.com",
         request_fn=control,
         app_getter=lambda _: SimpleNamespace(compute_status=SimpleNamespace(state="ACTIVE")),
+    )
+
+
+def test_control_error_detail_redacts_credentials() -> None:
+    detail = _safe_control_error_detail(
+        '{"error":"bad request","host_token":"launch-secret",'
+        '"nested":{"authorization":"Bearer x"}}'
+    )
+
+    assert "launch-secret" not in detail
+    assert "Bearer x" not in detail
+    assert detail == (
+        '{"error":"bad request","host_token":"<redacted>","nested":{"authorization":"<redacted>"}}'
     )
 
 

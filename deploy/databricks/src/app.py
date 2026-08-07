@@ -225,7 +225,15 @@ try:
     coda_app_name = os.environ.get("CODA_APP_NAME", "").strip()
     coda_app_url = os.environ.get("CODA_APP_URL", "").strip()
     public_server_url = os.environ.get("OMNIGENT_PUBLIC_SERVER_URL", "").strip()
-    if coda_app_name and coda_app_url and public_server_url:
+    coda_values = {
+        "CODA_APP_NAME": coda_app_name,
+        "CODA_APP_URL": coda_app_url,
+        "OMNIGENT_PUBLIC_SERVER_URL": public_server_url,
+    }
+    if any(coda_values.values()) and not all(coda_values.values()):
+        missing = ", ".join(name for name, value in coda_values.items() if not value)
+        raise RuntimeError(f"partial managed CoDA configuration; missing: {missing}")
+    if all(coda_values.values()):
         from omnigent.server.managed_hosts import parse_sandbox_config
 
         sandbox_config = parse_sandbox_config(
