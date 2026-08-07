@@ -8,7 +8,7 @@ from decimal import Decimal
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.artifacts import rank_issues, write_artifacts
 from issue_prioritization.config import ScoringConfig
-from issue_prioritization.domain import Issue, IssueType, Priority, Severity
+from issue_prioritization.domain import Impact, Issue, IssueType, Priority
 from issue_prioritization.scoring import ScoreEngine
 
 
@@ -21,7 +21,7 @@ def test_dry_run_artifacts_are_complete_and_deterministic(tmp_path) -> None:
             title="Database crash",
             url="https://github.com/omnigent-ai/omnigent/issues/2",
             issue_type=IssueType.BUG,
-            severity=Severity.S1,
+            impact=Impact.HIGH,
             area_keys=("db",),
             current_priority=Priority.P2,
             upvote_count=3,
@@ -32,7 +32,7 @@ def test_dry_run_artifacts_are_complete_and_deterministic(tmp_path) -> None:
             title="Small request",
             url="https://github.com/omnigent-ai/omnigent/issues/1",
             issue_type=IssueType.ENHANCEMENT,
-            severity=Severity.S3,
+            impact=Impact.LOW,
             area_keys=("db",),
             current_priority=Priority.P1,
         ),
@@ -55,6 +55,7 @@ def test_dry_run_artifacts_are_complete_and_deterministic(tmp_path) -> None:
     assert ranking[0]["upvote_count"] == 3
     assert ranking[0]["duplicate_count"] == 2
     assert ranking[1]["type"] == "Feature"
+    assert ranking[0]["impact"] == "high"
 
 
 def test_cli_writes_review_artifacts_without_network(tmp_path) -> None:

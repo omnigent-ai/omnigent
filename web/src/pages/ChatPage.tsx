@@ -4265,7 +4265,6 @@ export function Composer({
   onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
-  const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4294,6 +4293,9 @@ export function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Declared after textareaRef so dictation can place the caret after the
+  // text it inserts (and insert at the caret rather than the draft's end).
+  const dictation = useDictationInsert(value, setValue, textareaRef);
   const isComposingRef = useRef(false);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
@@ -5215,6 +5217,11 @@ export function Composer({
               // reset for that one tick.
               if (recallingRef.current) recallingRef.current = false;
               else resetCursor();
+            }}
+            onFocus={() => {
+              // From here the textarea's caret is one the user placed, so
+              // dictation inserts there instead of at the end of the draft.
+              dictation.noteFocus();
             }}
             onCompositionStart={() => {
               isComposingRef.current = true;

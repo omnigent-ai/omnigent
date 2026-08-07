@@ -1852,13 +1852,14 @@ function HarnessConfigModal({
         <DialogFooter className="border-t-0 bg-transparent">
           <Button
             type="button"
+            size="lg"
             variant="outline"
             onClick={() => onOpenChange(false)}
             data-testid="new-chat-landing-config-cancel"
           >
             Cancel
           </Button>
-          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save">
+          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save" size="lg">
             Save
           </Button>
         </DialogFooter>
@@ -1946,10 +1947,12 @@ export function NewChatLandingScreen() {
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
-  const dictation = useDictationInsert(setMessage);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Declared after textareaRef so dictation can place the caret after the
+  // text it inserts (and insert at the caret rather than the draft's end).
+  const dictation = useDictationInsert(message, setMessage, textareaRef);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
@@ -3874,8 +3877,8 @@ export function NewChatLandingScreen() {
           840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-sans">
+      <div className="flex w-full max-w-[840px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
@@ -3887,9 +3890,9 @@ export function NewChatLandingScreen() {
               </div>
             </span>
           ) : (
-            <OttoEyes className="h-16 w-auto shrink-0" />
+            <OttoEyes className="h-14 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-[28px] leading-8 font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+          <h1 className="min-w-0 break-words text-center text-[1.5em] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
             {selectedProject || "What should we build?"}
           </h1>
         </div>
@@ -3953,6 +3956,11 @@ export function NewChatLandingScreen() {
                       )
                     : null,
                 );
+              }}
+              onFocus={() => {
+                // From here the textarea's caret is one the user placed, so
+                // dictation inserts there instead of at the end of the draft.
+                dictation.noteFocus();
               }}
               onBlur={() => {
                 // Dismiss the mention menu when focus leaves the textarea; menu

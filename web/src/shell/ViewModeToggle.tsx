@@ -1,23 +1,16 @@
-import { useRef, useState } from "react";
-import { ChevronDownIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
+import { Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isIOSShell } from "@/lib/nativeBridge";
-import { type TerminalFirstView, useTerminalFirst } from "./TerminalFirstContext";
+import { cn } from "@/lib/utils";
+import { useTerminalFirst } from "./TerminalFirstContext";
 
 /**
- * Header Chat/Terminal switcher for terminal-first sessions. A
- * MessagesSquare + chevron trigger opens a small menu with Chat and
- * Terminal options (the current view is checked), replacing the old
- * in-page pill above the composer. Status lives in the sidebar — this is
- * purely a view toggle.
+ * Header Chat/Terminal switcher for terminal-first sessions. Two icon
+ * segments in a shared track show both destinations at once, so the
+ * active view is readable at a glance and switching is one click — no
+ * menu to open. Status lives in the sidebar; this is purely a view
+ * toggle.
  *
  * Self-gates to null when there's nothing to toggle:
  *   - non-terminal-first sessions,
@@ -27,99 +20,98 @@ import { type TerminalFirstView, useTerminalFirst } from "./TerminalFirstContext
  */
 export function ViewModeToggle() {
   const ctx = useTerminalFirst();
-  const [open, setOpen] = useState(false);
-  // Drive the tooltip from the trigger's own hover/focus rather than a nested
-  // TooltipTrigger: stacking TooltipTrigger + DropdownMenuTrigger asChild onto
-  // one Button merges two Slots and the tooltip's listeners can get dropped.
-  // Suppress it while the menu is open so it never overlaps the dropdown.
-  const [hovered, setHovered] = useState(false);
-  // Tracks how the last menu interaction ended so close-focus handling can tell
-  // a pointer close (suppress refocus — a restored ghost-button focus ring reads
-  // as a stuck highlight) from a keyboard close (restore focus so keyboard/AT
-  // users keep their place).
-  const closedByPointerRef = useRef(false);
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
 
   const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+  const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
 
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      {/* Tooltip anchors to a wrapper span (a single clean Slot) rather than
-          stacking TooltipTrigger + DropdownMenuTrigger onto the same Button —
-          two merged Slots on one node drop the tooltip's hover listeners. The
-          span carries the hover/focus that drives the controlled tooltip; the
-          DropdownMenuTrigger keeps anchoring the menu to the Button. Suppressed
-          while the menu is open so it never overlaps the dropdown. */}
-      <Tooltip open={hovered && !open}>
-        <TooltipTrigger asChild>
-          <span
-            className="inline-flex"
-            onPointerEnter={() => setHovered(true)}
-            onPointerLeave={() => setHovered(false)}
-            onFocus={() => setHovered(true)}
-            onBlur={() => setHovered(false)}
-          >
-            <DropdownMenuTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Switch between chat and terminal"
-                data-testid="view-mode-toggle"
-                className="w-11 gap-1 px-0 text-muted-foreground hover:text-foreground border-none"
-              >
-                <MessagesSquareIcon className="size-4" />
-                <ChevronDownIcon className="size-3 opacity-60" />
-              </Button>
-            </DropdownMenuTrigger>
-          </span>
-        </TooltipTrigger>
-        {/* Bottom placement: the header sits at top-0, so a top-side tooltip
-            would render above the viewport edge and get clipped. */}
-        <TooltipContent side="bottom">
-          {view === "terminal" ? "Terminal view" : "Chat view"}
-        </TooltipContent>
-      </Tooltip>
-      <DropdownMenuContent
-        align="end"
-        className="min-w-40"
-        // On a pointer close, don't snap focus back to the trigger: a ghost
-        // button keeps its focus ring lit until the next click, reading as a
-        // stuck "selected" state. On a keyboard close, let focus return so
-        // keyboard/AT users keep their place.
-        onCloseAutoFocus={(e) => {
-          if (closedByPointerRef.current) e.preventDefault();
-          closedByPointerRef.current = false;
-        }}
-        onPointerDownCapture={() => {
-          closedByPointerRef.current = true;
-        }}
+    <div
+      role="group"
+      aria-label="Switch between chat and terminal"
+      data-testid="view-mode-toggle"
+      // Inset track: p-0.5 around two size-6 segments lands the control at
+      // 32px tall, matching the header's other controls.
+      className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
+    >
+      <ViewModeSegment
+        label="Chat view"
+        active={view === "chat"}
+        onClick={() => setView("chat")}
+        testId="view-mode-chat"
       >
-        <DropdownMenuRadioGroup
-          value={view}
-          onValueChange={(next) => setView(next as TerminalFirstView)}
-        >
-          <DropdownMenuRadioItem value="chat" className="gap-2">
-            <MessagesSquareIcon className="size-4" />
-            Chat
-          </DropdownMenuRadioItem>
-          {/* Terminal disabled until a PTY is reachable; a spinner while it's
-              coming up reads as "loading" rather than a dead option. */}
-          <DropdownMenuRadioItem
-            value="terminal"
-            className="gap-2"
-            disabled={!terminalsAvailable}
-            title={terminalStartingUp ? "Terminal is starting up…" : undefined}
-          >
-            {terminalStartingUp ? (
-              <Loader2Icon className="size-4 animate-spin" aria-hidden />
-            ) : (
-              <TerminalIcon className="size-4" />
+        <MessagesSquareIcon className="size-3.5" />
+      </ViewModeSegment>
+      {/* Terminal stays disabled until a PTY is reachable; the spinner while
+          it's coming up reads as "loading" rather than a dead segment. */}
+      <ViewModeSegment
+        label={terminalLabel}
+        active={view === "terminal"}
+        disabled={!terminalsAvailable}
+        onClick={() => setView("terminal")}
+        testId="view-mode-terminal"
+      >
+        {terminalStartingUp ? (
+          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+        ) : (
+          <TerminalIcon className="size-3.5" />
+        )}
+      </ViewModeSegment>
+    </div>
+  );
+}
+
+/**
+ * One segment of the switcher: an icon-only button whose name lives in a
+ * tooltip. `aria-pressed` (not a radio) so each segment reads as an
+ * independent toggle to AT, matching how it behaves — clicking the active
+ * segment is a no-op rather than a selection change.
+ */
+function ViewModeSegment({
+  label,
+  active,
+  disabled = false,
+  onClick,
+  testId,
+  children,
+}: {
+  label: string;
+  active: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  testId: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      {/* Wrapper span owns hover/focus: a disabled button gets no pointer
+          events, so the tooltip explaining *why* it's disabled would never
+          open if it anchored to the button itself. */}
+      <TooltipTrigger asChild>
+        <span className="inline-flex">
+          <Button
+            type="button"
+            variant={active ? "secondary" : "ghost"}
+            size="icon-xs"
+            aria-label={label}
+            aria-pressed={active}
+            disabled={disabled}
+            onClick={onClick}
+            data-testid={testId}
+            className={cn(
+              "border-none",
+              active
+                ? "bg-background text-foreground shadow-sm hover:bg-background"
+                : "text-muted-foreground hover:bg-transparent hover:text-foreground",
             )}
-            Terminal
-          </DropdownMenuRadioItem>
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+          >
+            {children}
+          </Button>
+        </span>
+      </TooltipTrigger>
+      {/* Bottom placement: the header sits at top-0, so a top-side tooltip
+          would render above the viewport edge and get clipped. */}
+      <TooltipContent side="bottom">{label}</TooltipContent>
+    </Tooltip>
   );
 }

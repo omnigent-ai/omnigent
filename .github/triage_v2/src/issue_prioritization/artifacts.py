@@ -78,7 +78,7 @@ def _row(item: RankedIssue) -> dict[str, object]:
         "title": issue.title,
         "url": issue.url,
         "type": issue.issue_type.label,
-        "severity": issue.severity.value,
+        "impact": issue.impact.value,
         "classification_reasoning": issue.classification_reasoning,
         "score": float(result.score),
         "current_priority": issue.current_priority.value if issue.current_priority else None,
@@ -109,7 +109,7 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         "title",
         "url",
         "type",
-        "severity",
+        "impact",
         "score",
         "current_priority",
         "proposed_priority",
@@ -122,14 +122,14 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 def _write_markdown(path: Path, rows: list[dict[str, object]]) -> None:
     lines = [
-        "| Rank | Score | Severity | Current | Proposed | Δrank | Issue |",
+        "| Rank | Score | Impact | Current | Proposed | Δrank | Issue |",
         "|---:|---:|---|---|---|---:|---|",
     ]
     for row in rows:
         title = str(row["title"]).replace("|", "\\|")
         issue = f"[#{row['issue_number']}]({row['url']}) {title}"
         lines.append(
-            f"| {row['rank']} | {row['score']:.2f} | {row['severity']} | "
+            f"| {row['rank']} | {row['score']:.2f} | {row['impact']} | "
             f"{row['current_priority'] or 'none'} | {row['proposed_priority']} | "
             f"{row['rank_delta']:+d} | {issue} |"
         )

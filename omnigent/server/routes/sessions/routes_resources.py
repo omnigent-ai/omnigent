@@ -54,6 +54,7 @@ from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -1401,7 +1402,34 @@ def register_resources_routes(
             _publish_changed_files_invalidated(session_id, environment_id)
         return payload
 
-    @router.get(
+    # Reads that inline a whole file in their JSON body, so the response is as
+    # large as the file. Grouped on their own router purely to attach
+    # GZipFileContentRoute: the route table stays the source of truth for what
+    # compresses, and the PUT/PATCH/DELETE handlers sharing these paths — which
+    # return small acks — are registered on ``router`` and stay uncompressed.
+    # Included into ``router`` at the end of this function.
+    file_read_router = APIRouter(route_class=GZipFileContentRoute)
+
+    def _skip_gzip_for_binary(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Opt a base64 (binary) file read out of gzip, and return the payload.
+
+        Base64 of already-compressed media gains ~1.3x from gzip for real
+        event-loop time (385 ms at the 10 MiB binary cap), so it is skipped.
+        The decision is made here because this is where the payload is known —
+        the response is ``application/json`` for every file, so the transport
+        layer cannot tell binary from text without re-parsing the body.
+
+        :param request: The active request, carrying the flag to the route class.
+        :param payload: The read result, either a file-content object or a
+            directory listing.
+        :returns: *payload*, unchanged, for direct return by the caller.
+        """
+        if payload.get("encoding") == "base64":
+            skip_gzip(request)
+        return payload
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/filesystem",
         response_model=None,
     )
@@ -1434,17 +1462,20 @@ def register_resources_routes(
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _fs_get_with_host_fallback(
-            session_id,
-            op="list_or_read",
-            host_params={
-                "path": "",
-                "limit": limit,
-                "after": after,
-                "before": before,
-                "order": order,
-            },
-            runner_path=path,
+        return _skip_gzip_for_binary(
+            request,
+            await _fs_get_with_host_fallback(
+                session_id,
+                op="list_or_read",
+                host_params={
+                    "path": "",
+                    "limit": limit,
+                    "after": after,
+                    "before": before,
+                    "order": order,
+                },
+                runner_path=path,
+            ),
         )
 
     @router.get(
@@ -1528,7 +1559,7 @@ def register_resources_routes(
             runner_path=path,
         )
 
-    @router.get(
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/diff/{relative_path:path}",
         # Internal (UI diff view) — hidden from the public API reference.
         include_in_schema=False,
@@ -1565,7 +1596,7 @@ def register_resources_routes(
             runner_path=path,
         )
 
-    @router.get(
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}",
         response_model=None,
@@ -1605,17 +1636,20 @@ def register_resources_routes(
             f"/{environment_id}/filesystem/{relative_path}?{qs}"
         )
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _fs_get_with_host_fallback(
-            session_id,
-            op="list_or_read",
-            host_params={
-                "path": relative_path,
-                "limit": limit,
-                "after": after,
-                "before": before,
-                "order": order,
-            },
-            runner_path=path,
+        return _skip_gzip_for_binary(
+            request,
+            await _fs_get_with_host_fallback(
+                session_id,
+                op="list_or_read",
+                host_params={
+                    "path": relative_path,
+                    "limit": limit,
+                    "after": after,
+                    "before": before,
+                    "order": order,
+                },
+                runner_path=path,
+            ),
         )
 
     @router.put(
@@ -1776,3 +1810,9 @@ def register_resources_routes(
         await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/{resource_id}"
         return await _proxy_get_to_runner(session_id, path)
+
+    # Mount the gzip-wrapped file reads. Appended after every sibling route so
+    # the `{relative_path:path}` catch-alls cannot shadow a more specific
+    # sibling (e.g. `.../environments/{id}/shell`), which is how they behaved
+    # when they were registered inline on `router`.
+    router.include_router(file_read_router)

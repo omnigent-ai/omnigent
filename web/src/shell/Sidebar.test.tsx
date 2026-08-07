@@ -317,8 +317,41 @@ describe("Sidebar session list", () => {
     const row = screen.getByText("Balanced row title").closest("a")!;
     expect(row).toHaveClass("pr-28", "md:pr-2");
     expect(row.className).toContain("md:group-hover:pr-14");
-    expect(row.className).toContain("md:group-focus-within:pr-14");
+    // Keyed on `:focus-visible`, matching when the trailing controls appear and
+    // the state marker fades. `focus-within` would also fire for a plain click,
+    // narrowing the reserve on the selected row while the marker stayed put.
+    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-14");
+    expect(row.className).not.toContain("md:group-focus-within:pr-14");
     expect(row.className).not.toMatch(/(?:^|\s)md:pr-14(?:\s|$)/);
+  });
+
+  it("narrows the awaiting row's reserve on the same trigger that fades its tag", () => {
+    // The "Needs response" tag is absolutely positioned, so the row's right
+    // padding is the only thing keeping the title clear of it. If the padding
+    // narrows on a trigger the tag's fade doesn't share, the title slides under
+    // a still-visible tag — which is what a plain click did via `focus-within`.
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        title: "Awaiting row title",
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByText("Awaiting row title").closest("a")!;
+    const tag = screen.getByTestId("session-state-badge");
+    expect(tag).toHaveAttribute("data-state", "awaiting");
+
+    // Every state that narrows the reserve must also fade the tag, and vice
+    // versa, so the two can never disagree about whether the space is free.
+    for (const trigger of ["md:group-hover:", "md:group-has-[:focus-visible]:"]) {
+      expect(row.className).toContain(`${trigger}pr-14`);
+      expect(tag.parentElement!.className).toContain(`${trigger}opacity-0`);
+    }
+    // `focus-within` fires for a plain mouse click, which the tag's fade does
+    // not react to — the mismatch that put the title under the selected row's
+    // tag.
+    expect(row.className).not.toContain("focus-within");
   });
 
   it("offers the four display filters and defaults to All sessions", () => {
@@ -337,6 +370,50 @@ describe("Sidebar session list", () => {
     // Radio semantics: exactly one option is checked, and it's "All sessions".
     expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("keeps the picked filter across a remount", () => {
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    renderSidebar();
+
+    selectSessionFilter("mine");
+    expect(screen.queryByText("conv_shared")).toBeNull();
+
+    // Fresh mount re-reads localStorage: still scoped to the viewer's own
+    // sessions. If this fails, the pick lived only in memory and a reload
+    // silently snapped the list back to "All sessions".
+    cleanup();
+    renderSidebar();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("drops a persisted Shared filter on a single-user server", () => {
+    // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
+    // a value stored against a multi-user one would scope the list to a slice
+    // the viewer has no option to leave.
+    localStorage.setItem("omnigent:session-filter", "shared");
+    isServerLocalMock.mockReturnValue(true);
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
   });
 
   it("shows archived sessions only under the Archived filter", () => {

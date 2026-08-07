@@ -15,6 +15,7 @@ only an already-mirrored value is not re-posted.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2538,3 +2539,137 @@ def test_settle_timeout_tracks_slowest_configured_server(tmp_path: Path) -> None
         '[mcp_servers.off]\ncommand = "y"\nenabled = false\nstartup_timeout_sec = 120\n',
     )
     assert fwd._mcp_startup_settle_timeout_seconds(tmp_path) == 25.0
+
+
+def _coalescer(client: object) -> fwd._OutputTextDeltaCoalescer:
+    """Build a delta coalescer wired to ``client``."""
+    return fwd._OutputTextDeltaCoalescer(
+        client=client,
+        session_id="conv_idle",
+        flush_interval_seconds=0.05,
+        flush_char_threshold=64,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_close_returns_when_its_worker_is_cancelled() -> None:
+    """``close()`` must not park on a marker its cancelled worker can never resolve.
+
+    ``asyncio.run`` cancels every task before resuming any, so when the forwarder
+    resumes first its ``finally`` calls ``close()`` while the worker is cancelled but
+    not yet ``done()``. The marker is queued with nobody left to complete it.
+    """
+    coalescer = _coalescer(_RecordingClient())
+    coalescer._ensure_worker()
+    await asyncio.sleep(0)
+    worker = coalescer._worker_task
+    assert worker is not None
+
+    worker.cancel()
+    # Deliberately NOT awaited: this reproduces the teardown ordering where the
+    # worker is cancelled but has not run yet, which no `done()` check can catch.
+    assert not worker.done()
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(coalescer.close(), timeout=fwd._DELTA_MARKER_TIMEOUT_SECONDS + 5.0)
+
+    assert coalescer._worker_task is None
+    assert loop.time() - started < fwd._DELTA_MARKER_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_close_gives_up_on_a_wedged_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker still alive but stuck mid-post must not hold ``close()`` forever.
+
+    This is the one case the bound exists for: the worker owns the marker, so it is
+    off the queue, and the worker is running, so racing it does not help either.
+    """
+
+    class _HangingClient:
+        """Client whose post never returns, wedging the worker inside a flush."""
+
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def post(self, *args: object, **kwargs: object) -> None:
+            self.entered.set()
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(fwd, "_DELTA_MARKER_TIMEOUT_SECONDS", 0.1)
+    client = _HangingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    coalescer._queue.put_nowait(fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="x"))
+    await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+    worker = coalescer._worker_task
+    assert worker is not None
+
+    await asyncio.wait_for(coalescer.close(), timeout=fwd._DELTA_MARKER_TIMEOUT_SECONDS + 5.0)
+
+    # close() gave up on the bound rather than waiting out a worker still stuck in its post.
+    assert coalescer._worker_task is None
+    assert not worker.done()
+    worker.cancel()
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_worker_survives_an_already_settled_marker() -> None:
+    """Resolving a marker whose future is already settled must not kill the worker.
+
+    ``set_result`` on a settled future raises ``InvalidStateError``, and
+    ``_ensure_worker`` only replaces a ``None`` task, so a worker lost this way is
+    never restarted and every later delta is dropped without a word.
+    """
+    client = _RecordingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    await asyncio.sleep(0)
+
+    settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    settled.cancel()
+    coalescer._queue.put_nowait(fwd._DeltaFlushBarrier(done=settled))
+    await asyncio.sleep(0.1)
+
+    assert coalescer._worker_task is not None
+    assert not coalescer._worker_task.done()
+
+    posts_before = len(client.posts)
+    coalescer._queue.put_nowait(
+        fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="still here")
+    )
+    await asyncio.wait_for(coalescer.flush(), timeout=5.0)
+    assert len(client.posts) > posts_before
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_survives_a_cancelled_flush_caller() -> None:
+    """A cancelled ``flush()`` caller must not kill the worker.
+
+    The caller's cancellation settles its own future. Resolving it again raises
+    ``InvalidStateError`` inside the worker, and ``_ensure_worker`` only replaces a
+    ``None`` task, so the dead worker was never restarted and every later delta was
+    silently dropped.
+    """
+    client = _RecordingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    await asyncio.sleep(0)
+
+    pending = asyncio.ensure_future(coalescer.flush())
+    await asyncio.sleep(0)
+    pending.cancel()
+    await asyncio.gather(pending, return_exceptions=True)
+    await asyncio.sleep(0.1)
+
+    assert coalescer._worker_task is not None
+    assert not coalescer._worker_task.done()
+
+    posts_before = len(client.posts)
+    coalescer._queue.put_nowait(
+        fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="still here")
+    )
+    await asyncio.wait_for(coalescer.flush(), timeout=5.0)
+    assert len(client.posts) > posts_before

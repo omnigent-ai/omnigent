@@ -235,17 +235,28 @@ class ZygoteManager:
                 stderr=log_fh,
             )
 
-    def fork_runner(self, env: dict[str, str], log_path: str) -> ZygoteRunnerProc:
+    def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:
         """Ask the zygote to fork a runner with *env*, returning its handle.
 
         :param env: Full runner environment (the child replaces ``os.environ``
             with it). Must already carry ``RUNNER_PARENT_PID`` set to the
             zygote's pid so the runner's orphan watchdog stays correct.
         :param log_path: Session log path the child points stdout/stderr at.
+        :param workspace: Existing session workspace to use as the child's cwd.
+            Required: a daemon may outlive the checkout it started from, so
+            inheriting its cwd would make every ``Path.cwd()`` in the runner
+            raise ``FileNotFoundError``.
         :returns: A :class:`ZygoteRunnerProc` for the forked runner.
         :raises ZygoteUnavailable: If the zygote is down or reports a fork error.
         """
-        reply = self._exchange({"cmd": "fork", "env": env, "log_path": log_path})
+        reply = self._exchange(
+            {
+                "cmd": "fork",
+                "env": env,
+                "log_path": log_path,
+                "cwd": workspace,
+            }
+        )
         if "error" in reply:
             raise ZygoteUnavailable(f"zygote fork failed: {reply['error']}")
         pid = reply.get("pid")
