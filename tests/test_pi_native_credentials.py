@@ -1190,9 +1190,14 @@ def _databricks_provider_without_catalog(
 @pytest.mark.parametrize(
     ("model", "expected_provider", "expected_api"),
     [
-        ("databricks-glm-5-2", "omnigent-openai", "openai-responses"),
+        # Probed: the gateway serves Responses passthrough for the system.ai.*
+        # id but rejects it for the databricks-* alias of the same model.
+        ("databricks-glm-5-2", "omnigent-completions", "openai-completions"),
+        ("system.ai.glm-5-2", "omnigent-openai", "openai-responses"),
+        ("databricks-kimi-k3", "omnigent-completions", "openai-completions"),
         ("databricks-gpt-5-5", "omnigent-openai", "openai-responses"),
         ("system.ai.gemini-3-5-flash", "omnigent-mlflow", "openai-completions"),
+        ("databricks-gemini-3-5-flash", "omnigent-completions", "openai-completions"),
         ("databricks-llama-4-maverick", "omnigent-completions", "openai-completions"),
         ("databricks-deepseek-v3", "omnigent-completions", "openai-completions"),
     ],
@@ -1345,14 +1350,14 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
 
     assert args == [
         "--provider",
-        "omnigent-openai",
+        "omnigent-completions",
         "--model",
         "databricks-glm-5-2",
         "--thinking",
         "off",
     ]
     cfg = json.loads((tmp_path / "pi-agent" / "models.json").read_text())
-    registered = cfg["providers"]["omnigent-openai"]["models"]
+    registered = cfg["providers"]["omnigent-completions"]["models"]
     assert [m["id"] for m in registered] == ["databricks-glm-5-2"]
 
 

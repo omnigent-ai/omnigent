@@ -39,10 +39,9 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
     unavailable: the catalog carries authoritative per-endpoint capabilities and
     is always preferred.
 
-    Follows the surface split the catalog builder applies, so a keyword model
-    (GLM, kimi) lands on Responses. ``pi_executor._pi_provider_for_model`` sends
-    those to completions when it too has no wire metadata — that disagreement
-    predates this fallback and is why the keyword list exists.
+    The keyword surface split applies only to ``system.ai.*`` ids: the gateway
+    serves Responses passthrough for ``system.ai.glm-5-2`` but rejects it for the
+    ``databricks-glm-5-2`` alias of the same model, so an alias goes to chat.
 
     :param model_id: Gateway or Unity Catalog model id, any case.
     :returns: The surface whose protocol the model's family accepts.
@@ -50,12 +49,13 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
     lower = model_id.lower()
     if "claude" in lower:
         return DatabricksPiSurface.ANTHROPIC
-    needs_responses = any(keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS)
     if lower.startswith("system.ai."):
         # system.ai.* ids are not routable at /serving-endpoints; the ones whose
         # chat surface omits Pi's required finish reason need Responses instead.
-        return DatabricksPiSurface.RESPONSES if needs_responses else DatabricksPiSurface.MLFLOW
-    if needs_responses or "gpt" in lower:
+        if any(keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS):
+            return DatabricksPiSurface.RESPONSES
+        return DatabricksPiSurface.MLFLOW
+    if "gpt" in lower:
         # Unknown GPT metadata fails toward Responses — the forward-compatible
         # tool-capable surface.
         return DatabricksPiSurface.RESPONSES
