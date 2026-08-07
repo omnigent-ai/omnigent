@@ -567,7 +567,7 @@ async def test_unconfined_write_inside_a_read_grant_still_succeeds(tmp_path: Pat
         )
     )
     assert os_env is not None
-    fs = CallerProcessFilesystem(os_env, browse_outside_workspace=True)
+    fs = CallerProcessFilesystem(os_env)
 
     result = await fs.write(str(target), b"written\n")
 

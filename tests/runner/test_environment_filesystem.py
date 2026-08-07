@@ -1663,7 +1663,6 @@ async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) 
                 sandbox=OSEnvSandboxSpec(type="none"),
             )
         ),
-        browse_outside_workspace=True,
     )
 
     entries, _truncated = await fs.search_files("collide", path=str(outside))
@@ -1673,25 +1672,27 @@ async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_write_outside_workspace_requires_the_server_vouch(
+async def test_write_outside_workspace_accepted_for_an_unconfined_environment(
     client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
-    """Writing an absolute path is only accepted when the server vouches for the
-    caller. The runner cannot see who is asking, so without the vouch the
-    absolute form is not accepted at all -- the historical contract."""
+    """The runner serves an absolute write when the environment is unconfined.
+
+    It does not ask WHO is writing -- it cannot see the caller. Identity is
+    the server's gate: absolute paths require session ownership there, pinned
+    in ``tests/server/routes/test_shell_permission_gate.py``. What the runner
+    still enforces on its own is the sandbox policy, which is why a CONFINED
+    environment refuses the same request (see the isolation suite).
+    """
     target = tmp_path / "outside.txt"
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
     encoded = "%2F" + str(target).lstrip("/")
-    body = {"content": "written\n", "encoding": "utf-8"}
 
-    refused = await client.put(f"{base}/{encoded}", json=body)
-    assert refused.status_code == 400, refused.text
-    assert refused.json()["error"]["code"] == "invalid_path"
-    assert not target.exists()
+    resp = await client.put(
+        f"{base}/{encoded}", json={"content": "written\n", "encoding": "utf-8"}
+    )
 
-    vouched = await client.put(f"{base}/{encoded}?browse_outside_workspace=true", json=body)
-    assert vouched.status_code == 200, vouched.text
+    assert resp.status_code == 200, resp.text
     assert target.read_text() == "written\n"
 
 
@@ -1707,7 +1708,7 @@ async def test_edit_and_delete_outside_workspace_round_trip(
     target = tmp_path / "roundtrip.txt"
     target.write_text("alpha beta\n")
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
-    url = f"{base}/%2F{str(target).lstrip('/')}?browse_outside_workspace=true"
+    url = f"{base}/%2F{str(target).lstrip('/')}"
 
     edited = await client.patch(url, json={"old_text": "alpha", "new_text": "gamma"})
     assert edited.status_code == 200, edited.text
@@ -1731,7 +1732,7 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
     locked.chmod(0o500)  # read+execute only: no new entries
     try:
         base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
-        url = f"{base}/%2F{str(locked / 'nope.txt').lstrip('/')}?browse_outside_workspace=true"
+        url = f"{base}/%2F{str(locked / 'nope.txt').lstrip('/')}"
 
         resp = await client.put(url, json={"content": "x", "encoding": "utf-8"})
 

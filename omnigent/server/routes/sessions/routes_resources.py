@@ -408,30 +408,33 @@ def register_resources_routes(
         encoded = (
             "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
         )
-        path = (
+        return (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{encoded}"
         )
-        return f"{path}?browse_outside_workspace=true" if absolute else path
 
-    def _mutating_level(relative_path: str) -> int:
-        """Permission level a write / edit / delete needs for *relative_path*.
+    def _browse_level(client_path: str, *, within_workspace: int) -> int:
+        """Permission level a filesystem request needs for *client_path*.
 
-        Inside the workspace: ``LEVEL_EDIT``, the historical bar — the
-        workspace is the session's shared context, so a collaborator who can
-        edit the session can edit it.
+        Inside the workspace, the caller's usual bar (``LEVEL_READ`` to read,
+        ``LEVEL_EDIT`` to mutate) — the workspace is the session's shared
+        context, so a collaborator granted the session gets it.
 
-        Outside it: ``LEVEL_OWNER``. Everything beyond the workspace is the
-        owner's own machine, and the host-scoped filesystem endpoint that
-        already browses it (``/v1/hosts/{id}/filesystem``, behind the
-        workspace picker) is owner-scoped. Gating this at ``LEVEL_EDIT``
-        would make the session route a weaker way to reach the same files,
-        so a shared session must not become a way around that check.
+        Outside it, ``LEVEL_OWNER``, for reads as much as writes. Everything
+        past the workspace is the owner's own machine, and the host-scoped
+        endpoint that already browses it (``/v1/hosts/{id}/filesystem``,
+        behind the workspace picker) is owner-scoped. Anything weaker here
+        would make a shared session a way around that check.
 
-        :param relative_path: Client-supplied path.
+        This is the ONLY place the boundary is decided. The runner is handed
+        the path and nothing else: it cannot see who is asking, so it does
+        not try to — it enforces the sandbox grants, this enforces identity.
+
+        :param client_path: Client-supplied path; a leading ``/`` is absolute.
+        :param within_workspace: Level required for a workspace-relative path.
         :returns: The required permission level.
         """
-        return LEVEL_OWNER if relative_path.startswith("/") else LEVEL_EDIT
+        return LEVEL_OWNER if client_path.startswith("/") else within_workspace
 
     async def _authorize_absolute_browse(session_id: str, absolute_path: str) -> str:
         """Authorize an absolute browse target for the host-served path.
@@ -1670,11 +1673,9 @@ def register_resources_routes(
             params["exclude"] = exclude
 
         absolute = path.startswith("/")
-        if absolute:
-            await _validate_session(session_id, request, LEVEL_OWNER)
-            params["browse_outside_workspace"] = "true"
-        else:
-            await _validate_session(session_id, request, LEVEL_READ)
+        await _validate_session(
+            session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
+        )
 
         qs = urllib.parse.urlencode(params)
         suffix = ""
@@ -1809,11 +1810,9 @@ def register_resources_routes(
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
         absolute = relative_path.startswith("/")
-        if absolute:
-            await _validate_session(session_id, request, LEVEL_OWNER)
-            params["browse_outside_workspace"] = "true"
-        else:
-            await _validate_session(session_id, request, LEVEL_READ)
+        await _validate_session(
+            session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
+        )
 
         qs = urllib.parse.urlencode(params)
         # Encode only the leading slash: a literal "//" is what proxies
@@ -1877,7 +1876,7 @@ def register_resources_routes(
             body,
             request=request,
             environment_id=environment_id,
-            required_level=_mutating_level(relative_path),
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
         )
 
     @router.patch(
@@ -1909,7 +1908,7 @@ def register_resources_routes(
             body,
             request=request,
             environment_id=environment_id,
-            required_level=_mutating_level(relative_path),
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
         )
 
     @router.delete(
@@ -1939,7 +1938,7 @@ def register_resources_routes(
             path,
             request=request,
             environment_id=environment_id,
-            required_level=_mutating_level(relative_path),
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
         )
 
     # ── Phase 5: environment shell proxy ─────────────────────────

@@ -377,7 +377,7 @@ class CallerProcessFilesystem:
     :param os_env: The backing OSEnvironment instance.
     """
 
-    def __init__(self, os_env: OSEnvironment, *, browse_outside_workspace: bool = False) -> None:
+    def __init__(self, os_env: OSEnvironment) -> None:
         self._os_env = os_env
         self._root = Path(os_env.cwd).resolve()
         self._root_prefix = containment_prefix(self._root)
@@ -392,12 +392,6 @@ class CallerProcessFilesystem:
         else:
             self._roots = reachable_roots(self._root, policy)
             self._unconfined = is_unconfined(policy)
-        # An unconfined environment *could* serve any path, but the runner never
-        # decides that on its own: it cannot see who is asking. The server checks
-        # the caller's permission level and vouches for the wider scope per
-        # request. Without that vouch an absolute path is not accepted at all,
-        # so the default runner contract is unchanged.
-        self._allow_absolute = browse_outside_workspace
 
     @property
     def reach(self) -> tuple[list[ReachableRoot], bool]:
@@ -439,14 +433,17 @@ class CallerProcessFilesystem:
     def _absolute(self, path: str) -> bool:
         """Whether this request should be handled as an absolute path.
 
-        Absolute paths are accepted only when the server has vouched for
-        the caller. Otherwise they fall through to :func:`_validate_path`,
-        which rejects them exactly as it always has.
+        Absolute paths take the browse-authorization route, which admits
+        them only when a declared grant covers them or the environment is
+        unconfined. WHO may ask is the server's decision, not this
+        process's: it gates absolute paths on session ownership before
+        proxying (see ``_browse_level`` in the resources routes). The
+        runner cannot see the caller's identity, so it does not try to.
 
         :param path: Client-supplied path.
         :returns: ``True`` to take the absolute-path route.
         """
-        return self._allow_absolute and is_absolute_request(path)
+        return is_absolute_request(path)
 
     def _within_grants(self, resolved: Path, *, need_write: bool = False) -> bool:
         """Whether a grant covers this path *for the access being requested*.
