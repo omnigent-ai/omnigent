@@ -6,6 +6,9 @@ project-includes = [
 
 project-excludes = []
 
+# Editable workspace packages are project sources, not third-party site packages.
+disable-project-excludes-heuristics = true
+
 python-version = "3.12"
 
 search-path = ["."]
