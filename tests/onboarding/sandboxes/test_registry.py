@@ -67,6 +67,7 @@ def test_plugin_state_loads_builtins() -> None:
     state = plugin_state()
     assert isinstance(state, SandboxProviderPluginState)
     assert "modal" in state
+    assert "blaxel" in state
     assert "kubernetes" in state
 
 
@@ -92,6 +93,7 @@ def test_available_providers_returns_builtins() -> None:
     reset_plugin_state_for_tests()
     names = available_providers()
     assert "modal" in names
+    assert "blaxel" in names
     assert "kubernetes" in names
 
 
@@ -115,6 +117,13 @@ def test_instantiate_loads_built_in_provider() -> None:
     reset_plugin_state_for_tests()
     launcher = instantiate("modal")
     assert launcher.provider == "modal"
+
+
+def test_instantiate_loads_blaxel_without_optional_sdk() -> None:
+    """The lazy Blaxel module imports before the optional SDK is installed."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("blaxel")
+    assert launcher.provider == "blaxel"
 
 
 def test_instantiate_unknown_raises() -> None:
