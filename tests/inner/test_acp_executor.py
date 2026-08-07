@@ -25,6 +25,7 @@ import pytest
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.executor import (
+    ExecutorError,
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
@@ -569,3 +570,51 @@ async def test_end_to_end_denied_permission(tmp_path: Path) -> None:
 
     # Turn still completes even though the tool was rejected.
     assert any(isinstance(e, TurnComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# run_turn cleans up its pending prompt future on every exit path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_turn_timeout_does_not_leak_pending_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that times out must not leave its request future in ``_pending``.
+
+    The stdout reader pops ``req_id`` only when it matches a response. On the
+    timeout path (and the EOF/reader-error path) nothing removes it, so before
+    the ``finally`` cleanup ``_pending`` grew one stale entry per silent/failed
+    turn on a long-lived ACP session. Drive a turn whose response never arrives
+    and assert the map is empty afterward.
+    """
+    from types import SimpleNamespace
+
+    import omnigent.inner.acp_executor as acp_mod
+
+    # Time out the prompt loop near-instantly instead of after the 300s default.
+    monkeypatch.setattr(acp_mod, "_PROMPT_TIMEOUT_SECONDS", 0.05)
+
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def _noop(*_a: object, **_k: object) -> None:
+        return None
+
+    async def _sess() -> str:
+        return "sess-1"
+
+    # No real subprocess / handshake; nothing ever resolves the prompt future,
+    # so run_turn falls through to the timeout branch.
+    monkeypatch.setattr(ex, "_start_process", _noop)
+    monkeypatch.setattr(ex, "_ensure_initialized", _noop)
+    monkeypatch.setattr(ex, "_ensure_session", _sess)
+    monkeypatch.setattr(ex, "_send", _noop)
+    ex._proc = SimpleNamespace(returncode=None)  # type: ignore[assignment]
+
+    events = [event async for event in ex.run_turn([{"role": "user", "content": "hi"}], [], "sys")]
+
+    # It surfaced the timeout...
+    assert any(isinstance(e, ExecutorError) for e in events)
+    # ...and, the point of the fix, left no stale future behind.
+    assert ex._pending == {}, "run_turn must drop its prompt future from _pending on timeout"
