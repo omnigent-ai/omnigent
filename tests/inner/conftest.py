@@ -12,14 +12,35 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
 from tests import _model_pools
+
+
+@pytest.fixture
+def short_tmp_parent() -> Iterator[pathlib.Path]:
+    """A short-pathed temp dir under ``/tmp`` for Unix-socket-binding tests.
+
+    macOS caps an ``AF_UNIX`` path at ~103 bytes and its ``$TMPDIR`` is already
+    ~48 bytes, so pytest's ``tmp_path`` (which embeds the test name) overflows
+    before a socket filename is appended (issue #4279). Tests that bind a real
+    Unix socket — the private tmux server, the egress proxy — must place it
+    under a short parent. Production sockets already live under a short
+    ``$TMPDIR/omnigent-...`` path, so this is a test-path artifact only.
+    """
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="omni-inner-", dir="/tmp"))
+    try:
+        yield parent
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
