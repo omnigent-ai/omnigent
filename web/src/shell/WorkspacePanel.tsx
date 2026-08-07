@@ -685,6 +685,7 @@ export function WorkspacePanel({
       // same flush/bordered styling — only the width changes. The resize
       // handle is suppressed in that state — there's no neighbor to resize
       // against.
+      data-maximized={maximized || undefined}
       className={cn(
         "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
