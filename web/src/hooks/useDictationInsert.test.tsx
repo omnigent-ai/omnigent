@@ -292,6 +292,33 @@ describe("useDictationInsert", () => {
       expect(composer.value).toBe("Second. Hello PASTED");
     });
 
+    it("pins a final whose text matches the partial already on screen", () => {
+      // The server often finalizes exactly what it last streamed, so the splice
+      // changes nothing. The update is still a pin: if the region stayed
+      // pending, the next insert would lift the finalized text back out, and an
+      // end-of-take clear would delete the dictated word outright.
+      const composer = renderComposer("PASTED");
+      composer.click(0);
+      composer.replaceInterim("hello");
+      expect(composer.value).toBe("hello PASTED");
+      composer.appendFinal("hello");
+      expect(composer.value).toBe("hello PASTED");
+      composer.replaceInterim(""); // end of take
+      expect(composer.value).toBe("hello PASTED");
+      // ...and the next utterance continues after it, not in front of it.
+      composer.appendFinal("Next.");
+      expect(composer.value).toBe("hello Next. PASTED");
+    });
+
+    it("is inert when an empty clear arrives with nothing pending", () => {
+      const composer = renderComposer("USER TEXT");
+      composer.click(0);
+      composer.replaceInterim("");
+      expect(composer.value).toBe("USER TEXT");
+      composer.appendFinal("Lead.");
+      expect(composer.value).toBe("Lead. USER TEXT");
+    });
+
     it("does not resurrect a spent region when the draft returns to its text", () => {
       // Undo (or retyping the same string) restores value equality with what
       // dictation produced, but those characters now belong to the user. A

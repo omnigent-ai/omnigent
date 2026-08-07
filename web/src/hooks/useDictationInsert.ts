@@ -115,8 +115,10 @@ export function useDictationInsert(
     if (producedRef.current?.value !== draft) producedRef.current = null;
     draftRef.current = draft;
   }
-  // Whether the textarea has ever held focus. Until it has, its selectionStart
-  // is 0 by default rather than a caret the user placed and can see.
+  // Whether the textarea has EVER held focus. Until it has, its selectionStart
+  // is 0 by default rather than a caret the user placed and can see. Never
+  // reset on blur, deliberately: clicking the mic button blurs the composer,
+  // and the caret the user left behind is still the one they can see and mean.
   const focusedRef = useRef(false);
   // Caret this hook has asked for but not yet applied, or null when none is
   // outstanding. Non-null means the DOM caret is stale.
@@ -167,20 +169,28 @@ export function useDictationInsert(
       const at = region?.start ?? (stale ? mine.tail : (live ?? base.length));
       const spliced = splice(base, at, text);
 
-      // Nothing to write. Reached by the empty-interim clear the mic emits at
-      // the end of a take, once the preceding final has already cleared the
-      // region. setDraft would be a same-value update, which React can bail out
-      // of without committing, so the layout effect would never run to clear a
-      // caret request made here and every later utterance would read the DOM
-      // caret as stale, pinning inserts to the tail and ignoring the user.
-      if (spliced.next === current) return;
-
-      draftRef.current = spliced.next;
-      producedRef.current = {
+      const settled: Produced = {
         value: spliced.next,
         region: pin || !text ? null : spliced.region,
         tail: spliced.caret,
       };
+
+      // The draft already reads exactly like this. Two ways to get here: the
+      // empty-interim clear the mic emits at the end of a take, and a final
+      // whose text matches the partial already on screen. Ownership still has
+      // to settle (a final must pin, or the region would stay pending and the
+      // next insert would lift the finalized text back out and delete it), but
+      // no caret may be requested: setDraft would be a same-value update, which
+      // React can bail out of without committing, so the layout effect would
+      // never run to clear the request and every later utterance would read the
+      // DOM caret as stale, pinning inserts to the tail and ignoring the user.
+      if (spliced.next === current) {
+        producedRef.current = mine === null ? null : settled;
+        return;
+      }
+
+      draftRef.current = spliced.next;
+      producedRef.current = settled;
       wantCaretRef.current = spliced.caret;
       setDraft(spliced.next);
     },
