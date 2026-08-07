@@ -8,10 +8,12 @@ import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
 from omnigent.runtime.prompt import (
+    MCP_INSTRUCTIONS_ENV,
     SHARED_MESSAGE_ATTRIBUTION_ENV,
     SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
     append_framework_instructions,
     build_instructions,
+    format_mcp_routing_guidance,
     history_has_multiple_authors,
     history_to_input_items,
 )
@@ -249,3 +251,41 @@ def test_empty_framework_instructions_do_not_change_default() -> None:
 
 def test_framework_only_instructions_use_shared_composer() -> None:
     assert append_framework_instructions(None, ("Rename session",)) == "Rename session"
+
+
+def test_format_mcp_routing_guidance_appends_per_server_sections() -> None:
+    """Captured initialize.instructions become a separable prompt section."""
+    text = format_mcp_routing_guidance(
+        {
+            "pipeshub": "Prefer pipeshub_chat for Q&A.",
+            "other": "Use other_search to locate files.",
+        }
+    )
+    assert text is not None
+    assert text.startswith("## MCP server routing guidance")
+    assert "### pipeshub" in text
+    assert "Prefer pipeshub_chat for Q&A." in text
+    assert "### other" in text
+
+
+def test_format_mcp_routing_guidance_respects_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_MCP_INSTRUCTIONS_ENABLED=0 disables injection."""
+    monkeypatch.setenv(MCP_INSTRUCTIONS_ENV, "0")
+    assert format_mcp_routing_guidance({"pipeshub": "Prefer chat."}) is None
+
+
+def test_mcp_guidance_appends_after_agent_instructions() -> None:
+    """Agent AGENTS.md stays ahead of MCP server routing text."""
+    spec = cast(AgentSpec, SimpleNamespace(instructions="Agent AGENTS.md", skills=[]))
+    guidance = format_mcp_routing_guidance({"pipeshub": "Prefer pipeshub_chat."})
+    assert guidance is not None
+    result = build_instructions(
+        spec,
+        None,
+        [],
+        framework_instructions=(guidance,),
+    )
+    assert result.index("Agent AGENTS.md") < result.index("## MCP server routing guidance")
+    assert "Prefer pipeshub_chat." in result

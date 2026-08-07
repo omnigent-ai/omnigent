@@ -32,6 +32,9 @@ SHARED_SESSION_AUTHORSHIP_INSTRUCTION = (
     "credentials, session ownership, or authorization."
 )
 SHARED_MESSAGE_ATTRIBUTION_ENV = "OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED"
+# Kill switch for injecting MCP InitializeResult.instructions into the system
+# prompt. Default on; set to 0/false/no/off to disable.
+MCP_INSTRUCTIONS_ENV = "OMNIGENT_MCP_INSTRUCTIONS_ENABLED"
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 
@@ -46,6 +49,46 @@ def shared_message_attribution_enabled() -> bool:
     """
     value = os.environ.get(SHARED_MESSAGE_ATTRIBUTION_ENV, "").strip().lower()
     return value not in _FALSE_ENV_VALUES
+
+
+def mcp_instructions_enabled() -> bool:
+    """Return whether MCP ``initialize.instructions`` should be appended to prompts.
+
+    On by default. Operators can disable globally via
+    :data:`MCP_INSTRUCTIONS_ENV` without changing agent YAML.
+
+    :returns: ``False`` only when the environment explicitly disables injection.
+    """
+    value = os.environ.get(MCP_INSTRUCTIONS_ENV, "").strip().lower()
+    return value not in _FALSE_ENV_VALUES
+
+
+def format_mcp_routing_guidance(
+    server_instructions: dict[str, str],
+) -> str | None:
+    """Format captured MCP server instructions for system-prompt injection.
+
+    Emits a single section with one subsection per server that returned
+    non-empty ``InitializeResult.instructions``. Returns ``None`` when
+    injection is disabled or *server_instructions* is empty.
+
+    :param server_instructions: Map of display name → instruction text,
+        e.g. ``{"pipeshub": "Prefer pipeshub_chat for Q&A..."}``.
+    :returns: Formatted markdown block, or ``None`` when there is nothing
+        to append.
+    """
+    if not mcp_instructions_enabled() or not server_instructions:
+        return None
+    parts = ["## MCP server routing guidance"]
+    for name, text in server_instructions.items():
+        body = text.strip()
+        if not body:
+            continue
+        heading = name.strip() or "mcp"
+        parts.append(f"### {heading}\n\n{body}")
+    if len(parts) == 1:
+        return None
+    return "\n\n".join(parts)
 
 
 def append_framework_instructions(

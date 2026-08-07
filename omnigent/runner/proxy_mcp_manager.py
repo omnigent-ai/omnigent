@@ -129,7 +129,9 @@ class ProxyMcpManager:
             set, and per-server failure messages.
         """
         if not spec.mcp_servers:
-            return McpSchemasResult(schemas=[], tool_names=set(), failures={})
+            return McpSchemasResult(
+                schemas=[], tool_names=set(), failures={}, server_instructions={}
+            )
 
         payload: _JsonObject = {
             "jsonrpc": "2.0",
@@ -155,6 +157,7 @@ class ProxyMcpManager:
                 schemas=[],
                 tool_names=set(),
                 failures={"proxy": f"{type(exc).__name__}: {exc}"},
+                server_instructions={},
             )
 
         if "error" in data:
@@ -173,6 +176,7 @@ class ProxyMcpManager:
                 schemas=[],
                 tool_names=set(),
                 failures={"proxy": msg},
+                server_instructions={},
             )
 
         result = _json_object(data.get("result"))
@@ -186,6 +190,7 @@ class ProxyMcpManager:
                 schemas=[],
                 tool_names=set(),
                 failures={"proxy": msg},
+                server_instructions={},
             )
         tools_list = _json_object_list(result.get("tools"))
         schemas: list[_JsonObject] = []
@@ -216,7 +221,19 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
-        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
+        raw_instructions = result.get("serverInstructions")
+        server_instructions: dict[str, str] = {}
+        if isinstance(raw_instructions, dict):
+            for key, value in raw_instructions.items():
+                if isinstance(key, str) and isinstance(value, str) and value.strip():
+                    server_instructions[key] = value.strip()
+
+        return McpSchemasResult(
+            schemas=schemas,
+            tool_names=tool_names,
+            failures={},
+            server_instructions=server_instructions,
+        )
 
     async def call_tool(
         self,
