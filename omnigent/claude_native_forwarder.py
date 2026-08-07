@@ -250,17 +250,23 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 # published on the per-conversation SSE stream. Unmapped events emit
 # no status.
 #
-# ``Stop`` → idle and ``StopFailure`` → failed are the authoritative
-# turn-end edges (each fires once when Claude finishes / errors a turn);
-# they drive sub-agent terminal delivery via the codex-shared
-# ``external_session_status`` path (→ parent inbox + wake). The
-# PTY-activity ``idle`` cannot: it is a ~1s-quiescence heuristic that
-# oscillates on every mid-turn lull, so delivering on it fired a
-# premature completion and idempotently locked out the real one.
-# ``UserPromptSubmit`` → running stays PTY-derived — the pane watcher
-# drives the UI running/idle badge and catches what ``Stop`` misses
-# (interrupts, compaction failures, TUI edits). ``_publish_status``
-# keeps ``failed`` sticky against the trailing PTY idle.
+# Claude's own ``sessions/<pid>.json`` owns the running/idle badge (see
+# :mod:`omnigent.claude_native_status_file`), so these two hooks exist for
+# what the file cannot express:
+#
+# - ``Stop`` → idle: the sub-agent terminal-delivery edge (→ parent inbox +
+#   wake, via the codex-shared ``external_session_status`` path). It fires
+#   exactly once per finished turn, where the PTY-activity ``idle`` was a
+#   ~1s-quiescence heuristic that oscillated on mid-turn lulls, firing a
+#   premature completion that idempotently locked out the real one. It also
+#   carries the background-shell count. It agrees with the file rather than
+#   competing with it, so arrival order does not matter — the shared edge
+#   dedup collapses the pair.
+# - ``StopFailure`` → failed: the file has no failure literal (it returns to
+#   ``idle`` on a turn error exactly as on success), so this is the only
+#   source of the red pill, ``last_task_error``, and a failed scheduled run.
+#   ``_publish_status`` keeps it sticky against a trailing ``idle``; the
+#   file's next ``busy`` clears it on the following turn.
 _HOOK_EVENT_TO_STATUS: dict[str, str] = {
     "Stop": "idle",
     "StopFailure": "failed",
@@ -3037,19 +3043,18 @@ async def _forward_available_status_events(
         retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
-        effective_status = status
-        if status == "idle" and record.background_task_count > 0:
-            effective_status = "waiting"
         try:
             await post_external_session_status(
                 client,
                 session_id=session_id,
-                status=effective_status,
+                status=status,
                 response_id=response_id,
-                # Only the ``Stop`` (idle/waiting) edge carries an authoritative
+                # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
-                # ``StopFailure`` (failed) clears it on the server regardless, so
-                # leave its count off the wire.
+                # This is the one thing the status file cannot report: its
+                # ``shell`` literal is a boolean, and the indicator renders a
+                # number. ``StopFailure`` (failed) clears it on the server
+                # regardless, so leave its count off the wire.
                 background_task_count=(
                     None if status == "failed" else record.background_task_count
                 ),

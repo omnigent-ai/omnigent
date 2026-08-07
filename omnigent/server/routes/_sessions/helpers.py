@@ -6477,9 +6477,12 @@ async def _run_compact_locked(
                 code=ErrorCode.INVALID_INPUT,
             )
         task_id = f"compact_{int(time.time() * 1000)}"
-        _publish_status(session_id, "running")
-        # compact() publishes its own in_progress / completed SSE events
-        # when conversation_id is set — don't double-publish here.
+        # compact() publishes its own in_progress / completed SSE events when
+        # conversation_id is set, and the web UI's compaction bubble owns the
+        # busy state from those. Deliberately no ``session.status`` bracket:
+        # compaction is not an agent turn, so reporting running→idle would
+        # invent one — and its idle would land mid-turn on a session that is
+        # genuinely working, which clients then had to second-guess.
         from omnigent.runtime.workflow import compact_conversation_now
 
         try:
@@ -6495,12 +6498,10 @@ async def _run_compact_locked(
             _logger.exception("Explicit session compaction failed for %s", session_id)
             detail = str(exc) or repr(exc)
             _publish_compaction_failed(session_id)
-            _publish_status(session_id, "idle")
             raise OmnigentError(
                 f"Compaction failed while generating a summary: {detail}",
                 code=ErrorCode.INTERNAL_ERROR,
             ) from exc
-        _publish_status(session_id, "idle")
 
 
 def _agent_provider_family(agent: Agent) -> str | None:

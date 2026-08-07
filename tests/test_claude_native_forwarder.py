@@ -7945,16 +7945,17 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
+async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     tmp_path: Path,
 ) -> None:
     """
-    ``Stop`` with ``background_tasks`` → ``waiting`` instead of ``idle``.
+    ``Stop`` with ``background_tasks`` posts ``idle`` plus the shell count.
 
-    When Claude Code's Stop hook carries a non-empty ``background_tasks``
-    array (shells still running), the forwarder must publish ``waiting``
-    so the web UI keeps showing the spinner. Without this, the chat
-    interface shows "idle" while the terminal shows "1 shell running".
+    The turn really has ended, so the status is ``idle`` — the spinner stays
+    lit off the count instead (``showsWorking`` is ``isWorking || tally > 0``).
+    The count is the one thing Claude's status file cannot report: its
+    ``shell`` literal is a boolean and the indicator renders a number, which
+    is why this hook still posts at all.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -8008,7 +8009,7 @@ async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "waiting", "background_task_count": 1},
+        "data": {"status": "idle", "background_task_count": 1},
     }
 
 

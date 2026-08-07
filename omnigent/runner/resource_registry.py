@@ -97,16 +97,6 @@ _CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS = 1.0
 # don't 5x the capture-pane subprocess load on every terminal.
 _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS = 0.2
 
-# How long Claude's ``sessions/<pid>.json`` status stays trusted as a *level*
-# after it was written. The file is rewritten only when its value changes, so
-# a ``busy`` written for a delegate or background task outlives the turn that
-# produced it; honouring it forever would pin the session to "Working…" with
-# no way back. Inside this window a quiet pane is read as "parked on a prompt"
-# (the case the pane diff genuinely cannot see) and the session stays running;
-# past it the pane watcher decides. Comfortably above the 1s idle threshold so
-# a real prompt is not lost to the gap between the write and the pane settling.
-_CLAUDE_NATIVE_STATUS_FILE_LEVEL_TTL_SECONDS = 10.0
-
 # Minimum wall-clock interval (seconds) between consecutive
 # ``session.terminal.activity`` emissions for a single terminal. The
 # claude-native agent terminal polls its pane every 200ms
@@ -1152,16 +1142,6 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
-        def _blocked_reason() -> str | None:
-            # The reason rides every edge, not just the poller's own, so a
-            # redrawing pane under a dialog doesn't publish a bare ``running``
-            # that erases it.
-            if status_poller is None or not status_poller.asserts_running(
-                ttl_s=_CLAUDE_NATIVE_STATUS_FILE_LEVEL_TTL_SECONDS
-            ):
-                return None
-            return status_poller.blocked_on
-
         def _publish_status(status: str, blocked_on: str | None = None) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
@@ -1176,6 +1156,15 @@ class SessionResourceRegistry:
                 return
             self._set_session_status_memo(session_id, status)
             loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+
+        def _file_owns_status() -> bool:
+            # Once Claude's own status file is readable it is the session's
+            # status: it reports what Claude is doing, where the pane diff only
+            # infers it from redraws. The pane keeps its activity-badge and
+            # pane-death jobs, but must not publish status alongside the file —
+            # two publishers is what made a post-turn redraw fight the file's
+            # ``idle`` and needed a freshness window to arbitrate.
+            return status_poller is not None and status_poller.active
 
         # claude-native additionally reads Claude's own ``sessions/<pid>.json``
         # status (present since Claude Code v2.1.139): it flips on the real
@@ -1214,15 +1203,20 @@ class SessionResourceRegistry:
                     loop.call_soon_threadsafe(activity_publisher, session_id, resource_id)
             # Pane changed → the agent is working. Coalesce to the
             # idle→running edge so a continuously-redrawing pane doesn't
-            # re-emit ``running`` every poll. Always published, never deferred
-            # to the status file: that file is rewritten only when its value
-            # *changes*, so a turn starting while it already reads ``busy``
-            # produces no write at all — and the session would sit on its
-            # stale ``idle`` for the whole turn with no working indicator.
-            if emit_status:
-                _publish_status("running", _blocked_reason())
+            # re-emit ``running`` every poll. Skipped once the status file owns
+            # the session (see :func:`_file_owns_status`) — a post-turn prompt
+            # redraw is not a new turn, and the file already said so.
+            if emit_status and not _file_owns_status():
+                _publish_status("running")
 
         def _on_exit() -> None:
+            # The pane's process is gone, which the status file cannot report —
+            # a killed Claude never unlinks it, so the record survives holding
+            # its last value. Retire the poller before classifying the exit so
+            # that stale value can't keep owning the session's status.
+            if status_poller is not None:
+                status_poller.retire()
+
             def _schedule() -> None:
                 task = asyncio.create_task(
                     self._handle_terminal_exit(
@@ -1274,16 +1268,12 @@ class SessionResourceRegistry:
             # Pane quiet for the claude-native status threshold → the
             # agent has stopped. Edge-triggered: re-arms only after new
             # output mutates the pane (which flips back to ``running``).
-            # Held back only while the status file *freshly* reports running:
-            # a dialog owning the input quiets the pane without ending the
-            # turn, which the pane diff alone cannot tell from a finished one.
-            # Past that freshness window the pane decides, so a ``busy`` left
-            # standing by a background task can't pin the session to running.
+            # Skipped once the status file owns the session: a dialog owning
+            # the input quiets the pane without ending the turn, and only the
+            # file can tell that from a finished one.
             # Edge ordering: the watcher thread runs idle/exit serially, so
             # this idle commits before any later on_exit reads the memo.
-            if status_poller is None or not status_poller.asserts_running(
-                ttl_s=_CLAUDE_NATIVE_STATUS_FILE_LEVEL_TTL_SECONDS
-            ):
+            if not _file_owns_status():
                 _publish_status("idle")
             # Clear the activity throttle so the next working episode emits
             # its first pulse immediately, keeping the activity badge

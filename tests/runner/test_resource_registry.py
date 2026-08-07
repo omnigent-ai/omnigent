@@ -407,25 +407,25 @@ async def _observe_native_agent_terminal_and_capture(
 class _FakeStatusPoller:
     """Controllable stand-in for the claude-native status-file poller.
 
-    Lets a test flip :attr:`active` (file resolved vs. falling back), flip
-    :attr:`running_level` (the file freshly reports running vs. its value
-    having gone stale), and fire status edges through the registry's
-    callback, without touching a real ``sessions/<pid>.json``.
+    Lets a test flip :attr:`active` (file resolved and therefore owning the
+    session's status, vs. the PTY watcher falling back) and fire status edges
+    through the registry's callback, without touching a real
+    ``sessions/<pid>.json``.
     """
 
     def __init__(self, on_status: object) -> None:
         self._on_status = on_status
         self.active = False
-        self.running_level = False
         self.blocked_on: str | None = None
         self.ticks = 0
+        self.retired = False
 
     def tick(self) -> None:
         self.ticks += 1
 
-    def asserts_running(self, *, ttl_s: float, now: float | None = None) -> bool:
-        del ttl_s, now
-        return self.running_level
+    def retire(self) -> None:
+        self.retired = True
+        self.active = False
 
     def emit(self, status: str, blocked_on: str | None = None) -> None:
         """Simulate the file reporting a new status."""
@@ -503,53 +503,60 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pty_activity_publishes_running_even_with_active_status_file(
-    tmp_path: Path,
-) -> None:
-    """Pane activity publishes ``running`` even while the file poller is active.
+async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -> None:
+    """An active file poller is the only status source; the pane publishes none.
 
-    Claude rewrites ``sessions/<pid>.json`` only when its value *changes*, so a
-    turn that starts while the file already reads ``busy`` produces no write at
-    all. If the file were allowed to mute the pane watcher, nothing could
-    publish ``running`` and the session would sit on a stale ``idle`` — no
-    working indicator, no stop button — for the whole turn.
+    Claude redraws its prompt after a turn and blinks a cursor, so the pane
+    keeps changing once the file has already said ``idle``. Letting both
+    publish is what made that redraw contradict the file and needed a
+    freshness window to arbitrate — so while the file is readable it decides,
+    and the pane's edges are dropped.
     """
     callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
-        tmp_path, "conv_pre"
+        tmp_path, "conv_file_owns"
     )
     poller = pollers[0]
     poller.active = True
 
-    # The file already holds ``busy`` from an earlier turn, so it emits nothing.
-    callbacks["on_activity"]()
-
-    # Status edges publish via loop.call_soon_threadsafe; let them drain.
+    poller.emit("running")
+    callbacks["on_activity"]()  # pane redraws mid-turn — no second edge
     await asyncio.sleep(0)
     assert statuses == ["running"]
+
+    poller.emit("idle")
+    callbacks["on_activity"]()  # post-turn prompt redraw is not a new turn
+    callbacks["on_idle"]()  # nor does a quiet pane re-assert idle
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
 
 
 @pytest.mark.asyncio
-async def test_pty_idle_deferred_only_while_file_freshly_running(tmp_path: Path) -> None:
-    """A quiet pane goes idle unless the file *freshly* reports running.
+async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: Path) -> None:
+    """A dialog keeps the session running; a dead pane still ends it.
 
-    A dialog owning Claude's input quiets the pane without ending the turn, so
-    a fresh ``running`` level holds the idle edge back. Once that level goes
-    stale — a ``busy`` left standing by a background task outlives its turn —
-    the pane decides again, so the session can never be pinned to ``running``.
+    While Claude is parked on a prompt the pane is quiet but the turn is not
+    over, and only the file knows that — so the quiet pane must not publish
+    ``idle``. But a killed Claude leaves that ``waiting`` record behind, so
+    pane death retires the poller and the PTY side owns the outcome. Without
+    that, the session would spin forever.
     """
     callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
-        tmp_path, "conv_idle_gate"
+        tmp_path, "conv_parked"
     )
     poller = pollers[0]
     poller.active = True
-    poller.running_level = True
 
-    callbacks["on_activity"]()  # → running
-    callbacks["on_idle"]()  # suppressed: file freshly says running
+    poller.emit("running", "permission prompt")
+    callbacks["on_idle"]()  # pane quiet under the dialog — turn is NOT over
     await asyncio.sleep(0)
     assert statuses == ["running"]
 
-    poller.running_level = False  # the file's level went stale
+    # Claude is killed at the prompt. Its file survives holding ``waiting``.
+    callbacks["on_exit"]()
+    assert poller.retired is True
+    assert poller.active is False
+
+    # The pane now owns status again, so the session can settle.
     callbacks["on_idle"]()
     await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
@@ -557,29 +564,37 @@ async def test_pty_idle_deferred_only_while_file_freshly_running(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
-    """A forwarder's hook-derived edge rebases the watcher's dedup.
+    """A forwarder's hook-derived edge rebases the shared dedup baseline.
 
     ``Stop`` → ``idle`` is posted to the server by the claude-native forwarder,
-    bypassing this watcher. Without adopting it as the baseline the watcher
-    still believes ``running`` is live and swallows the next turn's genuine
-    ``running`` as a duplicate, leaving the session stuck on the hook's idle.
+    bypassing this watcher. Adopting it as the baseline is what makes the pair
+    idempotent: the file's own ``idle`` lands on the same edge and is collapsed,
+    so the two agree regardless of which arrives first.
     """
     callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_resync"
     )
-    pollers[0].active = True
+    poller = pollers[0]
+    poller.active = True
 
-    callbacks["on_activity"]()
+    poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running"]
 
     # The forwarder posts Stop → idle straight to the server.
     registry.note_external_session_status("conv_resync", "idle")
 
-    # Next turn: the pane moves again and must re-publish ``running``.
-    callbacks["on_activity"]()
+    # The file catches up moments later with the same edge — deduped away, so
+    # the user sees one idle rather than a flicker.
+    poller.emit("idle")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Next turn: the file reports work again and must publish.
+    poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
+    del callbacks
 
 
 @pytest.mark.asyncio
@@ -1336,13 +1351,13 @@ def test_resolve_environment_runner_workspace_overrides_absolute_spec_cwd(
 
 
 @pytest.mark.asyncio
-async def test_blocked_reason_rides_pane_edges(tmp_path: Path) -> None:
-    """The parked reason travels with every edge, not just the file's own.
+async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
+    """The parked reason survives the pane redrawing underneath the dialog.
 
-    Claude reports ``waitingFor`` once, when the dialog opens. The pane keeps
-    redrawing underneath it, so if a pane-derived ``running`` shipped without
-    the reason it would immediately erase what the file just said and the UI
-    would fall back to a bare spinner.
+    Claude reports ``waitingFor`` once, when the dialog opens, and the pane
+    keeps redrawing while it is up. Because the file owns status outright the
+    pane publishes nothing, so there is no bare ``running`` to erase the reason
+    — it stands until the file itself drops it.
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
@@ -1387,15 +1402,15 @@ async def test_blocked_reason_rides_pane_edges(tmp_path: Path) -> None:
 
     poller = pollers[0]
     poller.active = True
-    poller.running_level = True
     poller.blocked_on = "permission prompt"
 
     poller.emit("running", "permission prompt")
     callbacks["on_activity"]()  # pane redraw under the dialog
+    callbacks["on_idle"]()  # and the quiet spells between redraws
     await asyncio.sleep(0)
     assert edges == [("running", "permission prompt")]
 
-    # Dialog answered: the file drops the reason and the pane keeps moving.
+    # Dialog answered: the file drops the reason on its own edge.
     poller.blocked_on = None
     poller.emit("running", None)
     await asyncio.sleep(0)

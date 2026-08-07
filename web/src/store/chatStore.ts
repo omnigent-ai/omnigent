@@ -3378,12 +3378,16 @@ export async function startStreamPump(
           // Release the unconsumed error-response body so the underlying fetch
           // connection is freed promptly rather than lingering across retries.
           void streamRes.body?.cancel().catch(() => {});
-          // 401/403 won't fix themselves by retrying — give up and mark the
-          // session failed so the user isn't left on a silent spinner.
+          // 401/403 won't fix themselves by retrying — give up and settle the
+          // local send lifecycle so the user isn't left on a silent spinner.
+          // `sessionStatus` is NOT touched: losing our stream says nothing
+          // about what the agent is doing (it may well still be mid-turn), and
+          // only the server may declare a session failed. The dropped stream
+          // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
             finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
-            set({ sessionStatus: "failed", status: "idle" });
+            set({ status: "idle" });
             break;
           }
           // A reverse proxy routinely serves 404 for the stream route while
@@ -3396,8 +3400,10 @@ export async function startStreamPump(
               console.warn(
                 `Session ${id}: stream unavailable (404) after ${consecutive404s} attempts, giving up`,
               );
+              // Local lifecycle only — see the 401/403 branch above for why
+              // `sessionStatus` is left to the server.
               finalizeActive(set, "failed", "stream unavailable (404)", null);
-              set({ sessionStatus: "failed", status: "idle" });
+              set({ status: "idle" });
               break;
             }
             console.warn(
@@ -3710,23 +3716,15 @@ async function* tapLiveDeltas(
           retired.add(ev.messageId);
           continue;
         }
-        reviveStrayCompletedResponse(set);
         applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
       }
       continue;
     }
     if (ev.type === "tool_output_delta") {
       if (get().conversationId === id && !isStaleCompletedResponse(get())) {
-        reviveStrayCompletedResponse(set);
         applyLiveToolOutputDelta(set, ev.callId, ev.delta);
       }
       continue;
-    }
-    if (
-      (ev.type === "text_delta" || ev.type === "reasoning_delta") &&
-      get().conversationId === id
-    ) {
-      reviveStrayCompletedResponse(set);
     }
     yield ev;
   }
@@ -3772,12 +3770,11 @@ export function adoptTrailingUnattributedBlocks(
   return next;
 }
 
-// How long after a terminal edge a delta still revives the turn. A
-// STRAY mid-turn idle is contradicted by the still-flowing stream
-// within seconds; a scheduled wake (cron / wakeup fires at 60s
-// minimum) streams its FIRST deltas ahead of the transcript batch that
-// names the new turn — reviving the finished turn then popped its
-// "Worked for" fold open at the start of every /loop iteration.
+// How long after a terminal edge a delta still belongs to the finished
+// turn. A scheduled wake (cron / wakeup fires at 60s minimum) streams
+// its FIRST deltas ahead of the transcript batch that names the new
+// turn; attributing those to the previous turn popped its "Worked for"
+// fold open at the start of every /loop iteration.
 const REVIVE_WINDOW_MS = 15_000;
 
 /**
@@ -3790,23 +3787,6 @@ export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | n
     s.activeResponse.completedAt !== undefined &&
     Date.now() - s.activeResponse.completedAt > REVIVE_WINDOW_MS
   );
-}
-
-export function reviveStrayCompletedResponse(set: Setter): void {
-  set((s) => {
-    if (s.activeResponse?.state !== "completed") return {};
-    if (isStaleCompletedResponse(s)) return {};
-    // The delta also proves the SESSION is mid-turn: restore the busy
-    // signal the stray idle edge cleared, so send gating
-    // (shouldQueueSend) queues instead of firing into the live turn and
-    // the Working indicator comes back before the next running edge.
-    // Local `status` stays untouched — it means "this client's send is
-    // in flight", which is false for cross-client and TUI-typed turns.
-    return {
-      activeResponse: { ...s.activeResponse, state: "streaming" },
-      sessionStatus: "running",
-    };
-  });
 }
 
 /**
@@ -4648,17 +4628,14 @@ export function handleSessionEvent(event: StreamEvent): void {
             }
           } else {
             // Terminal edge without a matching response id. This is the
-            // NORMAL turn-end shape for most emitters — the PTY-activity
-            // relay's bare `idle`, orchestration teardown, and mismatched
-            // Stop-hook `waiting` all carry none — so a still-streaming
-            // turn is finalized here rather than left "streaming" forever
-            // (which hid the settled turn's "Worked for" fold and Fork
-            // action until a reload re-derived lifecycle from the
-            // snapshot). The one edge this can misread — the server's
-            // policy-deny short-circuit publishing a stray running→idle
-            // pair while a real turn streams — is healed by
-            // `reviveStrayCompletedResponse`: the live turn's next delta
-            // reopens it. A `cancelled` turn is preserved as-is.
+            // NORMAL turn-end shape for most emitters — the status file's
+            // bare `idle` and orchestration teardown carry none — so a
+            // still-streaming turn is finalized here rather than left
+            // "streaming" forever (which hid the settled turn's "Worked for"
+            // fold and Fork action until a reload re-derived lifecycle from
+            // the snapshot). Every terminal edge that reaches this point is
+            // now a real turn end: control signals (policy deny, compaction)
+            // no longer publish status. A `cancelled` turn is preserved as-is.
             patch.status = "idle";
             if (s.activeResponse?.state === "streaming") {
               patch.activeResponse = {
