@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ConversationRegistry, maxLiveConversations } from "./conversationRegistry";
+import {
+  ConversationRegistry,
+  getConnectionProtocol,
+  maxLiveConversations,
+} from "./conversationRegistry";
 import type { PendingUserMessage } from "./chatStore";
 
 /** An unsettled optimistic bubble — the shape that pins an entry. */
@@ -14,12 +18,51 @@ function postedBubble(tempId = "pend_1"): PendingUserMessage {
 }
 
 describe("maxLiveConversations", () => {
-  it("allows 30 over HTTP/2 and only 3 over HTTP/1.1", () => {
+  it("allows 30 when multiplexed and only 3 when serial", () => {
     // Not a product number: HTTP/2 multiplexes over one connection, while
     // HTTP/1.1 caps ~6 per origin and an SSE stream holds one for its whole
     // life — 30 there deadlocks every other fetch.
-    expect(maxLiveConversations("https:")).toBe(30);
-    expect(maxLiveConversations("http:")).toBe(3);
+    expect(maxLiveConversations("multiplexed")).toBe(30);
+    expect(maxLiveConversations("serial")).toBe(3);
+  });
+});
+
+describe("getConnectionProtocol", () => {
+  /** Pin the navigation entry's negotiated ALPN id. */
+  function withNextHop<T>(nextHopProtocol: string | undefined, body: () => T): T {
+    const spy = vi
+      .spyOn(performance, "getEntriesByType")
+      .mockReturnValue(
+        nextHopProtocol === undefined ? [] : [{ nextHopProtocol } as unknown as PerformanceEntry],
+      );
+    try {
+      return body();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("reads the negotiated protocol rather than the URL scheme", () => {
+    // The scheme does not imply the protocol: an HTTPS origin that negotiated
+    // HTTP/1.1 has the same ~6-connection ceiling as the dev server, so
+    // treating it as multiplexed would deadlock the pool.
+    expect(withNextHop("h2", getConnectionProtocol)).toBe("multiplexed");
+    expect(withNextHop("h3", getConnectionProtocol)).toBe("multiplexed");
+    expect(withNextHop("http/1.1", getConnectionProtocol)).toBe("serial");
+  });
+
+  it("falls back to the scheme when no navigation entry is available", () => {
+    // Old browsers, non-navigation contexts: `https:` is the better guess.
+    expect(withNextHop(undefined, getConnectionProtocol)).toBe(
+      location.protocol === "https:" ? "multiplexed" : "serial",
+    );
+  });
+
+  it("treats an empty nextHopProtocol as unknown", () => {
+    // Cross-origin and cached navigations report "" — not a serial transport.
+    expect(withNextHop("", getConnectionProtocol)).toBe(
+      location.protocol === "https:" ? "multiplexed" : "serial",
+    );
   });
 });
 
@@ -149,6 +192,44 @@ describe("ConversationRegistry", () => {
     }
     registry.acquire("conv_d");
     expect(registry.ids()).toHaveLength(4);
+  });
+
+  it("shrinks back to the cap as soon as a pin clears", () => {
+    // Eviction used to run only from `acquire`, so an over-cap registry stayed
+    // over-cap — every excess SSE connection held open until the user happened
+    // to open another conversation. Enough send-and-switch cycles could then
+    // exhaust the HTTP/1.1 pool despite the advertised cap.
+    for (const id of ["conv_a", "conv_b", "conv_c"]) {
+      registry.acquire(id).setState({ pendingUserMessages: [unsentBubble(`pend_${id}`)] });
+    }
+    const d = registry.acquire("conv_d");
+    registry.setActive("conv_d");
+    expect(registry.ids()).toHaveLength(4);
+
+    // conv_a's POST returns: the server owns the message now, so the pin that
+    // was holding the registry over budget is gone.
+    registry.peek("conv_a")!.setState({ pendingUserMessages: [postedBubble("pend_conv_a")] });
+
+    expect(registry.ids()).toEqual(["conv_b", "conv_c", "conv_d"]);
+    expect(registry.has("conv_a")).toBe(false);
+    expect(d.disposed).toBe(false);
+  });
+
+  it("does not evict the entry whose own pin just cleared when it is still needed", () => {
+    // The settling entry is the one being written to; trimming must pick a
+    // different victim (here: the next-oldest unpinned entry) rather than
+    // disposing the entry mid-write.
+    const a = registry.acquire("conv_a");
+    a.setState({ pendingUserMessages: [unsentBubble("pend_a")] });
+    registry.acquire("conv_b").setState({ pendingUserMessages: [unsentBubble("pend_b")] });
+    registry.acquire("conv_c").setState({ pendingUserMessages: [unsentBubble("pend_c")] });
+    registry.acquire("conv_d");
+    registry.setActive("conv_d");
+    // conv_b settles — it is now the oldest unpinned entry, so it is the victim.
+    registry.peek("conv_b")!.setState({ pendingUserMessages: [postedBubble("pend_b")] });
+    expect(registry.has("conv_b")).toBe(false);
+    expect(registry.has("conv_a")).toBe(true);
+    expect(a.disposed).toBe(false);
   });
 
   it("never hands back an entry it just evicted", () => {

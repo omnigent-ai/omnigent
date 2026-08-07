@@ -62,6 +62,7 @@ import {
   bindConversationForTest,
   releaseConversation,
 } from "./chatStore";
+import { conversationRegistry } from "./conversationRegistry";
 import { useTerminalActivityStore } from "./terminalActivity";
 
 // The real `send` action, captured before any test stubs it via
@@ -115,17 +116,18 @@ function nativeToolItem(responseId: string): ConversationItem {
   };
 }
 
-// A stream that delivers no events and closes with the server's `[DONE]`
-// sentinel — i.e. a deliberate clean server close, which the reconnect
-// loop in `startStreamPump` treats as terminal (no re-subscribe). Without
-// the `[DONE]`, a bare close reads as a transport drop and the loop would
-// reconnect, spinning these single-shot tests.
+// A stream that delivers no events and stays open, like a real idle session
+// stream between turns (the server holds it and emits heartbeats). Never
+// closing keeps it OPEN — `switchTo`/`ensureBoundSession` treat a stream that
+// ended as no longer current and re-bind, so a mock that closed immediately
+// would make every entry look dead and defeat background retention.
+//
+// Deliberately not `data: [DONE]`: in production that sentinel means a
+// clean server-side close, which is terminal by design.
 function emptyStream(): ReadableStream<Uint8Array> {
-  const enc = new TextEncoder();
   return new ReadableStream({
-    start(controller) {
-      controller.enqueue(enc.encode("data: [DONE]\n\n"));
-      controller.close();
+    start() {
+      // Left open; `afterEach` aborts the controller, which cancels the read.
     },
   });
 }
@@ -397,6 +399,10 @@ beforeEach(() => {
 
 afterEach(() => {
   useChatStore.getState().abortController?.abort();
+  // Every live entry owns an open stream now (the default mock never closes),
+  // so tear the registry down or its pumps outlive the test and leak into the
+  // next one's fetch mock.
+  conversationRegistry.clear();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   // Reset the stubbed viewer identity to the default (null) so a value set
@@ -539,10 +545,115 @@ describe("chatStore — switchTo", () => {
     sink.close();
   });
 
+  it("re-binds a retained conversation whose stream ended, instead of painting it stale", async () => {
+    // Registry membership alone does not mean "current". A clean server close
+    // (`[DONE]`) ends the pump for good and clears `abortController`, but does
+    // not release the entry — so treating "has an entry" as live meant returning
+    // to the conversation repainted whatever it held when the stream died and
+    // never reopened it: permanently stale until the next send.
+    const sink = pushableStream();
+    seedSession("conv_dead", [userMessage("resp_d", "first")]);
+    seedSession("conv_away", []);
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_dead/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_dead");
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+
+    // The server closes the stream deliberately; the pump stops for good.
+    sink.push("data: [DONE]\n\n");
+    sink.close();
+    await tick();
+    await tick();
+    expect(conversationRegistry.peek("conv_dead")!.getState().abortController).toBeNull();
+
+    await useChatStore.getState().switchTo("conv_away");
+    // Meanwhile the conversation gained an item the dead stream never delivered.
+    seedSession("conv_dead", [
+      userMessage("resp_d", "first"),
+      assistantMessage("resp_d", "second"),
+    ]);
+
+    await useChatStore.getState().switchTo("conv_dead");
+    // Re-bound: the fresh snapshot is here, exactly once.
+    expect(useChatStore.getState().blocks).toHaveLength(2);
+    expect(useChatStore.getState().blocks.map((b) => b.type)).toEqual([
+      "user_message",
+      "text_done",
+    ]);
+    expect(useChatStore.getState().abortController).not.toBeNull();
+  });
+
+  it("keeps an unsent bubble when re-binding a conversation whose stream died", async () => {
+    // The re-bind starts from a clean entry so the snapshot can't duplicate a
+    // stale transcript — but a send the server never acknowledged exists nowhere
+    // else, so dropping the entry wholesale would lose the user's message.
+    seedSession("conv_rebind_keep", []);
+    await useChatStore.getState().switchTo("conv_rebind_keep");
+    const entry = conversationRegistry.peek("conv_rebind_keep")!;
+    // A dead stream (cleared controller) holding an unsettled optimistic bubble.
+    entry.setState({
+      abortController: null,
+      pendingUserMessages: [{ tempId: "pend_keep", content: [{ type: "input_text", text: "hi" }] }],
+    });
+    await useChatStore.getState().switchTo(null);
+
+    await useChatStore.getState().switchTo("conv_rebind_keep");
+
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_keep"]);
+  });
+
+  it("reconciles a backgrounded conversation's stale approval card on tab focus", async () => {
+    // `bindStream` registers a visibilitychange reconcile per stream, so every
+    // LIVE conversation gets one — not just the visible one. Gating the apply on
+    // the active conversation made a background reconcile fetch the snapshot and
+    // then discard it, leaving a card that was answered elsewhere stuck pending
+    // until a page refresh.
+    seedSession("conv_vis_elic", []);
+    seedPendingElicitations("conv_vis_elic", [
+      {
+        type: "response.elicitation_request",
+        elicitation_id: "elic_vis",
+        params: {
+          mode: "form",
+          message: "Approve while hidden?",
+          phase: "tool_call_approval",
+          policy_name: "test_policy",
+          content_preview: "",
+        },
+      },
+    ]);
+    seedSession("conv_vis_other", []);
+
+    await useChatStore.getState().switchTo("conv_vis_elic");
+    const cardOf = (id: string) =>
+      conversationRegistry
+        .peek(id)!
+        .getState()
+        .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cardOf("conv_vis_elic")[0]!.status).toBe("pending");
+
+    // Background it, then the prompt is answered on another surface.
+    await useChatStore.getState().switchTo("conv_vis_other");
+    seedPendingElicitations("conv_vis_elic", []);
+
+    // Tab regains focus: every live stream's listener reconciles.
+    document.dispatchEvent(new Event("visibilitychange"));
+    await tick();
+    await tick();
+
+    const reconciled = cardOf("conv_vis_elic");
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]!.status).toBe("responded");
+    expect(reconciled[0]!.response).toEqual({ action: "auto_resolved" });
+  });
+
   it("does not abort a conversation's stream when switching away", async () => {
-    // Hold conv_a's stream open so the pump doesn't exit and clear its
-    // controller (the default mock closes immediately, which reads as a
-    // server-side close).
     const sink = pushableStream();
     seedSession("conv_a", []);
     seedSession("conv_b", []);
@@ -1962,6 +2073,74 @@ describe("chatStore — sendSlashCommand", () => {
     expect(state.sessionStatus).toBe("running");
   });
 
+  it("rolls back a denied slash command on the conversation that sent it", async () => {
+    // The converse of the test above: settling must be routed, not skipped. The
+    // denial has to land on the sending conversation even once it is
+    // backgrounded, or its echo hangs there forever with nothing to pop it (a
+    // denied command publishes no receipt).
+    seedSession("conv_slash_bg", []);
+    seedSession("conv_slash_other", []);
+    let resolvePost: (() => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_slash_bg/events")) {
+        return new Promise<Response>((resolve) => {
+          resolvePost = () => resolve(mockResponse({ queued: false, denied: true }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_slash_bg");
+    const sending = useChatStore.getState().sendSlashCommand("grill-me", "", "agent_xyz");
+    await tick();
+    expect(conversationRegistry.peek("conv_slash_bg")!.getState().pendingUserMessages).toHaveLength(
+      1,
+    );
+
+    await useChatStore.getState().switchTo("conv_slash_other");
+    resolvePost!();
+    await sending;
+
+    // The sender's echo rolled back and its status settled...
+    const sender = conversationRegistry.peek("conv_slash_bg")!.getState();
+    expect(sender.pendingUserMessages).toEqual([]);
+    expect(sender.status).toBe("idle");
+    expect(sender.sessionStatus).toBe("idle");
+    // ...without disturbing the conversation now on screen.
+    expect(useChatStore.getState().conversationId).toBe("conv_slash_other");
+  });
+
+  it("rolls back a failed slash command on the conversation that sent it", async () => {
+    // Same for a thrown POST: the old code skipped the rollback entirely once
+    // the sender was backgrounded, stranding the echo and leaving `status`
+    // pinned at "streaming" for that conversation.
+    seedSession("conv_slash_fail", []);
+    seedSession("conv_slash_elsewhere", []);
+    let rejectPost: (() => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_slash_fail/events")) {
+        return new Promise<Response>((resolve) => {
+          rejectPost = () => resolve(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_slash_fail");
+    const sending = useChatStore.getState().sendSlashCommand("deslop", "", "agent_xyz");
+    await tick();
+
+    await useChatStore.getState().switchTo("conv_slash_elsewhere");
+    rejectPost!();
+    await sending;
+
+    const sender = conversationRegistry.peek("conv_slash_fail")!.getState();
+    expect(sender.pendingUserMessages).toEqual([]);
+    expect(sender.status).toBe("idle");
+  });
+
   it("creates and binds a brand-new session before posting the slash_command", async () => {
     // First-message-is-a-skill path: no conversation yet. Must create the
     // session + bind the stream (like send) before POSTing.
@@ -2672,6 +2851,53 @@ describe("chatStore — send (file attachments)", () => {
         text: "[Attached: /tmp/uploads/screenshot.png]\n\nwhats going on",
       },
     ]);
+  });
+
+  it("promotes real file_ids on the sending conversation when the upload outlives a switch", async () => {
+    // The upload can be slow, so the user may background the conversation while
+    // it is in flight. The refresh must target the conversation that SENT the
+    // attachment: resolving it late from the visible conversation left the
+    // sender's bubble on `pending:<filename>` ids, and claude-native's text-only
+    // `session.input.consumed` then falls back to those placeholders — committing
+    // an attachment the server never gave an id.
+    seedSession("conv_upload", []);
+    seedSession("conv_visible", []);
+    let releaseUpload: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_upload/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          releaseUpload = () =>
+            resolve(
+              mockResponse({
+                id: "file_real_bg",
+                name: "bg.png",
+                metadata: { filename: "bg.png", bytes: 10, created_at: 0 },
+              }),
+            );
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_upload");
+    const file = new File(["bytes"], "bg.png", { type: "image/png" });
+    const sending = useChatStore.getState().send("with a picture", "agent_xyz", [file]);
+    await tick();
+
+    // Navigate away while the upload is still open.
+    await useChatStore.getState().switchTo("conv_visible");
+    releaseUpload();
+    await sending;
+
+    // The sender's bubble carries the real id...
+    const sender = conversationRegistry.peek("conv_upload")!.getState();
+    expect(sender.pendingUserMessages[0]!.content).toEqual([
+      { type: "input_image", file_id: "file_real_bg", filename: "bg.png" },
+      { type: "input_text", text: "with a picture" },
+    ]);
+    // ...and the conversation the user is looking at was never touched.
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
   it("does not hand the upload to the interrupt marker that precedes it", async () => {
@@ -3676,10 +3902,9 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("ignores an event for a different conversation than the open one", async () => {
-      // The store tracks one active conversation; a skills nudge for
-      // another session must not fetch or touch the open composer.
-      // refetchSkills' conv-id guard short-circuits before any fetch.
+    it("ignores an event for a conversation that is not live", async () => {
+      // Gated on liveness, not on being on screen: a nudge for a conversation
+      // this tab holds no entry for has nowhere to land, so it must not fetch.
       useChatStore.setState({
         conversationId: "conv_open",
         skills: [{ name: "kept", description: "open session's skill" }],
@@ -3687,7 +3912,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       handleSessionEvent({
         type: "session_skills",
-        conversationId: "conv_other",
+        conversationId: "conv_not_live",
       });
       await tick();
 
@@ -3698,35 +3923,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("drops the refetched skills when the user switched conversations mid-flight", async () => {
-      // A late snapshot for a since-abandoned session must not leak its
-      // skills into the now-open one (post-await conv-id re-check).
-      useChatStore.setState({ conversationId: "conv_abc", skills: [] });
-      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        if (url.split("?")[0] === "/v1/sessions/conv_abc" && (init?.method ?? "GET") === "GET") {
-          // The user navigates away before the snapshot lands.
-          useChatStore.setState({ conversationId: "conv_other" });
-          return mockResponse({
-            id: "conv_abc",
-            agent_id: "agent_xyz",
-            status: "idle",
-            created_at: 0,
-            items: [],
-            skills: [{ name: "stale", description: "wrong session" }],
-          });
-        }
-        return defaultFetchHandler(input, init);
-      });
+    it("applies the refetched skills to a conversation backgrounded mid-flight", async () => {
+      // `session_skills` is a one-shot nudge with no replay, and a live
+      // background conversation is never re-bound on return — so dropping the
+      // result because the user switched away left its slash-command menu empty
+      // for as long as the entry stayed live. It must land on the conversation
+      // it was fetched for, and only there.
+      seedSession("conv_bg_skills", []);
+      seedSession("conv_foreground", []);
+      await useChatStore.getState().switchTo("conv_bg_skills");
+      await useChatStore.getState().switchTo("conv_foreground");
+      seedSnapshotSkills("conv_bg_skills", [
+        { name: "late", description: "resolved in background" },
+      ]);
 
       handleSessionEvent({
         type: "session_skills",
-        conversationId: "conv_abc",
+        conversationId: "conv_bg_skills",
       });
       await tick();
 
-      // conv_other is now open; conv_abc's stale skills were dropped, and
-      // the seed never wrote skills onto conv_other.
+      // The backgrounded conversation has its skills...
+      expect(conversationRegistry.peek("conv_bg_skills")!.getState().skills).toEqual([
+        { name: "late", description: "resolved in background" },
+      ]);
+      // ...and the visible conversation was not touched.
       expect(useChatStore.getState().skills).toEqual([]);
     });
 
@@ -5093,6 +5314,45 @@ describe("chatStore — submitApproval", () => {
     }
   });
 
+  it("rolls back on the answering conversation when the failure outlives a switch", async () => {
+    // The approve POST can outlive a switch away. Resolving the rollback target
+    // late reopened the card on whatever conversation was then visible while
+    // leaving the answering one wrongly marked responded — so the user's failed
+    // approval silently disappeared and a stranger's card sprouted buttons.
+    seedSession("conv_approve", []);
+    seedSession("conv_after", []);
+    let failResolve: (() => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_approve/elicitations/elic_late/resolve")) {
+        return new Promise<Response>((resolve) => {
+          failResolve = () => resolve(mockResponse({}, { ok: false, status: 500 }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_approve");
+    conversationRegistry.peek("conv_approve")!.setState({
+      blocks: [elicitationBlock("elic_late")],
+    });
+    const approving = useChatStore.getState().submitApproval("elic_late", "accept");
+    await tick();
+
+    await useChatStore.getState().switchTo("conv_after");
+    failResolve!();
+    await approving;
+
+    // The card is answerable again on the conversation that owns it.
+    const card = conversationRegistry.peek("conv_approve")!.getState().blocks[0];
+    expect(card?.type).toBe("elicitation");
+    if (card?.type !== "elicitation") throw new Error("expected an elicitation block");
+    expect(card.status).toBe("pending");
+    expect(card.response).toBeNull();
+    // The visible conversation gained nothing.
+    expect(useChatStore.getState().blocks).toEqual([]);
+  });
+
   it("only updates the matching elicitation by id (other pending blocks untouched)", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
@@ -5434,6 +5694,60 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     const state = useChatStore.getState();
     expect(state.selectedModel).toBe("opus");
     expect(state.selectedEffort).toBe("high");
+  });
+
+  it("does not move the app-global picker when a bind lands after a switch away", async () => {
+    // `selectedModel` / `selectedEffort` are app-global sticky picks, not
+    // conversation state, so a cold bind that finishes in the background must
+    // hydrate its OWN conversation without touching them — otherwise A's late
+    // snapshot repaints the picker for whichever conversation the user is now
+    // looking at (and two concurrent cold binds are last-response-wins).
+    seedSession("conv_slow_bind", []);
+    seedSession("conv_now_visible", []);
+    let releaseSnapshot: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_slow_bind" &&
+        (init?.method ?? "GET") === "GET" &&
+        releaseSnapshot === null
+      ) {
+        return new Promise<Response>((resolve) => {
+          releaseSnapshot = () =>
+            resolve(
+              mockResponse({
+                id: "conv_slow_bind",
+                agent_id: "agent_xyz",
+                status: "idle",
+                created_at: 0,
+                items: [],
+                labels: { "omnigent.wrapper": "claude-code-native-ui" },
+                // The snapshot would hand "sonnet" to the picker.
+                model_override: "sonnet",
+                reasoning_effort: "low",
+                model_options: CLAUDE_MODEL_OPTIONS,
+              }),
+            );
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: "high", selectedModel: "opus" });
+    const binding = useChatStore.getState().switchTo("conv_slow_bind");
+    await tick();
+    // The user switches away before the snapshot lands.
+    await useChatStore.getState().switchTo("conv_now_visible");
+    releaseSnapshot!();
+    await binding;
+
+    // The visible conversation's picker is untouched...
+    expect(useChatStore.getState().selectedModel).toBe("opus");
+    expect(useChatStore.getState().selectedEffort).toBe("high");
+    // ...while the backgrounded conversation still hydrated its own state.
+    expect(conversationRegistry.peek("conv_slow_bind")!.getState().sessionModelOverride).toBe(
+      "sonnet",
+    );
   });
 
   it("applies a persisted Claude model after delayed model options arrive", async () => {

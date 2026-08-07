@@ -14,6 +14,55 @@ import type { ConversationState } from "./chatStore";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 
 /**
+ * Whether the origin's transport multiplexes requests over one connection.
+ *
+ * `multiplexed` — HTTP/2 or HTTP/3: many concurrent streams on one connection.
+ * `serial` — HTTP/1.1: the browser caps connections per origin, and an SSE
+ * stream holds one for its entire life.
+ */
+export type ConnectionProtocol = "multiplexed" | "serial";
+
+/** ALPN ids that multiplex. `h2c` is HTTP/2 over cleartext. */
+const MULTIPLEXED_ALPN_IDS = new Set(["h2", "h2c", "h3"]);
+
+/**
+ * How the browser is actually talking to this origin.
+ *
+ * Prefers the navigation entry's `nextHopProtocol` — the negotiated ALPN id, so
+ * the real answer — because the URL scheme does not imply a protocol: plenty of
+ * HTTPS deployments still negotiate HTTP/1.1, and treating those as multiplexed
+ * would deadlock the connection pool exactly like the dev server does.
+ *
+ * Falls back to the scheme only when the timing entry is unavailable (no
+ * `performance` in the environment, an old browser, or a navigation the entry
+ * doesn't cover), where `https:` is the better guess than `http:`.
+ */
+export function getConnectionProtocol(): ConnectionProtocol {
+  const nextHop = readNextHopProtocol();
+  if (nextHop !== null && nextHop !== "") {
+    return MULTIPLEXED_ALPN_IDS.has(nextHop) ? "multiplexed" : "serial";
+  }
+  const scheme = typeof location === "undefined" ? undefined : location.protocol;
+  return scheme === "https:" ? "multiplexed" : "serial";
+}
+
+/** The document navigation's negotiated ALPN id, or `null` when unavailable. */
+function readNextHopProtocol(): string | null {
+  if (typeof performance === "undefined" || typeof performance.getEntriesByType !== "function") {
+    return null;
+  }
+  try {
+    const [nav] = performance.getEntriesByType("navigation");
+    const value = (nav as PerformanceNavigationTiming | undefined)?.nextHopProtocol;
+    return typeof value === "string" ? value : null;
+  } catch {
+    // `getEntriesByType` is well-supported, but this runs on every eviction
+    // check — a throw here must not take the registry down with it.
+    return null;
+  }
+}
+
+/**
  * How many conversations stay live at once.
  *
  * Derived from the transport, not from product taste. HTTP/2 multiplexes every
@@ -25,9 +74,9 @@ import { createInitialConversationState, isConversationStateKey } from "./conver
  * blocks behind them forever.
  */
 export function maxLiveConversations(
-  protocol: string | undefined = typeof location === "undefined" ? undefined : location.protocol,
+  protocol: ConnectionProtocol = getConnectionProtocol(),
 ): number {
-  return protocol === "https:" ? 30 : 3;
+  return protocol === "multiplexed" ? 30 : 3;
 }
 
 /** Writes a patch into a conversation's state. Mirrors zustand's `setState`. */
@@ -183,6 +232,11 @@ export class ConversationRegistry {
    * exceed the cap: going over budget costs memory and a connection slot, while
    * evicting would destroy a user's message.
    *
+   * Runs on `acquire` and again whenever a pin clears, because an over-cap
+   * registry has to be able to shrink without waiting for the next acquire —
+   * otherwise repeated send-and-switch leaves the excess streams open
+   * indefinitely and can exhaust an HTTP/1.1 connection pool.
+   *
    * :param justAcquiredId: entry the caller is about to be handed, if any.
    */
   private evictIfOverBudget(justAcquiredId?: string): void {
@@ -208,6 +262,7 @@ export class ConversationRegistry {
         // unwind cleanly, but writes are dropped: nothing should be able to
         // resurrect state for a conversation that has been evicted.
         if (entry.disposed) return;
+        const wasPinned = hasUnsentWork(state);
         const patch = typeof partial === "function" ? partial(state) : partial;
         let changed = false;
         const next = { ...state };
@@ -229,6 +284,10 @@ export class ConversationRegistry {
         }
         if (!changed) return;
         state = next;
+        // A pin that just cleared may have been the only thing holding the map
+        // over budget — see `evictIfOverBudget`. Trim before notifying, so a
+        // listener never observes an over-cap registry that is about to shrink.
+        if (wasPinned && !hasUnsentWork(state)) this.evictIfOverBudget();
         for (const listener of this.listeners) listener(id);
       },
       dispose: () => {

@@ -1360,8 +1360,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // session.input.consumed is text-only (transcript round-trip
       // drops input_image blocks), so the consumed handler falls back
       // to the pending file blocks — they must already carry real ids.
+      //
+      // Targets the session this send posted to, not the visible one: the
+      // upload can outlive a switch away, and leaving the bubble on
+      // `pending:<filename>` ids means the consumed fallback commits those
+      // placeholders as if they were real attachments.
       if (fileBlocks.length > 0) {
-        setActive((s) => ({
+        setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId ? { ...p, content: serverContent } : p,
           ),
@@ -1510,13 +1515,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
-        // optimistic echo — roll it back here alongside the status
-        // settle. The stash copy rolls back even when the user has
-        // navigated away (that's when the entry lives there).
-        setActive((s) => {
-          const patch: Partial<ChatState> = {};
-          if (s.conversationId !== sessionId) return patch;
-          patch.pendingUserMessages = s.pendingUserMessages.filter((p) => p.tempId !== tempId);
+        // optimistic echo — roll it back here alongside the status settle.
+        // Targets the session the command posted to: a backgrounded
+        // conversation must still roll its echo back, and settling the VISIBLE
+        // one would clobber an unrelated chat.
+        setterFor(sessionId)((s) => {
+          const patch: Partial<ChatState> = {
+            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          };
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
@@ -1540,21 +1546,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      // Only settle status when the failed command's session is still active
-      // — a queued send can target a session the user switched away from, and
-      // its failure must not reset the now-active session's UI. A throw from
-      // session setup itself (postedSessionId unresolved) settles the active
-      // context as before.
-      const stillActive = postedSessionId === null || get().conversationId === postedSessionId;
-      if (stillActive) {
-        // Roll back the optimistic echo — no receipt will reconcile it.
-        setActive((s) => ({
-          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-        }));
-      }
-      if (stillActive && !alreadyStreaming) {
-        finalizeActive(setActive, "failed", message, null);
-        setActive({ status: "idle" });
+      // Settle the conversation this command targeted, wherever the user is
+      // now: its echo must roll back and its status must not stay "streaming"
+      // forever. A throw from session setup itself (`postedSessionId` never
+      // resolved) has no target conversation, so it belongs to the active one —
+      // the landing composer's own failure. Mirrors `send`'s catch.
+      const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
+      // Roll back the optimistic echo — no receipt will reconcile it.
+      failSet((s) => ({
+        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+      }));
+      if (!alreadyStreaming) {
+        finalizeActive(failSet, "failed", message, null);
+        failSet({ status: "idle" });
       }
     } finally {
       releaseSend();
@@ -1612,9 +1616,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   switchTo: async (conversationId) => {
     if (get().conversationId === conversationId) return;
 
-    // Whether this conversation is ALREADY live decides everything below, so
-    // read it before anything can create the entry.
-    const wasLive = conversationId !== null && conversationRegistry.has(conversationId);
+    // Whether this conversation is already live AND current decides everything
+    // below, so read it before anything can create the entry. A retained entry
+    // whose stream died (terminal status, failed bind) is deliberately NOT
+    // treated as live: it must cold-bind again or it stays stale forever.
+    const wasLive = conversationId !== null && isConversationStreamCurrent(conversationId);
 
     // No abort, no state wipe: the outgoing conversation's entry keeps its
     // stream open and keeps applying events in the background. That is the
@@ -1640,6 +1646,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
 
+    // Sends the server hasn't acknowledged, carried across the re-bind below.
+    let unsentOnRebind: PendingUserMessage[] = [];
+    if (!wasLive) {
+      // Drop any retained-but-dead entry so `acquire` builds a fresh one. A
+      // re-bind has to start from the initial state: `bindStream` PREPENDS its
+      // snapshot to whatever `blocks` already holds, so re-binding onto a dead
+      // entry's stale transcript would duplicate and mis-order it. Unsent
+      // bubbles are the one thing worth keeping — the server can't replay what
+      // it was never told about.
+      unsentOnRebind =
+        conversationRegistry
+          .peek(conversationId)
+          ?.getState()
+          .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      conversationRegistry.release(conversationId);
+    }
     const entry = conversationRegistry.acquire(conversationId);
     if (!wasLive) {
       // Cold entry: nothing is hydrated yet, so the page must show the
@@ -1649,7 +1671,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // paints the PREVIOUS conversation's model until the snapshot lands.
       // A live entry deliberately skips this — painting it instantly, with no
       // placeholder, is the whole point of keeping streams open.
-      entry.setState({ loadingConversation: true });
+      entry.setState({
+        loadingConversation: true,
+        ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
+      });
     }
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
@@ -1697,7 +1722,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
       // reappear and the user can try again.
-      setActive((s) => ({
+      //
+      // Targets the conversation whose card this is: the approval POST can
+      // outlive a switch away, and rolling back the VISIBLE conversation would
+      // reopen an unrelated chat's card while leaving this one wrongly
+      // answered.
+      setterFor(sessionId)((s) => ({
         blocks: s.blocks.map((b) =>
           b.type === "elicitation" && b.elicitationId === elicitationId
             ? { ...b, status: "pending", response: null }
@@ -1771,7 +1801,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
       const canonical = session.modelOverride ?? null;
-      setActive({ selectedModel: canonical, sessionModelOverride: canonical });
+      // The override belongs to the session that was PATCHed, so apply it there
+      // even if the user has since switched away.
+      setterFor(conversationId)({ sessionModelOverride: canonical });
+      // `selectedModel` is the cross-session sticky pick: only correct it while
+      // that session is still on screen, or this late canonicalization would
+      // overwrite whatever the conversation the user switched to has since
+      // resolved.
+      if (get().conversationId === conversationId) {
+        rootSetState({ selectedModel: canonical });
+      }
       savePickerPref(PICKER_PREF_MODEL_KEY, canonical);
     }
   },
@@ -1985,6 +2024,24 @@ const rootSetState = useChatStore.setState;
 function isConversationDisposed(id: string): boolean {
   const entry = conversationRegistry.peek(id);
   return entry === undefined || entry.disposed;
+}
+
+/**
+ * Whether a live entry is actually still current — stream open, snapshot loaded.
+ *
+ * Registry membership alone does NOT mean "up to date". `startStreamPump` clears
+ * `abortController` when it stops for good (a terminal 401/403/404, or `[DONE]`),
+ * and a failed `bindStream` leaves `conversationLoadError` set; neither releases
+ * the entry. Treating those as live means returning to the conversation paints
+ * whatever it held when the stream died and never reopens it — stale until the
+ * next send. `switchTo` rebinds when this is false; `ensureBoundSession` makes
+ * the same check before POSTing.
+ */
+function isConversationStreamCurrent(id: string): boolean {
+  const entry = conversationRegistry.peek(id);
+  if (entry === undefined || entry.disposed) return false;
+  const state = entry.getState();
+  return state.abortController !== null && state.conversationLoadError === null;
 }
 
 /** A conversation's state if it is still live, else `null`. */
@@ -2289,14 +2346,15 @@ async function ensureBoundSession(
     queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     await bindStream(sessionId, entrySetter(entry), entryGetter(entry));
   } else {
+    const streamCurrent = isConversationStreamCurrent(sessionId);
     const entry = conversationRegistry.acquire(sessionId);
-    if (entry.getState().abortController === null) {
-      // The SSE pump is gone — most commonly an HTTP intermediary closed the
-      // connection on idle, or this conversation was evicted and re-acquired.
-      // POSTing without a live pump would queue the message, run the turn, and
-      // publish events into an empty subscriber set; the user would never see
-      // the response. Rebind first, and fail loud if the rebind itself can't
-      // establish the stream.
+    if (!streamCurrent) {
+      // The SSE pump is gone or the last bind failed — most commonly an HTTP
+      // intermediary closed the connection on idle, or this conversation was
+      // evicted and re-acquired. POSTing without a live pump would queue the
+      // message, run the turn, and publish events into an empty subscriber set;
+      // the user would never see the response. Rebind first, and fail loud if
+      // the rebind itself can't establish the stream.
       entry.setState({ conversationLoadError: null });
       await bindStream(sessionId, entrySetter(entry), entryGetter(entry));
       const loadError = entry.getState().conversationLoadError;
@@ -2353,13 +2411,17 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
   } catch {
     return;
   }
-  if (useChatStore.getState().conversationId !== id) return;
+  // Liveness, not foreground: every live conversation reconciles, so a
+  // background one that missed `response.elicitation_resolved` doesn't keep
+  // showing a card that was already answered elsewhere. Gating on the visible
+  // conversation made a background reconcile fetch the snapshot and discard it.
+  if (isConversationDisposed(id)) return;
   const stillPending = new Set(
     (session.pendingElicitations ?? [])
       .map((e) => (typeof e.elicitation_id === "string" ? e.elicitation_id : null))
       .filter((x): x is string => x !== null),
   );
-  useChatStore.setState((s) => {
+  setterFor(id)((s) => {
     let changed = false;
     const blocks = s.blocks.map((b) => {
       if (
@@ -2628,6 +2690,10 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
+    // The sticky pick this bind resolved, applied app-globally after the patch
+    // below — but only while this conversation is still on screen. Resolved
+    // inside the updater because it depends on the catalog bind race.
+    let resolvedStickyModel: string | null = null;
     set((state) => {
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
@@ -2759,6 +2825,8 @@ async function bindStream(
               code: session.lastTaskError.code,
             }
           : null;
+      resolvedStickyModel =
+        catalogWonBindRace && preservedModelValid ? state.selectedModel : effectiveModel;
       return {
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
@@ -2794,9 +2862,12 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         blockedOn: null,
-        selectedEffort: effectiveEffort,
-        selectedModel:
-          catalogWonBindRace && preservedModelValid ? state.selectedModel : effectiveModel,
+        // `selectedEffort` / `selectedModel` are app-global sticky picks, not
+        // conversation state, so they are applied below — and only while this
+        // conversation is still on screen. A cold bind that finishes after the
+        // user switched away (or a second concurrent bind) would otherwise
+        // overwrite the visible conversation's picker, last-response-wins.
+        //
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
@@ -2814,6 +2885,13 @@ async function bindStream(
         }[],
       };
     });
+    // App-global sticky picks: this conversation's snapshot is only allowed to
+    // move them while it is the one on screen. A background bind (a switch away
+    // mid-fetch, or two cold binds racing) must hydrate its own conversation
+    // without touching the visible conversation's picker.
+    if (useChatStore.getState().conversationId === id) {
+      rootSetState({ selectedEffort: effectiveEffort, selectedModel: resolvedStickyModel });
+    }
     racedNativeModelOptions.delete(id);
   } catch (err) {
     if (isConversationDisposed(id)) return;
@@ -4282,7 +4360,11 @@ async function refetchRunnerBackedSessionState(
   conversationId: string,
   options: RefetchRunnerBackedSessionStateOptions = {},
 ): Promise<void> {
-  if (useChatStore.getState().conversationId !== conversationId) return;
+  // Liveness, not foreground: `session_skills` / `session_model_options` are
+  // one-shot nudges with no replay, and a live background conversation is never
+  // re-bound on return — dropping the nudge here would leave its slash menu and
+  // model catalog empty for as long as the entry stays live.
+  if (isConversationDisposed(conversationId)) return;
   let session: Session;
   try {
     if (queryClient !== null) {
