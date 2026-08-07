@@ -176,7 +176,7 @@ jobs:
           # a query-dependent candidate set makes IDF — and so the closure
           # threshold — depend on what search happened to return.
           gh issue list --repo "$REPO" --state all --limit "$CORPUS_LIMIT" \
-            --json number,title,body,state,url,createdAt,updatedAt,labels \
+            --json number,title,body,state,stateReason,url,createdAt,updatedAt,labels \
             > /tmp/corpus.json
 
           PYTHONPATH=.github/scripts python3 <<'PYEOF'
