@@ -43,6 +43,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
@@ -392,9 +393,9 @@ def register_resources_routes(
 
         A leading slash means an absolute location rather than a path under
         the workspace, and the runner refuses those unless the server vouches
-        for the caller. These routes already require ``LEVEL_EDIT`` — the same
-        level that grants shell, which on an unconfined session can already
-        write anywhere — so reaching here IS the vouch.
+        for the caller. The caller's level is checked separately — see
+        :func:`_mutating_level`, which raises the bar to owner-only for an
+        absolute target.
 
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
@@ -412,6 +413,25 @@ def register_resources_routes(
             f"/{environment_id}/filesystem/{encoded}"
         )
         return f"{path}?browse_outside_workspace=true" if absolute else path
+
+    def _mutating_level(relative_path: str) -> int:
+        """Permission level a write / edit / delete needs for *relative_path*.
+
+        Inside the workspace: ``LEVEL_EDIT``, the historical bar — the
+        workspace is the session's shared context, so a collaborator who can
+        edit the session can edit it.
+
+        Outside it: ``LEVEL_OWNER``. Everything beyond the workspace is the
+        owner's own machine, and the host-scoped filesystem endpoint that
+        already browses it (``/v1/hosts/{id}/filesystem``, behind the
+        workspace picker) is owner-scoped. Gating this at ``LEVEL_EDIT``
+        would make the session route a weaker way to reach the same files,
+        so a shared session must not become a way around that check.
+
+        :param relative_path: Client-supplied path.
+        :returns: The required permission level.
+        """
+        return LEVEL_OWNER if relative_path.startswith("/") else LEVEL_EDIT
 
     async def _authorize_absolute_browse(session_id: str, absolute_path: str) -> str:
         """Authorize an absolute browse target for the host-served path.
@@ -1651,7 +1671,7 @@ def register_resources_routes(
 
         absolute = path.startswith("/")
         if absolute:
-            await _validate_session(session_id, request, LEVEL_EDIT)
+            await _validate_session(session_id, request, LEVEL_OWNER)
             params["browse_outside_workspace"] = "true"
         else:
             await _validate_session(session_id, request, LEVEL_READ)
@@ -1784,12 +1804,13 @@ def register_resources_routes(
             params["before"] = before
 
         # A leading slash means an absolute location rather than a path under
-        # the workspace. Browsing there exposes what this session's shell can
-        # already read, so it takes the same permission level as running one —
-        # a read-only share keeps seeing the workspace and nothing more.
+        # the workspace, so it is owner-only: the workspace is the session's
+        # shared context, everything past it is the owner's own machine. See
+        # `_mutating_level` for why anything weaker would make this route a
+        # way around the owner-scoped host filesystem endpoint.
         absolute = relative_path.startswith("/")
         if absolute:
-            await _validate_session(session_id, request, LEVEL_EDIT)
+            await _validate_session(session_id, request, LEVEL_OWNER)
             params["browse_outside_workspace"] = "true"
         else:
             await _validate_session(session_id, request, LEVEL_READ)
@@ -1856,6 +1877,7 @@ def register_resources_routes(
             body,
             request=request,
             environment_id=environment_id,
+            required_level=_mutating_level(relative_path),
         )
 
     @router.patch(
@@ -1887,6 +1909,7 @@ def register_resources_routes(
             body,
             request=request,
             environment_id=environment_id,
+            required_level=_mutating_level(relative_path),
         )
 
     @router.delete(
@@ -1916,6 +1939,7 @@ def register_resources_routes(
             path,
             request=request,
             environment_id=environment_id,
+            required_level=_mutating_level(relative_path),
         )
 
     # ── Phase 5: environment shell proxy ─────────────────────────

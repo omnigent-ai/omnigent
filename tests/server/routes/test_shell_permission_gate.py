@@ -1,4 +1,4 @@
-"""Permission gating for the environment ``/shell`` proxy endpoint.
+"""Permission gating for the environment ``/shell`` and ``/filesystem`` proxies.
 
 A shared session's shell runs commands on the runner. When the runner is
 not isolated (``sandbox_active: false``), that shell can read files the
@@ -18,6 +18,13 @@ tests pin that gate end to end at the server boundary:
 The deeper gap — an *edit* collaborator on an unsafe runner reading
 out-of-root/sensitive files via shell — is pinned by
 the strict-xfail matrix in ``test_filesystem_path_isolation_e2e.py``.
+
+The filesystem proxy carries a second, stricter gate. A path under the
+workspace is the session's shared context and stays at ``LEVEL_EDIT``; an
+ABSOLUTE path is the owner's own machine and requires ``LEVEL_OWNER``. That
+matches the host-scoped ``/v1/hosts/{id}/filesystem`` endpoint behind the
+workspace picker, which is owner-scoped — without it, a shared session would
+be a weaker route to the very same files.
 """
 
 from __future__ import annotations
@@ -144,6 +151,8 @@ class _RecordingRunnerClient:
 
     def __init__(self) -> None:
         self.posts: list[tuple[str, Any]] = []
+        self.gets: list[str] = []
+        self.puts: list[tuple[str, Any]] = []
 
     async def post(
         self,
@@ -165,6 +174,37 @@ class _RecordingRunnerClient:
                 "cwd": "/workspace",
             },
             request=httpx.Request("POST", url),
+        )
+
+    async def get(
+        self,
+        url: str,
+        *,
+        params: Any = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del timeout
+        query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+        self.gets.append(f"{url}&{query}" if query and "?" in url else url)
+        return httpx.Response(
+            status_code=200,
+            json={"object": "list", "base": "/", "data": [], "has_more": False},
+            request=httpx.Request("GET", url),
+        )
+
+    async def put(
+        self,
+        url: str,
+        *,
+        json: Any = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del timeout
+        self.puts.append((url, json))
+        return httpx.Response(
+            status_code=200,
+            json={"object": "session.environment.filesystem.write_result"},
+            request=httpx.Request("PUT", url),
         )
 
 
@@ -206,6 +246,7 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     perm_store = _StubPermissionStore()
     perm_store.add_grant("owner@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
+    perm_store.add_grant("real-owner@example.com", "conv_share", LEVEL_OWNER)
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
     application = FastAPI()
@@ -291,3 +332,84 @@ async def test_shell_allows_edit_collaborator_and_proxies(
     assert resp.json()["stdout"] == "ok\n"
     # The edit-level command reached the runner verbatim.
     assert runner_client.posts == [(_SHELL_PATH, {"command": "echo hi"})]
+
+
+_FS_BASE = "/v1/sessions/conv_share/resources/environments/default/filesystem"
+# Encoded leading slash: the wire form that means "absolute", not
+# workspace-relative. See `browseLocationSegment` on the web side.
+_FS_ABSOLUTE = f"{_FS_BASE}/%2Fetc%2Fpasswd"
+_FS_RELATIVE = f"{_FS_BASE}/src/app.py"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_allows_edit_collaborator_inside_the_workspace(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """The workspace is the session's shared context: an edit collaborator
+    reads it, exactly as before. This is the control for the test below --
+    without it, an owner-only gate could pass by breaking browsing outright."""
+    resp = await client.get(_FS_RELATIVE, headers={"X-Forwarded-Email": "owner@example.com"})
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+async def test_filesystem_denies_edit_collaborator_outside_the_workspace(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """An absolute path is the owner's own machine, so edit is not enough.
+
+    Decisive: the request never reaches the runner, so a shared session
+    cannot be used as a weaker route around the owner-scoped host
+    filesystem endpoint.
+    """
+    resp = await client.get(_FS_ABSOLUTE, headers={"X-Forwarded-Email": "owner@example.com"})
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
+
+
+@pytest.mark.asyncio
+async def test_filesystem_allows_the_owner_outside_the_workspace(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """The owner may browse their own machine, and the server's vouch rides
+    along so the runner accepts the absolute form."""
+    resp = await client.get(_FS_ABSOLUTE, headers={"X-Forwarded-Email": "real-owner@example.com"})
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+    assert "browse_outside_workspace=true" in runner_client.gets[0]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_denies_edit_collaborator_writing_outside_the_workspace(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """The same bar applies to mutation, not just reads -- an edit
+    collaborator cannot write to the owner's machine."""
+    resp = await client.put(
+        _FS_ABSOLUTE,
+        json={"content": "pwn", "encoding": "utf-8"},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.puts == []
+
+
+@pytest.mark.asyncio
+async def test_filesystem_denies_read_only_collaborator_outside_the_workspace(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """A read-only share stays confined to the workspace."""
+    resp = await client.get(_FS_ABSOLUTE, headers={"X-Forwarded-Email": "viewer@example.com"})
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
