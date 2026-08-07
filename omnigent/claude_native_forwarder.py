@@ -663,12 +663,6 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
-    # Response id of the last turn-start ``running`` status POSTed, so the
-    # id-bearing running edge fires exactly once per turn even when an
-    # assistant item is held across polls for delta ordering (which leaves
-    # ``state.current_response_id`` unadvanced). ``None`` until the first
-    # turn-start edge. Reset on /clear and /fork like the other baselines.
-    posted_running_response_id: str | None = None
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -3182,31 +3176,6 @@ async def _ensure_state_for_transcript(
     return state
 
 
-def _turn_has_assistant_output(items: list[ClaudeTranscriptItem], response_id: str) -> bool:
-    """
-    Whether ``response_id`` has assistant-generated output among ``items``.
-
-    The turn-start ``running`` edge should open a streaming turn only for an id
-    that a later ``Stop``/``StopFailure`` hook will close — i.e. one produced by
-    an actual LLM turn. Assistant text (``message`` with ``role=assistant``) and
-    tool calls (``function_call``) qualify; a ``slash_command`` (``/model``,
-    ``/effort``) or ``terminal_command`` (``!cmd``) item opens an id with no LLM
-    turn behind it, so it must not.
-
-    :param items: Transcript items read this poll.
-    :param response_id: The current turn's response id.
-    :returns: ``True`` when an assistant-output item carries ``response_id``.
-    """
-    for item in items:
-        if item.response_id != response_id:
-            continue
-        if item.item_type == "function_call":
-            return True
-        if item.item_type == "message" and item.data.get("role") == "assistant":
-            return True
-    return False
-
-
 def _promote_pending_settle(
     dedupe: _ForwardDedupeState, items: list[ClaudeTranscriptItem]
 ) -> bool:
@@ -3465,55 +3434,15 @@ async def _forward_available_items(
     current_response_id = result.current_response_id
     seen_source_ids = list(state.seen_source_ids)
     seen = set(seen_source_ids)
-    # NOTE: the old "re-assert running on resumed agent output" hack lived
-    # here. It only existed to paper over the hook model's compaction
-    # blind spot (``Stop`` → idle, then an ``isCompactSummary`` resume that
-    # never fired ``UserPromptSubmit``). PTY-activity status makes it
-    # obsolete: the pane keeps changing through a mid-turn compaction, so
-    # the runner's watcher holds the session ``running`` directly.
-    #
-    # Turn-start edge: the first time we see a turn's response id, publish a
-    # ``running`` status carrying it. The PTY watcher already drives the
-    # running/idle BADGE with a bare (id-less) status; this id-bearing edge is
-    # what lets ap-web open a *streaming* ``activeResponse`` for the turn, so
-    # the forwarded tool-call cards (which carry the same response id) render
-    # LIVE — spinner + elapsed timer — instead of as static completed cards.
-    # Deduped on the persistent ``dedupe`` baseline (NOT ``state``): when an
-    # assistant item is held across polls for delta ordering, this function
-    # early-returns with ``state`` unadvanced, so a ``state``-based guard would
-    # re-fire ``running`` every poll of the hold window. Best-effort — a failed
-    # status post must not abort item forwarding (the items below are the
-    # primary payload); the turn-end idle/failed edge still carries the id to
-    # close the lifecycle, and the badge is unaffected either way.
-    #
-    # Only open the streaming turn for an id that has ASSISTANT output in this
-    # poll's items. A surfaced CLI built-in (``/model``, ``/effort``) or a
-    # ``!cmd`` becomes a slash_command / terminal_command item that opens its
-    # own response id but runs no LLM turn, so no ``Stop`` hook ever fires to
-    # close it — a ``running`` opened for it would strand the web composer in
-    # its "Stop"/busy state until the next real message. A skill that DOES
-    # trigger an LLM turn shares its id with the assistant text it produces, so
-    # ``running`` still fires — one poll later, when that output appears.
-    if (
-        current_response_id is not None
-        and dedupe.posted_running_response_id != current_response_id
-        and _turn_has_assistant_output(items, current_response_id)
-    ):
-        try:
-            await post_external_session_status(
-                client,
-                session_id=session_id,
-                status="running",
-                response_id=current_response_id,
-            )
-            dedupe.posted_running_response_id = current_response_id
-        except httpx.HTTPError:
-            _logger.warning(
-                "Failed to forward Claude turn-start running status; session=%s response_id=%s",
-                session_id,
-                current_response_id,
-                exc_info=True,
-            )
+    # This function publishes no session status. Claude's own
+    # ``sessions/<pid>.json`` owns the running/idle badge (see
+    # :mod:`omnigent.claude_native_status_file`), and it reports the turn ending
+    # the moment Claude settles. A status edge derived from the transcript can
+    # only fire once a poll has parsed assistant output, so it lands *after* the
+    # file's ``idle`` on a short turn and re-asserts ``running`` on a session
+    # that already finished — the user sees idle → running → idle. Items carry
+    # their own ``response_id`` (see :func:`_post_external_conversation_item`),
+    # so the transcript's job here is items, not status.
     updated = state
     for item in items:
         if item.source_id in seen:

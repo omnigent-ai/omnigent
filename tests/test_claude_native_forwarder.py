@@ -1175,13 +1175,10 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         )
     )
     try:
-        # Collect the seven transcript items. This transcript's final turn is a
-        # ``!bash`` command (a ``terminal_command``, no assistant output), so
-        # ``current_response_id`` lands on a turn that runs no LLM turn and thus
-        # gets no id-bearing ``running`` edge (that would strand the web UI busy
-        # with no ``Stop`` hook to close it). The turn-start ``running`` edge is
-        # asserted for a real assistant turn in
-        # ``test_forwarder_emits_turn_start_running_with_response_id``.
+        # Collect the seven transcript items. The transcript path publishes no
+        # session status at all — Claude's status file owns the badge — which
+        # ``test_forwarder_publishes_no_status_for_assistant_output`` asserts
+        # directly.
         requests = [await _get_recorded_item_request(server) for _index in range(7)]
     finally:
         task.cancel()
@@ -1380,9 +1377,8 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         )
     )
     try:
-        # The turn-start ``running`` status posts first (the transcript has an
-        # assistant turn), then the assistant message item.
-        running = await _get_recorded_request(server)
+        # The item posts FIRST: the transcript path publishes no status at all
+        # (Claude's status file owns the badge), so nothing precedes it.
         request = await _get_recorded_request(server)
     finally:
         task.cancel()
@@ -1392,8 +1388,6 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert running["body"]["type"] == "external_session_status"
-    assert running["body"]["data"]["status"] == "running"
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_type"] == "message"
@@ -3018,19 +3012,17 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         )
 
     persisted = json.loads((bridge_dir / "transcript_forwarder.json").read_text("utf-8"))
-    # The turn-start ``running`` status (carrying the turn's response id) leads,
-    # then the poison item is attempted twice, then the forwarder-failed status.
+    # The poison item is attempted twice, then the forwarder-failed status. No
+    # status POST leads: the transcript path publishes none (Claude's status
+    # file owns the badge).
     assert [request["type"] for request in requests] == [
-        "external_session_status",
         "external_conversation_item",
         "external_conversation_item",
         "external_session_status",
     ]
-    # The turn-start ``running`` edge carries the turn's response id, and the
-    # failed edge carries BOTH the drop reason as ``output`` (#1113 — the
-    # server surfaces it as the failure detail) and that same response id so
+    # The failed edge carries BOTH the drop reason as ``output`` (#1113 — the
+    # server surfaces it as the failure detail) and the turn's response id so
     # it closes the streaming turn instead of leaving its tool cards spinning.
-    assert requests[0]["data"]["status"] == "running"
     assert requests[-1]["data"] == {
         "status": "failed",
         "output": "transcript item poison-item:0:message rejected",
@@ -5469,16 +5461,16 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scheduled_wake_forwards_marker_and_new_running_edge(tmp_path: Path) -> None:
+async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path) -> None:
     """
     The full wake pipeline: settle → quiet-poll promote → marked new turn.
 
     Poll 1 forwards a turn; its Stop edge records the pending settle
     (covered by the status-events test — recorded directly here). Poll 2
     is quiet and promotes the settle, persisting it. Poll 3 sees new
-    assistant entries — a cron firing writes no user entry — and must
-    POST a fresh turn-start ``running`` edge plus the scheduled-wake
-    marker ahead of the resumed output, all under a new response id.
+    assistant entries — a cron firing writes no user entry — and must POST
+    the scheduled-wake marker ahead of the resumed output, all under a new
+    response id.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -5571,13 +5563,15 @@ async def test_scheduled_wake_forwards_marker_and_new_running_edge(tmp_path: Pat
             dedupe=dedupe,
         )
 
-    kinds = [request["type"] for request in requests]
-    assert kinds[0] == "external_session_status"
-    running = requests[0]["data"]
-    wake_turn_id = running["response_id"]
-    assert running["status"] == "running"
-    assert wake_turn_id != turn_one_id
+    # No status POST: the transcript path publishes none (Claude's status file
+    # owns the badge). The wake is observable entirely in the items — a fresh
+    # turn id plus the marker ahead of the resumed output.
+    assert [request["type"] for request in requests] == ["external_conversation_item"] * len(
+        requests
+    )
     items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    wake_turn_id = items[0]["response_id"]
+    assert wake_turn_id != turn_one_id
     assert [item["item_data"]["role"] for item in items] == ["user", "assistant"]
     assert items[0]["item_data"]["content"] == [
         {"type": "input_text", "text": "[System: scheduled prompt fired]"}
@@ -7860,15 +7854,15 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Path) -> None:
+async def test_forwarder_publishes_no_status_for_assistant_output(tmp_path: Path) -> None:
     """
-    The first assistant output of a turn publishes ``running`` + its response id.
+    Assistant output forwards items and publishes NO session status.
 
-    Native Claude's running/idle BADGE stays PTY-derived; this id-bearing
-    ``running`` edge is the additional signal that lets ap-web open a streaming
-    ``activeResponse`` for the turn, so the forwarded tool cards (which share
-    the same response id) render LIVE rather than as static completed cards.
-    The running edge's response id must equal the forwarded items' response id.
+    Claude's ``sessions/<pid>.json`` owns the running/idle badge. A status edge
+    derived from the transcript can only fire once a poll has parsed assistant
+    output, so on a short turn it lands *after* the file's ``idle`` and
+    re-asserts ``running`` on a session that already finished — the user sees
+    idle → running → idle. The items still carry their own ``response_id``.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -7925,9 +7919,7 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
         )
     )
     try:
-        # First POST of the poll is the turn-start running status (it runs
-        # before the items in _forward_available_items); the two items follow.
-        running = await _get_recorded_request(server)
+        # Both POSTs of the poll are items — no status edge precedes them.
         item_a = await _get_recorded_request(server)
         item_b = await _get_recorded_request(server)
     finally:
@@ -7938,20 +7930,90 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert running["body"]["type"] == "external_session_status"
-    assert running["body"]["data"]["status"] == "running"
-    running_rid = running["body"]["data"]["response_id"]
-    assert isinstance(running_rid, str) and running_rid
-    # The running edge's response id matches the ASSISTANT turn's forwarded
-    # item (the function_call), so that bubble enters the streaming lifecycle
-    # on the client. The user message carries its own distinct response id.
+    # Neither POST is a status edge — the transcript path publishes none.
+    assert [body["body"]["type"] for body in (item_a, item_b)] == [
+        "external_conversation_item",
+        "external_conversation_item",
+    ]
+    # The assistant turn's item still carries its own response id, which is
+    # what groups its bubble and its tool cards on the client.
     function_call = next(
-        body
-        for body in (item_a, item_b)
-        if body["body"]["type"] == "external_conversation_item"
-        and body["body"]["data"]["item_type"] == "function_call"
+        body for body in (item_a, item_b) if body["body"]["data"]["item_type"] == "function_call"
     )
-    assert function_call["body"]["data"]["response_id"] == running_rid
+    rid = function_call["body"]["data"]["response_id"]
+    assert isinstance(rid, str) and rid
+
+
+@pytest.mark.asyncio
+async def test_short_turn_poll_posts_items_without_a_status_edge(tmp_path: Path) -> None:
+    """
+    Regression: a short turn's poll must not re-assert ``running``.
+
+    The status file reports the turn ending the moment Claude settles, but a
+    transcript-derived edge can only fire once a poll has parsed assistant
+    output — so it arrived *after* that ``idle`` and flipped the session back to
+    ``running``, then ``Stop`` closed it again: the user saw
+    idle → running → idle on every short turn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "message": {"role": "user", "content": "i'll keep testing"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Sounds good."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Record every forwarder POST body.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        posted.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    assert [body["type"] for body in posted] == ["external_conversation_item"] * 2
+    assert not [body for body in posted if body["type"] == "external_session_status"]
 
 
 @pytest.mark.asyncio
