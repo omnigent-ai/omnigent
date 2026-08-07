@@ -3373,6 +3373,70 @@ async def test_relay_routing_decision_live_event_carries_persisted_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_message_live_event_carries_persisted_created_at() -> None:
+    """The relayed live message frame carries the store's ``created_at``.
+
+    The runner's raw ``output_item.done`` has no creation stamp — only the
+    store knows when the item was persisted. The relay must patch the live
+    frame with the persisted ``created_at`` so streamed items carry the
+    same clock the snapshot serves (drives the web's bubble timestamps);
+    without it, live turns render stampless until a reload.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    published: list[dict[str, Any]] = []
+    message_seen = asyncio.Event()
+
+    async def _consume() -> None:
+        async for event in session_stream.subscribe("79b22ebd2309e48fdeb450c65611d51b"):
+            published.append(event)
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "message":
+                message_seen.set()
+
+    consumer = asyncio.create_task(_consume())
+    await asyncio.sleep(0)
+    try:
+        store = _ConversationStore()
+        client = _FakeStreamingRunnerClient(
+            [
+                _sse_frame({"type": "response.in_progress", "response": {"id": "resp_turn"}}),
+                _sse_frame(
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Stamped."}],
+                            "agent": "databricks-claude-haiku-4-5",
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+        await asyncio.wait_for(message_seen.wait(), timeout=1)
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+    message_items = [i for i in store.appended_items if i.type == "message"]
+    assert len(message_items) == 1, f"expected 1 persisted message, got {store.appended_items}"
+
+    message_live = [
+        e
+        for e in published
+        if isinstance(e.get("item"), dict) and e["item"].get("type") == "message"
+    ]
+    assert len(message_live) == 1, f"expected 1 live message frame, got {published}"
+    assert message_live[0]["item"]["created_at"] == message_items[0].created_at
+    assert message_items[0].created_at > 0
+
+
+@pytest.mark.asyncio
 async def test_relay_drops_malformed_routing_decision() -> None:
     """A malformed routing item (empty model) is dropped, not persisted.
 

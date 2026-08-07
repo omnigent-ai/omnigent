@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
+import { writeShowMessageTimestamps } from "@/lib/timestampPreferences";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { BubbleView } from "./ChatPage";
 
@@ -325,5 +326,44 @@ describe("UserBubble @-mention attachment chips", () => {
     expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
     // ...the materialized upload does not.
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
+  });
+});
+
+describe("message timestamps", () => {
+  // The preference defaults to on; tests that flip it clean up after
+  // themselves so the module-level default holds for the other suites.
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("shows the prompt's wall-clock stamp when the bubble carries one", () => {
+    renderBubble(userBubble("hello", { createdAtS: 1_754_000_000 }));
+    const stamp = screen.getByTestId("message-timestamp");
+    expect(stamp.textContent).not.toBe("");
+    // Full date-time rides on the hover tooltip.
+    expect(stamp.getAttribute("title")).not.toBeNull();
+  });
+
+  it("omits the stamp when the bubble has no server time", () => {
+    // Optimistic bubbles and pre-stamp history have no createdAtS — the
+    // label must simply be absent, not render a bogus epoch.
+    renderBubble(userBubble("hello"));
+    expect(screen.queryByTestId("message-timestamp")).toBeNull();
+  });
+
+  it("hides timestamps when the preference is off", () => {
+    writeShowMessageTimestamps(false);
+    renderBubble(userBubble("hello", { createdAtS: 1_754_000_000 }));
+    expect(screen.queryByTestId("message-timestamp")).toBeNull();
+  });
+
+  it("shows the response's completion stamp on the assistant bubble", () => {
+    renderBubble({ ...assistantBubble("completed"), lastActivityAtS: 1_754_000_000 });
+    expect(screen.getByTestId("message-timestamp").textContent).not.toBe("");
+  });
+
+  it("omits the assistant stamp while none of the turn's items are finalized", () => {
+    renderBubble(assistantBubble("streaming"));
+    expect(screen.queryByTestId("message-timestamp")).toBeNull();
   });
 });

@@ -6393,6 +6393,7 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
           role: "assistant",
           content: [{ type: "output_text", text: segment }],
           model: "polly",
+          created_at: 1_754_000_000,
         },
       }),
     );
@@ -6410,6 +6411,9 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     // reconnect reconciliation (itemId-keyed) won't splice the
     // persisted copy in as a duplicate — the original #3146 hole.
     expect(dones[0]!.ctx.itemId).toBe("msg_seg1");
+    // ...and its server persistence stamp, which feeds the assistant
+    // bubble's timestamp (the streamed deltas carried none).
+    expect(dones[0]!.ctx.createdAtS).toBe(1_754_000_000);
     // The text keeps its streamed position ABOVE the tool call; an
     // appended copy would render below it.
     const types = blocks.map((b) => b.type);
@@ -9465,5 +9469,41 @@ describe("chatStore — attributing pre-turn blocks to the turn", () => {
 
     const rids = useChatStore.getState().blocks.map((b) => b.ctx.responseId);
     expect(rids).toEqual(["", "codex_prev", "codex_now"]);
+  });
+});
+
+describe("chatStore — session_input_consumed createdAtS stamping", () => {
+  it("stamps the committed bubble with the server persistence time", () => {
+    // The consumed event's `created_at` is the same clock history hydration
+    // reads, so a live send and a reloaded session show identical stamps.
+    useChatStore.setState({ conversationId: "conv_abc" });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_stamped",
+      itemType: "message",
+      createdAtS: 1_754_000_000,
+      data: { role: "user", content: [{ type: "input_text", text: "when was this?" }] },
+    });
+
+    const block = useChatStore.getState().blocks.at(-1) as UserMessageBlock;
+    expect(block.type).toBe("user_message");
+    expect(block.ctx.itemId).toBe("msg_stamped");
+    expect(block.ctx.createdAtS).toBe(1_754_000_000);
+  });
+
+  it("omits createdAtS when the event carries no stamp (older servers)", () => {
+    useChatStore.setState({ conversationId: "conv_abc" });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_unstamped",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "no stamp" }] },
+    });
+
+    const block = useChatStore.getState().blocks.at(-1) as UserMessageBlock;
+    expect(block.ctx.itemId).toBe("msg_unstamped");
+    expect(block.ctx.createdAtS).toBeUndefined();
   });
 });

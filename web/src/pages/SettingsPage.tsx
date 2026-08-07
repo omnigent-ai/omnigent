@@ -144,6 +144,11 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  DEFAULT_SHOW_MESSAGE_TIMESTAMPS,
+  readShowMessageTimestamps,
+  writeShowMessageTimestamps,
+} from "@/lib/timestampPreferences";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -823,6 +828,40 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+/**
+ * Wall-clock timestamps next to transcript messages (user prompts and
+ * assistant responses). On by default; turning it off declutters the
+ * transcript for sessions where timing doesn't matter.
+ */
+function ShowMessageTimestampsControl() {
+  const [value, setValue] = useState(() => readShowMessageTimestamps());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeShowMessageTimestamps(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Show message timestamps
+        </span>
+        <span className="text-sm text-muted-foreground">
+          Show when each prompt was sent and each response finished next to its message in the
+          transcript.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="show-message-timestamps-toggle"
+        className="mt-0.5 shrink-0"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode and Color theme pickers
   // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
@@ -848,6 +887,8 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
+    writeShowMessageTimestamps(DEFAULT_SHOW_MESSAGE_TIMESTAMPS);
+
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -870,6 +911,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-workspace-panel",
           "omnigent:hide-unconfigured-harnesses",
+          "omnigent:show-message-timestamps",
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -913,6 +955,8 @@ function AppearanceSection() {
         <WorkspacePanelDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
+
+        <ShowMessageTimestampsControl />
 
         <UiFontSizeControl />
 

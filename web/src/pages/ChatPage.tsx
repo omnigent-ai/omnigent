@@ -104,6 +104,10 @@ import {
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { formatMessageTime } from "@/lib/messageTime";
+import { useShowMessageTimestamps } from "@/lib/timestampPreferences";
+import { absoluteTime } from "@/lib/relativeTime";
+import { useNow } from "@/hooks/useNow";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
@@ -3449,8 +3453,30 @@ function useCopyMessage(getText: () => string): {
   return { isCopied, handleCopy };
 }
 
+/**
+ * Muted wall-clock stamp for a message bubble ("3:42 PM"). Subscribes to the
+ * shared 30s tick so the label rolls over at day boundaries; the full
+ * date-time rides on the hover tooltip.
+ */
+function MessageTimestamp({ createdAtS }: { createdAtS: number }) {
+  const now = useNow();
+  const label = formatMessageTime(createdAtS, now);
+  if (!label) return null;
+  return (
+    <time
+      dateTime={new Date(createdAtS * 1000).toISOString()}
+      title={absoluteTime(createdAtS * 1000)}
+      className="text-xs whitespace-nowrap text-muted-foreground/70"
+      data-testid="message-timestamp"
+    >
+      {label}
+    </time>
+  );
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
+  const showTimestamps = useShowMessageTimestamps();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // Plain-text path is the common case.
@@ -3610,12 +3636,19 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
-      {text && (
-        <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-          </MessageAction>
-        </MessageActions>
+      {(text || (showTimestamps && bubble.createdAtS !== undefined)) && (
+        <div className="ml-auto flex items-center gap-1.5">
+          {showTimestamps && bubble.createdAtS !== undefined && (
+            <MessageTimestamp createdAtS={bubble.createdAtS} />
+          )}
+          {text && (
+            <MessageActions className="opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+              <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+              </MessageAction>
+            </MessageActions>
+          )}
+        </div>
       )}
     </Message>
   );
@@ -3649,6 +3682,7 @@ function AssistantBubble({
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const showTimestamps = useShowMessageTimestamps();
 
   if (bubble.items.length === 0) return null;
 
@@ -3708,30 +3742,40 @@ function AssistantBubble({
             <span>Interrupted</span>
           </p>
         )}
-        {/* Skipped on a fold-only bubble: the actions belong to content
-            the user can see, and hanging them off a collapsed row spaced
+        {/* Skipped on a fold-only bubble: the row belongs to content
+            the user can see, and hanging it off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. */}
-        {markdownText && !foldOnly && (
-          <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-            </MessageAction>
-            {/* Fork from this response: clone the session with history
-                truncated after this turn. Hidden while the response is
-                still streaming (its items aren't committed yet) and when
-                the session can't be forked (sub-agent / isolated mount). */}
-            {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-              <MessageAction
-                tooltip="Fork from here"
-                size="icon-xxs"
-                data-testid="fork-from-response"
-                onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-              >
-                <GitForkIcon size={14} />
-              </MessageAction>
-            )}
-          </MessageActions>
-        )}
+        {(markdownText || (showTimestamps && bubble.lastActivityAtS !== undefined)) &&
+          !foldOnly && (
+            <div className="flex items-center gap-1.5">
+              {showTimestamps && bubble.lastActivityAtS !== undefined && (
+                <MessageTimestamp createdAtS={bubble.lastActivityAtS} />
+              )}
+              {markdownText && (
+                <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
+                  <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                    {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                  </MessageAction>
+                  {/* Fork from this response: clone the session with history
+                      truncated after this turn. Hidden while the response is
+                      still streaming (its items aren't committed yet) and when
+                      the session can't be forked (sub-agent / isolated mount). */}
+                  {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                    <MessageAction
+                      tooltip="Fork from here"
+                      size="icon-xxs"
+                      data-testid="fork-from-response"
+                      onClick={() =>
+                        forkDialog.openForkDialog({ upToResponseId: bubble.responseId })
+                      }
+                    >
+                      <GitForkIcon size={14} />
+                    </MessageAction>
+                  )}
+                </MessageActions>
+              )}
+            </div>
+          )}
       </Message>
 
       {bubble.lifecycle === "failed" && (

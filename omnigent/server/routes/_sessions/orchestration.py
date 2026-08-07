@@ -5603,11 +5603,26 @@ async def _relay_runner_stream(
                         response_id=_persist_rid,
                     )
                     if conv_item is not None:
-                        await _relay_persist(
+                        _persisted_relay_item = await _relay_persist(
                             conversation_store,
                             session_id,
                             conv_item,
                         )
+                        # Patch the live frame with the store's creation
+                        # stamp so streamed items carry the same clock the
+                        # snapshot serves (drives the web's bubble
+                        # timestamps). The runner's raw item has none —
+                        # only the store knows when it was persisted.
+                        if _persisted_relay_item is not None and isinstance(
+                            event.get("item"), dict
+                        ):
+                            event = {
+                                **event,
+                                "item": {
+                                    **event["item"],
+                                    "created_at": _persisted_relay_item.created_at,
+                                },
+                            }
 
                     # On ANY terminal event (not just completed), persist the
                     # final text segment: narration streamed before a failure /

@@ -192,6 +192,7 @@ function ctx(
   state: ReducerState,
   itemId: string | null = null,
   responseId: string | null = null,
+  createdAtS?: number,
 ): BlockContext {
   const agent = state.agent;
   const depth = agent ? (agent.match(/\./g)?.length ?? 0) : 0;
@@ -205,6 +206,9 @@ function ctx(
     // under the item's true id without moving the reducer's active id.
     responseId: responseId || state.responseId,
     itemId,
+    // Server persistence stamp from the finalizing item, when the wire
+    // carried one — the same clock history hydration uses.
+    ...(createdAtS !== undefined ? { createdAtS } : {}),
   };
 }
 
@@ -247,9 +251,14 @@ function* closeReasoning(state: ReducerState): Generator<AnyBlock> {
  * `TextDone.ctx.itemId` so renderers can correlate the streamed text
  * back to its persisted item. `null` when the closure is fired by a
  * non-message boundary (tool call, terminal event without a preceding
- * message_done).
+ * message_done). `createdAtS` is the finalizing item's server
+ * persistence time, threaded onto the block for timestamp display.
  */
-function* closeText(state: ReducerState, itemId: string | null = null): Generator<AnyBlock> {
+function* closeText(
+  state: ReducerState,
+  itemId: string | null = null,
+  createdAtS?: number,
+): Generator<AnyBlock> {
   if (!state.inText) return;
   if (state.accumulated) {
     yield {
@@ -261,7 +270,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
   }
   yield {
     type: "text_done",
-    ctx: ctx(state, itemId),
+    ctx: ctx(state, itemId, null, createdAtS),
     fullText: state.fullText,
     hasCodeBlocks: state.fullText.includes("```"),
   } satisfies TextDone;
@@ -696,8 +705,12 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       yield* closeReasoning(state);
       if (hadOpenText) {
         // On a response switch, event.itemId belongs to the new message — don't
-        // attach it to the old text block being closed.
-        yield* closeText(state, isResponseSwitch ? null : event.itemId || null);
+        // attach it (or its persistence stamp) to the old text block being closed.
+        yield* closeText(
+          state,
+          isResponseSwitch ? null : event.itemId || null,
+          isResponseSwitch ? undefined : event.createdAtS,
+        );
       }
 
       // A message_done with a new id is a genuine turn transition (the
@@ -729,7 +742,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       if (text) {
         yield {
           type: "text_done",
-          ctx: ctx(state, event.itemId || null),
+          ctx: ctx(state, event.itemId || null, null, event.createdAtS),
           fullText: text,
           hasCodeBlocks: text.includes("```"),
         } satisfies TextDone;

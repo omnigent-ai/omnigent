@@ -4018,6 +4018,19 @@
             "description": "When this consumed message drains a `omnigent.runtime.pending_inputs` entry (a native- terminal web message round-tripping back from the transcript), the drained entry's id, e.g. `\"pending_a1b2c3\"`. Lets a client drop the matching optimistic bubble by id instead of by position. `None` for non-native messages and for messages that matched no pending entry (e.g. typed directly in the TUI).",
             "title": "Cleared Pending Id"
           },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch seconds the item was persisted at, e.g. `1717171717`. Mirrors `ConversationItem.to_api_dict` so clients can stamp the live bubble with the same server clock history hydration uses.",
+            "title": "Created At"
+          },
           "created_by": {
             "anyOf": [
               {

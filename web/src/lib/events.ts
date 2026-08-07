@@ -291,6 +291,12 @@ export interface MessageDone {
   content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
+  /**
+   * Server persistence time (unix epoch seconds), when the wire item
+   * carried `created_at`. Stamps the finalized text block with the same
+   * clock history hydration uses, so live turns get timestamps too.
+   */
+  createdAtS?: number;
 }
 
 /**
@@ -653,6 +659,11 @@ export interface SessionInputConsumedEvent {
    * and single-user sends. Threaded onto the bubble for live attribution.
    */
   createdBy?: string;
+  /**
+   * Server persistence time (unix epoch seconds), when sent. Threaded
+   * onto the committed bubble so live sends match reloaded history.
+   */
+  createdAtS?: number;
   /** Decoded item payload — heterogeneous, `itemType`-specific. */
   data: Record<string, unknown>;
   /**

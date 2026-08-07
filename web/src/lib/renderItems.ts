@@ -137,6 +137,8 @@ export type Bubble =
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
+      /** Server persistence time (unix epoch seconds), when known. */
+      createdAtS?: number;
       /**
        * Stable React key when promoted from an optimistic
        * `pendingUserMessages` entry — carries that entry's client temp
@@ -676,6 +678,7 @@ function walkBubbles(
         itemId: b.ctx.itemId ?? `user_${i}`,
         content: b.content,
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
+        ...(b.ctx.createdAtS !== undefined ? { createdAtS: b.ctx.createdAtS } : {}),
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
         stableKey: b.stableKey,
@@ -1510,7 +1513,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.lifecycle !== b.lifecycle ||
       a.error !== b.error ||
       // Flips when a later bubble continues this turn — the fold depends on it.
-      Boolean(a.continued) !== Boolean(b.continued)
+      Boolean(a.continued) !== Boolean(b.continued) ||
+      // Drives the visible bubble timestamp — a stale memo would freeze it.
+      a.lastActivityAtS !== b.lastActivityAtS
     ) {
       return false;
     }
@@ -1526,6 +1531,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       a.createdBy !== b.createdBy ||
+      a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
       a.content.length !== b.content.length
     )

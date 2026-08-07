@@ -3808,6 +3808,13 @@ export async function pumpStreamEvents(
         // FIFO (findIndex): the relay flushes segments in order, so the
         // first unstamped match is the one this item persisted.
         const itemId = block.ctx.itemId;
+        // The persisted copy also carries the server creation time —
+        // stamp it alongside the id so the streamed block gains its
+        // timestamp (the deltas that painted it had none).
+        const stamp = {
+          itemId,
+          ...(block.ctx.createdAtS !== undefined ? { createdAtS: block.ctx.createdAtS } : {}),
+        };
         const matchesStreamed = (b: AnyBlock): b is TextDone =>
           b.type === "text_done" &&
           !b.ctx.itemId &&
@@ -3816,7 +3823,7 @@ export async function pumpStreamEvents(
         const bufferAt = buffer.findIndex(matchesStreamed);
         if (bufferAt !== -1) {
           const streamed = buffer[bufferAt] as TextDone;
-          buffer[bufferAt] = { ...streamed, ctx: { ...streamed.ctx, itemId } };
+          buffer[bufferAt] = { ...streamed, ctx: { ...streamed.ctx, ...stamp } };
           continue;
         }
         if (get().blocks.some(matchesStreamed)) {
@@ -3828,7 +3835,7 @@ export async function pumpStreamEvents(
             if (at === -1) return {};
             const streamed = s.blocks[at]!;
             const next = s.blocks.slice();
-            next[at] = { ...streamed, ctx: { ...streamed.ctx, itemId } };
+            next[at] = { ...streamed, ctx: { ...streamed.ctx, ...stamp } };
             return { blocks: next };
           });
           continue;
@@ -4020,6 +4027,7 @@ function committedUserBlock(
   content: MessageContentBlock[],
   stableKey?: string,
   createdBy?: string,
+  createdAtS?: number,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -4033,6 +4041,9 @@ function committedUserBlock(
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
+      // Server persistence stamp from the consumed event; omit when the
+      // server didn't send one. Mirrors itemsToBlocks on cold load.
+      ...(createdAtS !== undefined ? { createdAtS } : {}),
     },
     content,
     stableKey,
@@ -4649,6 +4660,7 @@ export function handleSessionEvent(event: StreamEvent): void {
                   content,
                   matched.tempId,
                   event.createdBy ?? matched.author,
+                  event.createdAtS,
                 ),
               ],
             };
@@ -4682,6 +4694,7 @@ export function handleSessionEvent(event: StreamEvent): void {
                 content,
                 head.tempId,
                 event.createdBy ?? head.author,
+                event.createdAtS,
               ),
             ],
           };
@@ -4693,7 +4706,13 @@ export function handleSessionEvent(event: StreamEvent): void {
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              event.createdAtS,
+            ),
           ],
         };
       });

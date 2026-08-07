@@ -112,6 +112,32 @@ describe("buildBubbles — bubble grouping", () => {
     expect(user.createdBy).toBeUndefined();
   });
 
+  it("propagates ctx.createdAtS onto the user bubble", () => {
+    // Feeds the visible timestamp label — history hydration and the live
+    // consumed event both land here via BlockContext.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1", createdAtS: 1_754_000_000 }),
+        content: [{ type: "input_text", text: "Hello" }],
+      },
+    ];
+    const user = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "user" }>;
+    expect(user.createdAtS).toBe(1_754_000_000);
+  });
+
+  it("leaves user bubble createdAtS undefined when ctx omits it", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "Hello" }],
+      },
+    ];
+    const user = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "user" }>;
+    expect(user.createdAtS).toBeUndefined();
+  });
+
   it("propagates a user_message block's stableKey onto its bubble", () => {
     // A block promoted from an optimistic bubble on session.input.consumed
     // carries stableKey = the optimistic temp id; buildBubbles must surface
@@ -2634,6 +2660,27 @@ describe("bubblesEqual — React.memo comparator", () => {
     expect(bubblesEqual(alice, bob)).toBe(false);
     expect(bubblesEqual(none, alice)).toBe(false);
     expect(bubblesEqual(alice, alice)).toBe(true);
+  });
+
+  it("reports not-equal when a user bubble's createdAtS differs", () => {
+    // The stamp feeds the visible timestamp label, so a consumed event
+    // landing after the optimistic→committed swap must repaint the bubble.
+    const content: MessageContentBlock[] = [{ type: "input_text", text: "Hello" }];
+    const unstamped: Bubble = { kind: "user", itemId: "u1", content };
+    const stamped: Bubble = { kind: "user", itemId: "u1", content, createdAtS: 1_754_000_000 };
+    const later: Bubble = { kind: "user", itemId: "u1", content, createdAtS: 1_754_000_060 };
+    expect(bubblesEqual(unstamped, stamped)).toBe(false);
+    expect(bubblesEqual(stamped, later)).toBe(false);
+    expect(bubblesEqual(stamped, { ...stamped })).toBe(true);
+  });
+
+  it("reports not-equal when an assistant bubble's lastActivityAtS differs", () => {
+    // Drives the assistant bubble's timestamp label; without the compare a
+    // memoized bubble would freeze its stamp at first paint.
+    const base = assistant("Done", "completed") as Extract<Bubble, { kind: "assistant" }>;
+    const stamped: Bubble = { ...base, lastActivityAtS: 1_754_000_000 };
+    expect(bubblesEqual(base, stamped)).toBe(false);
+    expect(bubblesEqual(stamped, { ...stamped })).toBe(true);
   });
 });
 
