@@ -1460,9 +1460,11 @@ async def _prepare_chat_session_via_daemon(
                 )
                 session_id = created.id
         except ClientOmnigentError as exc:
-            # A server that answers /health but has no session API is the
-            # wrong base URL (e.g. one carrying the web-UI path), not a bug
-            # worth a traceback. Name the URL so the fix is obvious.
+            # Any create/fork/resume rejection here is a server-side answer, not
+            # a client bug worth a traceback: a wrong base URL that answers
+            # /health but has no session API, a fork of a session that is gone,
+            # a permission refusal. Name the URL, since a wrong one is the case
+            # that looks least like itself, and pass the server's message through.
             raise click.ClickException(f"Could not start a session on {base_url}: {exc}") from exc
 
     # A separate raw httpx client for the host-runner protocol (the daemon

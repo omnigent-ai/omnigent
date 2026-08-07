@@ -486,10 +486,14 @@ async def test_unmatched_api_path_404s_for_every_method(
         )
         unmatched_post = await client.post("/v1/nope", json={})
         unmatched_get = await client.get("/v1/nope")
+        # OPTIONS is covered too. No CORS middleware is installed, so a
+        # preflight reaching this mount was already a 405 that no browser
+        # could use; 404 is the more accurate answer, not a lost capability.
+        unmatched_options = await client.request("OPTIONS", "/v1/nope")
         # An extensionless non-API path still gets the SPA shell.
         spa = await client.get("/c/conv_abc123")
 
-    for resp in (prefixed, unmatched_post, unmatched_get):
+    for resp in (prefixed, unmatched_post, unmatched_get, unmatched_options):
         assert resp.status_code == 404, resp.text
         assert resp.json()["error"]["code"] == "not_found"
     assert spa.status_code == 200

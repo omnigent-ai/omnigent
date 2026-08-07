@@ -39,10 +39,11 @@ def strip_conversation_path(url: str) -> str:
     :returns: The URL without the conversation route, e.g.
         ``"https://app.databricksapps.com"``.
     """
-    parsed = urllib.parse.urlsplit(url.rstrip("/"))
+    stripped = url.rstrip("/")
+    parsed = urllib.parse.urlsplit(stripped)
     trimmed = _CONVERSATION_PATH_RE.sub("", parsed.path)
     if trimmed == parsed.path:
-        return url
+        return stripped
     return urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, trimmed, parsed.query, parsed.fragment)
     )
