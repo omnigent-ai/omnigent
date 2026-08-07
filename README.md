@@ -301,15 +301,16 @@ full pages through an MCP search server, and verifies each claim across
 independent sources. It's also the simplest example to copy from: one agent
 plus one `tools/mcp/*.yaml` server, no sub-agents.
 
-**Prefer the browser?** Start a server and register your machine as a host:
+**Prefer the browser?** One command starts the local server and registers this
+machine as a host:
 
 ```bash
-omnigent server --background   # start the local server and web UI in the background
-omnigent host           # (separate terminal) register this machine as a host
+omnigent host --background   # starts the local server too, then returns
 ```
 
-In the web UI, hit **New Chat**, pick your machine, and go. Check status with
-`omnigent server status`; stop everything with `omnigent stop`.
+Open the server URL it prints, hit **New Chat**, pick your machine, and go.
+Check status with `omnigent server status`; stop everything with
+`omnigent stop`.
 
 ### 3. Choose & switch models
 
