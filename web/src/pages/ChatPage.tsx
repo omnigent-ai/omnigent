@@ -3504,138 +3504,140 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-user-message-id={bubble.itemId}
       className="max-w-[640px]"
     >
-      {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
-          immediately left of the right-aligned bubble (the bubble's own
-          ml-auto has no free space to absorb inside a fit-width row). */}
-      <div className="ml-auto flex w-fit max-w-full items-center gap-1.5">
-        {showAuthorBadge && author && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Avatar
-                size="sm"
-                data-testid="message-author"
-                aria-label={author}
-                className="shrink-0"
-              >
-                <AvatarFallback
-                  className="font-medium text-white"
-                  style={{ backgroundColor: userColor(author) }}
+      <div className="ml-auto flex w-fit max-w-full flex-col items-end">
+        {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
+            immediately left of the right-aligned bubble (the bubble's own
+            ml-auto has no free space to absorb inside a fit-width row). */}
+        <div className="flex w-fit max-w-full items-center gap-1.5">
+          {showAuthorBadge && author && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Avatar
+                  size="sm"
+                  data-testid="message-author"
+                  aria-label={author}
+                  className="shrink-0"
                 >
-                  {userInitials(author)}
-                </AvatarFallback>
-              </Avatar>
-            </TooltipTrigger>
-            <TooltipContent>{author}</TooltipContent>
-          </Tooltip>
-        )}
-        <MessageContent
-          className={cn(flashing && "animate-user-msg-flash")}
-          // Another contributor's bubble takes their avatar color at low
-          // alpha instead of the default bg-muted, so authorship reads at
-          // a glance without any email text.
-          style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
-        >
-          {/* Inline image previews — one non-wrapping strip. Wrapping would
-              re-flow the row as each image's width resolves on load, changing
-              the bubble's height and shoving the transcript; scrolling keeps
-              the row exactly one preview tall no matter what lands. */}
-          {images.length > 0 && (
-            <div className="mb-1.5 flex gap-2 overflow-x-auto">
-              {images.map((img) =>
-                img.file_id.startsWith("pending:") ? (
-                  // Upload in-flight — show a chip placeholder
+                  <AvatarFallback
+                    className="font-medium text-white"
+                    style={{ backgroundColor: userColor(author) }}
+                  >
+                    {userInitials(author)}
+                  </AvatarFallback>
+                </Avatar>
+              </TooltipTrigger>
+              <TooltipContent>{author}</TooltipContent>
+            </Tooltip>
+          )}
+          <MessageContent
+            className={cn(flashing && "animate-user-msg-flash")}
+            // Another contributor's bubble takes their avatar color at low
+            // alpha instead of the default bg-muted, so authorship reads at
+            // a glance without any email text.
+            style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
+          >
+            {/* Inline image previews — one non-wrapping strip. Wrapping would
+                re-flow the row as each image's width resolves on load, changing
+                the bubble's height and shoving the transcript; scrolling keeps
+                the row exactly one preview tall no matter what lands. */}
+            {images.length > 0 && (
+              <div className="mb-1.5 flex gap-2 overflow-x-auto">
+                {images.map((img) =>
+                  img.file_id.startsWith("pending:") ? (
+                    // Upload in-flight — show a chip placeholder
+                    <span
+                      key={img.file_id}
+                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                    >
+                      <ImageIcon className="size-3 shrink-0" />
+                      <span className="max-w-[180px] truncate">
+                        {img.filename ?? img.file_id.replace("pending:", "")}
+                      </span>
+                    </span>
+                  ) : (
+                    // Uploaded — render the actual image
+                    <SessionImage
+                      key={img.file_id}
+                      path={
+                        sessionId
+                          ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
+                          : undefined
+                      }
+                      alt={img.filename ?? img.file_id}
+                      // Sizing lives in SessionImage, which reserves a matching
+                      // box so the bubble's height is settled before bytes land.
+                      className="rounded-md object-contain"
+                    />
+                  ),
+                )}
+              </div>
+            )}
+            {/* Non-image file chips */}
+            {fileChips.length > 0 && (
+              <div className="mb-1.5 flex flex-wrap gap-1.5">
+                {fileChips.map((att) => (
                   <span
-                    key={img.file_id}
+                    key={att.file_id}
                     className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
-                    <ImageIcon className="size-3 shrink-0" />
-                    <span className="max-w-[180px] truncate">
-                      {img.filename ?? img.file_id.replace("pending:", "")}
-                    </span>
-                  </span>
-                ) : (
-                  // Uploaded — render the actual image
-                  <SessionImage
-                    key={img.file_id}
-                    path={
-                      sessionId
-                        ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                        : undefined
-                    }
-                    alt={img.filename ?? img.file_id}
-                    // Sizing lives in SessionImage, which reserves a matching
-                    // box so the bubble's height is settled before bytes land.
-                    className="rounded-md object-contain"
-                  />
-                ),
-              )}
-            </div>
-          )}
-          {/* Non-image file chips */}
-          {fileChips.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {fileChips.map((att) => (
-                <span
-                  key={att.file_id}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                >
-                  <FileTextIcon className="size-3 shrink-0" />
-                  <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-                </span>
-              ))}
-            </div>
-          )}
-          {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-          {mentionedChips.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {mentionedChips.map((item) => (
-                <span
-                  key={mentionItemPath(item)}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                >
-                  {item.isDir ? (
-                    <FolderIcon className="size-3 shrink-0" />
-                  ) : (
                     <FileTextIcon className="size-3 shrink-0" />
-                  )}
-                  <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                    @{item.path}
-                    {item.isDir ? "/" : ""}
+                    <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
                   </span>
-                  {item.lineRange && (
-                    <span className="shrink-0">
-                      :{item.lineRange.start}-{item.lineRange.end}
+                ))}
+              </div>
+            )}
+            {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
+            {mentionedChips.length > 0 && (
+              <div className="mb-1.5 flex flex-wrap gap-1.5">
+                {mentionedChips.map((item) => (
+                  <span
+                    key={mentionItemPath(item)}
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                  >
+                    {item.isDir ? (
+                      <FolderIcon className="size-3 shrink-0" />
+                    ) : (
+                      <FileTextIcon className="size-3 shrink-0" />
+                    )}
+                    <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
+                      @{item.path}
+                      {item.isDir ? "/" : ""}
                     </span>
-                  )}
-                </span>
-              ))}
-            </div>
+                    {item.lineRange && (
+                      <span className="shrink-0">
+                        :{item.lineRange.start}-{item.lineRange.end}
+                      </span>
+                    )}
+                  </span>
+                ))}
+              </div>
+            )}
+            {/* Render user text as markdown, matching the assistant bubble
+              (headings, lists, code fences, file-path links). `breaks` keeps
+              single newlines as line breaks — users type multi-line messages
+              without blank-line paragraph separators and expect their line
+              breaks preserved. Empty text — e.g. an attachments-only message —
+              renders nothing rather than an empty markdown block. */}
+            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+          </MessageContent>
+        </div>
+        <div className="mt-0.5 flex items-center gap-2">
+          {(() => {
+            const ts = formatBubbleTimestamp(bubble.createdAtS);
+            return ts ? (
+              <span className="select-none text-[10px] leading-none text-muted-foreground/60">
+                {ts}
+              </span>
+            ) : null;
+          })()}
+          {text && (
+            <MessageActions className="opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+              <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+              </MessageAction>
+            </MessageActions>
           )}
-          {/* Render user text as markdown, matching the assistant bubble
-            (headings, lists, code fences, file-path links). `breaks` keeps
-            single newlines as line breaks — users type multi-line messages
-            without blank-line paragraph separators and expect their line
-            breaks preserved. Empty text — e.g. an attachments-only message —
-            renders nothing rather than an empty markdown block. */}
-          {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
-        </MessageContent>
-      </div>
-      <div className="mt-1 flex items-center justify-end gap-2">
-        {(() => {
-          const ts = formatBubbleTimestamp(bubble.createdAtS);
-          return ts ? (
-            <span className="select-none text-[10px] leading-none text-muted-foreground/60">
-              {ts}
-            </span>
-          ) : null;
-        })()}
-        {text && (
-          <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-            </MessageAction>
-          </MessageActions>
-        )}
+        </div>
       </div>
     </Message>
   );
@@ -3728,7 +3730,7 @@ function AssistantBubble({
         {/* Skipped on a fold-only bubble: the actions belong to content
             the user can see, and hanging them off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. */}
-        <div className="mt-1 flex items-center gap-2">
+        <div className="mt-0.5 flex items-center gap-2">
           {(() => {
             const ts = formatBubbleTimestamp(bubble.createdAtS);
             return ts ? (
