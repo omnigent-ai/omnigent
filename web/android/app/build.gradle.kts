@@ -38,8 +38,8 @@ android {
         applicationId = "ai.omnigent.android"
         minSdk = 28
         targetSdk = 36
-        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 2
-        versionName = "0.1.1"
+        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 7
+        versionName = "0.1.2"
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
