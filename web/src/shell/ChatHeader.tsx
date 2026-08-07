@@ -3,6 +3,7 @@ import {
   ChevronLeftIcon,
   EllipsisVerticalIcon,
   FileIcon,
+  GitCompareIcon,
   InfoIcon,
   ListIcon,
   ListTodoIcon,
@@ -76,8 +77,10 @@ interface MobileSessionMenuProps {
    * entry badge) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Open the mobile files drawer. */
+  /** Open the mobile files drawer (full folder tree). */
   onOpenFiles: () => void;
+  /** Open the mobile files drawer pinned to the changed-files list. */
+  onOpenChanges: () => void;
   /** Open the mobile shells drawer. */
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
@@ -443,6 +446,15 @@ export function ChatHeader({
                   >
                     <FileIcon className="size-4" />
                     Files
+                  </DropdownMenuItem>
+                )}
+                {showFilesPanel && (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenChanges}
+                    className="gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <GitCompareIcon className="size-4" />
+                    Changes
                     {mobileMenu.changedCount > 0 && (
                       <span
                         className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}
