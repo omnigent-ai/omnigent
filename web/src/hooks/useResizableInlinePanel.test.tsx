@@ -6,8 +6,8 @@ import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizab
 // useResizableInlinePanel keeps its width in a module-level store shared across
 // all callers, re-seeded per conversation. resetWidthStoreForTesting clears it
 // between tests so cases are fully independent. A 2000px viewport gives a
-// 1200px clamp ceiling (2000 * 0.6); the default width there is 600 (0.36 *
-// 2000 = 720, clamped to the [420, 600] band).
+// 1512px clamp ceiling (2000 - 480 chat minimum - 8 gap); the default width
+// there is 600 (0.36 * 2000 = 720, clamped to the [420, 600] band).
 
 const SESSION = "conv_test";
 const originalInnerWidth = window.innerWidth;
@@ -78,17 +78,71 @@ describe("useResizableInlinePanel persistence", () => {
     expect(nudgeWiderOnce(result)).toBe(620);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
 
-    // Shrinking the viewport clamps the live width to the 0.6 ceiling
-    // (700 * 0.6 = 420) without disturbing the saved 620 preference.
+    // Shrinking the viewport clamps the live width to the chat-minimum ceiling
+    // (700 - 480 - 8 = 212, floored at the 240px minimum) without disturbing
+    // the saved 620 preference.
     setInnerWidth(700);
     act(() => window.dispatchEvent(new Event("resize")));
-    expect(result.current.panelWidth).toBe(420);
+    expect(result.current.panelWidth).toBe(240);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
 
     // Widening again re-derives from the preference, restoring 620 in-session.
     setInnerWidth(2000);
     act(() => window.dispatchEvent(new Event("resize")));
     expect(result.current.panelWidth).toBe(620);
+  });
+});
+
+describe("useResizableInlinePanel reserved width (sidebar)", () => {
+  // `reservedPx` is the open sidebar's width. It must tighten the ceiling
+  // (keeping the chat at its 480px minimum) without overwriting the user's
+  // preferred width, so collapsing the sidebar gives the width straight back.
+  it("caps at the sidebar-aware ceiling and restores the preference when it collapses", () => {
+    setInnerWidth(1400);
+    // Drag the panel out to its sidebar-collapsed ceiling: 1400 - 480 - 8 = 912.
+    const collapsed = renderHook(() =>
+      useResizableInlinePanel(SESSION, undefined, /* reservedPx */ 0),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 0 })));
+    act(() =>
+      collapsed.result.current.handleProps.onMouseDown({
+        preventDefault: () => {},
+      } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 100 })));
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(collapsed.result.current.panelWidth).toBe(912);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(912);
+    collapsed.unmount();
+
+    // Sidebar open (320px): the ceiling drops to 1400 - 320 - 480 - 8 = 592, so
+    // the rendered width is squeezed but the saved preference is untouched.
+    const open = renderHook(() => useResizableInlinePanel(SESSION, undefined, 320));
+    expect(open.result.current.panelWidth).toBe(592);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(912);
+    open.unmount();
+
+    // Collapsing restores the full preferred width.
+    const reopened = renderHook(() => useResizableInlinePanel(SESSION, undefined, 0));
+    expect(reopened.result.current.panelWidth).toBe(912);
+    reopened.unmount();
+  });
+
+  it("leaves the chat its 480px minimum with the sidebar open", () => {
+    setInnerWidth(1400);
+    // A preference far wider than the sidebar-open ceiling allows.
+    const { result, unmount } = renderHook(() => useResizableInlinePanel(SESSION, undefined, 320));
+    act(() => {
+      for (let i = 0; i < 60; i++) {
+        result.current.handleProps.onKeyDown({
+          key: "ArrowLeft",
+          preventDefault: () => {},
+        } as React.KeyboardEvent);
+      }
+    });
+    // 1400 - 320 sidebar - 8 gap - panel >= 480 for the chat.
+    expect(1400 - 320 - result.current.panelWidth - 8).toBeGreaterThanOrEqual(480);
+    unmount();
   });
 });
 
