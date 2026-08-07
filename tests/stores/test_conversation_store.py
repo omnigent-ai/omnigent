@@ -7,8 +7,10 @@ from sqlalchemy import event, text
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
+    ComputerUsePresentation,
     ErrorData,
     FunctionCallData,
+    FunctionCallOutputAttachment,
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
@@ -540,6 +542,70 @@ def test_append_function_call_items(
     )
     assert len(items[0].id) == 32
     assert len(items[1].id) == 32
+
+
+def test_computer_use_metadata_persists_and_hydrates(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Presentation metadata and frame references survive a DB round trip."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_computer",
+                data=FunctionCallData(
+                    agent="codex-native-ui",
+                    name="node_repl/js",
+                    arguments='{"code":"inspect"}',
+                    call_id="call_computer",
+                    presentation=ComputerUsePresentation(
+                        provider="codex",
+                        app_name="TextEdit",
+                        app_id="com.apple.TextEdit",
+                        action_label="Inspect document",
+                    ),
+                ),
+            ),
+            NewConversationItem(
+                type="function_call_output",
+                response_id="resp_computer",
+                data=FunctionCallOutputData(
+                    call_id="call_computer",
+                    output="sanitized result",
+                    presentation=ComputerUsePresentation(
+                        provider="codex",
+                        app_id="com.apple.TextEdit",
+                    ),
+                    presentation_final=True,
+                    status="completed",
+                    attachments=[
+                        FunctionCallOutputAttachment(
+                            kind="computer_frame",
+                            file_id="f" * 32,
+                            content_type="image/png",
+                            width=1280,
+                            height=800,
+                        )
+                    ],
+                ),
+            ),
+        ],
+    )
+
+    hydrated = conversation_store.list_items(conv.id, order="asc").data
+    call_data = hydrated[0].data
+    output_data = hydrated[1].data
+    assert isinstance(call_data, FunctionCallData)
+    assert call_data.presentation is not None
+    assert call_data.presentation.app_id == "com.apple.TextEdit"
+    assert isinstance(output_data, FunctionCallOutputData)
+    assert output_data.attachments[0].file_id == "f" * 32
+    assert output_data.presentation is not None
+    assert output_data.presentation.app_id == "com.apple.TextEdit"
+    assert output_data.presentation_final is True
+    assert output_data.status == "completed"
 
 
 def test_append_tool_output_with_nul_bytes(

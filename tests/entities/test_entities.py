@@ -5,9 +5,11 @@ from pydantic import ValidationError
 
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
+    ComputerUsePresentation,
     Conversation,
     ConversationItem,
     FunctionCallData,
+    FunctionCallOutputAttachment,
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
@@ -125,6 +127,51 @@ def test_function_call_missing_agent() -> None:
         FunctionCallData(name="b", arguments="c", call_id="d")
 
 
+def test_function_call_computer_use_presentation_round_trip() -> None:
+    fc = FunctionCallData(
+        agent="codex-native-ui",
+        name="node_repl/js",
+        arguments='{"code":"sky.getWindows()"}',
+        call_id="call_computer",
+        presentation=ComputerUsePresentation(
+            provider="codex",
+            app_name="  TextEdit  ",
+            app_id="com.apple.TextEdit",
+            action_label="  Inspect document  ",
+            action_kinds=["inspect", "inspect", "click"],
+        ),
+    )
+
+    dumped = fc.model_dump(exclude_none=True)
+    assert dumped["presentation"] == {
+        "kind": "computer_use",
+        "provider": "codex",
+        "app_name": "TextEdit",
+        "app_id": "com.apple.TextEdit",
+        "action_label": "Inspect document",
+        "action_kinds": ["inspect", "click"],
+    }
+    parsed = FunctionCallData.model_validate(dumped)
+    assert parsed == fc
+
+
+def test_computer_use_presentation_rejects_unknown_provider() -> None:
+    with pytest.raises(ValidationError, match="provider"):
+        ComputerUsePresentation.model_validate({"provider": "other"})
+
+
+def test_computer_use_presentation_bounds_untrusted_text() -> None:
+    with pytest.raises(ValidationError, match="at most 256"):
+        ComputerUsePresentation(provider="claude", app_name="x" * 257)
+
+
+def test_computer_use_presentation_rejects_unknown_action_kind() -> None:
+    with pytest.raises(ValidationError, match="action_kinds"):
+        ComputerUsePresentation.model_validate(
+            {"provider": "codex", "action_kinds": ["click", "teleport"]}
+        )
+
+
 # ── FunctionCallOutputData ─────────────────────────────
 
 
@@ -136,6 +183,77 @@ def test_function_call_output_valid() -> None:
 def test_function_call_output_missing_output() -> None:
     with pytest.raises(ValidationError, match="output"):
         FunctionCallOutputData(call_id="call_1")
+
+
+def test_function_call_output_omits_empty_attachments() -> None:
+    output = FunctionCallOutputData(call_id="call_1", output="done")
+    assert output.model_dump() == {"call_id": "call_1", "output": "done"}
+
+
+def test_function_call_output_can_finalize_presentation_and_status() -> None:
+    output = FunctionCallOutputData(
+        call_id="call_1",
+        output="failed",
+        presentation_final=True,
+        status="failed",
+    )
+
+    assert output.model_dump() == {
+        "call_id": "call_1",
+        "output": "failed",
+        "presentation_final": True,
+        "status": "failed",
+    }
+
+
+def test_computer_frame_attachment_round_trip() -> None:
+    attachment = FunctionCallOutputAttachment(
+        kind="computer_frame",
+        file_id="file_123",
+        content_type="image/png",
+        width=1280,
+        height=800,
+    )
+    output = FunctionCallOutputData(
+        call_id="call_1",
+        output="captured",
+        attachments=[attachment],
+    )
+
+    assert FunctionCallOutputData.model_validate(output.model_dump()) == output
+
+
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {"kind": "computer_frame", "content_type": "image/png", "width": 1, "height": 1},
+        {"kind": "computer_frame", "file_id": "f", "width": 1, "height": 1},
+        {
+            "kind": "computer_frame",
+            "file_id": "f",
+            "content_type": "image/png",
+            "width": 1,
+        },
+    ],
+)
+def test_computer_frame_attachment_requires_complete_metadata(
+    attachment: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="computer_frame attachment"):
+        FunctionCallOutputAttachment.model_validate(attachment)
+
+
+def test_unknown_attachment_kind_and_fields_are_preserved() -> None:
+    attachment = FunctionCallOutputAttachment.model_validate(
+        {"kind": "future_preview", "future_field": {"version": 2}}
+    )
+    assert attachment.model_dump()["future_field"] == {"version": 2}
+
+
+def test_function_call_output_bounds_attachment_count() -> None:
+    attachments = [FunctionCallOutputAttachment(kind=f"future_{index}") for index in range(17)]
+    with pytest.raises(ValidationError, match="at most 16"):
+        FunctionCallOutputData(call_id="call_1", output="done", attachments=attachments)
 
 
 # ── ReasoningData ──────────────────────────────────────
@@ -245,6 +363,59 @@ def test_conversation_item_valid() -> None:
     assert item.id == "item_1"
     assert item.status == "completed"
     assert item.created_at == 1700000000
+
+
+def test_computer_use_fields_flatten_into_api_item_shape() -> None:
+    """History and SSE serializers expose the optional display contract."""
+    call = ConversationItem(
+        id="fc_1",
+        type="function_call",
+        status="completed",
+        response_id="resp_1",
+        created_at=1700000000,
+        data=FunctionCallData(
+            agent="codex-native-ui",
+            name="node_repl/js",
+            arguments='{"code":"inspect"}',
+            call_id="call_1",
+            presentation=ComputerUsePresentation(provider="codex", app_name="TextEdit"),
+        ),
+    )
+    output = ConversationItem(
+        id="fco_1",
+        type="function_call_output",
+        status="completed",
+        response_id="resp_1",
+        created_at=1700000001,
+        data=FunctionCallOutputData(
+            call_id="call_1",
+            output="done",
+            attachments=[
+                FunctionCallOutputAttachment(
+                    kind="computer_frame",
+                    file_id="file_1",
+                    content_type="image/png",
+                    width=1280,
+                    height=800,
+                )
+            ],
+        ),
+    )
+
+    assert call.to_api_dict()["presentation"] == {
+        "kind": "computer_use",
+        "provider": "codex",
+        "app_name": "TextEdit",
+    }
+    assert output.to_api_dict()["attachments"] == [
+        {
+            "kind": "computer_frame",
+            "file_id": "file_1",
+            "content_type": "image/png",
+            "width": 1280,
+            "height": 800,
+        }
+    ]
 
 
 def test_conversation_item_type_data_mismatch_rejected() -> None:

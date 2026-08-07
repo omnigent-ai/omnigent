@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.entities import (
+    FILE_PURPOSE_COMPUTER_USE_FRAME,
+    FILE_PURPOSE_USER_UPLOAD,
+)
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 # Files are always listed per session, so pagination/ordering tests
@@ -38,6 +42,42 @@ def test_create_with_content_type(file_store: SqlAlchemyFileStore) -> None:
         content_type="image/png",
     )
     assert f.content_type == "image/png"
+
+
+def test_create_defaults_to_user_upload_purpose(file_store: SqlAlchemyFileStore) -> None:
+    stored = file_store.create(filename="data.csv", bytes=10)
+    assert stored.purpose == FILE_PURPOSE_USER_UPLOAD
+
+
+def test_file_purpose_filters_normal_and_hidden_lists(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    upload = file_store.create("notes.txt", 10, session_id=_SID)
+    frame = file_store.create(
+        "computer-use-frame.png",
+        20,
+        content_type="image/png",
+        session_id=_SID,
+        purpose=FILE_PURPOSE_COMPUTER_USE_FRAME,
+    )
+
+    assert [stored.id for stored in file_store.list(session_id=_SID).data] == [upload.id]
+    assert [
+        stored.id
+        for stored in file_store.list(
+            session_id=_SID,
+            purpose=FILE_PURPOSE_COMPUTER_USE_FRAME,
+        ).data
+    ] == [frame.id]
+
+
+def test_create_and_list_reject_unknown_file_purpose(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    with pytest.raises(ValueError, match="unsupported file purpose"):
+        file_store.create("bad.bin", 1, purpose="unknown")
+    with pytest.raises(ValueError, match="unsupported file purpose"):
+        file_store.list(session_id=_SID, purpose="unknown")
 
 
 def test_delete(file_store: SqlAlchemyFileStore) -> None:
@@ -146,13 +186,20 @@ def test_delete_all_for_session(
     """delete_all_for_session removes all session files and returns ids."""
     f1 = file_store.create("a.txt", 1, session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5")
     f2 = file_store.create("b.txt", 2, session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5")
+    frame = file_store.create(
+        "computer-use-frame.png",
+        3,
+        session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5",
+        purpose=FILE_PURPOSE_COMPUTER_USE_FRAME,
+    )
     file_store.create("c.txt", 3, session_id="aef8aa8b6e9cf6eda406cb88cf33708c")
     global_f = file_store.create("global.txt", 4)
 
     deleted_ids = file_store.delete_all_for_session("4e92b5a0c0ee6db3f874f9c4a3f855a5")
-    assert set(deleted_ids) == {f1.id, f2.id}
+    assert set(deleted_ids) == {f1.id, f2.id, frame.id}
     assert file_store.get(f1.id) is None
     assert file_store.get(f2.id) is None
+    assert file_store.get(frame.id) is None
     other_page = file_store.list(session_id="aef8aa8b6e9cf6eda406cb88cf33708c")
     assert (
         file_store.get(other_page.data[0].id, session_id="aef8aa8b6e9cf6eda406cb88cf33708c")

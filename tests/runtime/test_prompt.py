@@ -6,7 +6,13 @@ from typing import cast
 
 import pytest
 
-from omnigent.entities import ConversationItem, FunctionCallOutputData
+from omnigent.entities import (
+    ComputerUsePresentation,
+    ConversationItem,
+    FunctionCallData,
+    FunctionCallOutputAttachment,
+    FunctionCallOutputData,
+)
 from omnigent.runtime.prompt import (
     append_framework_instructions,
     build_instructions,
@@ -93,6 +99,68 @@ def test_history_replay_leaves_non_image_json_output_unchanged() -> None:
     stored = json.dumps([{"type": "text", "text": "hello"}], separators=(",", ":"))
     result = history_to_input_items([_output_item(stored)])
     assert result[0]["output"] == stored
+
+
+def test_history_replay_ignores_computer_use_presentation_and_attachments() -> None:
+    """Display metadata must never become model input on resume."""
+    call = ConversationItem(
+        id="i_call",
+        status="completed",
+        response_id="r1",
+        created_at=1,
+        type="function_call",
+        data=FunctionCallData(
+            agent="codex-native-ui",
+            name="node_repl/js",
+            arguments='{"code":"inspect"}',
+            call_id="c1",
+            presentation=ComputerUsePresentation(
+                provider="codex",
+                app_name="secret app label",
+                action_label="secret action label",
+            ),
+        ),
+    )
+    output = ConversationItem(
+        id="i_output",
+        status="completed",
+        response_id="r1",
+        created_at=2,
+        type="function_call_output",
+        data=FunctionCallOutputData(
+            call_id="c1",
+            output="sanitized result",
+            presentation=ComputerUsePresentation(
+                provider="codex",
+                app_id="secret.output.app",
+            ),
+            presentation_final=True,
+            status="completed",
+            attachments=[
+                FunctionCallOutputAttachment(
+                    kind="computer_frame",
+                    file_id="secret_frame_id",
+                    content_type="image/png",
+                    width=1280,
+                    height=800,
+                )
+            ],
+        ),
+    )
+
+    assert history_to_input_items([call, output]) == [
+        {
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "node_repl/js",
+            "arguments": '{"code":"inspect"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "sanitized result",
+        },
+    ]
 
 
 def test_framework_instructions_append_after_custom_prompts() -> None:

@@ -6,10 +6,13 @@ from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.conversation import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
+    ComputerUseActionKind,
+    ComputerUsePresentation,
     Conversation,
     ConversationItem,
     ErrorData,
     FunctionCallData,
+    FunctionCallOutputAttachment,
     FunctionCallOutputData,
     ItemData,
     MessageData,
@@ -24,7 +27,12 @@ from omnigent.entities.conversation import (
     synthesize_conversation_title,
 )
 from omnigent.entities.device_grant import DeviceGrant
-from omnigent.entities.file import StoredFile
+from omnigent.entities.file import (
+    FILE_PURPOSE_COMPUTER_USE_FRAME,
+    FILE_PURPOSE_USER_UPLOAD,
+    FILE_PURPOSES,
+    StoredFile,
+)
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
@@ -40,6 +48,9 @@ from omnigent.entities.session_resources import (
 
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
+    "FILE_PURPOSES",
+    "FILE_PURPOSE_COMPUTER_USE_FRAME",
+    "FILE_PURPOSE_USER_UPLOAD",
     "NON_CONTENT_ITEM_TYPES",
     "Account",
     "AccountToken",
@@ -47,11 +58,14 @@ __all__ = [
     "Comment",
     "CommentsFingerprint",
     "CompactionData",
+    "ComputerUseActionKind",
+    "ComputerUsePresentation",
     "Conversation",
     "ConversationItem",
     "DeviceGrant",
     "ErrorData",
     "FunctionCallData",
+    "FunctionCallOutputAttachment",
     "FunctionCallOutputData",
     "ItemData",
     "LoadedAgent",

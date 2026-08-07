@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import json
@@ -11,7 +13,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -522,6 +524,14 @@ class _ForwardDedupeState:
     recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
+    # Call ids already forwarded as Computer Use. Only these results have their
+    # images stored as preview frames, so an ordinary image tool result (e.g.
+    # reading a PNG) keeps its existing placeholder-only behavior.
+    computer_use_call_ids: set[str] = field(default_factory=set)
+    # Last app Claude was granted or opened. Only open_application and
+    # request_access name an app, so every later screenshot/click would
+    # otherwise render as "Unknown app" for the app already being driven.
+    computer_use_app: str | None = None
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
@@ -3353,6 +3363,12 @@ async def _forward_available_items(
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
         try:
+            item = await _attach_computer_use_frames(
+                client,
+                session_id=session_id,
+                item=item,
+                dedupe=dedupe,
+            )
             await _post_external_conversation_item(
                 client,
                 session_id=session_id,
@@ -3907,6 +3923,117 @@ async def _post_clear_supersession(
             new_session_id,
             exc_info=True,
         )
+
+
+def _detected_frame_content_type(data: bytes) -> str | None:
+    """Identify supported image bytes independently of untrusted vendor metadata.
+
+    Claude's Computer Use results have been observed declaring one media type
+    while carrying another, so the signature decides what is stored.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+async def _attach_computer_use_frames(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    item: ClaudeTranscriptItem,
+    dedupe: _ForwardDedupeState,
+) -> ClaudeTranscriptItem:
+    """Store Computer Use result images and reference them on the output item.
+
+    A failed or rejected upload degrades to the ordinary text-only tool result
+    rather than blocking the turn: the panel shows the call without a frame.
+    """
+    if item.item_type == "function_call":
+        presentation = item.data.get("presentation")
+        call_id = item.data.get("call_id")
+        if not (
+            isinstance(presentation, dict)
+            and presentation.get("kind") == "computer_use"
+            and isinstance(call_id, str)
+        ):
+            return item
+        dedupe.computer_use_call_ids.add(call_id)
+        app_name = presentation.get("app_name")
+        if isinstance(app_name, str) and app_name:
+            dedupe.computer_use_app = app_name
+        elif dedupe.computer_use_app is not None:
+            # Carry the session's known app onto calls that cannot name one, so
+            # the panel keeps labeling the app being driven rather than
+            # flipping to "Unknown app" on every screenshot.
+            presentation = {**presentation, "app_name": dedupe.computer_use_app}
+            item = replace(item, data={**item.data, "presentation": presentation})
+        return item
+    if item.item_type != "function_call_output" or not item.pending_frames:
+        return item
+    call_id = item.data.get("call_id")
+    if not isinstance(call_id, str) or call_id not in dedupe.computer_use_call_ids:
+        return item
+    extensions = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+    attachments: list[dict[str, object]] = []
+    for index, (declared_type, encoded) in enumerate(item.pending_frames):
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            _logger.warning("Claude Computer Use frame has invalid base64: call_id=%s", call_id)
+            continue
+        content_type = _detected_frame_content_type(decoded)
+        if content_type is None:
+            _logger.warning("Claude Computer Use frame has unsupported bytes: call_id=%s", call_id)
+            continue
+        if content_type != declared_type:
+            _logger.warning(
+                "Claude Computer Use frame MIME disagrees with bytes; using detected type: "
+                "call_id=%s declared=%s detected=%s",
+                call_id,
+                declared_type,
+                content_type,
+            )
+        try:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/resources/computer-use-frames",
+                params={"source_id": f"claude:{item.source_id}:{index}"},
+                files={
+                    "file": (
+                        f"computer-use-frame{extensions[content_type]}",
+                        decoded,
+                        content_type,
+                    )
+                },
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "Claude Computer Use frame upload failed: call_id=%s", call_id, exc_info=True
+            )
+            continue
+        if response.status_code >= 400:
+            _logger.warning(
+                "Claude Computer Use frame upload rejected: call_id=%s status=%s",
+                call_id,
+                response.status_code,
+            )
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("kind") == "computer_frame"
+            and isinstance(payload.get("file_id"), str)
+        ):
+            attachments.append(payload)
+    if not attachments:
+        return item
+    return replace(item, data={**item.data, "attachments": attachments})
 
 
 async def _post_external_conversation_item(

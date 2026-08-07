@@ -67,6 +67,11 @@ describe("sessionWorkspaceState", () => {
     });
   });
 
+  it("restores the Computer rail tab for sessions that have surfaced it", () => {
+    writeSessionWorkspaceState("conv_computer", { rightRailTab: "computer" });
+    expect(readSessionWorkspaceState("conv_computer").rightRailTab).toBe("computer");
+  });
+
   it("caps the persisted shell tabs at 20, keeping the most recent", () => {
     const terminals = Array.from({ length: 25 }, (_, i) => `terminal:t${i}`);
     writeSessionWorkspaceState("conv_terms", { openTerminals: terminals });

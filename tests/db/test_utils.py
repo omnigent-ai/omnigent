@@ -31,7 +31,11 @@ from omnigent.db.utils import (
     strip_nul_bytes,
 )
 from omnigent.entities.conversation import (
+    ComputerUsePresentation,
     ErrorData,
+    FunctionCallData,
+    FunctionCallOutputAttachment,
+    FunctionCallOutputData,
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
@@ -587,6 +591,49 @@ def test_extract_search_text_for_resource_event_item() -> None:
     assert "terminal" in text
     assert "opaque" not in text
     assert "not indexed" not in text
+
+
+def test_extract_search_text_ignores_computer_use_display_metadata() -> None:
+    """FTS indexes execution text, not app labels or frame references."""
+    call = NewConversationItem(
+        type="function_call",
+        response_id="resp_computer",
+        data=FunctionCallData(
+            agent="codex-native-ui",
+            name="node_repl/js",
+            arguments='{"code":"inspect"}',
+            call_id="call_computer",
+            presentation=ComputerUsePresentation(
+                provider="codex",
+                app_name="private-app-label",
+                action_label="private-action-label",
+            ),
+        ),
+    )
+    output = NewConversationItem(
+        type="function_call_output",
+        response_id="resp_computer",
+        data=FunctionCallOutputData(
+            call_id="call_computer",
+            output="sanitized result",
+            attachments=[
+                FunctionCallOutputAttachment(
+                    kind="computer_frame",
+                    file_id="private-frame-id",
+                    content_type="image/png",
+                    width=1280,
+                    height=800,
+                )
+            ],
+        ),
+    )
+
+    assert extract_search_text(call) == 'node_repl/js {"code":"inspect"}'
+    assert extract_search_text(output) == "sanitized result"
+    indexed = f"{extract_search_text(call)} {extract_search_text(output)}"
+    assert "private-app-label" not in indexed
+    assert "private-action-label" not in indexed
+    assert "private-frame-id" not in indexed
 
 
 @pytest.mark.parametrize(

@@ -14,7 +14,12 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     now_epoch,
 )
-from omnigent.entities import PagedList, StoredFile
+from omnigent.entities import (
+    FILE_PURPOSE_USER_UPLOAD,
+    FILE_PURPOSES,
+    PagedList,
+    StoredFile,
+)
 from omnigent.stores.file_store import FileStore
 
 
@@ -32,6 +37,7 @@ def _to_entity(row: SqlFile) -> StoredFile:
         bytes=row.bytes,
         content_type=row.content_type,
         session_id=row.session_id,
+        purpose=row.purpose,
     )
 
 
@@ -63,6 +69,7 @@ class SqlAlchemyFileStore(FileStore):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        purpose: str = FILE_PURPOSE_USER_UPLOAD,
     ) -> StoredFile:
         """
         Record a new file in the database.
@@ -72,8 +79,11 @@ class SqlAlchemyFileStore(FileStore):
         :param content_type: MIME type.
         :param session_id: Owning session id, or ``None`` for
             global files.
+        :param purpose: Visibility/use class.
         :returns: The newly created :class:`StoredFile`.
         """
+        if purpose not in FILE_PURPOSES:
+            raise ValueError(f"unsupported file purpose: {purpose!r}")
         row = SqlFile(
             id=generate_file_id(),
             created_at=now_epoch(),
@@ -81,6 +91,7 @@ class SqlAlchemyFileStore(FileStore):
             bytes=bytes,
             content_type=content_type,
             session_id=session_id,
+            purpose=purpose,
         )
         with self._session("insert_file") as session:
             session.add(row)
@@ -118,6 +129,7 @@ class SqlAlchemyFileStore(FileStore):
         before: str | None = None,
         order: str = "desc",
         include_unscoped: bool = False,
+        purpose: str = FILE_PURPOSE_USER_UPLOAD,
     ) -> PagedList[StoredFile]:
         """
         List a session's files with cursor-based pagination.
@@ -132,12 +144,18 @@ class SqlAlchemyFileStore(FileStore):
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param include_unscoped: When ``True``, also return global
             files (``session_id IS NULL``).
+        :param purpose: File purpose to list.
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         with self._session("list_files") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id())
+            if purpose not in FILE_PURPOSES:
+                raise ValueError(f"unsupported file purpose: {purpose!r}")
+            stmt = select(SqlFile).where(
+                SqlFile.workspace_id == current_workspace_id(),
+                SqlFile.purpose == purpose,
+            )
             if include_unscoped:
                 stmt = stmt.where(
                     or_(SqlFile.session_id == session_id, SqlFile.session_id.is_(None))

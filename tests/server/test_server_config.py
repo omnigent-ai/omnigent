@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 from omnigent.server.server_config import (
+    computer_use_frame_max_bytes,
+    computer_use_frame_max_dimension,
     config_str_list,
     load_server_config,
     resolve_config_path,
@@ -110,3 +112,31 @@ def test_config_str_list_none_is_empty() -> None:
 
 def test_config_str_list_strips_and_drops_empty() -> None:
     assert config_str_list(["  a@x.com  ", "", "  "]) == ["a@x.com"]
+
+
+def test_computer_use_frame_limits_read_server_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "computer_use_frame_max_bytes": "1234",
+            "computer_use_frame_max_dimension": 4096,
+        },
+    )
+
+    assert computer_use_frame_max_bytes() == 1234
+    assert computer_use_frame_max_dimension() == 4096
+
+
+def test_computer_use_dimension_above_wire_contract_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.computer_use_frames import DEFAULT_MAX_FRAME_DIMENSION
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"computer_use_frame_max_dimension": 32_769},
+    )
+
+    assert computer_use_frame_max_dimension() == DEFAULT_MAX_FRAME_DIMENSION

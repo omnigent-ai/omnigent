@@ -142,3 +142,52 @@ def copy_total_bytes_limit() -> int:
     from omnigent.runtime.content_resolver import MAX_COPY_TOTAL_BYTES
 
     return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)
+
+
+def computer_use_frame_max_bytes() -> int:
+    """Maximum decoded bytes in one stored Computer Use frame."""
+    from omnigent.computer_use_frames import DEFAULT_MAX_FRAME_BYTES
+
+    return _config_positive_int("computer_use_frame_max_bytes", DEFAULT_MAX_FRAME_BYTES)
+
+
+def computer_use_frame_max_dimension() -> int:
+    """Maximum width or height of one stored Computer Use frame."""
+    from omnigent.computer_use_frames import (
+        DEFAULT_MAX_FRAME_DIMENSION,
+        MAX_ATTACHMENT_DIMENSION,
+    )
+
+    value = _config_positive_int("computer_use_frame_max_dimension", DEFAULT_MAX_FRAME_DIMENSION)
+    if value > MAX_ATTACHMENT_DIMENSION:
+        logger.warning(
+            "server config computer_use_frame_max_dimension=%d exceeds %d — using default %d",
+            value,
+            MAX_ATTACHMENT_DIMENSION,
+            DEFAULT_MAX_FRAME_DIMENSION,
+        )
+        return DEFAULT_MAX_FRAME_DIMENSION
+    return value
+
+
+def computer_use_frame_max_pixels() -> int:
+    """Maximum decoded pixel count in one stored Computer Use frame."""
+    from omnigent.computer_use_frames import DEFAULT_MAX_FRAME_PIXELS
+
+    return _config_positive_int("computer_use_frame_max_pixels", DEFAULT_MAX_FRAME_PIXELS)
+
+
+def computer_use_frame_max_count() -> int:
+    """Maximum retained Computer Use frames per session."""
+    from omnigent.computer_use_frames import DEFAULT_MAX_FRAMES_PER_SESSION
+
+    return _config_positive_int("computer_use_frame_max_count", DEFAULT_MAX_FRAMES_PER_SESSION)
+
+
+def computer_use_frame_max_total_bytes() -> int:
+    """Maximum retained Computer Use frame bytes per session."""
+    from omnigent.computer_use_frames import DEFAULT_MAX_FRAME_BYTES_PER_SESSION
+
+    return _config_positive_int(
+        "computer_use_frame_max_total_bytes", DEFAULT_MAX_FRAME_BYTES_PER_SESSION
+    )

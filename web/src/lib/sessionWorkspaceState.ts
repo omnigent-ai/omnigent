@@ -14,6 +14,7 @@ const RAIL_TABS: readonly RightRailTab[] = [
   "subagents",
   "terminals",
   "todos",
+  "computer",
   "browser",
 ];
 

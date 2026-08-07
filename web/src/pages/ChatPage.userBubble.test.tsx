@@ -157,8 +157,8 @@ describe("UserBubble system messages", () => {
     // A real bubble with both screenshots — not the blank pill the stolen
     // file blocks used to leave behind.
     expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
-    expect(screen.getByAltText("shot1.png")).toBeInTheDocument();
-    expect(screen.getByAltText("shot2.png")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "shot1.png" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "shot2.png" })).toBeInTheDocument();
     // Upload markers are stripped from the text, and an empty text renders
     // nothing rather than an empty markdown block.
     expect(screen.queryByText(/\[Attached:/)).toBeNull();

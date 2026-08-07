@@ -1,0 +1,70 @@
+{
+  "source": "live subscription",
+  "events": [
+    {
+      "method": "item/started",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec_failed",
+          "server": "node_repl",
+          "tool": "js",
+          "status": "inProgress",
+          "arguments": {
+            "code": "globalThis.fixtureSky = (await import(\"@oai/sky\")).sky;\nawait globalThis.fixtureSky.get_app_state({ app: \"TextEdit\" });\nthrow new Error(\"computer-use discovery fixture failure\");",
+            "title": "Run failure fixture"
+          },
+          "appContext": null,
+          "pluginId": null,
+          "result": null,
+          "error": null,
+          "durationMs": null
+        },
+        "threadId": "thread_fixture",
+        "turnId": "turn_failed",
+        "startedAtMs": 1700000001000
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec_failed",
+          "server": "node_repl",
+          "tool": "js",
+          "status": "failed",
+          "arguments": {
+            "code": "globalThis.fixtureSky = (await import(\"@oai/sky\")).sky;\nawait globalThis.fixtureSky.get_app_state({ app: \"TextEdit\" });\nthrow new Error(\"computer-use discovery fixture failure\");",
+            "title": "Run failure fixture"
+          },
+          "appContext": null,
+          "pluginId": null,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "computer-use discovery fixture failure"
+              }
+            ],
+            "structuredContent": null,
+            "_meta": {
+              "codex/toolSurface": {
+                "kind": "computerUse",
+                "app": {
+                  "kind": "appId",
+                  "appId": "com.apple.TextEdit"
+                }
+              }
+            }
+          },
+          "error": null,
+          "durationMs": 198
+        },
+        "threadId": "thread_fixture",
+        "turnId": "turn_failed",
+        "completedAtMs": 1700000001198
+      }
+    }
+  ]
+}

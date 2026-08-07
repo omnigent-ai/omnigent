@@ -319,6 +319,9 @@ class SqlFile(OmnigentBase):
     :param bytes: Size of the file in bytes.
     :param content_type: MIME type of the file, e.g.
         ``"application/pdf"``. ``None`` when not provided.
+    :param purpose: Visibility/use class. Normal uploads use
+        ``"user_upload"``; generated Computer Use previews use
+        ``"computer_use_frame"``.
     """
 
     __tablename__ = "files"
@@ -337,6 +340,12 @@ class SqlFile(OmnigentBase):
     bytes: Mapped[int] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    purpose: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="user_upload",
+        server_default="user_upload",
+    )
 
     __table_args__ = (
         # Files are only ever listed per session (WHERE session_id = ?),
@@ -346,6 +355,7 @@ class SqlFile(OmnigentBase):
             "ix_files_session_id_created_at",
             "workspace_id",
             "session_id",
+            "purpose",
             "created_at",
             "id",
         ),

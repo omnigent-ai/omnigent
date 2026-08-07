@@ -41,13 +41,28 @@ status.
 
 | Column | Type | Notes |
 |---|---|---|
-| id | String(64) PK | "file_" + uuid4().hex |
+| workspace_id | BigInteger PK | Databricks workspace partition; 0 for the default workspace |
+| id | Uuid16 PK | uuid4 hex at the entity boundary, stored as 16 bytes |
 | created_at | Integer NOT NULL | |
 | filename | String(512) NOT NULL | Original filename |
 | bytes | Integer NOT NULL | File size |
 | content_type | String(256) | MIME type, nullable |
+| session_id | Uuid16 | Owning session, nullable for historical unscoped files |
+| purpose | String(32) NOT NULL | `user_upload` or hidden `computer_use_frame`; defaults to `user_upload` |
 
-**Indexes:** `ix_files_created_at`
+**Indexes:** `ix_files_session_id_created_at` on
+`(workspace_id, session_id, purpose, created_at, id)`. Ordinary file lists
+filter to `user_upload`; generated Computer Use frames remain directly readable
+through the owning session but do not appear in the normal Files panel.
+
+Computer Use frame storage accepts validated PNG, JPEG, and WebP bytes. Defaults
+are 5 MiB per frame, 8192 pixels per dimension, 32 MiPixels, 50 retained frames
+per session, and 100 MiB retained frame bytes per session. Operators may override
+these with `computer_use_frame_max_bytes`, `computer_use_frame_max_dimension`,
+`computer_use_frame_max_pixels`, `computer_use_frame_max_count`, and
+`computer_use_frame_max_total_bytes` in server config. The oldest frames are
+pruned when either session limit is exceeded; ordinary session deletion removes
+both upload and frame metadata and then deletes their artifact bytes.
 
 ---
 
@@ -96,9 +111,14 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 
 **message:** `{"role": "user", "content": [{"type": "input_text", "text": "..."}]}`
 
-**function_call:** `{"name": "get_weather", "arguments": "{...}", "call_id": "call_001"}`
+**function_call:** `{"name": "get_weather", "arguments": "{...}", "call_id": "call_001", "presentation": {"kind": "computer_use", "provider": "codex"}}`
 
-**function_call_output:** `{"call_id": "call_001", "output": "{...}"}`
+**function_call_output:** `{"call_id": "call_001", "output": "{...}", "attachments": [{"kind": "computer_frame", "file_id": "...", "content_type": "image/png", "width": 1280, "height": 800}]}`
+
+`presentation` and `attachments` are optional display metadata. They are stored
+for history/UI hydration but excluded from prompt reconstruction. Search indexing
+uses only the function name/arguments or textual `output`, never attachment
+metadata or frame bytes.
 
 **reasoning:** `{"summary": [...], "content": null, "encrypted_content": null}`
 

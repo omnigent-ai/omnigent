@@ -53,6 +53,11 @@ import {
   isTerminalCommandItem,
 } from "./conversationItems";
 import { routingExtrasFromWire } from "./routingDecision";
+import {
+  computerFramesFromWire,
+  computerUsePresentationFromWire,
+  computerUseStatusFromWire,
+} from "./computerUse";
 
 /**
  * Walk persisted items in arrival order and emit a flat block list.
@@ -210,6 +215,7 @@ function functionCallToBlock(item: FunctionCallItem): ToolGroup {
     agentName: item.model ?? "",
     executedBy: "server",
     output: null,
+    presentation: computerUsePresentationFromWire(item.presentation),
   };
   return {
     type: "tool_group",
@@ -228,6 +234,10 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
     callId: item.call_id,
     agentName: ctx.agent ?? "",
     output: item.output,
+    attachments: computerFramesFromWire(item.attachments),
+    presentation: computerUsePresentationFromWire(item.presentation),
+    presentationFinal: item.presentation_final === true,
+    status: computerUseStatusFromWire(item.status),
   };
 }
 

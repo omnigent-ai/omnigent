@@ -1,0 +1,79 @@
+{
+  "source": "live subscription",
+  "events": [
+    {
+      "method": "item/started",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec_image",
+          "server": "node_repl",
+          "tool": "js",
+          "status": "inProgress",
+          "arguments": {
+            "code": "if (!globalThis.sky) globalThis.sky = (await import(\"@oai/sky\")).sky;\nvar state = await sky.get_app_state({ app: \"TextEdit\", disableDiff: true });\nawait nodeRepl.emitImage({ bytes: await fs.readFile(fileURLToPath(state.screenshot.url)), mimeType: \"image/png\" });\nnodeRepl.write(state.text.split(\"\\n\")[0]);",
+            "title": "Inspect TextEdit once"
+          },
+          "appContext": null,
+          "pluginId": null,
+          "result": null,
+          "error": null,
+          "durationMs": null
+        },
+        "threadId": "thread_fixture",
+        "turnId": "turn_image",
+        "startedAtMs": 1700000000000
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec_image",
+          "server": "node_repl",
+          "tool": "js",
+          "status": "completed",
+          "arguments": {
+            "code": "if (!globalThis.sky) globalThis.sky = (await import(\"@oai/sky\")).sky;\nvar state = await sky.get_app_state({ app: \"TextEdit\", disableDiff: true });\nawait nodeRepl.emitImage({ bytes: await fs.readFile(fileURLToPath(state.screenshot.url)), mimeType: \"image/png\" });\nnodeRepl.write(state.text.split(\"\\n\")[0]);",
+            "title": "Inspect TextEdit once"
+          },
+          "appContext": null,
+          "pluginId": null,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Window: \"Untitled\", App: TextEdit."
+              },
+              {
+                "type": "image",
+                "data": "<base64 omitted>",
+                "dataEncodedLength": 28356,
+                "mimeType": "image/png",
+                "_meta": {
+                  "codex/imageDetail": "original"
+                }
+              }
+            ],
+            "structuredContent": null,
+            "_meta": {
+              "codex/toolSurface": {
+                "kind": "computerUse",
+                "app": {
+                  "kind": "appId",
+                  "appId": "com.apple.TextEdit"
+                }
+              }
+            }
+          },
+          "error": null,
+          "durationMs": 179
+        },
+        "threadId": "thread_fixture",
+        "turnId": "turn_image",
+        "completedAtMs": 1700000000179
+      }
+    }
+  ]
+}

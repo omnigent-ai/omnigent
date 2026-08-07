@@ -1,0 +1,37 @@
+{
+  "source": "thread/read",
+  "item": {
+    "type": "mcpToolCall",
+    "id": "exec_text_only",
+    "server": "node_repl",
+    "tool": "js",
+    "status": "completed",
+    "arguments": {
+      "code": "globalThis.sky = (await import(\"@oai/sky\")).sky;\nvar textEditState = await sky.get_app_state({ app: \"TextEdit\" });\nnodeRepl.write(textEditState.text);",
+      "title": "Inspect TextEdit window title"
+    },
+    "appContext": null,
+    "pluginId": null,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Window: \"Untitled\", App: TextEdit.\n<accessibility tree omitted>",
+          "textOriginalLength": 3381
+        }
+      ],
+      "structuredContent": null,
+      "_meta": {
+        "codex/toolSurface": {
+          "kind": "computerUse",
+          "app": {
+            "kind": "appId",
+            "appId": "com.apple.TextEdit"
+          }
+        }
+      }
+    },
+    "error": null,
+    "durationMs": 707931
+  }
+}
