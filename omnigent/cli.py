@@ -1152,10 +1152,12 @@ def _apply_bind_auth_defaults(host: str) -> None:
         ``"0.0.0.0"``.
     :returns: None.
     """
+    from omnigent.server.auth import bind_host_is_loopback as _bind_host_is_loopback
     from omnigent.server.auth import env_var_is_truthy as _env_var_is_truthy
     from omnigent.server.auth import resolve_auth_source as _resolve_auth_source
+    from omnigent.server.auth import warn_if_single_user_exposed as _warn_if_single_user_exposed
 
-    _is_loopback_bind = host in ("127.0.0.1", "localhost", "::1")
+    _is_loopback_bind = _bind_host_is_loopback(host)
     # Compose-style deploys pass OMNIGENT_AUTH_PROVIDER as an empty
     # string when unset ("${VAR:-}"), so empty and missing both mean
     # "not explicitly pinned".
@@ -1189,20 +1191,15 @@ def _apply_bind_auth_defaults(host: str) -> None:
             "single-user mode.",
             err=True,
         )
-    elif not _is_loopback_bind and _single_user_requested and _resolve_auth_source() == "header":
-        # Gated on the *resolved* source, not on whether a provider was pinned:
-        # the exposure exists only in header mode, where the "local" fallback is
-        # reachable. An explicit accounts/oidc provider still requires login, so
-        # warning there would be false.
-        click.echo(
-            "  ⚠ SECURITY: OMNIGENT_LOCAL_SINGLE_USER=1 is set and you are "
-            f"binding to non-local interface {host}.\n"
-            "    This server will serve UNAUTHENTICATED requests as the "
-            '"local" user to anyone who can reach this address.\n'
-            "    Only do this on a trusted private network.\n"
-            "    Unset OMNIGENT_LOCAL_SINGLE_USER to require login instead.",
-            err=True,
-        )
+    else:
+        # Exposure warning comes from the auth module so the CLI and the
+        # container entrypoints announce the same posture from one rule.
+        # It self-gates on the resolved source being ``header`` — an explicit
+        # accounts/oidc provider requires login, so there is nothing to warn
+        # about — and on the bind being reachable.
+        _exposure = _warn_if_single_user_exposed(host)
+        if _exposure:
+            click.echo(f"  ⚠ {_exposure}", err=True)
 
 
 def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)

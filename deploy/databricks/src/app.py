@@ -205,6 +205,16 @@ try:
     # OMNIGENT_AUTH_ENABLED in the deploy env (an explicit
     # provider always wins over the enable switch).
     os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
+
+    # Header mode here relies on the proxy injecting the identity header. A
+    # single-user marker in the deploy env would turn an un-proxied request
+    # into the "local" user instead, so surface that if it is ever set.
+    from omnigent.server.auth import warn_if_single_user_exposed
+
+    _exposure = warn_if_single_user_exposed("0.0.0.0")
+    if _exposure:
+        logger.warning("%s", _exposure)
+
     auth_provider = create_auth_provider()
     app = create_app(
         agent_store=agent_store,

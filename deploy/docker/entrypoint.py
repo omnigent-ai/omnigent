@@ -221,6 +221,17 @@ def _resolve_config() -> _ResolvedConfig:
                 os.environ, host=host, port=port
             )
 
+    # A container binds a reachable interface, so the AUTH_ENABLED=0 posture
+    # above (which sets the single-user marker) serves unauthenticated requests
+    # as "local". Logged rather than printed: container stderr is usually
+    # buried in a platform log viewer, and the operator who set the kill switch
+    # is not watching a terminal.
+    from omnigent.server.auth import warn_if_single_user_exposed
+
+    _exposure = warn_if_single_user_exposed(host)
+    if _exposure:
+        logger.warning("%s", _exposure)
+
     return _ResolvedConfig(
         cfg=cfg,
         database_url=database_url,
