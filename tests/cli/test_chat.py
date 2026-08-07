@@ -1444,6 +1444,44 @@ def test_prepare_chat_session_via_daemon_fork_wins_over_resume(
     assert launch["session_id"] == "conv_forked"
 
 
+def test_prepare_chat_session_via_daemon_reports_create_failure_as_click_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed session create is a ``ClickException`` naming the server URL.
+
+    A base URL that answers ``/health`` but exposes no session API (e.g. one
+    carrying the workspace web-UI path) fails here. Letting the SDK's
+    ``OmnigentError`` escape turns that wrong-URL case into a crash-handler
+    traceback, which hides the one detail that identifies it: the URL.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    async def _boom(_self: object, _bundle: bytes, *, filename: str, workspace: str) -> object:
+        raise ClientOmnigentError({"detail": "Method Not Allowed"}, 405, "")
+
+    monkeypatch.setattr(_FakeSessionsApi, "create", _boom)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        asyncio.run(
+            _prepare_chat_session_via_daemon(
+                base_url="https://example.databricks.com/omnigent",
+                headers={},
+                auth=None,
+                host_id="host_x",
+                bundle=b"bundle-bytes",
+                resume_conversation_id=None,
+                fork_session_id=None,
+                workspace="/tmp/proj",
+            )
+        )
+
+    # The URL is what tells the user their server target is wrong.
+    assert "https://example.databricks.com/omnigent" in str(excinfo.value)
+    # No runner is launched for a session that was never created.
+    assert "launch" not in captured
+
+
 # ── OMNIGENT_MODEL env-var fallback ───────────────────
 #
 # These tests pin explicit-environment and discovered-default precedence on

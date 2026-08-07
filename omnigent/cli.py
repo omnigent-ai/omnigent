@@ -10381,9 +10381,13 @@ def _resolve_server_url(server: str) -> str:
     :returns: The normalized API base URL without a trailing slash, e.g.
         ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
     """
-    from omnigent.conversation_browser import display_server_url
+    from omnigent.conversation_browser import display_server_url, strip_conversation_path
 
-    normalized = _with_default_scheme(server.rstrip("/"))
+    # A URL copied from the browser while a conversation is open carries the
+    # SPA's ``/c/<id>`` route. The SPA catch-all answers any GET under it with
+    # its HTML shell, so it probes as a healthy server and is accepted, then
+    # every API call 404s. Trim it back to the base before anything probes it.
+    normalized = _with_default_scheme(strip_conversation_path(server.rstrip("/")))
     expanded = _workspace_api_server_url(normalized)
     candidate = _canonical_azure_databricks_url(normalized)
     if candidate is None:

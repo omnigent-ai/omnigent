@@ -1448,16 +1448,22 @@ async def _prepare_chat_session_via_daemon(
     from omnigent.native_terminal import bind_session_runner
 
     async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
-        if fork_session_id is not None:
-            fork_result = await sdk.sessions.fork(fork_session_id)
-            session_id = fork_result["id"]
-        elif resume_conversation_id is not None:
-            session_id = resume_conversation_id
-        else:
-            created = await sdk.sessions.create(
-                bundle, filename="agent.tar.gz", workspace=workspace
-            )
-            session_id = created.id
+        try:
+            if fork_session_id is not None:
+                fork_result = await sdk.sessions.fork(fork_session_id)
+                session_id = fork_result["id"]
+            elif resume_conversation_id is not None:
+                session_id = resume_conversation_id
+            else:
+                created = await sdk.sessions.create(
+                    bundle, filename="agent.tar.gz", workspace=workspace
+                )
+                session_id = created.id
+        except ClientOmnigentError as exc:
+            # A server that answers /health but has no session API is the
+            # wrong base URL (e.g. one carrying the web-UI path), not a bug
+            # worth a traceback. Name the URL so the fix is obvious.
+            raise click.ClickException(f"Could not start a session on {base_url}: {exc}") from exc
 
     # A separate raw httpx client for the host-runner protocol (the daemon
     # launch helpers operate on httpx, not the SDK).

@@ -2541,7 +2541,15 @@ class _SPAStaticFiles(StaticFiles):
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+            # StaticFiles only serves GET/HEAD, so it answers every other
+            # method with 405, which reads as "this endpoint exists, wrong
+            # method" and sends a client pointed at the wrong base URL
+            # hunting a server bug instead. Nothing reaching this catch-all
+            # exists, and a non-GET is never an SPA navigation, so answer
+            # 404 whatever the path looks like.
+            if exc.status_code == 405 or (
+                exc.status_code == 404 and _is_web_ui_api_fallback_path(path)
+            ):
                 return JSONResponse(
                     status_code=404,
                     content={
