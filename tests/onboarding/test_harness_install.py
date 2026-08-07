@@ -68,7 +68,9 @@ def test_kimi_install_spec_is_login_only_no_npm() -> None:
     """Kimi ships via a curl installer (no npm package) and authenticates
     through its own ``kimi login`` (OAuth or Moonshot API key), so it carries
     an ``install_hint`` instead of a ``package`` and intentionally has no
-    ``status_args`` (no exit-code "am I logged in?" probe to read).
+    ``status_args`` (no exit-code "am I logged in?" probe to read). It has no
+    ``kimi logout`` subcommand (verified against kimi CLI v0.29.1), so
+    ``logout_args`` is ``None`` and ``harness_logout`` is a no-op for it.
     """
     spec = hi.harness_install_spec(hi.KIMI_KEY)
     assert spec is not None
@@ -76,7 +78,7 @@ def test_kimi_install_spec_is_login_only_no_npm() -> None:
     assert spec.package is None
     assert spec.install_hint is not None and "code.kimi.com" in spec.install_hint
     assert spec.login_args == ("login",)
-    assert spec.logout_args == ("logout",)
+    assert spec.logout_args is None
     assert spec.status_args is None
 
 
@@ -109,6 +111,37 @@ def test_kimi_only_upstream_binary_satisfies_readiness(
         lambda name: "/Users/x/.kimi-code/bin/kimi" if name == "kimi" else None,
     )
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_cli_probe_timeout_defaults_lenient_but_readiness_passes_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The readiness caller can shorten the probe subprocess timeout.
+
+    A wedged harness CLI must not stall the throttled readiness refresh for the
+    lenient default (30s); readiness passes ``READINESS_CLI_PROBE_TIMEOUT_S`` so
+    the ``auth status`` probe fails fast. Direct callers (setup / launch) keep
+    the 30s default.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    recorded: list[float | None] = []
+
+    def _record_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded.append(kwargs.get("timeout"))  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _record_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert recorded[-1] == 30.0
+
+    assert (
+        hi.harness_cli_logged_in(ANTHROPIC_FAMILY, timeout=hi.READINESS_CLI_PROBE_TIMEOUT_S)
+        is True
+    )
+    assert recorded[-1] == hi.READINESS_CLI_PROBE_TIMEOUT_S == 10.0
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -1155,6 +1188,30 @@ def test_harness_cli_installed_checks_minimum_for_other_versioned_specs(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(key) is False
+
+
+def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0.139.0 must read as installed, not ``version-too-low``.
+
+    A too-low codex makes ``harness_is_configured`` false, and the host then
+    refuses EVERY codex launch — plain sessions included — with a misleading
+    "run omni setup". Smart Routing's spawn hook wants 0.145.0, but that is
+    enforced where the hook is registered, so an older CLI loses only the
+    spawn gate.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="codex-cli 0.139.0\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
 def test_harness_cli_installed_true_when_version_in_range(

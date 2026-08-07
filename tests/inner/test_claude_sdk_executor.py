@@ -286,6 +286,33 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("file_id", text)
         self.assertIn("two attachments", text)
 
+    def test_historical_image_source_block_is_replaced_with_compact_placeholder(self):
+        # The ``Read`` tool returns an image file as an Anthropic content block
+        # ``{"type": "image", "source": {"type": "base64", ...}}`` — raw base64
+        # with no ``data:`` URI prefix. Redaction must catch this shape too, or a
+        # replayed image tool result flattens hundreds of KB into prompt text.
+        from omnigent.inner.claude_sdk_executor import _render_prior_content_blocks
+
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_payload,
+                },
+            }
+        ]
+
+        rendered = self._text_of(_render_prior_content_blocks(content))
+
+        self.assertNotIn(image_payload, rendered)
+        self.assertIn(
+            f"[image: image/png, {len(image_payload)} base64 chars]",
+            rendered,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties
@@ -525,12 +552,14 @@ class TestConstructor(unittest.TestCase):
         self.assertIn('databricks auth token --profile "oss"', helper)
         self.assertNotIn("--host", helper)
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # must be applied via a `--help` capability probe ($force), never
-        # passed unconditionally — an older CLI rejects the unknown flag and
-        # yields an empty token → silent 401.
+        # stays behind a `--help` capability probe — an older CLI rejects the
+        # unknown flag and yields an empty token → silent 401.
         self.assertIn("databricks auth token --help", helper)
-        self.assertIn("force=--force-refresh", helper)
-        self.assertNotIn('oss" --force-refresh', helper)
+        # And even where it exists it is only ATTEMPTED: it fails outright on a
+        # stale refresh token, so an empty result must fall back to the cached
+        # token rather than turning a usable credential into an auth failure.
+        self.assertIn("--force-refresh", helper)
+        self.assertIn('if [ -z "$token" ]; then', helper)
 
     def test_databricks_flag_no_creds_raises(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -1136,6 +1165,10 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 'databricks auth token --host "https://example.databricks.com"',
                 env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             )
+            self.assertEqual(
+                env["ANTHROPIC_CUSTOM_HEADERS"],
+                "x-databricks-use-coding-agent-mode: true",
+            )
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
 
     def test_strips_trailing_slash(self):
@@ -1180,6 +1213,20 @@ class TestResolveGatewayEnv(unittest.TestCase):
             "https://example.databricks.com/ai-gateway/anthropic",
         )
         self.assertEqual(env["OMNIGENT_CLAUDE_API_KEY_HELPER"], "printf token")
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"],
+            "x-databricks-use-coding-agent-mode: true",
+        )
+
+    def test_generic_provider_gateway_omits_databricks_header(self):
+        """Non-Databricks gateways must not receive the Databricks mode header."""
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        env = _resolve_gateway_env(
+            base_url_override="https://mock-llm.example/v1",
+            auth_command_override="printf sk-test",
+        )
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", env)
 
     def test_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env

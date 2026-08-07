@@ -465,6 +465,11 @@ _model_options_stale: set[str] = set()
 _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
+# Strong references to fire-and-forget catalog prefetches, so a task cannot be
+# garbage-collected mid-flight. Entries remove themselves when they finish.
+_catalog_prefetch_tasks: set[asyncio.Task[None]] = set()
+
+
 _pushed_model_options_cache: dict[str, list[dict[str, Any]]] = {}
 
 
@@ -630,6 +635,12 @@ _MAX_TERMINAL_LAUNCH_ARG_LEN = 4096
 COST_CONTROL_OVERRIDE_VALUES = frozenset({"on", "off"})
 
 
+# Per-session subagent-routing switch. Two-state: only ``"on"`` routes
+# spawns, and ``"off"`` / absent both read as Default. Creates that start
+# on Smart Routing are stamped ``"on"``, so absent is never an inherit.
+SUBAGENT_ROUTING_OVERRIDE_VALUES = frozenset({"on", "off"})
+
+
 _CHILD_PREVIEW_LIMIT = 150
 
 
@@ -711,6 +722,7 @@ def get_server_host_registry() -> HostRegistry | None:
 
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
+    "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_APPROVAL_TYPE",
@@ -834,6 +846,7 @@ __all__ = [
     "_browser_action_claims",
     "_browser_action_owners",
     "_browser_action_registry",
+    "_catalog_prefetch_tasks",
     "_deferred_elicitation_clear_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
@@ -875,8 +888,8 @@ __all__ = [
 # sibling ``_sessions`` modules resolve the names in their OWN namespace, so a
 # facade-level patch would miss them. These proxies resolve the facade attribute
 # lazily on every access, so a patch on the facade is honoured everywhere the
-# siblings import the name from here. Deliberately NOT in ``__all__`` so the
-# facade's ``import *`` never overwrites its real runtime bindings.
+# siblings import the name from here. Deliberately NOT in ``__all__`` or the
+# facade's explicit imports, preserving its real runtime bindings.
 
 
 def _sessions_facade() -> Any:

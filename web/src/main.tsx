@@ -16,14 +16,16 @@ import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
+  applyDesktopUiFontSize,
   applyUiFontFamily,
-  applyUiFontScale,
   readUiFontFamily,
   readUiFontSizePx,
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 
 // Start tracing before any request fires so fetch/XHR are patched in time
@@ -57,12 +59,12 @@ void resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
-// Apply the saved UI font size and family before first paint so there's no flash.
-applyUiFontScale(readUiFontSizePx());
+// Apply the saved desktop UI font size and family before first paint so there's no flash.
+applyDesktopUiFontSize(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
 
-// The sidebar font size control was removed. Clear any previously persisted
-// value so existing users fall back to the default 13px size on reload.
+// The standalone sidebar font size control was removed. Clear its legacy value
+// so sidebar items follow the shared desktop interface size.
 if (typeof window !== "undefined") {
   try {
     localStorage.removeItem("omnigent:sidebar-font-size");
@@ -99,6 +101,7 @@ const bootProbe: Promise<ServerInfo> = Promise.race([
           public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          smart_routing_sources: { external: false, oss: false },
           harness_install_enabled: false,
           installable_harnesses: [],
           dictation_available: false,

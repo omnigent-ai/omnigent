@@ -433,7 +433,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     const timeField = screen.getByTestId("schedule-time");
     expect(timeField.tagName).toBe("INPUT");
     expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
-    expect(timeField).toHaveClass("text-sm");
+    expect(timeField).toHaveClass("text-ui");
     expect(screen.getByTestId("schedule-time-picker-trigger")).toBeInTheDocument();
   });
 
@@ -587,10 +587,10 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(timeField).toHaveValue("05:07 PM");
   });
 
-  it("uses text-sm for dialog text fields that wrap shared primitives", () => {
+  it("uses text-ui for dialog text fields that wrap shared primitives", () => {
     renderDialog();
-    expect(screen.getByTestId("task-name-input")).toHaveClass("text-sm");
-    expect(screen.getByTestId("task-prompt-input")).toHaveClass("text-sm");
+    expect(screen.getByTestId("task-name-input")).toHaveClass("text-ui");
+    expect(screen.getByTestId("task-prompt-input")).toHaveClass("text-ui");
   });
 
   it("blocks submit while the typed time is invalid", async () => {
@@ -608,7 +608,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
     const minuteField = screen.getByTestId("schedule-minute");
     expect(minuteField.tagName).toBe("INPUT");
-    expect(minuteField).toHaveClass("text-sm");
+    expect(minuteField).toHaveClass("text-ui");
     expect(minuteField).toHaveAttribute("placeholder", "0");
     expect(screen.queryByTestId("schedule-time-picker-trigger")).toBeNull();
     fireEvent.change(minuteField, { target: { value: "7" } });

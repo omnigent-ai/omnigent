@@ -27,6 +27,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     from omnigent.inner.codex_executor import (
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
+        materialize_codex_provider_config,
     )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
@@ -51,6 +52,10 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             profile=launch.profile,
             bridge_dir=temp_root / "bridge",
             extra_config_overrides=launch.config_overrides,
+        )
+        native_server.config_overrides = materialize_codex_provider_config(
+            codex_home,
+            native_server.config_overrides,
         )
         output_path = temp_root / "title.txt"
         args = [

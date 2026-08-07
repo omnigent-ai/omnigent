@@ -10,6 +10,7 @@ DEVICE := env("OMNIGENT_IOS_SIMULATOR", "iPhone 17 Pro")
 
 _check-uv:
     uv run --no-sync ruff --version
+    uv run --no-sync pyrefly --version
     uv run --no-sync pre-commit --version
 
 _ensure-uv:
@@ -93,9 +94,15 @@ lint-all: _ensure-uv
     uv run pre-commit run --all-files
 
 [group('lint')]
+typecheck-python: _ensure-uv
+    uv run --no-sync pyrefly check
+
+[group('lint')]
 lint-ts:
-    pnpm install --frozen-lockfile --filter web
+    pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
     pnpm --filter web run lint
+    pnpm --filter web run type-check
+    pnpm --filter omnigent-vscode run type-check
 
 # --- Lockfile maintenance ---
 

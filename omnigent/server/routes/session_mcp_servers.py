@@ -386,9 +386,9 @@ def _find_mcp_location(root: Path, name: str) -> _McpLocation | None:
         config = _read_yaml_mapping(config_path)
         tools = config.get("tools")
         if isinstance(tools, dict):
-            raw = tools.get(name)
-            if isinstance(raw, dict) and str(raw.get("type", "")) == "mcp":
-                return _McpLocation(source="inline", path=config_path, raw=dict(raw))
+            inline_raw = tools.get(name)
+            if isinstance(inline_raw, dict) and str(inline_raw.get("type", "")) == "mcp":
+                return _McpLocation(source="inline", path=config_path, raw=dict(inline_raw))
     return None
 
 

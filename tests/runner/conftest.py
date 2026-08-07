@@ -6,12 +6,14 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
@@ -717,3 +719,24 @@ def _no_wake_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     monkeypatch.setattr("omnigent.runner.app._wake_retry_sleep", _record)
     return recorded
+
+
+@pytest.fixture
+def pinned_runner_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """
+    Pin the log path the runner names in its client-safe error messages.
+
+    ``process_log_reference`` reports whatever ``configure_process_logging``
+    published for this process, falling back to ``OMNIGENT_PROCESS_LOG_FILE``.
+    Any test in the session that runs the real ``configure_process_logging``
+    (``test_runner_entry``'s ``main()`` cases do) leaves its own allocated path
+    behind, so pin both sources here instead of depending on test order.
+
+    :param monkeypatch: pytest monkeypatch fixture.
+    :param tmp_path: pytest temp dir holding the stand-in log file.
+    :returns: The path the runner's error messages must name.
+    """
+    log_path = tmp_path / "runner-pinned.log"
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", log_path)
+    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(log_path))
+    return log_path

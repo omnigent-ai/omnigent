@@ -42,6 +42,8 @@ import {
   reactRouterRouting,
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
@@ -112,6 +114,7 @@ const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  smart_routing_sources: { external: false, oss: false },
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,

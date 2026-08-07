@@ -407,12 +407,32 @@ def test_headless_subagent_purpose_guard_ignores_non_session_tools() -> None:
         # Backslash embedded in a component was bypassing the split-on-'/' check.
         ("subdir/..\\escape", "DENY"),
         ("..\\etc\\passwd", "DENY"),
+        # Windows-shaped absolutes written with forward slashes: no backslash to
+        # catch, and posixpath reads "C:" as an ordinary relative dir name.
+        ("C:/Windows/System32/x.txt", "DENY"),
+        ("c:/temp/x", "DENY"),
+        ("//server/share/x", "DENY"),
+        # normpath strips "./" and collapses "a/../", so a drive-letter check
+        # against the raw string would miss these. Pins that it runs on the
+        # normalized path.
+        ("./C:/Windows/System32/x.txt", "DENY"),
+        ("a/../C:/Windows/x", "DENY"),
+        # Only ASCII [A-Za-z] is a Windows drive; a Unicode-aware isalpha()
+        # would reject this ordinary relative dir too.
+        ("Ω:/x", "ALLOW"),
     ],
 )
 def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
     """
     worktree_guard ALLOWS relative in-tree write paths and DENIES absolute or
     ``..``-escaping ones.
+
+    The verdict must not depend on ``sys.platform``: the guard normalizes with
+    ``posixpath``, not ``os.path``, because ``ntpath.normpath`` rewrites "/" to
+    "\\" and would make the leading-"/" test inert — every POSIX absolute path
+    would ALLOW on a Windows runner. Running this suite on Windows is what pins
+    that; the drive-letter and UNC cases pin the forms ``posixpath`` alone
+    still reads as relative.
 
     A DENY-case failure means an unsandboxed worker could write outside its
     worktree (the confinement that makes workers safe is gone). An ALLOW-case

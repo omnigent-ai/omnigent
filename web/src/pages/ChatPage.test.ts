@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
+import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
+import type { ServerInfo } from "@/lib/capabilities";
+import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -17,6 +20,8 @@ import {
   computeShowsWorking,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  isCostRoutingEligible,
+  isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
   readOnlyReasonForSessionLabels,
@@ -26,6 +31,7 @@ import {
   shouldShowWorkingIndicator,
   shouldShowTerminalSurface,
   splitSlashCommand,
+  stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   subAgentComposerLabel,
   WORKING_MESSAGES,
@@ -378,8 +384,16 @@ const elicitationBubble = (id: string, phase: string): Bubble => ({
     },
   ],
 });
+const routingChipBubble = (id: string, scope: RoutingScope): Bubble => ({
+  kind: "routing_decision",
+  itemId: id,
+  model: "databricks-claude-sonnet-5",
+  applied: true,
+  rationale: "trivial task -> cheapest arm",
+  routing: { scope },
+});
 const bubbleIds = (bubbles: Bubble[]): string[] =>
-  bubbles.map((b) => (b.kind === "user" ? b.itemId : b.kind === "assistant" ? b.stableId : ""));
+  bubbles.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId));
 
 describe("mergePendingBubbles", () => {
   it("appends pending bubbles at the end when nothing trails", () => {
@@ -423,6 +437,40 @@ describe("mergePendingBubbles", () => {
       "e1",
       "e2",
     ]);
+  });
+
+  it("splices the pending prompt ABOVE a create-time routing chip", () => {
+    // A pinned Smart Routing create routes before the pane launches, so the
+    // session-scope chip is the whole committed timeline while the landing
+    // composer's prompt is still optimistic. Appending after it would show
+    // the chip above the message — and move it below a beat later, when the
+    // server persists the message and the walker pairs them.
+    const committed = [routingChipBubble("rd_create", "session")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "rd_create"]);
+  });
+
+  it("splices above a create whose session AND turn chip both landed first", () => {
+    const committed = [
+      routingChipBubble("rd_create", "session"),
+      routingChipBubble("rd_turn", "turn"),
+    ];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "rd_create", "rd_turn"]);
+  });
+
+  it("does NOT lift a new prompt above a chip already paired with its message", () => {
+    const committed = [userBubble("u1"), routingChipBubble("rd_1", "turn")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "rd_1", "pend_1"]);
+  });
+
+  it("does NOT lift a new prompt above a trailing sub-agent chip", () => {
+    // Sub-agent chips render standalone where the spawn happened — they are
+    // not a verdict on the message being typed.
+    const committed = [routingChipBubble("rd_spawn", "native_subagent")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["rd_spawn", "pend_1"]);
   });
 
   it("does NOT reorder for a tool_call-phase elicitation (message already committed)", () => {
@@ -575,6 +623,63 @@ describe("stripPendingElicitations", () => {
     expect(stripped[0]).toBe(a1);
     expect(stripped[1]).not.toBe(a2);
     expect((stripped[1] as Extract<Bubble, { kind: "assistant" }>).items).toEqual([]);
+  });
+});
+
+// ── sub-agent routing chip gate ─────────────────────────────────────────────
+
+// Routing-decision chip bubble at some scope, e.g. an in-harness Task spawn.
+const routingChip = (id: string, scope?: RoutingScope): Bubble => ({
+  kind: "routing_decision",
+  itemId: id,
+  model: "databricks-claude-haiku-4-5",
+  applied: true,
+  rationale: "cheap lookup",
+  ...(scope !== undefined && { routing: { scope } }),
+});
+const chipIds = (bubbles: Bubble[]): string[] =>
+  bubbles.filter((b) => b.kind === "routing_decision").map((b) => b.itemId);
+
+describe("stripGatedSubagentRoutingChips", () => {
+  it("shows the spawn chips when the session turned sub-agent routing on", () => {
+    const bubbles = [userBubble("u1"), routingChip("rd_sub", "native_subagent")];
+    expect(stripGatedSubagentRoutingChips(bubbles, "on")).toBe(bubbles);
+  });
+
+  it("hides spawn chips on an unset switch but keeps the session's own decisions", () => {
+    // An unset switch means the spawns were not routed, so a per-spawn chip
+    // would describe a pick that never happened. The session's own session/turn
+    // verdicts (and legacy rows with no scope) still belong on screen.
+    const bubbles = [
+      routingChip("rd_session", "session"),
+      routingChip("rd_turn", "turn"),
+      routingChip("rd_legacy"),
+      routingChip("rd_child", "child_session"),
+      userBubble("u1"),
+      routingChip("rd_sub", "native_subagent"),
+      assistantText("a1"),
+    ];
+    const shown = stripGatedSubagentRoutingChips(bubbles, null);
+    expect(chipIds(shown)).toEqual(["rd_session", "rd_turn", "rd_legacy", "rd_child"]);
+    // Everything else keeps its place and its reference (BubbleView's memo).
+    expect(bubbleIds(shown)).toEqual([
+      "rd_session",
+      "rd_turn",
+      "rd_legacy",
+      "rd_child",
+      "u1",
+      "a1",
+    ]);
+  });
+
+  it("hides spawn chips on an explicit off", () => {
+    const bubbles = [routingChip("rd_sub", "native_subagent")];
+    expect(stripGatedSubagentRoutingChips(bubbles, "off")).toEqual([]);
+  });
+
+  it("returns the same array reference when there is nothing to hide", () => {
+    const bubbles = [userBubble("u1"), routingChip("rd_session", "session")];
+    expect(stripGatedSubagentRoutingChips(bubbles, null)).toBe(bubbles);
   });
 });
 
@@ -734,6 +839,24 @@ describe("shouldShowWorkingIndicator", () => {
 });
 
 // ── workingIndicatorLabel ───────────────────────────────────────────────────
+
+describe("workingIndicatorLabel — parked on a dialog", () => {
+  it("names what the agent is waiting on", () => {
+    expect(workingIndicatorLabel(0, 0, "permission prompt")).toBe("Blocked on: permission prompt");
+  });
+
+  it("outranks the background tally and the rotation", () => {
+    // Being blocked on the user is the one state that needs an action, and the
+    // dialog may exist only in the terminal tab — so it must not be buried
+    // under a rotating "Cooking…" or a background-shell count.
+    expect(workingIndicatorLabel(3, 2, "dialog open")).toBe("Blocked on: dialog open");
+  });
+
+  it("falls back to the normal label when not parked", () => {
+    expect(workingIndicatorLabel(0, 0, null)).toBe("Working…");
+    expect(workingIndicatorLabel(1, 0, null)).toBe("1 background task still running");
+  });
+});
 
 describe("workingIndicatorLabel", () => {
   it("shows the plain Working label when no background tasks remain", () => {
@@ -1322,5 +1445,104 @@ describe("isUnboundCodingFork", () => {
     // needs_workspace is workspace IS NULL, and "" never satisfies the
     // workspace-required-for-host constraint — treat it as unbound.
     expect(isUnboundCodingFork({ forkSourceId: "conv_src", workspace: "" })).toBe(true);
+  });
+});
+
+// The routing gates the ChatPage call site uses. The deployment flag is half of
+// each gate: a session-shape-eligible session on a server WITHOUT a routing
+// client must show no routing control at all, and neither must one while the
+// `/v1/info` probe is still in flight.
+describe("routing eligibility gates", () => {
+  function info(smartRouting: boolean): ServerInfo {
+    return {
+      accounts_enabled: false,
+      single_user: false,
+      login_url: null,
+      needs_setup: false,
+      databricks_features: false,
+      managed_sandboxes_enabled: false,
+      sandbox_provider: null,
+      sharing_mode: "on",
+      public_sharing_enabled: true,
+      server_version: null,
+      smart_routing_enabled: smartRouting,
+      smart_routing_sources: { external: smartRouting, oss: smartRouting },
+      harness_install_enabled: false,
+      installable_harnesses: [],
+      dictation_available: false,
+    };
+  }
+
+  // Top-level agent sessions: an SDK one for the per-turn gate, a native
+  // Claude Code one for the sub-agent gate (its own model is baked at launch).
+  const sdkSession = {
+    agentName: "coder",
+    parentSessionId: null,
+    harness: "claude-sdk",
+  } as unknown as Session;
+  const nativeSession = {
+    agentName: "coder",
+    parentSessionId: null,
+    harness: "claude-native",
+    labels: { "omnigent.wrapper": "claude-code" },
+    // Routed: a native session's spawn-routing apparatus is installed at
+    // launch, so only a Smart Routing one carries the switch.
+    costControlModeOverride: "on",
+  } as unknown as Session;
+
+  it.each([true, false] as const)("cost routing follows the server flag (%s)", (flag) => {
+    expect(isCostRoutingEligible(info(flag), sdkSession)).toBe(flag);
+  });
+
+  it.each([true, false] as const)("subagent routing follows the server flag (%s)", (flag) => {
+    expect(isSubagentRoutingEligible(info(flag), nativeSession)).toBe(flag);
+  });
+
+  it("both gates are off while the info probe is loading", () => {
+    expect(isCostRoutingEligible("loading", sdkSession)).toBe(false);
+    expect(isSubagentRoutingEligible("loading", nativeSession)).toBe(false);
+  });
+
+  it("a native terminal session is excluded from cost routing but not subagent routing", () => {
+    expect(isCostRoutingEligible(info(true), nativeSession)).toBe(false);
+    expect(isSubagentRoutingEligible(info(true), nativeSession)).toBe(true);
+  });
+
+  it("a non-native SDK session is subagent-routing eligible whatever its harness", () => {
+    // Its spawns go through the session-create path, not the native hook, so the
+    // harness allowlist doesn't apply.
+    const piSession = { ...sdkSession, harness: "pi" } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), piSession)).toBe(true);
+  });
+
+  it("a pinned codex Smart Routing session offers the subagent-routing switch", () => {
+    // Its launch installs the generated hooks.json spawn gate and the
+    // routed-spawn pre-approvals, same as the claude arm; what it does not get
+    // is cross-family picks, which is not a knob.
+    const codex = {
+      ...nativeSession,
+      harness: "codex-native",
+      labels: { "omnigent.wrapper": "codex-cli" },
+    } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), codex)).toBe(true);
+    const autoCodex = {
+      ...codex,
+      labels: { ...codex.labels, "omnigent.routing.auto_harness": "1" },
+    } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), autoCodex)).toBe(true);
+    // Plain codex is the one class that never reads the switch.
+    const plainCodex = { ...codex, costControlModeOverride: null } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), plainCodex)).toBe(false);
+  });
+
+  it("a plain native session has no subagent-routing switch to offer", () => {
+    const plain = { ...nativeSession, costControlModeOverride: null } as unknown as Session;
+    expect(isSubagentRoutingEligible(info(true), plain)).toBe(false);
+  });
+
+  it("both gates are off for a sub-agent (child) session even with the flag on", () => {
+    const child = { ...sdkSession, parentSessionId: "conv_parent" } as unknown as Session;
+    expect(isCostRoutingEligible(info(true), child)).toBe(false);
+    expect(isSubagentRoutingEligible(info(true), child)).toBe(false);
   });
 });

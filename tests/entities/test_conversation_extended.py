@@ -336,6 +336,7 @@ def test_to_api_dict_function_call() -> None:
     api = item.to_api_dict()
     assert api["id"] == "item_fc"
     assert api["type"] == "function_call"
+    assert api["created_at"] == 1
     assert api["model"] == "my-agent"  # alias
     assert api["name"] == "search"
     assert api["call_id"] == "call_1"

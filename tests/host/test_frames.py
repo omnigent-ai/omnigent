@@ -80,6 +80,23 @@ def test_model_options_frames_round_trip() -> None:
             "displayName": "Sonnet 4.6",
         }
     ]
+    # Absent from an older host's payload, and present when it reports the
+    # endpoint's wider catalog.
+    assert result.routable_models == []
+    with_routable = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsResultFrame(
+                request_id="req_models",
+                status="ok",
+                routable_models=["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"],
+            )
+        )
+    )
+    assert isinstance(with_routable, HostModelOptionsResultFrame)
+    assert with_routable.routable_models == [
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
+    ]
 
 
 def test_encode_injects_traceparent_under_active_span() -> None:
@@ -250,6 +267,70 @@ def test_harness_readiness_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+def test_hello_frame_gateway_inference_round_trip() -> None:
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="corey-laptop",
+        configured_harnesses={"claude-native": True},
+        gateway_inference={"claude-native": True, "codex": False},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference == {"claude-native": True, "codex": False}
+
+
+def test_hello_frame_absent_gateway_inference_decodes_to_none() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "corey-laptop",
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference is None
+
+
+def test_hello_frame_drops_non_bool_gateway_inference_values() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "corey-laptop",
+            "gateway_inference": {"codex": "maybe", "claude-native": True},
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference == {"claude-native": True}
+
+
+def test_harness_readiness_frame_gateway_inference_round_trip() -> None:
+    original = HostHarnessReadinessFrame(
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": True, "native-codex": True},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.gateway_inference == {"codex": True, "native-codex": True}
+
+
+def test_harness_readiness_frame_without_gateway_inference_is_none() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {"codex": True},
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.gateway_inference is None
 
 
 def test_harness_readiness_frame_rejects_unknown_availability() -> None:
@@ -1189,7 +1270,30 @@ def test_install_harness_result_failure_round_trip() -> None:
     assert isinstance(decoded, HostInstallHarnessResultFrame)
     assert decoded.status == "failed"
     assert decoded.configured_harnesses is None
+    assert decoded.gateway_inference is None
     assert decoded.error == "npm not found"
+
+
+def test_result_frames_round_trip_gateway_inference() -> None:
+    install = HostInstallHarnessResultFrame(
+        request_id="req_install_4",
+        status="ok",
+        configured_harnesses={"claude-native": True},
+        gateway_inference={"claude-native": False},
+    )
+    decoded_install = decode_host_frame(encode_host_frame(install))
+    assert isinstance(decoded_install, HostInstallHarnessResultFrame)
+    assert decoded_install.gateway_inference == {"claude-native": False}
+
+    secret = HostStoreSecretResultFrame(
+        request_id="req_cred_2",
+        status="ok",
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": True},
+    )
+    decoded_secret = decode_host_frame(encode_host_frame(secret))
+    assert isinstance(decoded_secret, HostStoreSecretResultFrame)
+    assert decoded_secret.gateway_inference == {"codex": True}
 
 
 def test_store_secret_key_frame_round_trip() -> None:

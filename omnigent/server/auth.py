@@ -33,6 +33,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
 
@@ -518,6 +519,8 @@ class UnifiedAuthProvider(AuthProvider):
         # share `cookie_secret` and `session_cookie_name` properties
         # by construction (see AccountsConfig docstring).
         cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if cookie_config is None:
+            return None
         cookie_name = cookie_config.session_cookie_name
         token = request.cookies.get(cookie_name)
         if not token:
@@ -543,7 +546,7 @@ class UnifiedAuthProvider(AuthProvider):
             return None
 
         user_id = payload.get("sub")
-        if not user_id or user_id in _RESERVED_USERS:
+        if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
 
         # Delegated (device-grant) tokens carry a ``grant_id`` claim.
@@ -552,6 +555,8 @@ class UnifiedAuthProvider(AuthProvider):
         # served from the plain user-id cache (which would skip both).
         grant_id = payload.get("grant_id")
         if grant_id is not None:
+            if not isinstance(grant_id, str):
+                return None
             if not delegated_path_allowed(request.url.path):
                 return None
             if self._grant_revoked is not None and self._grant_revoked(grant_id):
@@ -694,6 +699,6 @@ def create_auth_provider() -> AuthProvider:
 # Backwards-compatible re-export of forward-referenced config
 # types — both are imported lazily inside `create_auth_provider`
 # to keep startup cost off the import path that doesn't use them.
-if False:  # TYPE_CHECKING equivalent without the import
+if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig

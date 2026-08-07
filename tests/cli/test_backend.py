@@ -272,6 +272,26 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
 
 
+def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator env-forwarding control var survives the remote daemon hop.
+
+    ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names extra env vars for the daemon to
+    forward on to runners. In ``--server`` mode the daemon env is allowlisted by
+    a prefix set that includes ``DATABRICKS_`` but *not* plain ``OMNIGENT_``, so
+    without an explicit allowlist entry the control var itself is stripped here —
+    and ``_build_runner_env`` never sees the names it lists, making the whole
+    passthrough a silent no-op remotely. It carries only var names, not secrets.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_TOKEN")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_TOKEN"
+
+
 def test_ensure_host_daemon_reuses_same_target(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1163,6 +1183,85 @@ def test_host_stop_daemon_only_skips_session_stop(
 
     assert result.exit_code == 0, result.output
     assert terminated == ["https://server.example.com"]
+
+
+def test_host_stop_session_list_timeout_points_at_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session-list timeout names the flags that stop the daemon anyway.
+
+    ``GET /v1/sessions`` is one of the slowest managed APIs, so the
+    pre-check times out on healthy hosts. The failure has to name the
+    escape hatch or the daemon looks unstoppable.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated despite the failure"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "ReadTimeout" in result.output
+    assert "--force" in result.output
+    assert "--daemon-only" in result.output
+
+
+def test_host_stop_force_terminates_after_session_list_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--force`` stops the daemon when the session pre-check times out."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["https://server.example.com"]
+    assert "sessions_stopped=0" in result.output
 
 
 def test_host_stop_session_stops_only_named_sessions(

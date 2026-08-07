@@ -99,6 +99,18 @@ describe("UserBubble markdown rendering", () => {
     const cell = await screen.findByText("1", { selector: "td, td *" });
     expect(cell.closest("table")).not.toBeNull();
   });
+
+  it("renders CJK text around explicit inline math", async () => {
+    const { container } = renderBubble(userBubble(String.raw`中文 \(\sqrt{x + 1}\) 文本`));
+
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    expect(container.textContent).toContain("中文");
+    expect(container.textContent).toContain("文本");
+    const katex = container.querySelector(".katex") as HTMLElement;
+    expect(katex.querySelector(".sqrt")).not.toBeNull();
+    expect(katex.textContent).toContain("x");
+    expect(katex.textContent).toContain("1");
+  });
 });
 
 describe("UserBubble system messages", () => {
@@ -114,6 +126,43 @@ describe("UserBubble system messages", () => {
 
     expect(screen.queryByTestId("system-message")).toBeNull();
     expect(screen.getByText("build finished")).toBeInTheDocument();
+  });
+
+  it("renders a steering interrupt as a muted marker and its uploads as their own bubble", () => {
+    // The two items a mid-tool-use steer produces, once the pending-input
+    // drain stops handing the uploads to the marker: Claude's own interrupt
+    // record (text-only) and the user's attachments-only message.
+    renderBubble(userBubble("[Request interrupted by user for tool use]"));
+    const marker = screen.getByTestId("system-message");
+    expect(marker.getAttribute("data-system-kind")).toBe("interrupted");
+    expect(marker).toHaveTextContent("Interrupted");
+    // The raw record must not survive as user-bubble text.
+    expect(screen.queryByText(/\[Request interrupted by user/)).toBeNull();
+    expect(screen.queryByTestId("message-bubble")).toBeNull();
+
+    cleanup();
+
+    renderBubble(
+      userBubble("[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]", {
+        content: [
+          { type: "input_image", file_id: "file_1", filename: "shot1.png" },
+          { type: "input_image", file_id: "file_2", filename: "shot2.png" },
+          {
+            type: "input_text",
+            text: "[Attached: /tmp/uploads/shot1.png]\n\n[Attached: /tmp/uploads/shot2.png]",
+          },
+        ],
+      }),
+    );
+    // A real bubble with both screenshots — not the blank pill the stolen
+    // file blocks used to leave behind.
+    expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
+    expect(screen.getByAltText("shot1.png")).toBeInTheDocument();
+    expect(screen.getByAltText("shot2.png")).toBeInTheDocument();
+    // Upload markers are stripped from the text, and an empty text renders
+    // nothing rather than an empty markdown block.
+    expect(screen.queryByText(/\[Attached:/)).toBeNull();
+    expect(screen.queryByTestId("system-message")).toBeNull();
   });
 });
 
@@ -134,6 +183,13 @@ describe("AssistantBubble lifecycle rendering", () => {
 describe("UserBubble copy button", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("uses a compact action button with an 8px content gap", () => {
+    renderBubble(userBubble("copy me please"));
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("gap-2");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
   });
 
   it("copies the message text to the clipboard when clicked", async () => {

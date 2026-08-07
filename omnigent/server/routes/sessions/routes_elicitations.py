@@ -37,13 +37,17 @@ from omnigent.server.routes._auth_helpers import (
     require_approval_access as _require_approval_access,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _apply_pending_policy_ask_writes,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _resolve_elicitation,
+)
 from omnigent.server.schemas import (
     ElicitationResult,
 )
@@ -188,7 +192,8 @@ def register_elicitations_routes(
             return {"status": "resolved"}
 
         _conv_id, event = found
-        params = event.get("params") if isinstance(event.get("params"), dict) else {}
+        params_value = event.get("params")
+        params = params_value if isinstance(params_value, dict) else {}
         return {
             "status": "pending",
             "can_approve": access.can_approve,

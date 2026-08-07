@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TextIO, TypedDict
 
 from omnigent._platform import IS_POSIX
 
@@ -20,6 +20,21 @@ LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
 LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
+
+
+class ChildLoggingPopenKwargs(TypedDict, total=False):
+    """Keyword arguments forwarded to :class:`subprocess.Popen`."""
+
+    pass_fds: tuple[int, ...]
+
+
+class _ProcessLogStreamHandler(logging.StreamHandler[TextIO]):
+    _omnigent_process_log_stderr: bool
+
+
+class _ProcessLogFileHandler(logging.FileHandler):
+    _omnigent_process_log_path: str
+
 
 DEFAULT_LOG_SOURCE_WIDTH = 32
 DEFAULT_LOG_FUNC_WIDTH = 18
@@ -158,6 +173,22 @@ def process_log_dir(destination: str, *, root: str | Path | None = None) -> Path
     return base / destination
 
 
+def display_log_path(path: Path) -> str:
+    """Format a log path for display, collapsing the home prefix to ``~``.
+
+    :param path: Absolute path, typically under the runtime data dir, e.g.
+        ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
+    :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
+        otherwise ``str(path)``.
+    """
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except (ValueError, RuntimeError):
+        # Not under $HOME (e.g. an OMNIGENT_DATA_DIR outside home), or no
+        # resolvable home directory (container with no HOME/passwd entry).
+        return str(path)
+
+
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
@@ -217,7 +248,45 @@ def _process_log_file_from_env() -> Path | None:
     return Path(value).expanduser() if value else None
 
 
-def _terminal_stream() -> object | None:
+# Log file this process writes to, published by configure_process_logging so
+# error paths can point the user at it.
+_current_process_log_path: Path | None = None
+
+
+def current_process_log_path() -> Path | None:
+    """Return the log file this process writes to, or ``None`` if unset.
+
+    Set by :func:`configure_process_logging`; falls back to the path the
+    spawning parent published in ``OMNIGENT_PROCESS_LOG_FILE`` so callers
+    work before logging is configured.
+
+    :returns: Absolute log path, e.g.
+        ``Path("/Users/alice/.omnigent/logs/runner/runner-conv_ab12.log")``,
+        or ``None`` when this process's output is not captured to a file.
+    """
+    return _current_process_log_path or _process_log_file_from_env()
+
+
+def process_log_reference(destination: str) -> str:
+    """Return a user-facing pointer to this process's log for error messages.
+
+    Falls back to the destination's log directory when the process has no
+    captured log file (stdio inherited), so an error can always tell the
+    reader where to look.
+
+    :param destination: Process-log destination used for the directory
+        fallback, e.g. ``"runner"``.
+    :returns: A display path, e.g.
+        ``"~/.omnigent/logs/runner/runner-conv_ab12-20260806-101500.log"``,
+        or ``"~/.omnigent/logs/runner/"`` when no log file is configured.
+    """
+    path = current_process_log_path()
+    if path is not None:
+        return display_log_path(path)
+    return f"{display_log_path(process_log_dir(destination))}/"
+
+
+def _terminal_stream() -> TextIO | None:
     fd_value = os.environ.get(LOG_TTY_FD_ENV_VAR)
     if fd_value and IS_POSIX:
         try:
@@ -254,7 +323,7 @@ def terminal_stream_handler() -> logging.Handler:
     stream = _terminal_stream()
     if stream is None:
         return logging.NullHandler()
-    handler = logging.StreamHandler(stream)
+    handler = _ProcessLogStreamHandler(stream)
     handler._omnigent_process_log_stderr = True
     return handler
 
@@ -279,16 +348,19 @@ def configure_process_logging(
     The returned file always receives logs. Stderr receives logs only when
     requested and an interactive terminal stream is available.
     """
+    global _current_process_log_path
+
     resolved_level = effective_log_level() if level is None else level
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
     if path is None:
         path = create_process_log_path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _current_process_log_path = path
 
     formatter = TerminalLogFormatter(use_colors=False)
     handlers: list[logging.Handler] = []
 
-    file_handler = logging.FileHandler(path, encoding="utf-8")
+    file_handler = _ProcessLogFileHandler(path, encoding="utf-8")
     file_handler.setLevel(resolved_level)
     file_handler.setFormatter(formatter)
     file_handler._omnigent_process_log_path = str(path)
@@ -343,7 +415,7 @@ def _add_handler_once(logger: logging.Logger, handler: logging.Handler) -> None:
 
 
 @contextmanager
-def child_logging_popen_kwargs(env: dict[str, str]) -> Iterator[dict[str, object]]:
+def child_logging_popen_kwargs(env: dict[str, str]) -> Iterator[ChildLoggingPopenKwargs]:
     """Prepare inherited terminal-fd kwargs for a child process.
 
     Mutates *env* only when ``--log-to-stderr`` requested a mirror and the

@@ -511,11 +511,12 @@ class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
 
     # Backend identifier, e.g. ``"linux_bwrap"``,
-    # ``"darwin_seatbelt"``, or ``"none"``. The dataclass default of
-    # ``"linux_bwrap"`` is a safe sentinel for in-process construction
-    # (``OSEnvSandboxSpec(type=self.type_name)`` is the idiomatic call
-    # site); YAML parsers map a missing ``type:`` field to the platform
-    # default at parse time via
+    # ``"darwin_seatbelt"``, or ``"none"``. YAML also accepts ``"auto"``
+    # and resolves it to the platform default before constructing this value.
+    # The dataclass default of ``"linux_bwrap"`` is a safe sentinel for
+    # in-process construction (``OSEnvSandboxSpec(type=self.type_name)`` is
+    # the idiomatic call site); YAML parsers map a missing ``type:`` field to
+    # the platform default at parse time via
     # :func:`omnigent.inner.sandbox._default_sandbox_for_platform`,
     # which picks ``linux_bwrap`` on Linux (with ``bwrap`` on PATH)
     # and ``darwin_seatbelt`` on macOS.
@@ -638,11 +639,11 @@ class OSEnvSandboxSpec:
     cwd_hidden_scan_overflow: str = "warn"
     # Whether the dotfile / escaping-symlink masker recurses into
     # subdirectories. ``False`` (default) scans only the immediate
-    # children of cwd and each ``read_paths`` root — the top-level
-    # dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``, ...) that
-    # carry the overwhelming majority of secrets are still masked,
-    # but the walker no longer pays to descend the whole tree. This
-    # is the scalable default: a recursive walk of a medium/large
+    # children of cwd and each ``read_paths`` / ``write_paths`` root —
+    # the top-level dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``,
+    # ...) that carry the overwhelming majority of secrets are still
+    # masked, but the walker no longer pays to descend the whole tree.
+    # This is the scalable default: a recursive walk of a medium/large
     # project (or ``read_paths: ["~/"]``) visits enormous numbers of
     # entries and routinely trips :attr:`cwd_hidden_scan_max_entries`.
     #

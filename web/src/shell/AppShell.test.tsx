@@ -230,13 +230,10 @@ import { useChatStore } from "@/store/chatStore";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
- * The production view toggle now lives inside ChatPage's
- * ConnectionIndicator; these tests are scoped to the shell's state
- * machine, so we use a probe component with the exact same
- * `aria-label`s as the production pill ("Chat" / "Terminal" — see
- * ConnectedTerminalFirstPill in ChatPage.tsx) to drive `setView`. If
- * the production labels ever change, these tests fail loudly instead
- * of drifting silently.
+ * The production view toggle lives in the header (ViewModeToggle); these
+ * tests are scoped to the shell's state machine, so we use a probe
+ * component with its own "Chat" / "Terminal" buttons to drive `setView`
+ * and read the context's derived flags off data attributes.
  */
 function TerminalFirstViewProbe() {
   const ctx = useTerminalFirst();
@@ -339,6 +336,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -1076,8 +1074,8 @@ describe("Workspace rail maximize", () => {
     fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
     expect(rail().className).toContain("md:absolute");
     expect(rail().className).toContain("md:inset-0");
-    // Still keeps the docked card inset/rounding — only the width changes.
-    expect(rail().className).toContain("md:m-2");
+    // Still keeps the docked flush/bordered styling — only the width changes.
+    expect(rail().className).toContain("md:border-l");
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     // Minimize → back to the docked flex child, and the sidebar is restored to
@@ -1961,6 +1959,120 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTitle("a.ts")).toBeInTheDocument();
     expect(screen.getByTitle("b.ts")).toBeInTheDocument();
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  });
+
+  it("restores the open shell tabs per session (switch away and back keeps them)", () => {
+    // Regression: shell tabs used to live only in transient component state and
+    // were cleared on every conversation switch, so navigating away and back
+    // lost them. They now persist per session like file tabs. Seed a session
+    // with one open + selected shell tab whose terminal is live, and assert the
+    // tab strip restores it and mounts its xterm.
+    writeSessionWorkspaceState("conv_shellmem", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_bash_s1", name: "bash", session: "s1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    mockConversations([{ id: "conv_shellmem", permission_level: null }]);
+
+    renderShell("/c/conv_shellmem");
+
+    // The remembered tab renders in the strip (title = "name · session"), and
+    // the persisted active key drives the rail's xterm (stub echoes the id).
+    expect(screen.getByTitle("bash · s1")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
+  });
+
+  it("keeps restored shell tabs while the terminal list is still loading, then prunes dead ones", () => {
+    // The prune effect drops tabs whose terminal is gone — but the incoming
+    // session's list is momentarily empty *while loading*, indistinguishable
+    // from "all closed". Pruning then would wipe the just-restored tabs. The
+    // effect is gated on isLoading: it must skip the load window, then prune
+    // once the real (still-empty) list confirms the terminal is truly gone.
+    writeSessionWorkspaceState("conv_shellload", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    // Loading: list empty but not yet resolved.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: true, error: null });
+    mockConversations([{ id: "conv_shellload", permission_level: null }]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_shellload"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    // While loading the restored tab survives the transient empty list.
+    expect(screen.getByTitle("terminal_bash_s1")).toBeInTheDocument();
+
+    // The list resolves to genuinely empty (the terminal is really gone) —
+    // now the prune runs and drops the dead tab.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    expect(screen.queryByTitle("terminal_bash_s1")).toBeNull();
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+  });
+
+  it("keeps restored shell tabs when the terminals fetch errors (non-authoritative empty list)", () => {
+    // An errored terminals fetch also yields terminals: [], but that empty list
+    // is not authoritative — we couldn't reach the PTYs, not "they're gone".
+    // Pruning against it would wipe the restored tab, so the prune effect is
+    // gated on error too. The tab must survive an errored read.
+    writeSessionWorkspaceState("conv_shellerr", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [],
+      isLoading: false,
+      error: new Error("terminals fetch failed: 503"),
+    });
+    mockConversations([{ id: "conv_shellerr", permission_level: null }]);
+
+    renderShell("/c/conv_shellerr");
+
+    // The restored tab survives the errored (non-authoritative) empty list —
+    // the strip keeps the tab (title falls back to the raw id until the
+    // terminal loads) instead of pruning it as if the PTY were gone.
+    expect(screen.getByTitle("terminal_bash_s1")).toBeInTheDocument();
   });
 });
 
@@ -2852,36 +2964,31 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
-  it("opens the Tasks drawer for a codex-native session with todos", () => {
-    // Codex-native maps its plan updates to the same todo schema, so the
-    // Tasks entry must gate on codex-native too — not just claude-native.
+  it.each([
+    ["codex-native", "conv_codex", "codex-native-ui"],
+    ["pi-native", "conv_pi", "pi-native-ui"],
+  ])("opens the Tasks drawer for a %s session with todos", (_harness, id, wrapper) => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([
       {
-        id: "conv_codex",
+        id,
         permission_level: null,
-        labels: { "omnigent.wrapper": "codex-native-ui" },
+        labels: { "omnigent.wrapper": wrapper },
       },
     ]);
     useChatStore.setState({
-      todos: [
-        { content: "Locate CLI parser", status: "in_progress", activeForm: "Locate CLI parser" },
-      ],
+      todos: [{ content: "Locate CLI parser", status: "in_progress", activeForm: "Locating" }],
     });
 
-    renderShell("/c/conv_codex");
-
+    renderShell(`/c/${id}`);
     expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
-    expect(screen.queryByTestId("todo-panel")).toBeNull();
 
     openSessionMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
 
-    // A codex-native session with a non-empty plan opens the Tasks drawer,
-    // the same as a claude-native session with todos.
     expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });

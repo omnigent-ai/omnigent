@@ -833,3 +833,113 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker() -> None
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+def _bound_conv(
+    session_id: str,
+    *,
+    kind: str = "default",
+    live_status: str | None = None,
+) -> Any:
+    """
+    Build a conversation-shaped row for the offline-reconciliation helper.
+
+    ``_mark_runner_sessions_offline`` reads only ``id``, ``kind`` and
+    ``live_status`` off each row, so a namespace is enough.
+
+    :param session_id: Conversation identifier.
+    :param kind: ``"default"`` (top-level) or ``"sub_agent"``.
+    :param live_status: Persisted live status, read only on a cache miss.
+    :returns: A conversation-shaped namespace.
+    """
+    return SimpleNamespace(id=session_id, kind=kind, live_status=live_status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "cached", "live_status", "intentional_stop", "fail_idle_top_level", "expect_failed"),
+    [
+        # A turn was in flight when the runner went away — fail it, with cause.
+        ("default", "running", None, False, False, True),
+        ("sub_agent", "running", None, False, False, True),
+        ("sub_agent", "waiting", None, False, False, True),
+        # A sub-agent that finished its work keeps that outcome: the runner
+        # leaving does not retroactively fail completed work (this is the
+        # whole Agents-rail-goes-red bug).
+        ("sub_agent", "idle", None, False, False, False),
+        ("default", "idle", None, False, False, False),
+        # Cache miss falls back to the persisted row value.
+        ("default", None, "running", False, False, True),
+        ("default", None, "idle", False, False, False),
+        ("default", None, None, False, False, False),
+        # Stop / archive drop the tunnel on purpose; the relay owns that path.
+        ("default", "running", None, True, False, False),
+        # A crash report also covers the runner that died before it could run
+        # anything, so an idle TOP-LEVEL session is failed — but an idle
+        # sub-agent (spawned by an already-live runner) still is not.
+        ("default", "idle", None, False, True, True),
+        ("sub_agent", "idle", None, False, True, False),
+        # A crash report never downgrades an interrupted turn: a mid-turn
+        # sub-agent is failed under either flag.
+        ("sub_agent", "waiting", None, False, True, True),
+        # An intentional teardown still wins over the crash-report flag.
+        ("default", "idle", None, True, True, False),
+    ],
+)
+async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
+    kind: str,
+    cached: str | None,
+    live_status: str | None,
+    intentional_stop: bool,
+    fail_idle_top_level: bool,
+    expect_failed: bool,
+) -> None:
+    """
+    Only the sessions a departed runner interrupted are failed, with cause.
+
+    Sub-agents ride their parent's runner, so a drop reaches every child
+    bound to it. Marking them all ``failed`` painted the whole Agents rail
+    red for sub-agents that had completed successfully, and — because the
+    fan-out carried no ``ErrorDetail`` — left a failure the UI could not
+    tell from a real one and the reconnect recovery could not clear.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    session_id = "b04d1f3c9a5e4f7a8c2b6d0e1f3a5c79"
+    store = _RecordingLabelStore()
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+    if cached is not None:
+        sessions_module._session_status_cache[session_id] = cached
+    if intentional_stop:
+        sessions_module._intentional_stop_sessions.add(session_id)
+
+    try:
+        await sessions_module._mark_runner_sessions_offline(
+            [_bound_conv(session_id, kind=kind, live_status=live_status)],
+            error,
+            store,  # type: ignore[arg-type]
+            fail_idle_top_level=fail_idle_top_level,
+        )
+
+        status = sessions_module._session_status_cache.get(session_id)
+        persisted = store.labels.get(session_id)
+        if expect_failed:
+            assert status == "failed"
+            # The cause must be durable: it is what lets the UI render a
+            # benign "Disconnected" and what
+            # ``_publish_runner_recovered_status`` matches on to clear the
+            # failure when the runner comes back.
+            assert persisted is not None
+            assert sessions_module._last_task_error_from_labels(persisted) == {
+                "code": "runner_disconnected",
+                "message": "Runner disconnected unexpectedly.",
+            }
+        else:
+            assert status == cached
+            assert persisted is None
+    finally:
+        sessions_module._intentional_stop_sessions.discard(session_id)
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

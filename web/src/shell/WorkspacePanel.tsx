@@ -5,6 +5,7 @@ import {
   FilesIcon,
   GlobeIcon,
   ListTodoIcon,
+  Loader2Icon,
   MaximizeIcon,
   MinimizeIcon,
   PlusIcon,
@@ -30,6 +31,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useSessionAgent } from "@/hooks/useAgents";
+import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
@@ -80,12 +82,43 @@ function readPreferredShell(): string | null {
 // "Shell" nests a submenu so the user picks which type to launch — the last
 // pick is remembered (check-marked, and launched on a plain "Shell" click).
 // Gated on the agent's spec declaring terminal access — renders nothing else.
+//
+// The "Shell" item also reflects the session's liveness so opening a shell on
+// a disconnected session isn't a silent 502:
+//   - online / wakeable (runner_asleep, host_asleep, starting): the item stays
+//     enabled — the server transparently reconnects the runner on create (see
+//     `ensure_runner_connected`). While the create is in flight on a wakeable
+//     session it reads "Reconnecting…" with a spinner, since the cold wake can
+//     take tens of seconds.
+//   - offline (host_offline, local_stranded): the web can't reconnect from the
+//     browser (a CLI `omnigent host` / `--resume` is required), so the item is
+//     disabled and labeled "Offline" — the chat reconnect banner owns recovery.
 // ---------------------------------------------------------------------------
+
+/** How the "Shell" item should behave given the session's liveness. */
+type ShellConnectState = "ready" | "wakeable" | "offline";
+
+function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectState {
+  switch (liveness?.kind) {
+    case "host_offline":
+    case "local_stranded":
+      return "offline";
+    case "runner_asleep":
+    case "host_asleep":
+    case "starting":
+      return "wakeable";
+    // online, unknown, or absent: treat as ready (never block on an
+    // unresolved poll — matches useSessionLiveness's "assume online").
+    default:
+      return "ready";
+  }
+}
 
 function NewTabMenu({
   conversationId,
   onOpenTerminal,
   triggerClassName,
+  liveness,
 }: {
   conversationId: string;
   /** Open a freshly-created terminal as a rail tab by its tab key. */
@@ -93,9 +126,13 @@ function NewTabMenu({
   /** Extra classes on the trigger wrapper — used to cancel the open-tabs
    *  region's gap so the "+" hugs the last tab. */
   triggerClassName?: string;
+  /** Open session's derived liveness — drives the "Shell" item's connect
+   *  affordance. Absent is treated as ready. */
+  liveness?: SessionLiveness;
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  const connectState = shellConnectState(liveness);
   // Remembered shell type, persisted across remounts/reloads. Seeded from
   // localStorage so the "+" in either strip spot agrees on the current pick.
   const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
@@ -133,6 +170,27 @@ function NewTabMenu({
   // so the user picks which type to launch (mirrors NewTerminalButton's picker).
   const multipleShells = declaredTerminals.length > 1;
 
+  // Liveness-derived affordance for the "Shell" item. A create in flight on a
+  // wakeable session reads "Reconnecting…" (the server is waking the runner);
+  // an offline session disables the item since the browser can't reconnect it.
+  const isReconnecting = create.isPending && connectState === "wakeable";
+  const shellDisabled = create.isPending || connectState === "offline";
+  // Icon + label + trailing hint, shared by the single-item and submenu-trigger
+  // renders so both reflect the same connect state.
+  const shellItemContent = (
+    <>
+      {isReconnecting ? (
+        <Loader2Icon className="size-4 animate-spin" />
+      ) : (
+        <TerminalIcon className="size-4" />
+      )}
+      <span className="whitespace-nowrap">{isReconnecting ? "Reconnecting…" : "Shell"}</span>
+      {connectState === "offline" && (
+        <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
+      )}
+    </>
+  );
+
   return (
     <DropdownMenu>
       <WorkspaceTabTooltip label="Open new" className={triggerClassName}>
@@ -147,7 +205,10 @@ function NewTabMenu({
           </button>
         </DropdownMenuTrigger>
       </WorkspaceTabTooltip>
-      <DropdownMenuContent align="start">
+      {/* min-w-44 floors the content wide enough for the longest item label
+          ("Reconnecting…" + spinner, and the sub-trigger's chevron) — the
+          default min-w-32 tracks the 32px "+" trigger and clips it. */}
+      <DropdownMenuContent align="start" className="min-w-44">
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {multipleShells ? (
           <DropdownMenuSub>
@@ -157,21 +218,20 @@ function NewTabMenu({
                 lets the menu close on its own; preventDefault stops the click
                 from only toggling the submenu open. */}
             <DropdownMenuSubTrigger
-              disabled={create.isPending}
+              disabled={shellDisabled}
               onClick={(e) => {
                 e.preventDefault();
                 launchShell(defaultShell);
               }}
             >
-              <TerminalIcon className="size-4" />
-              Shell
+              {shellItemContent}
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
               {declaredTerminals.map((name) => (
                 <DropdownMenuItem
                   key={name}
                   onSelect={() => pickShell(name)}
-                  disabled={create.isPending}
+                  disabled={shellDisabled}
                 >
                   <CheckIcon
                     className={cn("size-4", name === defaultShell ? "opacity-100" : "opacity-0")}
@@ -184,10 +244,9 @@ function NewTabMenu({
         ) : (
           <DropdownMenuItem
             onSelect={() => launchShell(declaredTerminals[0])}
-            disabled={create.isPending}
+            disabled={shellDisabled}
           >
-            <TerminalIcon className="size-4" />
-            Shell
+            {shellItemContent}
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>
@@ -265,7 +324,7 @@ function FileTabsStrip({
               // sets. `group/tab` drives the hover-revealed close overlay below.
               // `overflow-hidden` clips the hover-close gradient overlay to the
               // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -364,14 +423,14 @@ function TerminalTabsStrip({
             className={cn(
               // Match FileTabsStrip's pill metrics so shell and file tabs line
               // up in the same strip.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
             )}
           >
             <TerminalIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate text-[11px]">{name}</span>
+            <span className="min-w-0 truncate text-sm">{name}</span>
             <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"
@@ -412,7 +471,7 @@ function RailTerminalView({
   const terminal = terminals.find((t) => terminalTabKey(t) === terminalKey) ?? null;
   if (!terminal) {
     return (
-      <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
+      <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
         Shell not available.
       </div>
     );
@@ -531,6 +590,10 @@ interface WorkspacePanelProps {
   filesPanelShowHidden: boolean;
   /** Toggle hidden-file visibility in the Files panel. */
   onShowHiddenChange: (show: boolean) => void;
+  /** Open session's derived liveness — drives the "+ New shell" menu's
+   *  connect affordance (Reconnecting… / Offline). Absent is treated as
+   *  ready. */
+  liveness?: SessionLiveness;
 }
 
 /**
@@ -585,6 +648,7 @@ export function WorkspacePanel({
   onFlatViewChange,
   filesPanelShowHidden,
   onShowHiddenChange,
+  liveness,
 }: WorkspacePanelProps) {
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
@@ -607,21 +671,22 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
-      // Floating desktop surface: 8px from every edge. AppShell reserves the
-      // panel width from ChatHeader, so the pane can extend to the top without
-      // sitting underneath the existing session action cluster.
+      // Full-height desktop surface flush to the window edge, separated from
+      // the main content by a left divider — no outer margin, rounding, or
+      // shadow (mirrors the left sidebar). AppShell reserves the panel width
+      // from ChatHeader, so the pane extends to the top without sitting under
+      // the existing session action cluster.
       // ``@container/rail`` makes the rail a named container-query context so
       // the tab strip can switch scroll behavior on the rail's own width
       // (see the strip below) without a JS width listener.
       //
       // Maximized: break out of the flex row and stretch across the content
-      // region (absolute inset-0) so the rail owns the full width. It keeps the
-      // same m-2 / rounded-lg / bordered card styling as when docked — only the
-      // width changes, the 8px inset (and thus the height) stays identical. The
-      // resize handle is suppressed in that state — there's no neighbor to
-      // resize against.
+      // region (absolute inset-0) so the rail owns the full width, keeping the
+      // same flush/bordered styling — only the width changes. The resize
+      // handle is suppressed in that state — there's no neighbor to resize
+      // against.
       className={cn(
-        "@container/rail relative z-40 hidden md:m-2 md:flex md:min-h-0 md:flex-col md:overflow-hidden md:rounded-lg md:border md:border-border md:bg-card md:shadow-lg",
+        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
@@ -782,6 +847,7 @@ export function WorkspacePanel({
               conversationId={conversationId}
               onOpenTerminal={openTerminalTab}
               triggerClassName="ml-[2px]"
+              liveness={liveness}
             />
           </>
         )}
@@ -790,7 +856,11 @@ export function WorkspacePanel({
             the open-tabs region to trail the last tab (see above). Self-gates
             to nothing when the agent has no terminal access. */}
         {openFiles.length === 0 && openTerminals.length === 0 && (
-          <NewTabMenu conversationId={conversationId} onOpenTerminal={openTerminalTab} />
+          <NewTabMenu
+            conversationId={conversationId}
+            onOpenTerminal={openTerminalTab}
+            liveness={liveness}
+          />
         )}
         {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
             which absorbs the free space before it. When open tabs exist their

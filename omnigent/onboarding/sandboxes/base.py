@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_SIGTERM_EXIT_CODE
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
@@ -45,6 +46,10 @@ pins a commit). It bakes the full omnigent install plus git / tmux /
 curl and the coding-harness CLIs, so sandbox creation skips the
 in-sandbox dependency install. Providers layer their own override
 mechanisms (env var / server config) on top of this default."""
+
+# Ceiling for the in-sandbox host restart backoff, so a host that crashes on
+# every attempt settles into a slow retry instead of a hot loop.
+_RESTART_MAX_DELAY_S: int = 30
 
 
 def host_image_wheel_install_command(remote_tgz_path: str) -> str:
@@ -600,6 +605,58 @@ class SandboxLifecycle(ABC):
         )
 
 
+def supervise_host_command(command: str) -> str:
+    """
+    Wrap a host launch in a restart loop so a crash does not strand the sandbox.
+
+    The sandbox container outlives the host process: PID 1 is a placeholder
+    (``sleep infinity``) or the provider's own init, so a dead host leaves a
+    healthy, still-billing sandbox with nothing running in it. The only recovery
+    is the server re-provisioning a fresh sandbox on the next message, which
+    discards the workspace — restarting in place keeps the clone and the
+    installed dependencies.
+
+    The loop stands down on a clean exit, on
+    :data:`~omnigent.host.HOST_FATAL_EXIT_CODE` (a credential / version failure
+    that can never succeed), and on SIGTERM (a deliberate stop). Anything else
+    is a crash, retried with a doubling delay. A signal-kill of the host alone
+    (SIGKILL → 137) counts as a crash on purpose: that is what an OOM kill looks
+    like, and restarting is the wanted response.
+
+    A path that means to STOP the host must therefore signal the supervisor too,
+    not just the host — otherwise the loop faithfully restarts it. Both in-sandbox
+    stop paths already do: ``foreground_kill_command`` signals the process the
+    pidfile recorded (the supervisor, which is what ``exec``s under it), and
+    islo's preserved-daemon stop matches ``"omnigent host"`` against full argv,
+    which the supervisor's own ``sh -c <script>`` argv contains.
+
+    The attempt counter in the restart log makes a persistently-crashing host
+    observable — the loop never gives up, so a wedged box would otherwise be
+    silent apart from indistinguishable repeats.
+
+    :param command: The host launch, e.g. ``"OMNIGENT_HOST_TOKEN=… omnigent
+        host --server https://…"``. Env prefixes are re-applied per attempt.
+    :returns: A POSIX ``sh`` script ending in ``done``, so callers can append
+        redirections to it directly.
+    """
+    stop_codes = f"0|{HOST_FATAL_EXIT_CODE}|{HOST_SIGTERM_EXIT_CODE}"
+    return (
+        "delay=1\n"
+        "attempt=0\n"
+        "while :; do\n"
+        f"  {command}\n"
+        "  rc=$?\n"
+        f'  case "$rc" in {stop_codes}) exit "$rc";; esac\n'
+        "  attempt=$((attempt + 1))\n"
+        '  echo "omnigent host exited ($rc); attempt $attempt; '
+        'restarting in ${delay}s" >&2\n'
+        '  sleep "$delay"\n'
+        f'  delay=$((delay * 2)); [ "$delay" -gt {_RESTART_MAX_DELAY_S} ] '
+        f"&& delay={_RESTART_MAX_DELAY_S}\n"
+        "done"
+    )
+
+
 class SandboxExecTransport(SandboxLifecycle):
     """
     Exec-transport primitives for providers that exec into a running sandbox.
@@ -630,30 +687,31 @@ class SandboxExecTransport(SandboxLifecycle):
         self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
     ) -> RemoteCommandResult:
         """
-        Start *command* as a detached background process in the sandbox.
+        Start *command* under a supervisor as a detached background process.
 
-        The default wraps the command in ``setsid nohup sh -c '…' & echo
-        launched`` so it survives the exec session ending. The ``sh -c`` wrapper
-        is load-bearing: callers pass env-prefixed commands (e.g.
-        ``"ENV=val omnigent host …"``), and ``nohup`` does NOT honor shell
-        ``VAR=val`` assignment syntax — ``nohup ENV=val cmd`` makes nohup try to
-        exec a program literally named ``ENV=val`` ("No such file or directory").
-        Re-parsing the command under ``sh -c`` lets the inner shell apply the
-        assignments before running the program. Providers where backgrounded
-        processes are reaped on exec return (e.g. OpenShell) override this
-        to hold the exec stream open instead.
+        The command is wrapped in :func:`supervise_host_command` (restart on
+        crash) and then in ``setsid nohup sh -c '…' & echo launched`` so it
+        survives the exec session ending. The ``sh -c`` wrapper is load-bearing:
+        callers pass env-prefixed commands (e.g. ``"ENV=val omnigent host …"``),
+        and ``nohup`` does NOT honor shell ``VAR=val`` assignment syntax —
+        ``nohup ENV=val cmd`` makes nohup try to exec a program literally named
+        ``ENV=val`` ("No such file or directory"). Re-parsing the command under
+        ``sh -c`` lets the inner shell apply the assignments before running the
+        program. Providers where backgrounded processes are reaped on exec
+        return (e.g. OpenShell) override this to hold the exec stream open
+        instead — they supervise too, just without the detach.
 
         :param sandbox_id: Target sandbox.
         :param command: Shell command to background, e.g.
             ``"ENV=val omnigent host --server https://…"``.
-        :param log_path: Where stdout/stderr of the backgrounded process
-            are redirected inside the sandbox.
+        :param log_path: Where stdout/stderr of the supervisor and every host
+            attempt are redirected inside the sandbox.
         :returns: A synthetic result with ``stdout="launched\\n"`` on success.
         :raises click.ClickException: If the launch command fails.
         """
         return self.run(
             sandbox_id,
-            f"setsid nohup sh -c {shlex.quote(command)} "
+            f"setsid nohup sh -c {shlex.quote(supervise_host_command(command))} "
             f"> {log_path} 2>&1 < /dev/null & echo launched",
         )
 

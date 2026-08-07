@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 
 from rich.console import Console
 from rich.panel import Panel
@@ -61,7 +62,7 @@ console = Console(theme=OMNIGENT_THEME, highlight=False)
 err_console = Console(stderr=True, theme=OMNIGENT_THEME, highlight=False)
 
 
-def show_banner(*, isatty: bool | None = None, env: dict[str, str] | None = None) -> bool:
+def show_banner(*, isatty: bool | None = None, env: Mapping[str, str] | None = None) -> bool:
     """
     Decide whether the brand banner / brandmark should be drawn.
 
@@ -79,8 +80,8 @@ def show_banner(*, isatty: bool | None = None, env: dict[str, str] | None = None
         isatty = sys.stderr.isatty()
     if not isatty:
         return False
-    env = os.environ if env is None else env
-    raw = str(env.get(NO_BANNER_ENV_VAR, "")).strip().lower()
+    effective_env = os.environ if env is None else env
+    raw = str(effective_env.get(NO_BANNER_ENV_VAR, "")).strip().lower()
     return raw not in {"1", "true", "yes", "on"}
 
 

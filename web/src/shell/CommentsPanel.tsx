@@ -114,11 +114,10 @@ export function CommentsPanel({
     const isExisting = comments.some(
       (c) => c.start_index === activeSelectionStart && c.end_index === activeSelectionEnd,
     );
-    if (!isExisting) {
-      // rAF ensures the textarea has been rendered before we try to focus it.
-      const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
-      return () => cancelAnimationFrame(id);
-    }
+    if (isExisting) return undefined;
+    // rAF ensures the textarea has been rendered before we try to focus it.
+    const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
+    return () => cancelAnimationFrame(id);
   }, [activeSelectionStart, activeSelectionEnd, comments]);
 
   // Selecting a highlighted range in the file activates its comment; if that
@@ -162,7 +161,7 @@ export function CommentsPanel({
       )}
       {/* Header — fixed height so layout doesn't shift when button is hidden */}
       <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
-        <span className="text-xs font-semibold">Comments</span>
+        <span className="text-sm font-semibold">Comments</span>
         {tab === "open" && (
           <Button
             type="button"
@@ -187,7 +186,7 @@ export function CommentsPanel({
               key={t}
               type="button"
               className={cn(
-                "flex-1 py-1.5 text-[11px] font-medium capitalize transition-colors cursor-pointer",
+                "flex-1 py-1.5 text-sm font-medium capitalize transition-colors cursor-pointer",
                 tab === t
                   ? "border-b-2 border-primary text-foreground"
                   : "text-muted-foreground hover:text-foreground",
@@ -206,7 +205,7 @@ export function CommentsPanel({
       </div>
 
       {!canEdit && (
-        <div className="shrink-0 border-b border-border px-3 py-2 text-xs text-muted-foreground">
+        <div className="shrink-0 border-b border-border px-3 py-2 text-sm text-muted-foreground">
           You have read-only access to this session.
         </div>
       )}
@@ -230,7 +229,7 @@ export function CommentsPanel({
               )}
               <textarea
                 ref={addCommentTextareaRef}
-                className="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-xs placeholder:text-muted-foreground"
+                className="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground"
                 rows={3}
                 placeholder="Add a comment…"
                 value={body}
@@ -266,7 +265,7 @@ export function CommentsPanel({
         {/* Comment list */}
         {tab === "open" ? (
           comments.length === 0 ? (
-            <div className="flex items-center justify-center p-8 text-xs text-muted-foreground">
+            <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
               No open comments.
             </div>
           ) : (
@@ -291,7 +290,7 @@ export function CommentsPanel({
             </div>
           )
         ) : addressedComments.length === 0 ? (
-          <div className="flex items-center justify-center p-8 text-xs text-muted-foreground">
+          <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
             No addressed comments.
           </div>
         ) : (
@@ -410,7 +409,7 @@ function CommentCard({
     >
       {/* Anchor */}
       {c.anchor_content && (
-        <p className="truncate font-mono text-[11px] text-muted-foreground">
+        <p className="truncate font-mono text-sm text-muted-foreground">
           {displayAnchorContent(c.anchor_content)}
         </p>
       )}
@@ -420,7 +419,7 @@ function CommentCard({
         <div className="space-y-1.5">
           <textarea
             ref={textareaRef}
-            className="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+            className="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
             rows={3}
             value={editBody}
             onChange={(e) => setEditBody(e.target.value)}
@@ -443,7 +442,7 @@ function CommentCard({
           <p
             ref={bodyRef}
             className={cn(
-              "text-xs leading-relaxed text-foreground break-words whitespace-pre-wrap",
+              "text-sm leading-relaxed text-foreground break-words whitespace-pre-wrap",
               !expanded && "line-clamp-4",
             )}
           >
@@ -479,7 +478,7 @@ function CommentCard({
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <span className="truncate text-[11px] text-muted-foreground">
+                    <span className="truncate text-sm text-muted-foreground">
                       {c.created_by ?? "You"}
                     </span>
                   </TooltipTrigger>
@@ -501,7 +500,7 @@ function CommentCard({
               {onEdit && (
                 <button
                   type="button"
-                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                  className="cursor-pointer text-sm text-muted-foreground transition-colors hover:text-foreground"
                   onClick={(e) => {
                     e.stopPropagation();
                     startEdit();
@@ -513,7 +512,7 @@ function CommentCard({
               {onDelete && (
                 <button
                   type="button"
-                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-destructive"
+                  className="cursor-pointer text-sm text-muted-foreground transition-colors hover:text-destructive"
                   onClick={(e) => {
                     e.stopPropagation();
                     onDelete();
@@ -526,7 +525,7 @@ function CommentCard({
                 <button
                   type="button"
                   aria-label="Copy link to comment"
-                  className="cursor-pointer text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                  className="cursor-pointer text-sm text-muted-foreground transition-colors hover:text-foreground"
                   onClick={(e) => {
                     e.stopPropagation();
                     onCopyLink();

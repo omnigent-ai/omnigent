@@ -44,6 +44,7 @@ import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.model_fallbacks import StaticModelFallback, static_model_fallback
 from omnigent.model_metadata import (
@@ -53,7 +54,7 @@ from omnigent.model_metadata import (
     ModelMetadata,
     ModelWireAPI,
 )
-from omnigent.model_override import model_family_mismatch
+from omnigent.model_override import is_codex_compatible_model, model_family_mismatch
 from omnigent.model_resolver import (
     ModelResolution,
     ModelResolutionError,
@@ -107,7 +108,6 @@ _ProviderHarness: TypeAlias = Literal[
     "kimi",
     "qwen",
 ]
-_JsonObject: TypeAlias = dict[str, object]
 
 # Harness spellings -> the workflow harness whose provider resolution they
 # share; natives resolve via their SDK sibling (the resolve_native_* rule).
@@ -314,19 +314,20 @@ def clear_model_catalog_cache() -> None:
 
 
 def model_family_token(model_id: str) -> str:
-    """Tag a model id with its vendor family.
+    """Tag a model id with the harness family that can serve it.
 
-    Mirrors the token rule in
+    Shares the token rule with
     :func:`omnigent.model_override.model_family_mismatch`: Claude ids
-    contain ``"claude"``; GPT ids contain ``"gpt"`` or ``"codex"``.
+    contain ``"claude"``; the ``"openai"`` token covers every
+    codex-compatible id (gpt/codex plus the GLM and Kimi families, which
+    serve on the same Responses wire).
 
     :param model_id: Model id, e.g. ``"databricks-claude-opus-4-8"``.
     :returns: ``"claude"``, ``"openai"``, or ``"other"``.
     """
-    lower = model_id.lower()
-    if "claude" in lower:
+    if "claude" in model_id.lower():
         return "claude"
-    if "gpt" in lower or "codex" in lower:
+    if is_codex_compatible_model(model_id):
         return "openai"
     return "other"
 

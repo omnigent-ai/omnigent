@@ -1099,6 +1099,51 @@ async def test_get_resource_by_id_404_from_runner(
     assert resp.json()["error"]["code"] == "not_found"
 
 
+@pytest.mark.asyncio
+async def test_get_resource_by_id_404_with_non_mapping_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """A malformed runner 404 uses the default not-found message."""
+    fake_runner = _FakeRunnerClient(payload=["not", "an", "object"], status_code=404)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/nonexistent")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["message"] == "Resource not found"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_rejects_invalid_runner_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """Malformed runner JSON becomes a controlled 502."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/bad-json"
+    fake_runner = _FakeRunnerClient(
+        text_responses={path: (200, "not-json", {"content-type": "application/json"})}
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path)
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint returned invalid JSON"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_rejects_non_mapping_runner_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """Valid non-object runner JSON becomes a distinct controlled 502."""
+    fake_runner = _FakeRunnerClient(payload=["not", "an", "object"])
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/non-object")
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint returned non-object JSON"
+
+
 @pytest.fixture
 def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve the session's agent spec to one declaring a ``bash`` terminal.
@@ -1717,6 +1762,41 @@ async def test_download_session_file_content(
         "attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt"
     )
     assert resp.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_download_session_file_content_is_revalidatable(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Content is immutable per file id, so it must be cacheable and revalidate to 304.
+
+    Transcripts re-render the same attachments on every session load and
+    the originals run to megabytes; without these headers the browser
+    re-downloads all of them each time.
+    """
+    upload = await file_client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+        files={"file": ("shot.png", b"pretend-png-bytes", "image/png")},
+    )
+    file_id = upload.json()["id"]
+    url = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}/content"
+
+    resp = await file_client.get(url)
+    assert resp.status_code == 200
+    etag = resp.headers["etag"]
+    assert etag == f'"{file_id}"'
+    assert resp.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+    # A conditional re-request must skip the bytes entirely.
+    cached = await file_client.get(url, headers={"If-None-Match": etag})
+    assert cached.status_code == 304
+    assert cached.content == b""
+    assert cached.headers["etag"] == etag
+
+    # A stale validator still gets the full body back.
+    stale = await file_client.get(url, headers={"If-None-Match": '"file_gone"'})
+    assert stale.status_code == 200
+    assert stale.content == b"pretend-png-bytes"
 
 
 @pytest.mark.asyncio

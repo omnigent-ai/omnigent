@@ -34,8 +34,9 @@ import importlib
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
+import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent.native_coding_agents import native_coding_agent_for_harness
@@ -44,18 +45,42 @@ from omnigent.runner.native.orchestration import (
     _claude_native_bridge_id_for_session,
     _session_labels_for_runner_spawn,
 )
+from omnigent.runner.resource_registry import SessionResourceRegistry
+
+if TYPE_CHECKING:
+    from omnigent.codex_native_bridge import CodexNativeBridgeState
+
+
+class SubagentDeliveryAck(Protocol):
+    """Result of attempting to deliver a terminal sub-agent payload."""
+
+    @property
+    def delivered(self) -> bool:
+        raise NotImplementedError
+
+    @property
+    def entry(self) -> object | None:
+        raise NotImplementedError
+
+    @property
+    def reason(self) -> str:
+        raise NotImplementedError
 
 
 class MarkSubagentTerminalAndWake(Protocol):
     """Mark a sub-agent work entry terminal and wake its parent."""
 
-    def __call__(self, child_session_id: str, *, status: str, output: str | None) -> Any: ...
+    def __call__(
+        self, child_session_id: str, *, status: str, output: str | None
+    ) -> SubagentDeliveryAck:
+        raise NotImplementedError
 
 
 class ClientSafeErrorDetail(Protocol):
     """Log an exception and return safe client-facing detail."""
 
-    def __call__(self, exc: BaseException, *, context: str) -> str: ...
+    def __call__(self, exc: BaseException, *, context: str) -> str:
+        raise NotImplementedError
 
 
 class CodexBridgeStateForSession(Protocol):
@@ -67,7 +92,8 @@ class CodexBridgeStateForSession(Protocol):
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> Any | None: ...
+    ) -> CodexNativeBridgeState | None:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -224,9 +250,9 @@ class NativeInterruptRunner:
     def __init__(
         self,
         *,
-        server_client: Any,
-        resource_registry: Any,
-        publish_event: Callable[[str, dict[str, Any]], None],
+        server_client: httpx.AsyncClient,
+        resource_registry: SessionResourceRegistry,
+        publish_event: Callable[[str, dict[str, object]], None],
         mark_subagent_terminal_and_wake: MarkSubagentTerminalAndWake,
         session_sub_agent_names: Mapping[str, str],
         codex_bridge_state_for_session: CodexBridgeStateForSession,

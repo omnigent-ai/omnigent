@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+import warnings
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 import httpx
 
@@ -23,27 +25,90 @@ _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
 
 
+#: Catalog spellings the same endpoint can be served under. Ordered by
+#: preference: a workspace exposing both keeps the ``databricks-`` id, so every
+#: consumer (routing candidates, the model picker, the launch alias pins) names
+#: a model the same way no matter which listing answered.
+_CATALOG_SPELLINGS: tuple[str, ...] = ("databricks-", _SYSTEM_MODEL_PREFIX)
+
+
+def _bare_model_id(model_id: str) -> str:
+    """Strip the catalog spelling so ids compare across vocabularies."""
+    lowered = model_id.lower()
+    for prefix in _CATALOG_SPELLINGS:
+        if lowered.startswith(prefix):
+            return lowered[len(prefix) :]
+    return lowered
+
+
 def _natural_model_key(model_id: str) -> tuple[tuple[int, str | int], ...]:
-    """Return a comparison key that orders numeric model versions naturally."""
+    """Return a comparison key that orders numeric model versions naturally.
+
+    Keyed on the bare id so the catalog spelling never outranks the version.
+    """
     return tuple(
         (1, int(part)) if part.isdigit() else (0, part)
-        for part in re.split(r"(\d+)", model_id.lower())
+        for part in re.split(r"(\d+)", _bare_model_id(model_id))
         if part
     )
+
+
+def _prefer_databricks_spelling(model_ids: Iterable[str]) -> list[str]:
+    """Collapse duplicate spellings of one model onto the preferred one.
+
+    :param model_ids: Catalog ids from one or more listings, possibly naming
+        the same endpoint under two spellings.
+    :returns: One id per model, sorted, with ``databricks-`` winning ties.
+    """
+    best: dict[str, str] = {}
+    for model_id in model_ids:
+        bare = _bare_model_id(model_id)
+        current = best.get(bare)
+        if current is None or _spelling_rank(model_id) < _spelling_rank(current):
+            best[bare] = model_id
+    return sorted(best.values())
+
+
+def _spelling_rank(model_id: str) -> int:
+    """Rank a catalog spelling; lower wins."""
+    lowered = model_id.lower()
+    for rank, prefix in enumerate(_CATALOG_SPELLINGS):
+        if lowered.startswith(prefix):
+            return rank
+    return len(_CATALOG_SPELLINGS)
+
+
+def _claude_family_of(model_id: str, *, marker: str) -> str | None:
+    """Return the Claude family *model_id* belongs to, if any."""
+    _, separator, suffix = model_id.lower().partition(marker)
+    if not separator:
+        return None
+    segments = suffix.split("-")
+    return next((family for family in CLAUDE_MODEL_FAMILIES if family in segments), None)
 
 
 def _models_by_claude_family(model_ids: list[str], *, marker: str) -> dict[str, str]:
     """Select the newest model id for every Claude family in *model_ids*."""
     result: dict[str, str] = {}
     for family in CLAUDE_MODEL_FAMILIES:
-        candidates = []
-        for model_id in model_ids:
-            _, separator, suffix = model_id.lower().partition(marker)
-            if separator and family in suffix.split("-"):
-                candidates.append(model_id)
+        candidates = [
+            model_id
+            for model_id in model_ids
+            if _claude_family_of(model_id, marker=marker) == family
+        ]
         if candidates:
             result[family] = max(candidates, key=_natural_model_key)
     return result
+
+
+def _all_claude_models(model_ids: list[str], *, marker: str) -> tuple[str, ...]:
+    """Keep every Claude-family id in *model_ids*, newest first per family."""
+    claude_ids = [
+        model_id
+        for model_id in model_ids
+        if _claude_family_of(model_id, marker=marker) is not None
+    ]
+    return tuple(sorted(claude_ids, key=_natural_model_key, reverse=True))
 
 
 def _list_model_service_ids(
@@ -68,7 +133,7 @@ def _list_model_service_ids(
             params=params,
         )
         response.raise_for_status()
-        payload: Any = response.json()
+        payload: object = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Databricks model-services response must be an object")
         services = payload.get("model_services")
@@ -111,7 +176,7 @@ def _list_anthropic_gateway_ids(
         headers=headers,
     )
     response.raise_for_status()
-    payload: Any = response.json()
+    payload: object = response.json()
     if not isinstance(payload, dict):
         raise ValueError("Databricks Anthropic models response must be an object")
     data = payload.get("data")
@@ -127,6 +192,92 @@ def _list_anthropic_gateway_ids(
     ]
 
 
+@dataclass(frozen=True)
+class DatabricksClaudeCatalog:
+    """Every Claude endpoint a workspace serves, plus the family picks.
+
+    :param families: Family alias → newest routable id, e.g.
+        ``{"opus": "system.ai.claude-opus-5"}``. What the launch env pins
+        each Claude Code alias to.
+    :param model_ids: Every Claude-family id the workspace serves, newest
+        first, e.g. ``("system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8")``. A superset of ``families``: an
+        older generation is still servable and still routable, it just
+        does not own an alias.
+    """
+
+    families: dict[str, str]
+    model_ids: tuple[str, ...]
+
+
+def discover_databricks_claude_catalog(
+    workspace_url: str,
+    token: str,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> DatabricksClaudeCatalog:
+    """Discover every Claude endpoint a Databricks workspace serves.
+
+    Both listings are consulted, because a workspace can serve the same
+    endpoint under both spellings (``system.ai.claude-opus-5`` from Unity
+    Catalog model services, ``databricks-claude-opus-5`` from the Anthropic AI
+    Gateway) and answering with whichever listing happened to succeed makes the
+    catalog nondeterministic. Duplicates collapse onto the ``databricks-``
+    spelling so every consumer names a model the same way.
+
+    The gateway listing is therefore issued even when Unity Catalog already
+    named Claude models — short-circuiting on the UC hit would cost one HTTP
+    round trip less per launch, but UC only ever spells ids ``system.ai.``, so
+    the spelling a consumer sees would depend on whether the (transiently
+    failing) UC call answered.
+
+    :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
+    :param token: Workspace bearer token.
+    :param transport: Optional HTTP transport used by tests.
+    :returns: The workspace's Claude catalog. Empty ``families`` with empty
+        ``model_ids`` is authoritative: the model-services listing answered
+        successfully and no Claude models are exposed.
+    :raises httpx.HTTPError: When the primary listing fails and the fallback
+        cannot compensate (it fails too, or exposes no Claude models).
+    :raises ValueError: Same contract for malformed responses.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    primary_error: Exception | None = None
+    gateway_error: Exception | None = None
+    model_service_ids: list[str] = []
+    gateway_ids: list[str] = []
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        try:
+            model_service_ids = _list_model_service_ids(client, workspace_url, headers)
+        except (httpx.HTTPError, ValueError) as exc:
+            primary_error = exc
+        try:
+            gateway_ids = _list_anthropic_gateway_ids(client, workspace_url, headers)
+        except (httpx.HTTPError, ValueError) as exc:
+            gateway_error = exc
+
+    if primary_error is not None and gateway_error is not None:
+        raise gateway_error from primary_error
+
+    merged = _prefer_databricks_spelling([*model_service_ids, *gateway_ids])
+    models = _models_by_claude_family(merged, marker="claude-")
+    if models:
+        return DatabricksClaudeCatalog(
+            families=models,
+            model_ids=_all_claude_models(merged, marker="claude-"),
+        )
+    if primary_error is not None:
+        # Neither listing named a Claude model and the authoritative one failed
+        # — an empty result here is NOT authoritative (e.g. a transient UC 503
+        # plus an unused legacy gateway). Surface the primary failure so callers
+        # fall back to cached models instead of treating the workspace as having
+        # none.
+        raise primary_error
+    # A successful permission-aware UC listing is authoritative even when the
+    # compatibility endpoint is not enabled.
+    return DatabricksClaudeCatalog(families={}, model_ids=())
+
+
 def discover_databricks_claude_models(
     workspace_url: str,
     token: str,
@@ -135,46 +286,27 @@ def discover_databricks_claude_models(
 ) -> dict[str, str]:
     """Discover the live Claude family mapping for a Databricks workspace.
 
-    Unity Catalog model services are authoritative when they expose Claude
-    models. The Anthropic AI Gateway model-list endpoint is the compatibility
-    fallback for workspaces that have not moved to model services yet.
+    .. deprecated:: 0.8.0
+        Use :func:`discover_databricks_claude_catalog` and read its
+        ``families``, which also carries every servable id. Removed in
+        ``v0.10.0``.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param transport: Optional HTTP transport used by tests.
     :returns: Family aliases mapped to routable model ids. An empty mapping is
-        authoritative: at least one endpoint answered successfully and no
-        Claude models are exposed.
-    :raises httpx.HTTPError: When the primary listing fails and the fallback
-        cannot compensate (it fails too, or exposes no Claude models).
-    :raises ValueError: Same contract for malformed responses.
+        authoritative: the listing answered and no Claude models are exposed.
+    :raises httpx.HTTPError: Same contract as the catalog lookup.
+    :raises ValueError: Same contract as the catalog lookup.
     """
-    headers = {"Authorization": f"Bearer {token}"}
-    primary_error: Exception | None = None
-    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        try:
-            model_service_ids = _list_model_service_ids(client, workspace_url, headers)
-        except (httpx.HTTPError, ValueError) as exc:
-            primary_error = exc
-        else:
-            models = _models_by_claude_family(model_service_ids, marker="claude-")
-            if models:
-                return models
-
-        try:
-            gateway_ids = _list_anthropic_gateway_ids(client, workspace_url, headers)
-        except (httpx.HTTPError, ValueError) as exc:
-            if primary_error is not None:
-                raise exc from primary_error
-            # A successful permission-aware UC listing is authoritative even
-            # when the compatibility endpoint is not enabled.
-            return {}
-    gateway_models = _models_by_claude_family(gateway_ids, marker="databricks-claude-")
-    if not gateway_models and primary_error is not None:
-        # The gateway answered but routes no Claude models, and the primary
-        # listing failed — an empty result here is NOT authoritative (e.g. a
-        # transient UC 503 plus an unused legacy gateway). Surface the primary
-        # failure so callers fall back to cached models instead of treating
-        # the workspace as having none.
-        raise primary_error
-    return gateway_models
+    warnings.warn(
+        "discover_databricks_claude_models() is deprecated and will be removed in "
+        "v0.10.0; call discover_databricks_claude_catalog() and read .families.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return discover_databricks_claude_catalog(
+        workspace_url,
+        token,
+        transport=transport,
+    ).families

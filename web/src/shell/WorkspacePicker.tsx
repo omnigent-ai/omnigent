@@ -497,7 +497,7 @@ export function WorkspacePicker({
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
-          className="min-w-0 flex-1 bg-transparent text-xs text-muted-foreground focus:outline-none"
+          className="min-w-0 flex-1 bg-transparent text-sm text-muted-foreground focus:outline-none"
           data-testid="workspace-picker-path-input"
         />
         <button
@@ -558,8 +558,7 @@ export function WorkspacePicker({
             <FolderPlusIcon className="size-4 shrink-0 text-muted-foreground" />
             <input
               type="text"
-              // eslint-disable-next-line jsx-a11y/no-autofocus -- focus belongs on
-              // the field the user just opened; the picker is already a focus trap.
+              // Focus belongs on the field the user just opened; the picker is already a focus trap.
               autoFocus
               value={newFolderName}
               onChange={(e) => {
@@ -579,7 +578,7 @@ export function WorkspacePicker({
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
-              className="min-w-0 flex-1 bg-transparent text-xs text-foreground focus:outline-none"
+              className="min-w-0 flex-1 bg-transparent text-sm text-foreground focus:outline-none"
               data-testid="workspace-picker-new-folder-input"
             />
             <button
@@ -606,7 +605,7 @@ export function WorkspacePicker({
           </div>
           {createError !== null && (
             <span
-              className="text-xs text-destructive"
+              className="text-sm text-destructive"
               data-testid="workspace-picker-new-folder-error"
             >
               {createError}
@@ -616,7 +615,7 @@ export function WorkspacePicker({
       )}
       {occupiedCount > 0 && (
         <div
-          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-xs text-warning"
+          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-sm text-warning"
           data-testid="workspace-picker-conflict"
         >
           <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -628,14 +627,14 @@ export function WorkspacePicker({
         </div>
       )}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {isLoading && <div className="px-3 py-3 text-xs text-muted-foreground">Loading…</div>}
+        {isLoading && <div className="px-3 py-3 text-sm text-muted-foreground">Loading…</div>}
         {error !== null && error !== undefined && !isLoading && (
-          <div className="px-3 py-3 text-xs text-destructive" data-testid="workspace-picker-error">
+          <div className="px-3 py-3 text-sm text-destructive" data-testid="workspace-picker-error">
             {error instanceof Error ? error.message : "Failed to load directory"}
           </div>
         )}
         {!isLoading && error === null && entries.length === 0 && (
-          <div className="px-3 py-3 text-xs text-muted-foreground">
+          <div className="px-3 py-3 text-sm text-muted-foreground">
             {activeFilter !== null ? "No matching entries" : "(empty directory)"}
           </div>
         )}
@@ -653,7 +652,7 @@ export function WorkspacePicker({
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => isDir && navigateTo(entry.path)}
               className={
-                "flex w-full items-center gap-2 border-b px-3 py-2 text-left text-xs last:border-b-0 " +
+                "flex w-full items-center gap-2 border-b px-3 py-2 text-left text-sm last:border-b-0 " +
                 (isDir
                   ? "hover:bg-accent hover:text-accent-foreground cursor-pointer"
                   : "text-muted-foreground cursor-not-allowed")
@@ -667,7 +666,7 @@ export function WorkspacePicker({
         })}
         {data?.truncated && (
           <div
-            className="px-3 py-2 text-xs text-muted-foreground"
+            className="px-3 py-2 text-sm text-muted-foreground"
             data-testid="workspace-picker-truncated"
           >
             Too many entries to list fully — type a path above to jump directly.
