@@ -181,6 +181,14 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
+def test_real_builders_pass_ssh_auth_sock(monkeypatch):
+    """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
+    sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
+    monkeypatch.setattr("os.environ", {"SSH_AUTH_SOCK": sock})
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        assert build().get("SSH_AUTH_SOCK") == sock, harness
+
+
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))
 def test_no_harness_inherits_unrelated_secrets(harness, hostile_env):
     env = clean_agent_env(allow_prefixes=HARNESS_PREFIXES[harness], source=hostile_env)
