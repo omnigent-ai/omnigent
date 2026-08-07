@@ -5,7 +5,7 @@
 // ExecutionLogsPanel / FilesPanelDrawer — those open at ~50 % by default
 // while the inline panel starts at a compact sidebar width.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
@@ -37,11 +37,19 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
   if (typeof window === "undefined") return Math.max(minPx, w);
   // 99vw is the nominal ceiling, but the chat column's minimum (plus the gap
   // between the two) is the one that actually binds on a normal desktop.
-  const ceiling = Math.min(
-    window.innerWidth * MAX_WIDTH_RATIO,
-    window.innerWidth - reservedPx - CHAT_MIN_WIDTH_PX - GAP_PX,
+  const ceiling = Math.max(
+    0,
+    Math.min(
+      window.innerWidth * MAX_WIDTH_RATIO,
+      window.innerWidth - reservedPx - CHAT_MIN_WIDTH_PX - GAP_PX,
+    ),
   );
-  return Math.max(minPx, Math.min(w, ceiling));
+  // The chat's 480px floor wins over the panel's own comfort minimum: when the
+  // viewport (with the sidebar open) is too small to grant both, the panel
+  // yields below `minPx` rather than let the chat break its minimum. Clamping
+  // the floor to the ceiling keeps the range valid so `Math.max` can't push the
+  // width back up past the chat-preserving cap.
+  return Math.max(Math.min(minPx, ceiling), Math.min(w, ceiling));
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +167,12 @@ export function useResizableInlinePanel(
   // live, so there's no idle window-level mousemove handler firing during
   // ordinary page use.
   const [isDragging, setIsDragging] = useState(false);
+  // `resolvedWidth` reads `window.innerWidth` at render, but a viewport resize
+  // that leaves the stored (no-reserve) width unchanged wouldn't otherwise
+  // re-render — so the render-time reserve clamp would go stale and the chat
+  // could dip below its minimum on a shrink. This tick forces a recompute on
+  // every resize regardless of whether the stored width moved.
+  const [, bumpViewport] = useReducer((n: number) => n + 1, 0);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
@@ -202,6 +216,9 @@ export function useResizableInlinePanel(
         const base = preferredWidth ?? prev;
         return base !== null ? clamp(base, minWidthRef.current) : defaultWidthPx();
       });
+      // Force a re-render even when the stored width is unchanged, so the
+      // render-time reserve clamp re-runs against the new viewport.
+      bumpViewport();
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);

@@ -70,3 +70,33 @@ def test_sidebar_toggle_preserves_widths(
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     assert abs(_rail_width(page) - rail_open) < 2, (_rail_width(page), rail_open)
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)
+
+
+def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Shrinking the window with both sidebars open never squeezes the chat < 480.
+
+    The reported regression: at a wide viewport the rail is wide; opening the
+    left sidebar and then dragging the window smaller let the chat fall under
+    480px, because the rail's width didn't recompute against the smaller
+    viewport (a resize that didn't move the stored width never re-rendered) and
+    the rail's own comfort minimum overrode the chat-preserving ceiling.
+    """
+    base_url, session_id = seeded_session
+    # Start wide so the rail's default is well above the shrunk ceiling.
+    page.set_viewport_size({"width": 1600, "height": 800})
+    page.goto(f"{base_url}/c/{session_id}")
+
+    conversations = page.locator(_CONVERSATIONS)
+    workspace = page.get_by_role("complementary", name="Workspace")
+    expect(workspace).to_be_visible(timeout=30_000)
+    expect(conversations).not_to_have_attribute("data-collapsed", "true")
+    assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)
+
+    # Shrink the window hard, sidebar still open. The rail must yield (below its
+    # own comfort minimum if needed) so the chat holds its 480px floor.
+    page.set_viewport_size({"width": 1000, "height": 800})
+    expect(conversations).not_to_have_attribute("data-collapsed", "true")
+    assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)

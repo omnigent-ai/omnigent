@@ -78,12 +78,13 @@ describe("useResizableInlinePanel persistence", () => {
     expect(nudgeWiderOnce(result)).toBe(620);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
 
-    // Shrinking the viewport clamps the live width to the chat-minimum ceiling
-    // (700 - 480 - 8 = 212, floored at the 240px minimum) without disturbing
-    // the saved 620 preference.
+    // Shrinking the viewport clamps the live width to the chat-preserving
+    // ceiling (700 - 480 chat - 8 gap = 212). The chat's 480 floor wins over
+    // the panel's own 240 comfort minimum, so the panel yields below 240 rather
+    // than squeeze the chat. The saved 620 preference is untouched.
     setInnerWidth(700);
     act(() => window.dispatchEvent(new Event("resize")));
-    expect(result.current.panelWidth).toBe(240);
+    expect(result.current.panelWidth).toBe(212);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
 
     // Widening again re-derives from the preference, restoring 620 in-session.
@@ -143,6 +144,34 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
     // 1400 - 320 sidebar - 8 gap - panel >= 480 for the chat.
     expect(1400 - 320 - result.current.panelWidth - 8).toBeGreaterThanOrEqual(480);
     unmount();
+  });
+
+  it("keeps the chat >= 480px when the viewport shrinks with both sidebars open", () => {
+    // The reported bug: with the left sidebar open (reserved) AND the rail wide,
+    // shrinking the window let the chat fall under 480 — the panel's own 240
+    // comfort minimum was overriding the chat-preserving ceiling, and a resize
+    // that didn't move the stored width never re-rendered. The chat floor must
+    // win and the recompute must fire on every resize.
+    setInnerWidth(1400);
+    const reservedPx = 320; // open left sidebar
+    const { result, rerender } = renderHook(
+      ({ reserved }) => useResizableInlinePanel(SESSION, undefined, reserved),
+      { initialProps: { reserved: reservedPx } },
+    );
+    // Drag the rail out to its widest at this viewport.
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 0 })));
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+
+    // Now shrink the viewport hard. Even though the stored (no-reserve) width may
+    // still fit its own ceiling, the render-time reserve clamp must re-run.
+    setInnerWidth(1000);
+    act(() => window.dispatchEvent(new Event("resize")));
+    rerender({ reserved: reservedPx });
+    // chat = viewport - sidebar - gap - panel.
+    expect(1000 - reservedPx - 8 - result.current.panelWidth).toBeGreaterThanOrEqual(480);
   });
 });
 
