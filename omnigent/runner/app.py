@@ -6652,25 +6652,25 @@ def create_runner_app(
         :param agent_spec: Agent spec for the session, if any.
         :returns: JSON-ready ``{"unconfined": bool, "roots": [...]}``.
         """
-        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+        from omnigent.inner.sandbox import (
+            ReachableRoot,
+            is_unconfined,
+            reach_payload,
+            reachable_roots,
+            resolve_sandbox,
+        )
 
         root_path = Path(root)
         spec_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
         if spec_os_env is None:
             # No spec to resolve (dev/standalone): report the root alone
             # rather than guessing a wider reach.
-            return {
-                "unconfined": False,
-                "roots": [{"path": root, "access": "write", "origin": "cwd"}],
-            }
+            return reach_payload(
+                [ReachableRoot(path=root_path, access="write", origin="cwd", kind="tree")],
+                unconfined=False,
+            )
         policy = resolve_sandbox(spec_os_env, root_path)
-        return {
-            "unconfined": is_unconfined(policy),
-            "roots": [
-                {"path": str(r.path), "access": r.access, "origin": r.origin}
-                for r in reachable_roots(root_path, policy)
-            ],
-        }
+        return reach_payload(reachable_roots(root_path, policy), unconfined=is_unconfined(policy))
 
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}")
     async def get_session_environment(

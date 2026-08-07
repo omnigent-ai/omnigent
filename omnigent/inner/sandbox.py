@@ -640,6 +640,28 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     return roots
 
 
+def reach_payload(roots: Sequence[ReachableRoot], *, unconfined: bool) -> dict[str, object]:
+    """
+    JSON-ready description of what an environment's file browsing can reach.
+
+    The single definition of this wire shape. Both producers use it — the
+    runner when the agent is awake, and the server when it synthesizes the
+    environment for a sleeping agent — so a browser cannot be told one thing
+    by one and something else by the other.
+
+    :param roots: Grants from :func:`reachable_roots`.
+    :param unconfined: Result of :func:`is_unconfined`.
+    :returns: ``{"unconfined": bool, "roots": [{"path", "access", "origin"}]}``.
+    """
+    return {
+        "unconfined": unconfined,
+        "roots": [
+            {"path": str(root.path), "access": root.access, "origin": root.origin}
+            for root in roots
+        ],
+    }
+
+
 def is_unconfined(policy: SandboxPolicy) -> bool:
     """
     Whether the policy leaves the environment without OS-level confinement.

@@ -724,9 +724,9 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param environment_id: Requested environment id; only the default
             environment is synthesized.
-        :returns: A minimal environment resource dict with
-            ``metadata.root`` set to the workspace path, or ``None`` when
-            not applicable (non-default env, no host, no workspace).
+        :returns: An environment resource dict carrying ``metadata.root``
+            and (when the spec resolves) ``metadata.reachable``, or ``None``
+            when not applicable (non-default env, no host, no workspace).
         """
         if environment_id != "default" or host_registry is None:
             return None
@@ -735,11 +735,24 @@ def register_resources_routes(
             return None
         if host_registry.get(conv.host_id) is None:
             return None
+
+        from omnigent.inner.sandbox import reach_payload
+
+        metadata: dict[str, Any] = {"root": conv.workspace}
+        # Advertise the same reach the runner would. Without it the file
+        # panel reads "nothing else reachable" and silently drops its
+        # navigation affordance the moment the agent sleeps -- even though
+        # the host-served path authorizes and serves absolute browsing
+        # exactly as the live runner does.
+        reach = await _environment_reach_for_session(session_id)
+        if reach is not None:
+            roots, unconfined, _workspace = reach
+            metadata["reachable"] = reach_payload(roots, unconfined=unconfined)
         return {
             "id": environment_id,
             "object": "session.resource",
             "type": "environment",
-            "metadata": {"root": conv.workspace},
+            "metadata": metadata,
         }
 
     @router.get(
