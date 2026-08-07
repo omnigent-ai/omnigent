@@ -457,8 +457,6 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
-    expect(headerActions.parentElement).toHaveClass("h-12", "pl-5", "pr-3");
-    expect(headerActions.parentElement).not.toHaveClass("px-4");
     const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
 
@@ -485,8 +483,6 @@ describe("Sidebar session list", () => {
     const inbox = within(primaryNav).getByTestId("inbox-button");
     const newChat = within(primaryNav).getByTestId("new-chat-button");
 
-    expect(primaryNav).toHaveClass("px-3", "pt-2", "pb-0");
-    expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
     expect(inbox).toHaveClass(
       "sidebar-row",

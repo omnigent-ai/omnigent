@@ -131,6 +131,7 @@ import {
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
+import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
@@ -388,7 +389,41 @@ function defaultModelLabel(
   return dflt ? `Default (${display(dflt)})` : "Default";
 }
 
-function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
+/** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
+export function displayNameForHost(
+  host: Pick<Host, "host_id" | "name">,
+  thisMachineHostId: string | null,
+  userAgent: string,
+): string {
+  if (thisMachineHostId === null || host.host_id !== thisMachineHostId) return host.name;
+  if (/iPhone/i.test(userAgent)) return "This iPhone";
+  if (/iPad/i.test(userAgent)) return "This iPad";
+  if (/Android/i.test(userAgent)) return "This Android";
+  if (/Windows/i.test(userAgent)) return "This Windows";
+  if (/Macintosh|Mac OS X/i.test(userAgent)) return "This Mac";
+  if (/Linux|X11/i.test(userAgent)) return "This machine";
+  return host.name;
+}
+
+/** Resolve this machine exactly from Electron, or conservatively from a local single-host server. */
+export function resolveThisMachineHostId(
+  desktopHostId: string | null,
+  serverIsLocal: boolean,
+  onlineHostIds: readonly string[],
+): string | null {
+  if (desktopHostId !== null) return desktopHostId;
+  return serverIsLocal && onlineHostIds.length === 1 ? onlineHostIds[0] : null;
+}
+
+function HostOption({
+  host,
+  displayName = host.name,
+  subtitle,
+}: {
+  host: Host;
+  displayName?: string;
+  subtitle?: string;
+}) {
   const isOnline = host.status === "online";
   return (
     <span className="flex min-w-0 items-center gap-2">
@@ -399,7 +434,7 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
       )}
       <span className="flex min-w-0 flex-col">
         <span className="flex items-center gap-2">
-          <span className="truncate text-sm">{host.name}</span>
+          <span className="truncate text-sm">{displayName}</span>
           <span
             className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
           >
@@ -1025,7 +1060,7 @@ export function AgentHarnessPicker({
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={active ? "true" : undefined}
         onSelect={() => onSelectAgent(agent)}
-        className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+        className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
       >
         {renderRowInner(agent, true)}
         {renderBadge(agent)}
@@ -1082,7 +1117,7 @@ export function AgentHarnessPicker({
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
-      className="gap-2 rounded-sm px-2 py-1.5 text-ui text-muted-foreground"
+      className="text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
       Create custom agent
@@ -1100,7 +1135,7 @@ export function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-pending"
           data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
           onSelect={onSelectPending}
-          className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+          className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
@@ -1180,7 +1215,7 @@ export function AgentHarnessPicker({
         // height cap / pin a width; tailwind-merge lets the passed max-h/width
         // override the defaults.
         className={cn(
-          "max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1",
+          "max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto",
           contentClassName,
         )}
       >
@@ -1193,7 +1228,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
+              className="items-center font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">More</span>
@@ -1210,7 +1245,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
+              className="items-center font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">Custom agents</span>
@@ -1231,7 +1266,7 @@ export function AgentHarnessPicker({
                     onSelectAutoHarness?.();
                     setOpen(false);
                   }}
-                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+                  className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
                 >
                   <span className="flex-1 truncate">{SMART_ROUTING_LABEL}</span>
                 </DropdownMenuItem>
@@ -1254,7 +1289,7 @@ export function AgentHarnessPicker({
                         e.preventDefault();
                         setMobilePage("more");
                       }}
-                      className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                      className="items-center"
                     >
                       <span className="flex-1">More</span>
                       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1264,11 +1299,11 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                        className="items-center"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto p-1">
+                      <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
                         {moreHarnessEntries.map(renderEntry)}
                       </DropdownMenuSubContent>
                     </DropdownMenuSub>
@@ -1293,7 +1328,7 @@ export function AgentHarnessPicker({
                     e.preventDefault();
                     setMobilePage("custom");
                   }}
-                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                  className="items-center"
                 >
                   <span className="flex-1">Custom agents</span>
                   <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1303,11 +1338,11 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
+                    className="items-center"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto p-1">
+                  <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-56 max-w-[calc(100vw-2rem)] overflow-y-auto">
                     {customAgentsBody}
                   </DropdownMenuSubContent>
                 </DropdownMenuSub>
@@ -1610,7 +1645,7 @@ function HarnessConfigModal({
                   <SelectContent
                     position="popper"
                     align="start"
-                    className="[&_[data-slot=select-item]]:pl-2.5"
+                    className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
                   >
                     <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                     {CLAUDE_NATIVE_EFFORTS.map((e) => (
@@ -1980,7 +2015,7 @@ export function NewChatLandingScreen() {
   // Unfiltered brain-harness labels: safe for membership checks and for
   // labelling an existing pick, but the OPTIONS offered in the gear modal use
   // the gated `brainHarnessLabels` below, which drops the fully-auto row when
-  // the gateway cannot back both arms.
+  // neither router can back both arms.
   const brainHarnessLabelsAll = useBrainHarnessLabels(smartRoutingEnabled);
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
@@ -2177,9 +2212,13 @@ export function NewChatLandingScreen() {
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped just before we navigate to a freshly-created
-  // session so the snapshot is dropped instead of resurrected.
+  // `submittedRef` is flipped once the draft is sent to a create, so the
+  // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
+  // Whether this composer is still on screen. The create POST can outlive
+  // it — the user opens another session while the session bootstraps — and
+  // the post-create navigation must not follow them there.
+  const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
     message,
@@ -2203,7 +2242,11 @@ export function NewChatLandingScreen() {
     costControlMode,
   };
   useEffect(() => {
+    // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
+    // doesn't leave the screen marked gone.
+    onScreenRef.current = true;
     return () => {
+      onScreenRef.current = false;
       landingDraft = submittedRef.current ? null : draftRef.current;
     };
   }, []);
@@ -2215,11 +2258,17 @@ export function NewChatLandingScreen() {
   const onlineHosts = allHosts.filter((h) => h.status === "online");
   const offlineHosts = allHosts.filter((h) => h.status === "offline");
 
-  // Identify the current desktop machine and whether we can connect it. When
-  // it's already in the host list (online or offline) we connect via that row;
-  // only when it's absent do we show a standalone "Run on this machine" item —
-  // so the machine never appears twice.
-  const thisMachineHostId = desktopHost?.hostId ?? null;
+  // Identify this machine exactly through Electron. A standalone browser cannot
+  // read local host config, so a loopback server with exactly one online host
+  // uses that host as a conservative local-development fallback.
+  const thisMachineHostId = resolveThisMachineHostId(
+    desktopHost?.hostId ?? null,
+    isCurrentServerLocal(),
+    onlineHosts.map((host) => host.host_id),
+  );
+  // When it's already in the host list (online or offline) we connect via that
+  // row; only when it's absent do we show a standalone "Run on this machine"
+  // item, so the machine never appears twice.
   const thisMachineInList =
     thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
   const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
@@ -2421,6 +2470,74 @@ export function NewChatLandingScreen() {
     [homeListing, homeListingIsPlaceholder],
   );
 
+  // Fill the branch field with a unique auto-generated name so the user can
+  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
+  // available in every browser the app targets; the short prefix keeps the
+  // dir/branch readable (worktree-1a2b3c4d).
+  const generateBranchName = useCallback(() => {
+    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    setBranchName(`worktree-${suffix}`);
+  }, []);
+  // The project's stored default base branch (Project settings), trimmed. Wins
+  // over the user-global default (Settings › Git); an unset project default
+  // falls through to the global one, then to blank (fork from current branch).
+  const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
+
+  // The path the once-per-host auto-seed WOULD land on: the most-recent path,
+  // else the derived home. Exposed as a memo so we can probe its repo for
+  // worktrees before committing to it (see the fork-fresh redirect below).
+  const autoSeedCandidate = useMemo(() => recent[0] ?? derivedHome ?? null, [recent, derivedHome]);
+  // "Fork fresh from default": when the project defines a default base branch,
+  // a fresh new-chat must NOT silently continue in the last-used worktree — it
+  // should fork a new branch off that default. The auto-seed can land on a
+  // linked worktree (a recent path that happens to be one), which prefills its
+  // branch and suppresses the base-branch fill. So when a default is set, probe
+  // the seed candidate's repo and redirect the seed to the MAIN work tree. Only
+  // armed until the host is seeded (the once-per-host guard), and skipped for
+  // sandboxes (no host worktrees).
+  const forkFreshArmed =
+    prefillSettled &&
+    selectedHostId !== null &&
+    !sandboxSelected &&
+    projectBaseBranch !== null &&
+    seededHostRef.current !== selectedHostId &&
+    autoSeedCandidate !== null;
+  const {
+    data: seedWorktrees,
+    isPlaceholderData: seedWorktreesArePlaceholder,
+    isError: seedWorktreesErrored,
+  } = useHostWorktrees(
+    forkFreshArmed ? selectedHostId : null,
+    forkFreshArmed ? autoSeedCandidate : null,
+  );
+  // Resolve the fork-fresh redirect to a STABLE value so the seed effect can
+  // depend on the decision, not the worktree array (whose identity churns every
+  // render). `undefined` = probe still loading (wait); `null` = not armed or no
+  // redirect (seed the candidate as-is); a string = the MAIN repo path to
+  // redirect the seed to (the candidate is a linked worktree we should fork off
+  // the project default instead of reusing).
+  const forkFreshMainPath = useMemo<string | null | undefined>(() => {
+    if (!forkFreshArmed) return null;
+    // A probe error (non-400; the hook already maps 400 → []) leaves data
+    // undefined for good. Treat it as "no redirect" so the seed still lands on
+    // the candidate as-is, rather than waiting on data that never arrives and
+    // leaving the workspace blank forever.
+    if (seedWorktreesErrored) return null;
+    if (seedWorktreesArePlaceholder || seedWorktrees === undefined) return undefined;
+    const norm = normalizeWorkspacePath(autoSeedCandidate);
+    const candIsLinkedWorktree = seedWorktrees.some(
+      (w) => !w.is_main && normalizeWorkspacePath(w.path) === norm,
+    );
+    const mainPath = seedWorktrees.find((w) => w.is_main)?.path ?? null;
+    return candIsLinkedWorktree && mainPath !== null ? mainPath : null;
+  }, [
+    forkFreshArmed,
+    seedWorktrees,
+    seedWorktreesArePlaceholder,
+    seedWorktreesErrored,
+    autoSeedCandidate,
+  ]);
+
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the
   // derived home (which can arrive a render later, hence the dep). Holds
@@ -2429,11 +2546,39 @@ export function NewChatLandingScreen() {
     if (!prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
-    const candidate = recent[0] ?? derivedHome;
-    if (!candidate) return;
+    if (autoSeedCandidate === null) return;
+    // Fork-fresh redirect pending: wait for the probe rather than seeding the
+    // wrong path (and locking the once-per-host guard).
+    if (forkFreshMainPath === undefined) return;
+
+    const didForkFresh = forkFreshMainPath !== null;
+    const candidate = didForkFresh ? forkFreshMainPath : autoSeedCandidate;
     seededHostRef.current = selectedHostId;
-    setWorkspace((cur) => (cur === "" ? candidate : cur));
-  }, [selectedHostId, recent, derivedHome, prefillSettled]);
+    // Seed into an empty field only, so a config-supplied (or explicitly
+    // picked) workspace isn't clobbered.
+    const seededWorkspace = workspace === "";
+    if (seededWorkspace) setWorkspace(candidate);
+    // Fork fresh only when we actually seeded the redirect AND no branch is set
+    // — a project that supplies its own workspace keeps a plain launch, and a
+    // branch typed/picked while the probe was loading isn't overwritten (the
+    // same guards the opt-in-worktree effect below enforces).
+    if (didForkFresh && seededWorkspace && branchName === "" && prefilledBranch === "") {
+      // Preempt the opt-in-worktree effect so it can't also seed a branch, then
+      // name one here to fork fresh off the project default. Store the ref in
+      // the raw representation that effect compares against (workspaceTrimmed).
+      worktreeSeededForRef.current = candidate;
+      generateBranchName();
+    }
+  }, [
+    selectedHostId,
+    autoSeedCandidate,
+    prefillSettled,
+    forkFreshMainPath,
+    workspace,
+    branchName,
+    prefilledBranch,
+    generateBranchName,
+  ]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -2771,25 +2916,28 @@ export function NewChatLandingScreen() {
         unreadyHarnesses: SMART_ROUTING_ARMS.filter((harness) =>
           harnessUnconfiguredOnHost(harness, harnessWarningHost),
         ),
-        // The five-arm menu the top-level row drives needs BOTH families on the
-        // gateway for the external router, so either one the host doesn't back
-        // takes the row away — unless the built-in judge can route it instead.
+        // Picking the harness is the external router's job alone, so the row
+        // needs it configured AND both families on the gateway its apply layer
+        // rewrites through. The built-in judge routes a model inside one
+        // harness and can't stand in here.
+        externalRoutingAvailable: externalRoutingConfigured,
         notGatewayBackedHarnesses: SMART_ROUTING_ARMS.filter(
           (harness) => !hostBacksHarnessWithGateway(harnessWarningHost, harness),
         ),
-        ossRoutingAvailable: ossRoutingConfigured,
       }),
-    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, ossRoutingConfigured],
+    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, externalRoutingConfigured],
   );
   const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
   // The fully-auto brain needs SOME router able to answer for both model
   // families — the router may land the session's work on either, and an arm the
   // external router can't reach (off the workspace AI gateway) is only a loss
-  // when the built-in judge can't cover it either. Source availability ONLY:
-  // unlike the top-level row, the bundle brain routes across SDK harnesses, so
-  // the native wrappers/CLIs are deliberately not required here. Gates the
-  // OPTIONS map only — membership checks and the summary label for an existing
-  // pick keep reading `brainHarnessLabelsAll`.
+  // when the built-in judge can't cover it either. The judge picks the bundle
+  // brain's harness as well as its model, so unlike the native-pane row above
+  // this surface stays on a judge-only deployment. Source availability ONLY:
+  // the bundle brain routes across SDK harnesses, so the native wrappers/CLIs
+  // are deliberately not required here. Gates the OPTIONS map only — membership
+  // checks and the summary label for an existing pick keep reading
+  // `brainHarnessLabelsAll`.
   const brainRoutable = SMART_ROUTING_ARMS.every(
     (harness) =>
       smartRoutingSourceFor({
@@ -2934,11 +3082,13 @@ export function NewChatLandingScreen() {
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
-  // Auto-fill the base branch from the configured default (Settings › Git) when
-  // a new-worktree branch is named, but only until the user touches the base
-  // field — then their choice (including a cleared field) stands. Clearing the
-  // branch name (so the base field goes away) re-arms the auto-fill, so naming
-  // a branch again starts fresh from the current default.
+  // Auto-fill the base branch when a new-worktree branch is named, but only
+  // until the user touches the base field — then their choice (including a
+  // cleared field) stands. Clearing the branch name (so the base field goes
+  // away) re-arms the auto-fill, so naming a branch again starts fresh from the
+  // current default. The project's stored default (Project settings) wins over
+  // the user-global one (Settings › Git); an unset project default falls
+  // through to the global one, then to blank (fork from current branch).
   useEffect(() => {
     if (!shouldCreateWorktree) {
       // No base field shown: reset so the next named branch re-seeds cleanly.
@@ -2947,9 +3097,9 @@ export function NewChatLandingScreen() {
       return;
     }
     if (!baseBranchEdited) {
-      _setBaseBranch(readDefaultBaseBranch() ?? "");
+      _setBaseBranch(projectBaseBranch ?? readDefaultBaseBranch() ?? "");
     }
-  }, [shouldCreateWorktree, baseBranchEdited]);
+  }, [shouldCreateWorktree, baseBranchEdited, projectBaseBranch]);
   // The branch input doubles as a combobox: focusing it reveals existing
   // worktrees, and what the user types filters them (match on branch or path
   // substring, case-insensitive). Typing a name that matches none = a new
@@ -2962,14 +3112,6 @@ export function NewChatLandingScreen() {
       (w) => (w.branch ?? "").toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
     );
   }, [linkedWorktrees, branchName]);
-  // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
-  const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-    setBranchName(`worktree-${suffix}`);
-  }, []);
   // Project prefill: seed host / workspace / agent from the project's stored
   // config, then settle so the generic defaults fill any slot the config left
   // unset. An opt-in worktree is generated by the dedicated effect below once
@@ -3215,14 +3357,17 @@ export function NewChatLandingScreen() {
   const workspaceLabel = workspaceTrimmed
     ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
     : "Working directory";
+  const selectedHostDisplayName = selectedHost
+    ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
+    : null;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : sandboxSelected
       ? sandboxLabel
-      : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
+      : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
   // The chip shows just the branch (the "(existing)" distinction lives in the
   // popover's warning; appending it here only gets clipped by the chip's cap).
-  const worktreeLabel = branchName.trim() || "No worktree";
+  const worktreeLabel = branchName.trim() || "Worktree";
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
   const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
@@ -3360,6 +3505,14 @@ export function NewChatLandingScreen() {
     }
   }
 
+  // No session was created after all, so the draft is the user's again —
+  // including when they navigated away and the unmount cleanup already
+  // dropped it on the strength of the submit.
+  function returnDraftToUser() {
+    submittedRef.current = false;
+    if (!onScreenRef.current) landingDraft = draftRef.current;
+  }
+
   async function handleCreate() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
@@ -3367,6 +3520,12 @@ export function NewChatLandingScreen() {
     if (!canSubmit) return;
     setCreating(true);
     setCreateError(null);
+    // The draft is spent from the moment it is submitted: it belongs to the
+    // session now being created, so a detour back to this screen must not
+    // hand it back pre-filled. Flipped here rather than on the response
+    // because the create outlives an unmount; a create that fails hands the
+    // draft back via returnDraftToUser.
+    submittedRef.current = true;
     try {
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -3397,6 +3556,16 @@ export function NewChatLandingScreen() {
       // sending both would silently disable routing for the whole session. Never
       // pin a model or an effort alongside routing, whatever the UI state says.
       const routingOwnsModel = costControlOverride === "on";
+      // A pinned native pane routes its MODEL at create too: the terminal
+      // launches with the session row and its turns start in the TUI, so
+      // routing after the fact means blocking the first prompt and replaying
+      // it. Sending the prompt here pins `model_override` before the pane
+      // exists. Bundle agents are excluded — they route on the first message
+      // event by design.
+      const pinnedNativeRoutes =
+        routingOwnsModel &&
+        !smartRoutingHarnessSelected &&
+        SMART_ROUTING_ARMS.some((harness) => harness === nativeAgent?.harness);
 
       // Prepend each "@"-tagged path as an attachment marker on its own line —
       // the same wording the native executors emit and that title-seeding
@@ -3563,7 +3732,8 @@ export function NewChatLandingScreen() {
             harness_override: smartRoutingHarnessSelected
               ? AUTO_HARNESS_ID
               : (pickedHarness ?? undefined),
-            smart_routing_message: smartRoutingHarnessSelected ? initialPrompt : undefined,
+            smart_routing_message:
+              smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
           }),
         });
         // The create doesn't answer until the host has spawned a runner — a
@@ -3596,6 +3766,7 @@ export function NewChatLandingScreen() {
         // the workspace and agent, so winning on the push can't skip past an
         // error the user needed to see on this screen.
         if ("error" in created) {
+          returnDraftToUser();
           setCreateError(created.error);
           return;
         }
@@ -3653,13 +3824,17 @@ export function NewChatLandingScreen() {
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
-      // The session was created — drop the preserved draft so the next visit
-      // to the landing screen starts clean (and the unmount cleanup below
-      // doesn't resurrect what we just sent).
-      submittedRef.current = true;
+      // The session was created — drop any draft a detour back to this
+      // screen stashed, so the next visit starts clean.
       landingDraft = null;
-      navigate(`/c/${data.id}`);
+      // Only follow the create while the user is still on the landing
+      // screen. A create that outlived it means they moved on to another
+      // session; jumping them into this one now would hijack that. The
+      // session is created either way and its first message stays held
+      // for whenever they open it.
+      if (onScreenRef.current) navigate(`/c/${data.id}`);
     } catch {
+      returnDraftToUser();
       setCreateError("Couldn't reach the server. Check your connection and try again.");
     } finally {
       setCreating(false);
@@ -3683,12 +3858,7 @@ export function NewChatLandingScreen() {
       {/* Label collapses to icon-only on narrow viewports (mobile). Capped
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
-      <span
-        className={`hidden max-w-40 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
-      >
-        {workspaceLabel}
-      </span>
-      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+      <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
     </button>
   );
 
@@ -3705,25 +3875,25 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-display-alt">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-sans">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
-            // to Otto's h-18 box so the centered composer doesn't shift when
+            // to Otto's h-16 box so the centered composer doesn't shift when
             // toggling between the two landings.
-            <span className="flex h-18 shrink-0 items-center">
+            <span className="flex h-16 shrink-0 items-center">
               <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
                 <FolderIcon className="size-6 text-brand-accent" />
               </div>
             </span>
           ) : (
-            <OttoEyes className="h-18 w-auto shrink-0" />
+            <OttoEyes className="h-16 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-[1.75em] font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+          <h1 className="min-w-0 break-words text-center text-[28px] leading-8 font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
             {selectedProject || "What should we build?"}
           </h1>
         </div>
-        <div className="relative flex w-full flex-col gap-3">
+        <div className="relative flex w-full flex-col gap-1">
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -3733,16 +3903,12 @@ export function NewChatLandingScreen() {
             onDragOver={handleDragOver}
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
-            // Two visual states only (no hover): resting --border, and
-            // --foreground while the textarea itself has focus (has-[]
-            // scopes it so focusing footer buttons doesn't trigger it).
-            // dark:bg-card-solid: the footer tray below tucks its top
-            // edge behind this card (-mt-9), and the dark glass --card
-            // is 60% alpha — the tucked strip ghosts through a
-            // translucent card. Mirrors the chat composer card. Drag-over
-            // lifts an inset ring (overlay below).
+            // A home-specific focus shadow adds depth without a resting shadow
+            // or focus border.
+            // dark:bg-card-solid stays opaque so dark glass --card doesn't show
+            // through. Drag-over keeps its separate inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)] transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -3872,16 +4038,17 @@ export function NewChatLandingScreen() {
               // Compose-pill text spec: SF Pro Text system stack at
               // 14px/20px. (Note: sub-16px inputs make mobile Safari
               // auto-zoom on focus — accepted tradeoff per the design.)
-              // Heights are border-box (16px top + 4px bottom padding lives
+              // Heights are border-box (12px top + 8px bottom padding lives
               // inside them): max 200px = the spec's 180px of content.
-              // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              // A 60px floor holds two 20px lines plus that padding;
+              // useAutoGrowTextarea expands from there to the unchanged cap.
+              className="min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
                 textarea; the pills themselves opt back in. */}
             {pillSkills.length > 0 && message.length === 0 && (
-              <div className="pointer-events-none absolute inset-x-4 top-4 flex flex-wrap items-center gap-2">
+              <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
                 <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
                   Describe a task, or try a skill
                 </span>
@@ -3964,7 +4131,10 @@ export function NewChatLandingScreen() {
             {/* No own bg — the pill paints the surface. An explicit bg-card
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
-            <div className="flex items-center justify-between pt-1 pr-4 pb-3 pl-2">
+            <div
+              className="flex items-center justify-between px-2 pb-2"
+              data-testid="new-chat-landing-actions"
+            >
               {/* Attach + dictate — left side, mirroring the in-session composer. */}
               <div className="flex items-center gap-0.5">
                 <Button
@@ -4138,16 +4308,12 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </form>
-          {/* Composer footer tray — host / working directory / worktree
-              selectors. Renders below the pill at z-0 while the pill sits
-              at z-10: -mt-9 cancels the wrapper's gap-3 (12px) and tucks
-              the tray's top 24px underneath the pill's rounded bottom
-              edge. Height is padding-driven (pt-8 + h-6 chips + pb-2 =
-              the same 64px as before when the chips fit one row) so the
-              chip row can wrap on narrow screens — with a fixed h-16 the
-              chips overflowed the viewport on phones, widening the whole
-              page (#sidebar-wider-than-screen on the landing page). */}
-          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl bg-tray/40 pt-8 pr-3 pb-2 pl-2">
+          {/* Footer tray (host / cwd / worktree). Sits below the composer with
+              symmetric vertical padding and no overlap. */}
+          <div
+            className="relative z-0 flex w-full items-center rounded-b-2xl py-1.5 pr-4 pl-2"
+            data-testid="new-chat-landing-footer"
+          >
             <div className="flex flex-wrap items-center gap-1">
               {/* Host chip */}
               <DropdownMenu
@@ -4166,17 +4332,17 @@ export function NewChatLandingScreen() {
                     className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
-                    {isCloudHost ? (
+                    {selectedHost?.status === "online" && !sandboxSelected ? (
+                      <>
+                        <span aria-hidden className="size-2 shrink-0 rounded-full bg-success" />
+                        <span className="sr-only">Online</span>
+                      </>
+                    ) : isCloudHost ? (
                       <MonitorCloudIcon className="ui-icon" />
                     ) : (
                       <MonitorIcon className="ui-icon" />
                     )}
-                    <span
-                      className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
-                    >
-                      {hostLabel}
-                    </span>
-                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                    <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -4190,7 +4356,7 @@ export function NewChatLandingScreen() {
                           onSelect={selectSandbox}
                           data-testid="new-chat-landing-sandbox-option"
                           data-active={sandboxSelected ? "true" : undefined}
-                          className="text-sm data-[active=true]:bg-accent/60"
+                          className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
@@ -4242,11 +4408,15 @@ export function NewChatLandingScreen() {
                       onSelect={() => selectHost(host.host_id)}
                       data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
-                      className="text-sm data-[active=true]:bg-accent/60"
+                      className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
                     >
                       <HostOption
                         host={host}
-                        subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                        displayName={displayNameForHost(
+                          host,
+                          thisMachineHostId,
+                          navigator.userAgent,
+                        )}
                       />
                     </DropdownMenuItem>
                   ))}
@@ -4267,11 +4437,12 @@ export function NewChatLandingScreen() {
                         >
                           <HostOption
                             host={host}
-                            subtitle={
-                              connectingThisMachine
-                                ? "connecting…"
-                                : "this machine · select to connect"
-                            }
+                            displayName={displayNameForHost(
+                              host,
+                              thisMachineHostId,
+                              navigator.userAgent,
+                            )}
+                            subtitle={connectingThisMachine ? "connecting…" : "select to connect"}
                           />
                         </DropdownMenuItem>
                       );
@@ -4280,7 +4451,11 @@ export function NewChatLandingScreen() {
                       <DropdownMenuItem key={host.host_id} disabled className="text-sm">
                         <HostOption
                           host={host}
-                          subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                          displayName={displayNameForHost(
+                            host,
+                            thisMachineHostId,
+                            navigator.userAgent,
+                          )}
                         />
                       </DropdownMenuItem>
                     );
@@ -4331,12 +4506,9 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span
-                        className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
-                      >
+                      <span className="hidden max-w-40 truncate text-sm sm:block">
                         {sandboxRepoLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-96 p-3">
@@ -4441,12 +4613,9 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span
-                        className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
-                      >
+                      <span className="hidden max-w-32 truncate text-sm sm:block">
                         {worktreeLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent
@@ -4525,10 +4694,10 @@ export function NewChatLandingScreen() {
                             // Floats over the popover as a combobox popup, so it
                             // doesn't stretch the box. Bounded height + internal
                             // scroll keep it from running off the viewport.
-                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
-                            <span className="px-2 pt-1 pb-0.5 text-sm font-medium tracking-wide text-muted-foreground uppercase">
+                            <span className="px-1.5 py-1 text-sm font-medium text-muted-foreground">
                               Existing worktrees
                             </span>
                             <ul className="flex flex-col gap-0.5">
@@ -4549,8 +4718,8 @@ export function NewChatLandingScreen() {
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
                                       }}
-                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-accent ${
-                                        selected ? "bg-accent" : ""
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-1.5 py-1 text-left text-sm transition-colors hover:bg-muted dark:hover:bg-muted/50 ${
+                                        selected ? "bg-muted dark:bg-muted/50" : ""
                                       }`}
                                       data-testid="new-chat-landing-worktree-option"
                                     >

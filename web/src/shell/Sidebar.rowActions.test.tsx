@@ -44,7 +44,9 @@ const mocks = vi.hoisted(() => {
     },
   };
   return {
-    rename: { mutate: vi.fn() },
+    // `isSuccess`/`isError` drive the row's hold-the-committed-name logic:
+    // it keeps showing the new title until the PATCH settles.
+    rename: { mutate: vi.fn(), isSuccess: false, isError: false },
     isMobile: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
@@ -233,6 +235,8 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  mocks.rename.isSuccess = false;
+  mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
   mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
@@ -452,6 +456,43 @@ describe("double-click to rename", () => {
     // the kebab's Rename item.
     expect(mocks.rename.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed Session" });
+  });
+
+  it("shows the committed title the moment the editor closes, before the list updates", () => {
+    // The rename mutation writes the new name into the list cache, but that
+    // reaches the row as a prop from the list above it, which re-renders a
+    // tick after the row's own state change. The row must not fall back to
+    // the pre-rename prop in between — that gap painted the old name for one
+    // frame as the input disappeared. The mocked mutation never updates the
+    // list, so the prop still says "My Session" throughout.
+    renderSidebar();
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByRole("link", { name: /Renamed Session/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /My Session/ })).toBeNull();
+  });
+
+  it("drops the committed title once a failed rename rolls the cache back", () => {
+    // The hook reverts the optimistic overlay when the PATCH fails, so the row
+    // has to stop showing the name the server rejected.
+    const { rerenderSidebar } = renderSidebar();
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("link", { name: /Renamed Session/ })).toBeTruthy();
+
+    mocks.rename.isError = true;
+    rerenderSidebar();
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Renamed Session/ })).toBeNull();
   });
 
   it("does not commit the rename when Enter confirms an active IME composition", () => {

@@ -11,6 +11,29 @@ class IssueType(StrEnum):
     ENHANCEMENT = "enhancement"
     DOCUMENTATION = "documentation"
 
+    @classmethod
+    def parse(cls, value: object) -> IssueType:
+        normalized = str(value).strip().casefold()
+        aliases = {
+            "bug": cls.BUG,
+            "feature": cls.ENHANCEMENT,
+            "enhancement": cls.ENHANCEMENT,
+            "docs": cls.DOCUMENTATION,
+            "documentation": cls.DOCUMENTATION,
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported issue type: {value!r}") from exc
+
+    @property
+    def label(self) -> str:
+        return {
+            IssueType.BUG: "Bug",
+            IssueType.ENHANCEMENT: "Feature",
+            IssueType.DOCUMENTATION: "Docs",
+        }[self]
+
 
 class Severity(StrEnum):
     S0 = "S0"
@@ -35,6 +58,7 @@ class Issue:
     severity: Severity
     area_keys: tuple[str, ...] = ()
     component_labels: tuple[str, ...] = ()
+    classification_reasoning: str = ""
     duplicate_count: int = 0
     upvote_count: int = 0
     current_priority: Priority | None = None
@@ -49,10 +73,13 @@ class Issue:
             number=int(value["number"]),
             title=str(value.get("title", "")),
             url=str(value.get("url", "")),
-            issue_type=_issue_type(value["type"]),
+            issue_type=IssueType.parse(value["type"]),
             severity=Severity(str(value["severity"])),
             area_keys=_string_tuple(value.get("area_keys", ())),
             component_labels=_string_tuple(value.get("component_labels", ())),
+            classification_reasoning=str(
+                value.get("classification_reasoning", value.get("reasoning", ""))
+            ),
             duplicate_count=max(0, int(value.get("duplicate_count", 0))),
             upvote_count=max(0, int(value.get("upvote_count", 0))),
             current_priority=Priority(str(current_priority)) if current_priority else None,
@@ -82,18 +109,3 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value)
-
-
-def _issue_type(value: object) -> IssueType:
-    normalized = str(value).strip().lower()
-    aliases = {
-        "bug": IssueType.BUG,
-        "feature": IssueType.ENHANCEMENT,
-        "enhancement": IssueType.ENHANCEMENT,
-        "docs": IssueType.DOCUMENTATION,
-        "documentation": IssueType.DOCUMENTATION,
-    }
-    try:
-        return aliases[normalized]
-    except KeyError as exc:
-        raise ValueError(f"unsupported issue type: {value!r}") from exc

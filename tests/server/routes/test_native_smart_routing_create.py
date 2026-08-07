@@ -7,15 +7,17 @@ the session row, so the harness is decided during the create — not on the firs
 message event the way the bundle-agent auto path does — and the session is
 rebound to the wrapper the router picked.
 
-A create pinned to one native harness (the CLI's ``omni claude --smart-routing``,
-or the web UI picking a harness with routing on) routes on the same seam for the
-same reason, but only the MODEL: its turns originate in the TUI, so the server
+A create pinned to one native harness (the web UI picking a harness with routing
+on) routes on the same seam for the same reason, but only the MODEL: its turns
+originate in the TUI, so the server
 never sees the first message pre-inference and the turn gate would never fire.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -178,9 +180,9 @@ async def _create_fixed_harness_session(
 ) -> httpx.Response:
     """POST a Smart Routing create for a session pinned to one harness.
 
-    The CLI's ``omni claude --smart-routing`` shape: a fixed harness (the native
-    wrapper agent, no ``harness_override``) plus routing on and the prompt as
-    ``smart_routing_message``.
+    The web UI's "Claude Code + Smart Routing" shape: a fixed harness (the
+    native wrapper agent, no ``harness_override``) plus routing on and the
+    prompt as ``smart_routing_message``.
 
     :param client: Test HTTP client.
     :param agent_id: Agent to bind.
@@ -484,6 +486,124 @@ async def test_smart_routing_session_keeps_cross_harness_subagents(
     # and may leave the session's own harness family.
     assert set(spawn_router.offered[0]) == {"claude-native", "codex-native"}
     assert resp.json()["harness"] == "codex-native"
+
+
+# ── The create's verdict is not re-derived on the first prompt ──────────────
+#
+# The prompt the landing screen routed is submitted again inside the harness,
+# where the first-prompt hook used to score it a second time — one more judge
+# call, tens of seconds later, for the verdict the pane was already running.
+
+
+async def _route_turn(
+    client: httpx.AsyncClient,
+    session_id: str,
+    routing_client: FakeRoutingClient | None,
+    *,
+    harness: str,
+    prompt: str,
+) -> httpx.Response:
+    """POST the in-harness first-prompt hook for *session_id*.
+
+    :param client: Test HTTP client.
+    :param session_id: The session whose prompt was submitted.
+    :param routing_client: Stub router the hook may call.
+    :param harness: The pane's harness, e.g. ``"codex-native"``.
+    :param prompt: The submitted prompt text.
+    :returns: The raw hook response.
+    """
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=False)):
+        return await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-turn",
+            json={"harness": harness, "prompt": prompt},
+        )
+
+
+async def test_the_first_prompt_reuses_the_creates_verdict(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    created = await _create_smart_routing_session(client, wrappers, routing_client)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    route = await _route_turn(
+        client,
+        session_id,
+        routing_client,
+        harness="codex-native",
+        prompt=ROUTING_MESSAGE,
+    )
+    assert route.status_code == 200, route.text
+    # Nothing to switch to and nothing to replay: the pane launched on the pick.
+    assert route.json()["action"] == "allow"
+    assert route.json()["terminal"] is True
+    # One router call for the whole session, not two.
+    assert len(routing_client.offered) == 1
+
+    # One chip, and it is the create's — now claimed as the session's decision,
+    # so a later prompt does not ask again either.
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert len(decisions) == 1
+    assert decisions[0]["scope"] == "session"
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get(ROUTING_DECISION_LABEL_KEY) == decisions[0]["decision_id"]
+
+
+async def test_a_prompt_the_create_did_not_route_still_routes(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    created = await _create_smart_routing_session(client, wrappers, routing_client)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    # The user edited the prompt in the pane before sending it, so the create's
+    # verdict was reached on text nobody submitted.
+    route = await _route_turn(
+        client,
+        session_id,
+        routing_client,
+        harness="codex-native",
+        prompt="actually, just fix the failing test",
+    )
+    assert route.status_code == 200, route.text
+    assert route.json()["action"] == "route"
+    assert len(routing_client.offered) == 2
+
+    decisions = _routing_decision_items(db_uri, session_id)
+    assert [d["scope"] for d in decisions] == ["session", "turn"]
+
+
+async def test_an_outage_at_create_leaves_the_first_prompt_free_to_route(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    wrappers = await _native_wrappers(client, db_uri)
+    created = await _create_smart_routing_session(client, wrappers, None)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    healthy = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    route = await _route_turn(
+        client,
+        session_id,
+        healthy,
+        harness="claude-native",
+        prompt=ROUTING_MESSAGE,
+    )
+    assert route.status_code == 200, route.text
+    # Nothing was routed at create, so there is no verdict to reuse.
+    assert route.json()["action"] == "route"
+    assert route.json()["model"] == CLAUDE_MODEL
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override == CLAUDE_MODEL
 
 
 async def test_bundle_agent_auto_path_is_unchanged(
@@ -1126,7 +1246,9 @@ async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() ->
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
-    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+    # An external router is what puts both panes on the menu; unknown gateway
+    # backing must not take it away.
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=False)):
         agent_name, model, _verdict, error = await _resolve_native_smart_routing(
             cast("Any", body),
             cast("Any", _routing_request(_host_reporting(None))),
@@ -1135,6 +1257,55 @@ async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() ->
 
     assert error is None
     assert (agent_name, model) == ("codex-native-ui", GPT_MODEL)
+
+
+async def test_a_judge_only_deployment_keeps_the_default_pane_and_routes_its_model() -> None:
+    """Choosing BETWEEN panes needs the workspace router; the model does not.
+
+    A native create bakes its harness into the terminal launch, so with no
+    external router the create keeps the default pane and routes only its
+    model — a normal Smart Routing session minus the harness half — rather
+    than declining into a session with no terminal.
+    """
+    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    judge = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)):
+        agent_name, model, verdict, error = await _resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host_reporting(None))),
+            "alice@example.com",
+        )
+
+    assert error is None
+    assert (agent_name, model) == ("claude-native-ui", CLAUDE_MODEL)
+    assert verdict is not None
+    assert verdict["router_source"] == "oss-llm"
+    # The chip says why the harness did not move.
+    assert "Harness routing" in verdict["rationale"]
+    # Only the kept pane was ever on the menu.
+    assert list(judge.offered[0]) == ["claude-native"]
+
+
+async def test_a_judge_only_create_pins_nothing_when_the_pick_is_out_of_family() -> None:
+    """One pane on offer means any pick resolves onto it — so check the family."""
+    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+
+    body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
+    judge = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)):
+        agent_name, model, verdict, error = await _resolve_native_smart_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(_host_reporting(None))),
+            "alice@example.com",
+        )
+
+    # The session still opens a terminal; it just keeps the CLI's own model.
+    assert agent_name == "claude-native-ui"
+    assert (model, verdict) == (None, None)
+    assert error is not None
+    assert GPT_MODEL in error
 
 
 async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_serve(
@@ -1234,6 +1405,56 @@ async def test_fixed_harness_routing_create_succeeds_off_the_gateway_with_the_ju
     items = (await client.get(f"/v1/sessions/{created.json()['id']}/items")).json()["data"]
     decisions = [i for i in items if i["type"] == "routing_decision"]
     assert decisions and decisions[0]["router_source"] == "oss-llm"
+
+
+@pytest.mark.parametrize("harness", list(AUTO_NATIVE_ROUTING_HARNESSES))
+async def test_a_pane_create_routes_with_the_judge_when_the_router_is_not_enabled(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+) -> None:
+    """Picking Smart Routing in the CLI's model menu, on a workspace with no router.
+
+    The gateway backing is fine here — the workspace simply never had the
+    routing API enabled, so ``routes:select`` 404s. The session must still get
+    a normal Smart Routing decision, from the judge.
+    """
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routing_backend import RoutingBackends
+
+    wrappers = await _native_wrappers(client, db_uri)
+    pick = _OFF_GATEWAY_CATALOG[harness][0]
+    external = FakeRoutingClient(
+        None, last_error="router returned HTTP 404: routes:select is not enabled for this account."
+    )
+    judge = FakeRoutingClient(RoutingResult(model=pick, rationale="sized task"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=judge),
+    )
+    body = {
+        "agent_id": wrappers[harness],
+        "cost_control_mode_override": "on",
+        "smart_routing_message": ROUTING_MESSAGE,
+    }
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        patch.object(orchestration, "_routing_host_for_create", return_value=_host_reporting({})),
+        patch.object(
+            orchestration,
+            "_pre_session_model_catalog",
+            AsyncMock(return_value={harness: [pick]}),
+        ),
+    ):
+        created = await client.post("/v1/sessions", json=body)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["model_override"] == pick
+    decisions = _routing_decision_items(db_uri, created.json()["id"])
+    assert decisions and decisions[0]["router_source"] == "oss-llm"
+    assert decisions[0]["applied"] is True
+    # The router was asked first — the judge is the fallback, not the default.
+    assert external.calls != []
 
 
 @pytest.mark.parametrize(
@@ -1494,12 +1715,20 @@ async def test_pre_session_catalog_reads_the_hosts_model_options(
     assert conn.pending_model_options == {}
 
 
-def _native_conv(session_id: str) -> Any:  # type: ignore[explicit-any]
+def _native_conv(  # type: ignore[explicit-any]
+    session_id: str,
+    *,
+    routing: bool = False,
+    archived: bool = False,
+) -> Any:
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 
     return SimpleNamespace(
         id=session_id,
         labels={"omnigent.wrapper": CLAUDE_NATIVE_CODING_AGENT.wrapper_label},
+        cost_control_mode_override="on" if routing else None,
+        harness_override=None,
+        archived=archived,
     )
 
 
@@ -1607,6 +1836,196 @@ async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
         await runner_client.aclose()
         _model_options_cache.pop(session_id, None)
         _model_options_stale.discard(session_id)
+
+
+async def test_launch_prefetch_takes_the_stale_refresh_off_the_turn_path() -> None:
+    """
+    Warming the catalog when the runner binds is what makes a first turn fast.
+
+    The stale-catalog refresh is the biggest single term in routing's
+    pre-router latency: the turn awaits a fetch that retries a booting runner.
+    Started at launch instead, it has landed by the time the prompt arrives and
+    the turn reads the cache — no wait, no second fetch.
+    """
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _model_options_inflight,
+        _model_options_stale,
+        _native_turn_catalog,
+    )
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_launch"
+    conv = _native_conv(session_id, routing=True)
+    # What the host resolved before launch — stale, so a turn would refetch it.
+    _model_options_cache[session_id] = [{"id": "opus", "model": "databricks-claude-opus-5"}]
+    _model_options_stale.add(session_id)
+    requested: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"workers": {"self": {"models": [{"id": "opus"}]}}})
+        return httpx.Response(
+            200, json={"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+    try:
+        prefetch_session_routing_catalogs(session_id, conv, runner_client)
+        inflight = _model_options_inflight.get(session_id)
+        assert inflight is not None
+        await inflight
+        assert session_id not in _model_options_stale
+        requested.clear()
+
+        assert await _native_turn_catalog(session_id, conv, runner_client) == [
+            "databricks-claude-opus-4-8"
+        ]
+        # The turn neither waited nor re-fetched: the launch prefetch answered.
+        assert requested == []
+    finally:
+        await asyncio.sleep(0)
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+        _model_options_stale.discard(session_id)
+
+
+def _prefetch_client(requested: list[str], *, fail: bool = False) -> httpx.AsyncClient:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if fail:
+            # What a tunnel torn down mid-prefetch raises: not an httpx error,
+            # so the fetch helpers do not catch it themselves.
+            raise RuntimeError("tunnel closed")
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"workers": {"self": {"models": [{"id": "opus"}]}}})
+        return httpx.Response(
+            200, json={"models": [{"id": "opus", "model": "databricks-claude-opus-4-8"}]}
+        )
+
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+
+
+async def test_plain_session_gets_no_catalog_prefetch_on_runner_connect() -> None:
+    """
+    A reconnect must cost a plain pane nothing.
+
+    The reconnect callback walks every session bound to the runner, so an
+    ungated prefetch turned one host's tunnel flap into two runner round trips
+    per plain pane — work only Smart Routing ever reads — starving the session
+    re-init running alongside it.
+    """
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_plain"
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested)
+    try:
+        before = set(_catalog_prefetch_tasks)
+        prefetch_session_routing_catalogs(session_id, _native_conv(session_id), runner_client)
+        await asyncio.sleep(0)
+
+        assert session_id not in _model_options_inflight
+        assert set(_catalog_prefetch_tasks) == before
+        assert requested == []
+    finally:
+        await runner_client.aclose()
+
+
+async def test_archived_routed_session_gets_no_catalog_prefetch() -> None:
+    """An archived session is not going to route a turn, so it warms nothing."""
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_archived"
+    conv = _native_conv(session_id, routing=True, archived=True)
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested)
+    try:
+        before = set(_catalog_prefetch_tasks)
+        prefetch_session_routing_catalogs(session_id, conv, runner_client)
+        await asyncio.sleep(0)
+
+        assert session_id not in _model_options_inflight
+        assert set(_catalog_prefetch_tasks) == before
+        assert requested == []
+    finally:
+        await runner_client.aclose()
+
+
+async def test_routed_live_session_still_warms_both_catalogs() -> None:
+    """The gate keeps the case it was built for: a routed pane warms both."""
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _model_options_inflight,
+    )
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_routed"
+    conv = _native_conv(session_id, routing=True)
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested)
+    try:
+        before = set(_catalog_prefetch_tasks)
+        prefetch_session_routing_catalogs(session_id, conv, runner_client)
+        started = set(_catalog_prefetch_tasks) - before
+        options_task = _model_options_inflight.get(session_id)
+        assert options_task is not None
+        assert len(started) == 1
+        await asyncio.gather(options_task, *started)
+
+        assert sorted(requested) == [
+            f"/v1/sessions/{session_id}/claude-model-options",
+            f"/v1/sessions/{session_id}/models",
+        ]
+        assert _model_options_cache[session_id] == [
+            {"id": "opus", "model": "databricks-claude-opus-4-8"}
+        ]
+    finally:
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+
+
+async def test_failing_prefetch_retrieves_its_own_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A prefetch that raises must not leave an unretrieved task exception.
+
+    Nothing awaits these tasks, so an escaping error surfaces only as asyncio's
+    unretrieved-exception warning at GC time — noise that hides real failures.
+    """
+    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+
+    session_id = "conv_prefetch_raises"
+    conv = _native_conv(session_id, routing=True)
+    requested: list[str] = []
+    runner_client = _prefetch_client(requested, fail=True)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="omnigent.server.routes.sessions"):
+            before = set(_catalog_prefetch_tasks)
+            prefetch_session_routing_catalogs(session_id, conv, runner_client)
+            started = set(_catalog_prefetch_tasks) - before
+            options_task = _model_options_inflight.get(session_id)
+            assert options_task is not None
+            await asyncio.gather(options_task, *started)
+
+        assert options_task.exception() is None
+        assert [task.exception() for task in started] == [None]
+        assert any("Catalog prefetch failed" in record.message for record in caplog.records)
+    finally:
+        await runner_client.aclose()
 
 
 async def test_turn_catalog_keeps_a_stale_catalog_when_the_refetch_fails() -> None:
@@ -1820,7 +2239,7 @@ async def test_a_routing_outage_still_creates_the_fixed_harness_session(
     failure: Exception,
 ) -> None:
     """
-    ``omni claude --smart-routing`` creates and launches unrouted, with a card.
+    A fixed-harness create launches unrouted, with a card.
 
     The harness was the caller's own choice, so only the model was ever at
     stake: nothing is pinned, the session opens on the CLI's default, and the

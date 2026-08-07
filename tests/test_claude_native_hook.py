@@ -2809,7 +2809,9 @@ def test_route_turn_falls_open_on_the_ladders_own_request_budget(
     assert seen == [HOOK_REQUEST_TIMEOUT_S]
     # Single digits: a fail-open the user waits half a minute for is blocking
     # in practice, whatever the code path says.
-    assert HOOK_REQUEST_TIMEOUT_S < 10.0
+    # Must outlast a healthy route (catalog prep + router call), capped at the
+    # owner's 15s ceiling.
+    assert HOOK_REQUEST_TIMEOUT_S <= 15.0
     # Nothing blocked and nothing marked, so the prompt ran.
     assert capsys.readouterr().out == ""
     assert not (bridge_dir / MARKER_FILE).exists()

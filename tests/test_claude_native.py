@@ -8,6 +8,7 @@ import importlib.metadata
 import io
 import json
 import os
+import shlex
 import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -324,6 +325,81 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
         api_key_helper="printf token",
         model="databricks-claude-opus-test",
     )
+
+
+def _ucode_state_with_auth_command(auth_command: str) -> Any:
+    """Build a one-agent ucode workspace state carrying *auth_command*."""
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    return UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        agents={
+            "claude": UcodeAgentState(
+                model="databricks-claude-opus-test",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command=auth_command,
+            )
+        },
+    )
+
+
+def test_ucode_config_pins_the_token_helper_to_the_named_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The profile the config names is the identity the pane must authenticate as.
+
+    ucode records its own token command, and it selects the workspace however
+    ucode was configured — often by host. The server's router client instead
+    uses the ``kind: databricks`` provider's profile. Two profiles on one host
+    are two identities, so host selection is how a pane and the router end up
+    disagreeing about whether the workspace is reachable.
+
+    The preference is not exclusive: the recorded command survives as the
+    helper's last resort, for the config that names a credential-less profile.
+    """
+    recorded = (
+        'databricks auth token --host "https://example.databricks.com" '
+        "--output json | jq -r '.access_token'"
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: _ucode_state_with_auth_command(recorded),
+    )
+
+    config = claude_native._ucode_config_for_profile("agent", refresh_models=False)
+
+    assert config is not None
+    helper = config.api_key_helper
+    assert helper is not None
+    # The mint selects by profile; the only --host left is the quoted fallback.
+    assert '--profile "agent"' in helper
+    mint, _, fallback = helper.partition("eval ")
+    assert "--host" not in mint
+    assert fallback.startswith(shlex.quote(recorded))
+
+
+def test_ucode_config_leaves_a_non_databricks_token_command_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An enterprise deployment's own token command has a selector we don't know."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: _ucode_state_with_auth_command("corp-auth print-token --scope llm"),
+    )
+
+    config = claude_native._ucode_config_for_profile("agent", refresh_models=False)
+
+    assert config is not None
+    assert config.api_key_helper == "corp-auth print-token --scope llm"
 
 
 def test_ucode_config_for_profile_sets_model_tier_env_vars(

@@ -54,7 +54,6 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
         user_id=row.user_id,
         conversation_id=row.conversation_id,
         level=row.level,
-        can_approve=row.can_approve,
     )
 
 
@@ -85,8 +84,6 @@ class SqlAlchemyPermissionStore(PermissionStore):
         user_id: str,
         conversation_id: str,
         level: int,
-        *,
-        can_approve: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
         with self._session("grant_permission") as session:
@@ -95,7 +92,6 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "level": level,
-                "can_approve": can_approve,
             }
             stmt: Insert
             if dialect == "sqlite":
@@ -104,14 +100,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .values(**values)
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level, "can_approve": can_approve},
+                        set_={"level": level},
                     )
                 )
             elif dialect == "mysql":
                 stmt = (
                     mysql_insert(SqlSessionPermission)
                     .values(**values)
-                    .on_duplicate_key_update(level=level, can_approve=can_approve)
+                    .on_duplicate_key_update(level=level)
                 )
             else:
                 stmt = (
@@ -119,7 +115,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .values(**values)
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level, "can_approve": can_approve},
+                        set_={"level": level},
                     )
                 )
             session.execute(stmt)
@@ -128,7 +124,6 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 user_id=user_id,
                 conversation_id=conversation_id,
                 level=level,
-                can_approve=can_approve,
             )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
@@ -407,7 +402,6 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 is_admin=False,
                 user_grant_level=None,
                 public_grant_level=None,
-                user_can_approve=False,
             )
         # One session = one connection checkout + transaction. Against a
         # remote DB (Lakebase) this is the round-trip that matters; the three
@@ -428,7 +422,6 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 is_admin=user_row is not None and user_row.is_admin,
                 user_grant_level=user_grant.level if user_grant is not None else None,
                 public_grant_level=public_grant.level if public_grant is not None else None,
-                user_can_approve=(user_grant.can_approve if user_grant is not None else False),
             )
 
     def has_any_grants(self, conversation_id: str) -> bool:

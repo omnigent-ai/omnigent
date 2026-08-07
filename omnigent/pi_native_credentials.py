@@ -315,8 +315,8 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         api="anthropic-messages",
         model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
-        # bearer token is refreshed per request (the auth command itself
-        # force-refreshes), matching codex-native's refresh semantics.
+        # bearer token is re-read per request (the auth command attempts a
+        # refresh), matching codex-native's refresh semantics.
         api_key=api_key,
         auth_header=True,
         extra_models=claude_models,

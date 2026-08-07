@@ -583,6 +583,9 @@ function chipPendingBeforeRegion(blocks: AnyBlock[], startBlock: number): boolea
     return false;
   for (let j = k + 1; j < blocks.length; j += 1) {
     const b = blocks[j]!;
+    // A sibling chip waiting on the same message doesn't end the pairing window
+    // (see `pairableMessageAfter`); real assistant output does.
+    if (b.type === "routing_decision") continue;
     if (!isChipPairingSkippable(b) && b.type !== "user_message") return false;
   }
   return true;
@@ -658,14 +661,15 @@ function walkBubbles(
     }
 
     if (b.type === "user_message") {
-      const chipIndex = deferred.byMessage.get(i);
+      const chipIndexes = deferred.byMessage.get(i);
+      const firstChip = chipIndexes?.[0];
       // The pair's region starts at whichever block came first, so an
       // incremental re-walk rebuilds both bubbles together — plus whatever
       // rendered in between, hence the recorded count rather than `i`'s.
-      lastBubbleStart = chipIndex !== undefined ? Math.min(chipIndex, i) : i;
+      lastBubbleStart = firstChip !== undefined ? Math.min(firstChip, i) : i;
       const regionBubbleStart =
-        chipIndex !== undefined
-          ? (bubbleCountAtChip.get(chipIndex) ?? bubbles.length)
+        firstChip !== undefined
+          ? (bubbleCountAtChip.get(firstChip) ?? bubbles.length)
           : bubbles.length;
       bubbles.push({
         kind: "user",
@@ -676,8 +680,10 @@ function walkBubbles(
         // steady across the optimistic→committed swap — no remount/flink.
         stableKey: b.stableKey,
       });
-      if (chipIndex !== undefined) {
-        bubbles.push(routingChipBubble(blocks[chipIndex] as RoutingDecisionBlock, chipIndex));
+      if (chipIndexes !== undefined) {
+        for (const chipIndex of chipIndexes) {
+          bubbles.push(routingChipBubble(blocks[chipIndex] as RoutingDecisionBlock, chipIndex));
+        }
       }
       lastBubbleCount = bubbles.length - regionBubbleStart;
       i += 1;
@@ -882,8 +888,8 @@ function deferredRoutingChips(
   blocks: AnyBlock[],
   startIndex: number,
   superseded: ReadonlySet<number>,
-): { byMessage: Map<number, number>; indexes: Set<number> } {
-  const byMessage = new Map<number, number>();
+): { byMessage: Map<number, number[]>; indexes: Set<number> } {
+  const byMessage = new Map<number, number[]>();
   const indexes = new Set<number>();
   for (let j = startIndex; j < blocks.length; j += 1) {
     const chip = blocks[j]!;
@@ -891,13 +897,47 @@ function deferredRoutingChips(
     if (superseded.has(j)) continue;
     // Already below its message — leave it where it is.
     if (adjacent(blocks, j, -1)?.type === "user_message") continue;
-    const next = adjacent(blocks, j, 1);
-    if (next !== null && next.type === "user_message") {
-      byMessage.set(next.index, j);
+    const next = pairableMessageAfter(blocks, j, superseded);
+    if (next !== null) {
+      const chips = byMessage.get(next) ?? [];
+      chips.push(j);
+      byMessage.set(next, chips);
       indexes.add(j);
     }
   }
   return { byMessage, indexes };
+}
+
+/**
+ * Index of the user message a chip at `from` routes, looking forward.
+ *
+ * Steps over the non-content blocks `adjacent` skips, plus the sibling chips
+ * that are themselves waiting on the same message: a create with Smart Routing
+ * as BOTH model and harness records the pick as a `session` chip, and the first
+ * turn records its own `turn` chip, so two chips sit above the session's first
+ * message. Neither is a content block between them, so both belong below the
+ * message, in transcript order. Superseded chips render nothing, so they are
+ * stepped over too. A sub-agent chip is NOT stepped over — it renders standalone
+ * where it occurs, and moving a session chip past it would reorder the two.
+ */
+function pairableMessageAfter(
+  blocks: AnyBlock[],
+  from: number,
+  superseded: ReadonlySet<number>,
+): number | null {
+  for (let k = from + 1; k < blocks.length; k += 1) {
+    const b = blocks[k]!;
+    if (isChipPairingSkippable(b)) continue;
+    if (b.type === "user_message") return k;
+    if (
+      b.type === "routing_decision" &&
+      (superseded.has(k) || isSessionScopedDecision(b.routing?.scope))
+    ) {
+      continue;
+    }
+    return null;
+  }
+  return null;
 }
 
 /**

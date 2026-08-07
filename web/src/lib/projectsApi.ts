@@ -29,11 +29,16 @@ export interface ProjectConfig {
    * Opt-in worktree default: only `true` is meaningful. When `true`, a new
    * session in a git workspace starts in a fresh randomly-named worktree; unset
    * (the only other value the dialog stores) starts directly in the workspace.
-   * `false` is never written and is treated the same as unset. The base branch a
-   * worktree forks from stays a global preference (Settings › Git), not a
-   * project default.
+   * `false` is never written and is treated the same as unset.
    */
   use_worktree?: boolean;
+  /**
+   * Default base branch a new worktree forks from, pre-filled into the
+   * composer's base-branch field. Takes precedence over the user-global default
+   * (Settings › Git); an unset key falls through to that global default. Blank
+   * is never stored (treated the same as unset).
+   */
+  base_branch?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

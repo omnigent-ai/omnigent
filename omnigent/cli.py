@@ -80,7 +80,7 @@ if TYPE_CHECKING:
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.server.smart_routing import LLMRoutingClient
-    from omnigent.smart_routing_cli import RoutingDecision
+    from omnigent.smart_routing_cli import ArmedSession
     from omnigent.spec.types import LLMConfig
     from omnigent.update_check import _InstalledWheelInfo
 
@@ -249,12 +249,14 @@ def _build_default_databricks_routing_client(
 def _build_external_routing_client(
     routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
     settings: Any = None,  # type: ignore[explicit-any]  # RoutingSettings | None
+    cfg: Any = None,  # type: ignore[explicit-any]  # parsed server config
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
     an explicit, provider-agnostic ``api_key`` (``${ENV}`` expanded) wins,
-    else the Databricks ``profile`` convenience, else unauthenticated.
+    else the Databricks ``profile`` convenience, else the deployment's own
+    ``kind: databricks`` provider profile, else unauthenticated.
     Optional ``model_prefix`` (a single prefix or a list of prefixes) is
     stripped from catalog model ids sent to the router (and restored on its
     answer) — e.g. ``"databricks-"`` when serving-endpoint names carry that
@@ -266,6 +268,8 @@ def _build_external_routing_client(
     :param settings: The parsed routing settings, supplying the extraction
         model, scenario menus, and model prefixes. ``None`` parses them from
         *routing_cfg*.
+    :param cfg: The parsed server ``--config`` mapping, read only for the
+        provider profile fallback. ``None`` skips that fallback.
     :returns: A configured client, or ``None`` when required config is
         missing (a warning is logged; routing stays off rather than raising).
     """
@@ -298,6 +302,13 @@ def _build_external_routing_client(
         auth = _bearer_auth(expand_env_vars({"api_key": api_key})["api_key"])
     elif profile:
         databricks_profile = profile
+    else:
+        # Named nowhere in ``routing:``, but the deployment's own Databricks
+        # provider names one. Take it rather than falling through to the
+        # ambient SDK chain: ambient resolves by host or [DEFAULT], and a
+        # workspace with two profiles on one host then has the router
+        # authenticating as a different identity than the panes it routes.
+        databricks_profile = _databricks_provider_profile(cfg) if cfg is not None else None
 
     from omnigent.server.smart_routing import ExternalRoutingClient
 
@@ -372,7 +383,7 @@ def _build_routing_backends(
         return RoutingBackends()
     external: Any = None  # type: ignore[explicit-any]
     if provider == "external":
-        external = _build_external_routing_client(routing_cfg, settings)
+        external = _build_external_routing_client(routing_cfg, settings, cfg)
     elif not isinstance(routing_cfg, dict):
         external = _build_default_databricks_routing_client(cfg, settings)
     return RoutingBackends(external=external, local=_build_local_llm_routing_client(server_llm))
@@ -1593,8 +1604,8 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     }
 
 
-def _help_style(text: str, **style: object) -> str:
-    """Colorize *text* for help output, honoring ``NO_COLOR``.
+def _cli_style(text: str, **style: object) -> str:
+    """Colorize *text* for terminal output, honoring ``NO_COLOR``.
 
     Click's ``echo`` already strips ANSI when the sink is not a TTY, so
     this only needs to guard the explicit ``NO_COLOR`` opt-out; on an
@@ -1618,7 +1629,7 @@ class _OmnigentCLI(click.Group):
     def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Render the usage line with an accent-colored ``Usage:`` prefix."""
         pieces = self.collect_usage_pieces(ctx)
-        prefix = f"{_help_style('Usage:', fg=_ACCENT_RGB, bold=True)} "
+        prefix = f"{_cli_style('Usage:', fg=_ACCENT_RGB, bold=True)} "
         formatter.write_usage(ctx.command_path, " ".join(pieces), prefix=prefix)
 
     def format_options(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
@@ -1627,9 +1638,9 @@ class _OmnigentCLI(click.Group):
         for param in self.get_params(ctx):
             rv = param.get_help_record(ctx)
             if rv is not None:
-                opts.append((_help_style(rv[0], fg="green"), rv[1]))
+                opts.append((_cli_style(rv[0], fg="green"), rv[1]))
         if opts:
-            with formatter.section(_help_style("Options", fg=_ACCENT_RGB, bold=True)):
+            with formatter.section(_cli_style("Options", fg=_ACCENT_RGB, bold=True)):
                 formatter.write_dl(opts)
         self.format_commands(ctx, formatter)
 
@@ -1677,10 +1688,10 @@ class _OmnigentCLI(click.Group):
         def _emit(title: str, rows: list[tuple[str, click.Command]], name_fg: object) -> None:
             if not rows:
                 return
-            with formatter.section(_help_style(title, fg=_ACCENT_RGB, bold=True)):
+            with formatter.section(_cli_style(title, fg=_ACCENT_RGB, bold=True)):
                 formatter.write_dl(
                     [
-                        (_help_style(name, fg=name_fg), cmd.get_short_help_str(limit))
+                        (_cli_style(name, fg=name_fg), cmd.get_short_help_str(limit))
                         for name, cmd in rows
                     ]
                 )
@@ -1689,7 +1700,7 @@ class _OmnigentCLI(click.Group):
         if any_hidden:
             formatter.write_paragraph()
             formatter.write_text(
-                _help_style(
+                _cli_style(
                     "Some harnesses need an optional extra — run `omnigent setup` to enable them.",
                     dim=True,
                 )
@@ -1816,6 +1827,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "sandbox",
         "server",
         "setup",
+        "start",
         "stop",
         "uninstall",
         "update",
@@ -4131,6 +4143,47 @@ def server_status(json_output: bool) -> None:
     click.echo(f"  host daemon attached: {'yes' if daemon_attached else 'no'}")
 
 
+@cli.command("start")
+@click.option("--server", default=None, help="Omnigent server URL to host on.")
+@click.option(
+    "--non-interactive",
+    "non_interactive",
+    is_flag=True,
+    default=False,
+    help=(
+        "Never prompt for sign-in. When the server requires auth and you "
+        "are not logged in, fail with the `omnigent login` hint instead of "
+        "launching the browser login flow. Use this in scripts and CI."
+    ),
+)
+def start(server: str | None, non_interactive: bool) -> None:
+    """Start Omnigent on this machine, in the background.
+
+    The on switch, and the counterpart of ``omnigent stop``: brings up the
+    local server (web UI / history) and registers this machine as a host, then
+    returns. With a configured or explicit ``--server`` it hosts on that server
+    instead, and no local server is started.
+
+    An alias of ``omnigent host --background`` — reach for that spelling when
+    a script wants the host lifecycle by name (``omnigent host status`` /
+    ``omnigent host stop``). Sign-in happens here, in your terminal, before the
+    daemon detaches.
+
+    :param server: Omnigent server URL to host on, e.g.
+        ``"https://example.databricksapps.com"``. ``None`` falls back to
+        config; empty string forces local mode.
+    :param non_interactive: When ``True``, never launch the browser login for
+        an un-authed remote server — fail with the ``omnigent login`` hint
+        instead.
+    :returns: None.
+    """
+    _run_background_host(
+        _resolve_host_server(server),
+        stop_command="omnigent stop",
+        non_interactive=non_interactive,
+    )
+
+
 @cli.command("stop")
 @click.option(
     "--force",
@@ -4140,10 +4193,11 @@ def server_status(json_output: bool) -> None:
 def stop(force: bool) -> None:
     """Stop everything Omnigent is running on this machine.
 
-    The off switch: stops every host daemon (local and remote-targeted)
-    and the detached background server. Runners are reaped when their daemon
-    exits. To stop only hosting while keeping the local server (web UI /
-    history) up, use ``omnigent host stop`` instead.
+    The off switch, and the counterpart of ``omnigent start``: stops every host
+    daemon (local and remote-targeted) and the detached background server.
+    Runners are reaped when their daemon exits. To stop only hosting while
+    keeping the local server (web UI / history) up, use ``omnigent host stop``
+    instead.
 
     :param force: Continue past individual failures and SIGKILL daemons that
         do not exit on SIGTERM.
@@ -6200,10 +6254,12 @@ _RESUME_HELP = (
 )
 _CONTINUE_HELP = "Continue the most recent conversation for this agent."
 _NO_SESSION_HELP = "Use a fresh temporary local session store for this run."
-_SMART_ROUTING_HELP = (
-    "Let the server pick the model for this launch (and the harness too, "
-    "unless --harness pins one). Requires -p, except with --harness "
-    "claude-native / codex-native, which route on your first typed message."
+#: ``run --smart-routing`` is gone; the flag survives only to say where routing
+#: moved. Remove the option (and the check that raises this) in 0.11.
+_RUN_SMART_ROUTING_REMOVED = (
+    "CLI smart routing is per-harness first-message only; use the web UI for "
+    "router-picked harnesses. Run `omnigent claude --smart-routing` or "
+    "`omnigent codex --smart-routing` to route this harness's first typed message."
 )
 
 _FORK_HELP = "Fork an existing session by id and open the REPL on the fork."
@@ -6678,68 +6734,31 @@ def _dispatch_native_terminal_harness(
     return True
 
 
-# ── Smart Routing (route before launch) ──────────────────────────────────
-# Only a launch with no harness able to route from inside itself needs the text
-# up front: the cross-harness route has to pick a harness before one exists to
-# hook, and a harness without the first-message hook can never route in-session.
-_SMART_ROUTING_NEEDS_PROMPT = (
-    "--smart-routing needs the text to route up front here: this launch has no "
-    'harness that can route from inside itself, so pass -p "<prompt>", start the '
-    "session from the web UI, or pin --harness claude-native / --harness "
-    "codex-native, which route on the first message you type."
-)
-#: Fail-open harness for a tier-3 route that returned nothing usable.
-_SMART_ROUTING_FALLBACK_HARNESS = "claude-native"
+# ── Smart Routing (arm the session, the harness routes the first message) ─
+# The CLI never routes a prompt at create time: ``--smart-routing`` turns Smart
+# Routing on for a new session and the harness's own first-message hook picks
+# the model once the user types. Routing a prompt up front is the web UI's job.
 
 
-def _smart_routing_capable_harness(harness: str | None) -> str | None:
+def _reject_smart_routing_prompt(prompt: str | None) -> None:
     """
-    Canonical native harness for *harness*, when Smart Routing can launch it.
+    Reject ``--smart-routing`` combined with ``-p``.
 
-    A routed launch has to carry the prompt into the TUI, so only native
-    terminal harnesses whose dispatch spec accepts a prompt qualify.
-
-    :param harness: Requested harness (canonical or alias), e.g.
-        ``"claude-native"``. Bare ``"claude"`` canonicalizes to the SDK
-        harness, which is not routable here.
-    :returns: The canonical harness id, or ``None`` when it is not routable.
-    """
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
-
-    native = native_coding_agent_for_harness(harness)
-    if native is None:
-        return None
-    spec = _NATIVE_TERMINAL_DISPATCH_SPECS.get(native.key)
-    if spec is None or spec.prompt_param is None:
-        return None
-    return native.harness
-
-
-def _require_smart_routing_prompt(
-    prompt: str | None, *, in_harness_routing: bool = True
-) -> str | None:
-    """
-    Resolve the text a routed launch starts from, rejecting an unroutable one.
-
-    A harness that hooks its own first typed message can be launched bare — the
-    hook routes whatever the user types — so a missing prompt is fine there.
-    Any other launch has to route before a harness exists to hook, and needs the
-    text up front.
+    The CLI routes the first message typed *inside* the harness, so a prompt
+    handed over up front would launch on an unrouted model with no sign that
+    the request was dropped.
 
     :param prompt: The ``-p`` text, or ``None``.
-    :param in_harness_routing: Whether this launch's harness routes its own
-        first message (see
-        :func:`omnigent.runner.turn_routing.supports_in_harness_turn_routing`).
-        Defaults to ``True`` for the per-harness ``--smart-routing``
-        subcommands, which exist only on harnesses carrying that hook.
-    :returns: The prompt, or ``None`` when the harness routes in-session.
-    :raises click.UsageError: When there is no text and no in-harness route.
+    :returns: None when the combination is fine.
+    :raises click.UsageError: When *prompt* carries text.
     """
-    if prompt is not None and prompt.strip():
-        return prompt
-    if in_harness_routing:
-        return None
-    raise click.UsageError(_SMART_ROUTING_NEEDS_PROMPT)
+    if prompt is None or not prompt.strip():
+        return
+    raise click.UsageError(
+        "--smart-routing routes the first message you type in the harness, so it "
+        "cannot be combined with -p/--prompt. Drop -p and type the prompt in the "
+        "TUI, or start the session from the web UI to route a prompt at create time."
+    )
 
 
 def _reject_smart_routing_resume(*, resuming: bool, flag: str = "--resume") -> None:
@@ -6763,55 +6782,28 @@ def _reject_smart_routing_resume(*, resuming: bool, flag: str = "--resume") -> N
     )
 
 
-def _with_routed_model_arg(args: tuple[str, ...], model: str | None) -> tuple[str, ...]:
+def _smart_routing_decision(*, server: str, harness: str) -> ArmedSession:
     """
-    Append ``--model <routed>`` to a wrapper's pass-through args.
-
-    A ``--model`` the user typed themselves wins: they asked for that model
-    explicitly, and routing is a default-filling service.
-
-    :param args: The wrapper's pass-through args, e.g. ``("--verbose",)``.
-    :param model: Routed model id, or ``None`` to leave *args* alone.
-    :returns: The args, with the routed model appended when appropriate.
-    """
-    if not model:
-        return args
-    if any(arg == "--model" or arg.startswith("--model=") for arg in args):
-        return args
-    return (*args, "--model", model)
-
-
-def _smart_routing_decision(
-    *,
-    server: str,
-    prompt: str | None,
-    harness: str | None,
-) -> RoutingDecision:
-    """
-    Preflight Smart Routing, then create the routed session for *prompt*.
+    Preflight Smart Routing, then create the session it will route in.
 
     Preflight failures raise (a pick that cannot be applied is worse than no
-    pick); a create the server rejects comes back as a decision with no session
+    pick); a create the server rejects comes back as a result with no session
     whose notice is printed here, so the caller only has to launch a plain
     wrapper session.
 
-    A ``None`` *prompt* creates the session with Smart Routing on but nothing
-    routed: the harness's own first-message hook picks the model once the user
-    types, which is what the stderr line reports.
+    Nothing is routed at create: the session carries Smart Routing on, and
+    *harness*'s own first-message hook picks the model once the user types,
+    which is what the stderr line reports.
 
     :param server: Resolved Omnigent server base URL.
-    :param prompt: The text to route (also the TUI's initial input), or ``None``
-        to leave the pick to the harness's in-session hook.
-    :param harness: Canonical harness to pin, or ``None`` to route the harness
-        too.
-    :returns: The routed session and pick to launch on.
+    :param harness: Canonical native harness to bind, e.g. ``"codex-native"``.
+    :returns: The armed session to attach the wrapper to.
     :raises click.ClickException: When Smart Routing is unavailable.
     """
     from omnigent.smart_routing_cli import (
+        arm_smart_routing_session,
         check_smart_routing_available,
-        create_smart_routing_session,
         known_host_id,
-        smart_routing_families,
     )
 
     # The session must be bound to the host it will run on: the server builds
@@ -6830,205 +6822,23 @@ def _smart_routing_decision(
         host_id = None
     check_smart_routing_available(
         base_url=server,
-        harnesses=smart_routing_families(harness),
+        harnesses=(harness,),
         host_id=host_id,
     )
-    decision = create_smart_routing_session(
+    armed = arm_smart_routing_session(
         base_url=server,
-        prompt=prompt,
         harness=harness,
         host_id=host_id,
         # The server requires a workspace with a host_id, and this is the cwd
         # the wrapper will attach in.
         workspace=str(Path.cwd().resolve()) if host_id is not None else None,
     )
-    if decision.notice is not None:
-        click.echo(decision.notice, err=True)
-    elif prompt is None:
-        click.echo(
-            "omnigent: Smart Routing is on for this session; your first message picks the model.",
-            err=True,
-        )
-    elif decision.model is not None:
-        picked = (
-            f"{decision.harness} on {decision.model}"
-            if decision.harness is not None
-            else decision.model
-        )
-        click.echo(f"omnigent: Smart Routing picked {picked}.", err=True)
-    return decision
-
-
-def _dispatch_smart_routing(
-    *,
-    harness: str | None,
-    server: str | None,
-    prompt: str | None,
-    model: str | None,
-    auto_open_conversation: bool,
-) -> None:
-    """
-    Create the routed session, then attach its native TUI wrapper to it.
-
-    Tier 2 (*harness* given) routes the model only and keeps the requested
-    harness. Tier 3 (*harness* ``None``) routes both, and the wrapper is chosen
-    from the harness the server bound — falling back to
-    :data:`_SMART_ROUTING_FALLBACK_HARNESS` (with a notice) when the create
-    resolved nothing, or a harness the CLI cannot hand a prompt to.
-
-    Without a *prompt*, a *harness* that routes its own first typed message is
-    launched bare: the session is created with Smart Routing on, and the TUI
-    starts with no initial input and no routed ``--model`` (there is no
-    create-time pick — the harness's hook applies one in-session). The auto
-    route cannot do this, because a harness has to be chosen before one exists
-    to hook.
-
-    The wrapper always attaches to the created session rather than bundling its
-    own, so the routed model, the decision card, and the wrapper labels the
-    server wrote at create are the ones the launch runs on. When the create
-    failed entirely, the wrapper starts a plain session instead — the launch is
-    never blocked.
-
-    :param harness: Canonical native harness to pin, or ``None`` for the auto
-        route.
-    :param server: ``--server`` value (or its config default), or ``None``.
-    :param prompt: The routed prompt (also the TUI's initial input), or ``None``
-        to let *harness* route its own first message.
-    :param model: ``--model`` fallback used when routing returns no model.
-    :param auto_open_conversation: Whether to open the web conversation.
-    :returns: None once the TUI attach ends.
-    :raises click.ClickException: When Smart Routing is unavailable.
-    :raises click.UsageError: When there is no prompt and no in-harness route.
-    """
-    from omnigent.runner.turn_routing import supports_in_harness_turn_routing
-
-    prompt = _require_smart_routing_prompt(
-        prompt, in_harness_routing=supports_in_harness_turn_routing(harness)
+    click.echo(
+        armed.notice
+        or "omnigent: Smart Routing is on for this session; your first message picks the model.",
+        err=True,
     )
-    server = _ensure_backend(server)
-    decision = _smart_routing_decision(server=server, prompt=prompt, harness=harness)
-    launch_harness = harness or _smart_routing_capable_harness(decision.harness)
-    if launch_harness is None:
-        launch_harness = _SMART_ROUTING_FALLBACK_HARNESS
-        click.echo(
-            f"omnigent: Smart Routing did not resolve a launchable harness; "
-            f"launching {launch_harness}.",
-            err=True,
-        )
-    routed_model = decision.model or model
-    _dispatch_native_terminal_harness(
-        harness=launch_harness,
-        server=server,
-        model=routed_model,
-        # A routed model is an explicit request, so wrappers that only take a
-        # model when the user asked for one still receive it.
-        model_from_cli=routed_model is not None,
-        prompt=prompt,
-        system_prompt=None,
-        tools=None,
-        log=False,
-        debug_events=False,
-        # Attach to the routed session; ``None`` (create failed) lets the
-        # wrapper start its own.
-        resume_conversation_id=decision.session_id,
-        resume_picker=False,
-        resume_latest=False,
-        fork_session_id=None,
-        ephemeral=False,
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_smart_routing(
-    *,
-    target: str | None,
-    harness: str | None,
-    prompt: str | None,
-    server: str | None,
-    model: str | None,
-    resume_conversation_id: str | None,
-    resume_picker: bool,
-    resume_latest: bool,
-    auto_open_conversation: bool,
-    system_prompt: str | None = None,
-    tools: str | None = None,
-    log: bool = False,
-    debug_events: bool = False,
-    fork_session_id: str | None = None,
-    ephemeral: bool = False,
-) -> None:
-    """
-    Handle ``omnigent run --smart-routing``: validate, then route and launch.
-
-    ``--harness`` (a native terminal harness) pins the harness and routes the
-    model; ``--harness auto`` or no ``--harness`` at all routes both, and always
-    needs ``-p`` (the harness is picked before one exists to route in). An AGENT
-    is rejected: a routed session is a native TUI, and an agent spec's
-    prompt/tools are never consulted there.
-
-    :param target: The AGENT argument as the user passed it, or ``None``.
-    :param harness: The ``--harness`` value the user passed, or ``None``.
-    :param prompt: The ``-p`` text, or ``None`` — allowed only when
-        ``--harness`` pins a harness that routes its own first message.
-    :param server: ``--server`` value or its config default.
-    :param model: ``--model`` fallback for an unrouted launch.
-    :param resume_conversation_id: ``--resume <id>`` target, rejected when set.
-    :param resume_picker: ``--resume`` with no value, rejected when set.
-    :param resume_latest: ``--continue``, rejected when set.
-    :param auto_open_conversation: Whether to open the web conversation.
-    :param system_prompt: ``--system-prompt`` value, rejected when set.
-    :param tools: ``--tools`` value, rejected when set.
-    :param log: ``--log``, rejected when set.
-    :param debug_events: ``--debug-events``, rejected when set.
-    :param fork_session_id: ``--fork`` value, rejected when set.
-    :param ephemeral: ``--no-session``, rejected when set.
-    :returns: None once the TUI attach ends.
-    :raises click.ClickException: On a rejected combination, or when Smart
-        Routing is unavailable.
-    """
-    # The same REPL-only options the plain native dispatch rejects: a routed
-    # launch is still a TUI attach, so they would be silently dropped.
-    repl_only = [
-        flag
-        for flag, active in (
-            ("--system-prompt", system_prompt is not None),
-            ("--tools", tools is not None),
-            ("--log", log),
-            ("--debug-events", debug_events),
-            ("--fork", fork_session_id is not None),
-            ("--no-session", ephemeral),
-        )
-        if active
-    ]
-    if repl_only:
-        raise click.ClickException(
-            "--smart-routing launches a native harness TUI; the REPL-only option(s) "
-            f"{', '.join(repl_only)} have no effect there — remove them."
-        )
-    _reject_smart_routing_resume(resuming=resume_conversation_id is not None or resume_picker)
-    _reject_smart_routing_resume(resuming=resume_latest, flag="--continue")
-    if target is not None:
-        raise click.ClickException(
-            "--smart-routing launches a native harness TUI, so it takes no AGENT. "
-            "Drop the AGENT to route the harness and model, or pass "
-            "`--harness claude-native` to route the model only."
-        )
-    requested: str | None = None
-    if harness is not None and harness != "auto":
-        requested = _smart_routing_capable_harness(harness)
-        if requested is None:
-            raise click.ClickException(
-                f"--smart-routing does not support --harness {harness!r}. Use a native "
-                "terminal harness that accepts a prompt (claude-native, codex-native, "
-                "kiro-native), or `--harness auto` to route the harness too."
-            )
-    _dispatch_smart_routing(
-        harness=requested,
-        server=server,
-        prompt=prompt,
-        model=model,
-        auto_open_conversation=auto_open_conversation,
-    )
+    return armed
 
 
 def _reject_agent_with_native_terminal_harness(harness: str) -> None:
@@ -7513,7 +7323,8 @@ def attach(
     "smart_routing",
     is_flag=True,
     default=False,
-    help=_SMART_ROUTING_HELP,
+    hidden=True,
+    help="[REMOVED] Use `omnigent claude|codex --smart-routing` or the web UI.",
 )
 @click.option(
     "--from-openclaw",
@@ -7620,8 +7431,6 @@ def run(
     Examples:
       omnigent run --harness claude-sdk
       omnigent run --harness codex -p "review the last commit"
-      omnigent run --smart-routing -p "review the last commit"
-      omnigent run --harness claude-native --smart-routing -p "fix the flaky test"
       omnigent run --from-openclaw "Gemini CLI" -p "review the last commit"
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
@@ -7637,6 +7446,10 @@ def run(
     # ambient DATABRICKS_CONFIG_PROFILE.
     if databricks_profile:
         os.environ["DATABRICKS_CONFIG_PROFILE"] = databricks_profile
+    # Rejected before anything is resolved: `run` never routed in-harness, and
+    # its create-time route is gone.
+    if smart_routing:
+        raise click.ClickException(_RUN_SMART_ROUTING_REMOVED)
     # Apply config defaults for any value the user did not pass explicitly.
     # Explicit CLI args always take precedence; project-local config overrides
     # global config, which provides user-level defaults.
@@ -7646,31 +7459,6 @@ def run(
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
-    # Smart Routing owns the whole launch: it routes before anything is
-    # created, then execs a native TUI wrapper. Handle it here, before the
-    # default-agent / first-run resolution below can substitute an agent the
-    # routed launch would have to reject.
-    if smart_routing:
-        _smart_routing_cfg = _load_effective_config()
-        _smart_routing_resume = _split_resume_value(resume)
-        _run_smart_routing(
-            target=target,
-            harness=harness if harness_from_cli else None,
-            prompt=prompt,
-            server=server if server_from_cli else _smart_routing_cfg.get("server"),
-            model=model if model_from_cli else None,
-            resume_conversation_id=_smart_routing_resume.conversation_id,
-            resume_picker=_smart_routing_resume.picker,
-            resume_latest=resume_latest,
-            auto_open_conversation=_resolve_auto_open_conversation_from_config(_smart_routing_cfg),
-            system_prompt=system_prompt,
-            tools=tools,
-            log=log,
-            debug_events=debug_events,
-            fork_session_id=fork_session_id,
-            ephemeral=ephemeral,
-        )
-        return
 
     acp_agent: AcpAgentEntry | None = None
     if from_openclaw is not None:
@@ -7897,8 +7685,147 @@ def _prompt_stop_local_server() -> None:
         click.echo(f"Left the local server running at {url}.")
 
 
+# Grace period a freshly spawned background host daemon must survive before
+# `host --background` reports success. A daemon that dies on startup (bad
+# server URL, missing credentials) leaves nothing on the terminal, so we wait
+# this long and surface its log instead of falsely reporting success.
+_BACKGROUND_HOST_GRACE_S = 2.0
+
+
+def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
+    """Fail loud if a freshly spawned background host daemon dies at once.
+
+    :param record: Registry record of the spawned daemon.
+    :raises click.ClickException: If the daemon exits within
+        :data:`_BACKGROUND_HOST_GRACE_S`.
+    """
+    deadline = time.time() + _BACKGROUND_HOST_GRACE_S
+    while True:
+        if not _pid_alive(record.pid):
+            from omnigent._runner_startup import format_runner_log_tail
+
+            log_path = Path(record.log_path) if record.log_path else None
+            raise click.ClickException(
+                "The host daemon exited immediately after starting."
+                f"{format_runner_log_tail(log_path)}"
+            )
+        if time.time() >= deadline:
+            return
+        time.sleep(0.1)
+
+
+def _run_background_host(
+    server: str | None,
+    *,
+    stop_command: str,
+    non_interactive: bool,
+) -> None:
+    """Spawn (or reuse) the detached host daemon and report it.
+
+    The background counterpart of the foreground ``omnigent host`` body,
+    selected by ``--background`` (and the whole of ``omnigent start``): the
+    same daemon loop runs detached (see :func:`_ensure_host_daemon`) so the
+    command returns instead of blocking.
+
+    Sign-in stays in the foreground. The detached daemon has no terminal to
+    prompt on, so a Databricks-fronted server is authenticated here, before the
+    spawn — otherwise the daemon would die in the background with an opaque
+    redirect error.
+
+    :param server: Resolved Omnigent server URL, e.g.
+        ``"https://example.databricksapps.com"``. ``None`` or ``""`` selects
+        local mode (the daemon starts or reuses a local Omnigent server).
+    :param stop_command: Command to echo for stopping this daemon, e.g.
+        ``"omnigent stop"`` — each entry point suggests the teardown that
+        matches how it was invoked.
+    :param non_interactive: When ``True``, never launch the browser login —
+        fail with the ``omnigent login`` hint instead.
+    :raises click.ClickException: If the daemon cannot be spawned, exits
+        immediately after starting, or (local mode) never serves its local
+        Omnigent server.
+    """
+    if server:
+        _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+    target = _normalize_daemon_target(server)
+    previous = _find_daemon_record(target)
+    _ensure_host_daemon(server or None)
+    record = _find_daemon_record(target)
+    if record is None:
+        # No record for this target: either the live local-mode daemon already
+        # serves the requested URL, or the spawn itself failed.
+        if _local_daemon_serves_target(target, server or None):
+            click.echo(f"The local host daemon already serves {target}.")
+            return
+        raise click.ClickException(
+            "Could not spawn the background host daemon. See ~/.omnigent/logs/host/ for details."
+        )
+    if previous is not None and previous.pid == record.pid:
+        headline = _cli_style("Host daemon already running", fg="yellow", bold=True)
+    else:
+        _confirm_background_host_alive(record)
+        headline = _cli_style("Started the host daemon in the background", fg="green", bold=True)
+    click.echo(f"{headline} (pid {record.pid}).")
+    if record.mode == "local":
+        # A local-mode daemon owns the local Omnigent server, so this command is
+        # the whole "start everything" step — wait for that server and report
+        # its URL, otherwise the Web UI is unreachable without a follow-up
+        # `omnigent server status`. Resolved after the headline above so a cold
+        # start isn't a silent terminal.
+        server_url = _discover_local_server_url()
+        _update_daemon_resolved_server_url(target, server_url)
+    else:
+        server_url = target
+    _echo_host_field("server", _cli_style(server_url, fg="cyan"))
+    if record.log_path is not None:
+        _echo_host_field("log", _display_path(Path(record.log_path)))
+    click.echo()
+    click.echo(_cli_style("Stop it with:", dim=True))
+    click.echo(f"  {_cli_style(stop_command, bold=True)}")
+
+
+def _echo_host_field(label: str, value: str) -> None:
+    """Echo one aligned ``label: value`` detail row.
+
+    :param label: Row label without its colon, e.g. ``"server"``.
+    :param value: Row value, possibly already ANSI-styled — padding is
+        applied to the label so escape codes can't skew the alignment.
+    """
+    click.echo(f"  {label + ':':<8}{value}")
+
+
+def _host_stop_command(explicit_server: str | None) -> str:
+    """Build the ``host stop`` command that mirrors how ``host`` was invoked.
+
+    ``host`` and ``host stop`` resolve their target the same way (the
+    ``--server`` value, else config, else local), so repeating the flag the
+    user omitted would be noise — and repeating the one they passed keeps the
+    command correct when config names a different target.
+
+    :param explicit_server: The ``--server`` value as the user spelled it,
+        e.g. ``"https://example.databricksapps.com"`` or ``""`` for local
+        mode. ``None`` when the option was omitted.
+    :returns: A copy-pasteable command, e.g. ``"omnigent host stop"``.
+    """
+    if explicit_server is None:
+        return "omnigent host stop"
+    stop_target = explicit_server if explicit_server else '""'
+    return f"omnigent host stop --server {stop_target}"
+
+
 @cli.group("host", cls=_HostGroup, invoke_without_command=True)
 @click.option("--server", default=None, help="Remote omnigent server URL.")
+@click.option(
+    "--background",
+    "background",
+    is_flag=True,
+    default=False,
+    help=(
+        "Spawn the host daemon as a detached background process (returning "
+        "immediately) instead of running it in the foreground. Reuses a "
+        "healthy daemon if one is already up. Sign-in still happens in the "
+        "foreground, before the spawn."
+    ),
+)
 @click.option(
     "--non-interactive",
     "non_interactive",
@@ -7911,7 +7838,12 @@ def _prompt_stop_local_server() -> None:
     ),
 )
 @click.pass_context
-def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
+def host(
+    ctx: click.Context,
+    server: str | None,
+    background: bool,
+    non_interactive: bool,
+) -> None:
     """
     Register this machine as a host with a server.
 
@@ -7920,6 +7852,7 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
       omnigent host https://omnigent-app.databricksapps.com
       omnigent host --server https://omnigent-app.databricksapps.com
       omnigent host ""   # spawn + connect to a local server
+      omnigent host --background   # spawn detached, return immediately
 
     The server URL may be given positionally (``omnigent host
     <url>``) or via ``--server <url>``. A leading ``status``, ``stop``,
@@ -7929,13 +7862,16 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     in, ``host`` runs the same flow ``omnigent login`` would before
     connecting (an interactive browser flow). Pass ``--non-interactive``
     to keep the old scripted behavior: fail with the login command to run
-    instead of prompting.
+    instead of prompting. This holds for ``--background`` too: the login
+    flow runs here, in your terminal, before the daemon is detached.
 
     :param ctx: Click invocation context. ``ctx.invoked_subcommand`` is
         set when a management subcommand such as ``"status"`` is running.
     :param server: Remote Omnigent server URL, e.g.
         ``"https://example.databricksapps.com"``. ``None`` falls back
         to config; empty string selects local mode.
+    :param background: When ``True``, spawn the daemon detached and return
+        instead of running the daemon loop in the foreground.
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
@@ -7944,6 +7880,9 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     ctx.obj["server"] = server
     if ctx.invoked_subcommand is not None:
         return
+    # Kept before the config fallback below: `--background` echoes a `host
+    # stop` command that mirrors how this command was invoked.
+    explicit_server = server
     cfg = _load_effective_config()
     if server is None:
         server = cfg.get("server")
@@ -7953,6 +7892,14 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     # ``server`` to the spawned loopback URL — only a remote target needs
     # the sign-in pre-flight.
     remote_mode = bool(server)
+
+    if background:
+        _run_background_host(
+            server,
+            stop_command=_host_stop_command(explicit_server),
+            non_interactive=non_interactive,
+        )
+        return
 
     from omnigent.host.connect import run_host_process
 
@@ -8860,7 +8807,10 @@ def _stop_daemon_sessions(
         if force:
             click.echo(f"{record.target}: skipping session stop: {result.error}", err=True)
             return 0
-        raise click.ClickException(f"{record.target}: {result.error}")
+        raise click.ClickException(
+            f"{record.target}: {result.error} — retry with --force to stop the "
+            f"daemon anyway, or --daemon-only to skip the session stop entirely."
+        )
     if result.base_url is None:
         return 0
     stopped = 0

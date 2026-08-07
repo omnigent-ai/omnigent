@@ -444,6 +444,95 @@ async def test_inline_launch_binds_runner_and_returns_host(
     assert conv.workspace == _WORKSPACE
 
 
+async def test_inline_launch_stamps_terminal_view_label_at_creation(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A host-launched SDK session carries ``omnigent.ui: terminal`` in
+    the create response itself.
+
+    The runner stamps this label only *after* auto-creating its REPL
+    terminal, which is too late for the Web UI's "Starting up…"
+    indicator: that needs the label while the terminal is still missing,
+    so the window was empty by construction and these sessions fell back
+    to the passive "Connecting…" row under the composer. Asserting on the
+    create response (not a later snapshot) is the whole point — a
+    regression that defers the stamp restores the wrong spinner.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"env": "test"},
+        },
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["labels"].get("omnigent.ui") == "terminal", (
+        f"create response must carry the terminal-view label; got {body['labels']}"
+    )
+    # The stamp merges over caller labels rather than replacing them.
+    assert body["labels"].get("env") == "test"
+    # Persisted, not just echoed — the snapshot a reloading UI reads is the row.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.labels.get("omnigent.ui") == "terminal"
+
+
+async def test_inline_launch_skips_terminal_view_label_for_native_harness(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A native-harness agent does not get the terminal-view label here.
+
+    Native harnesses run a vendor TUI instead of the omnigent REPL
+    terminal, so their runner never auto-creates one. Stamping the label
+    for them would leave the Web UI's spin-up spinner waiting on a
+    terminal that never arrives; they get terminal-first labels from the
+    native wrapper path instead.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    assert "omnigent.ui" not in resp.json()["labels"]
+
+
+async def test_unbound_session_skips_terminal_view_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """A session created without a host must not carry the label.
+
+    With no host there is no runner to auto-create a REPL terminal, so
+    the label would leave the Web UI showing a Terminal pill that can
+    never open.
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    assert "omnigent.ui" not in resp.json()["labels"]
+
+
 async def test_inline_launch_failure_still_returns_bound_session(
     client: httpx.AsyncClient,
     app: FastAPI,

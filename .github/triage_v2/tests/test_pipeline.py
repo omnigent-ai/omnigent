@@ -82,8 +82,9 @@ def _bronze(number, author="community"):
     )
 
 
-def test_pipeline_reuses_persisted_classification_and_excludes_maintainers() -> None:
+def test_pipeline_reuses_persisted_classification_and_includes_maintainers() -> None:
     issue = _bronze(1)
+    maintainer_issue = _bronze(2, author="maintainer")
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
@@ -94,27 +95,31 @@ def test_pipeline_reuses_persisted_classification_and_excludes_maintainers() -> 
         content_hash=issue.content().content_hash,
     )
     classifier = FakeClassifier(classification)
-    classifications = FakeClassifications({1: classification})
+    maintainer_classification = replace(
+        classification,
+        issue_number=2,
+        content_hash=maintainer_issue.content().content_hash,
+    )
+    classifications = FakeClassifications({1: classification, 2: maintainer_classification})
     scores = CaptureSink()
     artifacts = CaptureSink()
     area = Area("db", "comp:db", Decimal("1.2"))
     catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
     pipeline = IssuePrioritizationPipeline(
-        source=FakeSource([issue, _bronze(2, author="maintainer")]),
+        source=FakeSource([issue, maintainer_issue]),
         classifier=classifier,
         classifications=classifications,
         scores=scores,
         artifacts=artifacts,
         engine=ScoreEngine(ScoringConfig.default(), catalog),
-        maintainers={"maintainer"},
     )
 
     run = pipeline.run("run-1")
 
     assert classifier.calls == 0
     assert classifications.updated == []
-    assert len(run.ranked) == 1
-    assert run.ranked[0].result.score == Decimal("72.00")
+    assert len(run.ranked) == 2
+    assert {item.result.score for item in run.ranked} == {Decimal("72.00")}
     assert scores.runs == [run]
     assert artifacts.runs == [run]
 
@@ -152,7 +157,6 @@ def test_pipeline_reclassifies_changed_content() -> None:
         scores=sink,
         artifacts=sink,
         engine=ScoreEngine(ScoringConfig.default(), catalog),
-        maintainers=set(),
         classification_progress=lambda completed, total: progress.append((completed, total)),
     )
 
@@ -187,7 +191,6 @@ def test_pipeline_can_force_regrade_cached_content() -> None:
         scores=sink,
         artifacts=sink,
         engine=ScoreEngine(ScoringConfig.default(), catalog),
-        maintainers=set(),
     )
 
     pipeline.run("run-regrade", regrade=True)
@@ -218,7 +221,6 @@ def test_pipeline_scores_with_human_severity_override() -> None:
         scores=CaptureSink(),
         artifacts=CaptureSink(),
         engine=ScoreEngine(ScoringConfig.default(), catalog),
-        maintainers=set(),
         mutation_planner=MutationPlanner(manifest, FakeStates()),
     )
 
@@ -259,7 +261,6 @@ def test_dry_run_previews_safe_legacy_priority_regrade() -> None:
         scores=CaptureSink(),
         artifacts=CaptureSink(),
         engine=ScoreEngine(ScoringConfig.default(), catalog),
-        maintainers=set(),
         mutation_planner=planner,
     )
 
@@ -304,7 +305,6 @@ def test_pipeline_publishes_scores_only_after_artifacts_complete() -> None:
         scores=OrderedSink("scores"),
         artifacts=OrderedSink("artifacts"),
         engine=ScoreEngine(ScoringConfig.default(), catalog),
-        maintainers=set(),
     )
 
     pipeline.run("run-publish-order")
@@ -338,7 +338,6 @@ def test_pipeline_does_not_publish_scores_when_artifacts_fail() -> None:
         scores=scores,
         artifacts=FailingArtifacts(),
         engine=ScoreEngine(ScoringConfig.default(), catalog),
-        maintainers=set(),
     )
 
     with pytest.raises(RuntimeError, match="volume unavailable"):

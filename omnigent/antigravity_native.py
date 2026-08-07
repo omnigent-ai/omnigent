@@ -38,7 +38,13 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
 * **Workspace = the agy terminal cwd.** agy runs tools in its process working
   directory, so the terminal cwd is pinned to the session working dir; no
   ``--add-dir`` is needed.
-* **Auth is inherited from ``~/.gemini``** — no credential seeding.
+* **Auth stays on the real HOME; config is per-session.** agy launches with
+  ``--gemini_dir=<bridge_dir>/agy-home/.gemini``, so its MCP relay config and
+  settings are session-scoped and the user's real ``~/.gemini`` is never
+  rewritten. ``HOME`` is deliberately left real, because agy's OAuth token can
+  live in the OS keyring (macOS Keychain), which a relocated HOME cannot unlock
+  (#1477); file-based credential markers are copied into the isolated dir for
+  the platforms that use them.
 
 The runner OWNS the agy terminal: binding a runner triggers its idempotent
 auto-create of the antigravity terminal (``runner/app.py``
@@ -88,15 +94,18 @@ from omnigent.antigravity_native_bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
+    agy_gemini_dir,
+    agy_home_dir,
     bridge_dir_for_bridge_id,
     clear_bridge_state,
     ensure_agy_feedback_survey_disabled,
-    ensure_agy_onboarding_complete,
     is_placeholder_conversation_id,
     prepare_bridge_dir,
     read_bridge_state,
+    seed_isolated_agy_home,
     update_conversation_id,
     write_bridge_state,
+    write_mcp_config,
     write_tmux_target,
 )
 from omnigent.antigravity_native_launch import (
@@ -962,10 +971,11 @@ async def _launch_and_record(
     # Clear stale turn/conversation state so a fresh launch rediscovers this run's
     # real agy conversation id instead of binding to the previous run's.
     await asyncio.to_thread(clear_bridge_state, bridge_dir)
-    # Pre-accept agy's first-run onboarding wizard (HOME-global) so a headless /
-    # detached launch does not hang waiting for a TTY answer. Idempotent and
-    # offloaded to a thread (file I/O), mirroring the bridge-state writes below.
-    await asyncio.to_thread(ensure_agy_onboarding_complete)
+    # agy's first-run onboarding wizard has no TTY to answer it on a headless /
+    # detached launch, so its completion marker is pre-accepted below by
+    # ``seed_isolated_agy_home`` — in the isolated dir agy actually reads under
+    # ``--gemini_dir``. Seeding the real ``~/.gemini`` marker as well would write
+    # the user's tree for a file this launch never reads.
     argv, env_overrides = build_agy_launch(
         conversation_id=conversation_id if resume else None,
         model=model,
@@ -974,14 +984,29 @@ async def _launch_and_record(
         headless=headless,
         extra_args=antigravity_args,
     )
+    # Scope agy to a per-session isolated Gemini dir, exactly as the runner-owned
+    # launch does. agy has no --mcp-config flag and ignores every ANTIGRAVITY_* env
+    # knob, so its MCP relay config and its settings can only be scoped through the
+    # hidden --gemini_dir. Without this the CLI launch read the user's real
+    # ~/.gemini: agy saw no Omnigent relay (hence no sys_* tools, #1194), and the
+    # survey/trust seeds below rewrote the user's own settings.json. HOME stays real
+    # so keyring-backed auth (macOS Keychain) keeps working (#1477).
+    await asyncio.to_thread(write_mcp_config, bridge_dir)
+    env_overrides = {
+        **env_overrides,
+        **await asyncio.to_thread(
+            seed_isolated_agy_home,
+            bridge_dir,
+            trusted_workspace=Path.cwd().resolve(),
+        ),
+    }
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
-    # is up would be silently lost (#1494). Disable it in the launch HOME before agy
-    # starts. This path emits no HOME override, so agy runs under the real ~/.gemini.
-    await asyncio.to_thread(
-        ensure_agy_feedback_survey_disabled,
-        Path(env_overrides.get("HOME") or Path.home()),
-    )
+    # is up would be silently lost (#1494). Disable it in the isolated dir agy reads
+    # under --gemini_dir, never the user's real ~/.gemini.
+    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    # Lead the args so the flag is never swallowed by a later positional.
+    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(
         client,

@@ -1107,7 +1107,7 @@ function FileViewerBody({
             {action.options.map((option) => (
               <DropdownMenuItem
                 key={option.key}
-                className={cn("whitespace-nowrap", option.active && "bg-accent")}
+                className={cn("whitespace-nowrap", option.active && "bg-muted dark:bg-muted/50")}
                 onSelect={interactive ? option.onSelect : undefined}
               >
                 {option.icon}
@@ -1284,7 +1284,7 @@ function FileViewerBody({
                               // active choice.
                               className={cn(
                                 "whitespace-nowrap",
-                                action.options && option.active && "bg-accent",
+                                action.options && option.active && "bg-muted dark:bg-muted/50",
                               )}
                               onSelect={(e) => {
                                 if (option.keepOpen) e.preventDefault();

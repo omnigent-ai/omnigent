@@ -599,7 +599,9 @@ def main() -> None:
         )
         raise SystemExit(2)
 
-    _ZygoteServer(control_sock).serve()
+    # Ctrl+C is a normal operator-driven shutdown; exit quietly without a traceback.
+    with contextlib.suppress(KeyboardInterrupt):
+        _ZygoteServer(control_sock).serve()
 
 
 if __name__ == "__main__":

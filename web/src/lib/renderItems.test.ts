@@ -2033,15 +2033,203 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
     });
   });
 
-  it("defers only the adjacent chip when two decisions precede a message", () => {
+  it("defers BOTH chips when two session-scoped decisions precede a message", () => {
+    // Nothing of the conversation sits between them, so neither is a preamble:
+    // both are verdicts on the message that follows, in transcript order.
     const blocks: AnyBlock[] = [
       chipBlock("rd_far", "resp_1", "turn"),
       chipBlock("rd_near", "resp_1", "turn"),
       userBlock("u1", "resp_1"),
     ];
     const bubbles = buildBubbles(blocks, null);
-    expect(kinds(bubbles)).toEqual(["routing_decision", "user", "routing_decision"]);
+    expect(kinds(bubbles)).toEqual(["user", "routing_decision", "routing_decision"]);
     expect(chipIds(bubbles)).toEqual(["rd_far", "rd_near"]);
+  });
+
+  it("a sub-agent chip between two decisions blocks the earlier one from moving", () => {
+    // The spawn chip renders standalone where it occurred; deferring the chip
+    // above it past it would reorder the two.
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_session", "resp_1", "turn"),
+      chipBlock("rd_spawn", "resp_1", "native_subagent"),
+      userBlock("u1", "resp_1"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["routing_decision", "routing_decision", "user"]);
+    expect(chipIds(bubbles)).toEqual(["rd_session", "rd_spawn"]);
+  });
+
+  // Rows copied from `GET /v1/sessions/<id>/items` on a session created with
+  // Smart Routing as BOTH the model and the harness. The create records the
+  // pick as a `session` chip before the harness even boots, the first turn
+  // routes again and records a `turn` chip, and the terminal the harness
+  // brought up lands a `resource_event` in between — so the session's first
+  // message has two chips and a non-conversation row above it.
+  describe("auto-harness create (Smart Routing picks the harness too)", () => {
+    const RATIONALE =
+      "Routed to gpt-5-6-luna because trivial task (prompt<300, no errors/refs, " +
+      "llm easy) -> cheapest arm gpt-5-6-luna; never escalate.";
+
+    function resourceEventItem(id: string): ConversationItem {
+      return {
+        id,
+        type: "resource_event",
+        response_id: "ef1ee84af89447898edbbd3acb64a5d2",
+        status: "completed",
+        event_type: "session.resource.created",
+        resource_id: "terminal_codex_main",
+        resource_type: "terminal",
+      } as unknown as ConversationItem;
+    }
+    function promptItem(): ConversationItem {
+      return {
+        id: "msg_user",
+        type: "message",
+        response_id: "codex_019fd3fb",
+        status: "completed",
+        role: "user",
+        content: [{ type: "input_text", text: "what is 2+2?" }],
+      } as unknown as ConversationItem;
+    }
+    function replyItem(): ConversationItem {
+      return {
+        id: "msg_assistant",
+        type: "message",
+        response_id: "codex_019fd3fb",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "2 + 2 = 4." }],
+      } as unknown as ConversationItem;
+    }
+    /** The captured transcript, with the turn chip's verdict overridable. */
+    function autoItems(turn: RoutingDecisionWire = {}): ConversationItem[] {
+      return [
+        routingDecisionItem({
+          id: "rd_create",
+          response_id: "routing_d55b96265e01448a8c8cbfdb404b8ac1",
+          model: "databricks-gpt-5-6-luna",
+          rationale: RATIONALE,
+          harness: "codex-native",
+          scope: "session",
+          decision_id: "628a03ea-da4b-49cb-b41a-6f7c28598381",
+        }),
+        resourceEventItem("re_1"),
+        resourceEventItem("re_2"),
+        routingDecisionItem({
+          id: "rd_turn",
+          response_id: "routing_52d9826e05be482785570c6e86ff41ec",
+          model: "databricks-gpt-5-6-luna",
+          rationale: RATIONALE,
+          harness: "codex-native",
+          scope: "turn",
+          decision_id: "633569bb-dbfd-4c72-85db-88788583842b",
+          ...turn,
+        }),
+        promptItem(),
+        replyItem(),
+      ];
+    }
+
+    it("renders the create chip BELOW the prompt when the turn re-routes", () => {
+      // The turn scored the task differently, so the create pick is real news
+      // and survives the collapse — and it is still a verdict on this message,
+      // not a preamble to it.
+      const blocks = itemsToBlocks(autoItems({ model: "databricks-gpt-5-6-sol" }));
+      const bubbles = buildBubbles(blocks, null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "routing_decision", "assistant"]);
+      expect(chipIds(bubbles)).toEqual(["rd_create", "rd_turn"]);
+    });
+
+    it("still collapses the repeated verdict to one chip below the prompt", () => {
+      const bubbles = buildBubbles(itemsToBlocks(autoItems()), null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "assistant"]);
+      expect(chipIds(bubbles)).toEqual(["rd_turn"]);
+    });
+
+    it("stays stable frame by frame as the auto-harness transcript streams in", () => {
+      expectFrameByFrameStable(itemsToBlocks(autoItems({ model: "databricks-gpt-5-6-sol" })), [
+        "user",
+        "routing_decision",
+        "routing_decision",
+        "assistant",
+      ]);
+    });
+
+    it("defers the lone create chip past the terminal's resource row", () => {
+      // A create whose first turn never recorded its own chip — captured from
+      // an auto-harness session mid-flight.
+      const items = [
+        routingDecisionItem({
+          id: "rd_create",
+          model: "databricks-gpt-5-6-sol",
+          harness: "codex-native",
+          scope: "session",
+        }),
+        resourceEventItem("re_1"),
+        promptItem(),
+        replyItem(),
+      ];
+      const bubbles = buildBubbles(itemsToBlocks(items), null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "assistant"]);
+    });
+  });
+
+  // The rows a web create pinned to claude-native actually persisted: the
+  // session-scope decision is written AT CREATE, so for a while it is the
+  // session's only item and the prompt exists only as an optimistic pending
+  // bubble (spliced above the chip by `mergePendingBubbles`, tested in
+  // ChatPage.test.ts). These pin the walker's half: one chip throughout, and
+  // it lands below the message with no second position once it is persisted.
+  describe("pinned create routed before its pane launches", () => {
+    function createChip(applied = true): ConversationItem {
+      return routingDecisionItem({
+        id: "rd_create",
+        response_id: "routing_0181ee7e17fa4fa8aa8b18c2d41555e1",
+        model: "databricks-claude-sonnet-5",
+        applied,
+        rationale: "Routed to claude-sonnet-5 because trivial task -> cheapest arm.",
+        harness: "claude-native",
+        scope: "session",
+        decision_id: "2fc19175-929e-41e4-ab4a-6b1c07a0cbe7",
+      });
+    }
+    function prompt(): ConversationItem {
+      return {
+        id: "msg_user",
+        type: "message",
+        role: "user",
+        response_id: "resp_1",
+        status: "completed",
+        content: [{ type: "input_text", text: "what is 2+2?" }],
+      } as unknown as ConversationItem;
+    }
+
+    it("renders the lone create chip while no message has been persisted", () => {
+      const bubbles = buildBubbles(itemsToBlocks([createChip()]), null);
+      expect(kinds(bubbles)).toEqual(["routing_decision"]);
+      expect(chipIds(bubbles)).toEqual(["rd_create"]);
+    });
+
+    it("keeps a DECLINED create chip visible with no message", () => {
+      // Routing failed and the session launched unrouted — the user still has
+      // to see that a decision was attempted.
+      const bubbles = buildBubbles(itemsToBlocks([createChip(false)]), null);
+      expect(kinds(bubbles)).toEqual(["routing_decision"]);
+      expect(bubbles[0]).toMatchObject({ kind: "routing_decision", applied: false });
+    });
+
+    it("renders the chip once, below the prompt, when the message is appended", () => {
+      // Same block list plus the persisted message, through the incremental
+      // cache: the held-and-released region must not paint a stale position.
+      const cache = createBubbleCache();
+      const f1 = itemsToBlocks([createChip()]);
+      expect(kinds(buildBubbles(f1, null, cache))).toEqual(["routing_decision"]);
+      const f2 = [...f1, ...itemsToBlocks([prompt()])];
+      const second = buildBubbles(f2, null, cache);
+      expect(kinds(second)).toEqual(["user", "routing_decision"]);
+      expect(chipIds(second)).toEqual(["rd_create"]);
+      expect(second).toEqual(buildBubbles(f2, null));
+    });
   });
 
   it("static reload: the itemsToBlocks funnel defers the persisted decision too", () => {

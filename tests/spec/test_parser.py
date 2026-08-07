@@ -1699,6 +1699,69 @@ def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:
     assert sandbox.allow_network is False
 
 
+def test_parse_os_env_sandbox_auto_uses_platform_default(tmp_path: Path) -> None:
+    """``sandbox.type: auto`` explicitly selects the platform default."""
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+    config = {
+        "spec_version": 1,
+        "name": "auto-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "auto", "write_paths": ["."]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == _default_sandbox_for_platform().type
+    assert spec.os_env.sandbox.write_paths == ["."]
+
+
+def test_parse_os_env_sandbox_omitted_type_uses_platform_default(tmp_path: Path) -> None:
+    """An omitted ``sandbox.type`` selects the platform default."""
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+    config = {
+        "spec_version": 1,
+        "name": "default-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"write_paths": ["."]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == _default_sandbox_for_platform().type
+    assert spec.os_env.sandbox.write_paths == ["."]
+
+
+def test_parse_os_env_sandbox_null_type_disables_sandbox(tmp_path: Path) -> None:
+    """``sandbox.type: null`` explicitly disables sandboxing."""
+    config = {
+        "spec_version": 1,
+        "name": "null-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": None},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == "none"
+
+
 def test_parse_os_env_non_mapping_raises(tmp_path: Path) -> None:
     """A scalar/list under ``os_env:`` raises OmnigentError —
     fail loud rather than silently dropping the malformed block.

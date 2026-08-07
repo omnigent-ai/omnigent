@@ -8,7 +8,6 @@ sync:
   paths:
     - .
     - ../areas.json
-    - ../MAINTAINER
     - ../issue-prioritization-labels.json
 
 artifacts:
@@ -42,13 +41,29 @@ variables:
   github_secret_scope:
     description: Secret scope for legacy ownership reads and apply-mode writes.
     default: ""
+  github_auth_mode:
+    description: GitHub credential source. Use app after its secrets are configured.
+    default: token
   github_token_secret_key:
     default: github-token
+  github_app_client_id_secret_key:
+    default: github-app-client-id
+  github_app_private_key_secret_key:
+    default: github-app-private-key
   legacy_priority_bot_logins:
     description: Comma-separated actors whose historical priority labels may be adopted.
     default: github-actions[bot],omnigent-ci[bot]
   allow_github_writes:
     description: Hard gate for GitHub mutations. Keep false until rollout approval.
+    default: "false"
+  schedule_pause_status:
+    description: Keep PAUSED until App authentication is verified manually.
+    default: PAUSED
+  scheduled_mode:
+    description: Default mode for triggered runs. Keep dry_run until rollout approval.
+    default: dry_run
+  scheduled_adopt_legacy_bot_priorities:
+    description: Adopt legacy bot labels during triggered runs while ownership is migrated.
     default: "false"
 
 targets:

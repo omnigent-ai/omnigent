@@ -379,8 +379,6 @@ export interface Session {
    * permissively, so that's fine for unblocking interaction.
    */
   permissionLevel: number | null;
-  /** Whether this viewer may accept privileged actions for the session. */
-  canApprove?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` for top-level sessions.

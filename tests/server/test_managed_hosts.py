@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+from dataclasses import replace
 from pathlib import Path
-from typing import ClassVar
+from types import SimpleNamespace
+from typing import Any, ClassVar
 
 import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
+from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
@@ -23,6 +27,8 @@ from omnigent.server.managed_hosts import (
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
+    ManagedLaunch,
+    ManagedLaunchTracker,
     ManagedSandboxConfig,
     RepoWorkspace,
     host_resume_supported,
@@ -30,6 +36,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
+    resolve_managed_agent_label,
     resume_managed_host,
     terminate_managed_host,
 )
@@ -78,6 +85,43 @@ def _injected_config(
         token_ttl_s=token_ttl_s,
         host_config=host_config,
     )
+
+
+class _ClassifyingFakeSandboxLauncher(FakeSandboxLauncher):
+    """
+    A fake that declares ``classifies_runner_by_agent`` and records the
+    ``agent_name`` threaded to ``start_host``.
+
+    Stands in for the Kubernetes launcher — the only in-tree provider that
+    consumes the classifier. The exec-model :class:`FakeSandboxLauncher` does
+    NOT declare the capability, so the launch path never passes it the keyword.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.agent_names: list[str | None] = []
+
+    @property
+    def capabilities(self) -> Any:
+        return replace(super().capabilities, classifies_runner_by_agent=True)
+
+    def start_host(self, sandbox_id: str, *, agent_name: str | None = None, **kwargs: Any) -> str:
+        """Record the threaded agent name, then run the shared exec-model start."""
+        self.agent_names.append(agent_name)
+        return super().start_host(sandbox_id, **kwargs)
+
+
+class _StubAgentStore:
+    """Minimal AgentStore stand-in returning crafted agents (or raising)."""
+
+    def __init__(self, agents: dict[str, Agent] | None = None, *, error: bool = False) -> None:
+        self._agents = agents or {}
+        self._error = error
+
+    def get(self, agent_id: str) -> Agent | None:
+        if self._error:
+            raise RuntimeError("simulated agent-store failure")
+        return self._agents.get(agent_id)
 
 
 # ── parse_sandbox_config ────────────────────────────────────
@@ -1609,6 +1653,79 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     assert fake.terminated == []
 
 
+async def test_launch_threads_agent_name_only_to_a_classifying_launcher(db_uri: str) -> None:
+    """A launcher that DECLARES ``classifies_runner_by_agent`` receives the
+    resolved agent name at ``start_host``, so its runner Pod is stamped."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register)
+    await launch_managed_host(
+        config=_injected_config(fake),
+        owner=_OWNER,
+        host_store=host_store,
+        agent_name="research-agent",
+    )
+    assert fake.agent_names == ["research-agent"]
+
+
+async def test_launch_never_passes_agent_name_to_a_non_classifying_launcher(db_uri: str) -> None:
+    """
+    An exec-model launcher does not declare the capability, so the launch path
+    NEVER threads ``agent_name`` into its ``start_host`` — even when a name
+    resolved. The gate is on the capability, not on the value; the exec-model
+    ``start_host`` has no such keyword, so a launch that reached it would raise
+    ``TypeError`` and 502. The launch succeeding proves the keyword was omitted.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    result = await launch_managed_host(
+        config=_injected_config(fake),
+        owner=_OWNER,
+        host_store=host_store,
+        agent_name="research-agent",
+    )
+    # The host started normally through the exec-model path (no TypeError).
+    assert len(fake.host_starts) == 1
+    assert host_store.get_host(result.host_id) is not None
+
+
+async def test_relaunch_threads_agent_name_to_classifying_start_host(db_uri: str) -> None:
+    """
+    A relaunch re-stamps the runner: the agent name reaches the fresh
+    generation's ``start_host``, so a reused runner keeps its classifier and the
+    admission policy keeps injecting the credential.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    gen1 = host_store.get_host(first.host_id)
+    assert gen1 is not None
+
+    await relaunch_managed_host(
+        config=config, host=gen1, host_store=host_store, agent_name="code-reviewer"
+    )
+    # First launch had no agent; the relaunch carried it through.
+    assert fake.agent_names == [None, "code-reviewer"]
+
+
 async def test_launch_materializes_host_config_before_host_start(db_uri: str) -> None:
     """
     A configured host_config is written into the sandbox strictly BEFORE
@@ -2581,3 +2698,419 @@ def test_parse_modal_secrets_malformed_fails_loud(secrets: object) -> None:
                 "modal": {"secrets": secrets},
             }
         )
+
+
+# ── resolve_managed_agent_label (built-in gate) ─────────────
+
+
+def test_resolve_agent_label_stamps_genuine_builtin(db_uri: str) -> None:
+    """A genuine built-in (session_id None, deterministic id) is classified by name."""
+    store = SqlAlchemyAgentStore(db_uri)
+    store.create(builtin_agent_id("code-reviewer"), "code-reviewer", "bundle/loc")
+    resolved = resolve_managed_agent_label(
+        store, builtin_agent_id("code-reviewer"), session_id="conv_1"
+    )
+    assert resolved == "code-reviewer"
+
+
+def test_resolve_agent_label_omits_ordinary_template(db_uri: str) -> None:
+    """
+    A user-registered template gets a RANDOM id, so it never matches
+    builtin_agent_id(name) — it is not classified even under a built-in's name.
+    """
+    store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    store.create(agent_id, "code-reviewer", "bundle/loc")
+    assert resolve_managed_agent_label(store, agent_id, session_id="conv_1") is None
+
+
+def test_resolve_agent_label_omits_session_scoped_impostor() -> None:
+    """
+    The anti-spoof: a SESSION-SCOPED agent named like a built-in is omitted even
+    when its id collides with the deterministic built-in id — session_id being
+    set fails the gate, so it cannot self-attract the credential.
+    """
+    impostor = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id="conv_owner",
+    )
+    store = _StubAgentStore({impostor.id: impostor})
+    assert resolve_managed_agent_label(store, impostor.id, session_id="conv_1") is None
+
+
+def test_resolve_agent_label_omits_unknown_id(db_uri: str) -> None:
+    """An id that resolves to no agent yields None (never stamps the raw id)."""
+    store = SqlAlchemyAgentStore(db_uri)
+    assert resolve_managed_agent_label(store, generate_agent_id(), session_id="conv_1") is None
+
+
+def test_resolve_agent_label_omits_when_session_has_no_agent(db_uri: str) -> None:
+    """A session with no bound agent yields None."""
+    store = SqlAlchemyAgentStore(db_uri)
+    assert resolve_managed_agent_label(store, None, session_id="conv_1") is None
+
+
+def test_resolve_agent_label_survives_store_error() -> None:
+    """A store error degrades to None (label is an optimization, never fails create)."""
+    store = _StubAgentStore(error=True)
+    assert resolve_managed_agent_label(store, generate_agent_id(), session_id="conv_1") is None
+
+
+# ── relaunch re-derivation (claim-then-resolve) ─────────────
+
+
+async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relaunch hands the agent store and the bound agent id to the launch task
+    rather than resolving the classifier itself, and reads the store not at all —
+    so the claim-to-task region stays synchronous and only the winning caller
+    ever pays for the read.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
+
+    tracker = ManagedLaunchTracker()
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+
+    reads: list[str] = []
+
+    class _RecordingStore(_StubAgentStore):
+        def get(self, agent_id: str) -> Agent | None:
+            reads.append(agent_id)
+            return super().get(agent_id)
+
+    store = _RecordingStore({builtin.id: builtin})
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_relaunch(
+        session_id="conv_1",
+        conv=conv,
+        host=SimpleNamespace(user_id=_OWNER),
+        sandbox_config=SimpleNamespace(),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        app_state=SimpleNamespace(agent_store=store),
+    )
+    scheduled = set(orchestration._managed_launch_tasks) - before
+    assert scheduled, "the claim was taken but no task was scheduled to settle it"
+    await asyncio.gather(*scheduled)
+    assert reads == [], "the kick must not read the agent store; the launch task does"
+    assert captured["agent_store"] is store
+    assert captured["agent_id"] == builtin.id
+
+
+async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Claiming the single-flight entry and scheduling the task that settles it must
+    stay in one uninterrupted synchronous step.
+
+    An ``await`` between them is cancellable — a request timeout or a shutdown
+    drain there leaves the entry claimed but unsettled with nothing scheduled to
+    settle it, and that state does not heal:
+    :func:`_maybe_relaunch_managed_sandbox` skips the re-kick whenever an
+    unsettled entry exists, so every later message on the session waits out the
+    full rendezvous timeout and then fails for the remaining life of the process.
+
+    Keeping the function synchronous is what forecloses the window, so that is
+    what this asserts — a later change back to ``async def`` reopens it.
+    """
+    import inspect
+
+    from omnigent.server.routes._sessions import orchestration
+
+    assert not inspect.iscoroutinefunction(orchestration._kick_managed_relaunch), (
+        "_kick_managed_relaunch must stay synchronous: an await between "
+        "tracker.begin and create_task is cancellable and leaks the claim"
+    )
+
+    async def _noop(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _noop)
+
+    tracker = ManagedLaunchTracker()
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_relaunch(
+        session_id="conv_1",
+        conv=conv,
+        host=SimpleNamespace(user_id=_OWNER),
+        sandbox_config=SimpleNamespace(),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        app_state=SimpleNamespace(agent_store=_StubAgentStore()),
+    )
+    scheduled = set(orchestration._managed_launch_tasks) - before
+    assert scheduled, "the claim was taken but no task was scheduled to settle it"
+    assert tracker.get("conv_1") is not None
+    await asyncio.gather(*scheduled)
+
+
+async def test_kick_managed_relaunch_without_agent_store_threads_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No agent store on app.state (a stripped app) degrades the relaunch to an
+    unclassified runner rather than raising — a fail-safe deny, never a spurious
+    label."""
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
+
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_relaunch(
+        session_id="conv_1",
+        conv=conv,
+        host=SimpleNamespace(user_id=_OWNER),
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        app_state=SimpleNamespace(),
+    )
+    scheduled = set(orchestration._managed_launch_tasks) - before
+    await asyncio.gather(*scheduled)
+    assert captured["agent_store"] is None
+
+
+@pytest.mark.parametrize(
+    ("agent_kwargs", "expected"),
+    [
+        pytest.param({}, None, id="no-store-no-id"),
+        pytest.param({"agent_id": builtin_agent_id("code-reviewer")}, None, id="id-without-store"),
+    ],
+)
+async def test_run_managed_launch_leaves_the_runner_unclassified(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_kwargs: dict[str, object],
+    expected: str | None,
+) -> None:
+    """Without both an agent store and a bound agent id there is nothing to
+    resolve, and the launch proceeds with an unclassified runner rather than
+    raising — the same fail-safe the gate itself applies."""
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _provision(**kwargs: object) -> None:
+        captured.update(kwargs)
+        return
+
+    monkeypatch.setattr(orchestration, "_provision_managed_sandbox", _provision)
+
+    await orchestration._run_managed_launch(
+        session_id="conv_1",
+        owner=_OWNER,
+        sandbox_config=SimpleNamespace(),
+        repo=None,
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        **agent_kwargs,
+    )
+    assert captured["agent_name"] is expected
+
+
+async def test_run_managed_launch_resolves_the_classifier_on_its_own_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The launch task resolves the bound agent through the built-in gate and passes
+    the name down to the provision step.
+
+    This is where the read belongs: the task already owns the single-flight claim,
+    so the request path never awaits between claiming and spawning, and a losing
+    concurrent message never reaches this function at all.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _provision(**kwargs: object) -> None:
+        captured.update(kwargs)
+        return
+
+    monkeypatch.setattr(orchestration, "_provision_managed_sandbox", _provision)
+
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+    await orchestration._run_managed_launch(
+        session_id="conv_1",
+        owner=_OWNER,
+        sandbox_config=SimpleNamespace(),
+        repo=None,
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        agent_store=_StubAgentStore({builtin.id: builtin}),
+        agent_id=builtin.id,
+    )
+    assert captured["agent_name"] == "code-reviewer"
+
+
+async def test_run_managed_launch_omits_the_classifier_for_a_session_scoped_impostor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session-scoped agent named after a built-in resolves to no classifier
+    even now that the resolve runs on the launch task — the gate travels with the
+    read, so moving it did not weaken the anti-spoof property."""
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _provision(**kwargs: object) -> None:
+        captured.update(kwargs)
+        return
+
+    monkeypatch.setattr(orchestration, "_provision_managed_sandbox", _provision)
+
+    impostor = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id="conv_1",
+    )
+    await orchestration._run_managed_launch(
+        session_id="conv_1",
+        owner=_OWNER,
+        sandbox_config=SimpleNamespace(),
+        repo=None,
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        host_registry=None,
+        tunnel_registry=None,
+        agent_store=_StubAgentStore({impostor.id: impostor}),
+        agent_id=impostor.id,
+    )
+    assert captured["agent_name"] is None
+
+
+async def test_concurrent_relaunch_messages_kick_a_single_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Two messages racing to relaunch the same dead sandbox kick exactly ONE
+    launch: the check→begin region carries no ``await``, so the loser
+    rendezvouses on the winner's entry instead of double-launching a second Pod.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda *a, **k: False)
+
+    calls: list[dict[str, object]] = []
+    tracker = ManagedLaunchTracker()
+
+    # The racing message has to reach its tracker check while the winner's claim
+    # is still UNSETTLED, because an unsettled claim is what it must rendezvous
+    # on. Both callers await asyncio.to_thread twice before that check, and an
+    # executor hop takes an unpredictable number of event-loop turns to deliver,
+    # so holding the winner open for a fixed number of turns does not establish
+    # the ordering: on a loaded machine the racer arrives after the claim
+    # settled, takes the retry branch, and kicks a second launch. That retry is
+    # intended behaviour and is guarded in production by the is_online check
+    # above, which this test stubs False forever — so a fixed-turn hold made the
+    # test fail for a reason unrelated to the invariant.
+    #
+    # Hold until the racer has demonstrably checked instead. Three reads are the
+    # whole exchange: the winner checks and re-reads after kicking, and the racer
+    # checks once and rendezvouses.
+    raced = asyncio.Event()
+    reads = 0
+    tracker_get = tracker.get
+
+    def _counting_get(session_id: str) -> ManagedLaunch | None:
+        nonlocal reads
+        reads += 1
+        if reads >= 3:
+            raced.set()
+        return tracker_get(session_id)
+
+    monkeypatch.setattr(tracker, "get", _counting_get)
+
+    async def _capture(**kwargs: object) -> None:
+        calls.append(kwargs)
+        tracker_arg = kwargs["tracker"]
+        session_arg = kwargs["session_id"]
+        assert isinstance(tracker_arg, ManagedLaunchTracker)
+        assert isinstance(session_arg, str)
+        # Unbounded on purpose. Any duration here would be a second timing
+        # assumption, and this test exists because the first one was wrong; the
+        # suite's own timeout is the backstop if a refactor stops the racer
+        # reaching its check.
+        await raced.wait()
+        # Settle so the message rendezvous (_await_settled_managed_launch) returns.
+        tracker_arg.finish(session_arg)
+
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
+
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=now_epoch(),
+        name="code-reviewer",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+    dead_host = SimpleNamespace(sandbox_provider="modal", user_id=_OWNER)
+    app_state = SimpleNamespace(
+        host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
+        sandbox_config=SimpleNamespace(),
+        managed_launches=tracker,
+        agent_store=_StubAgentStore({builtin.id: builtin}),
+        host_registry=None,
+        tunnel_registry=None,
+    )
+    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+
+    engaged = await asyncio.gather(
+        *(
+            orchestration._maybe_relaunch_managed_sandbox(
+                session_id="conv_1",
+                conv=conv,
+                app_state=app_state,
+                conversation_store=SimpleNamespace(),
+            )
+            for _ in range(2)
+        )
+    )
+    # Drain any relaunch task the winner scheduled.
+    await asyncio.gather(*list(orchestration._managed_launch_tasks))
+    assert engaged == [True, True]
+    assert len(calls) == 1
+    assert calls[0]["agent_id"] == builtin.id

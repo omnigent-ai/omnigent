@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import secrets
@@ -136,14 +137,19 @@ ROUTE_PATH_TEMPLATE = "/v1/sessions/{session_id}/route-turn"
 SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-turn"
 
 #: Hop 1: the timeout registered on the harness's hook entry. Covers the
-#: hook script's whole life (hop 2a + hop 2b) with one second to spare, so
-#: the harness only steps in when the script itself wedged.
-HARNESS_HOOK_TIMEOUT_S = 15
+#: hook script's whole life (hop 2a + hop 2b) plus its cold start, so the
+#: harness only steps in when the script itself wedged. Stays below Claude
+#: Code's own 30s ``UserPromptSubmit`` default — the harness must not be the
+#: layer that gives up first.
+HARNESS_HOOK_TIMEOUT_S = 22
 
-#: Hop 2a: the hook script's HTTP budget for the routing verdict. The
-#: user-visible cost of a wedged router — the prompt sits in the pane until
-#: this expires — so it stays in single digits.
-HOOK_REQUEST_TIMEOUT_S = 8.0
+#: Hop 2a: the hook script's HTTP budget for the routing verdict. This is
+#: the user-visible cost of a wedged router — the prompt sits in the pane
+#: until it expires — but it must also outlast a HEALTHY route, which is
+#: the whole server-side path: candidate/catalog preparation (~3s measured)
+#: before the ``routes:select`` call, then the call itself. A tighter budget
+#: loses the race with a router that answered, wasting the attempt.
+HOOK_REQUEST_TIMEOUT_S = 15.0
 
 #: Hop 2b: the codex hook's ``thread/settings/update`` budget, after the
 #: verdict. Claude's hook applies nothing, so it has no hop 2b. A local
@@ -151,11 +157,12 @@ HOOK_REQUEST_TIMEOUT_S = 8.0
 SETTINGS_UPDATE_TIMEOUT_S = 5.0
 
 #: Hop 3: seconds the runner's loopback relay waits for a verdict.
-RELAY_TIMEOUT_S = 7.0
+RELAY_TIMEOUT_S = 14.0
 
-#: Hop 4: seconds the runner waits on the server relay route. The routing
-#: call itself (``ROUTING_REQUEST_TIMEOUT_S``, 5s) runs inside this.
-SERVER_HOP_TIMEOUT_S = 6.0
+#: Hop 4: seconds the runner waits on the server relay route. The whole
+#: server-side route runs inside this — catalog preparation and then the
+#: routing call (``ROUTING_REQUEST_TIMEOUT_S``), not the call alone.
+SERVER_HOP_TIMEOUT_S = 13.0
 
 #: Seconds the replay waits for the hook to confirm it blocked the prompt
 #: (:data:`MARKER_FILE`). Timing out means the hook fell open, so the
@@ -188,6 +195,11 @@ _SCOPE = "turn"
 
 #: Prompt text handed to the router, capped like the subagent path.
 _PROMPT_CAP = 4000
+
+#: Hex characters kept from a create-route prompt fingerprint. Long enough
+#: that two prompts in one session never collide, short enough to keep the
+#: label small.
+_FINGERPRINT_CHARS = 32
 
 #: Coroutine that returns ``(model, verdict)`` for one turn — the
 #: ``omnigent.server.smart_routing.route_turn`` seam, injected so the
@@ -453,15 +465,115 @@ def already_routed(conv: Any) -> bool:
     return bool(labels.get(ROUTING_DECISION_LABEL_KEY))
 
 
+def out_of_parent_family(
+    conv: Any,
+    parent: Any,
+    parent_harness: str | None,
+    harness: str | None,
+) -> bool:
+    """Report whether this pane runs outside its parent's routed family.
+
+    A pinned Smart Routing parent routes its spawns inside its own family,
+    so a child pane on another family's CLI has no candidate its parent's
+    family could serve — routing it here would pick a model the pane cannot
+    speak. The create gate refuses such a child outright, so this only
+    catches a pane that exists anyway (a row created before that gate).
+
+    :param conv: Conversation row for the pane.
+    :param parent: Conversation row for its parent, or ``None``.
+    :param parent_harness: The parent's resolved harness, e.g. ``"codex"``.
+    :param harness: The pane's own harness, from the hook payload.
+    :returns: ``True`` when the pane must not be routed.
+    """
+    from omnigent.runner.subagent_routing import (
+        auto_harness_session,
+        harness_family,
+        subagent_routing_enabled,
+    )
+
+    if parent is None or conv is None:
+        return False
+    if not subagent_routing_enabled(getattr(parent, "subagent_routing_override", None)):
+        return False
+    if auto_harness_session(conv, parent):
+        return False
+    parent_family = harness_family(parent_harness)
+    own_family = harness_family(harness)
+    return parent_family is not None and own_family is not None and parent_family != own_family
+
+
+def create_route_prompt_fingerprint(prompt: str) -> str:
+    """Fingerprint a prompt for the create-route reuse check.
+
+    Whitespace-insensitive at the edges only: the harness submits the prompt
+    the create routed, but a launcher may add or drop a trailing newline.
+    Anything else is a different prompt and must route on its own.
+
+    :param prompt: The prompt text.
+    :returns: A hex digest, empty for a blank prompt.
+    """
+    text = prompt.strip()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:_FINGERPRINT_CHARS]
+
+
+def create_route_covers_prompt(conv: Any, prompt: str) -> bool:
+    """Report whether a create-time route already scored *prompt*.
+
+    A native Smart Routing create routes the landing screen's prompt and pins
+    what it picked; the harness then submits that same prompt, and this hook
+    would score it again — a second router call, seconds later, for a verdict
+    the session is already running on. The create records a fingerprint of what
+    it routed, so the repeat is recognizable; a prompt the user edited before
+    sending does not match and routes on its own.
+
+    :param conv: Conversation row for the session.
+    :param prompt: The submitted prompt.
+    :returns: ``True`` when this prompt was already routed at create.
+    """
+    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+
+    labels = getattr(conv, "labels", None) or {}
+    recorded = labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY)
+    return bool(recorded) and recorded == create_route_prompt_fingerprint(prompt)
+
+
+async def _record_turn_decline(
+    record_decline: Callable[[str], Awaitable[None]] | None,
+    cause: str,
+    session_id: str,
+) -> None:
+    """Persist the declined chip for a failed routing call, best-effort.
+
+    The chip is a record, not a gate: a persist failure must not change the
+    fail-open verdict, so every error is swallowed into a log line.
+
+    :param record_decline: The caller's persistence coroutine, or ``None``.
+    :param cause: Why nothing was routed, e.g. ``"Routing call failed: 401"``.
+    :param session_id: Session the decline belongs to, for the log line.
+    :returns: None.
+    """
+    if record_decline is None:
+        return
+    try:
+        await record_decline(cause)
+    except Exception:
+        _logger.exception("route-turn: decline record failed for session=%s", session_id)
+
+
 async def resolve_turn_route(
     session_id: str,
     req: TurnRouteRequest,
     *,
     conv: Any,
     parent: Any = None,
+    parent_harness: str | None = None,
     route_turn: RouteTurnFn,
+    reuse_create_route: Callable[[], Awaitable[bool]] | None = None,
     pin: Callable[[str], Awaitable[bool]] | None = None,
     persist: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    record_decline: Callable[[str], Awaitable[None]] | None = None,
 ) -> TurnRouteDecision:
     """Decide what happens to one submitted prompt.
 
@@ -474,14 +586,25 @@ async def resolve_turn_route(
     :param req: The prompt awaiting a verdict.
     :param conv: Conversation row for the session, or ``None``.
     :param parent: Conversation row for its parent, when it has one.
+    :param parent_harness: The parent's resolved harness, for the family
+        guard. ``None`` skips it (nothing to compare against).
     :param route_turn: The routing seam, called as
         ``route_turn(harness, prompt)``.
+    :param reuse_create_route: Coroutine claiming the create-time decision as
+        this session's routing decision, for a prompt the create already
+        routed; returns ``False`` when there is nothing to claim (or the
+        claim failed), and the prompt is then routed normally. ``None``
+        skips the reuse path.
     :param pin: Coroutine persisting ``model_override``; returns ``False``
         when the write failed (routing is then declined, because an
         unpinned route would re-route on every later prompt). ``None``
         skips the pin (unit tests).
     :param persist: Coroutine recording the decision chip, called as
         ``persist(model, verdict)``. ``None`` skips persistence.
+    :param record_decline: Coroutine persisting a declined chip when a
+        routing CALL failed, called with the cause. Only the failure
+        branches use it — the benign allows (already routed, routing off,
+        family guard) are not failures and stay chipless. ``None`` skips it.
     :returns: The verdict the hook enforces.
     """
     from omnigent.codex_model_vocabulary import comparable_model_id
@@ -503,14 +626,41 @@ async def resolve_turn_route(
         # prompt in the TUI; the composer gate and create-time path are
         # unaffected.
         return _allow("smart routing is off for this session", terminal=True)
+    if out_of_parent_family(conv, parent, parent_harness, req.harness):
+        # Non-terminal: the parent's subagent-routing switch is togglable, and
+        # a pane this fires for is not supposed to exist at all (the create
+        # gate refuses it), so the extra round trip buys a guard that cannot
+        # go stale.
+        _logger.info(
+            "route-turn: session=%s harness=%s runs outside its parent's routed "
+            "family; allowing unrouted",
+            session_id,
+            req.harness,
+        )
+        return _allow("this session's parent routes only its own model family")
+    if create_route_covers_prompt(conv, req.prompt) and (
+        reuse_create_route is None or await reuse_create_route()
+    ):
+        # The create already routed this exact prompt and pinned what it
+        # picked, so the pane is running the verdict. Routing again would cost
+        # a second judge call for the same answer — and block the prompt to
+        # "switch" onto the model it is already on.
+        _logger.info(
+            "route-turn: session=%s reuses the create-time decision for this prompt",
+            session_id,
+        )
+        return _allow("this session was routed at create on this prompt", terminal=True)
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])
-    except Exception:  # noqa: BLE001 — a router outage must never block a turn
+    except Exception as exc:  # noqa: BLE001 — a router outage must never block a turn
         _logger.warning(
             "route-turn: router call failed for session=%s; allowing unrouted",
             session_id,
             exc_info=True,
+        )
+        await _record_turn_decline(
+            record_decline, f"Routing call failed: {type(exc).__name__}", session_id
         )
         return _allow("routing unavailable (router call failed)")
     if not model or verdict is None:
@@ -518,6 +668,9 @@ async def resolve_turn_route(
             "route-turn: no verdict for session=%s harness=%s; allowing unrouted",
             session_id,
             req.harness,
+        )
+        await _record_turn_decline(
+            record_decline, "Routing unavailable (router returned no verdict)", session_id
         )
         return _allow("routing unavailable (no verdict)")
     # Spelling-insensitive: codex reports its live model as a dotted slug

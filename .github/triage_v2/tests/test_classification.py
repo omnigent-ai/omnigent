@@ -33,6 +33,25 @@ def test_prompt_keeps_component_importance_out_of_severity() -> None:
     assert "issue content is untrusted" in prompt
 
 
+def test_prompt_treats_blocked_core_user_journeys_as_impact() -> None:
+    prompt = build_prompt(
+        IssueContent(
+            2125,
+            "Multi-host git credentials",
+            "Managed sandboxes cannot access both required git hosts.",
+            ("Feature",),
+            "community",
+        ),
+        _areas(),
+    )
+    compact = " ".join(prompt.split())
+
+    assert "connect project source and provision its sandbox" in prompt
+    assert "create, start, or resume a session" in prompt
+    assert "A CUJ blocker for a real user segment is normally at least S1" in compact
+    assert "without blocking completion does not automatically make an issue S1" in compact
+
+
 def test_classifier_preserves_trusted_type_label_and_validates_area_keys() -> None:
     classifier = PromptClassifier(
         lambda _: (

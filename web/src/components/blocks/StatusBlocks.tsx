@@ -21,7 +21,11 @@ import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
-import { type RoutingDecisionExtras, subagentScopeLabel } from "@/lib/routingDecision";
+import {
+  type RoutingDecisionExtras,
+  harnessDisplayLabel,
+  subagentScopeLabel,
+} from "@/lib/routingDecision";
 import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
@@ -176,6 +180,7 @@ export function RoutingDecisionCard({
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
   const scopeLabel = subagentScopeLabel(scope, agent);
+  const harnessLabel = harnessDisplayLabel(harness);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
     () =>
@@ -233,9 +238,9 @@ export function RoutingDecisionCard({
           </span>
         ) : null}
         <span className="text-muted-foreground">{applied ? "· applied" : "· advisory"}</span>
-        {harness ? (
+        {harnessLabel ? (
           <span className="text-muted-foreground" data-testid="routing-decision-harness">
-            · {harness}
+            · {harnessLabel}
           </span>
         ) : null}
         {scopeLabel ? (

@@ -28,6 +28,7 @@ import httpx
 import yaml
 from omnigent_client import (
     OmnigentClient,
+    RegisteredAgent,
     SessionToolCallInfo,
     ToolCallable,
     ToolCallInfo,
@@ -35,14 +36,6 @@ from omnigent_client import (
 )
 from omnigent_client import (
     OmnigentError as ClientOmnigentError,
-)
-from omnigent_client._events import (
-    ErrorEvent,
-    ResponseCancelled,
-    ResponseCompleted,
-    ResponseFailed,
-    ResponseIncomplete,
-    TextDelta,
 )
 from rich.console import Console
 
@@ -2029,46 +2022,20 @@ def _run_headless_prompt(
             headers=_server_headers(runner_id=runner_id),
             auth=_server_auth(server_url=base_url),
         ) as client:
-            if session_bundle is not None:
-                result_text = await _query_sessions_once(
-                    client=client,
-                    agent_name=agent_name,
-                    tool_handler=tool_handler,
-                    prompt=prompt,
-                    session_bundle=session_bundle,
-                    session_bundle_filename=session_bundle_filename,
-                    runner_id=runner_id,
-                )
-                if result_text:
-                    print(result_text)
-                return
-
-            session = client.session(model=agent_name, tool_handler=tool_handler)
-            chunks: list[str] = []
-            terminal_text: str | None = None
-            error_text: str | None = None
-            async for event in session.send(prompt):
-                if isinstance(event, TextDelta):
-                    chunks.append(event.delta)
-                elif isinstance(event, ErrorEvent):
-                    error_text = event.error.message or event.error.code
-                elif isinstance(
-                    event,
-                    ResponseCompleted | ResponseFailed | ResponseIncomplete | ResponseCancelled,
-                ):
-                    terminal_text = _response_output_text(event.response.output)
-
-            streamed_text = "".join(chunks)
-            # Prefer the real error from a response.error SSE event over the
-            # generic terminal-event message ("Failed to retrieve final response")
-            # that _build_terminal_event substitutes when it can't read the task.
-            if streamed_text:
-                print(streamed_text)
-            elif error_text:
-                print(f"Error: {error_text}", file=sys.stderr)
-                raise SystemExit(1)
-            elif terminal_text:
-                print(terminal_text)
+            # Both a local bundle and a remote registered agent go through
+            # the sessions API; _query_sessions_once picks the create route
+            # from whether a bundle was supplied.
+            result_text = await _query_sessions_once(
+                client=client,
+                agent_name=agent_name,
+                tool_handler=tool_handler,
+                prompt=prompt,
+                session_bundle=session_bundle,
+                session_bundle_filename=session_bundle_filename,
+                runner_id=runner_id,
+            )
+            if result_text:
+                print(result_text)
 
     try:
         asyncio.run(_main())
@@ -2087,7 +2054,7 @@ async def _query_sessions_once(
     agent_name: str,
     tool_handler: ToolHandler | None,
     prompt: str,
-    session_bundle: bytes,
+    session_bundle: bytes | None,
     session_bundle_filename: str,
     runner_id: str | None,
     resume_conversation_id: str | None = None,
@@ -2098,10 +2065,13 @@ async def _query_sessions_once(
 
     :param client: Connected SDK client.
     :param agent_name: Agent display name, e.g. ``"hello_world"``.
-        Used only for tool-handler validation messages.
+        Used for tool-handler validation messages, and to resolve the
+        registered agent when no bundle is supplied.
     :param tool_handler: Optional client-side tool handler.
     :param prompt: User prompt for the single turn.
-    :param session_bundle: Gzipped agent tarball bytes.
+    :param session_bundle: Gzipped agent tarball bytes, or ``None``
+        when the agent is already registered server-side (remote-URL
+        target) and the session should bind by ``agent_id`` instead.
     :param session_bundle_filename: Multipart filename, e.g.
         ``"agent.tar.gz"``.
     :param runner_id: Registered runner id, e.g.
@@ -2117,6 +2087,22 @@ async def _query_sessions_once(
     """
     from omnigent_client import SessionsChat
 
+    # Remote target: no local bundle means no local runner either, so
+    # adopt one the server already has online before the dispatch
+    # precondition is checked.
+    agent: RegisteredAgent | None = None
+    if runner_id is None and session_bundle is None:
+        agent = await client.sessions.resolve_agent(agent_name)
+        runner_id = await client.sessions.resolve_online_runner(
+            harness=agent.harness,
+            canonicalize=lambda name: canonicalize_harness(name) or name,
+        )
+        if runner_id is None:
+            raise RuntimeError(
+                "This server has no online runner to run the turn. Start one against "
+                "it with `omnigent host --server <url>` (or run the agent locally "
+                "with `omnigent run <agent.yaml>`), then retry."
+            )
     if runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
@@ -2128,14 +2114,23 @@ async def _query_sessions_once(
         bound = await client.sessions.get(resume_conversation_id)
         await client.sessions.bind_runner(resume_conversation_id, runner_id=runner_id)
     else:
-        created = await client.sessions.create(
-            session_bundle,
-            filename=session_bundle_filename,
-            # Record CLI cwd so the Web UI can show "ran locally
-            # in <workspace>" for one-shot sessions. CLI sessions
-            # don't set host_id; this column is purely informational.
-            workspace=os.getcwd(),
-        )
+        # Record CLI cwd so the Web UI can show "ran locally in
+        # <workspace>" for one-shot sessions. CLI sessions don't set
+        # host_id; this column is purely informational.
+        if session_bundle is None:
+            # Remote target: the agent is registered server-side, so
+            # bind by id rather than uploading a bundle we don't have.
+            agent = agent or await client.sessions.resolve_agent(agent_name)
+            created = await client.sessions.create_from_agent_id(
+                agent.id,
+                workspace=os.getcwd(),
+            )
+        else:
+            created = await client.sessions.create(
+                session_bundle,
+                filename=session_bundle_filename,
+                workspace=os.getcwd(),
+            )
         bound = await client.sessions.bind_runner(created.id, runner_id=runner_id)
     if on_session_ready is not None:
         on_session_ready(bound.id)
@@ -3834,35 +3829,29 @@ def _run_one_shot(
             headers=_server_headers(runner_id=runner_id),
             auth=_server_auth(server_url=base_url),
         ) as client:
-            if session_bundle is not None:
-                text = await _query_sessions_once(
-                    client=client,
-                    agent_name=agent_name,
-                    tool_handler=tool_handler,
-                    prompt=prompt,
-                    session_bundle=session_bundle,
-                    session_bundle_filename=session_bundle_filename,
-                    runner_id=runner_id,
-                    resume_conversation_id=resume_conversation_id,
-                    on_session_ready=(
-                        lambda session_id: open_conversation_link_if_enabled(
-                            base_url=base_url,
-                            conversation_id=session_id,
-                            enabled=auto_open_conversation,
-                            warn=lambda message: click.echo(message, err=True),
-                        )
-                    ),
-                )
-                if text:
-                    click.echo(text)
-                return
-            result = await client.query(
-                model=agent_name,
-                input=prompt,
+            # Both a local bundle and a remote registered agent go through
+            # the sessions API; _query_sessions_once picks the create route
+            # from whether a bundle was supplied.
+            text = await _query_sessions_once(
+                client=client,
+                agent_name=agent_name,
                 tool_handler=tool_handler,
+                prompt=prompt,
+                session_bundle=session_bundle,
+                session_bundle_filename=session_bundle_filename,
+                runner_id=runner_id,
+                resume_conversation_id=resume_conversation_id,
+                on_session_ready=(
+                    lambda session_id: open_conversation_link_if_enabled(
+                        base_url=base_url,
+                        conversation_id=session_id,
+                        enabled=auto_open_conversation,
+                        warn=lambda message: click.echo(message, err=True),
+                    )
+                ),
             )
-            if result.text:
-                click.echo(result.text)
+            if text:
+                click.echo(text)
 
     try:
         asyncio.run(_main())

@@ -68,6 +68,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
+from omnigent.process_logging import process_log_reference
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals
 from omnigent.runner.background_titles import (
@@ -146,12 +147,6 @@ from omnigent.runner.subagent_routing import (
     session_routing_class,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
-from omnigent.runtime.prompt import (
-    SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
-    input_items_have_multiple_authors,
-    prepare_input_items_for_model,
-    shared_message_attribution_enabled,
-)
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -311,14 +306,21 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     only this fixed string. The structured ``error`` code that accompanies
     the detail already names the failure category for the caller.
 
+    The runner's own log path is named so the reader can go read the cause
+    instead of hunting for it; it is home-relative (``~/…``) so it points
+    somewhere without leaking the account name.
+
     :param exc: The caught exception, e.g. a ``RuntimeError`` from a harness
         spawn or an ``InvalidPath`` from path validation.
     :param context: Short operator-facing label for the failing operation,
         e.g. ``"harness spawn"``. Appears only in the server log.
-    :returns: A fixed, non-sensitive string safe to return to clients.
+    :returns: A non-sensitive string safe to return to clients, e.g.
+        ``"Request failed on the runner; see the runner log for details:
+        ~/.omnigent/logs/runner/runner-conv_ab12.log"``.
     """
     _logger.warning("%s failed: %s", context, exc, exc_info=exc)
-    return "Request failed on the runner; see runner logs for details."
+    log_reference = process_log_reference("runner")
+    return f"Request failed on the runner; see the runner log for details: {log_reference}"
 
 
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
@@ -1878,6 +1880,12 @@ def create_runner_app(
     _live_response_id: dict[str, str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
+    # session_id → the harness the session actually runs, when it differs from
+    # the spec's. Smart Routing pins a routed child's harness on the
+    # conversation and forwards it as ``harness_override``; without this record
+    # every spec-derived read (native-vs-SDK checks above all) still answers
+    # with the harness the spec declared, which a routed session is not on.
+    _session_harness_overrides: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
@@ -1946,7 +1954,6 @@ def create_runner_app(
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[_JsonObject]] = {}
-    _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
@@ -2638,6 +2645,10 @@ def create_runner_app(
         # endpoint at all.
         _routing_class = init_context.routing_class
         remember_session_routing_class(session_id, _routing_class)
+        if init_context.envelope is not None:
+            _note_session_harness_override(
+                session_id, init_context.envelope.snapshot.harness_override
+            )
 
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
@@ -3261,7 +3272,12 @@ def create_runner_app(
         await asyncio.to_thread(shutdown_session_router, session_id)
         forget_session_routing_class(session_id)
 
+        from omnigent.runner.tool_dispatch import forget_spawn_family
+
+        forget_spawn_family(session_id)
+
         _session_spec_cache.pop(session_id, None)
+        _session_harness_overrides.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
@@ -3277,7 +3293,6 @@ def create_runner_app(
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
         _session_histories.pop(session_id, None)
-        _author_attribution_sessions.discard(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -3462,14 +3477,13 @@ def create_runner_app(
             ):
                 _skipped_types.append(str(item_type))
             if item_type == "message":
-                message = {
-                    "type": "message",
-                    "role": item.get("role", "user"),
-                    "content": item.get("content", []),
-                }
-                if item.get("created_by") is not None:
-                    message["created_by"] = item["created_by"]
-                result.append(message)
+                result.append(
+                    {
+                        "type": "message",
+                        "role": item.get("role", "user"),
+                        "content": item.get("content", []),
+                    }
+                )
             elif item_type == "function_call":
                 result.append(
                     {
@@ -3742,7 +3756,32 @@ def create_runner_app(
             title=snapshot.sub_agent_name or "",
         )
 
+    def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
+        """Record the harness a session was forwarded, so reads match the run.
+
+        A routed child arrives with ``harness_override`` naming a harness its
+        (sub-)agent spec never declared — Smart Routing picks it on the first
+        message. The ``"auto"`` sentinel is not a harness, so it is ignored.
+
+        :param conv_id: Session/conversation id, e.g. ``"conv_child456"``.
+        :param harness_override: The forwarded override, e.g. ``"codex"``.
+        :returns: None.
+        """
+        if not harness_override or harness_override == "auto":
+            return
+        _session_harness_overrides[conv_id] = (
+            canonicalize_harness(harness_override) or harness_override
+        )
+
     def _session_harness_name(conv_id: str) -> str | None:
+        # The override wins: a routed session runs the harness the server
+        # pinned, not the one its spec declares. Reading the spec here left a
+        # sub-agent whose spec says ``claude-native`` looking native while it
+        # actually ran ``claude-sdk``, so its completion was never pushed to
+        # the parent inbox (the native path that owes it never ran).
+        override = _session_harness_overrides.get(conv_id)
+        if override is not None:
+            return override
         spec = _session_spec_cache.get(conv_id)
         if spec is None:
             return None
@@ -4820,50 +4859,6 @@ def create_runner_app(
             )
         await _cancel_active_turn(conv_id, expected_task=target)
 
-    def _history_message_from_body(body: _JsonObject) -> _JsonObject:
-        message = {
-            "type": "message",
-            "role": body.get("role", "user"),
-            "content": body.get("content", []),
-        }
-        if body.get("created_by") is not None:
-            message["created_by"] = body["created_by"]
-        return message
-
-    def _note_message_author(session_id: str, body: _JsonObject) -> None:
-        if session_id in _author_attribution_sessions:
-            return
-        if body.get("author_attribution_required") is True:
-            _author_attribution_sessions.add(session_id)
-            return
-        authors = {
-            item.get("created_by")
-            for item in _session_histories.get(session_id, [])
-            if isinstance(item.get("created_by"), str) and item.get("created_by")
-        }
-        created_by = body.get("created_by")
-        if isinstance(created_by, str) and created_by:
-            authors.add(created_by)
-        if len(authors) >= 2:
-            _author_attribution_sessions.add(session_id)
-
-    def _message_body_for_harness(
-        body: _JsonObject,
-        *,
-        force_author_attribution: bool,
-    ) -> _JsonObject:
-        event = {
-            key: value
-            for key, value in body.items()
-            if key not in {"created_by", "author_attribution_required"}
-        }
-        prepared = prepare_input_items_for_model(
-            [_history_message_from_body(body)],
-            force_author_attribution=force_author_attribution,
-        )
-        event["content"] = prepared[0]["content"]
-        return event
-
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
@@ -4891,7 +4886,11 @@ def create_runner_app(
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
-                    _history_message_from_body(next_body)
+                    {
+                        "type": "message",
+                        "role": next_body.get("role", "user"),
+                        "content": next_body.get("content", []),
+                    }
                 )
             else:
                 all_bodies = list(buf)
@@ -4900,7 +4899,11 @@ def create_runner_app(
 
                 for body in all_bodies:
                     _session_histories.setdefault(session_id, []).append(
-                        _history_message_from_body(body)
+                        {
+                            "type": "message",
+                            "role": body.get("role", "user"),
+                            "content": body.get("content", []),
+                        }
                     )
                 next_body = all_bodies[-1]
 
@@ -5138,6 +5141,7 @@ def create_runner_app(
                 _dispatched_agent_id,
             )
             _session_spec_cache.pop(conv, None)
+            _session_harness_overrides.pop(conv, None)
             _session_skills_cache.pop(conv, None)
             _session_cursor_model_names.pop(conv, None)
             _drop_session_claude_launch_config(conv)
@@ -5206,6 +5210,7 @@ def create_runner_app(
         harness_name: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
+        _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
         if cached_spec is not None:
             h = (
                 cast(str | None, msg_body.get("harness_override"))
@@ -5218,10 +5223,6 @@ def create_runner_app(
             _session_histories[conv] = (
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
-        if conv not in _author_attribution_sessions and input_items_have_multiple_authors(
-            _session_histories[conv]
-        ):
-            _author_attribution_sessions.add(conv)
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -5233,17 +5234,7 @@ def create_runner_app(
             )
             from omnigent.runtime.prompt import build_instructions
 
-            framework_instructions = (
-                (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
-                if shared_message_attribution_enabled() and conv in _author_attribution_sessions
-                else ()
-            )
-            instructions = build_instructions(
-                cached_spec,
-                None,
-                [],
-                framework_instructions=framework_instructions,
-            )
+            instructions = build_instructions(cached_spec, None, [])
 
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
@@ -5275,14 +5266,7 @@ def create_runner_app(
                 _model_override,
             )
         if _session_histories[conv]:
-            history = _session_histories[conv]
-            if any("created_by" in item for item in history):
-                harness_body["content"] = prepare_input_items_for_model(
-                    history,
-                    force_author_attribution=conv in _author_attribution_sessions,
-                )
-            else:
-                harness_body["content"] = history
+            harness_body["content"] = _session_histories[conv]
         else:
             harness_body["content"] = msg_body.get(
                 "content",
@@ -5510,6 +5494,7 @@ def create_runner_app(
         spawn_env = (
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
         )
+        _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -5781,7 +5766,11 @@ def create_runner_app(
                                         _session_message_buffers[conv_id] = _remaining
                                         for _m in _consumed:
                                             _session_histories.setdefault(conv_id, []).append(
-                                                _history_message_from_body(_m)
+                                                {
+                                                    "type": "message",
+                                                    "role": _m.get("role", "user"),
+                                                    "content": _m.get("content", []),
+                                                }
                                             )
                                     continue
                                 if _evt_type == "response.output_text.delta":
@@ -6094,7 +6083,6 @@ def create_runner_app(
                         session_id=conversation_id,
                         server_client=server_client,
                     )
-                _note_message_author(conversation_id, message_body)
 
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
@@ -6120,15 +6108,9 @@ def create_runner_app(
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
-                            injection_body = _message_body_for_harness(
-                                message_body,
-                                force_author_attribution=(
-                                    conversation_id in _author_attribution_sessions
-                                ),
-                            )
                             _injection_resp = await _hc.post(
                                 f"/v1/sessions/{conversation_id}/events",
-                                json=injection_body,
+                                json=message_body,
                                 timeout=5.0,
                             )
                             if _injection_resp.status_code >= 400:
@@ -6161,7 +6143,11 @@ def create_runner_app(
                         },
                     )
 
-                new_item = _history_message_from_body(message_body)
+                new_item = {
+                    "type": "message",
+                    "role": message_body.get("role", "user"),
+                    "content": message_body.get("content", []),
+                }
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:
@@ -7260,14 +7246,22 @@ def create_runner_app(
         session_id: str,
         environment_id: str,  # noqa: ARG001
     ) -> JSONResponse:
+        import asyncio as _asyncio
+
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
         try:
+            # ``list_changed_files`` shells out to ``git status`` synchronously,
+            # which on a large repo (cold untracked cache) can take seconds.
+            # Offload to a thread so it never blocks the event loop — a blocked
+            # loop can't answer the server's runner-stream relay probe and the
+            # session's first turn 503s with runner_unavailable.
             raw_changes = (
-                session_registry.list_changed_files(
+                await _asyncio.to_thread(
+                    session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
                 )
@@ -7336,11 +7330,17 @@ def create_runner_app(
                 },
             )
 
+        import asyncio as _asyncio
+
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         try:
+            # Offloaded like list_filesystem_changes: get_changed_file shells out
+            # to git (status + show) synchronously, so keep it off the loop.
             record = (
-                session_registry.get_changed_file(session_id, relative_path)
+                await _asyncio.to_thread(
+                    session_registry.get_changed_file, session_id, relative_path
+                )
                 if session_registry is not None
                 else None
             )
@@ -7363,8 +7363,6 @@ def create_runner_app(
                 },
             )
         is_deleted = record.get("status") == "deleted"
-
-        import asyncio as _asyncio
 
         before: str | None = (
             await _asyncio.to_thread(session_registry.get_baseline, relative_path)
@@ -8068,6 +8066,7 @@ def create_runner_app(
 
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
+        _session_harness_overrides.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)

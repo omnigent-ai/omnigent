@@ -419,7 +419,7 @@ describe("NewChatLandingScreen create flow", () => {
     // inputs (host id, recents, derived home) change, so nothing ever
     // re-filled the field — the chip dropped back to its empty placeholder.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: /corey-laptop/ }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
 
     expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo");
   });
