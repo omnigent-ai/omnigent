@@ -61,6 +61,17 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param project_id: First-class project a fired session is filed into
+        (relates to ``projects.id``; no DB foreign key, Rule R032). ``None``
+        means fired sessions are left unfiled.
+    :param project_owner: The ``ProjectStore`` owner scope ``project_id`` was
+        validated and filed under, resolved ONCE at create/update time (see
+        ``omnigent.server.auth.encode_scheduled_task_project_owner`` /
+        ``resolve_project_owner``) — persisted so the fire path never has to
+        re-resolve it against the server's CURRENT auth mode, which can
+        change (e.g. across a restart) after the task was created. ``None``
+        when ``project_id`` is unset, or for a legacy row that predates this
+        column (see ``decode_scheduled_task_project_owner`` for the fallback).
     """
 
     id: str
@@ -82,6 +93,8 @@ class ScheduledTask:
     last_run_at: int | None = None
     last_run_conversation_id: str | None = None
     updated_at: int | None = None
+    project_id: str | None = None
+    project_owner: str | None = None
 
 
 @dataclass

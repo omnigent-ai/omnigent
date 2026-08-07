@@ -14,11 +14,13 @@ Three layers, each catching a distinct breakage:
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from starlette.types import ASGIApp, Send
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
@@ -32,10 +34,11 @@ from omnigent.server.ws_origin import (
 
 _LOCAL_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
 _ALLOWLIST_ENV = "OMNIGENT_WS_ALLOWED_ORIGINS"
+_CONFIG_HOME_ENV = "OMNIGENT_CONFIG_HOME"
 
 
 @pytest.fixture(autouse=True)
-def _clean_origin_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _clean_origin_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Start every test from a known WS-origin env baseline.
 
     The middleware reads ``OMNIGENT_LOCAL_SINGLE_USER`` and
@@ -49,6 +52,7 @@ def _clean_origin_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv(_LOCAL_ENV, raising=False)
     monkeypatch.delenv(_ALLOWLIST_ENV, raising=False)
+    monkeypatch.setenv(_CONFIG_HOME_ENV, str(tmp_path))
 
 
 # --------------------------------------------------------------------------
@@ -185,6 +189,67 @@ def test_parse_allowed_origins_unset_is_empty(monkeypatch: pytest.MonkeyPatch) -
     assert parse_allowed_origins() == frozenset()
 
 
+def test_parse_allowed_origins_reads_global_config_only(tmp_path: Path) -> None:
+    """The global config allowlist is accepted without an env var."""
+    (tmp_path / "config.yaml").write_text(
+        "ws_allowed_origins:\n  - ' https://config.example.com '\n  - ''\n"
+    )
+
+    assert parse_allowed_origins() == frozenset({"https://config.example.com"})
+
+
+def test_parse_allowed_origins_reads_environment_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment allowlist remains supported without config."""
+    monkeypatch.setenv(_ALLOWLIST_ENV, "https://env.example.com")
+
+    assert parse_allowed_origins() == frozenset({"https://env.example.com"})
+
+
+def test_parse_allowed_origins_unions_config_and_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Config and environment entries both contribute to the effective list."""
+    (tmp_path / "config.yaml").write_text("ws_allowed_origins: [https://config.example.com]\n")
+    monkeypatch.setenv(_ALLOWLIST_ENV, "https://env.example.com")
+
+    assert parse_allowed_origins() == frozenset(
+        {"https://config.example.com", "https://env.example.com"}
+    )
+
+
+def test_parse_allowed_origins_skips_malformed_config_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-list config value is warned about and cannot stop the server."""
+    (tmp_path / "config.yaml").write_text("ws_allowed_origins: https://config.example.com\n")
+
+    assert parse_allowed_origins() == frozenset()
+    assert "ws_allowed_origins" in caplog.text
+
+
+def test_parse_allowed_origins_absent_config_key_preserves_defaults(tmp_path: Path) -> None:
+    """A config file without the key leaves the allowlist empty."""
+    (tmp_path / "config.yaml").write_text("profile: default\n")
+
+    assert parse_allowed_origins() == frozenset()
+
+
+def test_middleware_logs_effective_allowed_origins_and_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Startup logging identifies every effective origin and its source."""
+    (tmp_path / "config.yaml").write_text("ws_allowed_origins: [https://config.example.com]\n")
+    monkeypatch.setenv(_ALLOWLIST_ENV, "https://config.example.com,https://env.example.com")
+
+    WebSocketOriginMiddleware(cast(ASGIApp, _RecordingASGIApp()))
+
+    assert "Effective extra trusted origins" in caplog.text
+    assert "config.yaml:ws_allowed_origins" in caplog.text
+    assert _ALLOWLIST_ENV in caplog.text
+
+
 # --------------------------------------------------------------------------
 # WebSocketOriginMiddleware — ASGI level
 # --------------------------------------------------------------------------
@@ -255,7 +320,7 @@ async def _drive_middleware(
         """
         sent.append(message)
 
-    await middleware(scope, receive, send)
+    await middleware(scope, receive, cast(Send, send))
     return sent
 
 
@@ -275,7 +340,7 @@ async def test_middleware_rejects_forbidden_origin_without_calling_route(
     """
     monkeypatch.setenv(_LOCAL_ENV, "1")
     downstream = _RecordingASGIApp()
-    middleware = WebSocketOriginMiddleware(downstream)
+    middleware = WebSocketOriginMiddleware(cast(ASGIApp, downstream))
 
     sent = await _drive_middleware(middleware, _ws_scope("https://evil.example.com"))
 
@@ -300,7 +365,7 @@ async def test_middleware_admits_loopback_origin(monkeypatch: pytest.MonkeyPatch
     """
     monkeypatch.setenv(_LOCAL_ENV, "1")
     downstream = _RecordingASGIApp()
-    middleware = WebSocketOriginMiddleware(downstream)
+    middleware = WebSocketOriginMiddleware(cast(ASGIApp, downstream))
 
     sent = await _drive_middleware(middleware, _ws_scope("http://localhost:8000"))
 
@@ -317,7 +382,7 @@ async def test_middleware_ignores_non_websocket_scope() -> None:
     :returns: None.
     """
     downstream = _RecordingASGIApp()
-    middleware = WebSocketOriginMiddleware(downstream)
+    middleware = WebSocketOriginMiddleware(cast(ASGIApp, downstream))
 
     await _drive_middleware(middleware, {"type": "http", "headers": []})
 

@@ -21,7 +21,8 @@ WebSocket share exactly one trust boundary:
   below, but are not required to.
 - the first-party sentinel (:data:`OMNIGENT_INTERNAL_WS_ORIGIN`,
   ``"omnigent://internal"``) and any origin in
-  ``OMNIGENT_WS_ALLOWED_ORIGINS`` pass;
+  ``OMNIGENT_WS_ALLOWED_ORIGINS`` or global ``ws_allowed_origins`` config key
+  pass;
 - in single-user **local mode** (no cookie / proxy auth) a present
   ``Origin`` must be a loopback host — this is where the guard actually
   bites, since that deployment has no other CSRF defense;

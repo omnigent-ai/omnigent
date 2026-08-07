@@ -70,6 +70,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "last_run_conversation_id",
         "created_at",
         "updated_at",
+        "project_id",
+        "project_owner",
     }
 
 

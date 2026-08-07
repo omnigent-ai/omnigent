@@ -61,6 +61,8 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
         updated_at=row.updated_at,
+        project_id=row.project_id,
+        project_owner=row.project_owner,
     )
 
 
@@ -130,6 +132,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = None,
         host_id: str | None = None,
         state: str = "active",
+        project_id: str | None = None,
+        project_owner: str | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         row = SqlScheduledTask(
@@ -151,6 +155,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             last_run_conversation_id=None,
             created_at=now_epoch(),
             updated_at=None,
+            project_id=project_id,
+            project_owner=project_owner,
         )
         with self._session("insert_task") as session:
             session.add(row)
@@ -251,14 +257,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        project_id: str | None = _UNSET,
+        project_owner: str | None = _UNSET,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
-        ``None`` leaves most fields unchanged. For ``host_id`` and
-        ``last_run_conversation_id``, the sentinel default means "not provided
-        / leave unchanged"; passing ``None`` explicitly sets the column to NULL.
-        Passing ``rrule`` updates the recurring trigger; ``None``
-        leaves it unchanged.
+        ``None`` leaves most fields unchanged. For ``host_id``,
+        ``last_run_conversation_id``, ``project_id``, and ``project_owner``,
+        the sentinel default means "not provided / leave unchanged"; passing
+        ``None`` explicitly sets the column to NULL. Passing ``rrule`` updates
+        the recurring trigger; ``None`` leaves it unchanged.
         """
         with self._session("update_task") as session:
             row = session.get(SqlScheduledTask, (current_workspace_id(), scheduled_task_id))
@@ -301,6 +309,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.last_run_conversation_id != last_run_conversation_id
             ):
                 row.last_run_conversation_id = last_run_conversation_id
+                changed = True
+            if project_id is not _UNSET and row.project_id != project_id:
+                row.project_id = project_id
+                changed = True
+            if project_owner is not _UNSET and row.project_owner != project_owner:
+                row.project_owner = project_owner
                 changed = True
             if changed:
                 row.updated_at = now_epoch()

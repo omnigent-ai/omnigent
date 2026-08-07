@@ -24,7 +24,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    encode_scheduled_task_project_owner,
+    resolve_project_owner,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -34,7 +39,7 @@ from omnigent.server.routes._session_create_validation import (
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
-from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores import AgentStore, ConversationStore, PermissionStore, ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -61,6 +66,10 @@ class CreateScheduledTaskRequest(BaseModel):
     # ``UpdateScheduledTaskRequest``).
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
+    # Optional: file each fired session into a first-class project. ``None``
+    # (the default) leaves fired sessions unfiled. Must name a project the
+    # caller owns — validated at create time, not just deferred to fire time.
+    project_id: str | None = None
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -77,6 +86,10 @@ class UpdateScheduledTaskRequest(BaseModel):
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     state: str | None = None
+    # Unlike workspace/host_id, an explicit ``null`` IS meaningful here: it
+    # unfiles the task (clears project_id). Omitting the field leaves
+    # membership unchanged (see ``model_fields_set`` handling below).
+    project_id: str | None = None
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:
@@ -129,6 +142,7 @@ def _to_response(
         "last_run_conversation_id": task.last_run_conversation_id,
         "next_run_at": next_run_at,
         "updated_at": task.updated_at,
+        "project_id": task.project_id,
     }
 
 
@@ -177,6 +191,7 @@ def create_scheduled_tasks_router(
     permission_store: PermissionStore | None = None,
     agent_cache: Any | None = None,
     auth_provider: AuthProvider | None = None,
+    project_store: ProjectStore | None = None,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -185,9 +200,20 @@ def create_scheduled_tasks_router(
     :param store: The shared :class:`ScheduledTaskStore`.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
+    :param project_store: Store for first-class projects. ``None`` disables
+        the projects feature — a caller-supplied ``project_id`` is then always
+        rejected.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
+
+    # Computed once from the SAME auth_provider instance the routes use to
+    # resolve identity, so the fire path (which is wired from this exact
+    # provider in app.py) can never drift from what this router does. See
+    # ``resolve_project_owner``.
+    _local_single_user = (
+        auth_provider.is_local_single_user() if auth_provider is not None else False
+    )
 
     def _owner(request: Request) -> str:
         """Resolve the calling user, mapping the auth-disabled case to
@@ -272,6 +298,88 @@ def create_scheduled_tasks_router(
         )
         return canonical_workspace, validated_model, validated_effort
 
+    async def _validate_project_id_or_404(
+        project_id: str | None, *, owner: str | None
+    ) -> str | None:
+        """Reject a ``project_id`` the caller does not own or that doesn't exist.
+
+        ``None`` (unset / unfiling) is always valid and skips the lookup.
+        Loud rejection at create/update time — the fire path separately
+        soft-fails a project that vanishes later.
+
+        Returns the RESOLVED owner scope (encoded for storage) so the caller
+        persists it into ``scheduled_tasks.project_owner`` alongside
+        ``project_id`` — the fire path then reads that stored value directly
+        instead of re-resolving ownership against whatever auth mode the
+        server happens to be running at fire time (unsafe across an
+        auth-mode change; see ``resolve_project_owner``'s docstring).
+
+        :param owner: The task-ownership-normalized owner (``owner_id`` —
+            ``None`` for "the single local user", whichever mode produced
+            that). Resolved to the project's actual owner scope via
+            :func:`resolve_project_owner` before the lookup — see that
+            function's docstring for why this indirection is required.
+        :returns: ``None`` when ``project_id`` is ``None``; otherwise the
+            encoded owner to persist as ``project_owner``.
+        """
+        if project_id is None:
+            return None
+        if project_store is None:
+            raise OmnigentError(
+                "Filing a scheduled task into a project is not supported by this server",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        project_owner = resolve_project_owner(owner, local_single_user=_local_single_user)
+        owned = await asyncio.to_thread(project_store.get, project_id, owner_user_id=project_owner)
+        if owned is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return encode_scheduled_task_project_owner(project_owner)
+
+    async def _heal_legacy_project_owner(project_id: str, *, owner: str | None) -> str | None:
+        """Best-effort heal-on-update: resolve a legacy row's owner under the
+        CURRENT mode and confirm it with a scoped lookup — same discipline as
+        the fire path's heal-on-fire — persisting it ONLY on a confirmed hit.
+
+        Unlike :func:`_validate_project_id_or_404`, a miss here is NOT an
+        error: an unrelated PATCH (rename, RRULE change, ...) must never fail
+        just because current-mode resolution doesn't happen to match this
+        legacy project's true owner. On a miss, the row is left exactly as
+        it was (``project_owner`` stays NULL) so the live fallback in
+        :func:`~omnigent.server.auth.decode_scheduled_task_project_owner`
+        remains available for a future fire or heal attempt — writing an
+        UNVERIFIED resolved owner here would instead turn a recoverable
+        legacy row into a permanently wrong non-legacy one (decode would no
+        longer fall back), breaking filing even after the mode reverts.
+
+        Best-effort ALSO means never letting the caller's PATCH fail because
+        of this: an exception from the lookup (a transient project-store
+        error) is caught, logged, and treated exactly like a miss — the
+        PATCH's own fields still get written normally. Mirrors how the fire
+        path's heal-on-fire never lets a healing failure break the run.
+
+        :param project_id: The task's existing (non-``None``) ``project_id``.
+        :param owner: The task-ownership-normalized owner (``owner_id``).
+        :returns: The encoded owner to persist, or ``None`` if the lookup
+            missed or failed (leave ``project_owner`` unset / still legacy).
+        """
+        if project_store is None:
+            return None
+        try:
+            project_owner = resolve_project_owner(owner, local_single_user=_local_single_user)
+            owned = await asyncio.to_thread(
+                project_store.get, project_id, owner_user_id=project_owner
+            )
+        except Exception:
+            _logger.exception(
+                "heal-on-update: project_store lookup for project %s failed; "
+                "leaving project_owner unresolved",
+                project_id,
+            )
+            return None
+        if owned is None:
+            return None
+        return encode_scheduled_task_project_owner(project_owner)
+
     def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
         """Load a task the caller owns, or raise 404.
 
@@ -290,8 +398,10 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
+        project_owner = await _validate_project_id_or_404(body.project_id, owner=owner_id)
         workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
             owner=owner,
@@ -306,13 +416,15 @@ def create_scheduled_tasks_router(
             name=body.name,
             prompt=body.prompt,
             rrule=body.rrule,
-            user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            user_id=owner_id,
             agent_id=body.agent_id,
             timezone=body.timezone,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
             workspace=workspace,
             host_id=body.host_id,
+            project_id=body.project_id,
+            project_owner=project_owner,
         )
         scheduler = _scheduler(request)
         if scheduler is not None:
@@ -473,6 +585,25 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        if "project_id" in fields:
+            fields["project_owner"] = await _validate_project_id_or_404(
+                fields["project_id"], owner=owner_id
+            )
+        elif existing.project_id is not None and existing.project_owner is None:
+            # Heal-on-update: a legacy row (project_id set, project_owner
+            # never persisted — predates this column) gets its owner resolved
+            # under the CURRENT mode and CONFIRMED with a scoped lookup on
+            # ANY successful PATCH, not just one that touches project_id.
+            # Without this, a rename or RRULE-only PATCH would leave the row
+            # mode-dependent forever (see
+            # decode_scheduled_task_project_owner's fallback). A miss (the
+            # legacy project's true owner doesn't match this mode's
+            # resolution) leaves the row untouched — see
+            # _heal_legacy_project_owner's docstring for why persisting an
+            # unverified guess would be worse than doing nothing.
+            healed_owner = await _heal_legacy_project_owner(existing.project_id, owner=owner_id)
+            if healed_owner is not None:
+                fields["project_owner"] = healed_owner
         if {"model_override", "reasoning_effort"}.intersection(fields):
             model_override, reasoning_effort = validate_session_model_metadata(
                 model_override=fields.get("model_override", existing.model_override),

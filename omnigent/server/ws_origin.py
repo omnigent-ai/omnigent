@@ -28,7 +28,8 @@ authenticate every connection with a signed ``__Host-ap_session`` cookie
 or a trusted-proxy header, so a cross-origin page cannot ride the user's
 credentials. The middleware leaves those modes as passthrough unless the
 deployment opts into an explicit allowlist via
-``OMNIGENT_WS_ALLOWED_ORIGINS``.
+``OMNIGENT_WS_ALLOWED_ORIGINS`` or the global ``ws_allowed_origins``
+configuration key.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from urllib.parse import urlsplit
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from omnigent.config import load_global_config
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.auth import local_single_user_enabled
 
@@ -64,6 +66,7 @@ __all__ = [
 # non-local modes a non-empty allowlist also flips the default from
 # passthrough to deny-by-default.
 _ALLOWED_ORIGINS_ENV = "OMNIGENT_WS_ALLOWED_ORIGINS"
+_ALLOWED_ORIGINS_CONFIG_KEY = "ws_allowed_origins"
 
 # Private-use WebSocket close code (4000-4999) for a rejected origin.
 # Distinct from the auth-failure ``1008`` and the tunnel-mismatch ``4004``
@@ -99,18 +102,79 @@ def origin_hostname_is_loopback(origin: str) -> bool:
     return addr.is_loopback or (mapped_ipv4 is not None and mapped_ipv4.is_loopback)
 
 
-def parse_allowed_origins() -> frozenset[str]:
-    """Read the optional explicit origin allowlist from the environment.
+def _normalize_allowed_origins(origins: Iterable[str]) -> frozenset[str]:
+    """Strip whitespace and discard blank origin entries.
 
-    Reads ``OMNIGENT_WS_ALLOWED_ORIGINS`` (comma-separated). Whitespace
-    around each entry is stripped and empty entries are dropped.
+    :param origins: Raw origin entries from a configured source.
+    :returns: The normalized, non-empty origins.
+    """
+    return frozenset(origin.strip() for origin in origins if origin.strip())
+
+
+def _config_allowed_origins() -> frozenset[str]:
+    """Read ``ws_allowed_origins`` from the global user configuration.
+
+    :returns: The config-supplied origins, or an empty set when absent or
+        malformed.
+    """
+    raw_origins = load_global_config().get(_ALLOWED_ORIGINS_CONFIG_KEY)
+    if raw_origins is None:
+        return frozenset()
+    if not isinstance(raw_origins, list) or not all(
+        isinstance(origin, str) for origin in raw_origins
+    ):
+        _logger.warning(
+            "Ignoring malformed %s in config.yaml; expected a list of origin strings",
+            _ALLOWED_ORIGINS_CONFIG_KEY,
+        )
+        return frozenset()
+    return _normalize_allowed_origins(raw_origins)
+
+
+def _allowed_origins_by_source() -> tuple[frozenset[str], frozenset[str]]:
+    """Return config and environment origins after shared normalization.
+
+    :returns: A ``(config_origins, environment_origins)`` pair.
+    """
+    config_origins = _config_allowed_origins()
+    environment_origins = _normalize_allowed_origins(
+        os.environ.get(_ALLOWED_ORIGINS_ENV, "").split(",")
+    )
+    return config_origins, environment_origins
+
+
+def parse_allowed_origins() -> frozenset[str]:
+    """Read the optional explicit origin allowlist from config and environment.
+
+    Reads ``ws_allowed_origins`` (a list) from the global config file and
+    ``OMNIGENT_WS_ALLOWED_ORIGINS`` (comma-separated), then normalizes both
+    through the same path. Whitespace around entries is stripped and empty
+    entries are dropped.
 
     :returns: The set of explicitly allowed origins, e.g.
         ``frozenset({"https://app.example.com"})``; empty when the env
-        var is unset or blank.
+        var and config key are absent or blank.
     """
-    raw = os.environ.get(_ALLOWED_ORIGINS_ENV, "")
-    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+    config_origins, environment_origins = _allowed_origins_by_source()
+    return config_origins | environment_origins
+
+
+def log_effective_allowed_origins() -> None:
+    """Log configured extra trusted origins and every contributing source.
+
+    :returns: None.
+    """
+    config_origins, environment_origins = _allowed_origins_by_source()
+    effective_origins = config_origins | environment_origins
+    entries = []
+    for origin in sorted(effective_origins):
+        sources = []
+        if origin in config_origins:
+            sources.append("config.yaml:ws_allowed_origins")
+        if origin in environment_origins:
+            sources.append(_ALLOWED_ORIGINS_ENV)
+        entries.append(f"{origin} ({', '.join(sources)})")
+    _logger.warning("Effective extra trusted origins: %s", ", ".join(entries) or "(none)")
 
 
 def origin_allowed(
@@ -193,8 +257,8 @@ class WebSocketOriginMiddleware:
     Non-WebSocket scopes and permitted handshakes pass through untouched.
 
     The server mode (``local_mode``) and the allowlist are read per
-    connection from the environment, so behavior tracks the runtime
-    configuration rather than being frozen at construction time.
+    connection, so behavior tracks runtime configuration rather than being
+    frozen at construction time.
 
     :param app: Downstream ASGI app.
     """
@@ -206,6 +270,7 @@ class WebSocketOriginMiddleware:
         :returns: None.
         """
         self._app = app
+        log_effective_allowed_origins()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Enforce the origin policy for WebSocket handshakes.

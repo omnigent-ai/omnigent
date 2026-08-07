@@ -19,14 +19,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import ScheduledTask
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    RESERVED_USER_LOCAL,
+    encode_scheduled_task_project_owner,
+)
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
@@ -75,7 +79,14 @@ class FakeScheduledTaskStore:
     def update(self, scheduled_task_id: str, **kwargs: Any) -> ScheduledTask | None:
         self.update_workspace_ids.append(current_workspace_id())
         self.updates.append({"id": scheduled_task_id, **kwargs})
-        return self._rows.get(scheduled_task_id)
+        row = self._rows.get(scheduled_task_id)
+        if row is not None:
+            # Actually apply the kwargs (unlike a bare recording stub) so a
+            # subsequent get() in the SAME test observes the write — needed
+            # for heal-on-fire tests that re-fire after a persisted heal.
+            row = replace(row, **kwargs)
+            self._rows[scheduled_task_id] = row
+        return row
 
     def create_run(
         self, run_id: str, scheduled_task_id: str, status: str, scheduled_at: int, **kwargs: Any
@@ -111,6 +122,7 @@ class FakeConversationStore:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.created: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
+        self.filed: list[tuple[str, str | None]] = []
         self._seq = 0
         self.fail_create = fail_create
 
@@ -134,6 +146,10 @@ class FakeConversationStore:
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
+
+    def set_conversation_project(self, conversation_id: str, project_id: str | None) -> bool:
+        self.filed.append((conversation_id, project_id))
+        return True
 
 
 class FakePermissionStore:
@@ -183,6 +199,25 @@ class FakeHostRegistry:
         return None
 
 
+class FakeProjectStore:
+    """Serves ``get`` from ``{project_id: owner_user_id}``, exactly like the
+    real :class:`ProjectStore`: a project owned by someone else (or by a
+    different owner scope, e.g. ``None`` vs ``"local"``) is treated as not
+    found, not just a missing id."""
+
+    def __init__(self, existing: dict[str, str | None] | None = None) -> None:
+        self.existing = existing or {}
+        self.gets: list[tuple[str, str | None]] = []
+
+    def get(self, project_id: str, *, owner_user_id: str | None) -> object | None:
+        self.gets.append((project_id, owner_user_id))
+        if project_id not in self.existing:
+            return None
+        if self.existing[project_id] != owner_user_id:
+            return None
+        return object()
+
+
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
     return FireDeps(
         scheduled_task_store=sched_store,
@@ -196,6 +231,8 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         tunnel_registry=overrides.get("tunnel_registry"),
         file_store=overrides.get("file_store"),
         artifact_store=overrides.get("artifact_store"),
+        project_store=overrides.get("project_store"),
+        local_single_user=overrides.get("local_single_user", False),
     )
 
 
@@ -334,6 +371,347 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@dataclass
+class _OwnerModeCase:
+    """One of the three owner conventions a task's persisted ``project_owner``
+    must reconcile with a project's ``owner_user_id``."""
+
+    mode_id: str
+    task_user_id: str | None
+    local_single_user: bool
+    project_owner: str | None
+
+
+_OWNER_MODE_CASES = [
+    _OwnerModeCase(
+        "auth_disabled", task_user_id=None, local_single_user=False, project_owner=None
+    ),
+    _OwnerModeCase(
+        "local_single_user",
+        task_user_id=None,
+        local_single_user=True,
+        project_owner=RESERVED_USER_LOCAL,
+    ),
+    _OwnerModeCase(
+        "multi_user",
+        task_user_id="alice@example.com",
+        local_single_user=False,
+        project_owner="alice@example.com",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _OWNER_MODE_CASES, ids=lambda c: c.mode_id)
+async def test_fire_files_session_into_project_across_owner_modes(case: _OwnerModeCase) -> None:
+    """A task's ``project_id`` files into the SAME owner scope a project of
+    that mode is actually stored under, in all three owner conventions:
+
+    * ``auth_disabled`` — no :class:`AuthProvider` at all; both the task's
+      ``user_id`` and the project's owner are ``None``.
+    * ``local_single_user`` — an :class:`AuthProvider` configured with
+      ``local_single_user=True``; the task's ``user_id`` is STILL ``None``
+      (scheduled-task ownership normalizes "the local user" to ``None``
+      regardless of why), but the project is owned by the literal
+      ``RESERVED_USER_LOCAL`` (``"local"``) — the raw identity
+      ``routes/projects.py``'s ``create_project`` stored it under.
+    * ``multi_user`` — a real user id owns both the task and the project.
+
+    ``task.project_owner`` is the value the ROUTES persisted at create/update
+    time (``encode_scheduled_task_project_owner(case.project_owner)``); the
+    fire path decodes it directly rather than re-deriving it from
+    ``task.user_id`` + the CURRENT server's mode — see
+    ``test_fire_files_session_into_project_survives_auth_mode_change`` for why
+    that distinction matters.
+    """
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    project_store = FakeProjectStore(existing={"proj_1": case.project_owner})
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                project_id="proj_1",
+                user_id=case.task_user_id,
+                project_owner=encode_scheduled_task_project_owner(case.project_owner),
+            )
+        }
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            project_store=project_store,
+            local_single_user=case.local_single_user,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert project_store.gets == [("proj_1", case.project_owner)]
+    assert len(conv_store.created) == 1
+    assert conv_store.filed == [("conv_1", "proj_1")]
+    # The run still recorded normally.
+    assert len(store.runs) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "created_local_single_user",
+    [False, True],
+    ids=["auth_disabled_to_local_single_user", "local_single_user_to_auth_disabled"],
+)
+async def test_fire_files_session_into_project_survives_auth_mode_change(
+    created_local_single_user: bool,
+) -> None:
+    """Regression: a task's project filing must survive an auth-mode change
+    between creation and fire (e.g. a server restart that flips
+    ``OMNIGENT_LOCAL_SINGLE_USER``), in BOTH directions.
+
+    The task's ``project_owner`` was resolved and persisted at create time
+    under ``created_local_single_user``'s mode (``None`` — auth fully
+    disabled — encodes to ``""``; local-single-user encodes to
+    ``RESERVED_USER_LOCAL``). The project is owned under that SAME resolved
+    scope. The fire path runs under the OPPOSITE mode
+    (``fired_local_single_user``) — simulating the restart — and must still
+    resolve the project's true owner from the persisted ``project_owner``,
+    NOT re-derive a (wrong) scope from ``task.user_id`` under the new mode.
+    Before persisting ``project_owner``, re-resolving at fire time from a
+    flipped mode would look the project up under the wrong scope and treat a
+    still-valid project as vanished.
+
+    Unit-boundary choice: this exercises ``build_on_fire`` directly against a
+    manually constructed row/``FireDeps.local_single_user`` flip rather than
+    a full create-through-app-A / restart / fire-through-app-B flow. The
+    route-level ``test_create_with_project_id_across_owner_modes`` /
+    ``test_update_with_project_id_across_owner_modes`` already cover real
+    create/update through each mode's actual app end-to-end; a true two-app
+    restart flow would additionally need to spin up and tear down two
+    separate ``create_app`` instances (with different ``auth_provider``s)
+    sharing one ``db_uri`` and both entering/exiting the ASGI lifespan, which
+    buys no more coverage of ``resolve_project_owner`` /
+    ``decode_scheduled_task_project_owner`` — the actual logic under test —
+    than flipping the flag here does.
+    """
+    created_owner = RESERVED_USER_LOCAL if created_local_single_user else None
+    fired_local_single_user = not created_local_single_user
+
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    project_store = FakeProjectStore(existing={"proj_1": created_owner})
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                project_id="proj_1",
+                user_id=None,
+                project_owner=encode_scheduled_task_project_owner(created_owner),
+            )
+        }
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            project_store=project_store,
+            # The OPPOSITE of the mode the task/project were created under —
+            # simulating a restart into the other mode before this fire.
+            local_single_user=fired_local_single_user,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert project_store.gets == [("proj_1", created_owner)]
+    assert conv_store.filed == [("conv_1", "proj_1")]
+
+
+@pytest.mark.asyncio
+async def test_fire_heals_legacy_project_owner_and_survives_later_mode_switch() -> None:
+    """Heal-on-fire: a legacy row (``project_owner`` NULL) has its owner
+    resolved under the CURRENT mode on this fire; since the lookup succeeds,
+    that resolution is persisted back onto the row. A LATER fire — even one
+    that runs after the server's auth mode changes — must still file
+    correctly, because it reads the now-healed ``project_owner`` directly
+    instead of taking the (now wrong) live fallback again.
+
+    Without the heal, the second fire below would re-derive
+    ``resolve_project_owner(None, local_single_user=False)`` == ``None`` and
+    look "proj_1" up under the wrong owner, soft-failing as vanished.
+    """
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    project_store = FakeProjectStore(existing={"proj_1": RESERVED_USER_LOCAL})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(project_id="proj_1", user_id=None, project_owner=None)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    # First fire: server is in local-single-user mode. The legacy row falls
+    # back to resolve_project_owner(None, local_single_user=True) ==
+    # RESERVED_USER_LOCAL, the lookup succeeds, and the heal persists it.
+    on_fire_before_switch = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            project_store=project_store,
+            local_single_user=True,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire_before_switch(0, "task_1")
+    await _drain()
+
+    assert conv_store.filed == [("conv_1", "proj_1")]
+    heal_writes = [u for u in store.updates if "project_owner" in u]
+    assert heal_writes == [{"id": "task_1", "project_owner": RESERVED_USER_LOCAL}]
+
+    # Second fire: simulate a restart that flips the server INTO
+    # auth-disabled mode. The row is no longer legacy (project_owner was
+    # healed to RESERVED_USER_LOCAL above), so decode returns it verbatim
+    # regardless of the new mode.
+    on_fire_after_switch = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            project_store=project_store,
+            local_single_user=False,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire_after_switch(0, "task_1")
+    await _drain()
+
+    assert project_store.gets == [
+        ("proj_1", RESERVED_USER_LOCAL),
+        ("proj_1", RESERVED_USER_LOCAL),
+    ]
+    assert conv_store.filed == [("conv_1", "proj_1"), ("conv_2", "proj_1")]
+    # No second heal write — the row was healed only once, on the first fire.
+    assert len([u for u in store.updates if "project_owner" in u]) == 1
+
+
+@pytest.mark.asyncio
+async def test_fire_leaves_legacy_row_null_on_scope_mismatch_and_still_fires_later() -> None:
+    """Companion to the route-level
+    ``test_update_heal_leaves_legacy_project_owner_null_on_scope_mismatch``:
+    a legacy row (``project_owner`` NULL) whose project is ``None``-owned
+    (created auth-disabled) fires FIRST under local-single-user mode. The
+    fallback resolves ``RESERVED_USER_LOCAL``, which does NOT match the
+    project's true ``None`` owner, so the lookup misses — this fire must
+    soft-fail unfiled WITHOUT persisting the unverified ``"local"`` guess
+    (mirrors heal-on-fire's existing "only heal on a confirmed hit"
+    discipline). A LATER fire back under auth-disabled mode must then
+    succeed, because the row is still legacy (NULL) and the fallback
+    re-resolves to the CORRECT ``None`` this time.
+    """
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    # The project's true owner is None, regardless of which mode fires below.
+    project_store = FakeProjectStore(existing={"proj_1": None})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(project_id="proj_1", user_id=None, project_owner=None)}
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    # First fire: local-single-user mode. Fallback resolves RESERVED_USER_LOCAL
+    # ("local"), which mismatches the project's true None owner — a miss.
+    on_fire_mismatch = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            project_store=project_store,
+            local_single_user=True,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire_mismatch(0, "task_1")
+    await _drain()
+
+    assert project_store.gets == [("proj_1", RESERVED_USER_LOCAL)]
+    # Session still created/launched/recorded — just left unfiled.
+    assert conv_store.filed == []
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert len(store.runs) == 1
+    # No heal write on a miss — the row stays legacy (NULL), still
+    # recoverable by a later fire under the mode that actually matches.
+    assert not [u for u in store.updates if "project_owner" in u]
+
+    # Second fire: back to auth-disabled mode. The row is STILL legacy, so
+    # the fallback re-resolves — correctly, this time — to None, and filing
+    # succeeds (and heals the row).
+    on_fire_correct_mode = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            project_store=project_store,
+            local_single_user=False,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire_correct_mode(0, "task_1")
+    await _drain()
+
+    assert project_store.gets == [("proj_1", RESERVED_USER_LOCAL), ("proj_1", None)]
+    assert conv_store.filed == [("conv_2", "proj_1")]
+    heal_writes = [u for u in store.updates if "project_owner" in u]
+    assert heal_writes == [{"id": "task_1", "project_owner": ""}]
+
+
+@pytest.mark.asyncio
+async def test_fire_vanished_project_soft_fails_and_still_runs() -> None:
+    """A task pinning a project that no longer exists still fires — unfiled."""
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    # The project store has no rows: "proj_gone" no longer exists.
+    project_store = FakeProjectStore(existing={})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_gone")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            project_store=project_store,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # No filing call was made — the session stays unfiled.
+    assert conv_store.filed == []
+    # But the run is NOT broken: session created, launched, and recorded.
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
 
 
 @pytest.mark.asyncio

@@ -110,6 +110,13 @@ class SysScheduledTaskCreateTool(Tool):
                                 "is online."
                             ),
                         },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional project to file each fired session into. Must be "
+                                "a project you own. Omit to leave fired sessions unfiled."
+                            ),
+                        },
                     },
                     "required": ["name", "prompt", "rrule", "agent_id"],
                     "additionalProperties": False,
@@ -199,6 +206,14 @@ class SysScheduledTaskUpdateTool(Tool):
                         "state": {
                             "type": "string",
                             "description": "'active' or 'paused'.",
+                        },
+                        "project_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "New project to file each fired session into (must be a "
+                                "project you own), or null to unfile. Omit to leave "
+                                "membership unchanged."
+                            ),
                         },
                     },
                     "required": ["scheduled_task_id"],

@@ -8,6 +8,7 @@ no network. Covers registry wiring, schema shape, bank resolution from
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
@@ -223,7 +224,16 @@ def test_client_exception_is_caught(tool_ctx: ToolContext) -> None:
     tool = HindsightRecallTool(_cfg(bank_id="b"))
     with patch("hindsight_client.Hindsight", return_value=client):
         result = tool.invoke(json.dumps({"query": "q"}), tool_ctx)
-    assert result.startswith("Hindsight recall failed:")
+    assert result.startswith("Hindsight recall failed (RuntimeError):")
+
+
+def test_retain_timeout_includes_exception_type(tool_ctx: ToolContext) -> None:
+    client = _mock_client()
+    client.retain.side_effect = asyncio.TimeoutError()
+    tool = HindsightRetainTool(_cfg(bank_id="b"))
+    with patch("hindsight_client.Hindsight", return_value=client):
+        result = tool.invoke(json.dumps({"content": "x"}), tool_ctx)
+    assert result == "Hindsight retain failed (TimeoutError): "
 
 
 # ---------------------------------------------------------------------------

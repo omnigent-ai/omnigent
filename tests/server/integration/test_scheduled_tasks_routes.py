@@ -7,6 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -19,12 +20,14 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
@@ -71,6 +74,9 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         # ownership) resolves against actual host rows. Without it,
         # ``app.state.host_store`` is None and the route skips the check.
         host_store=HostStore(db_uri),
+        # A real project store so project_id validation (existence + ownership)
+        # resolves against actual project rows.
+        project_store=SqlAlchemyProjectStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
 
@@ -157,6 +163,431 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+
+
+async def _create_project(
+    auth_client: httpx.AsyncClient, name: str, *, headers: dict[str, str] | None = None
+) -> str:
+    """Create a project via the projects API and return its id."""
+    resp = await auth_client.post(
+        "/v1/projects", json={"name": name}, headers=headers or _headers()
+    )
+    assert resp.status_code == 200, resp.text
+    return str(resp.json()["id"])
+
+
+async def test_create_with_project_id_files_the_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Creating with a ``project_id`` the caller owns persists it."""
+    _make_user(db_uri)
+    project_id = await _create_project(auth_client, "nightly work")
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(project_id=project_id),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["project_id"] == project_id
+    task_id = created["id"]
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["project_id"] == project_id
+
+
+async def test_create_rejects_nonexistent_project_id(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A ``project_id`` that does not exist is rejected loudly at create time."""
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(project_id="00000000000000000000000000000000"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_create_rejects_another_owners_project_id(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A ``project_id`` owned by a different user is rejected as not found."""
+    _make_user(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    bobs_project = await _create_project(
+        auth_client, "bob's project", headers=_headers("bob@example.com")
+    )
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(project_id=bobs_project),
+        headers=_headers("alice@example.com"),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_update_sets_project_id(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """PATCH can file a previously-unfiled task into a project the caller owns."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    project_id = await _create_project(auth_client, "later work")
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"project_id": project_id},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] == project_id
+
+
+async def test_update_clears_project_id(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """PATCH with an explicit ``project_id: null`` unfiles the task."""
+    _make_user(db_uri)
+    project_id = await _create_project(auth_client, "to be cleared")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(project_id=project_id),
+            headers=_headers(),
+        )
+    ).json()
+    assert created["project_id"] == project_id
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"project_id": None},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] is None
+
+
+async def test_update_omitting_project_id_leaves_it_unchanged(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Omitting ``project_id`` on PATCH leaves membership unchanged."""
+    _make_user(db_uri)
+    project_id = await _create_project(auth_client, "steady state")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(project_id=project_id),
+            headers=_headers(),
+        )
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"name": "renamed"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] == project_id
+
+
+async def test_update_rejects_nonexistent_project_id(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """PATCH rejects a ``project_id`` that does not exist."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"project_id": "00000000000000000000000000000000"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_update_heals_legacy_project_owner_on_unrelated_patch(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Heal-on-update: a legacy row (``project_id`` set directly at the store
+    layer, before ``project_owner`` existed — ``project_owner`` stays NULL)
+    gets its owner resolved and persisted on ANY successful PATCH, even one
+    that touches only unrelated fields (here: a rename). Without this, a
+    legacy row would stay mode-dependent forever, since only a PATCH that
+    itself sets ``project_id`` would otherwise ever write ``project_owner``.
+    """
+    _make_user(db_uri)
+    project_id = await _create_project(auth_client, "legacy target")
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    # Simulate a legacy row: project_id set directly at the store layer
+    # (bypassing the route, which always pairs it with project_owner), so
+    # project_owner stays NULL exactly like a row written before that column
+    # existed.
+    legacy_store = SqlAlchemyScheduledTaskStore(db_uri)
+    legacy_store.update(created["id"], project_id=project_id)
+    assert legacy_store.get(created["id"]).project_owner is None  # type: ignore[union-attr]
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"name": "renamed"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "renamed"
+
+    healed = legacy_store.get(created["id"])
+    assert healed is not None
+    assert healed.project_id == project_id
+    assert healed.project_owner == "alice@example.com"
+
+
+async def test_update_heal_leaves_legacy_project_owner_null_on_scope_mismatch(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    """Heal-on-update must NOT persist an unverified guess.
+
+    A legacy row's project was created auth-disabled (owner ``None``). The
+    server is NOW running local-single-user, so an unrelated rename PATCH
+    resolves the current-mode owner as ``RESERVED_USER_LOCAL`` — which does
+    NOT match the project's true ``None`` owner. The heal attempt's scoped
+    lookup must miss, and ``project_owner`` must stay NULL (not get
+    overwritten with the wrong, unverified ``"local"``) — otherwise this
+    legacy row would become permanently mis-owned: decode no longer falls
+    back once ``project_owner`` is non-NULL, so filing would stay broken even
+    after the server returns to auth-disabled.
+    """
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    # The project's true owner is None — as if created while auth was fully
+    # disabled — regardless of what mode the PATCH below runs under.
+    project_id = uuid.uuid4().hex
+    SqlAlchemyProjectStore(db_uri).create(project_id, "orphaned legacy project", None)
+
+    # A legacy scheduled-task row: project_id set, project_owner never
+    # persisted (NULL), owned by the single local user (user_id None).
+    task_id = uuid.uuid4().hex
+    legacy_store = SqlAlchemyScheduledTaskStore(db_uri)
+    legacy_store.create(
+        scheduled_task_id=task_id,
+        name="nightly",
+        prompt="do the thing",
+        rrule=_VALID_RRULE,
+        user_id=None,
+        agent_id=builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        timezone="UTC",
+        project_id=project_id,
+    )
+    assert legacy_store.get(task_id).project_owner is None  # type: ignore[union-attr]
+
+    # PATCH through a local-single-user app: headerless, resolves to "local".
+    app = _owner_mode_app("local_single_user", db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "renamed"
+
+    # The heal attempt missed (project is None-owned, not "local"-owned) —
+    # project_owner MUST remain NULL, still recoverable by a later heal/fire.
+    still_legacy = legacy_store.get(task_id)
+    assert still_legacy is not None
+    assert still_legacy.project_id == project_id
+    assert still_legacy.project_owner is None
+
+
+async def test_update_heal_lookup_failure_does_not_break_the_patch(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heal-on-update is best-effort: a transient ``project_store.get``
+    failure during an UNRELATED PATCH of a legacy row must never fail the
+    caller's own update. It's caught, logged, and treated like a miss —
+    ``project_owner`` stays NULL (still recoverable), and the PATCH's own
+    fields are still written normally.
+    """
+
+    class _RaisingProjectStore(SqlAlchemyProjectStore):
+        def get(self, project_id: str, *, owner_user_id: str | None) -> None:
+            raise RuntimeError("transient project-store failure")
+
+    project_id = uuid.uuid4().hex
+    SqlAlchemyProjectStore(db_uri).create(project_id, "flaky lookup project", None)
+
+    # A legacy row: project_id set, project_owner never persisted (NULL).
+    task_id = uuid.uuid4().hex
+    legacy_store = SqlAlchemyScheduledTaskStore(db_uri)
+    legacy_store.create(
+        scheduled_task_id=task_id,
+        name="nightly",
+        prompt="do the thing",
+        rrule=_VALID_RRULE,
+        user_id=None,
+        agent_id=builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        timezone="UTC",
+        project_id=project_id,
+    )
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        scheduled_tasks_routes._logger,
+        "exception",
+        lambda msg, *args, **kwargs: warnings.append(msg % args if args else msg),
+    )
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        project_store=_RaisingProjectStore(db_uri),
+        auth_provider=None,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "renamed"
+
+    still_legacy = legacy_store.get(task_id)
+    assert still_legacy is not None
+    assert still_legacy.project_owner is None
+    assert any("heal-on-update" in w for w in warnings)
+
+
+# ── project_id across all three owner conventions ───────────────────────────
+#
+# Real deployments run in exactly one of three modes:
+#
+# * ``auth_disabled``     — no AuthProvider at all; every identity is ``None``.
+# * ``local_single_user`` — an AuthProvider configured with
+#   ``local_single_user=True`` (``OMNIGENT_LOCAL_SINGLE_USER=1`` in
+#   production); a headerless request resolves to the literal
+#   ``RESERVED_USER_LOCAL`` ("local") identity. This is the mode the managed
+#   local server actually runs in, and the one prior review rounds missed.
+# * ``multi_user``        — header auth with a real per-request identity.
+#
+# create_project (routes/projects.py) always stores the RAW identity as a
+# project's owner. These tests exercise scheduled-task project validation
+# (create + update) against a project genuinely owned under each mode, with NO
+# host/workspace pinned so no lifespan/harness setup is needed.
+
+_OWNER_MODES = ("auth_disabled", "local_single_user", "multi_user")
+
+
+def _owner_mode_auth_provider(mode: str) -> AuthProvider | None:
+    if mode == "auth_disabled":
+        return None
+    if mode == "local_single_user":
+        return UnifiedAuthProvider(source="header", local_single_user=True)
+    if mode == "multi_user":
+        return UnifiedAuthProvider(source="header", local_single_user=False)
+    raise ValueError(mode)  # pragma: no cover — parametrize IDs are fixed above
+
+
+def _owner_mode_headers(mode: str) -> dict[str, str]:
+    """Headers a request in this mode carries. Both local modes are
+    headerless — ``auth_disabled`` has no header check at all, and
+    ``local_single_user`` deliberately falls back to ``"local"`` when the
+    header is absent (see :meth:`AuthProvider.is_local_single_user`)."""
+    if mode == "multi_user":
+        return _headers("alice@example.com")
+    return {}
+
+
+def _owner_mode_app(mode: str, db_uri: str, tmp_path: Path) -> FastAPI:
+    """A minimal app for one owner mode — no host_store (nothing pins a host).
+
+    ``create_app`` requires ``auth_provider`` whenever ``permission_store`` is
+    given, so ``auth_disabled`` (the one mode with no provider) also omits the
+    permission store — matching a real auth-disabled deployment, which has
+    neither.
+    """
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    auth_provider = _owner_mode_auth_provider(mode)
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        permission_store=SqlAlchemyPermissionStore(db_uri) if auth_provider is not None else None,
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        auth_provider=auth_provider,
+    )
+
+
+def _hostless_body(**overrides: object) -> dict[str, object]:
+    """A create body with no host/workspace pinned (project validation only
+    needs this — no live host/harness required)."""
+    body = _create_body(**overrides)
+    del body["workspace"]
+    del body["host_id"]
+    return body
+
+
+@pytest.mark.parametrize("mode", _OWNER_MODES)
+async def test_create_with_project_id_across_owner_modes(
+    mode: str, runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    """Creating with a ``project_id`` owned under THIS mode's identity must
+    resolve and file — not 404 as "not found" the way local-single-user did
+    before ``resolve_project_owner``."""
+    app = _owner_mode_app(mode, db_uri, tmp_path)
+    headers = _owner_mode_headers(mode)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            proj_resp = await client.post("/v1/projects", json={"name": "owned"}, headers=headers)
+            assert proj_resp.status_code == 200, proj_resp.text
+            project_id = proj_resp.json()["id"]
+
+            resp = await client.post(
+                "/v1/scheduled-tasks",
+                json=_hostless_body(project_id=project_id),
+                headers=headers,
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["project_id"] == project_id
+
+
+@pytest.mark.parametrize("mode", _OWNER_MODES)
+async def test_update_with_project_id_across_owner_modes(
+    mode: str, runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    """PATCH-ing a ``project_id`` owned under THIS mode's identity must
+    resolve and file — the update path funnels through the same
+    ``_validate_project_id_or_404`` as create, but is verified independently
+    since a prior review round did not."""
+    app = _owner_mode_app(mode, db_uri, tmp_path)
+    headers = _owner_mode_headers(mode)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            proj_resp = await client.post("/v1/projects", json={"name": "owned"}, headers=headers)
+            assert proj_resp.status_code == 200, proj_resp.text
+            project_id = proj_resp.json()["id"]
+
+            created = (
+                await client.post("/v1/scheduled-tasks", json=_hostless_body(), headers=headers)
+            ).json()
+
+            resp = await client.patch(
+                f"/v1/scheduled-tasks/{created['id']}",
+                json={"project_id": project_id},
+                headers=headers,
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["project_id"] == project_id
 
 
 async def test_create_no_workspace_task_persists_null_host_and_workspace(

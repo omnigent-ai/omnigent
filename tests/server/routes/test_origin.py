@@ -31,6 +31,8 @@ carrying just the ``Origin`` header under test — no body or transport.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -40,13 +42,14 @@ from omnigent.server.routes._origin import require_trusted_origin
 
 _LOCAL_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
 _ALLOWLIST_ENV = "OMNIGENT_WS_ALLOWED_ORIGINS"
+_CONFIG_HOME_ENV = "OMNIGENT_CONFIG_HOME"
 
 # A concrete cross-site origin used as the attacker's page throughout.
 _EVIL_ORIGIN = "https://evil.example.com"
 
 
 @pytest.fixture(autouse=True)
-def _clean_origin_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _clean_origin_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """
     Start every test from a known origin-env baseline.
 
@@ -62,6 +65,7 @@ def _clean_origin_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv(_LOCAL_ENV, raising=False)
     monkeypatch.delenv(_ALLOWLIST_ENV, raising=False)
+    monkeypatch.setenv(_CONFIG_HOME_ENV, str(tmp_path))
 
 
 def _request_with_origin(origin: str | None) -> Request:
@@ -95,7 +99,7 @@ def test_absent_origin_is_allowed(monkeypatch: pytest.MonkeyPatch, local_mode: b
     """
     if local_mode:
         monkeypatch.setenv(_LOCAL_ENV, "1")
-    assert require_trusted_origin(_request_with_origin(None)) is None
+    require_trusted_origin(_request_with_origin(None))
 
 
 def test_loopback_origin_is_allowed_in_local_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -106,7 +110,7 @@ def test_loopback_origin_is_allowed_in_local_mode(monkeypatch: pytest.MonkeyPatc
     POSTs must pass. A raise here would block the legitimate local UI.
     """
     monkeypatch.setenv(_LOCAL_ENV, "1")
-    assert require_trusted_origin(_request_with_origin("http://localhost:8000")) is None
+    require_trusted_origin(_request_with_origin("http://localhost:8000"))
 
 
 def test_cross_origin_is_rejected_in_local_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,7 +141,7 @@ def test_cross_origin_is_allowed_when_not_local_mode(monkeypatch: pytest.MonkeyP
     multi-user servers whose browser Origin is not loopback.
     """
     # _clean_origin_env left OMNIGENT_LOCAL_SINGLE_USER unset → non-local.
-    assert require_trusted_origin(_request_with_origin(_EVIL_ORIGIN)) is None
+    require_trusted_origin(_request_with_origin(_EVIL_ORIGIN))
 
 
 def test_sentinel_origin_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,7 +154,7 @@ def test_sentinel_origin_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     sentinel.
     """
     monkeypatch.setenv(_LOCAL_ENV, "1")
-    assert require_trusted_origin(_request_with_origin(OMNIGENT_INTERNAL_WS_ORIGIN)) is None
+    require_trusted_origin(_request_with_origin(OMNIGENT_INTERNAL_WS_ORIGIN))
 
 
 def test_allowlisted_origin_is_allowed_and_unlisted_rejected(
@@ -168,9 +172,22 @@ def test_allowlisted_origin_is_allowed_and_unlisted_rejected(
     """
     monkeypatch.setenv(_ALLOWLIST_ENV, "https://ui.example.com")
     # On the allowlist → allowed.
-    assert require_trusted_origin(_request_with_origin("https://ui.example.com")) is None
+    require_trusted_origin(_request_with_origin("https://ui.example.com"))
     # Not on the allowlist, and a non-empty allowlist flips non-local mode
     # to deny-by-default → 403.
+    with pytest.raises(HTTPException) as exc_info:
+        require_trusted_origin(_request_with_origin(_EVIL_ORIGIN))
+    assert exc_info.value.status_code == 403
+
+
+def test_config_allowlisted_origin_is_allowed_and_unlisted_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The HTTP gate consumes the global config allowlist."""
+    monkeypatch.setenv(_LOCAL_ENV, "1")
+    (tmp_path / "config.yaml").write_text("ws_allowed_origins: [https://ui.example.com]\n")
+
+    require_trusted_origin(_request_with_origin("https://ui.example.com"))
     with pytest.raises(HTTPException) as exc_info:
         require_trusted_origin(_request_with_origin(_EVIL_ORIGIN))
     assert exc_info.value.status_code == 403

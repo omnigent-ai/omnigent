@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
+_REQUEST_TIMEOUT_SECONDS = 60.0
 
 # Banks already ensured-to-exist this process, so ``retain`` doesn't issue a
 # redundant create_bank on every call. Module-level (not per-instance) because
@@ -58,6 +59,10 @@ def _csv(value: str | None) -> list[str] | None:
         return None
     tags = [t.strip() for t in value.split(",") if t.strip()]
     return tags or None
+
+
+def _failure_message(operation: str, error: Exception) -> str:
+    return f"Hindsight {operation} failed ({type(error).__name__}): {error}"
 
 
 class _HindsightToolBase(Tool):
@@ -96,7 +101,7 @@ class _HindsightToolBase(Tool):
         self._cached_client = hindsight_client.Hindsight(
             base_url=self._config.get("api_url") or _DEFAULT_API_URL,
             api_key=api_key,
-            timeout=30.0,
+            timeout=_REQUEST_TIMEOUT_SECONDS,
         )
         return self._cached_client
 
@@ -180,8 +185,9 @@ class HindsightRetainTool(_HindsightToolBase):
             client.retain(**kwargs)
             return "Stored to long-term memory."
         except Exception as e:
-            _logger.error("Hindsight retain failed: %s", e)
-            return f"Hindsight retain failed: {e}"
+            message = _failure_message("retain", e)
+            _logger.error("%s", message)
+            return message
 
 
 class HindsightRecallTool(_HindsightToolBase):
@@ -243,8 +249,9 @@ class HindsightRecallTool(_HindsightToolBase):
                 return "No relevant memories found."
             return "\n".join(f"- {m}" for m in memories)
         except Exception as e:
-            _logger.error("Hindsight recall failed: %s", e)
-            return f"Hindsight recall failed: {e}"
+            message = _failure_message("recall", e)
+            _logger.error("%s", message)
+            return message
 
 
 class HindsightReflectTool(_HindsightToolBase):
@@ -291,5 +298,6 @@ class HindsightReflectTool(_HindsightToolBase):
             response = client.reflect(bank_id=bank, query=query, budget=self._budget())
             return response.text or "No relevant memories found."
         except Exception as e:
-            _logger.error("Hindsight reflect failed: %s", e)
-            return f"Hindsight reflect failed: {e}"
+            message = _failure_message("reflect", e)
+            _logger.error("%s", message)
+            return message

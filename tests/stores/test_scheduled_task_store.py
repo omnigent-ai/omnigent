@@ -695,6 +695,140 @@ def test_update_clearing_already_null_field_is_noop_for_updated_at(
     assert result.updated_at is None
 
 
+# ── project_id: file a task's fired sessions into a project ─────────────────
+
+
+def test_create_with_project_id(store: SqlAlchemyScheduledTaskStore) -> None:
+    """``create`` persists ``project_id`` + ``project_owner`` and round-trips them."""
+    task = store.create(
+        scheduled_task_id=_uid("st_proj_create"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=_uid("proj_1"),
+        project_owner="alice@example.com",
+    )
+    assert task.project_id == _uid("proj_1")
+    assert task.project_owner == "alice@example.com"
+    fetched = store.get(_uid("st_proj_create"))
+    assert fetched is not None
+    assert fetched.project_id == _uid("proj_1")
+    assert fetched.project_owner == "alice@example.com"
+
+
+def test_create_without_project_id_defaults_to_none(store: SqlAlchemyScheduledTaskStore) -> None:
+    """``create`` with no ``project_id`` leaves fired sessions unfiled and
+    ``project_owner`` unset."""
+    task = store.create(
+        scheduled_task_id=_uid("st_proj_default"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    assert task.project_id is None
+    assert task.project_owner is None
+
+
+def test_update_sets_project_id(store: SqlAlchemyScheduledTaskStore) -> None:
+    """``update(project_id=..., project_owner=...)`` files a previously-unfiled
+    task, persisting the resolved owner alongside the id."""
+    store.create(
+        scheduled_task_id=_uid("st_proj_set"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    updated = store.update(
+        _uid("st_proj_set"), project_id=_uid("proj_2"), project_owner="bob@example.com"
+    )
+    assert updated is not None
+    assert updated.project_id == _uid("proj_2")
+    assert updated.project_owner == "bob@example.com"
+    fetched = store.get(_uid("st_proj_set"))
+    assert fetched is not None
+    assert fetched.project_id == _uid("proj_2")
+    assert fetched.project_owner == "bob@example.com"
+
+
+def test_update_clears_project_id_to_null(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Passing ``project_id=None`` (and ``project_owner=None``) explicitly
+    unfiles the task."""
+    store.create(
+        scheduled_task_id=_uid("st_proj_clear"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=_uid("proj_3"),
+        project_owner="carol@example.com",
+    )
+    updated = store.update(_uid("st_proj_clear"), project_id=None, project_owner=None)
+    assert updated is not None
+    assert updated.project_id is None
+    assert updated.project_owner is None
+    fetched = store.get(_uid("st_proj_clear"))
+    assert fetched is not None
+    assert fetched.project_id is None
+    assert fetched.project_owner is None
+
+
+def test_update_omitting_project_id_leaves_it_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting ``project_id``/``project_owner`` on update does not touch
+    either column."""
+    store.create(
+        scheduled_task_id=_uid("st_proj_omit"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=_uid("proj_4"),
+        project_owner="dana@example.com",
+    )
+    updated = store.update(_uid("st_proj_omit"), name="new_name")
+    assert updated is not None
+    assert updated.project_id == _uid("proj_4")
+    assert updated.project_owner == "dana@example.com"
+
+
+def test_create_project_owner_stores_empty_string_sentinel(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The store itself is a dumb passthrough: it persists whatever
+    ``project_owner`` string it's given verbatim (including the ``""``
+    anonymous-owner sentinel the routes encode ``None`` as) — the
+    encode/decode convention lives in ``omnigent.server.auth``, not here."""
+    task = store.create(
+        scheduled_task_id=_uid("st_proj_anon"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id=None,
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=_uid("proj_5"),
+        project_owner="",
+    )
+    assert task.project_owner == ""
+    fetched = store.get(_uid("st_proj_anon"))
+    assert fetched is not None
+    assert fetched.project_owner == ""
+
+
 # ── delete: cascade cleanup of runs (Finding 2) ──────────────────────────────
 
 

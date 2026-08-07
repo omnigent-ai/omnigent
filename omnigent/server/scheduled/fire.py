@@ -55,7 +55,12 @@ from typing import Any
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    RESERVED_USER_LOCAL,
+    decode_scheduled_task_project_owner,
+    encode_scheduled_task_project_owner,
+)
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -125,6 +130,14 @@ class FireDeps:
     tunnel_registry: Any | None = None
     file_store: Any | None = None
     artifact_store: Any | None = None
+    project_store: Any | None = None
+    # Whether the server's active AuthProvider is configured for the
+    # local-single-user posture (see AuthProvider.is_local_single_user).
+    # MUST be sourced from the SAME provider instance the scheduled-tasks
+    # router resolves identity through (app.py wires both from one
+    # ``auth_provider``), so ``resolve_project_owner`` calls here and in the
+    # routes can never drift apart. False when auth is fully disabled.
+    local_single_user: bool = False
 
 
 def _prompt_event(prompt: str) -> SessionEventInput:
@@ -425,6 +438,8 @@ async def _run_fire_for_task(
             )
             return
 
+        await _file_into_project(deps, task, conv.id)
+
         try:
             await _grant_owner(deps, task, conv.id)
         except Exception:
@@ -620,6 +635,105 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
     owner = task.user_id or RESERVED_USER_LOCAL
     await asyncio.to_thread(deps.permission_store.ensure_user, owner)
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
+
+
+async def _file_into_project(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
+    """File the fired session into the task's project. Never raises.
+
+    Soft-fail by design: a project deleted after the task was created must
+    never break the scheduled run. Missing ``project_store`` (feature not
+    configured) and a vanished project id both log and leave the session
+    unfiled; only an unset ``task.project_id`` is a silent no-op.
+
+    Heal-on-fire: a legacy row (``project_owner`` NULL — predates that
+    column) falls back to live current-mode resolution; when that succeeds,
+    the resolved owner is persisted back onto the row so the live fallback
+    happens at most once per legacy row (bounded by the next auth-mode
+    change or an update-time heal — see ``routes/scheduled_tasks.py``'s
+    heal-on-update).
+    """
+    if task.project_id is None:
+        return
+    try:
+        if deps.project_store is None:
+            _logger.warning(
+                "scheduled fire: task %s pins project %s but no project store is "
+                "configured — leaving session %s unfiled",
+                task.id,
+                task.project_id,
+                conversation_id,
+            )
+            return
+        # task.project_owner is the owner scope RESOLVED AND PERSISTED at
+        # create/update time (see routes/scheduled_tasks.py's
+        # _validate_project_id_or_404) — read directly rather than
+        # re-resolved from task.user_id against deps.local_single_user here.
+        # Re-resolving at fire time would be wrong whenever the server's auth
+        # mode changed since the task was created (e.g. across a restart that
+        # flips OMNIGENT_LOCAL_SINGLE_USER): decode_scheduled_task_project_owner
+        # only falls back to that live re-resolution for a legacy row that
+        # predates this column (project_owner is NULL) — see its docstring
+        # for the accepted limitation that applies to that gap only.
+        is_legacy_row = task.project_owner is None
+        project_owner = decode_scheduled_task_project_owner(
+            task.project_owner,
+            user_id=task.user_id,
+            local_single_user=deps.local_single_user,
+        )
+        project = await asyncio.to_thread(
+            deps.project_store.get, task.project_id, owner_user_id=project_owner
+        )
+        if project is None:
+            _logger.warning(
+                "scheduled fire: task %s project %s no longer exists — leaving session %s unfiled",
+                task.id,
+                task.project_id,
+                conversation_id,
+            )
+            return
+        if is_legacy_row:
+            # Heal-on-fire: this fire took the legacy NULL fallback above and
+            # the lookup succeeded, so the CURRENT mode's resolution is
+            # confirmed correct for this row right now — persist it so the
+            # fallback (and its live re-resolution) is not repeated on every
+            # future fire, only up to the next auth-mode change or heal.
+            #
+            # Known, accepted race (inert): a concurrent PATCH that clears
+            # project_id between the read above and this write can have this
+            # write land after the clear, briefly leaving a stale non-null
+            # project_owner on a project_id=NULL row. Harmless — filing
+            # always gates on project_id first (see the top of this
+            # function), so a stale project_owner is simply never read. It
+            # does NOT self-correct on an unrelated later PATCH (heal-on-update
+            # only touches project_owner when project_id is set and
+            # project_owner is NULL — a non-null stray value is left alone);
+            # it is overwritten only by a PATCH that itself sets project_id
+            # again, or made moot by deleting the task. Not worth a
+            # conditional/CAS update for a single stray column value with no
+            # observable effect.
+            await asyncio.to_thread(
+                deps.scheduled_task_store.update,
+                task.id,
+                project_owner=encode_scheduled_task_project_owner(project_owner),
+            )
+        filed = await asyncio.to_thread(
+            deps.conversation_store.set_conversation_project, conversation_id, task.project_id
+        )
+        if not filed:
+            _logger.warning(
+                "scheduled fire: task %s session %s has no metadata row — could not file "
+                "into project %s",
+                task.id,
+                conversation_id,
+                task.project_id,
+            )
+    except Exception:
+        _logger.exception(
+            "scheduled fire: failed to file session %s into project %s for task %s",
+            conversation_id,
+            task.project_id,
+            task.id,
+        )
 
 
 async def _record_run(

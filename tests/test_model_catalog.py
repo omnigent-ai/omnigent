@@ -953,10 +953,10 @@ def test_cli_config_listing_is_static_and_unverified(
     assert listing.source == "static"
     assert listing.verified is False
     assert [m.id for m in listing.models] == [
-        "gpt-5-6-sol",
-        "gpt-5-6-luna",
-        "gpt-5-6-terra",
-        "gpt-5-5",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.5",
     ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
