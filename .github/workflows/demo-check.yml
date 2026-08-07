@@ -1,11 +1,19 @@
-name: Demo Check
+name: PR Hygiene
 
-# Scan open contributor PRs every hour and comment on any that check the
-# "UI / frontend change" box but have no demo (screenshot / video) in the Demo
-# section. Maintainer PRs and drafts are skipped. PRs already labeled
-# `needs-demo` are skipped on subsequent runs to avoid duplicate comments.
-# Never checks out or runs PR code -- it reads PR metadata via the API using
-# only the default-branch script. See demo-check.js.
+# Hourly sweep over recently-opened PRs. Two independent checks share the run:
+#
+#   1. Demo check -- comment on PRs that check "Bug fix" / "Feature" /
+#      "UI / frontend change" but provide no demo (screenshot / video).
+#      See demo-check.js.
+#   2. Issue-link check -- comment on PRs that reference no issue. Forward-only:
+#      nothing opened before its effective date is considered, so the backlog is
+#      untouched. Enforcing, capped at LIMIT comments per run. See
+#      pr-issue-link.js.
+#
+# Both skip drafts and PRs they've already flagged -- the demo check dedupes on
+# its `needs-demo` label, the issue-link check on a marker in its own comment.
+# Neither ever closes anything. Never checks out or runs PR code -- they read
+# PR metadata via the API using only the default-branch script.
 
 on:
   schedule:
@@ -38,9 +46,39 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+      - name: Demo check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           retries: 3
           script: |
             const script = require(".github/workflows/demo-check.js");
+            await script({ context, github, core });
+      # LIMIT bounds how many contributors a single run may comment on, so a
+      # mistake in the wording or the predicate cannot reach the whole queue in one
+      # sweep. Setting ENFORCE back to "false" returns to a dry run, which
+      # enumerates every verdict into the step summary and writes nothing.
+      - name: Issue-link check
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          ENFORCE: "true"
+          LIMIT: "25"
+        with:
+          retries: 3
+          script: |
+            const script = require(".github/workflows/pr-issue-link.js");
+            await script({ context, github, core });
+      # Applies `waiting-for-review` to PRs that clear the bar, giving maintainers
+      # a queue of reviewable PRs instead of the whole open list. No LIMIT: a label
+      # notifies nobody and is trivially reversible, unlike the nudge above.
+      # ENFORCE="false" returns to a dry run that reports verdicts and writes nothing.
+      - name: Ready-for-review gate
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          ENFORCE: "true"
+        with:
+          retries: 3
+          script: |
+            const script = require(".github/workflows/ready-for-review.js");
             await script({ context, github, core });

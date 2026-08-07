@@ -9,7 +9,7 @@ import re
 import tarfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import click
@@ -24,6 +24,7 @@ from omnigent.onboarding.sandboxes import (
 )
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import session_stream
+from omnigent.server.smart_routing import RoutingResult, RoutingSettings
 
 # Sentinel ready event so a stream collector's registration is a
 # deterministic sync point (first delivered item) rather than a
@@ -194,6 +195,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.endpoint: str | None = None
         self.home_dir: str | None = None
         self.registry: dict[str, object] | None = None
+        self.disk_size_gb: int | None = None
         self.base_url: str | None = None
         self.gateway_profile: str | None = None
         self.snapshot_name: str | None = None
@@ -392,6 +394,7 @@ def install_fake_boxlite_launcher(
         env: list[str] | None = None,
         home_dir: str | None = None,
         registry: dict[str, object] | None = None,
+        disk_size_gb: int | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.endpoint = endpoint
@@ -399,6 +402,7 @@ def install_fake_boxlite_launcher(
         fake.env = env
         fake.home_dir = home_dir
         fake.registry = registry
+        fake.disk_size_gb = disk_size_gb
         return fake
 
     monkeypatch.setattr(boxlite_mod, "BoxliteSandboxLauncher", _ctor)
@@ -742,6 +746,12 @@ def build_agent_bundle(
                     "model": sa["name"],
                     "connection": {"api_key": "test-key"},
                 },
+                # A ``config.yaml`` sub-agent goes through the strict
+                # spec_version:1 parser, which requires an explicit
+                # harness for an omnigent executor. Default to the same
+                # harness the parent uses; callers may override via
+                # ``sa["executor"]``.
+                "executor": sa.get("executor", {"config": {"harness": "claude-sdk"}}),
             }
             if "description" in sa:
                 sa_config["description"] = sa["description"]
@@ -783,6 +793,7 @@ async def create_test_agent(
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
     include_llm: bool = True,
+    sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Create an agent via multipart session create and return the agent JSON.
@@ -810,6 +821,11 @@ async def create_test_agent(
         :func:`build_agent_bundle`. ``None`` omits guardrails.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
+    :param sub_agents: Optional sub-agent config dicts declared in the
+        bundle, each with at least a ``"name"`` key, e.g.
+        ``[{"name": "worker"}]``. Required for tests that create a child
+        session with a ``sub_agent_name`` — the create route rejects an
+        undeclared name.
     :returns: Parsed agent response body from the session agent
         endpoint, with an extra ``_session_id`` key for the owning
         session.
@@ -822,6 +838,7 @@ async def create_test_agent(
         skills=skills,
         guardrails=guardrails,
         include_llm=include_llm,
+        sub_agents=sub_agents,
     )
     metadata: dict[str, Any] = {}
     headers: dict[str, str] = {}
@@ -942,3 +959,73 @@ class CapturingRunnerClient:
         if body.get("type") == "cost_approval_popup":
             self.popup_seen.set()
         return httpx.Response(202, request=httpx.Request("POST", f"http://runner{url}"))
+
+
+# ── Routing stubs ───────────────────────────────────────────────────
+#
+# Shared by the routing suites (unit, endpoint, integration) so the
+# router double has one definition instead of one per file.
+
+
+class FakeRoutingClient:
+    """Routing-client double: canned verdict, recorded offers, optional error.
+
+    :param result: The verdict :meth:`route` returns, or ``None`` for a
+        no-decision (router declined).
+    :param error: Raised from :meth:`route` instead of returning, to
+        exercise the fail-open paths.
+    :param last_error: Seeds the protocol's ``last_error`` reason field.
+    :ivar calls: ``(message, offered_models)`` per :meth:`route` call.
+    :ivar offered: The ``available_models`` mapping per call.
+    """
+
+    def __init__(
+        self,
+        result: RoutingResult | None = None,
+        *,
+        error: Exception | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        self._result = result
+        self._error = error
+        self.last_error = last_error
+        self.calls: list[tuple[str, dict[str, list[str]]]] = []
+        self.offered: list[dict[str, list[str]]] = []
+
+    async def route(
+        self, message: str, available_models: dict[str, list[str]]
+    ) -> RoutingResult | None:
+        """Record the offer and return the canned verdict (or raise)."""
+        offer = dict(available_models)
+        self.calls.append((message, offer))
+        self.offered.append(offer)
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+@dataclass
+class FakeCaps:
+    """Caps double carrying only what the routing code reads off it.
+
+    ``routing_backends`` left ``None`` makes the routing seam derive the pair
+    from ``routing_client``, which classifies any non-``ExternalRoutingClient``
+    as the built-in judge — the shape most tests want.
+    """
+
+    routing_client: Any = None  # type: ignore[explicit-any]
+    routing_backends: Any = None  # type: ignore[explicit-any]
+    routing_settings: Any = field(default_factory=RoutingSettings)  # type: ignore[explicit-any]
+
+
+def echo_runner_client() -> httpx.AsyncClient:
+    """A runner client that acks every forwarded turn 202, like the runner."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(202, json={"queued": True})
+
+    return httpx.AsyncClient(
+        base_url="http://runner.test",
+        transport=httpx.MockTransport(_handler),
+    )

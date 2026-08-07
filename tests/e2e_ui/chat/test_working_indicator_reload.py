@@ -230,3 +230,529 @@ def test_live_tool_output_updates_running_card(
         expect(page.get_by_text("collecting tests...", exact=True)).to_be_visible(timeout=10_000)
     finally:
         _publish_status(base_url, session_id, "idle", response_id=response_id)
+
+
+def _seed_item(
+    base_url: str,
+    session_id: str,
+    *,
+    item_type: str,
+    item_data: dict,
+    response_id: str,
+) -> None:
+    """Mirror one native conversation item onto the session.
+
+    Generic sibling of :func:`_seed_function_call` for message /
+    ``function_call_output`` items.
+
+    :param base_url: Base URL of the local e2e server.
+    :param session_id: Session/conversation id.
+    :param item_type: Item type, e.g. ``"message"``.
+    :param item_data: The item payload, e.g. an assistant message body.
+    :param response_id: Turn id the item belongs to.
+    :returns: None.
+    """
+    resp = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {"item_type": item_type, "item_data": item_data, "response_id": response_id},
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+
+def test_bare_idle_finalizes_turn_and_folds(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """An id-less idle edge settles the turn and folds it — no reload needed.
+
+    Most turn-end publishes carry no ``response_id`` (the PTY-activity
+    relay's bare ``idle``, orchestration teardown). The client used to
+    finalize the streaming lifecycle only on an id-matched edge, so a
+    native turn ending on a bare idle stayed "streaming" forever: the
+    "Working…" indicator cleared but the settled turn's "Worked for"
+    process fold (and Fork action) never appeared until a reload
+    re-derived lifecycle from the snapshot. This drives the exact event
+    sequence live and asserts the fold forms in place.
+    """
+    base_url, session_id = seeded_session
+    response_id = "resp_bare_idle_1"
+    _publish_status(base_url, session_id, "running", response_id=response_id)
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="message",
+        item_data={
+            "role": "assistant",
+            "agent": "claude-native-ui",
+            "content": [{"type": "output_text", "text": "Let me look around first."}],
+        },
+        response_id=response_id,
+    )
+    _seed_function_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_bare_1",
+        name="shell",
+        arguments='{"command": "ls"}',
+    )
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="function_call_output",
+        item_data={"call_id": "call_bare_1", "output": "README.md\n"},
+        response_id=response_id,
+    )
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="message",
+        item_data={
+            "role": "assistant",
+            "agent": "claude-native-ui",
+            "content": [{"type": "output_text", "text": "All done - the repo looks healthy."}],
+        },
+        response_id=response_id,
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    # Scope to THIS turn's bubble — the fixture's pre-seeded history may
+    # carry its own (legitimately settled and folded) turns.
+    bubble = page.locator(
+        '[data-testid="message-bubble"][data-role="assistant"]',
+        has=page.get_by_text("All done - the repo looks healthy."),
+    ).first
+    expect(bubble).to_be_visible(timeout=20_000)
+    # Turn is live (running + streaming lifecycle) — the trace must be
+    # expanded, no fold yet.
+    expect(bubble.locator('[data-testid="turn-worked-fold"]')).to_have_count(0)
+
+    # The bare terminal edge: no response_id, like the PTY-activity relay.
+    _publish_status(base_url, session_id, "idle")
+
+    # The fold must appear IN PLACE — no reload between publish and assert.
+    expect(bubble.locator('[data-testid="turn-worked-fold"]').first).to_be_visible(timeout=15_000)
+
+
+_ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
+_FOLD = '[data-testid="turn-worked-fold"]'
+
+
+def _seed_user_message(base_url: str, session_id: str, *, text: str, response_id: str) -> None:
+    """
+    Mirror one native user message item onto the session.
+
+    :param base_url: Base URL of the local e2e server.
+    :param session_id: Session/conversation id.
+    :param text: User input text.
+    :param response_id: Turn id the message belongs to.
+    :returns: None.
+    """
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="message",
+        item_data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        response_id=response_id,
+    )
+
+
+def _seed_assistant_message(
+    base_url: str, session_id: str, *, text: str, response_id: str
+) -> None:
+    """
+    Mirror one native assistant message item onto the session.
+
+    :param base_url: Base URL of the local e2e server.
+    :param session_id: Session/conversation id.
+    :param text: Assistant output text.
+    :param response_id: Turn id the message belongs to.
+    :returns: None.
+    """
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="message",
+        item_data={
+            "role": "assistant",
+            "agent": "claude-native-ui",
+            "content": [{"type": "output_text", "text": text}],
+        },
+        response_id=response_id,
+    )
+
+
+def _seed_completed_tool_call(
+    base_url: str,
+    session_id: str,
+    *,
+    response_id: str,
+    call_id: str,
+    arguments: str,
+    output: str,
+) -> None:
+    """
+    Seed one completed tool step: a ``function_call`` plus its output.
+
+    :param base_url: Base URL of the local e2e server.
+    :param session_id: Session/conversation id.
+    :param response_id: Turn id both items belong to.
+    :param call_id: Tool-call id shared by the call and its output.
+    :param arguments: JSON-encoded ``shell`` arguments string.
+    :param output: Tool output text.
+    :returns: None.
+    """
+    _seed_function_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id=call_id,
+        name="shell",
+        arguments=arguments,
+    )
+    _seed_item(
+        base_url,
+        session_id,
+        item_type="function_call_output",
+        item_data={"call_id": call_id, "output": output},
+        response_id=response_id,
+    )
+
+
+def test_stepwise_step_edges_fold_once(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A codex goal-mode turn folds once despite per-step status edges.
+
+    Goal mode publishes a DISTINCT response id on every step's
+    running/idle edge while all conversation items carry ONE thread id.
+    Each between-step idle used to settle a per-step bubble, so a
+    multi-step goal grew one "Worked for" fold per step and the folds
+    flickered while later steps ran. The whole thread must render as one
+    bubble that folds exactly once when the goal settles.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    thread = "codex_thread_1"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+
+    _seed_user_message(base_url, session_id, text="Run the three-step goal.", response_id=thread)
+    _publish_status(base_url, session_id, "running", response_id="codex_step_1")
+    for step in (1, 2):
+        _seed_assistant_message(
+            base_url, session_id, text=f"Step {step}: narration.", response_id=thread
+        )
+        _seed_completed_tool_call(
+            base_url,
+            session_id,
+            response_id=thread,
+            call_id=f"call_step_{step}",
+            arguments=f'{{"command": "echo step{step}"}}',
+            output=f"step{step}\n",
+        )
+        # Step boundary: idle for this step, running for the next —
+        # back-to-back, well inside the fold's settle debounce.
+        _publish_status(base_url, session_id, "idle", response_id=f"codex_step_{step}")
+        _publish_status(base_url, session_id, "running", response_id=f"codex_step_{step + 1}")
+
+    # Mid-run oscillation guard: past the settle debounce, the step-2
+    # idle edge must not have flashed a fold while step 3 runs.
+    page.wait_for_timeout(900)
+    assert page.locator(_FOLD).count() == 0
+
+    _seed_assistant_message(base_url, session_id, text="Step 3: narration.", response_id=thread)
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=thread,
+        call_id="call_step_3",
+        arguments='{"command": "echo step3"}',
+        output="step3\n",
+    )
+    _seed_assistant_message(
+        base_url, session_id, text="All three steps are done.", response_id=thread
+    )
+    _publish_status(base_url, session_id, "idle", response_id="codex_step_3")
+
+    expect(page.locator(_FOLD).first).to_be_visible(timeout=15_000)
+    assert page.locator(_ASSISTANT_BUBBLE).count() == 1
+    assert page.locator(_FOLD).count() == 1
+
+
+def test_distinct_item_rids_fold_once_per_user_message(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    Items that switch response id mid-turn still yield one bubble and fold.
+
+    Native forwarders can re-tag items with a fresh response id partway
+    through a reply, with no user message in between. Grouping bubbles by
+    raw response id split such a turn into one bubble — and one
+    "Worked for" fold — per id. Only a real user message starts a new
+    turn, so this wire shape must settle as ONE assistant bubble with ONE
+    fold.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+
+    _seed_user_message(base_url, session_id, text="Check the repo.", response_id="turn_a")
+    _publish_status(base_url, session_id, "running", response_id="turn_a")
+    _seed_assistant_message(
+        base_url, session_id, text="Looking at the tree first.", response_id="turn_a"
+    )
+    _publish_status(base_url, session_id, "idle", response_id="turn_a")
+    _publish_status(base_url, session_id, "running", response_id="turn_b")
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id="turn_b",
+        call_id="call_turn_b_1",
+        arguments='{"command": "git status"}',
+        output="clean\n",
+    )
+    _seed_assistant_message(base_url, session_id, text="The repo is clean.", response_id="turn_b")
+    _publish_status(base_url, session_id, "idle", response_id="turn_b")
+
+    expect(page.locator(_FOLD).first).to_be_visible(timeout=15_000)
+    assert page.locator(_ASSISTANT_BUBBLE).count() == 1
+    assert page.locator(_FOLD).count() == 1
+
+
+def test_midturn_reload_keeps_partial_work_unfolded(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A mid-turn reload keeps the live turn's partial work expanded.
+
+    A refresh while the turn still runs mounts over a trace that already
+    holds a completed tool call and progress narration — content that
+    would fold if the turn were settled. The freshly mounted last bubble
+    of a running session must stay expanded (no "Worked for" fold) until
+    the session's own terminal edge lands, which then folds it.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    response_id = "t_mid"
+
+    _seed_user_message(base_url, session_id, text="Dig through logs.", response_id=response_id)
+    _publish_status(base_url, session_id, "running", response_id=response_id)
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id=response_id,
+        call_id="call_mid_1",
+        arguments='{"command": "grep -c ERROR app.log"}',
+        output="42\n",
+    )
+    _seed_assistant_message(
+        base_url, session_id, text="Still digging through the logs.", response_id=response_id
+    )
+
+    # Fresh mount mid-turn: the session status is still running.
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_text("Still digging through the logs.")).to_be_visible(timeout=20_000)
+
+    # Outlasts both fold debounces; absence is then structural — the
+    # possibly-live last bubble is fold-suppressed while running.
+    page.wait_for_timeout(4_500)
+    assert page.locator(_FOLD).count() == 0
+    # The trace stays expanded: the completed run's summary row (a run
+    # followed by narration folds into one line) and the narration are
+    # both on the page, not hidden behind a "Worked for" fold.
+    expect(page.get_by_text("Ran 1 shell command")).to_be_visible()
+    expect(page.get_by_text("Still digging through the logs.")).to_be_visible()
+
+    # The terminal edge settles the turn — the fold must now form,
+    # proving the earlier absence was live-turn suppression.
+    _publish_status(base_url, session_id, "idle", response_id=response_id)
+    expect(page.locator(_FOLD).first).to_be_visible(timeout=15_000)
+
+
+def test_prior_fold_holds_through_followup_send(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A settled turn's fold survives the start of the next turn.
+
+    Opencode shape: the follow-up user message lands and the running edge
+    fires seconds before the new turn's first item mirrors through the
+    TUI. Once a real user message follows the settled bubble, the running
+    status belongs to the reply-in-flight for that newer input, so the
+    prior "Worked for" fold must hold through the item-less gap instead
+    of popping open. Both turns then settle into two folds.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+
+    _seed_user_message(base_url, session_id, text="Start a server.", response_id="t1")
+    _publish_status(base_url, session_id, "running", response_id="t1")
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id="t1",
+        call_id="call_t1_1",
+        arguments='{"command": "echo up"}',
+        output="up\n",
+    )
+    _seed_assistant_message(base_url, session_id, text="Server is up.", response_id="t1")
+    _publish_status(base_url, session_id, "idle", response_id="t1")
+
+    fold = page.locator(_FOLD)
+    expect(fold.first).to_be_visible(timeout=15_000)
+    page.wait_for_timeout(1_000)
+
+    # Follow-up send: the user item mirrors, the running edge fires, and
+    # no new-turn item lands for a while (native items take seconds to
+    # round-trip through the vendor TUI).
+    _seed_user_message(base_url, session_id, text="Another one", response_id="t2")
+    page.wait_for_timeout(300)
+    _publish_status(base_url, session_id, "running", response_id="t2")
+
+    # Fold hide is undebounced, so any dip is visible within one sample.
+    for _ in range(17):
+        assert fold.count() >= 1
+        page.wait_for_timeout(150)
+
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id="t2",
+        call_id="call_t2_1",
+        arguments='{"command": "echo up2"}',
+        output="up2\n",
+    )
+    _seed_assistant_message(base_url, session_id, text="Second server is up.", response_id="t2")
+    _publish_status(base_url, session_id, "idle", response_id="t2")
+
+    expect(fold.nth(1)).to_be_visible(timeout=15_000)
+    assert fold.count() == 2
+
+
+def test_settled_fold_holds_through_scheduled_wake(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    A /loop iteration's fold survives the next scheduled wake.
+
+    Claude-native /loop sessions resume on cron/wakeup firings with no
+    real user input; the forwarder mirrors the resume as a
+    ``[System: scheduled prompt fired]`` marker plus a fresh turn's
+    running edge. The settled iteration is still the last assistant
+    bubble through that item-less gap, and a system marker does not end
+    its possibly-live status — the shown-fold latch is what keeps the
+    trace from popping open at every iteration. Both iterations then
+    settle into their own folds.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+
+    _seed_user_message(base_url, session_id, text="Watch the PR.", response_id="loop_t1")
+    _publish_status(base_url, session_id, "running", response_id="loop_t1")
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id="loop_t1",
+        call_id="call_loop_1",
+        arguments='{"command": "gh pr checks"}',
+        output="all green\n",
+    )
+    _seed_assistant_message(
+        base_url, session_id, text="Iteration 1: all green.", response_id="loop_t1"
+    )
+    _publish_status(base_url, session_id, "idle", response_id="loop_t1")
+
+    fold = page.locator(_FOLD)
+    expect(fold.first).to_be_visible(timeout=15_000)
+    # A live-streamed iteration spans one clock, so the fold carries a
+    # duration — the bare "Worked" label was the merged-bubble symptom.
+    expect(fold.first).to_contain_text("Worked for")
+    # Sit past the stray-idle revive window: a real wake fires 60s+
+    # after the finalize, and only a delta INSIDE the window may revive
+    # the finished turn.
+    page.wait_for_timeout(16_000)
+
+    # The wake, in live wire order: the new turn's first TEXT DELTAS
+    # stream ahead of the transcript batch (deltas-before-done), then
+    # the marker mirrors and the fresh turn's running edge fires. The
+    # early delta must not revive the FINISHED turn (the revive is for
+    # stray mid-turn idles, which are contradicted within seconds) or
+    # its fold pops open at every iteration.
+    httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_output_text_delta",
+            "data": {"delta": "Iteration 2 starting", "message_id": "m_wake_1", "index": 0},
+        },
+        timeout=10.0,
+    ).raise_for_status()
+    page.wait_for_timeout(400)
+    # The swallowed delta must not preview into the settled bubble
+    # either — that glued the new turn's text to the old fold, breaking
+    # its eligibility and inflating its worked-for span.
+    expect(page.get_by_text("Iteration 2 starting")).to_have_count(0)
+    _seed_user_message(
+        base_url,
+        session_id,
+        text="[System: scheduled prompt fired]",
+        response_id="loop_t2",
+    )
+    page.wait_for_timeout(300)
+    _publish_status(base_url, session_id, "running", response_id="loop_t2")
+
+    # Fold hide is undebounced, so any dip is visible within one sample.
+    for _ in range(17):
+        assert fold.count() >= 1
+        page.wait_for_timeout(150)
+
+    _seed_completed_tool_call(
+        base_url,
+        session_id,
+        response_id="loop_t2",
+        call_id="call_loop_2",
+        arguments='{"command": "gh pr checks"}',
+        output="still green\n",
+    )
+    _seed_assistant_message(
+        base_url, session_id, text="Iteration 2: still green.", response_id="loop_t2"
+    )
+    _publish_status(base_url, session_id, "idle", response_id="loop_t2")
+
+    expect(fold.nth(1)).to_be_visible(timeout=15_000)
+    assert fold.count() == 2
+    assert page.locator(_ASSISTANT_BUBBLE).count() == 2

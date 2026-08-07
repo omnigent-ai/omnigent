@@ -792,6 +792,16 @@ class ChildSessionSummary(BaseModel):
         a fanned-out sub-agent that needs attention is visible
         without opening its chat. Mirrors
         :attr:`SessionListItem.pending_elicitations_count`.
+    :param routed_model: Model this sub-agent runs on when one was pinned
+        for it, e.g. ``"databricks-claude-opus-4-8"``. Read from the
+        child's ``model_override`` — the field intelligent routing writes
+        when it picks a model for a spawned child. ``None`` when the child
+        inherits the parent/spec model.
+    :param routing_decision_id: Identifier of the routing decision that
+        produced :attr:`routed_model`, mirroring
+        ``RoutingDecisionData.decision_id``. Read from the child's
+        ``omnigent.routing.decision_id`` label, stamped when routing pins
+        the model. ``None`` when the child was not routed.
     """
 
     id: str
@@ -812,6 +822,8 @@ class ChildSessionSummary(BaseModel):
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
+    routed_model: str | None = None
+    routing_decision_id: str | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -1322,6 +1334,13 @@ class SessionCreateRequest(BaseModel):
         default) defers to the spec default. Set by the web UI's
         new-session "Cost Optimized" option; read by the cost-control
         advisor pipeline at turn start.
+    :param subagent_routing_override: Optional per-session
+        subagent-routing switch to persist at create time: ``"on"``
+        routes subagent spawns, ``"off"`` leaves them unrouted.
+        ``None`` (the default) lets the create route stamp ``"on"``
+        when the session starts on Smart Routing, and otherwise leaves
+        the session on Default. An explicit value always wins. Mutable
+        mid-session via ``PATCH /v1/sessions/{id}``.
     :param harness_override: Optional per-session brain-harness
         override to persist at create time, e.g. ``"pi"`` or
         ``"openai-agents"``. Set by the web UI's new-chat harness
@@ -1333,6 +1352,15 @@ class SessionCreateRequest(BaseModel):
         the spec's declared harness. Create-time only — there is no
         PATCH path, since the harness process spawns on the first
         turn.
+    :param smart_routing_message: The user's first-message text, used to
+        route the harness at create time. Only read on the top-level
+        Smart Routing path (``harness_override: "auto"`` on a native
+        wrapper agent), where the terminal launches as soon as the
+        session row exists and so the harness must be decided before it.
+        Routing-only: not persisted or dispatched — the client sends the
+        real message after the create returns. ``None`` everywhere else,
+        including the bundle-agent auto path, which routes on the first
+        message event instead.
     """
 
     agent_id: str
@@ -1349,7 +1377,9 @@ class SessionCreateRequest(BaseModel):
     model_override: str | None = None
     reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     harness_override: str | None = None
+    smart_routing_message: str | None = None
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> SessionCreateRequest:
@@ -1666,9 +1696,6 @@ class SessionResponse(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled (single-user mode without a permission store).
-    :param can_approve: Whether the requesting user may accept
-        privileged actions for this session. ``None`` when permissions
-        are disabled.
     :param llm_model: The LLM model identifier from the bound
         agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
         ``None`` when the agent has no explicit ``llm:`` block or
@@ -1692,6 +1719,13 @@ class SessionResponse(BaseModel):
         applies). Set at create time or via
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle); read by the cost-control advisor pipeline.
+    :param subagent_routing_override: Per-session subagent-routing
+        switch, two-state: ``"on"`` routes subagent spawns, and ``"off"``
+        or ``None`` (unset) both leave them unrouted — the in-session
+        "Subagent routing" row renders either as "Default". ``None`` on
+        a row created before this became explicit inherits nothing.
+        Stamped ``"on"`` at create for Smart Routing sessions; also set
+        via ``PATCH /v1/sessions/{id}``.
     :param context_window: The model's context window size in tokens
         as looked up server-side from litellm's registry (or from the
         ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.
@@ -1813,6 +1847,12 @@ class SessionResponse(BaseModel):
         id is not re-sent on reconnect. Today only native-terminal
         forwarders (claude-native) stamp a turn id on their status
         edges; other harnesses leave this ``None``.
+    :param updated_at: Unix epoch timestamp of the last persisted session
+        activity. Advances when conversation items are appended and on session
+        metadata edits (rename, agent switch, archive); a mid-stall rename
+        therefore resets the clock, so an orchestrator treating this as a pure
+        item-append heartbeat should account for that. Can be compared across
+        snapshots independently of lifecycle status.
     """
 
     id: str
@@ -1821,6 +1861,7 @@ class SessionResponse(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
     created_at: int
+    updated_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -1831,7 +1872,6 @@ class SessionResponse(BaseModel):
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
-    can_approve: bool | None = None
     sub_agent_name: str | None = None
     kind: str = "default"
     parent_session_id: str | None = None
@@ -1840,6 +1880,7 @@ class SessionResponse(BaseModel):
     harness: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -1919,6 +1960,14 @@ class UpdateSessionRequest(BaseModel):
         default; omitting the field leaves it unchanged (``"off"`` is
         a real value here, so the field's *presence* — not a clear
         alias — is the clear signal, unlike ``model_override``).
+    :param subagent_routing_override: Per-session subagent-routing
+        switch: ``"on"`` routes subagent spawns, ``"off"`` leaves them
+        unrouted. Explicit JSON ``null`` clears the override, which lands
+        the session on Default (the same behavior as ``"off"`` — nothing
+        is inherited); omitting the field leaves it unchanged (same
+        presence-is-the-clear-signal rule as
+        ``cost_control_mode_override``). Effective on the next spawn, so
+        it can be changed at any point in a session.
     :param external_session_id: Runtime-native session id captured
         by a wrapper bridge (e.g. Claude Code's session uuid for
         ``omnigent claude`` sessions). Idempotent on same-value
@@ -1962,6 +2011,7 @@ class UpdateSessionRequest(BaseModel):
     model_override: str | None = None
     collaboration_mode: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
@@ -2212,9 +2262,6 @@ class SessionListItem(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled.
-    :param can_approve: Whether the requesting user may accept
-        privileged actions for this session. ``None`` when permissions
-        are disabled.
     :param owner: The user_id of the session owner, or ``None``
         when permissions are disabled. Included so the sidebar
         can display the owner without a separate API call.
@@ -2294,7 +2341,6 @@ class SessionListItem(BaseModel):
     host_online: bool | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
-    can_approve: bool | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
@@ -2416,13 +2462,10 @@ class GrantPermissionRequest(BaseModel):
         read access.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
-    :param can_approve: Whether the owner delegates privileged-action
-        approval authority to this user.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
-    can_approve: bool | None = None
 
 
 class PermissionObject(BaseModel):
@@ -2434,13 +2477,11 @@ class PermissionObject(BaseModel):
         ``"conv_abc123"``.
     :param level: Numeric permission level (1=read, 2=edit,
         3=manage).
-    :param can_approve: Whether this grantee may approve privileged actions.
     """
 
     user_id: str
     conversation_id: str
     level: int
-    can_approve: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -2578,6 +2619,14 @@ class SessionStatusEvent(_SSEEventBase):
         is emitted. ``None`` for every non-failed transition.
         Clients render ``error.message`` as the terminal error
         line; without it a setup failure shows as a silent end.
+    :param blocked_on: Short human phrase naming what a still-``running``
+        session is parked on, e.g. ``"permission prompt"`` or
+        ``"dialog open"``. Set by terminal-backed integrations whose agent
+        can block on a dialog the web UI does not mirror, so the client can
+        say *why* nothing is moving instead of showing a bare spinner.
+        ``None`` whenever the session is not parked. Unrelated to the
+        ``waiting`` status above, which means the turn has ended and only
+        background work remains.
 
     Category: **transient** (SSE-only). Status is rederived on
     reconnect from the cached last-relayed turn lifecycle event
@@ -2590,6 +2639,7 @@ class SessionStatusEvent(_SSEEventBase):
     response_id: str | None = None
     error: ErrorDetail | None = None
     background_task_count: int | None = None
+    blocked_on: str | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):

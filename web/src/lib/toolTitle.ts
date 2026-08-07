@@ -63,8 +63,8 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   sys_advise_models: (args) => {
     const count = Array.isArray(args.tasks) ? args.tasks.length : null;
     return count === null
-      ? verbOnly("Intelligent routing")
-      : { verb: "Intelligent routing:", body: `${count} task${count === 1 ? "" : "s"}` };
+      ? verbOnly("Smart routing")
+      : { verb: "Smart routing:", body: `${count} task${count === 1 ? "" : "s"}` };
   },
 
   sys_session_close: (args) => sessionTitle("Close child session:", args),

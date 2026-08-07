@@ -2233,6 +2233,146 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
     )
 
 
+def test_write_paths_dotfile_masking_masks_external_write_root(tmp_path: Path) -> None:
+    """
+    A ``write_paths`` root outside cwd is dotfile-masked just like a
+    ``read_paths`` root: its top-level ``.env`` gets a ``(literal ...)``
+    deny and its ``.aws/`` a ``(subpath ...)`` deny, even though the
+    grant is for writing. Without scanning write roots the helper could
+    read (and clobber) secrets in a writable directory outside cwd.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    (external / ".aws").mkdir()
+    (external / ".aws" / "credentials").write_text("[default]")
+    (external / "notes.txt").write_text("ok")  # non-dotfile stays visible
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[external.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    ext = external.resolve(strict=False)
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    aws_deny = f'(deny file-read* file-write* (subpath "{ext / ".aws"}"))'
+    notes_deny = f'(deny file-read* file-write* (literal "{ext / "notes.txt"}"))'
+    assert env_deny in profile, (
+        ".env under a write_paths root must be masked — write grants are scanned too."
+    )
+    assert aws_deny in profile, ".aws/ under a write_paths root must get a (subpath ...) deny."
+    assert notes_deny not in profile, "Non-dotfiles under a write_paths root must stay visible."
+
+
+def test_read_write_overlap_masked_once(tmp_path: Path) -> None:
+    """
+    A path granted as BOTH a read and a write root is walked once —
+    ``merge_scan_roots`` dedupes the grant lists, so its ``.env`` deny
+    lands a single time, not once per grant list.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    ext = external.resolve(strict=False)
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[ext],
+        write_roots=[ext],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    assert profile.count(env_deny) == 1, (
+        f"Expected a single .env deny across overlapping read+write grants, "
+        f"got {profile.count(env_deny)}."
+    )
+
+
+def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` grant nested below a ``read_paths``
+    root must still have its top-level dotfiles denied in the default
+    (non-recursive) mode. A non-recursive walk of the parent masks only
+    the parent's immediate children, so the nested grant must be walked
+    in its own right rather than dropped as "subsumed".
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    (a / "deep" / "nested").mkdir(parents=True)
+    (a / ".env").write_text("SECRET_A")
+    (a / "deep" / "nested" / ".env").write_text("SECRET_NESTED")
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[a.resolve(strict=False)],
+        write_roots=[(a / "deep" / "nested").resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    top_env = f'(deny file-read* file-write* (literal "{a.resolve(strict=False) / ".env"}"))'
+    nested_env = (
+        "(deny file-read* file-write* (literal "
+        f'"{(a / "deep" / "nested").resolve(strict=False) / ".env"}"))'
+    )
+    assert top_env in profile, "Top-level .env of the read_paths root must be denied."
+    assert nested_env in profile, (
+        "Nested write_paths grant's .env must be denied in non-recursive mode; "
+        "dropping the nested root as subsumed would leak it."
+    )
+
+
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+    """
+    Regression: a framework write root added via
+    ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
+    excluded from the dotfile scan, so the egress ``.egress.sock`` in it
+    gets NO deny rule. Denying that socket cut off the relay endpoint and
+    reset every egress connection. A genuine user write root is still
+    scanned.
+    """
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework runtime dir
+    scratch.mkdir()
+    (scratch / ".egress.sock").write_text("")  # dotfile the sandbox needs
+    user_root = tmp_path / "shared"  # real user write grant
+    user_root.mkdir()
+    (user_root / ".env").write_text("SECRET=1")
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[user_root.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    # Mirror the real launch: the parent folds the scratch tmpdir in as a
+    # framework write root just before building the profile.
+    policy = with_additional_write_roots(policy, [scratch])
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    sock = scratch.resolve(strict=False) / ".egress.sock"
+    sock_deny = f'(deny file-read* file-write* (literal "{sock}"))'
+    assert sock_deny not in profile, (
+        "The framework scratch tmpdir must be excluded from the dotfile scan; "
+        "denying .egress.sock breaks the egress relay."
+    )
+    user_env = (
+        f'(deny file-read* file-write* (literal "{user_root.resolve(strict=False) / ".env"}"))'
+    )
+    assert user_env in profile, "A genuine user write root must still have its dotfiles denied."
+
+
 # ---------------------------------------------------------------------------
 # Exec-chain symlink hops + launcher target visibility (bwrap parity)
 # ---------------------------------------------------------------------------

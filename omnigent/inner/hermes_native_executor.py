@@ -16,10 +16,10 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from omnigent.hermes_native_bridge import BRIDGE_DIR_ENV_VAR, inject_interrupt, inject_user_message
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -58,7 +58,7 @@ class HermesNativeExecutor(Executor):
         """:returns: ``True`` — messages can be injected mid-turn (steering)."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """Inject a live steering message into the Hermes terminal."""
         del session_key
         text = _content_to_text(content, self._bridge_dir)
@@ -122,7 +122,7 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     return ""
 
 
-def _content_to_text(content: Any, bridge_dir: Path) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """Normalize executor content into text the Hermes TUI receives.
 
     Text blocks are extracted directly. Image/file blocks carrying a base64 data

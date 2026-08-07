@@ -24,6 +24,32 @@ export interface UserSuggestion {
   displayName?: string;
 }
 
+/**
+ * The kind of UI element an analytics event came from. A small, closed set kept
+ * intentionally host-agnostic — the host maps each value onto whatever its own
+ * telemetry taxonomy uses. Omitted when the element doesn't fit any of these.
+ */
+export type OmnigentComponentKind =
+  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select";
+
+/**
+ * A product-analytics event forwarded to the host. Each carries a stable,
+ * caller-chosen `componentId` / `pageId` so the host can attribute the action.
+ *
+ * PII: `value` on a value-change is only ever set when the emitting call site
+ * explicitly declares the value PII-free (see `useOmnigentAnalytics` in
+ * `lib/analytics.ts`). Free-form field text is never forwarded.
+ */
+export type OmnigentAnalyticsEvent =
+  | { type: "click"; componentId: string; componentKind?: OmnigentComponentKind }
+  | {
+      type: "value_change";
+      componentId: string;
+      componentKind?: OmnigentComponentKind;
+      value?: string | number | boolean;
+    }
+  | { type: "page_view"; pageId: string };
+
 export interface OmnigentHostConfig {
   /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
@@ -41,6 +67,15 @@ export interface OmnigentHostConfig {
    * logic and returns the suggestions to display.
    */
   searchUsers?: (query: string, options?: { signal?: AbortSignal }) => Promise<UserSuggestion[]>;
+  /**
+   * Optional product-analytics sink. When supplied by the host, the app's
+   * instrumented components forward clicks, field value-changes, and page views
+   * here (see `lib/analytics.ts`); when omitted (standalone, or before the host
+   * wires it) every emit is a no-op — the app records nothing on its own. The
+   * host owns transport, batching, and any PII policy beyond the app's default
+   * value redaction.
+   */
+  analytics?: (event: OmnigentAnalyticsEvent) => void;
   /**
    * Maps an web WS path (e.g.
    * `/v1/sessions/{id}/resources/terminals/{tid}/attach`) to a fully
@@ -105,6 +140,14 @@ export function getOmnigentHostConfig(): OmnigentHostConfig {
  */
 export function getOmnigentUserSearch(): OmnigentHostConfig["searchUsers"] {
   return hostConfig.searchUsers;
+}
+
+/**
+ * The host-provided analytics sink, or `undefined` when none is configured.
+ * Consumers use the absence to stay inert (emit nothing).
+ */
+export function getOmnigentAnalytics(): OmnigentHostConfig["analytics"] {
+  return hostConfig.analytics;
 }
 
 /**

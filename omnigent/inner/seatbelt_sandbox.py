@@ -122,7 +122,7 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from ._cwd_scan import MaskedEntry, MaskKind, scan_cwd_mask_entries
+from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     SandboxBackend,
@@ -852,8 +852,8 @@ def _build_profile(
     if extra_read_paths:
         lines.append("")
         lines.append(";; Helper interpreter visibility (argv[0] parents)")
-        for path in extra_read_paths:
-            lines.append(f"(allow file-read* (subpath {_quote(str(path))}))")
+        for read_path in extra_read_paths:
+            lines.append(f"(allow file-read* (subpath {_quote(str(read_path))}))")
 
     # ----------------------------------------------------------------
     # Exec-chain symlink hops + launcher target. Literal (not subpath)
@@ -864,8 +864,8 @@ def _build_profile(
     if extra_read_literals:
         lines.append("")
         lines.append(";; Exec-chain symlink hops + launcher target (literal reads)")
-        for path in extra_read_literals:
-            lines.append(f"(allow file-read* (literal {_quote(str(path))}))")
+        for read_literal in extra_read_literals:
+            lines.append(f"(allow file-read* (literal {_quote(str(read_literal))}))")
 
     # ----------------------------------------------------------------
     # Scratch tmpdir — always RW; surfaced via $TMPDIR for the helper.
@@ -995,7 +995,7 @@ def _build_profile(
     for entry in mask_entries:
         seen_mask_paths.add(str(entry.path))
     mask_entries.extend(
-        _scan_read_paths_mask_entries(
+        _scan_extra_roots_mask_entries(
             policy,
             cwd,
             safe_roots,
@@ -1016,7 +1016,7 @@ def _build_profile(
         mask_entries.append(MaskedEntry(path=mask_path, kind=kind))
     if mask_entries:
         lines.append("")
-        lines.append(";; Dotfile / escaping-symlink mask (cwd + read_paths)")
+        lines.append(";; Dotfile / escaping-symlink mask (cwd + read_paths + write_paths)")
         for entry in mask_entries:
             quoted = _quote(str(entry.path))
             if entry.kind == "dir":
@@ -1049,16 +1049,15 @@ def _build_profile(
     # ----------------------------------------------------------------
     lines.append("")
     lines.append(";; Network policy")
-    egress_active = policy.egress_relay_port is not None and policy.egress_socket_path is not None
-    if egress_active:
+    socket_path = policy.egress_socket_path
+    relay_port = policy.egress_relay_port
+    if socket_path is not None and relay_port is not None:
         # Hard enforcement: deny all network (already covered by
         # (deny default)) except loopback to the relay and the
         # parent's Unix socket. ``allow_network`` is intentionally
         # ignored here — egress mode always overrides it, matching
         # the bwrap behaviour where ``--unshare-net`` is added
         # whenever egress is active regardless of ``allow_network``.
-        socket_path = policy.egress_socket_path
-        relay_port = policy.egress_relay_port
         lines.append(";; Egress active — loopback to relay + Unix socket to parent")
         # SBPL host syntax: ``(remote ip "HOST:PORT")`` and
         # ``(local ip "HOST:PORT")`` require ``HOST`` to be either
@@ -1782,25 +1781,28 @@ def _sensitive_home_subpath_denials(policy: SandboxPolicy) -> list[Path]:
     return denials
 
 
-def _scan_read_paths_mask_entries(
+def _scan_extra_roots_mask_entries(
     policy: SandboxPolicy,
     cwd: Path,
     safe_roots: list[Path],
     *,
     already_seen: set[str],
-) -> list:  # list[MaskedEntry] — typed loosely to avoid the forward ref dance.
+) -> list[MaskedEntry]:
     """
-    Walk every ``read_paths`` root the operator granted and identify
-    dotfile / escaping-symlink entries to mask, using the same rules
-    the cwd walker applies (see
+    Walk every ``read_paths`` AND ``write_paths`` root the operator
+    granted and identify dotfile / escaping-symlink entries to mask,
+    using the same rules the cwd walker applies (see
     :func:`omnigent.inner._cwd_scan.scan_cwd_mask_entries`).
 
-    Roots that are at-or-under ``cwd`` are skipped — the cwd walker
-    already covered them. ``already_seen`` (a set of stringified
-    paths from a prior call, typically the cwd scan's emitted
-    entries) is updated in place so the caller can dedupe across
-    overlapping grants without re-emitting the same SBPL / bwrap
-    line twice.
+    :func:`omnigent.inner._cwd_scan.merge_scan_roots` folds the two
+    grant lists into one deduplicated, ancestor-first set: roots
+    at-or-under ``cwd`` are dropped (the cwd walker already covered
+    them) and a root nested under another kept root is walked once, so
+    a path granted read *and* write — or a subdir of a broader grant —
+    is not scanned twice. ``already_seen`` (a set of stringified paths
+    from a prior call, typically the cwd scan's emitted entries) is
+    updated in place so the caller can dedupe emitted entries across
+    overlapping grants without re-emitting the same SBPL line twice.
 
     The walker's per-root entry cap and overflow behaviour come from
     ``policy.cwd_hidden_scan_max_entries`` /
@@ -1811,20 +1813,17 @@ def _scan_read_paths_mask_entries(
     grant (which is the right answer almost every time — see the
     ``_SENSITIVE_HOME_SUBPATHS_DARWIN`` rationale).
     """
-    from ._cwd_scan import scan_cwd_mask_entries  # local import — avoids module-load order tangles
-
-    entries: list = []
-    if not policy.read_roots:
+    entries: list[MaskedEntry] = []
+    if not policy.read_roots and not policy.write_roots:
         return entries
     allow_hidden = policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else []
-    for root in policy.read_roots:
-        # Skip roots fully covered by the cwd scan that already ran.
-        # Comparing both ways: skip when root IS cwd, or when root
-        # is under cwd (cwd ancestor of root → cwd scan walked it),
-        # but NOT when cwd is under root (we still need to walk the
-        # rest of root that's outside cwd).
-        if _is_within(root, cwd):
-            continue
+    for root in merge_scan_roots(
+        cwd,
+        policy.read_roots,
+        policy.write_roots,
+        recursive=policy.cwd_hidden_scan_recursive,
+        skip_roots=policy.mask_scan_skip_roots,
+    ):
         try:
             root_entries = scan_cwd_mask_entries(
                 root,
@@ -1834,17 +1833,17 @@ def _scan_read_paths_mask_entries(
                 overflow=policy.cwd_hidden_scan_overflow,
                 recursive=policy.cwd_hidden_scan_recursive,
                 logger_name=__name__,
-                scope_label="read_paths",
+                scope_label="read_paths/write_paths",
             )
         except OSError as err:
-            # Re-raise with read_paths-specific advice, forwarding the
+            # Re-raise with grant-specific advice, forwarding the
             # walker's own message verbatim — it already names the
             # overflowed root (passed as the walk's scope) and the
             # unfinished directories, so we don't want to drop that
             # detail by rewriting the text from scratch.
             raise OSError(
-                f"dotfile mask scan overflowed while walking read_paths root "
-                f"{root}. Narrow the grant or tune the scan limits. {err}"
+                f"dotfile mask scan overflowed while walking read_paths/write_paths "
+                f"root {root}. Narrow the grant or tune the scan limits. {err}"
             ) from err
         for entry in root_entries:
             key = str(entry.path)

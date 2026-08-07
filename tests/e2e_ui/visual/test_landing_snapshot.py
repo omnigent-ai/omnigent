@@ -1,7 +1,7 @@
 """Visual-regression snapshot of the default empty view ("/").
 
 A single committed baseline of the whole app shell at ``/`` -- the open left
-sidebar plus the ``NewChatLandingScreen`` ("What should we do?") hero and
+sidebar plus the ``NewChatLandingScreen`` ("What should we build?") hero and
 composer. The gate lives in ``.github/workflows/ui-snapshot.yml``, which renders
 inside a *digest-pinned Playwright image* so the committed baseline and the PR
 comparison come from the exact same renderer (screenshots differ across
@@ -19,8 +19,8 @@ Determinism strategy -- mock every HTTP call the landing makes:
 feed, which on a fresh server is empty), but the rendered *data* is volatile and
 async: the agent catalog, host list, and session list arrive after mount, so a
 naive capture races them (the picker flips from "No agents" to a real agent, the
-sidebar from "Loading..." to "No active sessions"). Rather than wait-and-mask
-each one, we ``page.route``-stub the landing's HTTP endpoints with fixed
+sidebar from "Loading..." to "No sessions"). Rather than wait-and-mask each one,
+we ``page.route``-stub the landing's HTTP endpoints with fixed
 fixtures (same pattern as ``tests/e2e_ui/start_session``). That makes the view a
 pure function of the committed bundle + these stubs, so the snapshot needs no
 masks: the host/workspace/agent chips render fixed, known values. ``/v1/info`` /
@@ -38,8 +38,8 @@ from playwright.sync_api import Page, expect
 _HOST_ID = "host_e2e"
 # Bare session list/scan endpoint: ``/v1/sessions`` with an optional query, but
 # NOT ``/v1/sessions/{id}/...`` (the per-session agent enrich) nor the
-# ``/v1/sessions/updates`` WebSocket. Stubbed empty so the sidebar reads "No
-# active sessions" and no custom agents leak into the picker.
+# ``/v1/sessions/updates`` WebSocket. Stubbed empty so the sidebar reads
+# "No sessions" and no custom agents leak into the picker.
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 
@@ -106,7 +106,9 @@ def test_empty_landing_matches_baseline(
     # Wait for the async-populated regions to settle into their loaded state: the
     # agent picker (catalog resolved) and the sidebar session list.
     expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible(timeout=30_000)
-    expect(page.get_by_text("No active sessions")).to_be_visible(timeout=30_000)
+    # `.first`: an expanded project with no chats renders the same empty-state
+    # copy, so don't depend on this being the only match.
+    expect(page.get_by_text("No sessions").first).to_be_visible(timeout=30_000)
 
     # Settle web fonts + kill the blinking caret (both time-dependent).
     settle_for_snapshot(page)

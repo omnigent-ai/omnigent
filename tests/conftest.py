@@ -55,6 +55,7 @@ os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
 os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
 from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests import _model_pools
 
 pytest_plugins = ["tests._token_usage"]
@@ -272,6 +273,27 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
+def _reset_runner_catalog_cache() -> Generator[None, None, None]:
+    """
+    Clear smart routing's per-session runner-catalog cache after every test.
+
+    The cache is process-global and keyed by session id, and the suite reuses
+    a handful of fixed ids (``conv_123`` and friends) across unrelated tests —
+    so one test's catalog would answer another test's fetch and its counting
+    stub would never be called.
+
+    :returns: None.
+    """
+    yield
+    # sys.modules lookup, not an import: the spec lane blocks omnigent imports
+    # inside some tests, and a lane that never touched smart_routing should not
+    # pay for loading it in every teardown.
+    module = sys.modules.get("omnigent.server.smart_routing")
+    if module is not None:
+        module._runner_catalog_cache.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_claude_native_state(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
@@ -333,6 +355,42 @@ def _isolate_codex_native_state(
     """
     state_dir = tmp_path_factory.mktemp("codex-native-state")
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
+
+
+@pytest.fixture()
+def untracked_cache_start() -> None:
+    """Opt back in to the real :meth:`GitFilesystemRegistry.start`.
+
+    Request this alongside the tests that exercise the optimization
+    worker itself; :func:`_stub_untracked_cache_start` then leaves the
+    method alone.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _stub_untracked_cache_start(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the git untracked-cache worker out of unrelated tests.
+
+    :meth:`GitFilesystemRegistry.start` spawns a daemon thread that shells
+    out to git. It lands at an unpredictable moment, so a test that swaps
+    the process-global ``subprocess.run`` can record the worker's argv as
+    one of its own calls and fail on an assertion about a wholly unrelated
+    command. Stubbing the method by default removes the race for every
+    such test; the worker's own tests request ``untracked_cache_start``.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the method
+        at teardown.
+    :returns: None.
+    """
+    if "untracked_cache_start" in request.fixturenames:
+        return
+    monkeypatch.setattr(GitFilesystemRegistry, "start", lambda self: None)
 
 
 @pytest.fixture(scope="session", autouse=True)

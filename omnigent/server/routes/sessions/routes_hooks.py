@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, NamedTuple
 
@@ -14,10 +15,8 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
-from omnigent.policies.types import (
-    PolicyAction,
-)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -58,21 +57,74 @@ from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_re
 from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _EVALUATE_HOOK_ELICITATION_ID_RE,
+    _TURN_ACTOR_LABEL,
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _allow_all_edits_eligible,
+    _allow_remember_eligible,
+    _build_actor,
+    _build_evaluation_context,
+    _claude_native_remember_host,
+    _client_supplied_hook_elicitation_id,
+    _emit_server_routing_decision,
+    _forward_session_change_to_runner,
+    _get_runner_client,
+    _native_ask_gate_lock,
+    _publish_policy_denied,
+    _structured_ask_user_question,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _hold_native_ask_gate,
+    _publish_and_wait_for_harness_elicitation,
+    _spawn_gateway_backed,
+    _spawn_native_blocked_notice_forward,
+)
 from omnigent.server.schemas import (
     ElicitationRequestParams,
 )
 from omnigent.spec.types import (
     Phase,
+    PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+
+def _create_route_decision_id(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """Return the decision id of a session's create-time routing card.
+
+    The create emits the card but leaves the route-once label unclaimed,
+    because the prompt the user finally submits may not be the one it routed.
+    When it IS the same prompt, the first-prompt hook claims this decision
+    rather than making a second one.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store exposing ``list_items``.
+    :returns: The applied ``"session"``-scope decision id, or ``None`` when
+        the session has none.
+    """
+    try:
+        page = conversation_store.list_items(session_id, type="routing_decision", order="asc")
+    except (OSError, ValueError):
+        _logger.warning(
+            "route-turn: could not read session=%s routing decisions", session_id, exc_info=True
+        )
+        return None
+    for item in page.data:
+        data = item.data
+        if getattr(data, "scope", None) == "session" and getattr(data, "applied", False):
+            decision_id = getattr(data, "decision_id", None)
+            if isinstance(decision_id, str) and decision_id:
+                return decision_id
+    return None
 
 
 def register_hooks_routes(
@@ -649,7 +701,14 @@ def register_hooks_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        conv = conversation_store.get_conversation(session_id)
+        # Reuse the row the ACL check already fetched — same point in the
+        # request, so no less fresh than reading it again here, one query
+        # fewer on the blocking PreToolUse path. Absent for admin callers
+        # (who bypass the conversation lookup) and when permissions are
+        # disabled, which fall back to their own read.
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise OmnigentError(
                 f"Session {session_id!r} not found.",
@@ -709,7 +768,7 @@ def register_hooks_routes(
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
         )
 
-        def _build_engine() -> PolicyEngine:
+        def _build_engine(preloaded_conv: Conversation | None = None) -> PolicyEngine:
             """
             Build a policy engine for this session from the loaded spec.
 
@@ -718,6 +777,10 @@ def register_hooks_routes(
             does not re-query it during ``evaluate``, so a fresh build is the
             only way to observe a concurrent sibling's just-recorded approval.
 
+            :param preloaded_conv: The conversation row this handler already
+                loaded, passed on the FIRST build only to skip the builder's
+                re-read. Rebuilds that must observe concurrent writes (the
+                ASK-gate re-evaluation) pass ``None`` for a fresh read.
             :returns: A :class:`PolicyEngine` seeded with the latest
                 persisted state for ``session_id``.
             """
@@ -725,20 +788,30 @@ def register_hooks_routes(
                 spec=loaded.spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
+                conversation=preloaded_conv,
+                # ``agent`` below was resolved from conv.agent_id; the builder
+                # re-reads the row and fails closed if it was rebound since.
+                expected_agent_id=agent.id,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine()
+        engine = _build_engine(conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
         # user_id for direct API callers and native-terminal sessions (whose
         # turns go via _dispatch_session_event_to_runner, which does not write
         # this label).
-        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
+        # Read the actor from the engine's label snapshot, not from the row
+        # fetched at the top of this handler: the engine's labels come from a
+        # read taken after the agent/spec load, so a turn-actor label written
+        # in that window still gates on the right principal. (``agent_id``
+        # cannot be treated the same way — it selects the spec the engine is
+        # built from, so it is necessarily read first.)
+        turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
             phase, data, event, actor=_build_actor(turn_actor or user_id)
         )
@@ -776,7 +849,9 @@ def register_hooks_routes(
                 # an ALLOW (or now-hard DENY) collapses the ASK and falls through
                 # without a second prompt. Held across the human wait by design;
                 # a declined ASK records nothing, so siblings legitimately re-ask.
-                async with _native_ask_gate_lock(session_id, result.deciding_policy):
+                deciding_policy = result.deciding_policy
+                assert deciding_policy is not None
+                async with _native_ask_gate_lock(session_id, deciding_policy):
                     engine = _build_engine()
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
@@ -807,15 +882,15 @@ def register_hooks_routes(
                                 get_server_runner_router(),
                                 {"type": "interrupt"},
                             )
-                            verdict_body = {
+                            decline_body = {
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",
                             }
                             return Response(
-                                content=json.dumps(verdict_body),
+                                content=json.dumps(decline_body),
                                 media_type="application/json",
                             )
-                        verdict_body: dict[str, Any] = (
+                        approval_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
                             if approved
                             else {
@@ -824,7 +899,7 @@ def register_hooks_routes(
                             }
                         )
                         return Response(
-                            content=json.dumps(verdict_body),
+                            content=json.dumps(approval_body),
                             media_type="application/json",
                         )
                 # Re-evaluation collapsed the ASK (a sibling's approval recorded
@@ -1274,5 +1349,372 @@ def register_hooks_routes(
             )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
+            media_type="application/json",
+        )
+
+    async def _route_subagent_catalog(session_id: str) -> dict[str, list[str]] | None:
+        """
+        Fetch the session's live model catalog for subagent routing.
+
+        :param session_id: Parent session/conversation id.
+        :returns: Worker → servable model ids, or ``None`` when the runner
+            is unreachable (callers fall back to the static table).
+        """
+        from omnigent.server.smart_routing import fetch_runner_models
+
+        try:
+            runner_client = await _get_runner_client(
+                session_id, runner_router or get_server_runner_router()
+            )
+            if runner_client is None:
+                return None
+            return await fetch_runner_models(session_id, runner_client)
+        except Exception:
+            _logger.debug(
+                "route-subagent: live catalog unavailable for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
+    @router.post(
+        "/sessions/{session_id}/hooks/route-subagent",
+        # Internal runner relay — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def route_subagent_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Decide the model/harness a native subagent spawn may use.
+
+        The runner's loopback router (advertised to harness
+        ``PreToolUse`` hooks via ``subagent_router.json``) relays here
+        because ``RuntimeCaps.routing_client`` only lives in the server
+        process. Request and response follow the frozen route-subagent
+        contract; every routed verdict also lands as a
+        ``routing_decision`` transcript item.
+
+        The session's subagent-routing switch is two-state and re-read on
+        every call (it is togglable mid-session): only an explicit ``"on"``
+        routes, and every other session gets its spawn allowed unchanged
+        without calling the router. Sessions that start on Smart Routing
+        are stamped ``"on"`` at create, so nothing is inherited here.
+        Candidate models stay inside the session's own harness family
+        unless the session started in auto-harness mode.
+
+        :param request: FastAPI request — body is the route-subagent
+            request JSON.
+        :param session_id: Parent session/conversation id from the path.
+        :returns: The route-subagent decision as JSON.
+        :raises OmnigentError: 400 when the body is not a JSON object or
+            omits ``harness``.
+        """
+        from omnigent.runner.subagent_routing import (
+            SubagentRouteDecision,
+            SubagentRouteRequest,
+            auto_harness_session,
+            resolve_subagent_route,
+            store_persister,
+            subagent_routing_enabled,
+        )
+        from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+
+        user_id = _get_user_id(request, auth_provider)
+        # LEVEL_EDIT, like POST /events: a routed verdict mutates the session
+        # (a persisted ``routing_decision`` item, and on the sibling route-turn
+        # relay a ``model_override`` pin). A read-only viewer must not be able
+        # to steer somebody else's spawns.
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in route-subagent body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "route-subagent body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            route_request = SubagentRouteRequest.from_payload(payload)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        # A relayed spawn is evidence the harness ran its routing hook, but it
+        # is deliberately NOT turned into a clear here: the same warning code
+        # also carries the spawn-audit verdict ("started on a model the router
+        # never approved"), which a relay does not disprove — and every spawn
+        # that produces such a verdict is itself relayed, so clearing here
+        # wiped exactly the warnings the publisher had just raised (it only
+        # re-posts on a transition, so the wipe was permanent). The publisher
+        # owns the clear: its next check sees the canary and posts the repair.
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        parent = None
+        if conv is not None and conv.parent_conversation_id is not None:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        if conv is None or not subagent_routing_enabled(conv.subagent_routing_override):
+            # Allowed unchanged, and deliberately not persisted: an
+            # unrouted spawn is not a decision worth a transcript item.
+            _logger.info(
+                "route-subagent: subagent routing disabled for session=%s harness=%s",
+                session_id,
+                route_request.harness,
+            )
+            unrouted = SubagentRouteDecision(
+                action="allow",
+                rationale="subagent routing disabled for this session",
+            )
+            return Response(
+                content=json.dumps(unrouted.to_payload()),
+                media_type="application/json",
+            )
+
+        # Only a session started in auto-harness mode may be moved across
+        # harness families; everyone else is offered their own family, so a
+        # Claude Code session never gets a Codex suggestion.
+        cross_harness = auto_harness_session(conv, parent)
+        # Which families the spawn may land on decides which router can serve it:
+        # off the AI Gateway the built-in judge answers, from the live catalog
+        # alone (the static table's databricks-* ids are unreachable there).
+        gateway_backed = await _spawn_gateway_backed(
+            request,
+            conv,
+            (AUTO_NATIVE_ROUTING_HARNESSES if cross_harness else (route_request.harness,)),
+        )
+        # Offer the live catalog: the static table lags model generations, and
+        # a pick the workspace serves must not look unservable and get
+        # substituted down a tier.
+        catalog = await _route_subagent_catalog(session_id)
+        decision = await resolve_subagent_route(
+            session_id,
+            route_request,
+            caps=get_caps(),
+            catalog=catalog,
+            cross_harness=cross_harness,
+            gateway_backed=gateway_backed,
+            allow_static_fallback=gateway_backed,
+            persist=store_persister(session_id, conversation_store),
+        )
+        return Response(
+            content=json.dumps(decision.to_payload()),
+            media_type="application/json",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/hooks/route-turn",
+        # Internal runner relay — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def route_turn_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Decide the model a session's first real prompt should run on.
+
+        The in-harness sibling of ``route-subagent``: a harness
+        ``UserPromptSubmit`` hook relays here (through the runner's
+        loopback endpoint, advertised as ``turn_router.json``) because
+        ``RuntimeCaps.routing_client`` only lives in the server process.
+        It closes the bare-launch gap — a session started with no prompt,
+        whose first message is typed straight into the TUI and so is
+        invisible to the composer turn gate. Everything else about routing
+        is unchanged: same decision seam, same chip, same
+        ``model_override`` pin, and that pin is what stops a session from
+        ever routing twice.
+
+        :param request: FastAPI request — body is the route-turn request
+            JSON.
+        :param session_id: Session/conversation id from the path.
+        :returns: The route-turn decision as JSON.
+        :raises OmnigentError: 400 when the body is not a JSON object or
+            omits ``harness`` / ``prompt``.
+        """
+        from omnigent.runner.turn_routing import (
+            TurnRouteRequest,
+            decision_scope,
+            resolve_turn_route,
+        )
+        from omnigent.server.routes._sessions.helpers import _resolve_harness
+        from omnigent.server.routes._sessions.orchestration import (
+            _native_turn_catalog,
+            _publish_routed_model,
+            _stamp_routing_decision_label,
+            _unavailable_routing_card,
+        )
+        from omnigent.server.smart_routing import route_turn as _route_turn_seam
+
+        user_id = _get_user_id(request, auth_provider)
+        # LEVEL_EDIT, like POST /events: this route writes ``model_override``
+        # for the rest of the session and persists a decision item. LEVEL_READ
+        # let a read-only viewer repin somebody else's model.
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in route-turn body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "route-turn body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            route_request = TurnRouteRequest.from_payload(payload)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        parent = None
+        if conv is not None and conv.parent_conversation_id is not None:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+        runner_client = None
+        catalog = None
+        if conv is not None:
+            try:
+                runner_client = await _get_runner_client(
+                    session_id, runner_router or get_server_runner_router()
+                )
+                catalog = await _native_turn_catalog(session_id, conv, runner_client)
+            except Exception:
+                _logger.debug(
+                    "route-turn: live catalog unavailable for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+
+        # This pane's own family decides which router can serve its first turn.
+        # A create off the AI Gateway now succeeds (the built-in judge answers),
+        # so this hook must make the same choice the composer path does.
+        turn_gateway_backed = (
+            await _spawn_gateway_backed(request, conv, (route_request.harness,))
+            if conv is not None
+            else True
+        )
+
+        async def _route(
+            harness: str | None, prompt: str
+        ) -> tuple[str | None, dict[str, Any] | None]:
+            return await _route_turn_seam(
+                harness,
+                prompt,
+                session_id=session_id,
+                runner_client=runner_client,
+                catalog=catalog,
+                gateway_backed=turn_gateway_backed,
+                allow_static_fallback=turn_gateway_backed,
+            )
+
+        async def _pin(model: str) -> bool:
+            try:
+                await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    session_id,
+                    model_override=model,
+                )
+            except (OSError, ValueError):
+                _logger.warning(
+                    "route-turn: could not pin model_override for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+            _publish_routed_model(session_id, model)
+            return True
+
+        async def _persist(model: str, verdict: dict[str, Any]) -> None:
+            decision_id = await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                model,
+                verdict,
+                scope=decision_scope(),
+                harness=route_request.harness,
+            )
+            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+
+        async def _record_decline(cause: str) -> None:
+            """Persist the declined chip for a failed routing call.
+
+            The card, not the label: a failure must stay visible without
+            claiming the route-once gate, or one outage would make this the
+            session's routing decision forever.
+            """
+            model, verdict = _unavailable_routing_card(cause)
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                model,
+                verdict,
+                scope=decision_scope(),
+                harness=route_request.harness,
+            )
+
+        async def _reuse_create_route() -> bool:
+            """Claim the create-time decision as this session's routing decision.
+
+            No second chip: the create's own row already says what was picked,
+            and the pane launched on it. Claiming the route-once label is what
+            makes this the session's decision, so a later prompt does not ask
+            again.
+
+            :returns: ``True`` when the create's decision was claimed.
+            """
+            decision_id = await asyncio.to_thread(
+                _create_route_decision_id, session_id, conversation_store
+            )
+            if decision_id is None:
+                return False
+            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+            return True
+
+        decision = await resolve_turn_route(
+            session_id,
+            route_request,
+            conv=conv,
+            parent=parent,
+            # A pinned routed parent confines its spawns to its own family, so
+            # the pane's own family is not the only one that matters.
+            parent_harness=_resolve_harness(parent) if parent is not None else None,
+            route_turn=_route,
+            reuse_create_route=_reuse_create_route,
+            pin=_pin,
+            persist=_persist,
+            record_decline=_record_decline,
+        )
+        _logger.info(
+            "route-turn: session=%s harness=%s live_model=%s pinned=%s action=%s model=%s",
+            session_id,
+            route_request.harness,
+            route_request.model,
+            conv.model_override if conv is not None else None,
+            decision.action,
+            decision.model,
+        )
+        # The rationale paraphrases the user's prompt, so it stays off INFO —
+        # the same invariant ``omnigent.server.smart_routing`` keeps at each of
+        # its own three log sites.
+        _logger.debug("route-turn: session=%s rationale=%s", session_id, decision.rationale)
+        return Response(
+            content=json.dumps(decision.to_payload()),
             media_type="application/json",
         )

@@ -28,17 +28,8 @@ from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
-    ANTIGRAVITY_NATIVE_CODING_AGENT,
-    CLAUDE_NATIVE_CODING_AGENT,
-    CODEX_NATIVE_CODING_AGENT,
-    CURSOR_NATIVE_CODING_AGENT,
-    GOOSE_NATIVE_CODING_AGENT,
-    HERMES_NATIVE_CODING_AGENT,
-    KIMI_NATIVE_CODING_AGENT,
-    KIRO_NATIVE_CODING_AGENT,
-    OPENCODE_NATIVE_CODING_AGENT,
-    PI_NATIVE_CODING_AGENT,
-    QWEN_NATIVE_CODING_AGENT,
+    NativeHarnessProvider,
+    native_provider_for_key,
 )
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
@@ -166,17 +157,6 @@ _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
 _WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
-_CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
-_CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
-_PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
-_OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
-_CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
-_KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
-_GOOSE_NATIVE_AGENT_NAME = GOOSE_NATIVE_CODING_AGENT.agent_name
-_HERMES_NATIVE_AGENT_NAME = HERMES_NATIVE_CODING_AGENT.agent_name
-_ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
-_QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
-_KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
@@ -490,17 +470,7 @@ def _ensure_default_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_goose_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_hermes_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -575,434 +545,76 @@ def _ensure_extra_builtin_agents(
         _logger.info("Registered extra built-in agent %r from %s", name, source)
 
 
-def _build_claude_native_bundle() -> bytes:
+def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     """
-    Build a gzipped tarball of the claude-native-ui agent spec.
+    Materialize a built-in native agent's spec and tar it (registry-driven).
 
+    Replaces the 11 hand-written ``_build_<x>_native_bundle`` functions: resolves
+    the provider's ``materialize_agent_spec`` hook (``_materialize_<key>_agent_spec``)
+    and runs the same materialize -> bundle -> tar dance they all shared. The
+    per-harness ``model`` variance (codex/kiro/opencode take a keyword-only
+    ``model``; the rest take just ``tmpdir``) is bridged by signature inspection,
+    so the produced bytes are byte-identical to the pre-loop builders (which all
+    passed ``model=None`` where accepted).
+
+    :param provider: The native harness provider row.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
+    import inspect
     import tempfile
 
-    from omnigent.claude_native import _materialize_claude_agent_spec
+    from omnigent.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
+    materialize = resolve_hook(provider, "materialize_agent_spec")
+    if materialize is None:
+        raise OmnigentError(f"native provider {provider.key!r} has no materialize_agent_spec hook")
     with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_claude_agent_spec(Path(tmpdir))
+        # The bridge understands only the ``model`` axis: pass ``model=None`` iff
+        # the materializer declares that parameter, else call it bare. A future
+        # harness whose materializer needs a *different* required kwarg will fail
+        # loud here (missing-argument TypeError at seed time) rather than route —
+        # add that axis explicitly if/when it appears.
+        kwargs = {"model": None} if "model" in inspect.signature(materialize).parameters else {}
+        spec_path = materialize(Path(tmpdir), **kwargs)
         bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
         return _tar_gz_dir(bundle_dir)
 
 
-def _ensure_default_claude_agent(
+def _ensure_default_native_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
 ) -> None:
     """
-    Register or refresh the claude-native-ui agent.
+    Register or refresh every built-in native-CLI agent (claude/codex/pi/...).
 
-    Called during server lifespan startup so the Web UI can create
-    host-launched sessions without requiring a prior CLI-initiated
-    session. Content-aware via :func:`_ensure_builtin_agent`: a new
-    wheel with a changed spec refreshes the row in place rather than
-    being ignored.
+    Iterates :data:`NATIVE_CODING_AGENTS` (each carries both ``key`` and
+    ``agent_name``), resolves the matching provider, and seeds it content-aware
+    via :func:`_ensure_builtin_agent`. The agent name is unchanged
+    (``NativeCodingAgent.agent_name``), so :func:`builtin_agent_id` — a pure hash
+    of the name — stays byte-identical and a redeploy does not orphan persisted
+    ``conversation.agent_id`` rows.
 
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_CLAUDE_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_claude_native_bundle(),
-    )
-
-
-def _build_codex_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the codex-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.codex_native import _materialize_codex_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_codex_agent_spec(Path(tmpdir), model=None)
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_codex_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the codex-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer
-    Codex as a built-in agent alongside Claude. Content-aware via
-    :func:`_ensure_builtin_agent`: a new wheel with a changed spec
-    refreshes the row in place rather than being ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_CODEX_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_codex_native_bundle(),
-    )
-
-
-def _build_opencode_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the opencode-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.opencode_native import _materialize_opencode_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_opencode_agent_spec(Path(tmpdir), model=None)
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_opencode_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the opencode-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer OpenCode
-    as a built-in agent alongside Claude / Codex / Pi. Content-aware via
-    :func:`_ensure_builtin_agent`: a new wheel with a changed spec refreshes
-    the row in place rather than being ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_OPENCODE_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_opencode_native_bundle(),
-    )
-
-
-def _build_pi_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the pi-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.pi_native import _materialize_pi_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_pi_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_pi_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the pi-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer Pi as a
-    built-in native-terminal agent. Content-aware via
-    :func:`_ensure_builtin_agent`: a new wheel with a changed spec refreshes
-    the row in place rather than being ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_PI_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_pi_native_bundle(),
-    )
-
-
-def _build_cursor_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the cursor-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.cursor_native import _materialize_cursor_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_cursor_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_cursor_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the cursor-native-ui agent.
-
-    Called during server lifespan startup so the Web UI offers Cursor as a
-    built-in native-terminal agent on every deployment (not only after the
-    ``omnigent cursor`` CLI first registers it). Content-aware via
-    :func:`_ensure_builtin_agent`.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_CURSOR_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_cursor_native_bundle(),
-    )
-
-
-def _build_kiro_native_bundle() -> bytes:
-    """Build a gzipped tarball of the kiro-native-ui agent spec."""
-    import tempfile
-
-    from omnigent.kiro_native import _materialize_kiro_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_kiro_agent_spec(Path(tmpdir), model=None)
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_kiro_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """Register or refresh the kiro-native-ui agent."""
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_KIRO_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_kiro_native_bundle(),
-    )
-
-
-def _build_goose_native_bundle() -> bytes:
-    """Build a gzipped tarball of the goose-native-ui agent spec."""
-    import tempfile
-
-    from omnigent.goose_native import _materialize_goose_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_goose_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_goose_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """Register or refresh the goose-native-ui agent."""
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_GOOSE_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_goose_native_bundle(),
-    )
-
-
-def _build_hermes_native_bundle() -> bytes:
-    """Build a gzipped tarball of the hermes-native-ui agent spec."""
-    import tempfile
-
-    from omnigent.hermes_native import _materialize_hermes_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_hermes_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_hermes_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """Register or refresh the hermes-native-ui agent."""
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_HERMES_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_hermes_native_bundle(),
-    )
-
-
-def _ensure_default_antigravity_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the antigravity-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer Antigravity
-    as a built-in native-terminal agent (the ``agy`` TUI), alongside Claude
-    Code / Codex / Pi. Content-aware via :func:`_ensure_builtin_agent`: a new
-    wheel with a changed spec refreshes the row in place rather than being
-    ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_ANTIGRAVITY_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_antigravity_native_bundle(),
-    )
-
-
-def _build_antigravity_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the antigravity-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.antigravity_native import _materialize_antigravity_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_antigravity_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _build_qwen_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the qwen-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.qwen_native import _materialize_qwen_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_qwen_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_qwen_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the qwen-native-ui agent.
-
-    Called during server lifespan startup so the Web UI offers Qwen Code as a
-    built-in native-terminal agent on every deployment (not only after the
-    ``omnigent qwen`` CLI first registers it). Content-aware via
-    :func:`_ensure_builtin_agent`.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_QWEN_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_qwen_native_bundle(),
-    )
-
-
-def _build_kimi_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the kimi-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.kimi_native import _materialize_kimi_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_kimi_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_kimi_native_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the kimi-native-ui agent.
-
-    Called during server lifespan startup so the Web UI offers Kimi as a
-    built-in native-terminal agent on every deployment (not only after the
-    ``omnigent kimi`` CLI first registers it). Content-aware via
-    :func:`_ensure_builtin_agent`.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_KIMI_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_kimi_native_bundle(),
-    )
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+
+    for agent in NATIVE_CODING_AGENTS:
+        provider = native_provider_for_key(agent.key)
+        if provider is None:
+            raise OmnigentError(
+                f"native coding agent {agent.key!r} has no provider row to seed from"
+            )
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=agent.agent_name,
+            bundle_bytes=_build_native_bundle(provider),
+        )
 
 
 def _build_debby_bundle() -> bytes:
@@ -1275,6 +887,8 @@ def create_app(
             from omnigent.server.accounts_bootstrap import bootstrap_admin
 
             _accounts_cfg = auth_provider._accounts_config
+            if _accounts_cfg is None:
+                raise ValueError("accounts auth provider requires accounts_config")
             _bootstrap_result = bootstrap_admin(
                 account_store,
                 init_admin_password=_accounts_cfg.init_admin_password,
@@ -1545,6 +1159,7 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
@@ -1723,7 +1338,7 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=True)
+            _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
@@ -1761,7 +1376,7 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=True)
+        _logger.error("Database error: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1786,7 +1401,7 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=True)
+        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -2040,8 +1655,13 @@ def create_app(
         # Missing ids default to reachable / no-host, matching the bulk
         # lookup's own missing-row terminal.
         _missing = SessionLiveness(runner_online=True, host_online=None)
+
+        def _liveness_or_missing(sid: str) -> SessionLiveness:
+            found = liveness.get(sid)
+            return found if found is not None else _missing
+
         if session_id is not None:
-            single = liveness.get(session_id, _missing)
+            single = _liveness_or_missing(session_id)
             result["session"] = {
                 "id": session_id,
                 "runner_online": single.runner_online,
@@ -2051,7 +1671,7 @@ def create_app(
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
-                    "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
+                    "runner_online": (sl := _liveness_or_missing(sid)).runner_online,
                     "host_online": sl.host_online,
                     "host_version": sl.host_version,
                 }
@@ -2072,7 +1692,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | None]:
+    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -2135,16 +1755,17 @@ def create_app(
         # config is wired AND its provider can actually serve a managed
         # launch (staged providers parse but reject at launch — they
         # must not advertise the option).
-        managed_sandboxes_enabled = (
-            sandbox_config is not None and sandbox_config.managed_launch_supported
-        )
         # sandbox_provider names the backing provider (e.g. "modal",
         # "islo") so the web UI can label the option per provider
         # ("Modal Sandbox" / "Islo Sandbox") instead of the
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
-        sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        managed_sandboxes_enabled = False
+        sandbox_provider = None
+        if sandbox_config is not None and sandbox_config.managed_launch_supported:
+            managed_sandboxes_enabled = True
+            sandbox_provider = sandbox_config.provider
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -2157,19 +1778,26 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is configured (a server llm: block, or a
-        # routing.provider=external block) or the managed deployment registered
-        # a policy_llm_connection_factory (which means it has LLM capability
-        # and will supply its own RoutingClient).
+        # smart_routing_enabled: true when the server can route from ANY source
+        # — a configured RoutingClient (a server llm: block, routing.provider=
+        # external, or an explicit routing_backends pair) or a managed
+        # deployment's policy_llm_connection_factory.
+        # smart_routing_sources names WHICH router can answer: "external" is the
+        # workspace AI-Gateway task_v1 client, "oss" the built-in judge. A
+        # harness whose inference is not gateway-backed can only be served by
+        # the built-in one, so the SPA and the CLI read this to pick a source
+        # instead of hiding the surface.
+        # Both come from one helper, so the flag can never claim routing is off
+        # for a deployment whose sources say a router would answer.
         try:
             from omnigent.runtime._globals import _caps
+            from omnigent.server.routing_backend import routing_available, routing_sources
 
-            smart_routing_enabled = _caps is not None and (
-                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
-            )
+            smart_routing_enabled = routing_available(_caps)
+            smart_routing_sources = routing_sources(_caps)
         except ImportError:
             smart_routing_enabled = False
+            smart_routing_sources = {"external": False, "oss": False}
         # harness_install_enabled gates the web UI's "Install" action for a
         # missing, npm-installable harness on a connected host. Off by default
         # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
@@ -2210,6 +1838,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "smart_routing_sources": smart_routing_sources,
             "harness_install_enabled": harness_install_enabled,
             "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,
@@ -2438,22 +2067,22 @@ def create_app(
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark sessions pinned to *this* runner as offline.
+        """Mark the turns *this* runner interrupted as offline.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
         disconnect on one runner does not flip every cached session
         (e.g. sessions owned by other runners on the same server, or
         sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``. The cache is updated
-        in lockstep with the publish so the list endpoint stays
-        coherent.
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.schemas import ErrorDetail
 
         # Newest-wins guard: a superseded tunnel's teardown fires this
         # hook after a fresh tunnel for the same ``runner_id`` already
@@ -2485,20 +2114,22 @@ def create_app(
         # Archived sessions are included by construction — an archived
         # session can still be runner-bound, and skipping it here would
         # leave it stuck "running" forever.
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s disconnected; marking %d session(s) offline",
+            "Runner %s disconnected; reconciling %d bound session(s)",
             runner_id,
             len(affected),
         )
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed")
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            ),
+            conversation_store,
+        )
 
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
@@ -2509,34 +2140,33 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout.
+        instead of spinning on "starting" until a timeout. An idle
+        top-level session is included for exactly that reason; an idle
+        sub-agent is not, since its work finished on a runner that was
+        already live.
 
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s reported crashed; marking %d session(s) failed: %s",
+            "Runner %s reported crashed; reconciling %d bound session(s): %s",
             runner_id,
             len(affected),
             error,
         )
-        detail = ErrorDetail(code="runner_failed_to_start", message=error)
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed", error=detail)
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(code="runner_failed_to_start", message=error),
+            conversation_store,
+            fail_idle_top_level=True,
+        )
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -2552,6 +2182,7 @@ def create_app(
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            prefetch_session_routing_catalogs,
         )
 
         # Stamp liveness immediately so other replicas see the runner
@@ -2618,6 +2249,12 @@ def create_app(
                 routed.client,
                 conversation_store,
             )
+            # The session's terminal exists as of the handshake above, so its
+            # model catalogs are answerable now. Warming them here is what
+            # keeps the first routed message off the runner round trip. The
+            # helper self-gates on routing state, so the plain sessions in this
+            # loop (and any archived row) cost nothing.
+            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
             # Reconcile the persisted pending-elicitation count with this
             # pod's live index. A runner that crashed with prompts parked
             # leaves a stale row (no decrement is ever written on a crash),
@@ -2744,7 +2381,7 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
-        else:
+        elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 
             # OIDC invites are opt-in (OMNIGENT_OIDC_ALLOW_INVITES) and
@@ -2773,6 +2410,11 @@ def create_app(
                 ),
                 prefix="/auth",
                 tags=["auth"],
+            )
+        else:
+            _logger.debug(
+                "Skipping built-in auth routes for custom provider %s",
+                type(auth_provider).__name__,
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
@@ -2836,7 +2478,7 @@ def create_app(
     all_extra_routers = list(extra_routers or [])
     all_extra_routers.extend(_load_debug_routers(debug_router_modules))
     for router, prefix, tags in all_extra_routers:
-        app.include_router(router, prefix=prefix, tags=tags)
+        app.include_router(router, prefix=prefix, tags=[*tags])
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
@@ -2894,7 +2536,7 @@ class _SPAStaticFiles(StaticFiles):
             return
         await super().__call__(scope, receive, send)
 
-    async def get_response(self, path: str, scope: Scope) -> Response:  # type: ignore[override]
+    async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
         try:
             response = await super().get_response(path, scope)

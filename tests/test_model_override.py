@@ -136,6 +136,21 @@ class TestModelFamilyMismatch:
             ("claude-sdk", "claude-opus-4-8"),
             ("codex-native", "databricks-gpt-5-4"),
             ("codex", "gpt-5.1-codex"),
+            # The OpenAI family is matched as a substring, which is the only
+            # rule that admits these real ids: a per-segment match rejects both
+            # (the token is glued to a prefix in one and to its generation in
+            # the other), which silently un-dispatched them.
+            ("codex", "chatgpt-4o-latest"),
+            ("codex-native", "gpt4o"),
+            ("codex", "databricks-chatgpt-4o-latest"),
+            # GLM and Kimi serve on the same OpenResponses wire codex speaks,
+            # so those ids are codex-runnable. One row per distinct thing the
+            # segment matcher has to get right: bare id, dot-separated gateway
+            # namespace, the databricks- prefix, and a non-generational tail.
+            ("codex", "glm-5-2"),
+            ("native-codex", "system.ai.glm-5-2"),
+            ("codex-native", "databricks-kimi-k2-6"),
+            ("codex", "kimi-for-coding"),
             ("openai-agents", "gpt-5.4-mini"),
             # openai-agents is multi-model like pi (a live SDK probe completed a
             # Claude tool-calling turn over the chat wire), so it accepts the
@@ -176,9 +191,23 @@ class TestModelFamilyMismatch:
             ("claude-native", "databricks-gpt-5-4", "only runs Claude models"),
             ("native-claude", "gpt-5.4", "only runs Claude models"),
             ("claude-sdk", "databricks-meta-llama-3.3-70b-instruct", "only runs Claude models"),
-            ("codex-native", "databricks-claude-sonnet-4-6", "only runs GPT models"),
-            ("native-codex", "claude-opus-4-8", "only runs GPT models"),
-            ("codex", "databricks-meta-llama-3.3-70b-instruct", "only runs GPT models"),
+            # GLM / Kimi are codex-runnable but not Claude-runnable.
+            ("claude-native", "databricks-glm-5-2", "only runs Claude models"),
+            ("claude-sdk", "system.ai.glm-5-2", "only runs Claude models"),
+            ("claude-sdk", "databricks-kimi-k2-6", "only runs Claude models"),
+            (
+                "codex-native",
+                "databricks-claude-sonnet-4-6",
+                "only runs codex-compatible models",
+            ),
+            ("native-codex", "claude-opus-4-8", "only runs codex-compatible models"),
+            (
+                "codex",
+                "databricks-meta-llama-3.3-70b-instruct",
+                "only runs codex-compatible models",
+            ),
+            # A segment merely containing the letters is not the GLM family.
+            ("codex", "glmqlfit-eval", "only runs codex-compatible models"),
             # antigravity is Gemini-native: syntactically valid non-Gemini ids
             # must fail loud at the dispatch gate rather than be persisted as
             # model_override and land in HARNESS_ANTIGRAVITY_MODEL only to fail
@@ -226,19 +255,25 @@ class TestModelFamilyMismatch:
         ("claude-sonnet-4-6", "databricks-claude-sonnet-4-6"),
         ("gpt-5-4", "databricks-gpt-5-4"),
         ("gpt-5.4-mini", "databricks-gpt-5.4-mini"),
+        # The codex-compatible families localize the same way: they are
+        # dispatchable, so a caller can name a bare one, and leaving them out
+        # persisted the bare id verbatim onto a gateway-backed child.
+        ("glm-5-2", "databricks-glm-5-2"),
+        ("kimi-k2.6", "databricks-kimi-k2.6"),
         # Already gateway-local: no double prefix.
         ("databricks-claude-opus-4-8", "databricks-claude-opus-4-8"),
+        ("databricks-glm-5-2", "databricks-glm-5-2"),
         # Non-mechanical shapes pass through to the fail-loud path:
         # vendor-prefixed, slash-routed, alias-bracketed, other-family.
         ("us.anthropic.claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-6"),
         ("openai/gpt-4o", "openai/gpt-4o"),
         ("claude-opus-4-8[1m]", "claude-opus-4-8[1m]"),
-        ("kimi-k2.6", "kimi-k2.6"),
+        ("meta-llama-3.3-70b-instruct", "meta-llama-3.3-70b-instruct"),
     ],
 )
 def test_normalize_localizes_canonical_ids_for_gateway_children(model: str, expected: str) -> None:
     """
-    A Databricks-gateway child localizes bare canonical claude/gpt ids.
+    A Databricks-gateway child localizes bare canonical vendor ids.
 
     A missed prefix means the child spawns on an id the gateway cannot
     route; a wrongly-added prefix on a non-mechanical shape would

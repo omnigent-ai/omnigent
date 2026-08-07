@@ -44,7 +44,6 @@ interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
-  canSubmit?: boolean;
 }
 
 /**
@@ -83,12 +82,7 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({
-  questions,
-  onSubmit,
-  onReject,
-  canSubmit = true,
-}: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -226,12 +220,12 @@ export function AskUserQuestionForm({
 
   return (
     <div className="flex flex-col gap-2 text-foreground" data-testid="ask-user-question-form">
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
         <span data-testid="ask-user-question-progress">
           Question {currentIndex + 1} of {questions.length}:
         </span>
         {current.header && (
-          <span className="text-muted-foreground text-xs rounded bg-muted px-1.5 py-0.5">
+          <span className="text-muted-foreground text-sm rounded bg-muted px-1.5 py-0.5">
             {current.header}
           </span>
         )}
@@ -242,7 +236,7 @@ export function AskUserQuestionForm({
         className="flex flex-col gap-2 mb-2"
         data-testid="ask-user-question-section"
       >
-        <legend className="text-foreground text-sm font-medium flex items-center gap-2 mb-2">
+        <legend className="text-foreground text-ui font-medium flex items-center gap-2 mb-2">
           {current.question}
         </legend>
         <div className="flex flex-col gap-2">
@@ -255,7 +249,7 @@ export function AskUserQuestionForm({
                 <label
                   key={opt.label}
                   htmlFor={inputId}
-                  className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                  className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
                 >
                   <input
                     type="checkbox"
@@ -267,7 +261,7 @@ export function AskUserQuestionForm({
                   <span className="flex flex-col">
                     <span>{opt.label}</span>
                     {opt.description && (
-                      <span className="text-muted-foreground text-xs">{opt.description}</span>
+                      <span className="text-muted-foreground text-sm">{opt.description}</span>
                     )}
                   </span>
                 </label>
@@ -279,7 +273,7 @@ export function AskUserQuestionForm({
               <label
                 key={opt.label}
                 htmlFor={inputId}
-                className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
               >
                 <input
                   type="radio"
@@ -292,7 +286,7 @@ export function AskUserQuestionForm({
                 <span className="flex flex-col">
                   <span>{opt.label}</span>
                   {opt.description && (
-                    <span className="text-muted-foreground text-xs">{opt.description}</span>
+                    <span className="text-muted-foreground text-sm">{opt.description}</span>
                   )}
                 </span>
               </label>
@@ -304,7 +298,7 @@ export function AskUserQuestionForm({
               same way. */}
           <label
             htmlFor={customRowId}
-            className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+            className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
           >
             <input
               type={current.multiSelect ? "checkbox" : "radio"}
@@ -329,7 +323,7 @@ export function AskUserQuestionForm({
               value={customRowValue}
               onChange={(e) => handleCustomInput(currentKey, e)}
               data-testid="ask-user-question-custom-input"
-              className="field-sizing-content flex-1 resize-none bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none"
+              className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
             />
           </label>
         </div>
@@ -338,7 +332,7 @@ export function AskUserQuestionForm({
             {previewsToShow.map((opt) => (
               <pre
                 key={opt.label}
-                className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap"
+                className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap"
               >
                 {opt.preview}
               </pre>
@@ -373,7 +367,7 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             onClick={handleSubmit}
-            disabled={!allAnswered || !canSubmit}
+            disabled={!allAnswered}
             data-testid="ask-user-question-submit"
           >
             <CheckIcon className="mr-1 size-3.5" />

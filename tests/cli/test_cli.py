@@ -135,7 +135,7 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
 
     assert "Usage: python -m omnigent [OPTIONS] COMMAND [ARGS]..." in result.stdout
     assert "Commands:" in result.stdout
-    assert "run" in result.stdout and "Attach the REPL to a LIVE session" in result.stdout
+    assert "run" in result.stdout and "Attach the REPL to a live session" in result.stdout
     assert "Omnigent quick chat" not in result.stdout
 
 
@@ -950,6 +950,71 @@ def test_kiro_command_is_registered_in_click_help() -> None:
     assert result.exit_code == 0, result.output
     assert "kiro" in _CLICK_SUBCOMMANDS
     assert "kiro" in result.output
+
+
+def test_help_groups_harnesses_and_other_commands() -> None:
+    """``--help`` lists a ``Harnesses`` section separate from ``Commands``."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Harnesses:" in result.output
+    assert "Commands:" in result.output
+    # A harness launcher lands under Harnesses; a management command
+    # lands under Commands (both after their respective headings).
+    harnesses_at = result.output.index("Harnesses:")
+    commands_at = result.output.index("Commands:", harnesses_at)
+    assert harnesses_at < result.output.index("claude") < commands_at
+    assert commands_at < result.output.index("server")
+
+
+def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
+    """The ``update`` alias is omitted from --help but stays registered."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "upgrade" in result.output
+    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
+    assert "\n  update " not in result.output
+    # ...but it's still a real, invokable command.
+    assert cli.commands["update"] is cli.commands["upgrade"]
+
+
+def test_help_hides_extras_gated_harness_when_sdk_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor/antigravity drop out of the harness list; a notice replaces them."""
+    monkeypatch.setattr(
+        "omnigent.cli._harness_extra_checks",
+        lambda: {"cursor": lambda: False, "antigravity": lambda: False},
+    )
+
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    # Not listed as launchable harnesses...
+    assert "Launch Cursor with Omnigent" not in result.output
+    assert "Launch Antigravity" not in result.output
+    # ...but a generic notice points at setup instead.
+    assert "Some harnesses need an optional extra" in result.output
+    # Still a real, registered command — only the listing is suppressed.
+    assert "cursor" in _CLICK_SUBCOMMANDS
+
+
+def test_help_shows_extras_gated_harness_when_sdk_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor/antigravity appear in --help once their extra is importable."""
+    monkeypatch.setattr(
+        "omnigent.cli._harness_extra_checks",
+        lambda: {"cursor": lambda: True, "antigravity": lambda: True},
+    )
+
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "cursor" in result.output
+    assert "antigravity" in result.output
+    assert "Some harnesses need an optional extra" not in result.output
 
 
 def test_kiro_command_parses_native_options_and_prompt(
@@ -3037,6 +3102,85 @@ def test_run_from_openclaw_forwards_server(
 
     assert result.exit_code == 0, result.output
     assert run_chat.call_args.kwargs["server_url"] == "https://example.com"
+
+
+def _capture_profile_env_at_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, str | None]:
+    """Patch ``run``'s collaborators and capture ``DATABRICKS_CONFIG_PROFILE``.
+
+    Returns a dict whose ``"value"`` key is set to the env var as seen at
+    ``_dispatch_run`` time — i.e. after ``run`` applies ``--profile``.
+    """
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+
+    def _fake_dispatch(**_: object) -> None:
+        seen["value"] = os.environ.get("DATABRICKS_CONFIG_PROFILE")
+
+    monkeypatch.setattr("omnigent.cli._dispatch_run", _fake_dispatch)
+    return seen
+
+
+def test_run_profile_sets_databricks_config_profile_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--profile`` exports ``DATABRICKS_CONFIG_PROFILE`` for the auth chain.
+
+    The remote-auth paths (``_remote_headers`` / ``_server_auth`` /
+    ``_DatabricksTokenAuth``) resolve credentials through the Databricks SDK's
+    env-based profile selection, so ``run`` must set the env var before
+    dispatch for a headless service-principal ``--server`` login to resolve.
+    """
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://example.com", "--profile", "my-sp", "-p", "hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["value"] == "my-sp"
+
+
+def test_run_profile_wins_over_preset_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``--profile`` overrides an ambient ``DATABRICKS_CONFIG_PROFILE``.
+
+    A CLI flag is a stronger signal of intent than an inherited env var; the
+    flag must not be a silent no-op when the env var is already set.
+    """
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "preset")
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://example.com", "--profile", "my-sp", "-p", "hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["value"] == "my-sp"
+
+
+def test_run_without_profile_leaves_preset_env_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``--profile`` preserves an ambient ``DATABRICKS_CONFIG_PROFILE``.
+
+    Users who export the env var themselves keep working without the flag.
+    """
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "preset")
+    seen = _capture_profile_env_at_dispatch(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://example.com", "-p", "hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["value"] == "preset"
 
 
 def test_materialize_harness_launcher_file_kimi_gets_os_env() -> None:
@@ -5453,12 +5597,12 @@ def test_native_terminal_dispatch_specs_cover_registered_native_agents() -> None
         (
             "claude-native",
             "omnigent.claude_native.run_claude_native",
-            {"extra_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model"), "prompt": None},
         ),
         (
             "codex-native",
             "omnigent.codex_native.run_codex_native",
-            {"extra_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model", "prompt": None},
         ),
         (
             "pi-native",
@@ -5623,6 +5767,34 @@ def test_dispatch_native_terminal_harness_kiro_forwards_prompt(
 
     assert handled is True
     assert captured["prompt"] == "review repo"
+
+
+@pytest.mark.parametrize(
+    ("harness", "target"),
+    [
+        ("claude-native", "omnigent.claude_native.run_claude_native"),
+        ("codex-native", "omnigent.codex_native.run_codex_native"),
+    ],
+)
+def test_dispatch_native_terminal_harness_forwards_prompt_to_claude_and_codex(
+    monkeypatch: pytest.MonkeyPatch, harness: str, target: str
+) -> None:
+    """``run --harness claude-native -p`` is supported, not rejected.
+
+    Both wrappers deliver the text as the TUI's initial input, so a prompt is
+    no longer a REPL-only option for them. A multi-line prompt must arrive as
+    one value — the wrappers put it on argv rather than pasting it.
+    """
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(target, lambda **kwargs: captured.update(kwargs))
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(harness=harness, prompt="first line\nsecond line")
+    )
+
+    assert handled is True
+    assert captured["prompt"] == "first line\nsecond line"
 
 
 @pytest.mark.parametrize(
@@ -6028,7 +6200,7 @@ def test_manage_kimi_harness_not_installed_shows_hint_returns(
 
     Kimi is curl-installed (no npm ``package``), so the drill-in can't
     auto-install it — it must surface the install_hint and bail without
-    touching login / logout.
+    touching login.
     """
     import omnigent.onboarding.harness_install as hi
     import omnigent.onboarding.interactive as it
@@ -6037,16 +6209,13 @@ def test_manage_kimi_harness_not_installed_shows_hint_returns(
     console = Mock()
     monkeypatch.setattr(it, "console", console)
     login = Mock()
-    logout = Mock()
     monkeypatch.setattr(hi, "harness_login", login)
-    monkeypatch.setattr(hi, "harness_logout", logout)
     # If the drill-in wrongly reached the menu loop, this select would drive it.
     monkeypatch.setattr(it, "select", lambda *a, **k: 0)
 
     _manage_kimi_harness()
 
     login.assert_not_called()
-    logout.assert_not_called()
     # The curl install command was surfaced to the user.
     printed = " ".join(str(c.args[0]) for c in console.print.call_args_list if c.args)
     assert "code.kimi.com/kimi-code/install.sh" in printed
@@ -6062,16 +6231,44 @@ def test_manage_kimi_harness_back_does_not_login(
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
     login = Mock()
-    logout = Mock()
     monkeypatch.setattr(hi, "harness_login", login)
-    monkeypatch.setattr(hi, "harness_logout", logout)
-    # rows = [Sign in, Sign out, Show auth options, ← Back]; pick Back (3).
-    monkeypatch.setattr(it, "select", lambda *a, **k: 3)
+    # rows = [Sign in, Show auth options, ← Back]; pick Back (2). There is no
+    # "Sign out" row — kimi has no ``kimi logout`` subcommand.
+    monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
     _manage_kimi_harness()
 
     login.assert_not_called()
-    logout.assert_not_called()
+
+
+def test_manage_kimi_harness_has_no_sign_out_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Kimi drill-in offers no sign-out — kimi has no ``kimi logout``.
+
+    Capture the menu labels passed to ``select`` and assert none mention a
+    logout/sign-out action, so a regression re-adding the broken row is caught.
+    """
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(it, "console", Mock())
+    monkeypatch.setattr(hi, "harness_login", Mock())
+    captured: list[str] = []
+
+    def _select(_title: str, labels: list[str], *a, **k) -> int:
+        captured.extend(labels)
+        return len(labels) - 1  # pick "← Back" to exit
+
+    monkeypatch.setattr(it, "select", _select)
+
+    _manage_kimi_harness()
+
+    joined = " ".join(captured).lower()
+    assert "sign out" not in joined
+    assert "logout" not in joined
+    assert any("sign in" in label.lower() for label in captured)
 
 
 def test_manage_kimi_harness_login_runs_kimi_login(
@@ -6084,14 +6281,11 @@ def test_manage_kimi_harness_login_runs_kimi_login(
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
     login = Mock(return_value=False)  # kimi has no status probe; return is ignored
-    logout = Mock()
     monkeypatch.setattr(hi, "harness_login", login)
-    monkeypatch.setattr(hi, "harness_logout", logout)
-    # First iteration: Sign in (0); second: ← Back (3) to exit the loop.
-    choices = iter([0, 3])
+    # First iteration: Sign in (0); second: ← Back (2) to exit the loop.
+    choices = iter([0, 2])
     monkeypatch.setattr(it, "select", lambda *a, **k: next(choices))
 
     _manage_kimi_harness()
 
     login.assert_called_once_with(hi.KIMI_KEY)
-    logout.assert_not_called()

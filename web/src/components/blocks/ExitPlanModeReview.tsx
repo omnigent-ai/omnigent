@@ -33,8 +33,6 @@ interface ExitPlanModeReviewProps {
   onAccept: () => void;
   /** Reject; `feedback` is the user's typed revision guidance (`""` when none). */
   onReject: (feedback: string) => void;
-  /** Whether this viewer may approve the plan. */
-  canApprove?: boolean;
 }
 
 export function ExitPlanModeReview({
@@ -42,7 +40,6 @@ export function ExitPlanModeReview({
   onAcceptAuto,
   onAccept,
   onReject,
-  canApprove = true,
 }: ExitPlanModeReviewProps) {
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
@@ -54,7 +51,7 @@ export function ExitPlanModeReview({
           escaping AlertDescription's muted default (which otherwise washes
           the whole plan out). The short lead-in caption above stays muted
           for hierarchy, matching the Codex command card. */}
-      <div className="text-sm text-foreground">
+      <div className="text-ui text-foreground">
         <MessageResponse>{plan}</MessageResponse>
       </div>
       {rejecting ? (
@@ -64,7 +61,7 @@ export function ExitPlanModeReview({
             placeholder="What should change about the plan? (optional)"
             value={feedback}
             onChange={(e) => setFeedback(e.target.value)}
-            className="min-h-20 text-sm"
+            className="min-h-20 text-ui"
           />
           <div className="flex flex-wrap gap-2">
             <Button size="sm" onClick={() => onReject(feedback)}>
@@ -78,11 +75,11 @@ export function ExitPlanModeReview({
         </div>
       ) : (
         <div className="flex flex-wrap gap-2 pt-1">
-          <Button size="sm" onClick={onAcceptAuto} disabled={!canApprove}>
+          <Button size="sm" onClick={onAcceptAuto}>
             <ZapIcon className="mr-1 size-3.5" />
             Yes, and use auto mode
           </Button>
-          <Button size="sm" variant="outline" onClick={onAccept} disabled={!canApprove}>
+          <Button size="sm" variant="outline" onClick={onAccept}>
             <CheckIcon className="mr-1 size-3.5" />
             Yes, manually approve edits
           </Button>

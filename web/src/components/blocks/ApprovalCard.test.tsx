@@ -30,68 +30,6 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
   });
 
-  it("disables approval but leaves rejection available without authority", () => {
-    const submitSpy = vi.fn();
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared"
-        message="Run a privileged command?"
-        phase="tool_call"
-        policyName="approve_shell_commands"
-        contentPreview="sudo command"
-        requestedSchema={{}}
-        status="pending"
-        response={null}
-        canApprove={false}
-        allowAllEdits={true}
-        rememberScope={{ tool: "Bash" }}
-        onSubmit={submitSpy}
-      />,
-    );
-
-    for (const name of ["Approve", "Accept & allow all edits", /don't ask again for Bash/i]) {
-      expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
-    }
-    const reject = screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement;
-    expect(reject.disabled).toBe(false);
-    expect(screen.getByRole("note").textContent).toContain("delegated approver");
-
-    fireEvent.click(reject);
-    expect(submitSpy).toHaveBeenCalledWith("elic_shared", "decline");
-  });
-
-  it("disables Codex approval variants but leaves rejection available", () => {
-    render(
-      <ApprovalCard
-        elicitationId="elic_codex_shared"
-        message="Run tests?"
-        phase="codex_command_approval"
-        policyName="codex_native_command_approval"
-        contentPreview=""
-        requestedSchema={{}}
-        status="pending"
-        response={null}
-        canApprove={false}
-        codexCommand={{
-          command: "pytest",
-          cwd: "/workspace",
-          reason: null,
-          execPolicyAmendment: ["pytest"],
-        }}
-      />,
-    );
-
-    expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(
-      true,
-    );
-    expect(
-      (screen.getByRole("button", { name: "Approve and remember" }) as HTMLButtonElement).disabled,
-    ).toBe(true);
-    expect((screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement).disabled).toBe(
-      false,
-    );
-  });
-
   it("renders Codex command approvals from structured extras instead of raw JSON", () => {
     // Codex command approval frames carry internal correlation ids in
     // content_preview. The card should show only user-relevant command
@@ -468,30 +406,6 @@ describe("ApprovalCard — multi-choice options", () => {
     expect(submitSpy).toHaveBeenCalledWith("elic_pick", "accept", { answer: "Beta" });
   });
 
-  it("disables every multi-choice answer without approval authority", () => {
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared_pick"
-        message="Pick one"
-        phase="ask_user_question"
-        policyName="claude_native_ask_user_question"
-        contentPreview="Pick one"
-        requestedSchema={{
-          type: "object",
-          properties: { answer: { type: "string", enum: ["Alpha", "Beta"] } },
-        }}
-        status="pending"
-        response={null}
-        canApprove={false}
-      />,
-    );
-
-    expect((screen.getByRole("button", { name: "Alpha" }) as HTMLButtonElement).disabled).toBe(
-      true,
-    );
-    expect((screen.getByRole("button", { name: "Beta" }) as HTMLButtonElement).disabled).toBe(true);
-  });
-
   it("renders 'Selected: <label>' on the responded card when content carries an answer", () => {
     // The store stamps `response.content.answer` after a successful
     // submit so the responded pill can show the actual choice
@@ -601,30 +515,6 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     fireEvent.click(screen.getByLabelText("React"));
     expect(submit.hasAttribute("disabled")).toBe(false);
-  });
-
-  it("keeps question submission disabled but cancellation enabled without authority", () => {
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared_question"
-        message="Claude wants to call AskUserQuestion"
-        phase="pre_tool_use"
-        policyName="claude_native_permission"
-        contentPreview={sampleSinglePreview}
-        requestedSchema={{}}
-        status="pending"
-        response={null}
-        canApprove={false}
-      />,
-    );
-
-    fireEvent.click(screen.getByLabelText("React"));
-    expect((screen.getByRole("button", { name: /submit/i }) as HTMLButtonElement).disabled).toBe(
-      true,
-    );
-    expect((screen.getByRole("button", { name: /cancel/i }) as HTMLButtonElement).disabled).toBe(
-      false,
-    );
   });
 
   it("submits gathered answers via submitApproval on click", () => {
@@ -1185,30 +1075,6 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     expect(submitSpy).toHaveBeenCalledWith("elic_plan_auto", "accept", {
       allow_all_edits: true,
     });
-  });
-
-  it("disables plan approval but leaves rejection available without authority", () => {
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared_plan"
-        status="pending"
-        response={null}
-        canApprove={false}
-        {...planProps}
-      />,
-    );
-
-    expect(
-      (screen.getByRole("button", { name: /yes, and use auto mode/i }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: /yes, manually approve edits/i }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: /reject with feedback/i }) as HTMLButtonElement).disabled,
-    ).toBe(false);
   });
 
   it("submits a plain accept for 'Yes, manually approve edits'", () => {

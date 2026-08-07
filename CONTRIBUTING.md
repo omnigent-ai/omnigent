@@ -6,6 +6,53 @@ welcome. For larger changes, open an issue first so we can discuss the approach.
 Please don't include secrets, internal URLs, customer data, or private
 configuration in issues, tests, examples, or logs.
 
+## Issue prioritization
+
+We rank open community issues so maintainers see the most important work first.
+The ranking is a triage aid, not a delivery promise or roadmap commitment.
+
+An LLM reads the issue title, body, and labels and classifies its type, severity,
+and affected areas. It does not assign the final priority directly. Priority
+comes from deterministic arithmetic:
+
+```text
+score = severity points × component weight + community-demand points
+```
+
+| Signal | Current treatment |
+| --- | --- |
+| Severity | S0=100, S1=60, S2=30, S3=10. It captures impact and reach. |
+| Component | The highest matching area weight, currently 0.9–1.4. |
+| Community demand | GitHub `+1` reactions add up to 15 points, capped at 12 reactions. |
+| Needs information | An issue labeled `needs-info` scores zero until the missing information arrives. |
+
+Scores map to priority labels as follows:
+
+| Priority | Score |
+| --- | ---: |
+| `P0-critical` | 100 or higher |
+| `P1-high` | 60–99.99 |
+| `P2-medium` | 25–59.99 |
+| `P3-low` | Below 25 |
+
+Age, readiness, and duplicate-count adjustments are not currently enabled.
+Component importance is a separate signal, so severity is not raised merely
+because an issue affects a particular harness or subsystem.
+
+Maintainers can correct severity, component, or priority labels when context is
+missing from the model. Automation preserves those overrides and does not
+replace a maintainer-set priority with its own proposal. The queue is rerun as
+issues change, while unchanged LLM classifications are reused.
+
+For bugs, include the observed impact, reproduction steps, Omnigent version,
+platform, and affected harness or authentication mode. For feature requests,
+describe the user problem and expected reach. Use a `+1` reaction when an
+existing issue matters to you; ordinary comments are not counted as votes.
+
+The scoring configuration and component map are public in
+[`default_scoring.json`](.github/triage_v2/src/issue_prioritization/default_scoring.json)
+and [`areas.json`](.github/areas.json).
+
 ## Development setup
 
 This is a Python package with an optional frontend under `web/`. Use
@@ -44,16 +91,25 @@ source .venv/bin/activate    # or prefix commands with `uv run`
 
 Common checks:
 
+Pyrefly is the canonical Python type checker for the repository.
+
 ```bash
 uv run pytest                      # Python tests (e2e/live skipped by default)
 uv run ruff check . && uv run ruff format --check .
+uv run --no-sync pyrefly check     # Python type checking (core and client SDK)
 uv run pre-commit run --all-files
 ```
 
 When touching `web/`:
 
 ```bash
-cd web && pnpm install && pnpm run lint && pnpm run build
+cd web && pnpm install && pnpm run lint && pnpm run type-check && pnpm run build
+```
+
+When touching `editors/vscode/`:
+
+```bash
+cd editors/vscode && pnpm install && pnpm run type-check && pnpm run test && pnpm run build
 ```
 
 ## Running locally
@@ -249,7 +305,81 @@ request enforces this, so unsigned commits will block merging.
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
 - Sign off your commits with `git commit -s` (see
   [Developer Certificate of Origin](#developer-certificate-of-origin) above).
+- **Reference an issue** (see below).
 - Fill in the PR template. For **UI / frontend changes**, check the
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
+
+### Every PR needs an issue
+
+We require an issue for every pull request. Issues are how work gets
+prioritized, so a PR without one arrives unsorted and waits longer.
+
+Reference it in the description. Which keyword you use depends on whether the PR
+finishes the issue:
+
+| Your PR | Write | Effect |
+| --- | --- | --- |
+| Finishes the issue | `Closes #123` (or `Fixes` / `Resolves`) | GitHub links the PR and closes the issue on merge |
+| Is one step towards it | `Part of #123` (or `Related to` / `Towards` / `Refs`) | The issue stays open |
+
+`Closes` is preferred when it applies, because GitHub records a real link and
+closes the issue for you. For a partial change, do not claim `Closes`: use one of
+the second-row keywords instead, so the issue is not closed before the work is
+done. You can also link a closing issue from the **Development** section of the
+sidebar, which counts the same as a `Closes` keyword.
+
+A bare `#123` is not enough on its own. It creates a cross-reference rather than
+saying anything about this PR, so pair it with one of the keywords above. The
+reference also has to point at an **issue**: naming another pull request does not
+count, since a PR is not a tracking record.
+
+**No issue for your change yet?** Open one first, then reference it. That is also
+the faster path for anything non-trivial: it lets a maintainer confirm the
+approach before you write code.
+
+The only exceptions are changes with no user-visible behaviour: pure
+**Refactor / chore**, **Docs**, or **Test / CI** work. If that is genuinely what
+your PR is, check that box under *Type of change* and no issue is needed.
+Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
+even when it also touches docs or tests.
+
+A bot comments once on PRs that reference no issue. It never closes anything.
+
+### Review state labels
+
+Two labels track whose turn it is. Both are managed by automation, so you do not
+need to apply them.
+
+| Label | Meaning |
+| --- | --- |
+| `waiting-on-author` | A maintainer has left feedback. The PR is in your court. |
+| `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
+
+A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
+you push a commit, comment, or reply to a review, that clears automatically and
+`waiting-for-review` goes on instead, which also re-pings your reviewer. You do
+not need to ask for a re-review.
+
+A PR left in `waiting-on-author` for **7 days** with no reply or new commit is
+closed to keep the review queue readable. That is not a judgement on the change,
+and it is reversible: comment `/reopen` (see below).
+
+**As of 5 August 2026** maintainers follow this process for new pull requests.
+PRs opened before then are being worked through separately, so an older PR may
+not carry these labels yet; that does not mean it has been forgotten. The
+issue-link rule also applies only to PRs opened on or after that date, so you
+will not be asked to retrofit an issue onto an older PR.
+
+### Reopening a closed PR
+
+If automation closed your PR (as a duplicate, for example) and you think that
+was wrong, comment `/reopen` on it and a bot will reopen it for you. GitHub only
+lets maintainers press the Reopen button, so this command is how you do it
+yourself. You can also use it on a PR you closed by hand.
+
+Only the PR author can use it, and it won't override a maintainer who closed
+your PR deliberately; ask them in a comment instead. It also needs your source
+branch to still exist. If you deleted it, push it again and open a fresh PR
+linking the old one.

@@ -24,14 +24,14 @@ export type DictationEvent =
   | { type: "stopped"; text: string }
   | { type: "error"; message: string };
 
-export type DictationSessionEvents = {
+export interface DictationSessionEvents {
   /** Revisable in-progress utterance (server-throttled to ~6 Hz). */
   onPartial: (text: string) => void;
   /** An utterance completed by a pause; append it and clear the partial. */
   onFinal: (text: string) => void;
   /** Fatal error after start. The session has already cleaned itself up. */
   onError: (message: string) => void;
-};
+}
 
 /**
  * The server was reachable but at its concurrent-take cap (WS close 1013).

@@ -102,7 +102,10 @@ class SessionUpdatesSocket {
     this.ws = null;
     if (ws) {
       // Drop handlers first so the close doesn't schedule a reconnect.
-      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
       ws.close();
     }
     this.setConnected(false);
@@ -261,3 +264,46 @@ class SessionUpdatesSocket {
 
 /** Shared transport instance for the current tab. */
 export const sessionUpdatesSocket = new SessionUpdatesSocket();
+
+/**
+ * Resolve with the first pushed session row matching `match`.
+ *
+ * The server announces a session on this stream as soon as its row is
+ * written — well before a `POST /v1/sessions` that waits on a host runner
+ * launch answers with the same id. A caller that knows what it just asked
+ * for can use this to learn its own session's id early and open the chat
+ * without waiting for the create.
+ *
+ * The stream carries EVERY session that becomes visible to this user —
+ * created in another tab, started by a scheduled task, or just shared with
+ * them — and restates rows already on screen on each snapshot. So `match`
+ * must identify one specific expected session; "anything new" would hand
+ * back somebody else's.
+ *
+ * @param match - Predicate over each row of a snapshot/changed frame.
+ * @param signal - Stops listening when aborted, resolving `null` so the
+ *   caller can fall back to its own result.
+ * @returns The first matching row, or `null` if aborted before one arrived.
+ */
+export function nextPushedSession(
+  match: (item: SessionListWireItem) => boolean,
+  signal: AbortSignal,
+): Promise<SessionListWireItem | null> {
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let unsubscribe = () => {};
+    const onAbort = () => {
+      unsubscribe();
+      resolve(null);
+    };
+    unsubscribe = sessionUpdatesSocket.subscribe((frame) => {
+      if (frame.type !== "snapshot" && frame.type !== "changed") return;
+      const found = frame.items.find(match);
+      if (found === undefined) return;
+      unsubscribe();
+      signal.removeEventListener("abort", onAbort);
+      resolve(found);
+    });
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}

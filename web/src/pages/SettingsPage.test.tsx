@@ -3,9 +3,9 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import { type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -93,7 +93,15 @@ vi.mock("@/hooks/useConversations", async () => {
     // Picker options are sourced from this dedicated scan, decoupled from the
     // loaded rows so archived-only projects on later pages still appear.
     useArchivedProjectNames: () => ({ data: mocks.projectNames }),
-    useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
+    // Mirrors react-query's mutate: per-call `onSuccess` runs once the
+    // mutation settles, which is what drives the post-unarchive navigation.
+    useArchiveConversation: () => ({
+      mutate: (vars: { id: string; archived: boolean }, opts?: { onSuccess?: () => void }) => {
+        mocks.archiveMutate(vars, opts);
+        opts?.onSuccess?.();
+      },
+      isPending: false,
+    }),
     useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
   };
 });
@@ -164,11 +172,17 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   };
 }
 
+/** Exposes the router location so navigation assertions read the real URL. */
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
+}
+
 function renderPage(path = "/settings") {
   return render(
     <TooltipProvider>
       <MemoryRouter initialEntries={[path]}>
         <SettingsPage />
+        <LocationProbe />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -191,11 +205,10 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
-  // Reset the font-size preference + applied scale so the Appearance tests
-  // don't leak persisted state or the --ui-font-scale variable into each other.
+  // Reset the font-size preference + applied desktop size so the Appearance
+  // tests don't leak state into each other.
   localStorage.clear();
-  document.documentElement.style.removeProperty("--ui-font-scale");
-  document.documentElement.style.removeProperty("--sidebar-font-size");
+  document.documentElement.style.removeProperty("--desktop-ui-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -368,28 +381,29 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
-    // No stored preference → 16px default.
-    expect(input.value).toBe("16");
+    // No stored preference → 13px default.
+    expect(input.value).toBe("13");
+    expect(screen.getByTestId("ui-font-size-inc").querySelector("svg")).toHaveClass("ui-icon");
 
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    expect(input.value).toBe("17");
+    expect(input.value).toBe("14");
     // The choice is persisted so it survives a refresh.
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("17");
-    // The scale is applied live to the document root (17 / 16).
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.0625");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("14");
+    // The discrete desktop size is applied live to the document root.
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
   });
 
   it("disables the steppers at the min and max bounds", () => {
-    localStorage.setItem("omnigent:ui-font-size", "20");
+    localStorage.setItem("omnigent:ui-font-size", "18");
     renderPage("/settings/appearance");
-    // At the 20px max, only the increase button is disabled.
+    // At the 18px max, only the increase button is disabled.
     expect(screen.getByTestId("ui-font-size-inc")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-dec")).not.toBeDisabled();
 
     cleanup();
-    localStorage.setItem("omnigent:ui-font-size", "12");
+    localStorage.setItem("omnigent:ui-font-size", "11");
     renderPage("/settings/appearance");
-    // At the 12px min, only the decrease button is disabled.
+    // At the 11px min, only the decrease button is disabled.
     expect(screen.getByTestId("ui-font-size-dec")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
   });
@@ -459,7 +473,7 @@ describe("SettingsPage", () => {
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
 
     // Open the confirmation dialog and confirm the reset.
@@ -470,11 +484,11 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("system");
 
     // Fonts are back to their defaults.
-    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("16");
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
@@ -501,19 +515,18 @@ describe("SettingsPage", () => {
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
     expect(input.value).toBe("13");
 
-    // Deleting a digit leaves "1" — below the 12px min. The box must SHOW "1"
-    // (free editing) without snapping to 12 or persisting the transient value.
+    // Deleting a digit leaves "1" — below the 11px min. The box must SHOW "1"
+    // (free editing) without snapping to 11 or persisting the transient value.
     fireEvent.change(input, { target: { value: "1" } });
     expect(input.value).toBe("1");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("13");
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
 
     // Finishing the number to a valid size applies it live and persists it.
     fireEvent.change(input, { target: { value: "18" } });
     expect(input.value).toBe("18");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
-    // 18 / 16 base = 1.125.
-    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.125");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
   });
 
   it("clamps a below-min entry to the minimum on blur", () => {
@@ -524,8 +537,8 @@ describe("SettingsPage", () => {
     fireEvent.change(input, { target: { value: "1" } });
     fireEvent.blur(input);
     // On blur the draft settles to the clamped minimum.
-    expect(input.value).toBe("12");
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("12");
+    expect(input.value).toBe("11");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("11");
   });
 
   it("reverts an empty entry to the committed size on blur", () => {
@@ -545,15 +558,14 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default (code widgets read a touch smaller
-    // than the 16px chrome default).
+    // No stored preference → 13px default, matching the interface default.
     expect(input.value).toBe("13");
 
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
     expect(input.value).toBe("14");
     // Persisted under the code-font key (distinct from the chrome font's) so it
-    // survives a refresh. There's no --ui-font-scale here — the pref reaches the
-    // editor/terminal imperatively, not via a CSS variable.
+    // survives a refresh. It doesn't use --desktop-ui-font-size — the pref
+    // reaches the editor/terminal imperatively, not via a CSS variable.
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("14");
   });
 
@@ -794,7 +806,12 @@ describe("SettingsPage", () => {
     expect(within(rows[0]).getByText("Old chat")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("unarchive-conversation"));
-    expect(mocks.archiveMutate).toHaveBeenCalledWith({ id: "conv_archived", archived: false });
+    expect(mocks.archiveMutate.mock.calls[0][0]).toEqual({
+      id: "conv_archived",
+      archived: false,
+    });
+    // Unarchiving opens the restored session (the mock mutate runs onSuccess).
+    expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
   });
 
   it("deletes an archived session after confirming, with no row-click navigation", () => {

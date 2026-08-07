@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from typing import cast
 
 from sqlalchemy import and_, delete, or_, update
+from sqlalchemy.engine import CursorResult
 
 from omnigent.db.db_models import SqlDeviceGrant, current_workspace_id
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
-from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
 from omnigent.entities import DeviceGrant
 
 
@@ -83,7 +85,10 @@ class DeviceGrantStore:
     def __init__(self, storage_location: str) -> None:
         self.storage_location = storage_location
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.device_grant_store",
+        )
 
     def create_grant(
         self,
@@ -111,7 +116,7 @@ class DeviceGrantStore:
         :param expires_at: Unix epoch seconds the device_code expires.
         :returns: The created :class:`DeviceGrant`.
         """
-        with self._session() as session:
+        with self._session("insert_device_grant") as session:
             row = SqlDeviceGrant(
                 id=grant_id,
                 device_code_hash=device_code_hash,
@@ -136,7 +141,7 @@ class DeviceGrantStore:
         Used by the browser consent page to show the initiating client
         before the identity approves. Returns ``None`` if unknown.
         """
-        with self._session() as session:
+        with self._session("select_device_grant_by_user_code") as session:
             row = (
                 session.query(SqlDeviceGrant)
                 .filter(
@@ -149,7 +154,7 @@ class DeviceGrantStore:
 
     def get_by_id(self, grant_id: str) -> DeviceGrant | None:
         """Look up a grant by its id."""
-        with self._session() as session:
+        with self._session("select_device_grant_by_id") as session:
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
             return _to_device_grant(row) if row is not None else None
 
@@ -160,7 +165,7 @@ class DeviceGrantStore:
         its ``refresh_token_hash`` cleared to ``NULL``, so a revoked
         token never resolves here. Returns ``None`` if unknown.
         """
-        with self._session() as session:
+        with self._session("select_device_grant_by_refresh_hash") as session:
             row = (
                 session.query(SqlDeviceGrant)
                 .filter(
@@ -195,22 +200,25 @@ class DeviceGrantStore:
         Returns the approved grant, or ``None`` if it was not pending
         (unknown, already decided, or expired).
         """
-        with self._session() as session:
-            result = session.execute(
-                update(SqlDeviceGrant)
-                .where(
-                    and_(
-                        SqlDeviceGrant.workspace_id == current_workspace_id(),
-                        SqlDeviceGrant.id == grant_id,
-                        SqlDeviceGrant.status == encode_device_grant_status("pending"),
-                        SqlDeviceGrant.expires_at > now_epoch_seconds,
+        with self._session("approve_device_grant") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        and_(
+                            SqlDeviceGrant.workspace_id == current_workspace_id(),
+                            SqlDeviceGrant.id == grant_id,
+                            SqlDeviceGrant.status == encode_device_grant_status("pending"),
+                            SqlDeviceGrant.expires_at > now_epoch_seconds,
+                        )
                     )
-                )
-                .values(
-                    status=encode_device_grant_status("approved"),
-                    user_id=user_id,
-                    approved_at=now_epoch_seconds,
-                )
+                    .values(
+                        status=encode_device_grant_status("approved"),
+                        user_id=user_id,
+                        approved_at=now_epoch_seconds,
+                    )
+                ),
             )
             if result.rowcount == 0:
                 return None
@@ -219,17 +227,20 @@ class DeviceGrantStore:
 
     def deny(self, grant_id: str) -> bool:
         """Mark a ``pending`` grant ``denied``. Returns True if it flipped."""
-        with self._session() as session:
-            result = session.execute(
-                update(SqlDeviceGrant)
-                .where(
-                    and_(
-                        SqlDeviceGrant.workspace_id == current_workspace_id(),
-                        SqlDeviceGrant.id == grant_id,
-                        SqlDeviceGrant.status == encode_device_grant_status("pending"),
+        with self._session("deny_device_grant") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        and_(
+                            SqlDeviceGrant.workspace_id == current_workspace_id(),
+                            SqlDeviceGrant.id == grant_id,
+                            SqlDeviceGrant.status == encode_device_grant_status("pending"),
+                        )
                     )
-                )
-                .values(status=encode_device_grant_status("denied"))
+                    .values(status=encode_device_grant_status("denied"))
+                ),
             )
             return result.rowcount == 1
 
@@ -253,7 +264,7 @@ class DeviceGrantStore:
             ``"pending"``, ``"denied"``, ``"approved"``, ``"revoked"``,
             ``"redeemed"``. ``grant`` is the row when found.
         """
-        with self._session() as session:
+        with self._session("poll_device_grant") as session:
             row = (
                 session.query(SqlDeviceGrant)
                 .filter(
@@ -301,21 +312,24 @@ class DeviceGrantStore:
         Returns the redeemed grant, or ``None`` if it was not in the
         ``approved`` state (already redeemed, expired, revoked, …).
         """
-        with self._session() as session:
-            result = session.execute(
-                update(SqlDeviceGrant)
-                .where(
-                    and_(
-                        SqlDeviceGrant.workspace_id == current_workspace_id(),
-                        SqlDeviceGrant.id == grant_id,
-                        SqlDeviceGrant.status == encode_device_grant_status("approved"),
-                        SqlDeviceGrant.expires_at > now_epoch_seconds,
+        with self._session("redeem_device_grant") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        and_(
+                            SqlDeviceGrant.workspace_id == current_workspace_id(),
+                            SqlDeviceGrant.id == grant_id,
+                            SqlDeviceGrant.status == encode_device_grant_status("approved"),
+                            SqlDeviceGrant.expires_at > now_epoch_seconds,
+                        )
                     )
-                )
-                .values(
-                    status=encode_device_grant_status("redeemed"),
-                    refresh_token_hash=refresh_token_hash,
-                )
+                    .values(
+                        status=encode_device_grant_status("redeemed"),
+                        refresh_token_hash=refresh_token_hash,
+                    )
+                ),
             )
             if result.rowcount == 0:
                 return None
@@ -357,19 +371,22 @@ class DeviceGrantStore:
         stale/mismatched/expired token.
         """
         min_approved_at = now_epoch_seconds - max_lifetime_seconds
-        with self._session() as session:
-            result = session.execute(
-                update(SqlDeviceGrant)
-                .where(
-                    and_(
-                        SqlDeviceGrant.workspace_id == current_workspace_id(),
-                        SqlDeviceGrant.id == grant_id,
-                        SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
-                        SqlDeviceGrant.refresh_token_hash == expected_hash,
-                        SqlDeviceGrant.approved_at > min_approved_at,
+        with self._session("rotate_refresh_token") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        and_(
+                            SqlDeviceGrant.workspace_id == current_workspace_id(),
+                            SqlDeviceGrant.id == grant_id,
+                            SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                            SqlDeviceGrant.refresh_token_hash == expected_hash,
+                            SqlDeviceGrant.approved_at > min_approved_at,
+                        )
                     )
-                )
-                .values(refresh_token_hash=new_hash, prev_refresh_token_hash=expected_hash)
+                    .values(refresh_token_hash=new_hash, prev_refresh_token_hash=expected_hash)
+                ),
             )
             if result.rowcount == 0:
                 return None
@@ -385,7 +402,7 @@ class DeviceGrantStore:
         the grant. Only matches ``redeemed`` (live) grants; a revoked
         grant clears both hashes. Returns ``None`` if unknown.
         """
-        with self._session() as session:
+        with self._session("select_device_grant_by_previous_refresh_hash") as session:
             row = (
                 session.query(SqlDeviceGrant)
                 .filter(
@@ -405,21 +422,24 @@ class DeviceGrantStore:
         ``/oauth/revoke`` and reuse-detection. Access tokens carrying
         this ``grant_id`` are rejected via the revocation denylist.
         """
-        with self._session() as session:
-            result = session.execute(
-                update(SqlDeviceGrant)
-                .where(
-                    and_(
-                        SqlDeviceGrant.workspace_id == current_workspace_id(),
-                        SqlDeviceGrant.id == grant_id,
-                        SqlDeviceGrant.status != encode_device_grant_status("revoked"),
+        with self._session("revoke_device_grant") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        and_(
+                            SqlDeviceGrant.workspace_id == current_workspace_id(),
+                            SqlDeviceGrant.id == grant_id,
+                            SqlDeviceGrant.status != encode_device_grant_status("revoked"),
+                        )
                     )
-                )
-                .values(
-                    status=encode_device_grant_status("revoked"),
-                    refresh_token_hash=None,
-                    prev_refresh_token_hash=None,
-                )
+                    .values(
+                        status=encode_device_grant_status("revoked"),
+                        refresh_token_hash=None,
+                        prev_refresh_token_hash=None,
+                    )
+                ),
             )
             return result.rowcount == 1
 
@@ -431,7 +451,7 @@ class DeviceGrantStore:
         Consulted by the auth layer's revocation check for delegated
         access tokens.
         """
-        with self._session() as session:
+        with self._session("select_device_grant_revocation_status") as session:
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
             if row is None:
                 return True
@@ -479,13 +499,16 @@ class DeviceGrantStore:
                     SqlDeviceGrant.approved_at <= cutoff,
                 )
             )
-        with self._session() as session:
-            result = session.execute(
-                delete(SqlDeviceGrant).where(
-                    and_(
-                        SqlDeviceGrant.workspace_id == current_workspace_id(),
-                        or_(*conds),
+        with self._session("purge_expired_device_grants") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlDeviceGrant).where(
+                        and_(
+                            SqlDeviceGrant.workspace_id == current_workspace_id(),
+                            or_(*conds),
+                        )
                     )
-                )
+                ),
             )
             return result.rowcount

@@ -17,10 +17,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -45,13 +46,15 @@ from .sandbox import (
     set_temp_env,
     with_additional_write_roots,
 )
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from .egress import EgressProxyHandle
+    from .egress.proxy import EgressProxy
 from .sandbox import (
     run_launcher as _run_launcher,
 )
-
-# Any JSON-shaped leaf — used for the encode/decode serializer helpers that
-# mirror the pattern in ``omnigent/sandbox.py`` and ``omnigent/uc_tools.py``.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 # Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
 # corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines
@@ -70,6 +73,10 @@ OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
 EditEntry: TypeAlias = dict[str, str]
+
+
+class _PopenKwargs(TypedDict, total=False):
+    pass_fds: tuple[int, ...]
 
 
 # Environment variables every helper subprocess inherits unconditionally.
@@ -300,6 +307,7 @@ class OSEnvironment(ABC):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -374,15 +382,15 @@ class _HelperProcessClient:
         # ``_stop_locked`` to tear down the helper's process tree.
         self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
-        self._egress_proxy: Any | None = None  # EgressProxy when active
-        self._egress_loop: Any | None = None  # asyncio event loop for proxy
+        self._egress_proxy: EgressProxy | None = None
+        self._egress_loop: asyncio.AbstractEventLoop | None = None
         self._egress_thread: threading.Thread | None = None
         # Controller handle for unified start/stop. The legacy
         # ``_egress_proxy`` / ``_egress_loop`` / ``_egress_thread``
         # mirrors are kept for back-compat with any tooling that
         # introspects them, but the lifecycle is driven through
         # the handle when present.
-        self._egress_handle: Any | None = None  # EgressProxyHandle
+        self._egress_handle: EgressProxyHandle | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -573,7 +581,7 @@ class _HelperProcessClient:
         # in the child, which is why we can pass it as a plain ``--config-fd``
         # argv arg. On Windows the config came via ``--config-file`` instead,
         # so there is no fd to inherit.
-        popen_kwargs: dict[str, Any] = {}
+        popen_kwargs: _PopenKwargs = {}
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:

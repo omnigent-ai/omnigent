@@ -21,7 +21,7 @@ module importable for testing / tooling without a live database.
 Configuration is via environment variables:
 
   DATABASE_URL          Required. SQLAlchemy URL. Both PaaS-style URLs
-                        (``postgresql://user:pw@host:5432/db``,
+                        (``postgresql://<user>:<password>@host:5432/db``,
                         ``postgres://...``) and the explicit psycopg3
                         form (``postgresql+psycopg://...``) are accepted;
                         the prefix is normalized automatically.
@@ -188,7 +188,11 @@ def _resolve_config() -> _ResolvedConfig:
     # kill-switch path gets the marker: an EXPLICIT
     # OMNIGENT_AUTH_PROVIDER=header deploy declared a header-injecting
     # proxy and must stay strict.
-    from omnigent.server.auth import env_var_is_truthy
+    from omnigent.server.auth import (
+        env_var_is_truthy,
+        resolve_auth_source,
+        warn_if_single_user_exposed,
+    )
 
     # Compose passes OMNIGENT_AUTH_PROVIDER as "" when unset
     # ("${VAR:-}"): empty and missing both mean "not explicitly pinned".
@@ -202,8 +206,6 @@ def _resolve_config() -> _ResolvedConfig:
     # compose up` deploy works with zero config. Gate on the *resolved*
     # selection so an explicit header/oidc deploy (or AUTH_ENABLED=0)
     # doesn't mint accounts secrets it never reads.
-    from omnigent.server.auth import resolve_auth_source
-
     if resolve_auth_source() == "accounts":
         from omnigent.server.accounts_secret import load_or_generate_cookie_secret
 
@@ -220,6 +222,11 @@ def _resolve_config() -> _ResolvedConfig:
             os.environ["OMNIGENT_ACCOUNTS_BASE_URL"] = detect_base_url(
                 os.environ, host=host, port=port
             )
+
+    # Logged, not printed: container stderr is buried in a platform log viewer.
+    _exposure = warn_if_single_user_exposed(host)
+    if _exposure:
+        logger.warning("%s", _exposure)
 
     return _ResolvedConfig(
         cfg=cfg,
@@ -273,6 +280,30 @@ def _build_local_llm_routing_client(
     return LLMRoutingClient(policy_client)
 
 
+def _build_routing(
+    cfg: dict[str, Any],
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> tuple[Any, Any]:  # type: ignore[explicit-any]  # (RoutingClient | None, RoutingSettings)
+    """Build the routing client and settings from the ``routing:`` block.
+
+    Reuses the CLI's parser and builder so a Docker deployment honours the
+    same ``routing.*`` keys (router name, selection model, model prefixes) a
+    local server does.
+
+    :param cfg: The parsed server config mapping.
+    :param server_llm: The parsed server-level ``LLMConfig``, used for the
+        built-in judge when no external router is configured.
+    :returns: ``(routing_client, routing_settings)`` for ``RuntimeCaps``.
+    """
+    from omnigent.cli import _build_external_routing_client, parse_routing_settings
+
+    routing_cfg = cfg.get("routing")
+    settings = parse_routing_settings(routing_cfg)
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        return _build_external_routing_client(routing_cfg, settings), settings
+    return _build_local_llm_routing_client(server_llm), settings
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -309,6 +340,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -323,6 +355,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
+    project_store = SqlAlchemyProjectStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -338,47 +371,13 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    routing_cfg = cfg.get("routing")
-    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
-        from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
-
-        base_url = (routing_cfg.get("base_url") or "").strip()
-        router_name = (routing_cfg.get("router_name") or "").strip()
-        api_key_raw = (routing_cfg.get("api_key") or "").strip()
-        profile = (routing_cfg.get("profile") or "").strip()
-        raw_prefixes = routing_cfg.get("model_prefix")
-        if isinstance(raw_prefixes, str):
-            raw_prefixes = [raw_prefixes]
-        model_prefixes = (
-            [p.strip() for p in raw_prefixes if isinstance(p, str) and p.strip()]
-            if isinstance(raw_prefixes, list)
-            else []
-        )
-        if base_url and router_name:
-            auth = None
-            databricks_profile: str | None = None
-            if api_key_raw:
-                from omnigent.spec import expand_env_vars
-
-                auth = _bearer_auth(expand_env_vars({"api_key": api_key_raw})["api_key"])
-            elif profile:
-                databricks_profile = profile
-            routing_client = ExternalRoutingClient(
-                base_url=base_url,
-                router_name=router_name,
-                auth=auth,
-                databricks_profile=databricks_profile,
-                model_prefixes=model_prefixes,
-            )
-        else:
-            routing_client = None
-    else:
-        routing_client = _build_local_llm_routing_client(server_llm)
+    routing_client, routing_settings = _build_routing(cfg, server_llm)
 
     caps = RuntimeCaps(
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
+        routing_settings=routing_settings,
     )
 
     init_runtime(
@@ -419,6 +418,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         policy_store=policy_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
+        project_store=project_store,
         auth_provider=auth_provider,
         account_store=account_store,
         # Non-secret auth settings from the config file (admins are the

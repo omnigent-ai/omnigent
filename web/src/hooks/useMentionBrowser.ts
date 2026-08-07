@@ -1,6 +1,6 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
-import { type MentionItem, type MentionState } from "@/lib/composerMentions";
+import type { MentionItem, MentionState } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, Route, expect
 
 from omnigent.claude_native import ClaudeNativeUcodeConfig, claude_native_model_options
+from tests.e2e_ui.conftest import seed_committed_turn
 
 _EXPECTED_ROWS = [
     ("opus", "Opus 4.10"),
@@ -425,6 +426,187 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
     expect(rows.first).to_have_attribute("data-model-id", default_model)
     expect(rows.first).to_have_attribute("data-active", "true")
     _screenshot(page, "unpinned-gateway-picker")
+
+
+_CODEX_MODEL_ID = "gpt-5.5"
+_CODEX_MODEL_LABEL = "Codex Pretty 5.5"
+_CODEX_MODEL_OPTIONS = [
+    {
+        "id": _CODEX_MODEL_ID,
+        "model": "databricks-gpt-5-5",
+        "displayName": _CODEX_MODEL_LABEL,
+        "isDefault": True,
+    }
+]
+_CLAUDE_LLM_MODEL = "system.ai.claude-sonnet-5"
+# Long enough that the stale-label window is unmissable, short enough to keep
+# the test quick. Only the switch back to the Claude session is delayed.
+_SNAPSHOT_DELAY_MS = 2_000
+
+# Records every distinct composer model label the page ever paints, tagged with
+# the session route it was painted under. A transient wrong label is invisible
+# to `expect()` (which retries until it passes), so the assertion runs against
+# this log rather than a point-in-time read.
+_LABEL_RECORDER = """
+(() => {
+  window.__modelLabelLog = [];
+  const record = () => {
+    const el = document.querySelector('[data-testid="composer-model-effort-label"]');
+    const entry = { path: location.pathname, text: el ? el.textContent.trim() : "" };
+    const log = window.__modelLabelLog;
+    const last = log[log.length - 1];
+    if (!last || last.path !== entry.path || last.text !== entry.text) log.push(entry);
+  };
+  new MutationObserver(record).observe(document, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+  });
+})()
+"""
+
+# Holds the incoming session's snapshot GET so the pre-bind window — where the
+# store has dropped the outgoing session's model fields but not yet hydrated the
+# incoming one's — lasts long enough to observe. Armed via `__delaySnapshot`
+# right before the switch so the first visit stays fast.
+_SNAPSHOT_DELAY = """
+(() => {
+  const sessionId = __SESSION_ID__;
+  const delayMs = __DELAY_MS__;
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (
+      window.__delaySnapshot &&
+      new URL(url, window.location.origin).pathname === `/v1/sessions/${sessionId}`
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return originalFetch(input, init);
+  };
+})()
+"""
+
+
+def _patch_native_session_pair(page: Page, codex_session_id: str, claude_session_id: str) -> None:
+    """Patch two session snapshots at once: one codex-native, one claude-native.
+
+    The sibling single-session helpers each own a ``**/v1/sessions/**`` route
+    and ``continue_()`` past the ids they don't serve, so two of them can't be
+    composed (the first matching handler wins and goes straight to the
+    network). This serves both ids from one handler instead.
+
+    :param page: Playwright page before navigation.
+    :param codex_session_id: Session id to shape as codex-native, pinned to
+        ``gpt-5.5`` via ``model_override`` so binding it leaves that model as
+        the cross-session sticky pick.
+    :param claude_session_id: Session id to shape as claude-native, bound to
+        Sonnet 5 with no override of its own.
+    """
+
+    def _handle(route: Route) -> None:
+        request = route.request
+        path = urlparse(request.url).path
+        if request.method != "GET" or path not in (
+            f"/v1/sessions/{codex_session_id}",
+            f"/v1/sessions/{claude_session_id}",
+        ):
+            route.continue_()
+            return
+
+        response = route.fetch()
+        payload = response.json()
+        if path == f"/v1/sessions/{codex_session_id}":
+            wrapper, harness = "codex-native-ui", "codex"
+            payload["llm_model"] = _CODEX_MODEL_ID
+            payload["model_override"] = _CODEX_MODEL_ID
+            payload["model_options"] = _CODEX_MODEL_OPTIONS
+        else:
+            wrapper, harness = "claude-code-native-ui", "claude"
+            payload["llm_model"] = _CLAUDE_LLM_MODEL
+            payload["model_options"] = _MODEL_OPTIONS
+        payload["labels"] = {**payload.get("labels", {}), "omnigent.wrapper": wrapper}
+        payload["harness"] = harness
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    page.route("**/v1/sessions/**", _handle)
+
+
+def test_composer_model_label_never_shows_the_previous_sessions_model(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Switching Codex → Claude must not paint Codex's model on the way in.
+
+    Failure mode this catches: ``switchTo`` clears the session-scoped model
+    fields (``sessionModelOverride`` / ``llmModel`` / ``codexModelOptions``) but
+    deliberately keeps ``selectedModel``, the cross-session sticky pick. The
+    native picker kind flips to Claude immediately (the session query and the
+    sidebar row are already cached), so for the whole snapshot round trip the
+    composer resolves the sticky and reads ``gpt-5.5`` on a Claude session
+    before correcting itself to Sonnet 5.
+
+    :param page: Playwright page fixture.
+    :param seeded_session_pair: ``(base_url, codex_session, claude_session)``
+        for two real server-backed sessions; both snapshots are patched into
+        native shapes as seen by the browser.
+    """
+    base_url, codex_session, claude_session = seeded_session_pair
+    # Both sessions need a committed transcript: the store caches (and repaints
+    # from) only non-empty ones, and an empty session falls back to the hydrate
+    # placeholder, which hides the composer instead of painting a stale label.
+    for session_id in (codex_session, claude_session):
+        seed_committed_turn(session_id, prompt="ping", reply="pong")
+    _patch_native_session_pair(page, codex_session, claude_session)
+    page.add_init_script(_LABEL_RECORDER)
+    page.add_init_script(
+        _SNAPSHOT_DELAY.replace("__SESSION_ID__", json.dumps(claude_session)).replace(
+            "__DELAY_MS__", str(_SNAPSHOT_DELAY_MS)
+        )
+    )
+
+    label = page.get_by_test_id("composer-model-effort-label")
+
+    # Visit the Claude session first so the return trip is the real-world
+    # switch-back: its snapshot query and transcript are cached, so the
+    # composer stays mounted (no hydrate placeholder) and paints through the
+    # window instead of being replaced by a spinner.
+    page.goto(f"{base_url}/c/{claude_session}")
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
+
+    # Open the Codex session — binding it makes gpt-5.5 the sticky pick.
+    page.locator(f'a[href="/c/{codex_session}"]').click()
+    page.wait_for_url(re.compile(rf"/c/{re.escape(codex_session)}"))
+    expect(label).to_contain_text(_CODEX_MODEL_LABEL, timeout=15_000)
+
+    # Switch back to Claude with its snapshot held, and watch every label the
+    # composer paints under the Claude route.
+    page.evaluate("window.__delaySnapshot = true")
+    page.evaluate("window.__modelLabelLog = []")
+    page.locator(f'a[href="/c/{claude_session}"]').click()
+    page.wait_for_url(re.compile(rf"/c/{re.escape(claude_session)}"))
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
+
+    log = page.evaluate("window.__modelLabelLog")
+    claude_labels = [e["text"] for e in log if e["path"] == f"/c/{claude_session}"]
+    # Guard against a no-op run: the held snapshot must have produced at least
+    # one pre-bind paint before the settled Sonnet 5 label.
+    assert len(claude_labels) > 1, (
+        f"the delayed-bind window was never observed (labels: {claude_labels}); "
+        "the snapshot delay did not take effect, so this run proves nothing"
+    )
+    leaked = [
+        text for text in claude_labels if _CODEX_MODEL_ID in text or _CODEX_MODEL_LABEL in text
+    ]
+    assert not leaked, (
+        f"the Codex session's model leaked into the Claude session's composer: {leaked} "
+        f"(full label sequence under the Claude route: {claude_labels}). The composer must "
+        "never surface another session's sticky model while the snapshot is in flight."
+    )
 
 
 def test_claude_native_picker_prefers_session_override_over_sticky_model(

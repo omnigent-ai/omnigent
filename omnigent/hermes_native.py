@@ -24,7 +24,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
@@ -43,6 +42,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -201,7 +201,7 @@ def _materialize_hermes_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "hermes-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Hermes is running in the session terminal. The user drives the hermes TUI directly."
@@ -404,7 +404,7 @@ async def _create_hermes_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first hermes-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -424,7 +424,7 @@ async def _create_hermes_session(
     return new_session_id
 
 
-async def _fetch_hermes_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_hermes_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

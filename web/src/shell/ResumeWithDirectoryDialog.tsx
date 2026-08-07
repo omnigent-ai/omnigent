@@ -45,7 +45,7 @@ function HostLabel({ host }: { host: Host }) {
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-xs">{host.name}</span>
+      <span className="font-mono text-sm">{host.name}</span>
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
@@ -267,12 +267,12 @@ export function ResumeWithDirectoryDialog({
         </DialogHeader>
 
         {sourceLoading || !hostsLoaded ? (
-          <p className="text-xs text-muted-foreground" data-testid="resume-dir-loading">
+          <p className="text-sm text-muted-foreground" data-testid="resume-dir-loading">
             Loading the original session's directory…
           </p>
         ) : showCliFallback ? (
           <div className="flex flex-col gap-2" data-testid="resume-dir-cli-fallback">
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               The original session's host is offline, so there's nothing to launch a runner on.
               Reconnect it from your terminal — then send your message again to pick a directory.
             </p>
@@ -293,9 +293,9 @@ export function ResumeWithDirectoryDialog({
         ) : (
           <>
             <div className="flex flex-col gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Host</span>
+              <span className="text-sm font-medium text-muted-foreground">Host</span>
               <Select value={selectedHostId ?? ""} onValueChange={(v) => setSelectedHostId(v)}>
-                <SelectTrigger className="w-full text-xs" data-testid="resume-dir-host-select">
+                <SelectTrigger className="w-full text-sm" data-testid="resume-dir-host-select">
                   <SelectValue placeholder="Select a host" />
                 </SelectTrigger>
                 <SelectContent>
@@ -313,7 +313,7 @@ export function ResumeWithDirectoryDialog({
             </div>
 
             <div className="flex flex-col gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Working directory</span>
+              <span className="text-sm font-medium text-muted-foreground">Working directory</span>
               {selectedHostId ? (
                 <>
                   <WorkspacePathField
@@ -339,7 +339,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                   {showConflictHint && (
                     <p
-                      className="flex items-start gap-1.5 text-xs text-warning"
+                      className="flex items-start gap-1.5 text-sm text-warning"
                       data-testid="resume-dir-conflict-hint"
                     >
                       <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -354,7 +354,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                   {showMismatchWarning && (
                     <p
-                      className="flex items-start gap-1.5 text-xs text-warning"
+                      className="flex items-start gap-1.5 text-sm text-warning"
                       data-testid="resume-dir-mismatch-warning"
                     >
                       <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -366,7 +366,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                 </>
               ) : (
-                <p className="text-xs text-muted-foreground">
+                <p className="text-sm text-muted-foreground">
                   Select a host to choose a directory.
                 </p>
               )}
@@ -375,7 +375,7 @@ export function ResumeWithDirectoryDialog({
             <div className="flex flex-col gap-1">
               <label
                 htmlFor="resume-dir-branch"
-                className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+                className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
               >
                 <GitBranchIcon className="size-3.5" />
                 Git worktree (optional)
@@ -387,7 +387,7 @@ export function ResumeWithDirectoryDialog({
                 onChange={(e) => setBranchName(e.target.value)}
                 placeholder="feature/my-branch"
                 data-testid="resume-dir-branch-input"
-                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
               />
               {branchName.trim() !== "" && (
                 <input
@@ -398,10 +398,10 @@ export function ResumeWithDirectoryDialog({
                   placeholder="Base branch (defaults to the current branch)"
                   aria-label="Base branch"
                   data-testid="resume-dir-base-branch-input"
-                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
                 />
               )}
-              <p className="text-xs text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Creates a git worktree for a new branch in an isolated directory — keeps the clone
                 from fighting the original over the same files. Leave blank to start in the picked
                 directory.
@@ -409,7 +409,7 @@ export function ResumeWithDirectoryDialog({
             </div>
 
             {error !== null && (
-              <p className="text-xs text-destructive" data-testid="resume-dir-error">
+              <p className="text-sm text-destructive" data-testid="resume-dir-error">
                 {error}
               </p>
             )}

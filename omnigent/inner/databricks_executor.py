@@ -18,9 +18,10 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
 
@@ -229,6 +230,77 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
     return None
 
 
+def databricks_bearer_token_command(
+    host: str,
+    profile: str | None = None,
+    fallback_command: str | None = None,
+) -> str:
+    """Build the shell command a harness runs to mint a workspace bearer token.
+
+    The one definition of the generated helper, so the claude and codex
+    harnesses cannot drift apart on which profile they authenticate as or how
+    they handle a refresh failure.
+
+    **Profile selection.** ``--profile`` when the caller names one, ``--host``
+    only as the fallback. Two profiles can share a host, and ``databricks auth
+    token --host`` then fails ("Use --profile to specify which profile") →
+    empty token → 401. Host lookup is also how a pane and the server end up
+    authenticating as *different* profiles for the same workspace, one of them
+    re-authed and the other not.
+
+    **Refresh.** ``--force-refresh`` is attempted first: it renews a still-valid
+    cached token, which is what keeps a long gateway session from hitting a
+    mid-session 401. But it *fails* when the refresh token itself has gone
+    stale, and unconditionally forcing turned a perfectly usable cached access
+    token into a hard auth failure. So the forced attempt is speculative — its
+    output is captured and its stderr dropped — and an empty result falls back
+    to plain ``auth token``, which serves the cached token and renews it only
+    when it is near expiry. The fallback keeps its stderr so a genuine auth
+    failure is still visible. ``--force-refresh`` only exists in Databricks CLI
+    >= v0.296.0, so it stays behind the ``--help`` capability probe.
+
+    **Fallback command.** The named profile is the identity we *want*, but the
+    user may have authenticated under a different profile on the same host — a
+    config naming a credential-less profile would otherwise 401 every turn.
+    When the caller knows a token command that already worked (the one ucode
+    recorded, say), it runs last, once the named profile has yielded nothing.
+
+    :param host: Databricks workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``, or
+        ``None`` to select the workspace by host.
+    :param fallback_command: Shell command printing a bearer token on stdout,
+        run only when the profile above yields an empty token.
+    :returns: Shell command that prints a bearer token on stdout.
+    """
+    selector = (
+        f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
+    )
+    mint = f"env -u DATABRICKS_CONFIG_PROFILE databricks auth token {selector}"
+    fallback = (
+        # ``eval`` on a quoted string: the recorded command is opaque shell,
+        # and inlining it bare would let its own quoting reshape this script.
+        f'if [ -z "$token" ]; then token=$(eval {shlex.quote(fallback_command)}); fi; '
+        if fallback_command
+        else ""
+    )
+    return (
+        # An injected bearer wins: the runner already resolved one.
+        'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
+        'printf "%s\\n" "$DATABRICKS_BEARER"; '
+        "else token=''; "
+        "if databricks auth token --help 2>&1 | grep -q force-refresh; then "
+        f"token=$({mint} --force-refresh --output json 2>/dev/null "
+        "| jq -r '.access_token // empty'); "
+        "fi; "
+        'if [ -z "$token" ]; then '
+        f"token=$({mint} --output json | jq -r '.access_token // empty'); "
+        "fi; "
+        f"{fallback}"
+        'printf "%s\\n" "$token"; fi'
+    )
+
+
 def _read_databrickscfg_host(profile: str | None = None) -> str | None:
     """
     Read only the workspace host from the Databricks config file.
@@ -320,6 +392,11 @@ class DatabricksAuthError(OSError):
     """
 
 
+class _DatabricksAuthConfig(Protocol):
+    def authenticate(self) -> dict[str, str]:
+        raise NotImplementedError
+
+
 class _DatabricksBearerAuth(httpx.Auth):
     """httpx Auth that calls ``Config.authenticate()`` on every HTTP request.
 
@@ -340,7 +417,7 @@ class _DatabricksBearerAuth(httpx.Auth):
 
     def __init__(
         self,
-        config: Any,  # type: ignore[explicit-any]
+        config: _DatabricksAuthConfig,
         profile_name: str | None = None,
         failure_message: str | None = None,
     ) -> None:
@@ -785,7 +862,7 @@ def _convert_messages(
     return result
 
 
-def _extract_stream_text_delta(content: Any) -> str:
+def _extract_stream_text_delta(content: object) -> str:
     """
     Extract assistant-visible text from a Chat Completions stream delta.
 

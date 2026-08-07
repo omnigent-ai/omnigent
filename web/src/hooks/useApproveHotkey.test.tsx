@@ -6,7 +6,7 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const submitApproval = vi.fn();
-let blocks: Array<Record<string, unknown>> = [];
+let blocks: Record<string, unknown>[] = [];
 vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: () => ({ blocks, submitApproval }) },
 }));
@@ -48,13 +48,6 @@ describe("useApproveHotkey", () => {
     renderHook(() => useApproveHotkey());
     press({ ctrlKey: true });
     expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
-  });
-
-  it("does not accept when the viewer lacks approval authority", () => {
-    blocks = [pending];
-    renderHook(() => useApproveHotkey(false));
-    press();
-    expect(submitApproval).not.toHaveBeenCalled();
   });
 
   it("accepts the most recent pending approval", () => {

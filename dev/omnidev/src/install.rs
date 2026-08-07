@@ -14,7 +14,7 @@ use crate::paths;
 pub const DEFAULT_REPO: &str = "https://github.com/omnigent-ai/omnigent.git";
 pub const DEFAULT_REF: &str = "main";
 pub const DEFAULT_EXTRA: &str = "databricks";
-const PYTHON_VERSION: &str = "3.12";
+pub const PYTHON_VERSION: &str = "3.12";
 
 /// Durable record of how the user wants omnigent installed. Persisted so
 /// `update` reinstalls the same repo/ref/extras without re-specifying them.

@@ -278,7 +278,7 @@ jobs:
           # low-quota gpt-5-4 model, so sustained 429s don't masquerade as
           # flakes (mirrors e2e.yml).
           OMNIGENT_TEST_MODEL_SPREAD: "1"
-          OMNIGENT_TEST_MODEL_POOL_GPT: "databricks-gpt-5-5,databricks-gpt-5-4-mini"
+          OMNIGENT_TEST_MODEL_POOL_GPT: ${{ vars.OMNIGENT_CI_E2E_MODEL_POOL_GPT }}
         run: |
           mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
           # --junitxml emits per-test results eagerly so diagnostics survive a

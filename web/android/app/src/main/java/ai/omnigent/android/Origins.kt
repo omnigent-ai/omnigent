@@ -37,6 +37,24 @@ fun isHttpScheme(scheme: String?): Boolean {
 }
 
 /**
+ * Server domains whose IdP permits embedded user-agents. Their login redirect
+ * chain runs inside the WebView and the server sets the session cookie on its
+ * own domain, so no system-browser hop is needed.
+ */
+private val IN_WEBVIEW_AUTH_DOMAINS =
+    listOf("databricks.com", "azuredatabricks.net", "databricksapps.com")
+
+/**
+ * True when [origin]'s host is, or sits under, a domain that authenticates in
+ * the WebView. Matches on a dot boundary so a lookalike host like
+ * `databricks.com.example.org` does not qualify.
+ */
+fun usesInWebViewAuth(origin: String?): Boolean {
+    val host = origin?.let(Uri::parse)?.host?.lowercase() ?: return false
+    return IN_WEBVIEW_AUTH_DOMAINS.any { host == it || host.endsWith(".$it") }
+}
+
+/**
  * Normalize user-entered server text into a loadable URL, or null if it isn't a
  * usable http(s) address. Adds a default `https://` scheme when omitted and
  * trims a trailing slash.

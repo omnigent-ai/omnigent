@@ -17,9 +17,15 @@ import {
 } from "lucide-react";
 import { useMemo } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
+import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
+import {
+  type RoutingDecisionExtras,
+  harnessDisplayLabel,
+  subagentScopeLabel,
+} from "@/lib/routingDecision";
 import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
@@ -92,7 +98,7 @@ export function RetryIndicator({
   delaySeconds,
 }: RetryIndicatorProps) {
   return (
-    <div className="flex items-center gap-2 text-muted-foreground text-xs">
+    <div className="flex items-center gap-2 text-muted-foreground text-sm">
       <RotateCcwIcon className="size-3" />
       <span>
         Retrying {source} · attempt {attempt}/{maxAttempts}
@@ -110,45 +116,36 @@ export function RetryIndicator({
  */
 export function CompactionMarker() {
   return (
-    <div className="flex items-center gap-2 text-muted-foreground text-xs italic">
+    <div className="flex items-center gap-2 text-muted-foreground text-sm italic">
       <ShrinkIcon className="size-3" />
       <span>Conversation compacted</span>
     </div>
   );
 }
 
-interface RoutingDecisionChipProps {
-  model: string;
-  applied: boolean;
-  rationale: string;
+/**
+ * Short raw-pick name when the router's own vocabulary pick differs from the
+ * model actually applied (an unservable arm mapped to a servable id), else
+ * `null` — the common case where both names collapse to the same tier.
+ */
+function rawPickName(model: string, rawModel: string | null | undefined): string | null {
+  if (!rawModel) return null;
+  const raw = shortModelName(rawModel);
+  return raw === shortModelName(model) ? null : raw;
 }
 
 /**
- * Muted inline chip announcing the intelligent model router's pick at
- * the start of a turn.
+ * Short name of the model the spawn asked for, when Smart Routing picked a
+ * different one. `null` when nothing was attempted or both names collapse to
+ * the same tier — a struck-through name identical to the pill reads as a bug.
  */
-export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisionChipProps) {
-  const short = shortModelName(model);
-  const lead = applied ? short : `would have picked ${short}`;
-  const summary = `Intelligent model router · ${lead}`;
-  return (
-    <div
-      className="my-1 flex flex-col items-center gap-0.5 text-muted-foreground text-xs"
-      data-testid="routing-decision-chip"
-      data-applied={applied ? "true" : "false"}
-      title={rationale || summary}
-    >
-      <span className="flex items-center gap-1.5">
-        <BrainCircuitIcon className="size-3 shrink-0" />
-        <span>
-          Intelligent model router{" · "}
-          {!applied && <span>would have picked </span>}
-          <span className="font-medium text-foreground">{short}</span>
-        </span>
-      </span>
-      {rationale ? <span className="text-muted-foreground/70">{rationale}</span> : null}
-    </div>
-  );
+function attemptedPickName(
+  model: string,
+  attemptedOverride: string | null | undefined,
+): string | null {
+  if (!attemptedOverride) return null;
+  const attempted = shortModelName(attemptedOverride);
+  return attempted === shortModelName(model) ? null : attempted;
 }
 
 interface RoutingDecisionCardProps {
@@ -157,10 +154,12 @@ interface RoutingDecisionCardProps {
   rationale: string;
   /** Sub-agent name when this card is shown in the parent session. */
   agent?: string;
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
 }
 
 /**
- * Collapsible card announcing the intelligent model router's session-level
+ * Collapsible card announcing smart routing's session-level
  * pick. Mirrors the SmartRoutingCard style: same container, model pill,
  * rationale, and expandable raw verdict JSON.
  *
@@ -174,12 +173,45 @@ export function RoutingDecisionCard({
   applied,
   rationale,
   agent,
+  routing,
 }: RoutingDecisionCardProps) {
+  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
   const short = shortModelName(model);
+  const rawShort = rawPickName(model, rawModel);
+  const attemptedShort = attemptedPickName(model, attemptedOverride);
+  const scopeLabel = subagentScopeLabel(scope, agent);
+  const harnessLabel = harnessDisplayLabel(harness);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
-    () => JSON.stringify({ model, applied, rationale, ...(agent ? { agent } : {}) }, null, 2),
-    [model, applied, rationale, agent],
+    () =>
+      JSON.stringify(
+        {
+          model,
+          applied,
+          rationale,
+          ...(agent ? { agent } : {}),
+          ...(harness ? { harness } : {}),
+          ...(scope ? { scope } : {}),
+          ...(decisionId ? { decision_id: decisionId } : {}),
+          ...(rawModel ? { raw_model: rawModel } : {}),
+          ...(attemptedOverride ? { attempted_override: attemptedOverride } : {}),
+          ...(routerSource ? { router_source: routerSource } : {}),
+        },
+        null,
+        2,
+      ),
+    [
+      model,
+      applied,
+      rationale,
+      agent,
+      harness,
+      scope,
+      decisionId,
+      rawModel,
+      attemptedOverride,
+      routerSource,
+    ],
   );
   return (
     <Collapsible
@@ -191,10 +223,31 @@ export function RoutingDecisionCard({
       data-testid="routing-decision-card"
       data-applied={applied ? "true" : "false"}
     >
-      <div className="flex items-center gap-1.5 text-xs">
+      <div className="flex items-center gap-1.5 text-sm">
         <BrainCircuitIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="font-medium">Intelligent routing</span>
+        <span className="font-medium">Smart routing</span>
+        {routerSource === "databricks-aigw" ? (
+          <span
+            className="text-muted-foreground"
+            title="Routed by the Databricks AI Gateway"
+            aria-label="Routed by the Databricks AI Gateway"
+            role="img"
+            data-testid="routing-decision-source-databricks"
+          >
+            <DatabricksIcon className="size-3 shrink-0" />
+          </span>
+        ) : null}
         <span className="text-muted-foreground">{applied ? "· applied" : "· advisory"}</span>
+        {harnessLabel ? (
+          <span className="text-muted-foreground" data-testid="routing-decision-harness">
+            · {harnessLabel}
+          </span>
+        ) : null}
+        {scopeLabel ? (
+          <span className="text-muted-foreground" data-testid="routing-decision-scope">
+            · {scopeLabel}
+          </span>
+        ) : null}
         <CollapsibleTrigger
           className="ml-auto cursor-pointer rounded p-0.5 text-muted-foreground hover:text-foreground"
           aria-label="Show raw routing verdict"
@@ -203,14 +256,43 @@ export function RoutingDecisionCard({
           <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
         </CollapsibleTrigger>
       </div>
-      <div className="flex items-center gap-2 text-xs">
+      <div className="flex items-center gap-2 text-sm">
         <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
-        <span className="ml-auto shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground">
+        {attemptedShort ? (
+          // The spawn named its own model and the router picked another — the
+          // substitution is the whole point of the row, so it shows at a glance.
+          <span
+            className="ml-auto shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground line-through"
+            data-testid="routing-decision-attempted-override"
+            title="The spawn asked for this model; Smart Routing picked the one on the right."
+          >
+            {attemptedShort}
+          </span>
+        ) : null}
+        {rawShort ? (
+          // Router vocabulary pick that had to be mapped to a servable id —
+          // show what the router said next to what actually ran.
+          <span
+            className={cn(
+              "shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground",
+              !attemptedShort && "ml-auto",
+            )}
+            data-testid="routing-decision-raw-model"
+          >
+            {rawShort} →
+          </span>
+        ) : null}
+        <span
+          className={cn(
+            "shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground",
+            !rawShort && !attemptedShort && "ml-auto",
+          )}
+        >
           {short}
         </span>
       </div>
       {rationale.length > 0 && (
-        <p className="text-xs leading-snug text-muted-foreground">{rationale}</p>
+        <p className="text-sm leading-snug text-muted-foreground">{rationale}</p>
       )}
       <CollapsibleContent className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         <CodeBlock code={prettyOutput} language="json">

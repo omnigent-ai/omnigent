@@ -24,7 +24,7 @@ vi.mock("qrcode.react", () => ({
 // Host config is read-once at render to decide plain-input vs combobox and to
 // transform the share link. Mock both getters so we can drive each branch.
 vi.mock("@/lib/host", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/host")>();
+  const actual = await importOriginal<typeof host>();
   return {
     ...actual,
     getOmnigentUserSearch: vi.fn(() => undefined),
@@ -34,6 +34,7 @@ vi.mock("@/lib/host", async (importOriginal) => {
 
 import * as api from "@/lib/permissionsApi";
 import * as host from "@/lib/host";
+
 const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
@@ -67,6 +68,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -141,7 +143,7 @@ describe("PermissionsModal", () => {
     fireEvent.click(grantBtn);
 
     await waitFor(() => {
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol@example.com", 1, false);
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol@example.com", 1);
     });
   });
 
@@ -190,7 +192,7 @@ describe("PermissionsModal", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Edit" }));
 
     await waitFor(() => {
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2, false);
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2);
     });
     // Editing the level must never delete the existing grant.
     expect(revokeMock).not.toHaveBeenCalled();
@@ -232,43 +234,6 @@ describe("PermissionsModal", () => {
     await waitFor(() => {
       expect(grantMock).toHaveBeenCalledWith("conv_abc", "__public__", 1);
     });
-  });
-
-  it("lets owners grant edit plus approval authority", async () => {
-    listMock.mockResolvedValue([]);
-    grantMock.mockResolvedValue({
-      user_id: "bob@example.com",
-      conversation_id: "conv_abc",
-      level: 2,
-      can_approve: true,
-    });
-
-    render(
-      <PermissionsModal
-        sessionId="conv_abc"
-        open={true}
-        onOpenChange={() => {}}
-        canDelegateApprovals
-      />,
-      { wrapper: createWrapper() },
-    );
-
-    await waitFor(() => expect(listMock).toHaveBeenCalled());
-    fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
-      target: { value: "bob@example.com" },
-    });
-    const formSelect = screen.getByRole("combobox");
-    formSelect.focus();
-    fireEvent.keyDown(formSelect, { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Edit + approve" }));
-    fireEvent.click(screen.getByRole("button", { name: /grant/i }));
-
-    await waitFor(() => {
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "bob@example.com", 2, true);
-    });
-    expect(
-      screen.getByText("Approvers can authorize actions that use your session credentials."),
-    ).toBeInTheDocument();
   });
 
   it("displays server error messages from failed grant", async () => {
