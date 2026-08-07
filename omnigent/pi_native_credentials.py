@@ -434,11 +434,27 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     selected_model = (
         model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
     )
+    # The live v2 catalog uses system.ai.* ids, while older profile defaults and
+    # explicit endpoint aliases may still use databricks-*. Normalize only when
+    # the authoritative catalog confirms the normalized id. If discovery
+    # failed, preserving the original alias lets family fallback route it to
+    # the legacy serving-endpoints surface instead of guessing incorrectly.
+    normalized_model = _model_service_id(selected_model)
+    catalog_ids = {
+        str(item.get("id"))
+        for item in (*claude_models, *gpt_models, *completions_models, *gemini_models)
+    }
+    rendered_model = (
+        normalized_model
+        if normalized_model in catalog_ids
+        or (credential_warning is not None and selected_model.startswith("databricks-claude-"))
+        else selected_model
+    )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}/ai-gateway/mlflow/v1",
         api="openai-completions",
-        model=_model_service_id(selected_model),
+        model=rendered_model,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is re-read per request (the auth command attempts a
         # refresh), matching codex-native's refresh semantics.
