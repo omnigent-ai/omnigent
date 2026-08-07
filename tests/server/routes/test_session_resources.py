@@ -5179,6 +5179,8 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
         "unconfined": True,
         "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
     }
+
+
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────
 #
 # These exercise the real routes through the real router, because the whole
