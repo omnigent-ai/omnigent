@@ -1079,7 +1079,7 @@ export function AgentHarnessPicker({
         className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
       >
         <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
-          <span className="truncate">{agent.name}</span>
+          <span className="max-w-48 shrink-0 truncate">{agent.name}</span>
           {!agent.command_found && (
             <span className="truncate text-[11px] text-muted-foreground/70">
               command not found on host
@@ -1112,7 +1112,7 @@ export function AgentHarnessPicker({
         className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
       >
         <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
-          <span className="truncate">{entry.name}</span>
+          <span className="max-w-48 shrink-0 truncate">{entry.name}</span>
           {entry.description && (
             <span className="truncate text-[11px] text-muted-foreground/70">
               {entry.description}
