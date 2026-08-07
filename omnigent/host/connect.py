@@ -1235,6 +1235,7 @@ class HostProcess:
         initial_auth_token = await asyncio.to_thread(
             self._current_auth_token,
             initialize=False,
+            allow_managed=True,
         )
         env = _build_runner_env(
             os.environ,

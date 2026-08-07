@@ -573,6 +573,7 @@ def _cleanup_host(host: HostProcess) -> None:
 
 async def test_handle_launch_spawns_subprocess(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Verify that _handle_launch spawns a subprocess with the correct
@@ -582,6 +583,9 @@ async def test_handle_launch_spawns_subprocess(
     failed or the result frame construction is wrong.
     """
     host = _make_host_process()
+    # Managed hosts still pass their ingress bearer to the runner bootstrap;
+    # delegated owner-token minting cannot cross Apps without it.
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "managed-launch-token")
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
     host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
