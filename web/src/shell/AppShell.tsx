@@ -159,6 +159,8 @@ export function AppShell() {
   const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  const [sidebarPeek, setSidebarPeek] = useState(false);
+
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
   const { width: sidebarWidth } = useResizableSidebar();
@@ -1396,8 +1398,16 @@ export function AppShell() {
             )}
             <Sidebar
               open={sidebarOpen}
+              onOpen={() => {
+                setSidebarOpen(true);
+                setSidebarPeek(false);
+              }}
+              peek={sidebarPeek}
               dragProgress={sidebarDragProgress}
-              onClose={() => setSidebarOpen(false)}
+              onClose={() => {
+                setSidebarOpen(false);
+                setSidebarPeek(false);
+              }}
               onOpenSearch={() => setCommandPaletteOpen(true)}
             />
 
@@ -1427,8 +1437,16 @@ export function AppShell() {
                 }
               >
                 <ChatHeader
-                  sidebarOpen={sidebarOpen}
-                  onOpenSidebar={() => setSidebarOpen(true)}
+                  sidebarOpen={sidebarOpen || sidebarPeek}
+                  onOpenSidebar={(peek?: boolean) => {
+                    if (peek) {
+                      setSidebarPeek(true);
+                      setSidebarOpen(false);
+                    } else {
+                      setSidebarOpen(true);
+                      setSidebarPeek(false);
+                    }
+                  }}
                   isChildSession={isChildSession}
                   parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
