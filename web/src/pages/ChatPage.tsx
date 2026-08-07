@@ -3732,37 +3732,39 @@ function AssistantBubble({
         {/* Skipped on a fold-only bubble: the actions belong to content
             the user can see, and hanging them off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. */}
-        <div className="mt-0.5 flex items-center gap-2">
-          {(() => {
-            const ts = formatBubbleTimestamp(bubble.createdAtS);
-            return ts ? (
-              <span className="select-none text-[10px] leading-none text-muted-foreground/60">
-                {ts}
-              </span>
-            ) : null;
-          })()}
-          {markdownText && !foldOnly && (
-            <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
-              <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-              </MessageAction>
-              {/* Fork from this response: clone the session with history
-                  truncated after this turn. Hidden while the response is
-                  still streaming (its items aren't committed yet) and when
-                  the session can't be forked (sub-agent / isolated mount). */}
-              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <MessageAction
-                  tooltip="Fork from here"
-                  size="icon-xxs"
-                  data-testid="fork-from-response"
-                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-                >
-                  <GitForkIcon size={14} />
+        {!foldOnly && (
+          <div className="mt-0.5 flex items-center gap-2">
+            {(() => {
+              const ts = formatBubbleTimestamp(bubble.createdAtS);
+              return ts ? (
+                <span className="select-none text-[10px] leading-none text-muted-foreground/60">
+                  {ts}
+                </span>
+              ) : null;
+            })()}
+            {markdownText && (
+              <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
+                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
-              )}
-            </MessageActions>
-          )}
-        </div>
+                {/* Fork from this response: clone the session with history
+                    truncated after this turn. Hidden while the response is
+                    still streaming (its items aren't committed yet) and when
+                    the session can't be forked (sub-agent / isolated mount). */}
+                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                  <MessageAction
+                    tooltip="Fork from here"
+                    size="icon-xxs"
+                    data-testid="fork-from-response"
+                    onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                  >
+                    <GitForkIcon size={14} />
+                  </MessageAction>
+                )}
+              </MessageActions>
+            )}
+          </div>
+        )}
       </Message>
 
       {bubble.lifecycle === "failed" && (
