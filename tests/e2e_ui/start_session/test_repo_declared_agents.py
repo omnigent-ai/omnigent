@@ -77,7 +77,7 @@ def _run_in_fresh_loop(coro) -> None:
     def _worker() -> None:
         try:
             asyncio.run(coro)
-        except Exception as exc:  # noqa: BLE001 — re-raised on the test thread
+        except Exception as exc:
             captured["error"] = exc
 
     thread = threading.Thread(target=_worker)
