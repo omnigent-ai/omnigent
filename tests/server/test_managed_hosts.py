@@ -547,6 +547,35 @@ def test_parse_openshell_without_section_defaults(
     assert fake.workspace is None
 
 
+def test_parse_valid_coda_config_builds_parameterized_factory() -> None:
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+    from omnigent.server.managed_hosts import (
+        CODA_DEFAULT_MAX_SESSIONS_PER_LEASE,
+        CODA_MANAGED_TOKEN_TTL_S,
+        CODA_MAX_LEASE_S,
+        parse_sandbox_config,
+    )
+
+    config = parse_sandbox_config(
+        {
+            "provider": "coda",
+            "server_url": "https://omnigent.example.com",
+            "coda": {
+                "app_name": "coda-main",
+                "app_url": "https://coda-main.example.com",
+            },
+        }
+    )
+
+    assert config is not None
+    assert config.provider == "coda"
+    assert config.managed_launch_supported is True
+    assert config.token_ttl_s == CODA_MANAGED_TOKEN_TTL_S
+    assert config.token_ttl_s > CODA_MAX_LEASE_S
+    assert config.max_sessions_per_lease == CODA_DEFAULT_MAX_SESSIONS_PER_LEASE
+    assert isinstance(config.launcher_factory(), CodaProvider)
+
+
 def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
