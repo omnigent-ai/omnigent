@@ -83,6 +83,25 @@ def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ambient_provider_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate host state ambient provider detection reads (issue #4279).
+
+    Two ambient sources leak past ``$OMNIGENT_CONFIG_HOME``:
+
+    - ``~/.codex/config.toml`` and ``~/.databrickscfg`` live under ``$HOME``
+      (``$USERPROFILE`` on Windows), so redirect it to an empty temp dir.
+    - On macOS ``_claude_login_detected()`` falls back to ``claude auth status``,
+      which reads the **Keychain** — no ``$HOME`` override can hide it. A
+      signed-in Mac would inject a ``subscription`` provider that outranks the
+      test's own configured entry, so stub it to "not logged in". Tests that
+      exercise a detected login can still override this in call order.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.ambient._claude_login_detected", lambda: False)
+
+
 @pytest.fixture
 def config_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """
