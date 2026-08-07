@@ -755,6 +755,7 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         tag_push = any(t in ("--tags", "--follow-tags") for t in args)
         for refspec in positionals[1:]:
             dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
+            dest = dest.lstrip("+")
             if dest.startswith("refs/tags/"):
                 tag_push = True
                 continue

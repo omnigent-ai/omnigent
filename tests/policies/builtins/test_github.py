@@ -937,6 +937,13 @@ def test_tag_push_full_refspec_denied() -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+def test_tag_push_force_prefixed_refspec_denied() -> None:
+    """``+refs/tags/v1.0`` (force-prefixed) is still detected as a tag push."""
+    policy = github_policy(write_repos=["octo/hello"])
+    result = policy(_sh("git push https://github.com/octo/hello +refs/tags/v1.0"))
+    assert result is not None and result["result"] == "DENY"
+
+
 def test_tag_push_allowed_when_opt_out() -> None:
     """deny_tag_push=False lets tag pushes through normal write gating."""
     policy = github_policy(write_repos=["octo/hello"], deny_tag_push=False)
