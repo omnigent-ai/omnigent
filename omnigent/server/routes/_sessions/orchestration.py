@@ -950,6 +950,8 @@ def _build_session_response(
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
     viewer_id: str | None = None,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1016,6 +1018,8 @@ def _build_session_response(
     :param model_options: Runner-owned native model picker options,
         e.g. ``[{"id": "gpt-5.5", "displayName": "GPT-5.5"}]``.
         ``None`` is treated as ``[]``.
+    :param agent_store: Optional store used to resolve the session harness.
+    :param agent_cache: Optional cache used to load the session harness spec.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1063,7 +1067,11 @@ def _build_session_response(
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
-        harness=_resolve_harness(conv),
+        harness=_resolve_harness(
+            conv,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        ),
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
@@ -8898,6 +8906,8 @@ async def _get_session_snapshot(
         ),
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
 
 

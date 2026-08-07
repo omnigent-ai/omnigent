@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
@@ -69,6 +70,47 @@ def test_model_options_wire_skips_malformed_rows_not_the_catalog() -> None:
         ]
     )
     assert [option["id"] for option in options] == ["opus"]
+
+
+def test_snapshot_metadata_resolvers_ignore_malformed_agent_ids() -> None:
+    """A wrapped UUID bind error degrades optional snapshot metadata to unknown."""
+
+    class _MalformedAgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            raise StatementError(
+                "invalid agent id",
+                {"agent_id": agent_id},
+                ValueError("expected a UUID"),
+                False,
+            )
+
+    conv = Conversation(
+        id="legacy_session",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="legacy_session",
+        agent_id="legacy_agent",
+    )
+    agent_store = _MalformedAgentStore()
+    agent_cache = object()
+
+    assert (
+        _sessions_mod._resolve_llm_model(
+            conv,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        is None
+    )
+    assert (
+        _sessions_mod._resolve_harness(
+            conv,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        is None
+    )
 
 
 class _ConversationStore:
@@ -255,6 +297,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
         ),
     }
     conv_store = _ConversationStore([], conversations=conversations)
+    cache_loads: list[bool] = []
 
     class _AgentStore:
         @staticmethod
@@ -263,13 +306,19 @@ async def test_session_snapshot_uses_child_spec_metadata(
             return type(
                 "StoredAgent",
                 (),
-                {"id": agent_id, "name": "advisor-row", "bundle_location": "bundle"},
+                {
+                    "id": agent_id,
+                    "name": "advisor-row",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                },
             )()
 
     class _AgentCache:
         @staticmethod
-        def load(agent_id: str, bundle_location: str) -> Any:
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            cache_loads.append(expand_env)
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -291,9 +340,12 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert parent.agent_name == "advisor"
     assert parent.llm_model == "openai-codex/gpt-5.6-sol:high"
     assert parent.context_window == 200_000
+    assert parent.harness == "codex"
     assert child.agent_name == "executor"
     assert child.llm_model == "openai-codex/gpt-5.6-sol:medium"
     assert child.context_window == 100_000
+    assert child.harness == "codex"
+    assert cache_loads == [False, True, False, True]
 
 
 @pytest.mark.asyncio
