@@ -192,7 +192,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _ancestor_session_ids,
-    _approval_access_from_grants,
     _await_settled_managed_launch,
     _build_new_item,
     _build_policy_engine_from_spec,
@@ -285,7 +284,6 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_terminal_resolved_harness_elicitation,
     _spec_harness,
     _stop_session_via_runner,
-    _strip_pending_author_prefix,
     _usage_by_model_for_display,
     _validate_session_workspace,
     _validate_terminal_launch_args,
@@ -812,11 +810,6 @@ def _build_session_list_item(
     # only); assert for the type checker without a runtime branch.
     assert conv.agent_id is not None
     level = _permission_level_from_grants(user_id, grants, user_is_admin)
-    can_approve = (
-        _approval_access_from_grants(user_id, grants, user_is_admin)
-        if permissions_enabled
-        else None
-    )
     owner = _owner_from_grants(grants) if permissions_enabled else None
     # Per-viewer read tracking, embedded so the client hydrates the unread
     # dots straight from the list (no separate fetch). Built per-user here —
@@ -837,7 +830,6 @@ def _build_session_list_item(
         host_id=conv.host_id,
         reasoning_effort=conv.reasoning_effort,
         permission_level=level,
-        can_approve=can_approve,
         owner=owner,
         external_session_id=conv.external_session_id,
         # The persisted row count is a CROSS-REPLICA mirror: the replica
@@ -923,7 +915,6 @@ def _build_session_response(
     items: list[ConversationItem],
     status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
-    can_approve: bool | None = None,
     background_task_count: int | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
@@ -958,8 +949,6 @@ def _build_session_response(
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
-    :param can_approve: Whether the requesting user may accept
-        privileged actions, or ``None`` when permissions are disabled.
     :param runner_online: Session-scoped liveness for the bound
         runner/host, e.g. ``False`` for a dead tunneled runner.
         ``None`` when no lookup is wired.
@@ -1048,7 +1037,6 @@ def _build_session_response(
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
-        can_approve=can_approve,
         sub_agent_name=conv.sub_agent_name,
         kind=conv.kind,
         parent_session_id=conv.parent_conversation_id,
@@ -2030,7 +2018,6 @@ async def _persist_external_conversation_item(
             drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-            item = _strip_pending_author_prefix(item, drained.content, drained.created_by)
             item = _merge_pending_file_blocks(item, drained.content)
             # Apply the original sender's identity recorded at POST time.
             # The transcript forwarder is the single writer here and has no
@@ -3816,8 +3803,6 @@ def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
     model_override: str | None = None,
-    created_by: str | None = None,
-    author_attribution_required: bool = False,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -3831,9 +3816,6 @@ def _build_native_terminal_message_event(
         so the claude-native executor applies ``/model`` and injects the
         message under one lock (no separate racing ``model_change``
         event). ``None`` when routing did not pick a model.
-    :param created_by: Authenticated identity of the posting actor.
-    :param author_attribution_required: Whether the posting actor is a
-        shared-session collaborator.
     :returns: Harness ``MessageEvent`` body for the runner-local
         native terminal harness, including ``agent_id`` so the runner
         can resolve the harness spec on the first message.
@@ -3860,8 +3842,6 @@ def _build_native_terminal_message_event(
         # harness and is dropped. Match the non-native forward path,
         # which always includes it.
         "agent_id": conv.agent_id,
-        **({"created_by": created_by} if created_by is not None else {}),
-        **({"author_attribution_required": True} if author_attribution_required else {}),
     }
     # Ride the routed model in-band as ``model_override`` (extra field the
     # harness MessageEvent forwards into ExecutorConfig.model). The
@@ -3880,8 +3860,6 @@ async def _forward_native_terminal_message(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
-    created_by: str | None = None,
-    author_attribution_required: bool = False,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -3905,21 +3883,12 @@ async def _forward_native_terminal_message(
         in-band on the message so the executor applies ``/model`` and the
         inject under one lock (no separate racing ``model_change``).
         ``None`` when routing did not pick a model.
-    :param created_by: Authenticated identity of the posting actor.
-    :param author_attribution_required: Whether the posting actor is a
-        shared-session collaborator.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, _ = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(
-        conv,
-        body,
-        model_override=model_override,
-        created_by=created_by,
-        author_attribution_required=author_attribution_required,
-    )
+    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
@@ -4395,7 +4364,6 @@ async def _forward_event_to_runner(
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
-    author_attribution_required: bool = False,
     host_store: HostStore | None = None,
 ) -> str:
     """
@@ -4425,8 +4393,6 @@ async def _forward_event_to_runner(
         this turn. ``False`` by default (agents without MCP servers).
     :param created_by: Authenticated identity of the posting actor,
         recorded on the persisted item for attribution.
-    :param author_attribution_required: Whether the posting actor is a
-        shared-session collaborator.
     :param host_store: Host registrations, read only to learn whether this
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed.
@@ -4515,8 +4481,6 @@ async def _forward_event_to_runner(
         # PRE-resolution form) and drops it by id, appending its own
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
-        **({"created_by": created_by} if created_by is not None else {}),
-        **({"author_attribution_required": True} if author_attribution_required else {}),
     }
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
@@ -5042,7 +5006,6 @@ async def _dispatch_session_event_to_runner_impl(
     artifact_store: ArtifactStore | None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
-    author_attribution_required: bool = False,
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
@@ -5107,8 +5070,6 @@ async def _dispatch_session_event_to_runner_impl(
         :func:`omnigent.runtime.pending_inputs.record` and applied
         to the item when the forwarder mirrors it back (see
         :func:`_persist_external_conversation_item`).
-    :param author_attribution_required: Whether the authenticated sender is
-        a shared-session collaborator.
     :param runner_router: Router used to resolve the runner for the
         native-terminal parent-wake forward when a sub-agent fails to
         boot (see :func:`_persist_native_terminal_failure`). ``None``
@@ -5296,8 +5257,6 @@ async def _dispatch_session_event_to_runner_impl(
                 model_override=(
                     _native_routed_model if _native_applied_model is not None else None
                 ),
-                created_by=created_by,
-                author_attribution_required=author_attribution_required,
             )
             forwarded = True
         finally:
@@ -5347,7 +5306,6 @@ async def _dispatch_session_event_to_runner_impl(
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
-        author_attribution_required=author_attribution_required,
         host_store=host_store,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
@@ -8608,7 +8566,6 @@ async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
     permission_level: int | None = None,
-    can_approve: bool | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     conversation: Conversation | None = None,
@@ -8633,8 +8590,6 @@ async def _get_session_snapshot(
         e.g. ``"conv_abc123"``.
     :param permission_level: The requesting user's numeric level
         on this session, or ``None`` when permissions are disabled.
-    :param can_approve: Whether the requesting user may accept
-        privileged actions, or ``None`` when permissions are disabled.
     :param agent_store: Optional agent store used to look up the
         bound agent's bundle location. ``None`` in legacy call sites
         that don't yet pass it.
@@ -8877,7 +8832,6 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
-        can_approve,
         background_task_count=_session_background_task_count_cache.get(session_id),
         llm_model=llm_model,
         context_window=context_window,

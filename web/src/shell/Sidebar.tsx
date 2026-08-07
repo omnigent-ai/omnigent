@@ -3543,12 +3543,7 @@ function ConversationRow({
           </DropdownMenu>
         </div>
       )}
-      <PermissionsModal
-        sessionId={conversation.id}
-        open={shareOpen}
-        onOpenChange={setShareOpen}
-        canDelegateApprovals={isOwner}
-      />
+      <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
       <Dialog
         open={deleteOpen}
         onOpenChange={(open) => {

@@ -74,13 +74,7 @@ from omnigent.runtime.compaction import (
     count_tokens,
 )
 from omnigent.runtime.content_resolver import resolve_content_references
-from omnigent.runtime.prompt import (
-    SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
-    build_instructions,
-    history_has_multiple_authors,
-    history_to_input_items,
-    shared_message_attribution_enabled,
-)
+from omnigent.runtime.prompt import build_instructions, history_to_input_items
 from omnigent.spec import AgentSpec
 from omnigent.spec.parser import check_unresolved_env_vars
 from omnigent.spec.types import (
@@ -2299,6 +2293,7 @@ def _prepare_messages(
         used to verify session-scoped file ownership.
     :returns: Tuple of (system_instructions, messages, sys_tokens).
     """
+    sys_instructions = build_instructions(spec, instructions, tool_schemas)
     file_store = get_file_store()
     artifact_store = get_artifact_store()
     resolved = history
@@ -2310,17 +2305,6 @@ def _prepare_messages(
             content_cache,
             session_id=conversation_id,
         )
-    framework_instructions = (
-        (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
-        if shared_message_attribution_enabled() and history_has_multiple_authors(resolved)
-        else ()
-    )
-    sys_instructions = build_instructions(
-        spec,
-        instructions,
-        tool_schemas,
-        framework_instructions=framework_instructions,
-    )
     messages = history_to_input_items(resolved)
     sys_tokens = count_tokens(
         [{"role": "system", "content": sys_instructions}],

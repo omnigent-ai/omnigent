@@ -108,13 +108,7 @@ export function InboxPage() {
   const sources: InboxSource[] = [];
   rows.forEach((row, i) => {
     const snapshot = snapshotQueries[i]?.data;
-    if (snapshot) {
-      sources.push({
-        row,
-        pendingElicitations: snapshot.pendingElicitations ?? [],
-        canApprove: snapshot.canApprove ?? true,
-      });
-    }
+    if (snapshot) sources.push({ row, pendingElicitations: snapshot.pendingElicitations ?? [] });
   });
   const items = collectInboxItems(sources);
 
@@ -329,7 +323,6 @@ export function InboxPage() {
                   codexCommand={item.elicitation.codexCommand}
                   allowAllEdits={item.elicitation.allowAllEdits}
                   rememberScope={item.elicitation.rememberScope}
-                  canApprove={item.canApprove}
                   onSubmit={makeSubmit(item)}
                 />
               )}

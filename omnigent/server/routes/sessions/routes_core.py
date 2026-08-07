@@ -74,9 +74,6 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
-    get_approval_access as _get_approval_access,
-)
-from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -353,7 +350,6 @@ def register_core_routes(
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, resp.id, LEVEL_OWNER)
             resp.permission_level = await _get_permission_level(user_id, resp.id, permission_store)
-            resp.can_approve = True
         # Push the new session to this user's other open tabs (see the
         # multipart path above for the rationale).
         _announce_session_added(user_id, resp.id)
@@ -745,7 +741,6 @@ def register_core_routes(
             conversation_store,
             session_id,
             access.level,
-            access.can_approve,
             agent_store,
             agent_cache,
             conversation=access.conversation,
@@ -1952,15 +1947,7 @@ def register_core_routes(
                 )
                 if not filed:
                     raise _session_not_found()
-        level, can_approve = await asyncio.gather(
-            _get_permission_level(user_id, session_id, permission_store),
-            _get_approval_access(
-                user_id,
-                session_id,
-                permission_store,
-                conversation_store,
-            ),
-        )
+        level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
         # items read — it dominated this response's size and build time.
@@ -1968,7 +1955,6 @@ def register_core_routes(
             conversation_store,
             session_id,
             level,
-            can_approve,
             agent_store,
             agent_cache,
             liveness_lookup=liveness_lookup,
@@ -2194,7 +2180,6 @@ def register_core_routes(
             fork_items.data,
             "idle",
             permission_level=level,
-            can_approve=True if permission_store is not None else None,
             last_task_error=None,
             agent_name=base_agent.name,
         )
@@ -2420,21 +2405,12 @@ def register_core_routes(
         background_tasks.add_task(_reset_runner_resources_after_switch, session_id)
 
         items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
-        level, can_approve = await asyncio.gather(
-            _get_permission_level(user_id, session_id, permission_store),
-            _get_approval_access(
-                user_id,
-                session_id,
-                permission_store,
-                conversation_store,
-            ),
-        )
+        level = await _get_permission_level(user_id, session_id, permission_store)
         return _build_session_response(
             updated,
             items.data,
             "idle",
             permission_level=level,
-            can_approve=can_approve,
             last_task_error=None,
             agent_name=target_agent.name,
         )
