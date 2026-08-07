@@ -10,7 +10,7 @@ from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
 from issue_prioritization.config import ScoringConfig
-from issue_prioritization.domain import IssueType, Severity
+from issue_prioritization.domain import Impact, IssueType
 from issue_prioritization.labels import LabelDefinition, LabelManifest
 from issue_prioritization.mutations import MutationPlanner
 from issue_prioritization.pipeline import IssuePrioritizationPipeline
@@ -88,7 +88,7 @@ def test_pipeline_reuses_persisted_classification_and_includes_maintainers() -> 
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S1,
+        impact=Impact.HIGH,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="No workaround",
@@ -129,7 +129,7 @@ def test_pipeline_reclassifies_changed_content() -> None:
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S2,
+        impact=Impact.MEDIUM,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="Has mitigation",
@@ -138,7 +138,7 @@ def test_pipeline_reclassifies_changed_content() -> None:
     stale = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S3,
+        impact=Impact.LOW,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="Old",
@@ -173,7 +173,7 @@ def test_pipeline_can_force_regrade_cached_content() -> None:
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S2,
+        impact=Impact.MEDIUM,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="Refreshed",
@@ -199,13 +199,13 @@ def test_pipeline_can_force_regrade_cached_content() -> None:
     assert classifications.updated == [classification]
 
 
-def test_pipeline_scores_with_human_severity_override() -> None:
+def test_pipeline_scores_from_impact_and_retires_severity_label() -> None:
     issue = _bronze(1)
     issue = replace(issue, labels=(*issue.labels, "severity:S3"))
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S1,
+        impact=Impact.HIGH,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="No workaround",
@@ -213,7 +213,7 @@ def test_pipeline_scores_with_human_severity_override() -> None:
     )
     area = Area("db", "comp:db", Decimal("1.2"))
     catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
-    manifest = LabelManifest(labels=(LabelDefinition("severity:S3", "000000", ""),))
+    manifest = LabelManifest(labels=(LabelDefinition("comp:db", "000000", ""),))
     pipeline = IssuePrioritizationPipeline(
         source=FakeSource([issue]),
         classifier=FakeClassifier(classification),
@@ -226,8 +226,9 @@ def test_pipeline_scores_with_human_severity_override() -> None:
 
     run = pipeline.run("run-human-severity")
 
-    assert run.ranked[0].issue.severity == Severity.S3
-    assert run.ranked[0].result.score == Decimal("12.00")
+    assert run.ranked[0].issue.impact == Impact.HIGH
+    assert run.ranked[0].result.score == Decimal("72.00")
+    assert run.mutations[0].labels_remove == ("severity:S3",)
 
 
 def test_dry_run_previews_safe_legacy_priority_regrade() -> None:
@@ -235,7 +236,7 @@ def test_dry_run_previews_safe_legacy_priority_regrade() -> None:
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S1,
+        impact=Impact.HIGH,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="No workaround",
@@ -243,12 +244,7 @@ def test_dry_run_previews_safe_legacy_priority_regrade() -> None:
     )
     area = Area("db", "comp:db", Decimal("1.2"))
     catalog = AreaCatalog(by_key={"db": area}, by_label={"comp:db": (area,)})
-    manifest = LabelManifest(
-        labels=(
-            LabelDefinition("severity:S1", "000000", ""),
-            LabelDefinition("comp:db", "000000", ""),
-        )
-    )
+    manifest = LabelManifest(labels=(LabelDefinition("comp:db", "000000", ""),))
     planner = MutationPlanner(
         manifest,
         FakeStates(),
@@ -270,7 +266,7 @@ def test_dry_run_previews_safe_legacy_priority_regrade() -> None:
     )
 
     assert run.legacy_priorities_adopted == 1
-    assert set(run.mutations[0].labels_add) == {"P1-high", "comp:db", "severity:S1"}
+    assert set(run.mutations[0].labels_add) == {"P1-high", "comp:db"}
     assert run.mutations[0].labels_remove == ("P2-medium",)
 
 
@@ -279,7 +275,7 @@ def test_pipeline_publishes_scores_only_after_artifacts_complete() -> None:
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S1,
+        impact=Impact.HIGH,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="No workaround",
@@ -317,7 +313,7 @@ def test_pipeline_does_not_publish_scores_when_artifacts_fail() -> None:
     classification = Classification(
         issue_number=1,
         issue_type=IssueType.BUG,
-        severity=Severity.S1,
+        impact=Impact.HIGH,
         area_keys=("db",),
         component_labels=("comp:db",),
         reasoning="No workaround",

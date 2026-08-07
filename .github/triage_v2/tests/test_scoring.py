@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.config import ModuleConfig, ScoringConfig
-from issue_prioritization.domain import Issue, IssueType, Priority, Severity
+from issue_prioritization.domain import Impact, Issue, IssueType, Priority
 from issue_prioritization.scoring import ScoreEngine
 
 
@@ -30,7 +30,7 @@ def _issue(**changes: object) -> Issue:
         title="Harness fails",
         url="https://github.com/omnigent-ai/omnigent/issues/1",
         issue_type=IssueType.BUG,
-        severity=Severity.S1,
+        impact=Impact.HIGH,
         area_keys=("harness-claude",),
     )
     return replace(issue, **changes)
@@ -59,7 +59,7 @@ def test_duplicate_reach_is_capped() -> None:
     enabled = replace(default, modules=modules)
 
     result = ScoreEngine(enabled, _catalog()).score(
-        _issue(severity=Severity.S2, duplicate_count=100)
+        _issue(impact=Impact.MEDIUM, duplicate_count=100)
     )
 
     assert result.score == Decimal("63.00")
@@ -81,7 +81,7 @@ def test_optional_modules_are_disabled_by_default() -> None:
 
     assert result.score == Decimal("84.00")
     assert [step.name for step in result.steps] == [
-        "severity",
+        "impact",
         "component",
         "demand",
     ]
@@ -114,7 +114,7 @@ def test_demand_is_capped() -> None:
     result = ScoreEngine(ScoringConfig.default(), _catalog()).score(
         _issue(
             issue_type=IssueType.ENHANCEMENT,
-            severity=Severity.S2,
+            impact=Impact.MEDIUM,
             area_keys=("harness-kimi",),
             upvote_count=1000,
         )
