@@ -73,7 +73,9 @@ async def _run(sandbox: Path) -> tuple[list[str], dict[str, str], Path, set[str]
     # Stand in for a signed-in user who also has their own agy MCP config + settings.
     (real_gemini / "oauth_creds.json").write_text('{"access_token": "real-token"}')
     (real_gemini / "google_accounts.json").write_text('{"active": "user@example.com"}')
-    (real_gemini / "antigravity-cli" / "settings.json").write_text('{"model": "gemini-3-pro"}')
+    # An opaque placeholder, not a real model id: this only has to be a setting of
+    # the user's that the launch must leave alone.
+    (real_gemini / "antigravity-cli" / "settings.json").write_text('{"model": "user-picked"}')
     (real_gemini / "config" / "mcp_config.json").write_text('{"mcpServers": {"mine": {}}}')
 
     # Redirect HOME so the real ~/.gemini is untouched, and re-point the two module
