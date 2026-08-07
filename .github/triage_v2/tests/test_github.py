@@ -300,7 +300,8 @@ def test_client_strips_token_whitespace() -> None:
     assert client.token == "token"
 
 
-def test_client_creates_and_updates_one_marker_comment() -> None:
+@pytest.mark.parametrize("author_type", ("Bot", "User"))
+def test_client_creates_and_updates_one_marker_comment(author_type: str) -> None:
     calls = []
     comments = []
 
@@ -309,7 +310,7 @@ def test_client_creates_and_updates_one_marker_comment() -> None:
         if method == "GET":
             return comments
         if method == "POST":
-            comments.append({"id": 42, "body": payload["body"], "user": {"type": "Bot"}})
+            comments.append({"id": 42, "body": payload["body"], "user": {"type": author_type}})
             return comments[0]
         if method == "PATCH":
             comments[0]["body"] = payload["body"]
@@ -326,4 +327,4 @@ def test_client_creates_and_updates_one_marker_comment() -> None:
 
     assert [method for method, _, _ in calls].count("POST") == 1
     assert [method for method, _, _ in calls].count("PATCH") == 1
-    assert comments == [{"id": 42, "body": second, "user": {"type": "Bot"}}]
+    assert comments == [{"id": 42, "body": second, "user": {"type": author_type}}]

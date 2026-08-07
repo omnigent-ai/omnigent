@@ -110,11 +110,8 @@ class GitHubClient:
             if not isinstance(value, list):
                 raise ValueError("GitHub issue comments response must be an array")
             for comment in value:
-                user = comment.get("user") if isinstance(comment, dict) else None
-                if (
-                    not isinstance(user, dict)
-                    or user.get("type") != "Bot"
-                    or COMMENT_MARKER not in str(comment.get("body", ""))
+                if not isinstance(comment, dict) or COMMENT_MARKER not in str(
+                    comment.get("body", "")
                 ):
                     continue
                 comment_id = int(comment["id"])
