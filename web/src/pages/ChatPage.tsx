@@ -3534,7 +3534,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             // Another contributor's bubble takes their avatar color at low
             // alpha instead of the default bg-muted, so authorship reads at
             // a glance without any email text.
-            style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
+            style={
+              showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
+            }
           >
             {/* Inline image previews — one non-wrapping strip. Wrapping would
                 re-flow the row as each image's width resolves on load, changing
