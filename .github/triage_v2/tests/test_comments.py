@@ -39,7 +39,8 @@ def test_comment_exposes_judgment_and_hides_base_score() -> None:
 
     assert '"base_score":60.0' in body.splitlines()[0]
     assert "Base score" not in body
-    assert "**Impact:** High" in body
+    assert "**Bot assessment:** High impact" in body
+    assert "**Impact:**" not in body
     assert "**Priority:** `P1-high`" in body
     assert "@\u200bteam" in body
     assert "&lt;unsafe&gt;" in body

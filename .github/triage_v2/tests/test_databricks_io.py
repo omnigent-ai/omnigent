@@ -66,7 +66,7 @@ def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
     assert payload[0]["labels_add"] == ["P1-high", "comp:db"]
     assert payload[0]["labels_remove"] == ["P2-medium", "severity:S2"]
     assert "<!-- omnigent-issue-prioritization-v2" in payload[0]["comment"]
-    assert "**Impact:** High" in payload[0]["comment"]
+    assert "**Bot assessment:** High impact" in payload[0]["comment"]
     assert "**Priority:** `P1-high`" in payload[0]["comment"]
     metadata = json.loads((tmp_path / "preview" / "run.json").read_text())
     assert metadata["mode"] == "dry_run"

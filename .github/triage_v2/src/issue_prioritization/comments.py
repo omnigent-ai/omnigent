@@ -29,11 +29,11 @@ def build_triage_comment(
             marker,
             "🤖 **Automated triage**",
             "",
-            f"- **Impact:** {item.issue.impact.label}",
+            f"- **Bot assessment:** {item.issue.impact.label} impact",
             *priority_lines,
             f"- **Why:** {reasoning}",
             "",
-            "This is a bot judgment based on the issue content and repository signals. "
+            "This automated assessment uses the issue content and repository signals. "
             "Maintainers can override the priority label.",
         )
     )

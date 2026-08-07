@@ -126,7 +126,7 @@ def test_apply_posts_the_ranked_bot_judgment() -> None:
 
     assert client.applied == [(1, ("P1-high", "comp:db"), ("severity:S2",))]
     assert len(client.comments) == 1
-    assert "**Impact:** High" in client.comments[0][1]
+    assert "**Bot assessment:** High impact" in client.comments[0][1]
 
 
 def test_apply_preserves_human_priority_changed_after_dry_run() -> None:

@@ -29,7 +29,7 @@ demand counts GitHub `+1` reactions only, not all reaction types.
 When `ISSUE_PRIORITIZATION_V2_ENABLED=true`, the existing Issue Triage workflow
 runs v2 after intake for each new non-bot issue, including maintainer-authored
 issues. It calls the configured model serving endpoint, applies component and
-priority labels, posts one bot-owned triage comment with the Impact judgment,
+priority labels, posts one bot-owned triage comment with its assessment of impact,
 and uploads a 30-day decision artifact.
 Legacy `severity:S*` labels are removed instead of replaced with another label.
 The periodic Databricks job remains responsible for
@@ -215,8 +215,8 @@ That apply run is also the comment backfill. The bot finds comments by the
 `omnigent-issue-prioritization-v2` marker and updates the existing comment rather
 than posting another one. The base score is embedded in HTML metadata for audit
 and is not rendered by GitHub; it is hidden, not secret. Visible text contains
-Impact, effective priority, the automated recommendation when a human override
-is retained, and a concise rationale.
+the bot assessment, effective priority, the automated recommendation when a
+human override is retained, and a concise rationale.
 
 Keep the write variable false until a dry-run's `ranking.*` and
 `mutations.json` artifacts have been reviewed. Apply mode also creates any
