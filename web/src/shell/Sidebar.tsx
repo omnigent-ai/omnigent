@@ -254,7 +254,12 @@ type SelectionScope = "sessions" | "projects";
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
-  onOpen: () => void;
+  /**
+   * Pin a peeking sidebar fully open (the in-sidebar toggle shown while
+   * peeking). Optional (defaults to a no-op) so the sidebar renders standalone
+   * in tests.
+   */
+  onOpen?: () => void;
   /**
    * Live open fraction (0 = closed, 1 = open) while the iOS shell's left-edge
    * swipe is dragging the sidebar; `null` when not dragging. When set, the
