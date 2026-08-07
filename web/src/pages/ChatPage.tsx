@@ -1010,6 +1010,11 @@ export function ChatPage() {
     hasPendingElicitation,
     runnerOnline,
     backgroundTaskCount,
+    // Optimistic: light up the moment this client dispatches, without waiting
+    // for the server's ``running``. The sidebar row already reads this same
+    // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
+    // server confirmed; now they agree immediately.
+    localSendInFlight: status === "streaming",
   });
 
   // A fork of a coding session carries the source id in this label (set by
@@ -5704,10 +5709,17 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  *   10s cadence and reads stale-offline during the runner's connect window on a
  *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
  * @param options.backgroundTaskCount - Background shells still running after
- *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
- *   watcher's edge) even while shells run, so the bare status alone would hide
- *   the indicator; a positive count keeps it lit so "N background tasks still running"
+ *   the turn ended. A claude-native turn settles to ``idle`` (the status file's
+ *   edge) even while shells run, so the bare status alone would hide the
+ *   indicator; a positive count keeps it lit so "N background tasks still running"
  *   stays visible.
+ * @param options.localSendInFlight - This client's own send is in flight
+ *   (``chatStore.status === "streaming"``). Lights the indicator optimistically
+ *   the moment the user presses Enter, before any server edge confirms the turn
+ *   — the sidebar row already does this (see ``isStartingUp`` in Sidebar.tsx),
+ *   so without it the two disagree for the dispatch round-trip. Distinct from
+ *   ``sessionStatus``, which mirrors the server: this one means "we asked", not
+ *   "the agent is working".
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
@@ -5716,6 +5728,7 @@ export function computeShowsWorking(
     hasPendingElicitation: boolean;
     runnerOnline: boolean | undefined;
     backgroundTaskCount?: number;
+    localSendInFlight?: boolean;
   },
 ): boolean {
   if (options.hasPendingElicitation) return false;
@@ -5723,9 +5736,10 @@ export function computeShowsWorking(
   // A running/waiting session is proof the runner is up, so a stale
   // poll-derived ``runnerOnline === false`` must not suppress it. Only gate on
   // known-offline for the not-actively-working case (e.g. a background-shell
-  // tally on an idle session).
-  if (options.runnerOnline === false && !isWorking) return false;
-  return isWorking || (options.backgroundTaskCount ?? 0) > 0;
+  // tally on an idle session). An in-flight local send is the same kind of
+  // proof — the user just dispatched — so it also survives the gate.
+  if (options.runnerOnline === false && !isWorking && !options.localSendInFlight) return false;
+  return isWorking || options.localSendInFlight === true || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**
