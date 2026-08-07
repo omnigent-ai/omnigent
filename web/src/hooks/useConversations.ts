@@ -45,7 +45,7 @@ import {
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
-import { useChatStore } from "@/store/chatStore";
+import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -379,6 +379,8 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
   // Drop any client-side queued messages for the now-deleted session; bound to
   // a dead conversation, they could never flush.
   useChatStore.getState().clearQueuedMessages(id);
+  // A deleted conversation must stop pumping and let go of its stream.
+  releaseConversation(id);
 }
 
 /**
