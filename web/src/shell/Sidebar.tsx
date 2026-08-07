@@ -878,7 +878,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                         ? "1 inbox item waiting"
                         : `${inboxCount} inbox items waiting`
                     }
-                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-accent/15 px-1 text-10 font-medium text-brand-accent tabular-nums"
                   >
                     {inboxCount}
                   </span>
@@ -3307,7 +3307,12 @@ function ConversationRow({
             : sessionState !== null
               ? "pr-28 md:pr-8"
               : "pr-28 md:pr-2"),
-        !selectionMode && "md:group-hover:pr-14 md:group-focus-within:pr-14",
+        // The narrowed reserve must track exactly when the trailing controls
+        // appear and the state marker fades — both keyed on `:focus-visible`.
+        // `focus-within` also fires for a plain click, which shrank the reserve
+        // on the selected row while the marker stayed put, sliding the title
+        // under it.
+        !selectionMode && "md:group-hover:pr-14 md:group-has-[:focus-visible]:pr-14",
         !selectionMode && menuOpen && "md:pr-14",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
