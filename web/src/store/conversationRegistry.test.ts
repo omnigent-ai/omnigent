@@ -232,6 +232,49 @@ describe("ConversationRegistry", () => {
     expect(a.disposed).toBe(false);
   });
 
+  it("trims the outgoing conversation when switching back to an existing one", () => {
+    // Moving the on-screen exemption can itself make an entry evictable. A/B/C
+    // pinned, then cold-opening D leaves four entries — correct, D is protected
+    // as both active and just-acquired. Switching back to A makes the now-unpinned
+    // D a valid victim, but `setActive` used not to trim and `acquire(A)` returns
+    // early for an existing entry, so D's excess SSE connection stayed open until
+    // something unrelated happened.
+    for (const id of ["conv_a", "conv_b", "conv_c"]) {
+      registry.acquire(id).setState({ pendingUserMessages: [unsentBubble(`pend_${id}`)] });
+    }
+    const d = registry.acquire("conv_d");
+    registry.setActive("conv_d");
+    expect(registry.ids()).toHaveLength(4);
+
+    // Back to A, which is still live. D is no longer active or pinned.
+    registry.setActive("conv_a");
+
+    expect(registry.has("conv_d")).toBe(false);
+    expect(d.disposed).toBe(true);
+    expect(registry.ids()).toHaveLength(3);
+    expect(registry.has("conv_a")).toBe(true);
+  });
+
+  it("never evicts the conversation being switched TO", () => {
+    // The incoming conversation is about to be painted, so the new `setActive`
+    // trim must never take it. Here every entry is pinned, so the sweep finds no
+    // legal victim and the registry correctly stays over budget rather than
+    // disposing the entry the user is switching to.
+    const a = registry.acquire("conv_a");
+    a.setState({ pendingUserMessages: [unsentBubble("pend_a")] });
+    registry.acquire("conv_b").setState({ pendingUserMessages: [unsentBubble("pend_b")] });
+    registry.acquire("conv_c").setState({ pendingUserMessages: [unsentBubble("pend_c")] });
+    registry.acquire("conv_d").setState({ pendingUserMessages: [unsentBubble("pend_d")] });
+    registry.setActive("conv_d");
+    expect(registry.ids()).toHaveLength(4);
+
+    registry.setActive("conv_a");
+
+    expect(registry.has("conv_a")).toBe(true);
+    expect(a.disposed).toBe(false);
+    expect(registry.ids()).toHaveLength(4);
+  });
+
   it("never hands back an entry it just evicted", () => {
     // Eviction runs after insertion, so the entry being acquired is itself a
     // candidate. With every older entry pinned, the sweep would otherwise reach

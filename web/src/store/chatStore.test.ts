@@ -1167,6 +1167,94 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("keeps each conversation's own effort across a warm A→B→A switch", async () => {
+    // `selectedEffort` is a single app-global sticky pick, so it cannot answer
+    // "what is THIS conversation at" once a warm switch skips hydration: cold
+    // opening B set it to B's value, and returning to still-live A mirrored no
+    // effort field and returned without a bind — so A displayed B's effort.
+    // `sessionReasoningEffort` is conversation-scoped, so each keeps its own.
+    seedSession("conv_eff_a", []);
+    seedSession("conv_eff_b", []);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+      if (
+        (path === "/v1/sessions/conv_eff_a" || path === "/v1/sessions/conv_eff_b") &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: path.split("/").pop(),
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          reasoning_effort: path.endsWith("conv_eff_a") ? "high" : "low",
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_eff_a");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+
+    // Cold-open B at a different effort. This moves the app-global sticky pick.
+    await useChatStore.getState().switchTo("conv_eff_b");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("low");
+
+    // Warm switch back: no bind, so the projection is the only source of truth.
+    await useChatStore.getState().switchTo("conv_eff_a");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+    // And B still holds its own.
+    expect(conversationRegistry.peek("conv_eff_b")!.getState().sessionReasoningEffort).toBe("low");
+  });
+
+  it("loadMoreHistory settles on the conversation that scrolled, not the visible one", async () => {
+    // Backgrounding is not staleness. Resolving the target after the await left
+    // `loadingMoreHistory: true` pinned on the scrolling conversation — and since
+    // a live entry is never re-bound on return, that guard then no-oped EVERY
+    // future scroll-up: dead history until a page refresh.
+    // One full window plus one page, so there is genuinely more to scroll to.
+    const items: ConversationItem[] = Array.from(
+      { length: INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE },
+      (_, idx) => userMessage(`bh_${idx.toString().padStart(4, "0")}`, `bh ${idx}`),
+    );
+    seedSession("conv_scroll", items);
+    seedSession("conv_visible", []);
+    await useChatStore.getState().switchTo("conv_scroll");
+    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+
+    let releasePage: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_scroll\/items\?.*after=/.test(url) && releasePage === null) {
+        return new Promise<Response>((resolve) => {
+          releasePage = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const page = useChatStore.getState().loadMoreHistory();
+    expect(conversationRegistry.peek("conv_scroll")!.getState().loadingMoreHistory).toBe(true);
+
+    // Switch away while the page is still open, then let it land.
+    await useChatStore.getState().switchTo("conv_visible");
+    releasePage!();
+    await page;
+
+    const scrolled = conversationRegistry.peek("conv_scroll")!.getState();
+    // The flag cleared, so scroll-up still works when the user returns...
+    expect(scrolled.loadingMoreHistory).toBe(false);
+    // ...and the page landed on the conversation it belongs to, in order.
+    expect(scrolled.blocks.map((b) => b.ctx.itemId)).toEqual([
+      ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...windowIds,
+    ]);
+    // The visible conversation gained nothing.
+    expect(useChatStore.getState().blocks).toEqual([]);
+  });
+
   it("does not run flat session items through the nested snapshot flattener", async () => {
     seedSessionSnapshot("conv_native", []);
     seedSessionItems("conv_native", [nativeToolItem("resp_native")]);
@@ -1548,6 +1636,93 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(eventBodies.map(textOf)).toEqual(["first", "second"]);
   });
 
+  it("keeps three sends ordered across a new chat's id publication", async () => {
+    // The chain has to migrate as ONE unit, carrying its already-queued
+    // followers. Send 2 queues under the new-session key (before the id exists);
+    // send 3 arrives after the id is published, so it keys the real id directly.
+    // Moving only the creating send's slot left send 3 waiting on send 1 rather
+    // than on send 2 — so both became runnable at once.
+    //
+    // The invariant is strict serialization, asserted by leaving send 2's POST
+    // UNRESOLVED: send 3 must not reach the wire until send 2's has returned.
+    // (Asserting only the final array can't catch this — with both in flight
+    // the mock's microtask order still happens to append them in sequence,
+    // while against a real server the two are racing.)
+    const eventBodies: string[] = [];
+    const resolvers: (() => void)[] = [];
+    seedSession("conv_new");
+    const baseHandler = fetchMock.getMockImplementation()!;
+    let releaseSnapshot: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_new/events" && init?.method === "POST") {
+        eventBodies.push(init.body as string);
+        return new Promise<Response>((resolve) => {
+          resolvers.push(() => resolve(mockResponse({ queued: true, item_id: "ci_mock" })));
+        });
+      }
+      // Hold the first bind's snapshot so send 1 parks inside `bindStream` with
+      // the id already published — the window both followers land in.
+      if (
+        /^\/v1\/sessions\/conv_new(\?|$)/.test(url) &&
+        (init?.method ?? "GET") === "GET" &&
+        releaseSnapshot === null
+      ) {
+        return new Promise<Response>((resolve) => {
+          releaseSnapshot = () => resolve(baseHandler(input, init) as Promise<Response>);
+        });
+      }
+      return baseHandler(input, init);
+    });
+    const textOf = (body: string): string =>
+      (JSON.parse(body).data.content[0] as { text: string }).text;
+
+    // Sends 1 and 2 are submitted in the SAME tick, from the landing route: no
+    // id exists yet, so both take slots under the new-session key. This has to
+    // be synchronous — `rekey` fires as soon as `createSession` returns, so any
+    // await here would let send 2 key the real id and miss the case under test.
+    const p1 = useChatStore.getState().send("1", "agent_xyz");
+    const p2 = useChatStore.getState().send("2", "agent_xyz");
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 3; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    // The id is now visible, and send 1 is parked in its bind.
+    expect(useChatStore.getState().conversationId).toBe("conv_new");
+    expect(releaseSnapshot).not.toBeNull();
+    // Send 3 resolves the real id and must queue behind send 2, not send 1.
+    const p3 = useChatStore.getState().send("3", "agent_xyz");
+    await tick();
+    await tick();
+    expect(eventBodies.map(textOf)).toEqual([]);
+
+    releaseSnapshot!();
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 4; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    // Send 1 posts alone — the followers are still chained behind it.
+    expect(eventBodies.map(textOf)).toEqual(["1"]);
+
+    // Release ONLY send 1. Send 2 may now post; send 3 must stay parked, because
+    // its predecessor's POST has not returned. Pre-fix, send 3 waited on send 1
+    // too, so it posts here alongside send 2 — two writes racing on one session.
+    resolvers[0]!();
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 10; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    expect(eventBodies.map(textOf)).toEqual(["1", "2"]);
+
+    // Only now that send 2's POST has returned may send 3 go out.
+    resolvers[1]!();
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 10; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    expect(eventBodies.map(textOf)).toEqual(["1", "2", "3"]);
+
+    resolvers[2]!();
+    await Promise.all([p1, p2, p3]);
+    expect(eventBodies.map(textOf)).toEqual(["1", "2", "3"]);
+  });
+
   it("PATCHes sticky effort onto a brand-new session before binding the runner", async () => {
     seedSession("conv_new");
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -1692,6 +1867,48 @@ describe("chatStore — send (first-send ordering)", () => {
 
     // The optimistic bubble survives — the POST succeeded.
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+  });
+
+  it("tears the old pump down before rebinding after a failed snapshot", async () => {
+    // A snapshot failure leaves `conversationLoadError` set while the pump it
+    // opened is STILL RUNNING — `bindStream` catches the error without aborting
+    // its controller. Rebinding blind then replaced the stored controller and
+    // left two subscribers on one entry, so any delta with no item id to dedupe
+    // on (live claude-native text) applied twice.
+    seedSession("conv_two_subs", []);
+    let failSnapshot = true;
+    const openedStreams: AbortSignal[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_two_subs/stream") {
+        if (init?.signal) openedStreams.push(init.signal);
+        return mockResponse(null, { bodyStream: pushableStream().stream });
+      }
+      // Fail only the FIRST snapshot GET, so the bind errors with its pump live.
+      if (url.split("?")[0] === "/v1/sessions/conv_two_subs" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) {
+          failSnapshot = false;
+          return mockResponse({}, { ok: false, status: 500 });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_two_subs");
+    const entry = conversationRegistry.peek("conv_two_subs")!;
+    // The failed bind: error recorded, but its pump is still open.
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    expect(openedStreams).toHaveLength(1);
+    expect(openedStreams[0]!.aborted).toBe(false);
+
+    // Sending rebinds, because the entry is not stream-current.
+    await useChatStore.getState().send("after a failed load", "agent_xyz");
+
+    // The first pump was aborted rather than orphaned — one live subscriber.
+    expect(openedStreams).toHaveLength(2);
+    expect(openedStreams[0]!.aborted).toBe(true);
+    expect(openedStreams[1]!.aborted).toBe(false);
+    expect(entry.getState().conversationLoadError).toBeNull();
   });
 
   it("degrades gracefully when stream rebind fails — message still posts", async () => {
@@ -4107,6 +4324,33 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().selectedEffort).toBe("high");
     });
+
+    it("records a backgrounded conversation's effort switch on that conversation", () => {
+      // The session-scoped value always lands, background included: a live entry
+      // is never re-bound on return, so discarding the event left the picker
+      // showing the wrong effort until a refresh. The app-global sticky pick is
+      // still only adopted from the conversation on screen.
+      bindConversationForTest("conv_effort_bg");
+      bindConversationForTest("conv_effort_fg");
+      useChatStore.setState({ selectedEffort: "high" });
+
+      // Delivered by the backgrounded conversation's OWN stream, which is how
+      // this arrives in production.
+      handleSessionEvent(
+        {
+          type: "session_reasoning_effort",
+          conversationId: "conv_effort_bg",
+          reasoningEffort: "low",
+        },
+        "conv_effort_bg",
+      );
+
+      expect(conversationRegistry.peek("conv_effort_bg")!.getState().sessionReasoningEffort).toBe(
+        "low",
+      );
+      // The visible conversation's sticky pick is untouched.
+      expect(useChatStore.getState().selectedEffort).toBe("high");
+    });
   });
 
   describe("session.collaboration_mode", () => {
@@ -5694,6 +5938,65 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     const state = useChatStore.getState();
     expect(state.selectedModel).toBe("opus");
     expect(state.selectedEffort).toBe("high");
+  });
+
+  it("lets only the newest model pick settle the persisted sticky preference", async () => {
+    // A conversation-id guard can't order two picks. If A's PATCH is slow, the
+    // user switches to B and picks again, then A resolves last: A's canonical
+    // value overwrote the newer localStorage pref even though the UI correctly
+    // showed B's. The wrong model then came back on reload / in a new chat.
+    seedSession("conv_pick_a", []);
+    seedSession("conv_pick_b", []);
+    let releaseA: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_pick_a" && init?.method === "PATCH") {
+        return new Promise<Response>((resolve) => {
+          releaseA = () =>
+            resolve(
+              mockResponse({
+                id: "conv_pick_a",
+                agent_id: "agent_xyz",
+                status: "idle",
+                created_at: 0,
+                items: [],
+                model_override: "sonnet",
+              }),
+            );
+        });
+      }
+      if (url === "/v1/sessions/conv_pick_b" && init?.method === "PATCH") {
+        return mockResponse({
+          id: "conv_pick_b",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          model_override: "opus",
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_pick_a");
+    const pickA = useChatStore.getState().setModel("sonnet");
+    await tick();
+
+    // Switch to B and pick a NEWER model, which settles first.
+    await useChatStore.getState().switchTo("conv_pick_b");
+    await useChatStore.getState().setModel("opus");
+    expect(window.localStorage.getItem("omnigent.picker.model")).toBe("opus");
+
+    // A's slower PATCH now resolves last. It must not revive the older pick.
+    releaseA!();
+    await pickA;
+
+    expect(window.localStorage.getItem("omnigent.picker.model")).toBe("opus");
+    expect(useChatStore.getState().selectedModel).toBe("opus");
+    // A's own session override still settled to its canonical value.
+    expect(conversationRegistry.peek("conv_pick_a")!.getState().sessionModelOverride).toBe(
+      "sonnet",
+    );
   });
 
   it("does not move the app-global picker when a bind lands after a switch away", async () => {
@@ -8452,6 +8755,41 @@ describe("chatStore — setCostControlMode", () => {
     await expect(useChatStore.getState().setCostControlMode("on")).rejects.toThrow();
     // Back to the pre-toggle value: the pill must not claim a state the
     // server never persisted (it would silently diverge from the snapshot).
+    expect(useChatStore.getState().costControlModeOverride).toBeNull();
+  });
+
+  it("rolls back on the toggling conversation when the failure outlives a switch", async () => {
+    // The rollback used to be skipped entirely once the user switched away, on
+    // the assumption that leaving destroyed the state. It doesn't any more: the
+    // conversation stays live, so returning to it showed the optimistic value
+    // the server had rejected, permanently.
+    seedSession("conv_cc_bg", []);
+    seedSession("conv_cc_fg", []);
+    await useChatStore.getState().switchTo("conv_cc_bg");
+
+    let failPatch: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_cc_bg" && init?.method === "PATCH") {
+        return new Promise<Response>((resolve) => {
+          failPatch = () =>
+            resolve(mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const toggling = useChatStore.getState().setCostControlMode("on");
+    await tick();
+    expect(conversationRegistry.peek("conv_cc_bg")!.getState().costControlModeOverride).toBe("on");
+
+    await useChatStore.getState().switchTo("conv_cc_fg");
+    failPatch!();
+    await expect(toggling).rejects.toThrow();
+
+    // The rejected optimistic flip is gone from the conversation that owns it...
+    expect(conversationRegistry.peek("conv_cc_bg")!.getState().costControlModeOverride).toBeNull();
+    // ...and the visible conversation was never touched.
     expect(useChatStore.getState().costControlModeOverride).toBeNull();
   });
 

@@ -314,6 +314,18 @@ export interface ConversationState {
    */
   sessionModelOverride: string | null;
   /**
+   * This session's effective reasoning effort — the server's persisted
+   * ``reasoning_effort`` once hydrated, else the sticky pick applied on bind.
+   * ``null`` when the harness has no effort control or none is set.
+   *
+   * Conversation-scoped for the same reason as ``sessionModelOverride``: two
+   * live conversations can sit at different efforts, and a warm switch back
+   * re-projects this rather than re-binding. ``selectedEffort`` remains the
+   * single app-global sticky pick used for cross-session restore, so it cannot
+   * answer "what is THIS conversation at".
+   */
+  sessionReasoningEffort: string | null;
+  /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
    * disables cost control, ``null`` defers to the spec default.
@@ -705,14 +717,23 @@ export function releaseConversation(id: string): void {
 const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
 let pendingSeq = 0;
 let queueSeq = 0;
-// Tail of each conversation's send chain, keyed by conversation id. A `send`
-// waits on the previous send TO THE SAME CONVERSATION before issuing its POST,
-// so rapid-fire messages reach the server in submission order (concurrent
-// `fetch` POSTs have no ordering guarantee). Per conversation, not global:
-// ordering is only meaningful within a session, and a shared chain lets a
-// stalled send to one conversation delay an unrelated one. Chains only ever
-// resolve, never reject.
-const sendChains = new Map<string | symbol, Promise<void>>();
+// One send chain per conversation, keyed by conversation id. A `send` waits on
+// the previous send TO THE SAME CONVERSATION before issuing its POST, so
+// rapid-fire messages reach the server in submission order (concurrent `fetch`
+// POSTs have no ordering guarantee). Per conversation, not global: ordering is
+// only meaningful within a session, and a shared chain lets a stalled send to
+// one conversation delay an unrelated one. Chains only ever resolve, never
+// reject.
+//
+// The chain is a mutable box rather than a bare promise so a new chat's chain
+// can be RE-KEYED as one unit. Its `tail` is whatever the most recent entrant
+// is waiting to release, so migrating the box carries every already-queued
+// follower with it; replacing a bare promise under the new key would strand
+// them behind the wrong link. See `enterSendChain`.
+interface SendChain {
+  tail: Promise<void>;
+}
+const sendChains = new Map<string | symbol, SendChain>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -734,35 +755,64 @@ function enterSendChain(conversationId: string | null): {
   rekey: (resolvedConversationId: string) => void;
   releaseSend: () => void;
 } {
-  let key: string | symbol = conversationId ?? NEW_SESSION_SEND_CHAIN_KEY;
-  const priorSend = sendChains.get(key) ?? Promise.resolve();
+  const key: string | symbol = conversationId ?? NEW_SESSION_SEND_CHAIN_KEY;
+  let chain = sendChains.get(key);
+  if (chain === undefined) {
+    chain = { tail: Promise.resolve() };
+    sendChains.set(key, chain);
+  }
+  const priorSend = chain.tail;
   let releaseSend: () => void = () => {};
   const slot = new Promise<void>((resolve) => {
     releaseSend = resolve;
   });
-  sendChains.set(key, slot);
+  // Everything entering after us waits on our slot, so the chain stays a strict
+  // FIFO of submission order.
+  chain.tail = slot;
+  // Captured, not re-read: `rekey` may move this chain to another key, and our
+  // release must still find the box we actually queued on.
+  const ownChain = chain;
   return {
     priorSend,
     rekey: (resolvedConversationId) => {
-      // A brand-new chat's id exists only after `createSession`, so this slot
+      // A brand-new chat's id exists only after `createSession`, so this chain
       // starts under the new-session key. `ensureBoundSession` then publishes
       // that id to the store and awaits its bind — a send issued in that window
       // resolves the real id, and would find an empty chain and overtake us.
       //
       // So this MUST run while the id is still private to the creating call:
       // `ensureBoundSession` invokes it via `onSessionResolved`, immediately
-      // after `createSession` and before anything publishes the id. Calling it
-      // after the await would leave the window open (and could clobber a slot
-      // the second send had already taken).
-      if (key === resolvedConversationId) return;
-      if (sendChains.get(key) === slot) sendChains.delete(key);
-      key = resolvedConversationId;
-      sendChains.set(key, slot);
+      // after `createSession` and before anything publishes the id.
+      //
+      // The WHOLE chain moves, not just this send's slot: followers that queued
+      // under the new-session key are already waiting on `ownChain.tail`, so
+      // re-pointing the box preserves their order behind us. Installing a bare
+      // slot at the new key instead would let a send arriving after the id is
+      // published wait on US rather than on the true tail, and the two would
+      // then POST concurrently and could arrive out of order.
+      if (sendChains.get(resolvedConversationId) === ownChain) return;
+      // A pre-existing chain under the real id can't happen (the id was just
+      // minted), but if it somehow did, splice ours behind it rather than
+      // dropping its queued sends on the floor.
+      const existing = sendChains.get(resolvedConversationId);
+      if (existing !== undefined && existing !== ownChain) {
+        const priorTail = existing.tail;
+        ownChain.tail = priorTail.then(() => ownChain.tail);
+      }
+      if (sendChains.get(NEW_SESSION_SEND_CHAIN_KEY) === ownChain) {
+        sendChains.delete(NEW_SESSION_SEND_CHAIN_KEY);
+      }
+      sendChains.set(resolvedConversationId, ownChain);
     },
     releaseSend: () => {
-      // Drop the entry when we're the tail, so the map can't grow without
-      // bound across a long session's conversations.
-      if (sendChains.get(key) === slot) sendChains.delete(key);
+      // Drop the chain when nothing is queued behind us — our slot is still its
+      // tail — so the map can't grow without bound across a long session's
+      // conversations. A follower would have replaced `tail`, and must keep it.
+      if (ownChain.tail === slot) {
+        for (const [k, v] of sendChains) {
+          if (v === ownChain) sendChains.delete(k);
+        }
+      }
       releaseSend();
     },
   };
@@ -864,6 +914,13 @@ function savePickerPref(key: string, value: string | null): void {
     // Ignore — running without storage just means prefs don't survive reload.
   }
 }
+
+// Bumped by every explicit model pick, so a PATCH that resolves out of order can
+// tell whether its canonicalization is still the newest choice. A conversation-id
+// check is not enough: the user can pick in A, switch to B and pick again, then
+// have A's slower PATCH land last — and two reordered picks WITHIN one
+// conversation share an id. Only the newest pick may settle the sticky pref.
+let modelPickRevision = 0;
 
 /**
  * Make `id` the live, active conversation and return setters bound to its entry.
@@ -1037,6 +1094,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   selectedEffort: loadPickerPref(PICKER_PREF_EFFORT_KEY),
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
+  sessionReasoningEffort: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
@@ -1771,7 +1829,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setEffort: async (effort) => {
-    setActive({ selectedEffort: effort });
+    // `selectedEffort` is the cross-session sticky pick; `sessionReasoningEffort`
+    // is this conversation's effective value. An explicit pick sets both.
+    setActive({ selectedEffort: effort, sessionReasoningEffort: effort });
     savePickerPref(PICKER_PREF_EFFORT_KEY, effort);
     const { conversationId } = get();
     if (conversationId) {
@@ -1784,7 +1844,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         staleTime: Infinity,
         retry: false,
       });
-      if (!supportsEffortControl(session)) return;
+      // Harness has no effort control: undo the optimistic session-scoped write
+      // so this conversation doesn't claim an effort the server will never hold.
+      if (!supportsEffortControl(session)) {
+        setterFor(conversationId)({ sessionReasoningEffort: null });
+        return;
+      }
       await updateSession(conversationId, { reasoningEffort: effort });
     }
   },
@@ -1792,6 +1857,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   setModel: async (model) => {
     // `selectedModel` is the sticky pick; `sessionModelOverride` is this
     // session's applied override. An explicit `/model` sets both.
+    modelPickRevision += 1;
+    const pickRevision = modelPickRevision;
     setActive({ selectedModel: model, sessionModelOverride: model });
     savePickerPref(PICKER_PREF_MODEL_KEY, model);
     const { conversationId } = get();
@@ -1803,14 +1870,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // The override belongs to the session that was PATCHed, so apply it there
       // even if the user has since switched away.
       setterFor(conversationId)({ sessionModelOverride: canonical });
-      // `selectedModel` is the cross-session sticky pick: only correct it while
-      // that session is still on screen, or this late canonicalization would
-      // overwrite whatever the conversation the user switched to has since
-      // resolved.
-      if (get().conversationId === conversationId) {
+      // The sticky pref (root + localStorage) is app-global and must reflect the
+      // NEWEST pick, so a slower PATCH that resolves last cannot overwrite it —
+      // otherwise the superseded model returns on reload or in a new chat. Both
+      // writes are gated together: persisting without the root write would leave
+      // them disagreeing until the next reload.
+      if (pickRevision === modelPickRevision) {
         rootSetState({ selectedModel: canonical });
+        savePickerPref(PICKER_PREF_MODEL_KEY, canonical);
       }
-      savePickerPref(PICKER_PREF_MODEL_KEY, canonical);
     }
   },
 
@@ -1827,9 +1895,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
     const previousModel = get().sessionModelOverride;
     const clearModel = mode === "on" && previousModel != null;
+    // Pin the target: these are this conversation's switches, and the PATCH can
+    // outlive a switch away. Resolving the target afterwards would leave a
+    // backgrounded conversation showing an optimistic value the server rejected,
+    // with no re-bind on return to correct it.
+    const patchSet = setterFor(conversationId);
     // Optimistic flip so the pill responds instantly; the PATCH
     // response (or the rollback below) is the settled truth.
-    setActive({
+    patchSet({
       costControlModeOverride: mode,
       ...(clearModel ? { sessionModelOverride: null } : {}),
     });
@@ -1838,19 +1911,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         costControlModeOverride: mode,
         ...(clearModel ? { modelOverride: null } : {}),
       });
-      if (get().conversationId !== conversationId) return;
-      setActive({
+      patchSet({
         costControlModeOverride: session.costControlModeOverride ?? null,
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
       });
     } catch (err) {
       // Roll back so neither control claims a state the server never persisted.
-      if (get().conversationId === conversationId) {
-        setActive({
-          costControlModeOverride: previous,
-          ...(clearModel ? { sessionModelOverride: previousModel } : {}),
-        });
-      }
+      // A disposed entry makes this a no-op, which is the only case worth
+      // skipping — there is no state left to correct.
+      patchSet({
+        costControlModeOverride: previous,
+        ...(clearModel ? { sessionModelOverride: previousModel } : {}),
+      });
       throw err;
     }
   },
@@ -1863,15 +1935,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // (or the rollback below) is the settled truth. Unlike the session's own
     // routing switch this never touches `model_override` — it governs the
     // sub-agents' models, not this session's.
-    setActive({ subagentRoutingOverride: mode });
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    patchSet({ subagentRoutingOverride: mode });
     try {
       const session = await updateSession(conversationId, { subagentRoutingOverride: mode });
-      if (get().conversationId !== conversationId) return;
-      setActive({ subagentRoutingOverride: session.subagentRoutingOverride ?? null });
+      patchSet({ subagentRoutingOverride: session.subagentRoutingOverride ?? null });
     } catch (err) {
-      if (get().conversationId === conversationId) {
-        setActive({ subagentRoutingOverride: previous });
-      }
+      patchSet({ subagentRoutingOverride: previous });
       throw err;
     }
   },
@@ -1903,15 +1974,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     const previous = get().codexPlanMode;
-    setActive({ codexPlanMode: enabled });
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    patchSet({ codexPlanMode: enabled });
     try {
       const session = await updateSession(conversationId, { codexPlanMode: enabled });
-      if (get().conversationId !== conversationId) return;
-      setActive({ codexPlanMode: codexPlanModeFromSession(session) });
+      patchSet({ codexPlanMode: codexPlanModeFromSession(session) });
     } catch (err) {
-      if (get().conversationId === conversationId) {
-        setActive({ codexPlanMode: previous });
-      }
+      patchSet({ codexPlanMode: previous });
       throw err;
     }
   },
@@ -1920,20 +1990,30 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId, oldestItemId, loadingMoreHistory, hasMoreHistory, historyGeneration } =
       get();
     if (!conversationId || !oldestItemId || loadingMoreHistory || !hasMoreHistory) return;
-    setActive({ loadingMoreHistory: true });
+    // Pin the originating conversation: this page belongs to it, and it may be
+    // backgrounded before the fetch lands. Resolving the target afterwards would
+    // strand `loadingMoreHistory: true` on it — and since a live entry is never
+    // re-bound on return, that guard would then no-op every future scroll-up.
+    const pageSet = setterFor(conversationId);
+    pageSet({ loadingMoreHistory: true });
     // Drop the result if the window was reset while this page was in flight
     // (navigate away-and-back, rebind hydration, reconnect re-hydrate): the
     // page is cursor-relative to the OLD window, and prepending it into the
     // new one would invert order or rewind the cursor past a silent gap.
+    //
+    // Backgrounding is NOT staleness — only disposal (the entry is gone, so
+    // nothing to fix) or a generation bump (the window moved under us).
     const stale = (): boolean =>
-      get().conversationId !== conversationId || get().historyGeneration !== historyGeneration;
+      isConversationDisposed(conversationId) ||
+      (setterForState(conversationId)?.historyGeneration ?? historyGeneration) !==
+        historyGeneration;
     try {
       const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
         olderThan: oldestItemId,
       });
       if (stale()) return;
       const newBlocks = itemsToBlocks(items);
-      setActive((state) => {
+      pageSet((state) => {
         // Rebind hydration resets the cursor to the fresh window's top while
         // keeping scrolled-up blocks, so an older page can overlap — dedupe.
         const seen = new Set(
@@ -1952,7 +2032,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (stale()) return;
       // Disable further fetches on error — a persistent server failure
       // would otherwise re-trigger the scroll listener on every scroll event.
-      setActive({ loadingMoreHistory: false, hasMoreHistory: false });
+      pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
     }
   },
 }));
@@ -2041,6 +2121,23 @@ function isConversationStreamCurrent(id: string): boolean {
   if (entry === undefined || entry.disposed) return false;
   const state = entry.getState();
   return state.abortController !== null && state.conversationLoadError === null;
+}
+
+/**
+ * Tear down an entry's stream, keeping the entry itself alive.
+ *
+ * Needed before re-binding a live entry: a failed snapshot leaves
+ * `conversationLoadError` set while its pump is still running (`bindStream`
+ * catches the error without aborting), so binding again would strand the old
+ * pump — two subscribers on one entry, double-applying any delta that carries no
+ * item id to dedupe on. Aborting ends the reconnect loop and cancels the
+ * in-flight fetch; `bindStream` installs the replacement controller.
+ */
+function abortConversationStream(entry: ConversationEntry): void {
+  const { abortController } = entry.getState();
+  if (abortController === null) return;
+  abortController.abort();
+  entry.setState({ abortController: null });
 }
 
 /** A conversation's state if it is still live, else `null`. */
@@ -2354,6 +2451,14 @@ async function ensureBoundSession(
       // message, run the turn, and publish events into an empty subscriber set;
       // the user would never see the response. Rebind first, and fail loud if
       // the rebind itself can't establish the stream.
+      //
+      // Tear the old pump down first. A snapshot failure leaves
+      // `conversationLoadError` set while its pump is STILL OPEN (`bindStream`
+      // catches the snapshot error without aborting the controller), so
+      // rebinding blind would replace the stored controller and leave two
+      // subscribers on one entry — and deltas with no item id, which nothing can
+      // dedupe, would then apply twice.
+      abortConversationStream(entry);
       entry.setState({ conversationLoadError: null });
       await bindStream(sessionId, entrySetter(entry), entryGetter(entry));
       const loadError = entry.getState().conversationLoadError;
@@ -2867,6 +2972,9 @@ async function bindStream(
         // user switched away (or a second concurrent bind) would otherwise
         // overwrite the visible conversation's picker, last-response-wins.
         //
+        // This conversation's own effective effort, which is what a warm switch
+        // back re-projects (it does not re-bind, so it cannot recompute it).
+        sessionReasoningEffort: effectiveEffort,
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
@@ -4633,13 +4741,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToNamedConversation(event.conversationId, { sessionModelOverride: event.model });
       return;
     case "session_reasoning_effort":
-      // A thinking-level switch made inside a native terminal. Reflect it
-      // in the picker for the open session; the server persisted
-      // reasoning_effort, so reload restores the same value.
-      // Guard by conversation id so a late event from a previous session
-      // cannot overwrite the effort picker for the currently-open one.
-      // Sticky app-level pref, but only adopt a value reported by the
-      // conversation the user is actually looking at.
+      // A thinking-level switch made inside a native terminal. The session's own
+      // effective effort always lands, background included — a live conversation
+      // is never re-bound on return, so dropping it here would leave the picker
+      // wrong until a refresh.
+      applyToNamedConversation(event.conversationId, {
+        sessionReasoningEffort: event.reasoningEffort,
+      });
+      // `selectedEffort` is the app-global sticky pick, so only adopt a value
+      // reported by the conversation the user is actually looking at.
       if (
         event.conversationId === sourceConversationId &&
         useChatStore.getState().conversationId === event.conversationId

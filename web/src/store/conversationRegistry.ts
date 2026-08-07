@@ -164,10 +164,15 @@ export class ConversationRegistry {
    *
    * Only used to exempt it from eviction — no behaviour is gated on being
    * active. Pass `null` on the landing route.
+   *
+   * Re-trims, because moving the exemption can make the OUTGOING conversation
+   * evictable: an over-cap registry that only stayed over-cap to protect it
+   * must shrink now, not wait for an unrelated acquire.
    */
   setActive(id: string | null): void {
     this.activeId = id;
     if (id !== null) this.touch(id);
+    this.evictIfOverBudget(id ?? undefined);
   }
 
   /** The conversation on screen, or `null`. */
@@ -230,10 +235,11 @@ export class ConversationRegistry {
    * exceed the cap: going over budget costs memory and a connection slot, while
    * evicting would destroy a user's message.
    *
-   * Runs on `acquire` and again whenever a pin clears, because an over-cap
-   * registry has to be able to shrink without waiting for the next acquire —
-   * otherwise repeated send-and-switch leaves the excess streams open
-   * indefinitely and can exhaust an HTTP/1.1 connection pool.
+   * Runs from every path that can make an entry evictable — `acquire`, a
+   * clearing pin, and `setActive` (which moves the on-screen exemption) —
+   * because an over-cap registry has to shrink at that moment rather than
+   * waiting for an unrelated acquire. Otherwise repeated send-and-switch leaves
+   * the excess streams open indefinitely and can exhaust an HTTP/1.1 pool.
    *
    * :param justAcquiredId: entry the caller is about to be handed, if any.
    */
