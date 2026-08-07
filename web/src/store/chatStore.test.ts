@@ -116,6 +116,16 @@ function nativeToolItem(responseId: string): ConversationItem {
   };
 }
 
+// Controllers of every open `emptyStream`, closed in `afterEach`.
+//
+// Aborting the store's `AbortController` does NOT settle a parked
+// `reader.read()`: `mockResponse` hands back a plain object, so there is no
+// fetch plumbing tying the signal to the stream (a real fetch errors the body on
+// abort). Without closing these explicitly, `parseSseStream` stays parked on the
+// read forever and the pump outlives the test — `conversationRegistry.clear()`
+// aborts the controller, which is not enough.
+const openEmptyStreams = new Set<ReadableStreamDefaultController<Uint8Array>>();
+
 // A stream that delivers no events and stays open, like a real idle session
 // stream between turns (the server holds it and emits heartbeats). Never
 // closing keeps it OPEN — `switchTo`/`ensureBoundSession` treat a stream that
@@ -125,11 +135,30 @@ function nativeToolItem(responseId: string): ConversationItem {
 // Deliberately not `data: [DONE]`: in production that sentinel means a
 // clean server-side close, which is terminal by design.
 function emptyStream(): ReadableStream<Uint8Array> {
+  let own: ReadableStreamDefaultController<Uint8Array> | null = null;
   return new ReadableStream({
-    start() {
-      // Left open; `afterEach` aborts the controller, which cancels the read.
+    start(controller) {
+      own = controller;
+      openEmptyStreams.add(controller);
+    },
+    cancel() {
+      // The consumer let go first, so this one needs no closing. Drop only its
+      // own controller — the set holds every other live stream's too.
+      if (own !== null) openEmptyStreams.delete(own);
     },
   });
+}
+
+/** Close every open `emptyStream` so parked readers settle. */
+function closeOpenEmptyStreams(): void {
+  for (const controller of openEmptyStreams) {
+    try {
+      controller.close();
+    } catch {
+      // Already closed or errored — nothing to do.
+    }
+  }
+  openEmptyStreams.clear();
 }
 
 function mockResponse(
@@ -403,6 +432,10 @@ afterEach(() => {
   // so tear the registry down or its pumps outlive the test and leak into the
   // next one's fetch mock.
   conversationRegistry.clear();
+  // Aborting is not enough on its own: the mocked Response has no fetch
+  // plumbing, so nothing errors the body and `parseSseStream` stays parked on
+  // `reader.read()`. Close the streams so those reads actually settle.
+  closeOpenEmptyStreams();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   // Reset the stubbed viewer identity to the default (null) so a value set
@@ -440,6 +473,37 @@ function seedPendingInputs(
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
+
+describe("test harness teardown", () => {
+  it("settles a parked SSE reader, which aborting alone cannot do", async () => {
+    // Guards the `afterEach` contract. The default `/stream` mock stays open (so
+    // background retention is exercised faithfully), but `mockResponse` returns a
+    // plain object with no fetch plumbing — so aborting the store's controller
+    // never errors the body, and `parseSseStream` would stay parked on
+    // `reader.read()` for the whole run. Closing the stream is what settles it.
+    seedSession("conv_teardown", []);
+    await useChatStore.getState().switchTo("conv_teardown");
+    expect(openEmptyStreams.size).toBeGreaterThan(0);
+
+    // What `conversationRegistry.clear()` does, and all it does.
+    useChatStore.getState().abortController?.abort();
+    const stream = emptyStream();
+    const reader = stream.getReader();
+    let settled = false;
+    void reader.read().then(() => {
+      settled = true;
+    });
+    await tick();
+    // Still parked: the abort above has no relationship to this stream.
+    expect(settled).toBe(false);
+
+    closeOpenEmptyStreams();
+    await tick();
+    // Closing settled it, and the registry of open streams is empty.
+    expect(settled).toBe(true);
+    expect(openEmptyStreams.size).toBe(0);
+  });
+});
 
 describe("chatStore — switchTo", () => {
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
