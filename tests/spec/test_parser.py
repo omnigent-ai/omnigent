@@ -2884,6 +2884,60 @@ def test_parse_spawn_true_sets_flag(tmp_path: Path) -> None:
     assert spec.spawn is True
 
 
+# ─── Top-level ``team:`` flag (peer-messaging opt-in) ─────────
+
+
+def test_parse_team_defaults_to_false_when_omitted(agent_dir: Path) -> None:
+    """
+    Without a top-level ``team:`` key the parsed ``AgentSpec.team``
+    is ``False``.
+
+    Default-off keeps the child-only write scope: ``sys_session_send`` by
+    ``session_id`` can reach only the caller's direct children. A regression
+    flipping this default would let any agent message siblings across its
+    whole spawn tree without the tree ever opting in.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    spec = parse(agent_dir)
+    assert spec.team is False
+
+
+def test_parse_team_true_sets_flag(tmp_path: Path) -> None:
+    """
+    ``team: true`` in config.yaml round-trips to ``AgentSpec.team == True``.
+
+    The flag is what ``_resolve_team`` surfaces on the session snapshot and
+    the runner's peer-send gate reads on BOTH endpoints. A parser regression
+    that dropped the field would make the YAML opt-in silently inert — peer
+    sends would keep failing as ``session_out_of_tree``.
+
+    :param tmp_path: pytest-provided temporary directory.
+    """
+    config = {"spec_version": 1, "name": "team-agent", "team": True}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.team is True
+
+
+def test_parse_team_is_independent_of_spawn(tmp_path: Path) -> None:
+    """
+    ``team:`` and ``spawn:`` are separate opt-ins and do not imply each other.
+
+    They gate different things — ``spawn`` grants the child-write tools at
+    all, ``team`` widens who a send may address. Coupling them would either
+    grant peer messaging to every spawner or make teams impossible without
+    the full spawn surface.
+
+    :param tmp_path: pytest-provided temporary directory.
+    """
+    config = {"spec_version": 1, "name": "team-only", "team": True}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.team is True
+    assert spec.spawn is False
+
+
 def test_parse_share_defaults_to_none_when_omitted(agent_dir: Path) -> None:
     """
     Without a top-level ``agent_session_sharing:`` key the parsed

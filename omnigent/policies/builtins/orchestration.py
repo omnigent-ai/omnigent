@@ -531,6 +531,87 @@ def headless_subagent_purpose_guard(
     return _evaluate
 
 
+def team_bounds(
+    *,
+    max_peer_sends_per_turn: int = 3,
+    max_team_peers: int = 10,
+) -> Callable[[_Json], _Json]:
+    """
+    Factory: bound agent-team peer messaging so a team cannot grow unbounded.
+
+    Complements :func:`spawn_bounds` (which caps *child* dispatches per turn)
+    for teams that opt into peer-to-peer messaging (top-level ``team:``). A
+    peer send is a ``sys_session_send`` addressing an existing session by
+    ``session_id`` — i.e. one that carries ``args`` plus a ``session_id`` and
+    no ``agent``/``title``. This policy:
+
+    - DENIES once more than *max_peer_sends_per_turn* peer sends are made in a
+      single turn (per-turn wave bound, reset via the ``reset_turn`` hook), and
+    - DENIES once a session has peer-messaged more than *max_team_peers*
+      DISTINCT peers over the run (cumulative team-fanout bound), so transitive
+      peer contact cannot expand the effective team without limit.
+
+    Named ``(agent, title)`` sends and child sends are ignored here — they are
+    bounded by :func:`spawn_bounds`. Cross-turn *live* concurrency is still the
+    single-turn-per-session guard's job; this is the team-shape bound.
+
+    :param max_peer_sends_per_turn: Maximum peer sends allowed in one turn,
+        e.g. ``3``.
+    :param max_team_peers: Maximum distinct peer sessions a member may message
+        over the whole run, e.g. ``10``.
+    :returns: A stateful evaluator ``fn(event)`` carrying a ``reset_turn``
+        attribute, returning a V0 decision dict.
+    """
+    state: dict[str, Any] = {"turn_count": 0, "peers": set()}
+
+    def _evaluate(event: _Json) -> _Json:
+        """
+        Count and bound agent-team peer sends.
+
+        :param event: V0 event; a peer send is a ``sys_session_send``
+            ``tool_call`` carrying ``session_id`` (by-id addressing).
+        :returns: ALLOW, or DENY once a team bound is exceeded.
+        """
+        args = _tool_call(event, {"sys_session_send"})
+        if args is None:
+            return _ALLOW
+        target = args.get("session_id")
+        # Only by-session-id sends are peer sends; (agent, title) creates and
+        # continues are child dispatches bounded by spawn_bounds.
+        if not isinstance(target, str) or not target:
+            return _ALLOW
+        state["turn_count"] += 1
+        if state["turn_count"] > max_peer_sends_per_turn:
+            return _decision(
+                "DENY",
+                f"Exceeded {max_peer_sends_per_turn} team peer sends this turn; "
+                "collect the running batch before messaging more teammates.",
+            )
+        peers = state["peers"]
+        if target not in peers and len(peers) >= max_team_peers:
+            return _decision(
+                "DENY",
+                f"Team fan-out limit reached ({max_team_peers} distinct peers); "
+                "this session has already peer-messaged the maximum number of teammates.",
+            )
+        peers.add(target)
+        return _ALLOW
+
+    def reset_turn() -> None:
+        """
+        Reset the per-turn peer-send counter at each turn boundary.
+
+        The cumulative distinct-peer set persists across turns.
+
+        :returns: ``None``.
+        """
+        state["turn_count"] = 0
+
+    # FunctionPolicy looks for this attribute to reset per-turn state.
+    _evaluate.reset_turn = reset_turn  # type: ignore[attr-defined]
+    return _evaluate
+
+
 def worktree_guard(
     *,
     allowed_root: str = ".worktrees",
@@ -708,6 +789,13 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "name": "Require Purpose on Sub-Agent Dispatches",
         "description": "Requires every sub-agent dispatch to declare a purpose "
         "(implement, review, explore, search)",
+    },
+    {
+        "handler": "omnigent.policies.builtins.orchestration.team_bounds",
+        "kind": "factory",
+        "name": "Limit Agent-Team Peer Messaging",
+        "description": "Bounds agent-team peer sends (sys_session_send by session_id) "
+        "per turn and caps distinct peers per session to prevent unbounded team fan-out",
     },
     {
         "handler": "omnigent.policies.builtins.orchestration.worktree_guard",

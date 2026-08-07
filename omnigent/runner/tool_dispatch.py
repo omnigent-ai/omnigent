@@ -2098,6 +2098,53 @@ async def _execute_subagent_tool(
     )
 
 
+async def _peer_send_allowed(
+    *,
+    target_snapshot: _JsonObject,
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> bool:
+    """
+    Return whether a caller may peer-message a non-child target.
+
+    Agent-team relaxation of the child-only rule: a send to a session that
+    is NOT the caller's direct child is permitted iff both sit under the
+    same spawn-tree root AND the team opted into peer messaging. Membership
+    derives from the lead's spec (top-level ``team:``); a teammate cannot
+    self-promote.
+
+    The shared-root check mirrors the read scope that
+    ``sys_session_get_history`` already enforces (see
+    ``omnigent/tools/builtins/spawn.py`` ``_resolve_session_target``), so
+    peer *writes* never reach further than peer *reads* already do. The
+    team flag is required on BOTH endpoints — a conservative AND that, for
+    the common shared-bundle team, equals the root's flag, and for a
+    mixed-bundle tree requires both parties to consent to team messaging.
+
+    :param target_snapshot: The already-fetched ``GET /v1/sessions``
+        snapshot of the peer target.
+    :param conversation_id: The caller's own session id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when the peer send is authorized, else ``False``.
+    """
+    target_root = target_snapshot.get("root_conversation_id")
+    if not target_root:
+        return False
+    if not target_snapshot.get("team"):
+        return False
+    try:
+        caller_snap = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=30.0)
+    except Exception:  # noqa: BLE001
+        return False
+    if caller_snap.status_code != 200:
+        return False
+    caller_data = caller_snap.json()
+    caller_root = caller_data.get("root_conversation_id") or conversation_id
+    if caller_root != target_root:
+        return False
+    return bool(caller_data.get("team"))
+
+
 async def _send_to_existing_session(
     target_session_id: str,
     message: str,
@@ -2108,25 +2155,34 @@ async def _send_to_existing_session(
     created_by: str | None = None,
 ) -> str:
     """
-    Post a message to an existing direct-child session, return a handle.
+    Post a message to an existing child — or team peer — session.
 
-    The by-session-id mode of ``sys_session_send``. **Child-only**: the
-    target must be a direct child of the caller (its
+    The by-session-id mode of ``sys_session_send``. **Child-only by
+    default**: the target must be a direct child of the caller (its
     ``parent_session_id`` equals ``conversation_id``), so a caller can
-    only drive sessions inside its own subtree — never a sibling or an
-    unrelated session it merely has access to. Looks the target up to
-    verify parentage (404 → ``session_not_found``; wrong parent or
-    denied read → ``session_out_of_tree``), registers the child→parent
-    fan-out and work mappings, posts the message, and returns a
-    ``running`` handle immediately — the completion lands in the parent's
-    ``sys_read_inbox`` queue, matching named-mode send.
+    only drive sessions inside its own subtree. The one exception is an
+    **agent team**: when the tree opted in (top-level ``team:``), a send to
+    a sibling / cousin sharing the caller's spawn-tree root is permitted
+    (see :func:`_peer_send_allowed`). Looks the target up to verify
+    parentage or team membership (404 → ``session_not_found``; neither
+    child nor authorized peer → ``session_out_of_tree``), registers the
+    fan-out and work mappings, posts the message, and returns a ``running``
+    handle immediately.
 
-    :param target_session_id: The existing child session id, e.g.
+    Completion routing splits by mode: a child send delivers into the
+    parent's (== caller's) ``sys_read_inbox``; a peer send delivers into
+    the SENDER's inbox via ``awaiter_session_id``, so the teammate that
+    reached out gets the result even though the target's structural parent
+    is the lead. The target's live SSE deltas keep flowing to its
+    structural parent's UI either way (``register_child_session`` is left
+    untouched for a peer send).
+
+    :param target_session_id: The existing child or peer session id, e.g.
         ``"conv_abc123"``.
     :param message: The user message text to post.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's own session id — the required
-        parent of the target.
+        parent for a child send, or a team peer for a peer send.
     :returns: JSON handle on success; a JSON/text error otherwise.
     """
     from omnigent.runner import app as _runner_app
@@ -2142,17 +2198,31 @@ async def _send_to_existing_session(
     if snap.status_code != 200:
         return f"Error: sys_session_send lookup returned {snap.status_code}"
     snap_data = snap.json()
-    if snap_data.get("parent_session_id") != conversation_id:
-        return json.dumps(
-            {
-                "error": "session_out_of_tree",
-                "conversation_id": target_session_id,
-                "message": (
-                    "target is not a direct child of the calling session; "
-                    "sys_session_send by session_id is child-only."
-                ),
-            }
+    is_child = snap_data.get("parent_session_id") == conversation_id
+    is_peer = False
+    if not is_child:
+        is_peer = await _peer_send_allowed(
+            target_snapshot=snap_data,
+            conversation_id=conversation_id,
+            server_client=server_client,
         )
+        if not is_peer:
+            return json.dumps(
+                {
+                    "error": "session_out_of_tree",
+                    "conversation_id": target_session_id,
+                    "message": (
+                        "target is not a direct child of the calling session, "
+                        "and is not an authorized team peer (both sessions must "
+                        "share a spawn-tree root and opt into 'team:'); "
+                        "sys_session_send by session_id is child-only outside "
+                        "an agent team."
+                    ),
+                }
+            )
+    # For a peer send the SENDER awaits the completion; for a child send the
+    # awaiter defaults to the parent (== caller), leaving routing unchanged.
+    awaiter_session_id = conversation_id if is_peer else None
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
             {
@@ -2174,23 +2244,28 @@ async def _send_to_existing_session(
             f"Error: session {target_session_id!r} is already running; "
             "wait for completion before sending again"
         )
+    # SSE fan-out follows the STRUCTURAL parent so the target's live deltas
+    # keep rendering in its owner's UI panel. For a child send that is the
+    # caller; for a peer send it stays the target's real parent.
+    structural_parent = snap_data.get("parent_session_id") or conversation_id
     _runner_app.register_child_session(
         target_session_id,
-        parent_session_id=conversation_id,
+        parent_session_id=structural_parent,
         title=snap_data.get("title") or "",
         tool=agent_label,
         session_name=parsed.title or "",
     )
     _runner_app.register_subagent_work(
-        parent_session_id=conversation_id,
+        parent_session_id=structural_parent,
         child_session_id=target_session_id,
         agent=agent_label,
         title=parsed.title or "",
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
+        awaiter_session_id=awaiter_session_id,
     )
     _publish_child_launching_update(
-        parent_session_id=conversation_id,
+        parent_session_id=structural_parent,
         child_session_id=target_session_id,
         title=snap_data.get("title") or "",
         tool=agent_label,

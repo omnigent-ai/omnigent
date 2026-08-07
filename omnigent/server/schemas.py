@@ -1882,6 +1882,12 @@ class SessionResponse(BaseModel):
     root_conversation_id: str | None = None
     llm_model: str | None = None
     harness: str | None = None
+    # Whether this session's bound agent opted its spawn tree into agent-team
+    # peer messaging (top-level ``team:`` in the spec). Read by the runner's
+    # peer-send authorization to decide if sessions under a shared team root
+    # may message each other directly. ``None`` when the agent can't be looked
+    # up. See :attr:`AgentSpec.team`.
+    team: bool | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None

@@ -1494,6 +1494,20 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``sys_session_get_history`` / ``sys_session_get_info``)
         are always registered and are not affected by either
         opt-in.
+    :param team: Whether this agent's session tree is an *agent team* —
+        i.e. sessions sharing this session's spawn-tree root may message
+        each OTHER directly (peer-to-peer), not only their structural
+        parent. YAML key is ``team:`` (top-level boolean, like ``spawn:``).
+        **Defaults to ``False``**, preserving the child-only write scope:
+        with ``team`` unset, ``sys_session_send`` by ``session_id`` can
+        target only the caller's direct children. When ``True``, a peer
+        send to a session under the same team root is permitted, and the
+        turn's completion is delivered to the SENDER's inbox rather than
+        the target's structural parent. Only the team root's spec is
+        consulted, so a teammate cannot self-promote — membership derives
+        from the lead. Reads (``sys_session_list`` /
+        ``sys_session_get_history``) are already team-root scoped and are
+        unaffected by this flag.
     :param agent_session_sharing: Authority for the agent to share the
         session it is running in, via ``sys_session_share``. YAML key is
         ``agent_session_sharing:`` (top-level, like ``spawn:``). This
@@ -1549,4 +1563,5 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
+    team: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
