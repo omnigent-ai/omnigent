@@ -43,6 +43,7 @@ from omnigent.runner._entry import (
 )
 from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_OWNER_TOKEN_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
@@ -318,10 +319,10 @@ def test_initial_host_token_defers_local_auth_until_rejected(
 def test_initial_host_token_immediately_mints_managed_owner_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A managed runner uses the host bearer only as mint proxy auth.
+    """A managed runner keeps ingress and owner credentials separate.
 
-    Application requests must carry the owner-bound minted token, never the
-    CoDA service principal bearer that merely crosses the Apps ingress.
+    Application requests use the host bearer to cross the Apps ingress and
+    carry the owner-bound minted token in the internal owner-token header.
     """
     mint_calls: list[int] = []
 
@@ -357,7 +358,8 @@ def test_initial_host_token_immediately_mints_managed_owner_token(
         request,
         httpx.Response(200),
     )
-    assert captured == ["Bearer managed-minted-token"]
+    assert captured == ["Bearer host-bootstrap-token"]
+    assert request.headers[RUNNER_OWNER_TOKEN_HEADER] == "managed-minted-token"
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(

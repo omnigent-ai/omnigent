@@ -47,6 +47,14 @@ def test_resolves_databricks_default_to_gateway_v2(monkeypatch: pytest.MonkeyPat
     assert provider.base_url == "https://wkspc.example.com/ai-gateway/mlflow/v1"
     assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
+    rendered = provider.to_models_config()["providers"]["omnigent"]
+    assert rendered["compat"] == {
+        "supportsDeveloperRole": False,
+        "supportsStore": False,
+        "supportsStrictMode": False,
+        "supportsReasoningEffort": False,
+        "supportsUsageInStreaming": False,
+    }
     # apiKey is a "!command" so Pi refreshes the gateway token per request.
     assert provider.api_key.startswith("!")
     assert "demo-staging" in provider.api_key

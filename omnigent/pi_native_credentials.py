@@ -194,6 +194,9 @@ class PiProviderConfig:
         request time, used for short-lived gateway tokens).
     :param auth_header: When ``True``, Pi sends ``Authorization: Bearer
         <apiKey>`` (gateways) instead of a provider-native key header.
+    :param compat: Optional Pi wire-compatibility flags for the primary
+        provider. Databricks' MLflow gateway rejects OpenAI-only fields such as
+        ``store`` and ``stream_options`` even when their values are false.
     :param credential_warning: A user-facing notice set when the provider was
         rendered but its credentials could not be resolved (e.g. an expired
         Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
@@ -211,6 +214,7 @@ class PiProviderConfig:
     model: str
     api_key: str
     auth_header: bool
+    compat: _PiProviderCompat | None = None
     credential_warning: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
@@ -321,6 +325,8 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
+        if self.compat is not None:
+            provider["compat"] = self.compat
         providers = {self.provider_id: provider}
         providers.update(additional)
         return {"providers": providers}
@@ -438,6 +444,13 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # refresh), matching codex-native's refresh semantics.
         api_key=api_key,
         auth_header=True,
+        compat={
+            "supportsDeveloperRole": False,
+            "supportsStore": False,
+            "supportsStrictMode": False,
+            "supportsReasoningEffort": False,
+            "supportsUsageInStreaming": False,
+        },
         extra_models=claude_models,
         additional_providers=additional,
         credential_warning=credential_warning,
