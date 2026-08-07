@@ -83,6 +83,10 @@ def _read_records(path: Path) -> list[dict[str, object]]:
             False,
         ),
         (httpx.PoolTimeout("no slot", request=httpx.Request("POST", "http://test")), False),
+        # Raised before the request reached the transport, so it carries no
+        # request and nothing was sent. A runner whose auth flow fails closed
+        # raises exactly this. Safe to retry.
+        (httpx.RequestError("token refresh returned no token"), False),
         # Request was sent and no response was seen — the server may have
         # committed it. Ambiguous: a retry could duplicate.
         (httpx.ReadTimeout("no response", request=httpx.Request("POST", "http://test")), True),

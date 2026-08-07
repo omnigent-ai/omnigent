@@ -146,6 +146,10 @@ def post_may_have_been_delivered(exc: httpx.HTTPError) -> bool:
     - Connection-establishment / pool-acquire failures
       (:data:`_DELIVERY_SAFE_RETRY_ERRORS`): no bytes were sent → not
       delivered → safe to retry, so ``False``.
+    - Errors raised before the request was bound to the transport (no
+      ``.request``, e.g. an auth flow that fails closed instead of
+      yielding the request): nothing was sent → safe to retry, so
+      ``False``.
     - Any other transport error (read/write timeout, read/write error,
       remote protocol error): the request was sent and we never saw a
       response, so the server may have processed it → ambiguous →
@@ -158,6 +162,12 @@ def post_may_have_been_delivered(exc: httpx.HTTPError) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return False
     if isinstance(exc, _DELIVERY_SAFE_RETRY_ERRORS):
+        return False
+    # httpx raises RuntimeError when no request was ever attached, which only
+    # happens if the failure preceded the send.
+    try:
+        _ = exc.request
+    except RuntimeError:
         return False
     return True
 
