@@ -1842,16 +1842,27 @@ def register_events_routes(
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
             if bound_host is not None and bound_host.sandbox_id is not None:
-                from omnigent.server.managed_hosts import terminate_managed_host
+                keep_shared_coda_host = False
+                if bound_host.sandbox_provider == "coda":
+                    remaining = await asyncio.to_thread(
+                        conversation_store.list_conversations,
+                        limit=1000,
+                        kind=None,
+                    )
+                    keep_shared_coda_host = any(
+                        session.host_id == bound_host.host_id for session in remaining.data
+                    )
+                if not keep_shared_coda_host:
+                    from omnigent.server.managed_hosts import terminate_managed_host
 
-                await terminate_managed_host(
-                    bound_host,
-                    host_store_for_managed,
-                    # Supplies the launcher for the provider-side
-                    # terminate; None (config removed since launch)
-                    # still deletes the row and revokes the token.
-                    getattr(request.app.state, "sandbox_config", None),
-                )
+                    await terminate_managed_host(
+                        bound_host,
+                        host_store_for_managed,
+                        # Supplies the launcher for the provider-side
+                        # terminate; None (config removed since launch)
+                        # still deletes the row and revokes the token.
+                        getattr(request.app.state, "sandbox_config", None),
+                    )
         try:
             import hashlib as _hashlib
             import time as _time

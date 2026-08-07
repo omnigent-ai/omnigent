@@ -2305,6 +2305,11 @@ async def launch_managed_host(
         startup, or registration fails.
     """
     launcher = config.launcher_factory()
+    if launcher.provider == "coda":
+        from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+        if isinstance(launcher, CodaProvider):
+            launcher.set_lease_owner(owner)
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness

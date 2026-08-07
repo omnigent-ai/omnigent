@@ -56,6 +56,11 @@ class CodaProvider(SandboxHostLauncher):
         self._workspace_path = workspace_path
         self._request_fn = request_fn or self._request
         self._app_getter = app_getter or self._get_app
+        self._lease_owner: str | None = None
+
+    def set_lease_owner(self, owner: str) -> None:
+        """Set the user principal used by CoDA's authoritative lease CAS."""
+        self._lease_owner = owner
 
     @staticmethod
     def _get_app(app_name: str) -> object:
@@ -103,7 +108,7 @@ class CodaProvider(SandboxHostLauncher):
     def provision(self, name: str) -> str:
         """Acquire a fenced CoDA lease without creating infrastructure."""
         lease_id = uuid.uuid4().hex
-        self._request_fn(
+        result = self._request_fn(
             "POST",
             "/api/omnigent-host/lease",
             {
@@ -111,9 +116,13 @@ class CodaProvider(SandboxHostLauncher):
                 "app_name": self._app_name,
                 "host_name": name,
                 "lease_id": lease_id,
+                "owner": self._lease_owner,
             },
         )
-        return f"coda:{self._app_name}#{lease_id}"
+        acquired_id = result.get("lease_id", lease_id)
+        if not isinstance(acquired_id, str) or not acquired_id:
+            raise click.ClickException("CoDA lease response omitted lease_id")
+        return f"coda:{self._app_name}#{acquired_id}"
 
     def start_host(
         self,
@@ -158,6 +167,21 @@ class CodaProvider(SandboxHostLauncher):
             raise click.ClickException(
                 "CoDA connect response did not contain an absolute workspace"
             )
+        return workspace
+
+    def allocate_workspace(self, sandbox_id: str, session_id: str) -> str:
+        """Create and return a session-specific directory on the active lease."""
+        app_name, lease_id = _parse_sandbox_id(sandbox_id)
+        if app_name != self._app_name:
+            raise click.ClickException("CoDA sandbox id targets a different app")
+        result = self._request_fn(
+            "POST",
+            "/api/omnigent-host/workspaces",
+            {"lease_id": lease_id, "session_id": session_id},
+        )
+        workspace = result.get("workspace")
+        if not isinstance(workspace, str) or not workspace.startswith("/"):
+            raise click.ClickException("CoDA did not return an absolute session workspace")
         return workspace
 
     def terminate(self, sandbox_id: str) -> None:
