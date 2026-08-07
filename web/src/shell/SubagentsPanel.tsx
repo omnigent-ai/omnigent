@@ -57,7 +57,11 @@ import { cn } from "@/lib/utils";
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
-import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  nativeCodingAgentForHarness,
+  nativeCodingAgentForWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import {
   activityDotClassName,
   childStatus,
@@ -77,7 +81,6 @@ const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
-const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
 
 /**
@@ -301,6 +304,21 @@ export function iconForAgentType(tool: string | null): AgentRowIcon {
  * @returns The Claude/Codex/pi glyph component, or ``null`` for generic agents.
  */
 function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
+  // Prefer the resolved harness (reflects routing decisions) over the wrapper
+  // label (only set for native-terminal sessions launched directly).
+  const harnessAgent = nativeCodingAgentForHarness(child.harness);
+  if (harnessAgent != null) {
+    if (harnessAgent.iconKind === "claude") return ClaudeIcon;
+    if (harnessAgent.iconKind === "codex") return CodexIcon;
+    if (harnessAgent.iconKind === "opencode") return OpenCodeIcon;
+    if (harnessAgent.iconKind === "pi") return PiIcon;
+    if (harnessAgent.iconKind === "cursor") return CursorIcon;
+    if (harnessAgent.iconKind === "kiro") return KiroIcon;
+    if (harnessAgent.iconKind === "antigravity") return AntigravityIcon;
+    if (harnessAgent.iconKind === "goose") return GooseIcon;
+    if (harnessAgent.iconKind === "kimi") return KimiIcon;
+    if (harnessAgent.iconKind === "hermes") return HermesIcon;
+  }
   const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
@@ -314,7 +332,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   if (nativeAgent?.iconKind === "hermes") return HermesIcon;
   // Exact match — substring checks would false-match names like "pipeline".
-  if (child.tool === PI_AGENT_NAME) return PiIcon;
+  if (child.tool === "pi") return PiIcon;
   return null;
 }
 

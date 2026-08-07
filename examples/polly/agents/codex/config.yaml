@@ -5,11 +5,7 @@ description: Codex coding sub-agent — implements, cross-vendor reviews, or exp
 executor:
   type: omnigent
   config:
-    harness: codex-native
-    # YOLO: headless workers can't answer approval prompts, so run Codex
-    # with full bypass. The server translates this into
-    # ``--dangerously-bypass-approvals-and-sandbox`` (native sub-agents only).
-    yolo: true
+    harness: codex
 
 prompt: |
   You are Codex, a coding sub-agent dispatched by the polly

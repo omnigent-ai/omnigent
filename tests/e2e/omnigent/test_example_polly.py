@@ -90,20 +90,19 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
         "opencode",
         "pi",
     ]
-    assert fam["claude_code"] == "claude-native"
-    assert fam["codex"] == "codex-native"
+    assert fam["claude_code"] == "claude-sdk"
+    assert fam["codex"] == "codex"
     assert fam["opencode"] == "opencode-native"
     assert fam["cursor"] == "cursor-native"
-    assert fam["hermes"] == "hermes-native"
-    assert fam["agy"] == "antigravity-native"
+    assert fam["hermes"] == "hermes"
+    assert fam["agy"] == "antigravity"
     assert fam["pi"] == "pi"
     # Seven distinct vendors → any implementer's diff is reviewable by another.
     assert len(set(fam.values())) == 7
-    # Headless bypass knobs so workers don't stall on ApprovalCards.
+    # cursor still needs headless bypass; claude-sdk and codex default to
+    # auto-approve / approvalPolicy=never at the harness level.
     by_name = {a.name: a for a in polly_spec.sub_agents}
-    assert by_name["claude_code"].executor.config.get("permission_mode") == "auto"
     assert by_name["claude_code"].executor.model is None
-    assert by_name["codex"].executor.config.get("yolo") in (True, "True", "true")
     assert by_name["cursor"].executor.config.get("yolo") in (True, "True", "true")
     assert by_name["cursor"].executor.model == "grok-4.5"
     for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):

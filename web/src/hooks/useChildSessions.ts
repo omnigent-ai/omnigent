@@ -57,6 +57,11 @@ export interface ChildSessionInfo {
    * not routed (routing off, or a server that predates the field).
    */
   routed_model?: string | null;
+  /**
+   * Effective harness for this child session, e.g. ``"codex"`` or
+   * ``"pi"``. Reflects the routing decision when Smart Routing is on.
+   */
+  harness?: string | null;
 }
 
 /**
@@ -76,6 +81,7 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  harness?: string | null;
 }
 
 interface ChildSessionsResponse {
@@ -188,6 +194,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
+    harness: row.harness ?? null,
   }));
 }
 
