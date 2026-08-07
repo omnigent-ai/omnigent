@@ -241,5 +241,16 @@ describe("buildAgentBundle", () => {
     expect(yaml).not.toContain("session_id_mode");
     expect(yaml).not.toContain("send_model");
     expect(yaml).not.toContain("model:");
+    expect(yaml).not.toContain("omnigent_mcp");
+  });
+
+  it("emits omnigent_mcp only when disabled", async () => {
+    const input: AgentBundleInput = {
+      name: "repo-agent",
+      harness: "acp:repo-echo",
+      acpAgent: { name: "Repo Echo", command: "echo-agent --acp", omnigentMcp: false },
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).toContain("    omnigent_mcp: false");
   });
 });
