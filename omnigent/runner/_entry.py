@@ -1077,13 +1077,10 @@ async def _resolve_agent_spec_from_server(
         via the session-scoped endpoint, e.g. ``"conv_abc123"``.
         ``None`` means the runner cannot resolve the session-scoped
         bundle and returns ``None``.
-    :param spec_parse_cache: Optional in-memory memo of parsed specs
-        keyed by ``(agent_id, version, expand_env)``. When provided, a
-        bundle already parsed for that key is reused instead of being
-        re-parsed, so sub-agent fan-out doesn't re-parse the shared
-        parent bundle. The caller gets a deepcopy each time so its
-        per-session in-place edits don't touch the cached spec.
-        ``None`` disables memoization.
+    :param spec_parse_cache: Optional memo of parsed specs keyed by
+        ``(agent_id, version, expand_env)``, so a sub-agent fan-out
+        reuses the parent bundle's parse instead of repeating it. Each
+        caller gets a deepcopy. ``None`` disables memoization.
     :returns: The parsed :class:`AgentSpec` plus its extracted bundle
         directory, or ``None`` when the server returns 404 for the
         requested agent.
@@ -1134,12 +1131,6 @@ async def _resolve_agent_spec_from_server(
     if not dest.exists():
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    # The bundle files under dest are already disk-cached by (agent_id, version),
-    # but the parse re-ran on every dispatch, so sub-agent fan-out re-parsed the
-    # same parent bundle. Memoize the parse and hand out a deepcopy: callers mutate
-    # the resolved spec in place per session (e.g. a builtin tool appends a
-    # sub-agent), so the cached master has to stay pristine. deepcopy is far
-    # cheaper than re-reading and re-parsing the bundle.
     if spec_parse_cache is None:
         spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     else:
@@ -1147,10 +1138,12 @@ async def _resolve_agent_spec_from_server(
         master = spec_parse_cache.get(cache_key)
         if master is None:
             master = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-            # A version bump retires every prior version of this agent.
+            # A newly parsed version supersedes every other entry for this agent.
             for stale in [k for k in spec_parse_cache if k[0] == agent_id]:
                 del spec_parse_cache[stale]
             spec_parse_cache[cache_key] = master
+        # Callers edit the resolved spec in place per session (a builtin tool can
+        # append a sub-agent), so keep the memoized one pristine.
         spec = copy.deepcopy(master)
     return ResolvedSpec(spec=spec, workdir=dest)
 
@@ -1258,9 +1251,7 @@ def create_app(
     import tempfile
 
     _spec_cache_root = Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-"))
-    # Parsed-spec memo, torn down with the runner like _spec_cache_root. Keyed by
-    # (agent_id, version, expand_env); each resolve gets a deepcopy, and a new
-    # version for an agent evicts that agent's older entries.
+    # Parsed-spec memo; lives for the runner's lifetime.
     _spec_parse_cache: dict[tuple[str, str, bool], AgentSpec] = {}
 
     async def spec_resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec | None:
