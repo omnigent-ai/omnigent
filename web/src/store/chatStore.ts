@@ -4153,6 +4153,7 @@ function committedUserBlock(
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
+      createdAtS: Math.floor(Date.now() / 1000),
     },
     content,
     stableKey,

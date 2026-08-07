@@ -406,6 +406,7 @@ export function buildPendingBubbles(
       itemId: p.tempId,
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
+      createdAtS: Math.floor(Date.now() / 1000),
     };
   });
 }
@@ -3353,6 +3354,25 @@ function CompactionLoadingIndicator() {
 // re-renders the bubble that actually changed, not every prior message's
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
 // the user-bubble markdown render tests.
+function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
+  if (epochSeconds === undefined || epochSeconds === 0) return null;
+  const d = new Date(epochSeconds * 1000);
+  const now = new Date();
+  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if (
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  ) {
+    return time;
+  }
+  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (d.getFullYear() !== now.getFullYear()) {
+    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
+  }
+  return `${date}, ${time}`;
+}
+
 export const BubbleView = memo(
   function BubbleView({
     bubble,
@@ -3600,13 +3620,23 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
-      {text && (
-        <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-          </MessageAction>
-        </MessageActions>
-      )}
+      <div className="mt-1 flex items-center justify-end gap-2">
+        {(() => {
+          const ts = formatBubbleTimestamp(bubble.createdAtS);
+          return ts ? (
+            <span className="select-none text-[10px] leading-none text-muted-foreground/60">
+              {ts}
+            </span>
+          ) : null;
+        })()}
+        {text && (
+          <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+            </MessageAction>
+          </MessageActions>
+        )}
+      </div>
     </Message>
   );
 }
@@ -3698,27 +3728,37 @@ function AssistantBubble({
         {/* Skipped on a fold-only bubble: the actions belong to content
             the user can see, and hanging them off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. */}
-        {markdownText && !foldOnly && (
-          <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-            </MessageAction>
-            {/* Fork from this response: clone the session with history
-                truncated after this turn. Hidden while the response is
-                still streaming (its items aren't committed yet) and when
-                the session can't be forked (sub-agent / isolated mount). */}
-            {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-              <MessageAction
-                tooltip="Fork from here"
-                size="icon-xxs"
-                data-testid="fork-from-response"
-                onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-              >
-                <GitForkIcon size={14} />
+        <div className="mt-1 flex items-center gap-2">
+          {(() => {
+            const ts = formatBubbleTimestamp(bubble.createdAtS);
+            return ts ? (
+              <span className="select-none text-[10px] leading-none text-muted-foreground/60">
+                {ts}
+              </span>
+            ) : null;
+          })()}
+          {markdownText && !foldOnly && (
+            <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
+              <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
               </MessageAction>
-            )}
-          </MessageActions>
-        )}
+              {/* Fork from this response: clone the session with history
+                  truncated after this turn. Hidden while the response is
+                  still streaming (its items aren't committed yet) and when
+                  the session can't be forked (sub-agent / isolated mount). */}
+              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                <MessageAction
+                  tooltip="Fork from here"
+                  size="icon-xxs"
+                  data-testid="fork-from-response"
+                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                >
+                  <GitForkIcon size={14} />
+                </MessageAction>
+              )}
+            </MessageActions>
+          )}
+        </div>
       </Message>
 
       {bubble.lifecycle === "failed" && (

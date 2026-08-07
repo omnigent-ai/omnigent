@@ -137,6 +137,8 @@ export type Bubble =
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
+      /** Server epoch seconds of this message, when known. */
+      createdAtS?: number;
       /**
        * Stable React key when promoted from an optimistic
        * `pendingUserMessages` entry — carries that entry's client temp
@@ -176,6 +178,8 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
+      /** Server epoch seconds of the first block in the group. */
+      createdAtS?: number;
     }
   | { kind: "compaction_loading"; itemId: string }
   | { kind: "compaction"; itemId: string }
@@ -676,6 +680,7 @@ function walkBubbles(
         itemId: b.ctx.itemId ?? `user_${i}`,
         content: b.content,
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
+        ...(b.ctx.createdAtS !== undefined ? { createdAtS: b.ctx.createdAtS } : {}),
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
         stableKey: b.stableKey,
@@ -833,6 +838,8 @@ function walkBubbles(
     lastBubbleCount = 1;
     const workedForS = turnWorkedForS(groupBlocks);
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
+    const groupCreatedAtS = groupBlocks.find((bk) => bk.ctx.createdAtS !== undefined)?.ctx
+      .createdAtS;
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
@@ -842,6 +849,7 @@ function walkBubbles(
       items: buildAssistantItems(groupBlocks, lifecycle, crossBubbleResults),
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
+      ...(groupCreatedAtS !== undefined ? { createdAtS: groupCreatedAtS } : {}),
     });
   }
 
@@ -1526,6 +1534,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       a.createdBy !== b.createdBy ||
+      a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
       a.content.length !== b.content.length
     )
