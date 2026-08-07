@@ -31,14 +31,8 @@ def _databricks_config() -> dict[str, object]:
     }
 
 
-def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A Databricks default → Pi anthropic-messages gateway provider.
-
-    The Databricks profile is marked default for the anthropic/openai surfaces
-    (not ``pi`` directly), so the resolver must fall back to the Anthropic
-    surface — which Pi speaks natively — and build a gateway provider with a
-    bearer-token refresh command.
-    """
+def test_resolves_databricks_default_to_gateway_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Databricks default renders the AI Gateway v2 MLflow provider."""
     from omnigent.inner import databricks_executor
 
     def _host(profile: str | None) -> str:
@@ -49,8 +43,8 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
     assert provider is not None
-    assert provider.api == "anthropic-messages"
-    assert provider.base_url == "https://wkspc.example.com/ai-gateway/anthropic"
+    assert provider.api == "openai-completions"
+    assert provider.base_url == "https://wkspc.example.com/ai-gateway/mlflow/v1"
     assert provider.model == "catalog-databricks-claude-default"
     assert provider.auth_header is True
     # apiKey is a "!command" so Pi refreshes the gateway token per request.
@@ -823,13 +817,13 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
     )
 
     assert provider is not None
-    assert provider.model == "databricks-claude-opus-4-7"
+    assert provider.model == "system.ai.claude-opus-4-7"
     # The override flows into the rendered models.json. When the live model
     # fetch fails (no real credentials in tests), only the selected model is
     # shown — no stale hardcoded list.
     cfg = provider.to_models_config()
     model_ids = [m["id"] for m in cfg["providers"]["omnigent"]["models"]]
-    assert "databricks-claude-opus-4-7" in model_ids
+    assert "system.ai.claude-opus-4-7" in model_ids
 
 
 def test_model_override_beats_inline_family_default() -> None:

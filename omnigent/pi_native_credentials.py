@@ -354,6 +354,13 @@ class PiProviderConfig:
         )
 
 
+def _model_service_id(model: str) -> str:
+    """Normalize a legacy Databricks alias for AI Gateway v2 model routing."""
+    if model.startswith("databricks-"):
+        return f"system.ai.{model.removeprefix('databricks-')}"
+    return model
+
+
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Databricks-profile provider into Pi gateway config.
 
@@ -418,11 +425,14 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
             api_key, f"{host}/ai-gateway/mlflow/v1", gemini_models, api_type="openai-completions"
         )
+    selected_model = (
+        model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
-        base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
-        api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        base_url=f"{host}/ai-gateway/mlflow/v1",
+        api="openai-completions",
+        model=_model_service_id(selected_model),
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is re-read per request (the auth command attempts a
         # refresh), matching codex-native's refresh semantics.
