@@ -208,11 +208,10 @@ export function composerAttachmentKey(a: ComposerAttachment): string {
  * State owned by a SINGLE conversation.
  *
  * Every field here describes one conversation: its transcript, turn
- * lifecycle, binding, usage, and stream. Exactly one conversation is live
- * at a time today, so these sit flat on the root store; keeping streams
- * open in the background moves them onto a per-conversation store (see
- * `docs/BACKGROUND_STREAMS_DESIGN.md`). A new field belongs here only if it
- * still makes sense for a conversation the user is NOT looking at.
+ * lifecycle, binding, usage, and stream. Each lives on its own registry entry
+ * (see `conversationRegistry`), projected onto the root store for whichever
+ * conversation is on screen. A new field belongs here only if it still makes
+ * sense for a conversation the user is NOT looking at.
  */
 export interface ConversationState {
   /**

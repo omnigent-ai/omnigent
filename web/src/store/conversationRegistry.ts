@@ -5,10 +5,8 @@
 // (including the reconnect loop). An entry is either **live** — state plus an
 // open stream — or **absent**. There is deliberately no third "retained but
 // detached" state: a detached entry holding stale state that must be reconciled
-// on revisit is `transcriptCache` in a different shape, which is what this whole
-// refactor deletes. Live-or-gone is the simplification.
-//
-// See `docs/BACKGROUND_STREAMS_DESIGN.md`.
+// on revisit is a transcript cache in a different shape, which is what keeping
+// streams open replaces. Live-or-gone is the simplification.
 
 import type { ConversationState } from "./chatStore";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
