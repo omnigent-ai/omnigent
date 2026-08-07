@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -227,14 +228,32 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+# Allowlist rather than a denylist: a denylist only stops the separators it
+# thought to enumerate, and the previous one let a backslash through — a real
+# separator on a Windows host.
+_UNSAFE_SESSION_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
 def _sanitize_session_id(session_id: str) -> str:
     """Sanitize a session id for safe use as a filesystem path component.
 
+    Real ids are ``uuid4().hex``, so this is a no-op for them. It exists so a
+    malformed or hostile id can never become a separator or a parent
+    reference.
+
+    Note the allowlist deliberately keeps ``.`` (ids may carry one), which
+    means it does NOT by itself stop ``.`` or ``..`` — those are handled
+    explicitly below. An allowlist that merely permits dots is not enough.
+
     :param session_id: Raw session/conversation identifier,
         e.g. ``"conv_abc123"`` or ``"user/session"``.
-    :returns: Sanitized string safe for directory names.
+    :returns: A single path component: never empty, never a traversal.
     """
-    return session_id.replace("/", "_").replace("..", "_")
+    safe = _UNSAFE_SESSION_ID_CHARS.sub("_", session_id)
+    # "", ".", "..", "..." — empty or pure traversal once used as a component.
+    if set(safe) <= {"."}:
+        return "_" * max(len(safe), 1)
+    return safe
 
 
 def _session_workspace(session_id: str) -> str:
