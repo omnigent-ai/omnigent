@@ -37,8 +37,12 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 
     A last-resort fallback for when the live model-services catalog is
     unavailable: the catalog carries authoritative per-endpoint capabilities and
-    is always preferred. Mirrors the in-process harness's
-    ``_pi_provider_for_model`` so both Pi paths route a given id identically.
+    is always preferred.
+
+    Follows the surface split the catalog builder applies, so a keyword model
+    (GLM, kimi) lands on Responses. ``pi_executor._pi_provider_for_model`` sends
+    those to completions when it too has no wire metadata — that disagreement
+    predates this fallback and is why the keyword list exists.
 
     :param model_id: Gateway or Unity Catalog model id, any case.
     :returns: The surface whose protocol the model's family accepts.

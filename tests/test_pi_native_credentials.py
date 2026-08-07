@@ -1402,3 +1402,29 @@ def test_databricks_builders_carry_reachable_surfaces(monkeypatch: pytest.Monkey
         creds.DatabricksPiSurface.COMPLETIONS: "https://wkspc.example.com/serving-endpoints",
         creds.DatabricksPiSurface.MLFLOW: "https://wkspc.example.com/ai-gateway/mlflow/v1",
     }
+
+
+def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Rendering is not repeated per launch, so routing is logged once.
+
+    ``pi_native_provider_launch`` both writes ``models.json`` and reads it back
+    to resolve ``--provider``; rendering twice duplicated the routing log line.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        lambda *_args, **_kwargs: None,
+    )
+    renders = 0
+    original = creds.PiProviderConfig.to_models_config
+
+    def _counting(self: creds.PiProviderConfig) -> object:
+        nonlocal renders
+        renders += 1
+        return original(self)
+
+    monkeypatch.setattr(creds.PiProviderConfig, "to_models_config", _counting)
+
+    creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+
+    assert renders == 1

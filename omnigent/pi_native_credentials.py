@@ -236,7 +236,7 @@ class PiProviderConfig:
     def _model_registered_in_additional(self) -> bool:
         """Whether some secondary provider already serves the selected model."""
         return any(
-            any(entry["id"] == self.model for entry in provider["models"])
+            any(entry.get("id") == self.model for entry in provider["models"])
             for provider in self.additional_providers.values()
         )
 
@@ -265,7 +265,7 @@ class PiProviderConfig:
         """
         if self._model_registered_in_additional():
             return None
-        if any(entry["id"] == self.model for entry in self.extra_models):
+        if any(entry.get("id") == self.model for entry in self.extra_models):
             return None
         if self._fallback_surface() is not None:
             return None
@@ -1000,20 +1000,28 @@ def resolve_pi_native_provider(
         return None
 
 
-def write_pi_models_config(agent_dir: Path, provider: PiProviderConfig) -> Path:
+def write_pi_models_config(
+    agent_dir: Path,
+    provider: PiProviderConfig,
+    rendered: _PiModelsConfig | None = None,
+) -> Path:
     """Write *provider* as ``models.json`` into a managed Pi config dir.
 
     :param agent_dir: The managed Pi config dir (``PI_CODING_AGENT_DIR``).
     :param provider: The resolved provider config to render.
+    :param rendered: An already-rendered config to write, so a caller that also
+        inspects it renders (and logs) only once. Defaults to rendering here.
     :returns: Path to the written ``models.json``.
     """
+    if rendered is None:
+        rendered = provider.to_models_config()
     agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(agent_dir, 0o700)
     models_path = agent_dir / "models.json"
     # 0o600: the apiKey may be a literal token (key-kind providers).
     fd = os.open(models_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(provider.to_models_config(), handle, indent=2, sort_keys=True)
+        json.dump(rendered, handle, indent=2, sort_keys=True)
         handle.write("\n")
     return models_path
 
@@ -1029,7 +1037,10 @@ def pi_native_provider_launch(
         (relocating Pi's config dir) and the ``--provider``/``--model`` args to
         append to the Pi command.
     """
-    write_pi_models_config(agent_dir, provider)
+    # Render once and reuse: rendering logs how an uncataloged model was routed,
+    # and this function both writes the config and reads it back for --provider.
+    rendered = provider.to_models_config()
+    write_pi_models_config(agent_dir, provider, rendered)
     # Copy the user's global Pi settings but suppress defaultThinkingLevel.
     # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
     # non-Claude models via openai-completions, any thinking level causes the
@@ -1048,7 +1059,7 @@ def pi_native_provider_launch(
     # rather than additional_providers so a model routed by the family fallback
     # gets the same --provider that models.json registered it under.
     model_provider_id = provider.provider_id
-    for extra_id, extra_cfg in provider.to_models_config()["providers"].items():
+    for extra_id, extra_cfg in rendered["providers"].items():
         if extra_id == provider.provider_id:
             continue
         if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
