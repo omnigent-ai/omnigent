@@ -1,29 +1,40 @@
 /**
- * Client-side trust ledger for repo-declared harness commands.
+ * Client-side trust ledger for repo-declared agents.
  *
- * A `.omnigent/config.yaml` checked into a repo can declare arbitrary shell
- * commands, so the first launch of a discovered agent always goes through an
- * explicit consent dialog. "Always allow" persists a grant keyed by
- * (host, workspace, slug, SHA-256 of the exact command) — any change to the
- * command re-prompts. Per-browser only; server-side trust is a follow-up.
+ * Repo content is arbitrary code from a clone, so the first launch of a
+ * discovered agent always goes through an explicit consent dialog.
+ * "Always allow" persists a grant keyed by a JSON-encoded tagged tuple —
+ * `["cmd", host, workspace, slug, sha256(command)]` for ACP commands,
+ * `["bundle", host, workspace, slug, sha256(bundle bytes)]` for agent
+ * configs — so the two grant types can never collide, path characters
+ * can't be confused for delimiters, and any change to the command or
+ * bundle content re-prompts. Per-browser only; server-side trust is a
+ * follow-up.
  */
 
 const STORAGE_KEY = "omnigent.repoHarnessTrust";
 
-async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+async function sha256Hex(data: string | ArrayBuffer): Promise<string> {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
-async function grantKey(
+/** SHA-256 hex of raw bundle bytes — the identity a bundle grant is keyed on. */
+export async function digestBundleBytes(bytes: ArrayBuffer): Promise<string> {
+  return sha256Hex(bytes);
+}
+
+function grantKey(
+  kind: "cmd" | "bundle",
   hostId: string,
   workspace: string,
   slug: string,
-  command: string,
-): Promise<string> {
-  return `${hostId}|${workspace}|${slug}|${await sha256Hex(command)}`;
+  digestHex: string,
+): string {
+  return JSON.stringify([kind, hostId, workspace, slug, digestHex]);
 }
 
 function readGrants(): Record<string, true> {
@@ -36,6 +47,16 @@ function readGrants(): Record<string, true> {
   }
 }
 
+function writeGrant(key: string): void {
+  const grants = readGrants();
+  grants[key] = true;
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(grants));
+  } catch {
+    // Quota/private-mode failures just mean re-prompting next time.
+  }
+}
+
 /** Whether this exact command was previously granted "always allow". */
 export async function isRepoCommandTrusted(
   hostId: string,
@@ -43,7 +64,8 @@ export async function isRepoCommandTrusted(
   slug: string,
   command: string,
 ): Promise<boolean> {
-  return readGrants()[await grantKey(hostId, workspace, slug, command)] === true;
+  const key = grantKey("cmd", hostId, workspace, slug, await sha256Hex(command));
+  return readGrants()[key] === true;
 }
 
 /** Persist an "always allow" grant for this exact command. */
@@ -53,49 +75,25 @@ export async function trustRepoCommand(
   slug: string,
   command: string,
 ): Promise<void> {
-  const grants = readGrants();
-  grants[await grantKey(hostId, workspace, slug, command)] = true;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(grants));
-  } catch {
-    // Quota/private-mode failures just mean re-prompting next time.
-  }
-}
-
-/** SHA-256 hex of raw bundle bytes — the identity a bundle grant is keyed on. */
-export async function digestBundleBytes(bytes: ArrayBuffer): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-function digestKey(hostId: string, workspace: string, slug: string, digestHex: string): string {
-  return `${hostId}|${workspace}|${slug}|${digestHex}`;
+  writeGrant(grantKey("cmd", hostId, workspace, slug, await sha256Hex(command)));
 }
 
 /** Whether this exact bundle digest was previously granted "always allow". */
-export function isRepoDigestTrusted(
+export async function isRepoDigestTrusted(
   hostId: string,
   workspace: string,
   slug: string,
   digestHex: string,
-): boolean {
-  return readGrants()[digestKey(hostId, workspace, slug, digestHex)] === true;
+): Promise<boolean> {
+  return readGrants()[grantKey("bundle", hostId, workspace, slug, digestHex)] === true;
 }
 
 /** Persist an "always allow" grant for this exact bundle digest. */
-export function trustRepoDigest(
+export async function trustRepoDigest(
   hostId: string,
   workspace: string,
   slug: string,
   digestHex: string,
-): void {
-  const grants = readGrants();
-  grants[digestKey(hostId, workspace, slug, digestHex)] = true;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(grants));
-  } catch {
-    // Quota/private-mode failures just mean re-prompting next time.
-  }
+): Promise<void> {
+  writeGrant(grantKey("bundle", hostId, workspace, slug, digestHex));
 }

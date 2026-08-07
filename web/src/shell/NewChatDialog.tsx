@@ -2173,10 +2173,16 @@ export function NewChatLandingScreen() {
     digest: string;
   } | null>(null);
   const [repoConsentAlways, setRepoConsentAlways] = useState(false);
-  const repoConsentGrantedRef = useRef(false);
-  // Bytes approved in the consent dialog, carried into the re-entered
-  // handleCreate so the upload is byte-identical to what was shown.
-  const approvedRepoBundleRef = useRef<{ bytes: ArrayBuffer; digest: string } | null>(null);
+  // Approval granted by the consent dialog, carried into the re-entered
+  // handleCreate. A VALUE bound to exactly what was approved (slug +
+  // command / digest + bytes), read-and-cleared at the top of the create,
+  // so an early return can never leak a stale approval onto a different
+  // pick, and the upload stays byte-identical to what the dialog showed.
+  const repoApprovalRef = useRef<
+    | { kind: "command"; slug: string; command: string }
+    | { kind: "bundle"; slug: string; digest: string; bytes: ArrayBuffer }
+    | null
+  >(null);
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -3630,59 +3636,73 @@ export function NewChatLandingScreen() {
     // because the create outlives an unmount; a create that fails hands the
     // draft back via returnDraftToUser.
     submittedRef.current = true;
+    // Consume any dialog-granted approval immediately: it applies to this
+    // create only, and only if it still matches the current pick.
+    const repoApproval = repoApprovalRef.current;
+    repoApprovalRef.current = null;
     try {
       // Repo-declared command: explicit first-use consent (the command is
       // arbitrary shell from a cloned repo). The dialog's confirm re-enters
-      // via the one-shot granted ref; "Always allow" grants persist per
-      // (host, workspace, slug, command hash) so an edited command re-prompts.
-      if (pickedRepoAgent && !repoConsentGrantedRef.current) {
+      // with an approval bound to the exact command; "Always allow" grants
+      // persist per (host, workspace, slug, command hash) so an edited
+      // command re-prompts.
+      if (pickedRepoAgent) {
+        const approved =
+          repoApproval?.kind === "command" &&
+          repoApproval.slug === pickedRepoAgent.slug &&
+          repoApproval.command === pickedRepoAgent.command;
         const trusted =
-          selectedHostId !== null &&
-          (await isRepoCommandTrusted(
-            selectedHostId,
-            workspace.trim(),
-            pickedRepoAgent.slug,
-            pickedRepoAgent.command,
-          ));
+          approved ||
+          (selectedHostId !== null &&
+            (await isRepoCommandTrusted(
+              selectedHostId,
+              workspace.trim(),
+              pickedRepoAgent.slug,
+              pickedRepoAgent.command,
+            )));
         if (!trusted) {
           setRepoConsentAgent(pickedRepoAgent);
           return;
         }
       }
       // Repo-declared agent config: package on the host (deterministic
-      // bytes), hash, and gate on the digest. The consent dialog holds the
-      // exact bytes so confirm uploads what was approved — a repo edit
-      // between consent and create can't swap the content.
+      // bytes), hash, and gate on the digest. An approval carries the exact
+      // bytes the dialog showed, so the upload is byte-identical to what
+      // was approved — a repo edit between consent and create can't swap
+      // the content.
       let repoConfigBundle: { file: File; digest: string } | null = null;
       if (pickedRepoConfig && selectedHostId !== null) {
-        let approved = approvedRepoBundleRef.current;
-        approvedRepoBundleRef.current = null;
-        if (approved === null) {
-          const bytes = await packageWorkspaceAgent(
-            selectedHostId,
-            workspace.trim(),
-            pickedRepoConfig.path,
-          );
-          approved = { bytes, digest: await digestBundleBytes(bytes) };
-        }
+        const approvedBundle =
+          repoApproval?.kind === "bundle" && repoApproval.slug === pickedRepoConfig.slug
+            ? { bytes: repoApproval.bytes, digest: repoApproval.digest }
+            : null;
+        const bundle =
+          approvedBundle ??
+          (await (async () => {
+            const bytes = await packageWorkspaceAgent(
+              selectedHostId,
+              workspace.trim(),
+              pickedRepoConfig.path,
+            );
+            return { bytes, digest: await digestBundleBytes(bytes) };
+          })());
         const trusted =
-          repoConsentGrantedRef.current ||
-          isRepoDigestTrusted(
+          approvedBundle !== null ||
+          (await isRepoDigestTrusted(
             selectedHostId,
             workspace.trim(),
             pickedRepoConfig.slug,
-            approved.digest,
-          );
+            bundle.digest,
+          ));
         if (!trusted) {
-          setRepoConsentConfig({ entry: pickedRepoConfig, ...approved });
+          setRepoConsentConfig({ entry: pickedRepoConfig, ...bundle });
           return;
         }
         repoConfigBundle = {
-          file: new File([approved.bytes], "agent.tar.gz", { type: "application/gzip" }),
-          digest: approved.digest,
+          file: new File([bundle.bytes], "agent.tar.gz", { type: "application/gzip" }),
+          digest: bundle.digest,
         };
       }
-      repoConsentGrantedRef.current = false;
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
@@ -4027,9 +4047,9 @@ export function NewChatLandingScreen() {
     ? `Start a new session in ${selectedProject}`
     : "Describe a task to start a new session…";
 
-  // Confirm handler for the repo-command consent dialog: optionally persist
-  // the "always allow" grant, then re-enter handleCreate through the one-shot
-  // granted ref so this run doesn't re-prompt.
+  // Confirm handler for the repo consent dialog: optionally persist the
+  // "always allow" grant, then re-enter handleCreate with an approval bound
+  // to exactly what the dialog showed.
   async function confirmRepoConsent() {
     const agent = repoConsentAgent;
     const config = repoConsentConfig;
@@ -4038,18 +4058,18 @@ export function NewChatLandingScreen() {
       if (agent !== null) {
         await trustRepoCommand(selectedHostId, workspace.trim(), agent.slug, agent.command);
       } else if (config !== null) {
-        trustRepoDigest(selectedHostId, workspace.trim(), config.entry.slug, config.digest);
+        await trustRepoDigest(selectedHostId, workspace.trim(), config.entry.slug, config.digest);
       }
     }
-    if (config !== null) {
-      // Carry the approved bytes into the re-entered create so the upload
-      // is byte-identical to what the dialog showed.
-      approvedRepoBundleRef.current = { bytes: config.bytes, digest: config.digest };
-    }
+    repoApprovalRef.current =
+      agent !== null
+        ? { kind: "command", slug: agent.slug, command: agent.command }
+        : config !== null
+          ? { kind: "bundle", slug: config.entry.slug, digest: config.digest, bytes: config.bytes }
+          : null;
     setRepoConsentAgent(null);
     setRepoConsentConfig(null);
     setRepoConsentAlways(false);
-    repoConsentGrantedRef.current = true;
     await handleCreate();
   }
 
