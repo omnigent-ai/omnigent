@@ -23,16 +23,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import os
 import signal
 import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import IO
+from typing import IO, NamedTuple
 
 import httpx
 import yaml
@@ -55,10 +57,12 @@ _HEALTH_TIMEOUT_S = 90.0
 _MOCK_TIMEOUT_S = 15.0
 _POLL_INTERVAL_S = 0.2
 _TURN_TIMEOUT_S = 180.0
-# Budget for the host daemon (session_cold_start journey, with_host) to connect
-# its tunnel and register in the hosts table after being spawned. Covers
+# Budget for the host daemon (host-backed cold journeys) to connect its tunnel
+# and register in the hosts table after being spawned. Covers
 # interpreter start + imports + the reverse-tunnel handshake.
 _HOST_ONLINE_TIMEOUT_S = 60.0
+# Budget for a host-owned runner tunnel to disappear after ``stop_session``.
+_RUNNER_OFFLINE_TIMEOUT_S = 30.0
 
 # Terminal SSE events — if one arrives before any delta, the turn produced no
 # streamed text (a failure for the TTFT journey).
@@ -80,6 +84,49 @@ _DEFAULT_HARNESS = "openai-agents"
 # blocks or returns non-verdict text.
 _POLICY_LLM_KEY = "_policy_llm_"
 _POLICY_ALLOW = '{"action": "allow", "reason": ""}'
+
+# Dotted path to the CI-only debug router (under ``dev/``, never shipped in the
+# wheel). The server loads it via the ``debug_router_modules`` config key to
+# expose ``GET /debug/server-metrics`` for per-journey request counting.
+_DEBUG_ROUTER_MODULE = "dev.benchmarks.omnigent.debug_router"
+_SERVER_METRICS_PATH = "/debug/server-metrics"
+
+
+class ServerRequestSnapshot(NamedTuple):
+    """A point-in-time read of the server's cumulative request counters.
+
+    :param total: ``total_started`` — every HTTP request the server has handled
+        since process start.
+    :param routes: ``"METHOD /route/{template}"`` mapped to its cumulative
+        count, for attributing a journey's requests to specific endpoints.
+    """
+
+    total: int
+    routes: dict[str, int]
+
+
+def _sse_session_status(data: str) -> str | None:
+    """Extract the status from a ``session.status`` SSE ``data:`` payload.
+
+    Returns the status string (``"running"`` / ``"waiting"`` / ``"idle"`` /
+    ``"failed"``) for a ``session.status`` event, else ``None`` (a different
+    event, the ``[DONE]`` sentinel, or unparseable JSON). Tolerates both the
+    nested ``{"data": {"status": ...}}`` and flat ``{"status": ...}`` shapes.
+
+    :param data: The SSE ``data:`` line body, already stripped of the prefix.
+    :returns: The session status, or ``None`` when this isn't a status event.
+    """
+    if not data or data == "[DONE]":
+        return None
+    try:
+        payload = json.loads(data)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "session.status":
+        return None
+    inner = payload.get("data")
+    status = inner.get("status") if isinstance(inner, dict) else payload.get("status")
+    return status if isinstance(status, str) else None
 
 
 def _find_free_port() -> int:
@@ -112,9 +159,8 @@ class BenchEnvironment:
     :param with_host: When ``True`` (implies ``with_runner``), additionally
         spawn a real ``omnigent host`` daemon. Additive over ``with_runner``:
         the boot runner still serves the warm journeys, while the daemon lets
-        the ``session_cold_start`` journey create host-bound sessions that fire
-        ``host.launch_runner`` and launch their OWN fresh runner — so the first
-        message races the runner's boot, reproducing the true UI cold path.
+        the cold-start and cold-restart journeys use host-bound sessions that
+        fire ``host.launch_runner`` and launch their own fresh runners.
     :param database_uri: SQLAlchemy URI the server boots against. ``None``
         (default) uses a fresh throwaway SQLite file in the temp dir — the
         empty-DB path. Pass a pre-seeded URI (e.g. a seeded SQLite file, or a
@@ -124,6 +170,11 @@ class BenchEnvironment:
     :param harness: Harness for full-turn agents when ``with_runner`` (default
         ``openai-agents``, a base dependency needing no vendor CLI binary).
     :param model: Model string baked into registered agent specs.
+    :param network_delay_ms: Artificial latency in milliseconds injected before
+        every request the benchmark client sends to the server, modelling a
+        real client↔server network hop that loopback lacks. ``0`` (default)
+        adds no delay. Combined with per-op request counts, it turns each
+        journey's round-trip count into wall-clock cost.
     """
 
     def __init__(
@@ -134,6 +185,7 @@ class BenchEnvironment:
         database_uri: str | None = None,
         harness: str = _DEFAULT_HARNESS,
         model: str = _DEFAULT_MODEL,
+        network_delay_ms: float = 0.0,
     ) -> None:
         # with_host is additive over with_runner: the boot runner still serves
         # the warm journeys, and the host daemon additionally lets the cold-start
@@ -143,6 +195,7 @@ class BenchEnvironment:
         self.database_uri = database_uri
         self.harness = harness
         self.model = model
+        self.network_delay_ms = network_delay_ms
         self.base_url = ""
         self.mock_url = ""
         self.runner_id = ""
@@ -160,16 +213,34 @@ class BenchEnvironment:
         self._runner_base_env: dict[str, str] = {}
         self._log_handles: list[IO[bytes]] = []
         self._agent_cache: dict[str, str] = {}
+        self._resource_samples: list[dict[str, float]] = []
+        self._sampler_stop: threading.Event = threading.Event()
+        self._sampler_thread: threading.Thread | None = None
 
     # ── lifecycle ────────────────────────────────────────────
 
     async def __aenter__(self) -> BenchEnvironment:
         await asyncio.to_thread(self._start)
+        # A request event hook injects the simulated client↔server network
+        # delay before each request leaves the benchmark process. Registered
+        # only when a delay is set so the zero-delay default path is untouched.
+        event_hooks: dict[str, list[object]] = {}
+        if self.network_delay_ms > 0:
+            delay_s = self.network_delay_ms / 1000.0
+
+            async def _delay_request(_request: httpx.Request) -> None:
+                await asyncio.sleep(delay_s)
+
+            event_hooks["request"] = [_delay_request]
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=300.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+            event_hooks=event_hooks,  # type: ignore[arg-type]
         )
+        # Start background resource sampler (server CPU + memory).
+        self._sampler_thread = threading.Thread(target=self._sample_resources, daemon=True)
+        self._sampler_thread.start()
         if self.with_runner:
             # ALLOW fallback so a server-side classifier call resolves against
             # the mock (never api.openai.com) and returns a valid verdict.
@@ -181,6 +252,9 @@ class BenchEnvironment:
     async def __aexit__(self, *exc: object) -> None:
         if self.client is not None:
             await self.client.aclose()
+        self._sampler_stop.set()
+        if self._sampler_thread is not None:
+            self._sampler_thread.join(timeout=5)
         await asyncio.to_thread(self._stop)
 
     def _start(self) -> None:
@@ -216,9 +290,8 @@ class BenchEnvironment:
             self._runner_proc = self._spawn_runner(base_env, binding_token)
         self._wait_ready()
         # The host daemon is ADDITIVE — the boot runner above still serves the
-        # warm journeys; the daemon exists so the cold-start journey can create
-        # host-bound sessions that launch their OWN fresh runners on demand
-        # (the race the cold path measures). The two never share a runner id.
+        # warm journeys; the daemon exists so host-backed cold journeys can
+        # launch their own runners on demand. The two never share a runner id.
         if self.with_host:
             self._host_proc = self._spawn_host(base_env)
             self._wait_host_online()
@@ -246,6 +319,98 @@ class BenchEnvironment:
         import shutil
 
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _sample_resources(self, interval: float = 1.0) -> None:
+        """Sample the server process's CPU and RSS memory at *interval*-second intervals.
+
+        Runs in a daemon thread; exits when ``_sampler_stop`` is set or the
+        process terminates. The first ``cpu_percent`` call always returns 0.0
+        (psutil baseline) — we discard it so only real measurements accumulate.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return
+        if self._server_proc is None:
+            return
+        try:
+            proc = psutil.Process(self._server_proc.pid)
+            proc.cpu_percent()  # baseline; discard
+        except psutil.NoSuchProcess:
+            return
+        while not self._sampler_stop.is_set():
+            try:
+                cpu = proc.cpu_percent()
+                mem = proc.memory_info().rss
+                self._resource_samples.append({"cpu_pct": cpu, "rss_bytes": mem})
+            except psutil.NoSuchProcess:
+                break
+            self._sampler_stop.wait(timeout=interval)
+
+    @property
+    def resource_usage(self) -> dict[str, object]:
+        """Summarise sampled CPU% and RSS across the benchmark run.
+
+        :returns: A dict with ``cpu_pct`` and ``rss_bytes`` sub-dicts each
+            containing ``mean``, ``min``, ``max``, ``samples``. Empty dicts
+            when no samples were collected (psutil unavailable or server never
+            started).
+        """
+        if not self._resource_samples:
+            return {"cpu_pct": {}, "rss_bytes": {}}
+        cpu = [s["cpu_pct"] for s in self._resource_samples]
+        rss = [s["rss_bytes"] for s in self._resource_samples]
+        import statistics as _stats
+
+        return {
+            "cpu_pct": {
+                "mean": _stats.mean(cpu),
+                "min": min(cpu),
+                "max": max(cpu),
+                "samples": len(cpu),
+            },
+            "rss_bytes": {
+                "mean": _stats.mean(rss),
+                "min": min(rss),
+                "max": max(rss),
+                "samples": len(rss),
+            },
+        }
+
+    async def server_request_snapshot(self) -> ServerRequestSnapshot:
+        """Read the server's cumulative request counters (total + per-route).
+
+        Reads the CI-only ``GET /debug/server-metrics`` endpoint the server
+        mounts from ``debug_router_modules``. The counters are monotonic since
+        the server process started; callers diff two reads to get the requests
+        the server handled during a window — including cross-process traffic
+        (runner → server callbacks, host → server) invisible to a client-side
+        hook in the benchmark process.
+
+        The count-poll request itself hits the server, so it increments the
+        counters; the caller accounts for its own polls when computing per-op
+        volume. Uses a short-lived client so it never carries the simulated
+        network delay wired onto ``self.client``.
+
+        :returns: A :class:`ServerRequestSnapshot` of ``total_started`` and the
+            per-route breakdown.
+        :raises RuntimeError: If the debug endpoint is unreachable, which means
+            the debug router did not load (a benchmark misconfiguration).
+        """
+        try:
+            async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as client:
+                resp = await client.get(_SERVER_METRICS_PATH)
+                resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"server debug metrics endpoint {_SERVER_METRICS_PATH} unreachable "
+                f"({exc!r}); is the debug router loaded? logs in {self._tmp}"
+            ) from exc
+        body = resp.json()
+        return ServerRequestSnapshot(
+            total=int(body["total_started"]),
+            routes={str(k): int(v) for k, v in body.get("route_counts", {}).items()},
+        )
 
     # ── spawns ───────────────────────────────────────────────
 
@@ -284,27 +449,24 @@ class BenchEnvironment:
             str(artifact_dir),
         ]
         env = {**base_env}
+        # The server always boots with a config that loads the CI-only debug
+        # router (exposing its request counter over HTTP for per-journey network
+        # counting). In runner mode it additionally routes the server-side
+        # policy-classifier LLM at the mock, mirroring live_server — without
+        # that the classifier's client defaults to api.openai.com and errors.
+        server_config: dict[str, object] = {"debug_router_modules": [_DEBUG_ROUTER_MODULE]}
         if self.with_runner:
-            # Route the server-side policy-classifier LLM at the mock, mirroring
-            # live_server. Without this the classifier's client defaults to
-            # api.openai.com and errors. Server-only mode needs no llm config —
-            # the classifier only builds under OMNIGENT_SMART_ROUTING=1.
-            server_cfg = self._tmp / "server.yaml"
-            server_cfg.write_text(
-                yaml.safe_dump(
-                    {
-                        "llm": {
-                            "model": _POLICY_LLM_KEY,
-                            "connection": {
-                                "base_url": f"{self.mock_url}/v1",
-                                "api_key": "mock-key",
-                            },
-                        }
-                    }
-                )
-            )
-            args.extend(["--config", str(server_cfg)])
+            server_config["llm"] = {
+                "model": _POLICY_LLM_KEY,
+                "connection": {
+                    "base_url": f"{self.mock_url}/v1",
+                    "api_key": "mock-key",
+                },
+            }
             env["OMNIGENT_RUNNER_TUNNEL_TOKEN"] = binding_token
+        server_cfg = self._tmp / "server.yaml"
+        server_cfg.write_text(yaml.safe_dump(server_config))
+        args.extend(["--config", str(server_cfg)])
         return subprocess.Popen(
             args,
             env=env,
@@ -340,10 +502,8 @@ class BenchEnvironment:
     ) -> subprocess.Popen[bytes]:
         """Spawn one runner subprocess under *runner_id* + *binding_token*.
 
-        Factored out of :meth:`_spawn_runner` so the ``session_cold_start``
-        journey can spawn additional runners on demand, each under its own id,
-        binding token, and workspace. The caller must pair *runner_id* with the token
-        it derives from (``token_bound_runner_id(binding_token)``): the runner
+        The caller must pair *runner_id* with the token it derives from
+        (``token_bound_runner_id(binding_token)``): the runner
         derives its managed-mint URL from the token internally, so a mismatch
         would register the tunnel under one id but mint under another (→ 401).
         """
@@ -640,6 +800,33 @@ class BenchEnvironment:
         bound.raise_for_status()
         return session_id
 
+    async def stop_session_runner(
+        self, session_id: str, *, timeout: float = _RUNNER_OFFLINE_TIMEOUT_S
+    ) -> None:
+        """Stop a host-backed session's runner and wait until it is offline.
+
+        ``stop_session`` preserves the conversation and its host binding. The
+        next user message therefore exercises the production auto-relaunch
+        path instead of starting a new conversation.
+        """
+        assert self.client is not None
+        if not self.with_host:
+            raise RuntimeError("stop_session_runner requires with_host=True")
+        stopped = await self.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "stop_session", "data": {}},
+        )
+        stopped.raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snap = await self.client.get(f"/v1/sessions/{session_id}")
+            snap.raise_for_status()
+            if snap.json().get("runner_online") is False:
+                return
+            await asyncio.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(f"runner did not stop within {timeout}s (session {session_id})")
+
     async def write_runner_file(self, session_id: str, relative_path: str, content: str) -> None:
         """Write a file into the runner's default environment over HTTP.
 
@@ -677,7 +864,15 @@ class BenchEnvironment:
     async def drive_turn(
         self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
     ) -> None:
-        """Post a user message and poll the session to a terminal state.
+        """Post a user message and await the turn's completion over SSE.
+
+        Subscribes to the session stream, posts the message, then returns when a
+        ``session.status`` event reports ``idle`` *after* the turn has been seen
+        ``running``/``waiting`` — the SSE equivalent of the old poll-to-idle
+        loop, but without hammering ``GET /v1/sessions/{id}`` every 200ms (which
+        polluted the per-journey request count, especially when a turn stalled).
+        The ``seen_running`` guard ensures a warm session's trailing ``idle``
+        from a *prior* turn can't end this wait early.
 
         :raises RuntimeError: If not in runner mode, the turn fails, or it does
             not settle within *timeout* seconds.
@@ -685,27 +880,64 @@ class BenchEnvironment:
         assert self.client is not None
         if not self.with_runner:
             raise RuntimeError("drive_turn requires with_runner=True")
-        body = {
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
-        }
-        posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
-        posted.raise_for_status()
 
-        deadline = time.monotonic() + timeout
-        seen_running = False
-        while time.monotonic() < deadline:
-            snap = await self.client.get(f"/v1/sessions/{session_id}")
-            snap.raise_for_status()
-            status = snap.json().get("status")
-            if status in ("running", "waiting"):
-                seen_running = True
-            elif status == "failed":
-                raise RuntimeError(f"turn failed: {snap.json().get('last_task_error')}")
-            elif status == "idle" and seen_running:
-                return
-            await asyncio.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(f"turn did not settle within {timeout}s (session {session_id})")
+        connected = asyncio.Event()
+        settled = asyncio.Event()
+        outcome: dict[str, str] = {}
+
+        async def _read_stream() -> None:
+            seen_running = False
+            try:
+                async with self.client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{session_id}/stream", timeout=timeout
+                ) as resp:
+                    # First line means the stream is live (server emits a ready
+                    # heartbeat on connect); post only once subscribed so no
+                    # status event for this turn can be missed.
+                    connected.set()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        status = _sse_session_status(line[len("data:") :].strip())
+                        if status is None:
+                            continue
+                        if status in ("running", "waiting"):
+                            seen_running = True
+                        elif status == "failed":
+                            outcome["failed"] = "turn failed"
+                            settled.set()
+                            return
+                        elif status == "idle" and seen_running:
+                            settled.set()
+                            return
+            except httpx.HTTPError as exc:
+                outcome["error"] = repr(exc)
+                connected.set()
+                settled.set()
+
+        reader = asyncio.create_task(_read_stream())
+        try:
+            await asyncio.wait_for(connected.wait(), timeout=timeout)
+            body = {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            }
+            posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
+            posted.raise_for_status()
+            try:
+                await asyncio.wait_for(settled.wait(), timeout=timeout)
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"turn did not settle within {timeout}s (session {session_id})"
+                ) from exc
+            if "error" in outcome:
+                raise RuntimeError(f"stream error: {outcome['error']}")
+            if "failed" in outcome:
+                snap = await self.client.get(f"/v1/sessions/{session_id}")
+                last_error = snap.json().get("last_task_error") if snap.is_success else None
+                raise RuntimeError(f"turn failed: {last_error}")
+        finally:
+            reader.cancel()
 
     async def _wait_idle(self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S) -> None:
         """Poll until the session is ``idle`` (a prior turn has settled)."""
@@ -742,9 +974,9 @@ class BenchEnvironment:
 
         :param wait_idle_first: When ``True``, wait for the session to be ``idle``
             before subscribing so a prior turn's terminal event can't race this
-            turn's response (warm-session TTFT). ``False`` for a fresh session whose
-            first turn is the only one — the cold path, where the timed span must
-            include runner launch + connect, so we must NOT poll it warm first.
+            turn's response (warm-session TTFT). ``False`` for a fresh session or
+            a stopped existing session — cold paths where polling for ``idle``
+            would either warm the runner or wait forever on its disconnected state.
         :raises RuntimeError: If not in runner mode, or no response / a terminal
             event arrives within *timeout*.
         """
@@ -843,6 +1075,19 @@ class BenchEnvironment:
         """
         await self._post_and_await_first_delta(
             session_id, text, wait_idle_first=True, timeout=timeout
+        )
+
+    async def cold_restart_first_delta(
+        self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
+    ) -> None:
+        """Post to a stopped existing session and await its first response.
+
+        A stopped session is marked failed rather than idle, so this deliberately
+        skips the warm-session idle poll. The POST itself triggers the host runner
+        relaunch whose latency this path measures.
+        """
+        await self._post_and_await_first_delta(
+            session_id, text, wait_idle_first=False, timeout=timeout
         )
 
     async def cold_start_first_delta(

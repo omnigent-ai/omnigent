@@ -41,10 +41,13 @@ afterEach(() => {
 describe("listPermissions", () => {
   it("GETs /v1/sessions/{id}/permissions and returns the array", async () => {
     fetchMock.mockResolvedValueOnce(
-      mockResponse([
-        { user_id: "alice", conversation_id: "conv_abc", level: 3 },
-        { user_id: "bob", conversation_id: "conv_abc", level: 1 },
-      ]),
+      mockResponse({
+        permissions: [
+          { user_id: "alice", conversation_id: "conv_abc", level: 3 },
+          { user_id: "bob", conversation_id: "conv_abc", level: 1 },
+        ],
+        next_cursor: null,
+      }),
     );
 
     const result = await listPermissions("conv_abc");
@@ -62,7 +65,7 @@ describe("listPermissions", () => {
   });
 
   it("url-encodes the session id", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse([]));
+    fetchMock.mockResolvedValueOnce(mockResponse({ permissions: [], next_cursor: null }));
     await listPermissions("conv with space");
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv%20with%20space/permissions");
   });
@@ -200,6 +203,7 @@ describe("derivePermissionLevel — resolution order", () => {
       permissionLevel,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     };
   }
 
@@ -238,6 +242,19 @@ describe("derivePermissionLevel — resolution order", () => {
     // level renders synchronously while the single-fetch is in flight.
     const sidebar = makeConv(2);
     expect(derivePermissionLevel(null, true, sidebar, "conv_test", true)).toBe(2);
+  });
+
+  it("ignores a sidebar row whose level is null and defers to the snapshot fallback", () => {
+    // A deployment whose session list is owner-only (the caller's effective
+    // level omitted, e.g. the Databricks-managed server) returns rows with
+    // permission_level=null. That absence is NOT the permissive null sentinel:
+    // we must not conclude from it, so while the single-fetch loads we return
+    // null (loading, permissive) rather than reading the row's null as a
+    // resolved level — the authoritative snapshot then wins once it lands.
+    const sidebar = makeConv(null);
+    expect(derivePermissionLevel(null, true, sidebar, "conv_test", true)).toBeNull();
+    // And once the snapshot resolves, it — not the null row — decides.
+    expect(derivePermissionLevel(makeSession(1), false, sidebar, "conv_test", true)).toBe(1);
   });
 
   it("returns null while the single-fetch is still loading and the sidebar has no row", () => {
@@ -290,7 +307,9 @@ describe("isOwnerLevel — owner boundary", () => {
 
 describe("authenticatedFetch integration", () => {
   it("all API functions route through authenticatedFetch, not raw fetch", async () => {
-    const spy = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(mockResponse([]));
+    const spy = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockResolvedValue(mockResponse({ permissions: [], next_cursor: null }));
 
     await listPermissions("conv_abc");
     expect(spy).toHaveBeenCalledTimes(1);

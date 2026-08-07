@@ -279,14 +279,23 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
     await asyncio.sleep(0.2)
 
     ws = _FakeWebSocket(inbound=[], send_delay_s=0.005)
+    reader_done = asyncio.Event()
+    forward_done = asyncio.Event()
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
+            ws,
+            socket_path=str(sock),
+            tmux_target=target,
+            read_only=False,
+            reader_done=reader_done,
+            forward_done=forward_done,
         )
     )
-    # Wait past attach + burst + the bounded drain (coalesced to ~100 frames of
-    # ~20 KB, so ~0.5 s of 5 ms sends; generous margin below).
-    await asyncio.sleep(10.0)
+    # Deterministically wait until the reader has queued the whole backlog plus
+    # the EOF sentinel, then until the forwarder has fully drained it — no
+    # arbitrary wall-clock sleep. Timeouts are generous backstops, not timing.
+    await asyncio.wait_for(reader_done.wait(), timeout=20.0)
+    await asyncio.wait_for(forward_done.wait(), timeout=20.0)
 
     total_y = sum(f.count(b"Y") for f in ws.sent)
     assert total_y >= payload_len, (
@@ -473,6 +482,62 @@ async def test_seed_alternate_screen_does_not_leak_primary_history() -> None:
             f"alt-screen seed leaked {seed.count(b'OLD-')} stale primary-history lines"
         )
         assert b"ALT-row" in seed, "alt-screen visible content missing from seed"
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_seed_replays_alt_screen_and_mouse_modes() -> None:
+    """The seed replays the pane program's screen/input modes.
+
+    capture-pane records cells only; a TUI that entered the alternate screen
+    and enabled mouse tracking BEFORE this client attached (OpenCode, vim)
+    would otherwise leave the browser xterm believing no tracking is active —
+    wheel events then send nothing and the view cannot scroll.
+    """
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    # The OpenCode/bubbletea shape: alt screen + any-motion mouse + SGR.
+    sock, target = await _new_private_tmux(
+        "python3 -c 'import sys,time; "
+        'sys.stdout.write("\\x1b[?1049h\\x1b[?1003h\\x1b[?1006h\\x1b[1;1HTUI"); '
+        "sys.stdout.flush(); time.sleep(30)'"
+    )
+    await asyncio.sleep(0.5)
+    try:
+        seed = await _run_tmux_capture(str(sock), target)
+        assert seed is not None
+        # Alt screen entered BEFORE the clear+content so the seed paints into
+        # the alt buffer, never into primary-screen scrollback.
+        assert seed.startswith(b"\x1b[?1049h"), f"seed prelude missing 1049h: {seed[:16]!r}"
+        assert b"\x1b[?1003h" in seed, "mouse any-motion mode not replayed"
+        assert b"\x1b[?1006h" in seed, "SGR mouse encoding not replayed"
+        # Modes the program never set stay unset.
+        assert b"\x1b[?1002h" not in seed
+        assert b"\x1b[?1000h" not in seed
+    finally:
+        await _kill_tmux(sock)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_seed_plain_shell_replays_no_modes() -> None:
+    """A primary-screen pane with no mouse tracking gets no mode escapes.
+
+    Spurious enables would put the browser xterm on the alt buffer (killing
+    native scrollback) or swallow wheel events into mouse reports the shell
+    can't use.
+    """
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    sock, target = await _new_private_tmux("bash")
+    await asyncio.sleep(0.5)
+    try:
+        seed = await _run_tmux_capture(str(sock), target)
+        assert seed is not None
+        for mode in (b"?1049h", b"?1000h", b"?1002h", b"?1003h", b"?1005h", b"?1006h", b"?1h"):
+            assert b"\x1b[" + mode not in seed, f"spurious mode enable {mode!r} in seed"
     finally:
         await _kill_tmux(sock)
 

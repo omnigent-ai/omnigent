@@ -7,15 +7,21 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
+from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
+    SWITCH_MODEL_DIALOG_HINT,
+    inject_slash_command,
     inject_user_message,
     read_active_session_id,
+    read_claude_status_model,
+    read_launch_model,
+    read_model_env,
 )
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -24,7 +30,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment
+from omnigent.inner.native_attachments import attachment_reference_line
 
 _logger = logging.getLogger(__name__)
 
@@ -60,6 +66,10 @@ class ClaudeNativeExecutor(Executor):
         # adapter caching one executor per conversation; per-turn
         # construction would regress the lock to per-turn scope.
         self._inject_lock = asyncio.Lock()
+        # The model the pane is currently on, so a routing turn only types
+        # ``/model`` when the model actually changes. Seeded lazily from the
+        # spawn ``launch_model`` on the first turn (``None`` = not yet known).
+        self._applied_model: str | None = None
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -69,7 +79,7 @@ class ClaudeNativeExecutor(Executor):
         """:returns: ``True`` because messages can be injected mid-turn."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
         Inject a live steering message into the Claude terminal.
 
@@ -115,12 +125,15 @@ class ClaudeNativeExecutor(Executor):
         :param system_prompt: System prompt from the agent spec. The
             native Claude Code terminal controls its own prompt/settings,
             so this is ignored.
-        :param config: Per-turn executor config. Unused by this
-            terminal-backed executor.
+        :param config: Per-turn executor config. Only ``config.model``
+            is used: when intelligent routing picks a model for this turn,
+            it arrives here (adapter maps ``request.model_override`` →
+            ``config.model``) and the switch is applied inline, before the
+            message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
             or :class:`ExecutorError` on bridge failure.
         """
-        del tools, system_prompt, config
+        del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             yield ExecutorError(
                 message=(
@@ -139,9 +152,40 @@ class ClaudeNativeExecutor(Executor):
         # native path. session.id is applied generically by the span processor
         # (the executor adapter binds session_scope for the turn), so there's
         # no per-call-site stamping here.
+        #
+        # Apply a routed ``/model`` switch and inject the message as ONE
+        # step under ``_inject_lock``. Intelligent routing used to switch
+        # the model with a separate server-issued ``model_change`` event
+        # that raced this inject on the same tmux pane, so the message's
+        # keystrokes could land mid-switch and be lost (the "routing drops
+        # the first message" bug). Folding the switch into the turn under
+        # the same lock removes the second writer entirely: ``/model`` fully
+        # commits, then ``inject_user_message`` (which waits for the input
+        # box and verifies its submit) delivers the message — in order,
+        # once.
+        wanted_model = config.model if config is not None else None
+        # ``/model`` only accepts this session's aliases / custom slot; a
+        # bare catalog id is ignored and the pane keeps its old model.
+        wanted_model_arg = self._model_command_arg(wanted_model)
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
+                    if wanted_model_arg is not None:
+                        # Accepted trade-off: ``/model <id>`` also saves the
+                        # pick as the person's global default for new Claude
+                        # sessions. Runs to completion before the message
+                        # inject below (same lock), so its confirm Enter can't
+                        # race the message.
+                        await asyncio.to_thread(
+                            inject_slash_command,
+                            self._bridge_dir,
+                            command=f"/model {wanted_model_arg}",
+                            auto_confirm=True,
+                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                        )
+                        # Track the routed id, not the alias: the next turn's
+                        # comparison is against what routing asked for.
+                        self._applied_model = wanted_model
                     await asyncio.to_thread(
                         inject_user_message,
                         self._bridge_dir,
@@ -151,6 +195,98 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=str(exc))
             return
         yield TurnComplete(response=None)
+
+    def _model_command_arg(self, wanted_model: str | None) -> str | None:
+        """
+        Return the ``/model`` argument for this turn, or ``None`` to skip.
+
+        Two gates: the switch must be needed at all
+        (:meth:`_should_switch_model`), and the routed catalog id must
+        translate into vocabulary ``/model`` accepts — the session's
+        family aliases, or the exact id of its custom picker slot. The
+        pinning comes from the terminal's launch env, recorded in the
+        bridge config because this process doesn't share that env.
+
+        An untranslatable id fails open: the message still goes in, on
+        the current model, with a warning. Typing a value the CLI won't
+        take leaves the pane on its old model while reporting success.
+
+        :param wanted_model: The turn's routed model, or ``None``.
+        :returns: A ``/model`` argument, or ``None`` when no switch
+            should be typed.
+        """
+        if wanted_model is None:
+            _logger.info("claude-native: turn carries no routed model; not typing /model")
+            return None
+        if not self._should_switch_model(wanted_model):
+            _logger.info(
+                "claude-native: skipping /model — pane is already on %s",
+                wanted_model,
+            )
+            return None
+        env = read_model_env(self._bridge_dir) or None
+        wanted_arg = claude_model_command_arg(wanted_model, env)
+        if wanted_arg is None:
+            _logger.warning(
+                "claude-native: skipping /model — routed model %r has no spelling this "
+                "session accepts (pins=%s); sending the turn on the current model",
+                wanted_model,
+                sorted(env or ()),
+            )
+            return None
+        if (
+            self._applied_model is not None
+            and claude_model_command_arg(self._applied_model, env) == wanted_arg
+        ):
+            # Resolves to the model the pane is already on, so the switch
+            # would be a pointless prompt (and can pop a confirm dialog).
+            _logger.info(
+                "claude-native: skipping /model — %r resolves to %r, already applied",
+                wanted_model,
+                wanted_arg,
+            )
+            return None
+        _logger.info(
+            "claude-native: typing /model %s for routed model %s",
+            wanted_arg,
+            wanted_model,
+        )
+        return wanted_arg
+
+    def _should_switch_model(self, wanted_model: str | None) -> bool:
+        """
+        Return whether this turn must type ``/model`` before the message.
+
+        Only switches when routing named a model AND it differs from the
+        model the pane is already on. The baseline is tracked per turn in
+        ``_applied_model``, seeded lazily so turn 1's routed pick is compared
+        against what the pane is actually on — not blindly re-issued.
+
+        The LIVE model (the statusLine capture) is the seed, falling back to
+        the launch model. ``launch_model`` alone was wrong for a routed first
+        message: the turn router blocks the prompt, switches the pane itself
+        and then replays the prompt with the same override, so a baseline
+        frozen at bridge-prepare time still named the pre-switch model and the
+        replay typed a second, redundant ``/model``.
+
+        :param wanted_model: The turn's routed model, or ``None`` when the
+            turn carries no override (routing off / already-pinned session).
+        :returns: ``True`` when a ``/model`` switch is required.
+        """
+        if not wanted_model:
+            return False
+        if self._applied_model is None:
+            # Both reads are best-effort (no statusLine capture yet, no ucode
+            # profile); an unknown baseline means we switch to be safe — a
+            # redundant ``/model`` to the current model is a harmless no-op.
+            self._applied_model = read_claude_status_model(self._bridge_dir) or read_launch_model(
+                self._bridge_dir
+            )
+        if self._applied_model is None:
+            return True
+        # The statusLine reports a display spelling ("Sonnet 5") where routing
+        # names a catalog id, so compare normalized.
+        return normalized_model_id(wanted_model) != normalized_model_id(self._applied_model)
 
 
 def _bridge_dir_from_env() -> Path:
@@ -213,7 +349,7 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     return ""
 
 
-def _content_to_text(content: Any, bridge_dir: Path) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """
     Normalize executor content into plain text.
 
@@ -245,13 +381,7 @@ def _content_to_text(content: Any, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                path = materialize_attachment(block, bridge_dir)
-                if path is not None:
-                    # Marker format is load-bearing: the transcript mirrors
-                    # this text back as the durable user message, and title
-                    # seeding strips lines matching _ATTACHMENT_MARKER_RE in
-                    # omnigent/entities/conversation.py. Keep in sync.
-                    attachment_lines.append(f"[Attached: {path}]")
+                attachment_lines.append(attachment_reference_line(block, bridge_dir))
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""

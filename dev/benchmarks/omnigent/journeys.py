@@ -15,6 +15,10 @@ v1 journeys are pure HTTP/API (server + DB, no runner, no LLM):
   ``external_conversation_item`` (see :meth:`BenchEnvironment.seed_items`).
 - ``fork_session`` — fork a session (deep-copy its items), then DELETE.
 - ``add_comment`` — create a review comment on a file (DB write).
+- ``list_projects`` — the sidebar project list (dual-read union of first-class
+  projects + legacy ``omni_project`` label-projects).
+- ``list_project_sessions`` — a project folder's session list, the
+  ``?project=`` dual-read filter behind clicking a project in the sidebar.
 
 ``read_runner_file`` needs a runner but no LLM turn: it plants a file in the
 runner environment (setup) and times the server → runner filesystem read proxy.
@@ -26,6 +30,11 @@ creates a host-bound session (which fires ``host.launch_runner``), attaches the
 SSE stream, sends the first message, and times to the first output-text delta —
 so the span includes the on-demand runner launch + reverse-tunnel handshake the
 UI's first message races, exactly as a real new chat pays it.
+
+``session_cold_restart`` reuses one existing host-bound session. Before every
+timed message it stops that session's runner outside the measured span; the
+message then exercises the server's automatic relaunch path and times to the
+first streamed response.
 
 The framework (``Journey`` + the two runners) is harness-agnostic and reused
 verbatim by phase-2 full-turn journeys.
@@ -42,7 +51,7 @@ from typing import Literal, cast
 
 import httpx
 
-from .environment import BenchEnvironment
+from .environment import BenchEnvironment, ServerRequestSnapshot
 from .measure import RunResult
 
 # Per-journey context returned by ``setup`` and threaded to ``measure``. Its
@@ -70,6 +79,9 @@ class Journey:
         the environment and the setup context.
     :param setup: Optional coroutine run once before timing; its return value
         is passed to ``measure`` (and ``teardown``) as ``ctx``.
+    :param prepare: Optional coroutine run before every measured operation,
+        outside that operation's latency timer. Used when each sample needs a
+        repeatable precondition, such as an offline runner.
     :param teardown: Optional coroutine run once after timing, given ``ctx``.
     :param concurrency_safe: Whether many ``measure`` calls may run at once
         against a shared setup (true for read-only / independent-write HTTP
@@ -79,8 +91,7 @@ class Journey:
         HTTP/DB journeys leave this ``False``.
     :param needs_host: Whether this journey needs a real host daemon
         (``BenchEnvironment(with_host=True)``) so a host-bound session-create
-        fires ``host.launch_runner`` and the first message races the runner's
-        boot. Implies ``needs_runner``. Only ``session_cold_start`` sets this.
+        or restart can fire ``host.launch_runner``. Implies ``needs_runner``.
     :param max_iterations: Upper bound on latency iterations for this journey,
         clamping ``--iterations`` down (never up). Full-turn journeys cost ~1s+
         per op, so 100+ iterations would blow the CI time budget; they cap at a
@@ -93,6 +104,7 @@ class Journey:
     kind: JourneyKind
     measure: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]]
     setup: Callable[[BenchEnvironment], Awaitable[JourneyContext]] | None = None
+    prepare: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     teardown: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     concurrency_safe: bool = False
     needs_runner: bool = False
@@ -103,12 +115,92 @@ class Journey:
     async def run_setup(self, env: BenchEnvironment) -> JourneyContext:
         return await self.setup(env) if self.setup is not None else None
 
+    async def run_prepare(self, env: BenchEnvironment, ctx: JourneyContext) -> None:
+        if self.prepare is not None:
+            await self.prepare(env, ctx)
+
     async def run_teardown(self, env: BenchEnvironment, ctx: JourneyContext) -> None:
         if self.teardown is not None:
             await self.teardown(env, ctx)
 
 
-# ── timed operation (shared by both runners) ─────────────────
+# ── failure classification (shared) ──────────────────────────
+
+
+def _failure_reason(exc: Exception) -> str:
+    """Classify an exception into a stable failure-breakdown label.
+
+    HTTP status errors key off their status code (``"HTTP 500"``) so the same
+    server error groups across ops; anything else keys off its class name.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return exc.__class__.__name__
+
+
+def _setup_failed_result(exc: Exception) -> RunResult:
+    """A run whose ``setup`` raised: zero successes, one recorded failure.
+
+    Returned in place of timing when a journey's per-run ``setup`` fails (e.g.
+    a 500 while resolving a target session), so the failure is recorded as a
+    data point and the suite moves on instead of the whole process aborting.
+    The ``setup:`` prefix distinguishes it from an operation-level failure, and
+    ``n_success == 0`` keeps it out of the summary averages (see
+    :func:`measure.aggregate`).
+    """
+    result = RunResult()
+    result.record_failure(f"setup: {_failure_reason(exc)}")
+    return result
+
+
+# ── server request counting (shared by both runners) ─────────
+
+# Route key for the harness's own counter-poll (see environment.py's debug
+# endpoint). Filtered out of the per-journey route appendix — it's
+# instrumentation overhead, not the journey's traffic.
+_METRICS_ROUTE_KEY = "GET /debug/server-metrics"
+
+
+async def _count_start(env: BenchEnvironment) -> ServerRequestSnapshot | None:
+    """Snapshot the server request counters before a run's timed region.
+
+    Returns ``None`` (counting disabled for the run) if the counter is
+    unreachable, so a benchmark against a server without the debug router still
+    produces latency numbers — it just omits the network block.
+    """
+    try:
+        return await env.server_request_snapshot()
+    except Exception:  # noqa: BLE001 — counting is best-effort, never fatal
+        return None
+
+
+async def _count_finish(
+    env: BenchEnvironment, start: ServerRequestSnapshot | None, result: RunResult
+) -> None:
+    """Record server HTTP requests handled during the run's timed region.
+
+    Diffs the counters against *start* and stores the total + per-route
+    breakdown on *result*. The closing poll itself hits the server and lands
+    inside the window, so subtract it (1) from the total to leave only the
+    journey's own requests plus any cross-process traffic (runner → server,
+    host → server). The poll targets the debug-metrics route, a bucket no
+    journey uses, so it never pollutes the per-route diff. A negative or
+    unavailable value leaves ``http_requests`` as ``None``.
+    """
+    if start is None:
+        return
+    end = await _count_start(env)
+    if end is None:
+        return
+    result.http_requests = max(0, end.total - start.total - 1)
+    result.route_requests = {
+        route: delta
+        for route, count in end.routes.items()
+        # Exclude the harness's own counter-poll route so the appendix reflects
+        # only the journey's traffic (the total above already backs it out).
+        if route != _METRICS_ROUTE_KEY
+        if (delta := count - start.routes.get(route, 0)) > 0
+    }
 
 
 async def _timed(
@@ -118,10 +210,8 @@ async def _timed(
     start = time.perf_counter()
     try:
         await journey.measure(env, ctx)
-    except httpx.HTTPStatusError as exc:
-        result.record_failure(f"HTTP {exc.response.status_code}")
     except Exception as exc:  # noqa: BLE001 — any failure is a recorded data point
-        result.record_failure(exc.__class__.__name__)
+        result.record_failure(_failure_reason(exc))
     else:
         result.latencies_ms.append((time.perf_counter() - start) * 1000)
 
@@ -136,20 +226,35 @@ async def run_latency(
 
     Warmup operations run through the same path but are excluded from the
     result, so first-call import/JIT/connection costs don't skew the numbers.
+
+    A failing ``setup`` (e.g. a 500 resolving a target session) is recorded as
+    a failed run and returned, rather than propagating and aborting the suite.
     """
-    ctx = await journey.run_setup(env)
+    try:
+        ctx = await journey.run_setup(env)
+    except Exception as exc:  # noqa: BLE001 — a setup failure is a recorded data point
+        return _setup_failed_result(exc)
     try:
         for _ in range(warmup):
             with contextlib.suppress(Exception):  # warmup errors are non-fatal
+                await journey.run_prepare(env, ctx)
                 await journey.measure(env, ctx)
         result = RunResult()
+        count_start = await _count_start(env)
         wall_start = time.perf_counter()
         for _ in range(iterations):
+            try:
+                await journey.run_prepare(env, ctx)
+            except Exception as exc:  # noqa: BLE001 — preparation failure is a data point
+                result.record_failure(_failure_reason(exc))
+                continue
             await _timed(journey, env, ctx, result)
         result.wall_time = time.perf_counter() - wall_start
+        await _count_finish(env, count_start, result)
         return result
     finally:
-        await journey.run_teardown(env, ctx)
+        with contextlib.suppress(Exception):  # teardown failure must not abort the suite
+            await journey.run_teardown(env, ctx)
 
 
 async def run_throughput(
@@ -165,17 +270,29 @@ async def run_throughput(
     Wall time spans from the first dispatch to the last completion, so
     ``throughput`` reflects sustained req/s under load (MLflow's ``_run_once``
     shape, with an :class:`asyncio.Semaphore` gate).
+
+    A failing ``setup`` is recorded as a failed run and returned, rather than
+    propagating and aborting the suite.
     """
-    ctx = await journey.run_setup(env)
+    try:
+        ctx = await journey.run_setup(env)
+    except Exception as exc:  # noqa: BLE001 — a setup failure is a recorded data point
+        return _setup_failed_result(exc)
     try:
         sem = asyncio.Semaphore(concurrency)
 
         async def _one(count_it: bool, result: RunResult) -> None:
             async with sem:
                 if count_it:
+                    try:
+                        await journey.run_prepare(env, ctx)
+                    except Exception as exc:  # noqa: BLE001 — preparation failure is a data point
+                        result.record_failure(_failure_reason(exc))
+                        return
                     await _timed(journey, env, ctx, result)
                 else:
                     with contextlib.suppress(Exception):  # warmup errors are non-fatal
+                        await journey.run_prepare(env, ctx)
                         await journey.measure(env, ctx)
 
         if warmup:
@@ -183,12 +300,15 @@ async def run_throughput(
             await asyncio.gather(*[_one(False, throwaway) for _ in range(warmup)])
 
         result = RunResult()
+        count_start = await _count_start(env)
         wall_start = time.perf_counter()
         await asyncio.gather(*[_one(True, result) for _ in range(requests)])
         result.wall_time = time.perf_counter() - wall_start
+        await _count_finish(env, count_start, result)
         return result
     finally:
-        await journey.run_teardown(env, ctx)
+        with contextlib.suppress(Exception):  # teardown failure must not abort the suite
+            await journey.run_teardown(env, ctx)
 
 
 # ── journey implementations ──────────────────────────────────
@@ -270,6 +390,53 @@ async def _measure_load_history(env: BenchEnvironment, ctx: JourneyContext) -> N
         f"/v1/sessions/{session_id}/items",
         params={"order": "asc", "limit": _HISTORY_PAGE_LIMIT},
     )
+    resp.raise_for_status()
+
+
+# Project name for the folder-fetch journey. Self-seeded when the corpus has no
+# project so the ``?project=`` filter has a real member to resolve and return.
+_BENCH_PROJECT_NAME = "bench-project"
+
+
+async def _setup_project_name(env: BenchEnvironment) -> str:
+    """Return a project name to fetch: an existing corpus project, else seed one.
+
+    Mirrors ``_setup_target_session``: real runs read a representative project
+    from the seeded corpus (``seed.py`` files a configurable fraction of sessions
+    into first-class projects), so the folder fetch resolves a realistically
+    populated project. When none exists (empty-DB smoke path) we file one session
+    under a fresh project so the ``?project=`` filter still exercises the real
+    dual-read path instead of an empty match.
+    """
+    assert env.client is not None
+    listing = await env.client.get("/v1/sessions/projects")
+    listing.raise_for_status()
+    projects = listing.json()
+    if projects:
+        return str(projects[0]["name"])
+    # Empty DB: create a first-class project and file one session into it.
+    name = await env.ensure_agent()
+    agent_id = await env.agent_id(name)
+    session_id = await env.create_session(agent_id)
+    created = await env.client.post("/v1/projects", json={"name": _BENCH_PROJECT_NAME})
+    created.raise_for_status()
+    filed = await env.client.patch(
+        f"/v1/sessions/{session_id}", json={"project_id": created.json()["id"]}
+    )
+    filed.raise_for_status()
+    return _BENCH_PROJECT_NAME
+
+
+async def _measure_list_projects(env: BenchEnvironment, _ctx: JourneyContext) -> None:
+    assert env.client is not None
+    resp = await env.client.get("/v1/sessions/projects")
+    resp.raise_for_status()
+
+
+async def _measure_list_project_sessions(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    assert env.client is not None
+    project = cast(str, ctx)  # _setup_project_name
+    resp = await env.client.get("/v1/sessions", params={"limit": 20, "project": project})
     resp.raise_for_status()
 
 
@@ -385,6 +552,32 @@ async def _setup_cold_start_agent(env: BenchEnvironment) -> str:
     return await _setup_turn_agent(env, stream=True)
 
 
+async def _setup_cold_restart_session(env: BenchEnvironment) -> str:
+    """Create a host-backed session and complete its first turn.
+
+    This establishes the durable conversation and its runner binding before
+    the per-sample preparation stops the runner. Every measured message then
+    resumes this same existing session through the automatic relaunch path.
+    """
+    agent_id = await _setup_turn_agent(env, stream=True)
+    session_id = await env.create_hosted_session(agent_id)
+    await env.drive_turn(session_id, _TURN_PROMPT)
+    return session_id
+
+
+async def _prepare_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the existing session's runner before a cold-restart sample."""
+    session_id = cast(str, ctx)  # _setup_cold_restart_session
+    await env.stop_session_runner(session_id)
+
+
+async def _teardown_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the runner left online after the final first-token sample."""
+    session_id = cast(str, ctx)  # _setup_cold_restart_session
+    with contextlib.suppress(Exception):
+        await env.stop_session_runner(session_id)
+
+
 async def _setup_warm_session(env: BenchEnvironment) -> str:
     """Create+bind a session and drive one warm-up turn; return the session id.
 
@@ -447,6 +640,12 @@ async def _measure_session_cold_start(env: BenchEnvironment, ctx: JourneyContext
     await env.cold_start_first_delta(agent_id, _TURN_PROMPT)
 
 
+async def _measure_session_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Post to an existing session with a dead runner; await first token."""
+    session_id = cast(str, ctx)  # _setup_cold_restart_session
+    await env.cold_restart_first_delta(session_id, _TURN_PROMPT)
+
+
 async def _measure_warm_turn(env: BenchEnvironment, ctx: JourneyContext) -> None:
     session_id = cast(str, ctx)  # _setup_warm_session
     await env.drive_turn(session_id, _TURN_PROMPT)
@@ -478,6 +677,86 @@ async def _setup_runner_file_session(env: BenchEnvironment) -> str:
 async def _measure_read_runner_file(env: BenchEnvironment, ctx: JourneyContext) -> None:
     session_id = cast(str, ctx)  # _setup_runner_file_session
     await env.read_runner_file(session_id, _RUNNER_FILE_PATH)
+
+
+# ── policy evaluate ──────────────────────────────────────────
+
+_POLICY_EVALUATE_PAYLOAD = {
+    "event": {
+        "type": "PHASE_TOOL_CALL",
+        "data": {"name": "Bash", "arguments": {"command": "ls"}},
+    }
+}
+
+
+async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
+    """Create an agent-bound session with a declared policy and warm the caches.
+
+    The agent must declare at least one policy so ``any_policies_apply`` is
+    true and the full engine build (single tree scan + preloaded conversation)
+    runs on every evaluate call. A zero-policy spec short-circuits before the
+    build, which would measure the wrong path.
+
+    Two warm calls are made before returning so the agent-spec and
+    session-policy caches are populated; the measured iteration then reflects
+    steady-state overhead, not cold-cache cost.
+    """
+    assert env.client is not None
+    import io
+    import tarfile
+
+    import yaml
+
+    config: dict[str, object] = {
+        "spec_version": 1,
+        "name": "bench-policy-agent",
+        "guardrails": {
+            "policies": {
+                "allow_all": {
+                    "type": "function",
+                    "on": ["tool_call"],
+                    "function": "tests.runtime.policies.conftest._always_allow",
+                }
+            }
+        },
+    }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        payload = yaml.safe_dump(config).encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    bundle = buf.getvalue()
+
+    resp = await env.client.post(
+        "/v1/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    resp.raise_for_status()
+    agent_id = resp.json()["id"]
+
+    session_resp = await env.client.post("/v1/sessions", json={"agent_id": agent_id})
+    session_resp.raise_for_status()
+    session_id = session_resp.json()["id"]
+
+    # Warm the spec + policy caches — the measured iteration is steady-state.
+    for _ in range(2):
+        await env.client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_POLICY_EVALUATE_PAYLOAD,
+        )
+
+    return session_id
+
+
+async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    session_id = cast(str, ctx)  # _setup_policy_evaluate_session
+    assert env.client is not None
+    resp = await env.client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_POLICY_EVALUATE_PAYLOAD,
+    )
+    resp.raise_for_status()
 
 
 # ── registry ─────────────────────────────────────────────────
@@ -524,6 +803,21 @@ ALL_JOURNEYS: dict[str, Journey] = {
             description="GET /v1/sessions?search_query= — unindexed LIKE over titles + items.",
         ),
         Journey(
+            name="list_projects",
+            kind="latency",
+            measure=_measure_list_projects,
+            concurrency_safe=True,
+            description="GET /v1/sessions/projects — sidebar project list (dual-read union).",
+        ),
+        Journey(
+            name="list_project_sessions",
+            kind="latency",
+            measure=_measure_list_project_sessions,
+            setup=_setup_project_name,
+            concurrency_safe=True,
+            description="GET /v1/sessions?project= — a project folder's sessions (dual-read).",
+        ),
+        Journey(
             name="fork_session",
             kind="latency",
             measure=_measure_fork_session,
@@ -540,6 +834,15 @@ ALL_JOURNEYS: dict[str, Journey] = {
             concurrency_safe=True,
             description="POST /v1/sessions/{id}/comments — create a review comment.",
         ),
+        Journey(
+            name="policy_evaluate",
+            kind="latency",
+            measure=_measure_policy_evaluate,
+            setup=_setup_policy_evaluate_session,
+            concurrency_safe=True,
+            description="POST /v1/sessions/{id}/policies/evaluate — PreToolUse hook "
+            "(single tree scan, preloaded conversation row, caches warm).",
+        ),
         # Runner (full-turn) journeys — with_runner=True, openai-agents, mock LLM.
         Journey(
             name="session_cold_start",
@@ -551,6 +854,19 @@ ALL_JOURNEYS: dict[str, Journey] = {
             max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Create a host-bound session (fires host.launch_runner) then "
             "time create → attach SSE → send → first token — the real UI cold path.",
+        ),
+        Journey(
+            name="session_cold_restart",
+            kind="latency",
+            measure=_measure_session_cold_restart,
+            setup=_setup_cold_restart_session,
+            prepare=_prepare_cold_restart,
+            teardown=_teardown_cold_restart,
+            needs_runner=True,
+            needs_host=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
+            description="Stop the runner for an existing host-bound session, then time "
+            "POST message → automatic runner relaunch → first token.",
         ),
         Journey(
             name="warm_turn",

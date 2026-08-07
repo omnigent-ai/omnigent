@@ -44,9 +44,18 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_meta_text,
     list_skill_resources,
 )
+from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
+from omnigent.tools.builtins.nimble_research import NimbleResearchTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
+from omnigent.tools.builtins.scheduled_tasks import (
+    SysScheduledTaskCreateTool,
+    SysScheduledTaskDeleteTool,
+    SysScheduledTaskListTool,
+    SysScheduledTaskUpdateTool,
+)
+from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     SysSessionCloseTool,
     SysSessionCreateTool,
@@ -68,6 +77,8 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "NimbleExtractTool",
+    "NimbleResearchTool",
     "ReadSkillFileTool",
     "SysAdviseModelsTool",
     "SysAgentDownloadTool",
@@ -77,11 +88,16 @@ __all__ = [
     "SysCancelAsyncTool",
     "SysListModelsTool",
     "SysReadInboxTool",
+    "SysScheduledTaskCreateTool",
+    "SysScheduledTaskDeleteTool",
+    "SysScheduledTaskListTool",
+    "SysScheduledTaskUpdateTool",
     "SysSessionCloseTool",
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
     "SysSessionListTool",
+    "SysSessionRenameTool",
     "SysSessionSendTool",
     "SysSessionShareTool",
     "SysTimerCancelTool",
@@ -101,8 +117,8 @@ __all__ = [
 
 # Factory type: each constructor accepts a config dict and returns
 # a Tool. Callable is used instead of type[Tool] because the base
-# Tool.__init__ does not declare a config parameter — only the
-# web search subclasses do.
+# Tool.__init__ does not declare a config parameter — only some
+# subclasses (web search, nimble research, nimble extract) do.
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
@@ -234,6 +250,8 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "nimble_research": lambda config: NimbleResearchTool(config=config),
+    "nimble_extract": lambda config: NimbleExtractTool(config=config),
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,

@@ -58,6 +58,14 @@ export function LoginPage() {
   // paths — never a fully-qualified URL — to prevent open-redirect.
   const returnTo = sanitizeReturnTo(params.get("return_to"));
   const magicError = params.get("magic"); // "expired" | "missing" | null
+  // Forced re-authentication: the device-grant consent page bounces here with
+  // ?reauth=1 to require a FRESH password submit before approving a delegated
+  // login, even for an already-signed-in user. When set, suppress the
+  // "already authenticated → bounce back" shortcut below — otherwise the
+  // stale session would auto-return to consent, which would just bounce here
+  // again (a loop). The user must re-enter their password; a successful submit
+  // mints a new session whose iat clears the consent page's freshness check.
+  const forceReauth = params.get("reauth") === "1";
 
   const [username, setUsername] = useState(readLastUsername);
   const [password, setPassword] = useState("");
@@ -74,7 +82,12 @@ export function LoginPage() {
   // user — bounce them to where they were headed (or home). Covers
   // someone hitting /login directly, a bookmarked /login, or a
   // back-button after auth. Hard-navigate so identity.ts re-runs.
+  //
+  // EXCEPT under forced re-auth (?reauth=1, from device-grant consent): there
+  // the whole point is to re-prove the password, so an existing session must
+  // NOT short-circuit — show the form and require a fresh submit.
   useEffect(() => {
+    if (forceReauth) return;
     void (async () => {
       const account = await getMe();
       if (account !== null) {
@@ -130,12 +143,12 @@ export function LoginPage() {
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
-          <p className="text-sm text-muted-foreground">Welcome to Omnigent.</p>
+          <p className="text-ui text-muted-foreground">Welcome to Omnigent.</p>
         </div>
 
         <form onSubmit={onSubmit} className="space-y-4">
           <div className="space-y-1.5">
-            <label htmlFor="login-username" className="text-sm font-medium leading-none">
+            <label htmlFor="login-username" className="text-ui font-medium leading-none">
               Username
             </label>
             <Input
@@ -147,14 +160,14 @@ export function LoginPage() {
               disabled={submitting}
               required
             />
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm text-muted-foreground">
               On a fresh install your username is your machine login (the output of{" "}
               <code className="font-mono">whoami</code>), unless an admin set a different one.
             </p>
           </div>
 
           <div className="space-y-1.5">
-            <label htmlFor="login-password" className="text-sm font-medium leading-none">
+            <label htmlFor="login-password" className="text-ui font-medium leading-none">
               Password
             </label>
             <Input
@@ -171,7 +184,7 @@ export function LoginPage() {
           {error !== null && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {error}
             </div>
@@ -182,11 +195,12 @@ export function LoginPage() {
           </Button>
         </form>
 
-        <p className="text-center text-xs text-muted-foreground">
-          On a fresh install the initial admin password was printed to the server's stderr and saved
-          to{" "}
+        <p className="text-center text-sm text-muted-foreground">
+          On a fresh install you set the first admin's password yourself — no credential is
+          auto-generated. A brand-new instance shows a Create-admin form instead of this one; the
+          password can also be pre-seeded with{" "}
           <code className="rounded bg-muted px-1 py-0.5 font-mono">
-            ~/.omnigent/admin-credentials
+            OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD
           </code>
           .
         </p>

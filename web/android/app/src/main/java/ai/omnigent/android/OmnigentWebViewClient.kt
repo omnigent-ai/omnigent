@@ -6,21 +6,19 @@ import android.net.Uri
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.webkit.WebViewFeature
 
 /**
- * Injects the [NativeBridgeScript] facade on the pinned origin, signals
- * [onPageReady] once a pinned-origin page finishes loading, and routes the OIDC
- * login flow to the system browser via [onLoginRequired].
+ * Signals [onPageReady] once a pinned-origin page finishes loading and decides
+ * where the login flow runs: inline for servers matching [usesInWebViewAuth],
+ * otherwise handed to the system browser via [onLoginRequired].
  *
- * Unlike iOS's `WKUserScript(.atDocumentStart)`, Android has no pre-JS injection
- * hook; `onPageStarted` fires after the first response byte — in practice before
- * the SPA's bundle evaluates, so `window.omnigentNative` is present by the time
- * React mounts. Anything depending on the injected emit-callbacks (notification
- * replay, inset push) waits for [onPageReady].
+ * The facade is normally registered with `addDocumentStartJavaScript` in
+ * `MainActivity`. Older WebViews that support the message listener but not
+ * document-start scripts inject it after the pinned page finishes.
  */
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
+    private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
 ) : WebViewClient() {
@@ -33,33 +31,25 @@ class OmnigentWebViewClient(
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
+        val pinned = pinnedOrigin()
 
         // A real http(s) navigation to a foreign origin means the server bounced
-        // us to the OIDC IdP and shouldOverrideUrlLoading didn't catch the
-        // redirect. Stop and run native system-browser login (RFC 8252: never
-        // authenticate in an embedded WebView; Google blocks it and passkeys don't
-        // work). Idempotent: the login manager ignores a second start while one is
-        // in flight.
+        // us to the IdP and shouldOverrideUrlLoading didn't catch the redirect.
+        // Stop and run native system-browser login (RFC 8252 — required for IdPs
+        // like Google that reject embedded user-agents). Idempotent: the login
+        // manager ignores a second start while one is in flight. Servers that
+        // authenticate in the WebView keep loading instead.
         //
         // A null / about:blank / chrome-error:// URL is a failed or transitional
         // load of the pinned server (e.g. it's offline), NOT an IdP redirect —
         // don't misread it as a bounce and pop the browser. Mirror the http(s)
         // gate in shouldOverrideUrlLoading.
-        if (isHttpScheme(scheme) && origin != pinnedOrigin()) {
+        if (isHttpScheme(scheme) && origin != pinned && !usesInWebViewAuth(pinned)) {
             // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
             view.stopLoading()
             onLoginRequired()
             return
-        }
-
-        // Inject the facade ONLY on the pinned origin and only when the web
-        // message listener is supported — otherwise the web would see a dead
-        // bridge and suppress its own Web Notifications / fallbacks.
-        if (origin == pinnedOrigin() &&
-            WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
-        ) {
-            view.evaluateJavascript(NativeBridgeScript.source, null)
         }
     }
 
@@ -68,6 +58,10 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        if (originOf(url) == pinnedOrigin() && shouldInjectBridgeAtPageReady()) {
+            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            return
+        }
         onPageReady(url)
     }
 
@@ -90,14 +84,27 @@ class OmnigentWebViewClient(
 
         // Same-origin app pages load in the WebView.
         val origin = originOf(url.toString())
-        if (origin == pinnedOrigin()) return false
+        val pinned = pinnedOrigin()
+        if (origin == pinned) return false
 
-        // Off-origin top-level navigation. A server redirect (no user gesture) is
-        // the OIDC flow bouncing to the IdP -> run native system-browser login. A
-        // user gesture is an external link -> hand to the system browser. Either
-        // way the foreign page never loads in this WebView (which holds the
-        // native bridge).
         authLog("off-origin nav $origin gesture=${request.hasGesture()}")
+
+        // In-WebView auth: the IdP flow runs inline — safe because the native
+        // bridge is origin-allowlisted to the pinned origin by WebView itself, so
+        // the IdP page can't reach it. Only a gesture from a pinned-origin page is
+        // an external link; once we're on the IdP's own pages its navigations
+        // (sign-in buttons, form posts, tenant hops) are all gesture-driven and
+        // must stay inline or the flow ejects to the browser mid-login.
+        if (usesInWebViewAuth(pinned)) {
+            if (originOf(view.url) == pinned && request.hasGesture()) {
+                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                return true
+            }
+            return false
+        }
+
+        // System-browser auth. A user gesture is an external link -> hand to the
+        // system browser. A server redirect is the login flow bouncing to the IdP.
         if (request.hasGesture()) {
             runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
         } else {

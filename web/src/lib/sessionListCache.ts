@@ -23,6 +23,18 @@ export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string |
  */
 export const PROJECT_LABEL_KEY = "omni_project";
 
+/**
+ * The reserved `conversation_labels` key that records whether a session is
+ * pinned in the sidebar. The value is the epoch-ms timestamp of when it was
+ * pinned (any non-empty value means pinned); the label is absent when unpinned
+ * (the server deletes it on an empty-string PATCH). Storing the pin time lets
+ * the Pinned section order by pin recency, stable when a new message bumps a
+ * session's `updated_at`. Mirrors the server's `PINNED_LABEL_KEY`. Kept beside
+ * `PROJECT_LABEL_KEY` in this leaf module so the sidebar can derive pin state
+ * without a hooks-layer import cycle.
+ */
+export const PINNED_LABEL_KEY = "omnigent.pinned";
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;
@@ -301,9 +313,7 @@ export function removeIdsFromPages(
  *   skipped.
  * @returns Deduplicated conversation ids.
  */
-export function collectConversationIds(
-  datas: Array<ConversationsInfiniteData | undefined>,
-): string[] {
+export function collectConversationIds(datas: (ConversationsInfiniteData | undefined)[]): string[] {
   const ids = new Set<string>();
   for (const data of datas) {
     if (!data) continue;

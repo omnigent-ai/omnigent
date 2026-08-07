@@ -129,7 +129,7 @@ vi.mock("@/hooks/useResizablePanel", () => ({
 }));
 
 vi.mock("@/hooks/CommentSenderContext", () => ({
-  CommentSenderProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  CommentSenderProvider: ({ children }: { children: React.ReactNode }) => children,
   useOptionalCommentSender: vi.fn(() => null),
 }));
 
@@ -146,6 +146,7 @@ import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
+import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
@@ -855,6 +856,21 @@ describe("classifyAndRemapComments", () => {
     expect(result.open[0].id).toBe("c6");
   });
 
+  it("skips remapping for PDF geometry anchors", () => {
+    const anchor = encodePdfAnchor(1, [{ x: 0.1, y: 0.2, w: 0.3, h: 0.04 }], "Hello PDF");
+    const c = makeAnchoredComment({
+      id: "c_pdf",
+      start_index: anchor.start_index,
+      end_index: anchor.end_index,
+      anchor_content: anchor.anchor_content,
+    });
+
+    const result = classifyAndRemapComments([c], "%PDF-1.4 binary bytes");
+
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0]).toEqual(c);
+  });
+
   // Spec/xfail: a draft comment whose anchor can no longer be found
   // is currently returned in `open` at its stale stored offsets with no marker,
   // so the UI shows it as if still attached. The desired behavior is a
@@ -1450,5 +1466,49 @@ describe("FileViewer Escape closes the active tab", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     window.removeEventListener("keydown", swallow, { capture: true });
     expect(onCloseTab).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileViewer 3D model files", () => {
+  // Models render through CodeViewer's <ModelViewer> like images: they always
+  // resolve to the source surface and have no diff representation, so the diff
+  // toggle must be suppressed even when the model is a changed file (Monaco
+  // would otherwise render the base64 payload as garbage).
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+
+  it("resolves a model file to the source surface", () => {
+    renderViewer({ open: true, path: "widget.stl" });
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("suppresses the diff toggle for a model file even when it is a changed file", () => {
+    // Report the model as a changed file — an ordinary changed file would get a
+    // "Show diff" button; a model must not.
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [
+          {
+            path: "widget.stl",
+            bytes: 10,
+            modified_at: null,
+            name: "widget.stl",
+            status: "modified",
+          },
+        ],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderViewer({ open: true, path: "widget.stl" });
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+  });
+
+  it("does not offer the markdown/html view-mode controls for a model file", () => {
+    renderViewer({ open: true, path: "mesh.obj" });
+    expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
   });
 });

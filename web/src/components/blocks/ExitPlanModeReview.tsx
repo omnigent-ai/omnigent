@@ -51,7 +51,7 @@ export function ExitPlanModeReview({
           escaping AlertDescription's muted default (which otherwise washes
           the whole plan out). The short lead-in caption above stays muted
           for hierarchy, matching the Codex command card. */}
-      <div className="text-sm text-foreground">
+      <div className="text-ui text-foreground">
         <MessageResponse>{plan}</MessageResponse>
       </div>
       {rejecting ? (
@@ -61,7 +61,7 @@ export function ExitPlanModeReview({
             placeholder="What should change about the plan? (optional)"
             value={feedback}
             onChange={(e) => setFeedback(e.target.value)}
-            className="min-h-20 text-sm"
+            className="min-h-20 text-ui"
           />
           <div className="flex flex-wrap gap-2">
             <Button size="sm" onClick={() => onReject(feedback)}>

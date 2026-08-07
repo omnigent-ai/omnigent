@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import re
 
-from markdown_to_mrkdwn import SlackMarkdownConverter
-
 MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
 WHITESPACE_RE = re.compile(r"\s+")
 
-# Slack renders its own `mrkdwn` dialect, not standard Markdown (e.g. *bold* is
-# single-asterisk, links are <url|text>). Reuse one converter instance — it
-# compiles regex patterns on init.
-_MRKDWN_CONVERTER = SlackMarkdownConverter()
-
-
-def to_mrkdwn(text: str) -> str:
-    """Convert standard Markdown to Slack's mrkdwn dialect for display."""
-    return str(_MRKDWN_CONVERTER.convert(text))
+# Generic user-facing failure. Raw error detail (exception strings, in-band
+# ``response.error`` / ``turn.failed`` messages, server bodies) can carry stack
+# traces or internal paths, and a Slack thread is visible to the whole channel —
+# so the detail is logged server-side and only this generic line is shown (the
+# "server error bodies are never echoed" rule in DESIGN.md). Lives here (a
+# dependency-free leaf) so the streaming, notification, and service layers share
+# one wording.
+GENERIC_FAILURE_TEXT = (
+    ":warning: Something went wrong on the Omnigent server. Please try again; if it "
+    "keeps happening, contact your Omnigent operator."
+)
 
 
 def strip_bot_mention(text: str, bot_user_id: str | None) -> str:
@@ -30,10 +30,8 @@ def normalize_whitespace(text: str) -> str:
     return WHITESPACE_RE.sub(" ", text).strip()
 
 
-# Slack accepts up to 40,000 characters in a message `text`, but its own
-# guidance is to keep messages under 4,000 so they render without a "Show more"
-# fold. Stay at that best-practice ceiling and split longer answers across
-# replies (see `split_for_slack`).
+# Default cap for one-shot messages (session titles, short guidance replies).
+# Streamed answers are not subject to this — Slack owns chunking for streams.
 SLACK_MESSAGE_CHAR_LIMIT = 4000
 
 
@@ -46,34 +44,11 @@ def truncate_for_slack(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> str:
     return text[: limit - len(suffix)].rstrip() + suffix
 
 
-def split_for_slack(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> list[str]:
-    """Split ``text`` into chunks no longer than ``limit`` characters.
+# Block Kit caps a static_select option's text and value at 75 chars; some
+# packed values (e.g. an elicitation question key) use a larger app-defined cap.
+SLACK_OPTION_CHAR_LIMIT = 75
 
-    Preserves every character so a long assistant answer (code blocks,
-    reports) is delivered in full across multiple messages instead of being
-    truncated. Prefers to break after a newline, then a space, and only
-    hard-cuts a run with no whitespace (e.g. a long URL). A blank string
-    yields ``[""]`` so the caller always has a message to post.
-    """
-    if limit <= 0:
-        raise ValueError("limit must be positive")
-    if not text:
-        return [""]
 
-    chunks: list[str] = []
-    start = 0
-    length = len(text)
-    while start < length:
-        end = start + limit
-        if end >= length:
-            chunks.append(text[start:])
-            break
-        window = text[start:end]
-        boundary = window.rfind("\n")
-        if boundary == -1:
-            boundary = window.rfind(" ")
-        # Include the delimiter in the current chunk; hard-cut if none found.
-        cut = end if boundary <= 0 else start + boundary + 1
-        chunks.append(text[start:cut])
-        start = cut
-    return chunks
+def truncate_option(text: str, limit: int = SLACK_OPTION_CHAR_LIMIT) -> str:
+    """Fit ``text`` within a Block Kit option's char cap, eliding with ``…``."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"

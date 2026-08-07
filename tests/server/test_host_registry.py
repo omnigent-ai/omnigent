@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass, field
 
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
@@ -83,6 +85,96 @@ def test_deregister() -> None:
     registry.deregister("host_bbb")
 
     assert registry.get("host_bbb") is None
+
+
+def test_deregister_poisons_outbound_queue() -> None:
+    """
+    Verify that deregister ends the sender loop via the None sentinel,
+    the same way register does when it replaces a stale connection.
+
+    Without it the route handler's loops keep running on a connection
+    no lookup can find: the ping loop heart-beats the host row online
+    while every get() reports it offline, so a wake driven off the
+    durable row waits for a reconnect the host was never told to make.
+    """
+    registry = HostRegistry()
+    conn = registry.register("host_poison", FakeWebSocket(), _make_hello(), owner="bob")
+
+    assert registry.deregister("host_poison") is True
+    assert conn.outbound_queue.get_nowait() is None
+
+
+def test_deregister_returns_false_for_unknown() -> None:
+    """
+    Verify that deregister reports whether it removed an entry.
+
+    Callers gate the durable set_offline write on this, so a missing
+    host must not read as a successful removal.
+    """
+    registry = HostRegistry()
+
+    assert registry.deregister("host_nonexistent") is False
+
+
+def test_deregister_guard_keeps_newer_connection() -> None:
+    """
+    Verify that a guarded deregister only removes its own generation.
+
+    A superseded route handler reaching its cleanup after a reconnect
+    replaced it would otherwise evict the live connection and mark the
+    host offline.
+    """
+    registry = HostRegistry()
+    old_conn = registry.register("host_gen", FakeWebSocket(), _make_hello(), owner="bob")
+    new_conn = registry.register("host_gen", FakeWebSocket(), _make_hello(), owner="bob")
+
+    assert registry.deregister("host_gen", conn=old_conn) is False
+    assert registry.get("host_gen") is new_conn
+
+
+def test_mark_frame_seen_refreshes_current_connection() -> None:
+    """
+    Verify that a frame on the live connection refreshes its liveness.
+
+    The ping loop reads last_frame_at to decide whether a host is
+    dead, so a real frame must move it forward.
+    """
+    registry = HostRegistry()
+    conn = registry.register("host_seen", FakeWebSocket(), _make_hello(), owner="bob")
+    conn.last_frame_at = 0.0
+
+    assert registry.mark_frame_seen(conn) is True
+    assert conn.last_frame_at > 0.0
+
+
+def test_mark_frame_seen_rejects_superseded_connection() -> None:
+    """
+    Verify that a frame on a replaced connection does not refresh it.
+
+    Mirrors TunnelRegistry.mark_frame_seen: otherwise a stale handler
+    keeps a dead generation looking alive.
+    """
+    registry = HostRegistry()
+    old_conn = registry.register("host_stale", FakeWebSocket(), _make_hello(), owner="bob")
+    registry.register("host_stale", FakeWebSocket(), _make_hello(), owner="bob")
+    old_conn.last_frame_at = 0.0
+
+    assert registry.mark_frame_seen(old_conn) is False
+    assert old_conn.last_frame_at == 0.0
+
+
+def test_mark_frame_seen_rejects_deregistered_connection() -> None:
+    """
+    Verify that a frame arriving after deregistration is ignored.
+
+    The receive loop uses the False return to stop, so cleanup runs
+    and the host redials instead of lingering unreachable.
+    """
+    registry = HostRegistry()
+    conn = registry.register("host_gone", FakeWebSocket(), _make_hello(), owner="bob")
+    registry.deregister("host_gone")
+
+    assert registry.mark_frame_seen(conn) is False
 
 
 def test_deregister_noop_for_unknown() -> None:
@@ -186,6 +278,69 @@ def test_get_returns_none_for_unknown() -> None:
     assert registry.get("host_nonexistent") is None
 
 
+def test_same_host_id_isolated_across_workspaces() -> None:
+    """
+    The same stable host_id connecting to two workspaces is tracked as
+    two independent connections — neither evicts the other.
+
+    A laptop's config.yaml host_id is stable, so a multi-workspace user
+    presents the same id to workspace A and workspace B. Keyed on
+    host_id alone, the second connect would poison the first's outbound
+    queue and ``send_text`` would route workspace A's frames to
+    workspace B's tunnel. Keyed on (workspace_id, host_id) — mirroring
+    the hosts-table PK — both stay live and isolated.
+    """
+    registry = HostRegistry()
+    host_id = "00112233445566778899aabbccddeeff"
+
+    with workspace_scope(111):
+        conn_a = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+    with workspace_scope(222):
+        conn_b = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+
+    # Distinct connections, neither evicted.
+    assert conn_a is not conn_b
+    assert conn_a.workspace_id == 111
+    assert conn_b.workspace_id == 222
+    with workspace_scope(111):
+        assert registry.get(host_id) is conn_a
+    with workspace_scope(222):
+        assert registry.get(host_id) is conn_b
+
+    # Workspace B's connect did NOT poison workspace A's outbound queue.
+    assert conn_a.outbound_queue.empty()
+
+    # send_text routes to the right workspace's tunnel (no "replaced" error).
+    registry.send_text(conn_a, "a")
+    registry.send_text(conn_b, "b")
+    assert conn_a.outbound_queue.get_nowait() == "a"
+    assert conn_b.outbound_queue.get_nowait() == "b"
+
+    # Deregister is workspace-scoped: removing A leaves B live.
+    with workspace_scope(111):
+        registry.deregister(host_id)
+        assert registry.get(host_id) is None
+    with workspace_scope(222):
+        assert registry.get(host_id) is conn_b
+
+
+def test_online_host_ids_scoped_to_workspace() -> None:
+    """
+    online_host_ids returns only the requesting workspace's hosts, so
+    one tenant never sees another's connected host ids.
+    """
+    registry = HostRegistry()
+    with workspace_scope(111):
+        registry.register("host_a", FakeWebSocket(), _make_hello(), owner="alice")
+    with workspace_scope(222):
+        registry.register("host_b", FakeWebSocket(), _make_hello(), owner="bob")
+
+    with workspace_scope(111):
+        assert registry.online_host_ids() == ["host_a"]
+    with workspace_scope(222):
+        assert registry.online_host_ids() == ["host_b"]
+
+
 # ── RunnerExitReports ───────────────────────────────────
 
 
@@ -256,3 +411,83 @@ def test_exit_reports_get_is_unscoped() -> None:
     assert reports.get("runner_abc") == "runner process exited with code 1"
     # Missing runner still reads None (snapshot then leaves last_task_error unset).
     assert reports.get("runner_unknown") is None
+
+
+def test_gateway_inference_is_reported_not_persisted() -> None:
+    """The map a host reports is held per host id and survives a tunnel flap.
+
+    Nothing about gateway backing reaches the database, so the registry is the
+    only place a routing decision can read it. A host that disconnects keeps its
+    last report (a flap must not blank a known answer); a fresh registry — a
+    restarted server — knows nothing until the host reconnects and re-reports.
+    """
+    bare = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    registry = HostRegistry()
+    assert registry.gateway_inference(bare) is None
+
+    registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+    registry.record_gateway_inference(bare, {"claude-native": True, "codex": False})
+    assert registry.gateway_inference(bare) == {"claude-native": True, "codex": False}
+    # Any accepted spelling of the id reads the same entry.
+    assert registry.gateway_inference(f"host_{bare}") == {
+        "claude-native": True,
+        "codex": False,
+    }
+
+    registry.deregister(bare)
+    assert registry.gateway_inference(bare) == {"claude-native": True, "codex": False}
+
+    # A host that cannot evaluate the map at all reports None, which is unknown
+    # — not "nothing is gateway-backed".
+    registry.record_gateway_inference(bare, None)
+    assert registry.gateway_inference(bare) is None
+
+    assert HostRegistry().gateway_inference(bare) is None
+
+
+def test_gateway_inference_returns_a_copy() -> None:
+    """A caller mutating the returned map cannot corrupt the registry's copy."""
+    bare = "11223344556677889900aabbccddeeff"
+    registry = HostRegistry()
+    reported = {"codex": True}
+    registry.record_gateway_inference(bare, reported)
+
+    reported["codex"] = False
+    read = registry.gateway_inference(bare)
+    assert read == {"codex": True}
+    assert read is not None
+    read["codex"] = False
+    assert registry.gateway_inference(bare) == {"codex": True}
+
+
+def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
+    """
+    Every ``uuid_to_bytes``-accepted spelling of a host id must key
+    the same registry entry (regression: #2740).
+
+    The tunnel route registers under the bare-hex form, but
+    pre-migration clients still send ``host_<hex>`` in REST paths.
+    Before the fix, ``get`` was exact-string: launches 409'd "host
+    is offline" while ``GET /v1/hosts`` (DB-normalized) reported the
+    host online.
+    """
+    bare = "00112233445566778899aabbccddeeff"
+    prefixed = f"host_{bare}"
+    dashed = str(uuid.UUID(bare))
+
+    registry = HostRegistry()
+    conn = registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert registry.get(prefixed) is conn
+    assert registry.get(dashed) is conn
+
+    # Registering under a legacy spelling replaces the same entry, and
+    # the stored connection carries the canonical id (send_text's
+    # replaced-connection check keys on conn.host_id).
+    replacement = registry.register(prefixed, FakeWebSocket(), _make_hello(), owner="alice")
+    assert replacement.host_id == bare
+    assert registry.get(bare) is replacement
+
+    # Deregistering by any spelling removes the entry.
+    registry.deregister(prefixed)
+    assert registry.get(bare) is None

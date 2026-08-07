@@ -9,6 +9,17 @@ Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
 let it run on staged files via `git commit`). Fix any issues it reports so the
 commit lands clean — CI runs the same checks.
 
+## Local development shortcuts
+
+Use `just` for common tasks; run `just --list` for grouped recipes.
+
+- `just ensure` — install/check prerequisites
+- `just run-ios` / `just run-android` — build/run mobile apps
+- `just dev` / `just dev-mobile` — start the omnigent dev pod
+- `just electron-dev` / `just electron-build` — Electron desktop shell
+- `just lint` / `just lint-all` — run pre-commit
+- `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
+
 ## Pull requests
 
 When you open a pull request, fill in the repo's PR template at
@@ -30,6 +41,20 @@ Generate the description from the actual diff and this session's context — lea
 with the motivation, then the change. Don't pass a `--body` that skips these
 sections.
 
+## Finishing a task
+
+When you finish a task, print instructions to the user on how to test it: the
+commands to run, the inputs to provide, or the steps to reproduce so they can
+verify the result themselves. Don't leave the user guessing how to confirm the
+work — tell them exactly what to do.
+
+## Deprecating features
+
+When deprecating a feature, note the version in which it is expected to be
+removed so we can clean it up when that version ships. Call out the deprecation
+version in code (e.g. a `@deprecated` tag or comment naming the target release)
+and in the PR/commit description, so there's a clear marker to act on later.
+
 ## Code comments
 
 Keep comments short and focused on the code, not on the change history.
@@ -41,3 +66,26 @@ Keep comments short and focused on the code, not on the change history.
   *why* it exists, in terms a future reader needs. Don't reference PR numbers,
   issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
   should be clear without chasing external links.
+
+## Database query names
+
+Application stores use `make_named_managed_session_maker` and give every
+session a stable semantic operation name. The session-level name must describe
+the caller's intent rather than repeat SQL syntax; use a nested
+`query_name_scope` only when one transaction needs distinct names for important
+subqueries. Because the named session covers implicit flush and commit, don't
+add an explicit `flush()` only to make a query name observable.
+
+## Framework-owned instructions
+
+Keep runtime lifecycle and metadata instructions separate from portable agent
+instructions:
+
+- Agent-spec and per-request instructions are user-authored. Framework-owned
+  instructions are additive runtime behavior and are appended after them in
+  `omnigent/runtime/prompt.py`.
+- Keep the canonical instruction text and lifecycle gate in the owning framework
+  module. Harness adapters should only transport the composed instructions; do
+  not duplicate policy across adapters or add lifecycle metadata to `AgentSpec`.
+- If framework instructions grow beyond a small ordered list, introduce a
+  structured `FrameworkInstructions` value at the prompt-composition boundary.

@@ -29,7 +29,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { iconForTool } from "@/lib/toolIcon";
-import { type ToolTitle, formatToolTitle } from "@/lib/toolTitle";
+import {
+  type ToolRunCall,
+  type ToolTitle,
+  formatToolRunLabel,
+  formatToolTitle,
+} from "@/lib/toolTitle";
 import { useFileViewer } from "@/shell/FileViewerContext";
 
 const OUTPUT_PREVIEW_LINE_LIMIT = 80;
@@ -224,30 +229,22 @@ export function ToolCard({
 }
 
 /**
- * Render a contiguous run of tool calls as one muted "See N steps" line.
- * Clicking expands to show each tool as its own (also-collapsible)
- * trigger. `BlockRenderer` decides which tools fold here (older tools
- * once a streaming-tail of the most recent ones has been peeled off,
- * or all completed tools once streaming finishes).
+ * Render the folded (older) part of a contiguous tool run as one muted
+ * summary line ("Read 2 files"). Clicking expands to show each tool as
+ * its own (also-collapsible) trigger. `BlockRenderer` decides which
+ * tools fold here: older tools once the visible tail of the most
+ * recent ones has been peeled off.
  */
-export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?: number }) {
-  // Label the FULL contiguous run, not just the folded tools — during
-  // streaming the most-recent tools render as a visible tail outside this
-  // group, so counting only `tools` would undercount ("See 2 steps" when
-  // there are more visible). `count` defaults to the folded length for
-  // fully-collapsed runs (reload / idle), where they're equal.
-  const n = count ?? tools.length;
-  const label = `See ${n} step${n === 1 ? "" : "s"}`;
+export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
+  const label = formatToolRunLabel(tools.map(toolRunCall));
   return (
     // Named `group/tool-summary` so this collapsible only rotates its
     // OWN chevron (line 296 in `ToolTriggerRow` uses an unnamed
     // `group-data-[state=open]:rotate-90` that would otherwise match
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
-    // `peer` lets `BlockRenderer`'s trailing tail react to this
-    // collapsible's open/closed state for the border-join effect.
-    <Collapsible defaultOpen={false} className="group/tool-summary peer not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
+    <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground">
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
         <span>{label}</span>
       </CollapsibleTrigger>
@@ -286,6 +283,15 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
   );
 }
 
+/** Tool name + args used to categorize a run item for the summary label. */
+function toolRunCall(item: RenderItem): ToolRunCall {
+  if (item.kind === "tool") {
+    return { name: item.execution.name, args: item.execution.arguments };
+  }
+  if (item.kind === "native_tool") return { name: item.toolType, args: item.data };
+  return { name: "" };
+}
+
 /**
  * Single muted-text trigger line for a tool call. Status/category icon
  * at left, title (verb bold + dynamic body) in the middle truncated to
@@ -312,7 +318,7 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
+      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground"
     >
       <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
       <span className="min-w-0 flex-1 truncate">
@@ -432,7 +438,7 @@ function OutputSection({ output }: { output: string }) {
         )}
       </div>
       {canExpand && (
-        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-sm sm:flex-row sm:items-center sm:justify-between">
           <span className="min-w-0">
             {isExpanded ? "Showing full output" : "Previewing output"} (
             {formatOutputStats(isExpanded ? preview : collapsedPreview)})
@@ -460,7 +466,7 @@ function OutputSection({ output }: { output: string }) {
 function ToolPendingOutput({ duration }: { duration: number | undefined }) {
   return (
     <div className="rounded-md border border-dashed bg-muted/30 p-3">
-      <div className="flex items-center gap-2 text-muted-foreground text-sm">
+      <div className="flex items-center gap-2 text-muted-foreground text-ui">
         <Loader2Icon className="size-4 animate-spin text-info" />
         <span>
           Waiting for output
@@ -484,7 +490,7 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
     message = "Tool did not return output before the response failed.";
   }
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-sm">
+    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-ui">
       {message}
     </div>
   );

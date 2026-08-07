@@ -97,7 +97,9 @@ export function moveColumnToIndex(
     const row = node.child(r);
     if (fromCol < 0 || fromCol >= row.childCount) return row;
     if (toCol < 0 || toCol >= row.childCount) return row;
-    const cells = Array.from({ length: row.childCount }, (_, c) => row.child(c));
+    const cells = Array.from({ length: row.childCount }, (__, columnIndex) =>
+      row.child(columnIndex),
+    );
     const [cell] = cells.splice(fromCol, 1);
     cells.splice(toCol, 0, cell);
     return row.type.create(row.attrs, Fragment.fromArray(cells));
@@ -118,7 +120,7 @@ export function moveColumnToIndex(
  * contains `y`, or -1 if none.
  */
 export function rowIndexAtY(
-  rowRects: ReadonlyArray<{ top: number; bottom: number }>,
+  rowRects: readonly { top: number; bottom: number }[],
   y: number,
 ): number {
   for (let i = 0; i < rowRects.length; i++) {
@@ -132,7 +134,7 @@ export function rowIndexAtY(
  * or -1 if none.
  */
 export function colIndexAtX(
-  cellRects: ReadonlyArray<{ left: number; right: number; cellIndex: number }>,
+  cellRects: readonly { left: number; right: number; cellIndex: number }[],
   x: number,
 ): number {
   for (const r of cellRects) {
@@ -189,8 +191,8 @@ function setCursorToCell(editor: Editor, rowIndex: number, colIndex: number): vo
 // ---------------------------------------------------------------------------
 
 type MenuItemDef =
-  | { label: string; icon: React.ReactNode; onClick: () => void; destructive?: boolean }
-  | { separator: true };
+  | { id: string; label: string; icon: React.ReactNode; onClick: () => void; destructive?: boolean }
+  | { id: string; separator: true };
 
 function HandleMenu({
   items,
@@ -221,17 +223,17 @@ function HandleMenu({
   return createPortal(
     <div
       data-table-handle-menu
-      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-md border border-border bg-popover py-1 shadow-md"
+      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu"
       style={{ top: anchorTop, left: anchorLeft }}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
     >
-      {items.map((item, i) =>
+      {items.map((item) =>
         "separator" in item ? (
-          <div key={i} className="mx-2 my-1 h-px bg-border" />
+          <div key={item.id} className="-mx-1 my-1 h-px bg-border" />
         ) : (
           <button
-            key={i}
+            key={item.id}
             type="button"
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {
@@ -239,7 +241,7 @@ function HandleMenu({
               onClose();
             }}
             className={cn(
-              "flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors",
+              "flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-ui transition-colors",
               item.destructive
                 ? "text-destructive hover:bg-destructive/10"
                 : "text-foreground hover:bg-muted",
@@ -565,8 +567,7 @@ export function TableHandles({
           // Scope hit-testing to the source table's rows only — prevents the
           // ghost/indicator from jumping to rows in other tables.
           const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
-            | HTMLTableRowElement
-            | undefined;
+            HTMLTableRowElement | undefined;
           const sourceTableEl = sourceRow?.closest("table");
           if (!sourceTableEl) return;
           const tableRows = Array.from(sourceTableEl.querySelectorAll("tr"));
@@ -602,8 +603,7 @@ export function TableHandles({
         } else {
           // Look up target column by X band within the source table only.
           const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
-            | HTMLTableRowElement
-            | undefined;
+            HTMLTableRowElement | undefined;
           const tableEl = sourceRow?.closest("table");
           const firstRow = tableEl?.querySelector("tr") as HTMLTableRowElement | null;
           if (!firstRow) return;
@@ -687,6 +687,7 @@ export function TableHandles({
   // Build row menu items (Insert / Delete only — drag handles Move)
   const buildRowItems = (h: HandlePos): MenuItemDef[] => [
     {
+      id: "insert-row-above",
       label: "Insert row above",
       icon: <span className="text-[10px] font-bold">↑</span>,
       onClick: () => {
@@ -695,6 +696,7 @@ export function TableHandles({
       },
     },
     {
+      id: "insert-row-below",
       label: "Insert row below",
       icon: <span className="text-[10px] font-bold">↓</span>,
       onClick: () => {
@@ -702,8 +704,9 @@ export function TableHandles({
         editor.chain().focus().addRowAfter().run();
       },
     },
-    { separator: true },
+    { id: "row-actions-separator", separator: true },
     {
+      id: "delete-row",
       label: "Delete row",
       icon: <Trash2 className="size-3.5" />,
       destructive: true,
@@ -717,6 +720,7 @@ export function TableHandles({
   // Build column menu items (Insert / Delete only — drag handles Move)
   const buildColItems = (h: HandlePos): MenuItemDef[] => [
     {
+      id: "insert-column-before",
       label: "Insert column before",
       icon: <span className="text-[10px] font-bold">←</span>,
       onClick: () => {
@@ -725,6 +729,7 @@ export function TableHandles({
       },
     },
     {
+      id: "insert-column-after",
       label: "Insert column after",
       icon: <span className="text-[10px] font-bold">→</span>,
       onClick: () => {
@@ -732,8 +737,9 @@ export function TableHandles({
         editor.chain().focus().addColumnAfter().run();
       },
     },
-    { separator: true },
+    { id: "column-actions-separator", separator: true },
     {
+      id: "delete-column",
       label: "Delete column",
       icon: <Trash2 className="size-3.5" />,
       destructive: true,
@@ -974,6 +980,7 @@ export function TableHandles({
         <HandleMenu
           items={[
             {
+              id: "delete-table",
               label: "Delete table",
               icon: <Trash2 className="size-3.5" />,
               destructive: true,

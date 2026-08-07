@@ -6,7 +6,8 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -62,6 +63,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
+        "sys_session_rename",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -72,6 +74,14 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Scheduled-task management tools are always auto-registered
+        # so agents can create, list, update, and delete recurring
+        # runs without spec opt-in. They are runner-dispatched via
+        # the Omnigent server's REST API.
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -108,6 +118,12 @@ def _non_lifecycle_schemas(
             and fn.get("name") in _ALWAYS_PRESENT_TOOLS
         )
     ]
+
+
+def test_session_rename_is_registered_for_every_agent() -> None:
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert "sys_session_rename" in names
 
 
 @pytest.fixture()
@@ -384,7 +400,7 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     ``sys_session_list`` / ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
-    mutating session tools (``sys_session_send`` /
+    opt-in session-spawn tools (``sys_session_send`` /
     ``sys_session_close`` / ``sys_session_create`` /
     ``sys_session_share``) are NOT registered without an opt-in
     (``tools.agents`` or top-level ``spawn: true``). A regression that
@@ -514,12 +530,29 @@ def _spawn_spec() -> AgentSpec:
 
 
 def test_advise_models_hidden_when_routing_disabled() -> None:
-    """sys_advise_models must not appear when RuntimeCaps.routing_client is None."""
+    """sys_advise_models must not appear when no router is configured."""
     caps = _FakeRoutingCaps(routing_client=None)
     with patch("omnigent.runtime._globals._caps", new=caps):
         names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_list_models" in names
     assert "sys_advise_models" not in names
+
+
+def test_advise_models_exposed_from_a_backends_only_deployment() -> None:
+    """The gate is "some source can answer", not "a legacy client is set".
+
+    A deployment that configures only ``routing_backends`` routes, so hiding the
+    tool there would advertise routing-off while the server routes anyway.
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=RoutingBackends(local=cast("Any", object())),
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_advise_models" in names
 
 
 def test_advise_models_exposed_when_routing_enabled() -> None:

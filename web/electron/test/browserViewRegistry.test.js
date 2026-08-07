@@ -94,11 +94,10 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
   it("full first-navigate path: create signal → setActive → attached + bounds synced", () => {
     // Mirrors what BrowserPane does: it learns of the view from the create
     // event, mounts the placeholder, then setActive attaches + syncs bounds.
-    let sawCreate = null;
     // (the pane's onBrowserViewCreated listener)
     ctx.sent.length = 0;
     ctx.registry.openOrNavigate("conv_1", "https://example.com");
-    sawCreate = ctx.sent.find((s) => s.channel === "browser-view-created");
+    const sawCreate = ctx.sent.find((s) => s.channel === "browser-view-created");
     assert.ok(sawCreate, "pane would receive the create event");
 
     // Pane reacts: setActive(conversationId) then a resize (bounds).

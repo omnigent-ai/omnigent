@@ -122,7 +122,7 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from ._cwd_scan import scan_cwd_mask_entries
+from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     SandboxBackend,
@@ -423,6 +423,12 @@ class SeatbeltSandboxBackend(SandboxBackend):
                     name,
                 )
 
+        mask_paths = (
+            [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]
+            if sandbox_spec.mask_paths
+            else None
+        )
+
         return SandboxPolicy(
             backend_type=self.type_name,
             active=True,
@@ -433,6 +439,8 @@ class SeatbeltSandboxBackend(SandboxBackend):
             cwd_allow_hidden=cwd_allow_hidden,
             cwd_hidden_scan_max_entries=sandbox_spec.cwd_hidden_scan_max_entries,
             cwd_hidden_scan_overflow=sandbox_spec.cwd_hidden_scan_overflow,
+            cwd_hidden_scan_recursive=sandbox_spec.cwd_hidden_scan_recursive,
+            mask_paths=mask_paths,
             env_passthrough=(
                 list(sandbox_spec.env_passthrough)
                 if sandbox_spec.env_passthrough is not None
@@ -504,6 +512,16 @@ class SeatbeltSandboxBackend(SandboxBackend):
         :param chdir: Ignored. Present for interface parity with
             :class:`SandboxBackend.wrap_launcher_argv`; the helper
             chdirs itself from its JSON config.
+        :param target: Absolute path to the binary the launcher will
+            exec as its final target after the re-exec (e.g. the
+            ``claude`` CLI). When set and not already covered by the
+            default subtrees / cwd / read roots, narrow read grants
+            are added for its symlink chain and its resolved parent
+            directory so the in-sandbox exec can read it — the same
+            treatment the bwrap backend gives its ``target``. This
+            lane never raises; un-grantable layouts degrade to
+            literal grants plus a WARNING
+            (see :func:`_target_visibility_grants`).
         :returns: A complete ``sandbox-exec`` argv ready for
             ``subprocess.Popen`` — never an empty list.
         :raises OSError: When the cwd-scan cap is hit and overflow is
@@ -513,15 +531,34 @@ class SeatbeltSandboxBackend(SandboxBackend):
             unsafe ancestor (see :func:`_ensure_executable_visible`).
         """
         del chdir  # See docstring — Seatbelt has no --chdir analog.
-        del target  # SBPL profile grants read access by subpath rules; the
-        # run_launcher target binary is typically covered by the cwd or default
-        # subpath allows.  A targeted seatbelt fix is tracked separately.
         cwd_resolved = cwd.resolve(strict=False)
         extra_read_paths = _ensure_executable_visible(
             argv, cwd_resolved, policy_read_roots=policy.read_roots or []
         )
+        covered_prefixes: list[Path] = [Path(p) for p in _DEFAULT_READ_SUBPATHS]
+        covered_prefixes.append(cwd_resolved)
+        covered_prefixes.extend(policy.read_roots or [])
+        # Symlink hops in the exec chain need explicit literal reads:
+        # execve reads each symlink at its literal path, and subpath
+        # rules match only the kernel-canonical path. Without these,
+        # uv's version-floating ``cpython-3.12 -> cpython-3.12.13``
+        # dir symlink EPERMs the helper interpreter's execvp even
+        # though the resolved install root has a subpath grant.
+        extra_read_literals: list[Path] = (
+            _symlink_hop_literals(Path(argv[0]), covered_prefixes) if argv else []
+        )
+        if target is not None:
+            target_subpaths, target_literals = _target_visibility_grants(
+                target, covered_prefixes, extra_read_paths
+            )
+            extra_read_paths.extend(target_subpaths)
+            extra_read_literals.extend(p for p in target_literals if p not in extra_read_literals)
         profile = _build_profile(
-            policy, cwd_resolved, extra_read_paths=extra_read_paths, argv=argv
+            policy,
+            cwd_resolved,
+            extra_read_paths=extra_read_paths,
+            extra_read_literals=extra_read_literals,
+            argv=argv,
         )
         if len(profile.encode("utf-8")) > _MAX_PROFILE_BYTES:
             raise OSError(
@@ -597,6 +634,7 @@ def _build_profile(
     cwd: Path,
     *,
     extra_read_paths: list[Path] | None = None,
+    extra_read_literals: list[Path] | None = None,
     argv: Sequence[str] | None = None,
 ) -> str:
     """
@@ -641,6 +679,14 @@ def _build_profile(
         the explicit HOME deny would otherwise block). Emitted as
         ``(allow file-read* (subpath ...))`` AFTER the HOME deny so
         last-match-wins re-allows the interpreter.
+    :param extra_read_literals: Individual paths — symlink hops in
+        the exec chain and, for un-grantable layouts, the launcher
+        target binary itself — emitted as
+        ``(allow file-read* (literal ...))``. Symlinks are read by
+        the kernel at their literal path during execve resolution,
+        which subpath rules (matched against canonical paths) never
+        cover. Also fed to the ancestor-traversal walker so
+        ``realpath()`` walks through their parent chains succeed.
     :returns: The SBPL profile text, ready to pass to
         ``sandbox-exec -p``. Always a non-empty string starting with
         ``(version 1)``.
@@ -712,6 +758,19 @@ def _build_profile(
             "(allow ipc-posix-sem)",
             "(allow sysctl-read)",
             "(allow file-ioctl)",
+            # M7 (security 2026-07-15): Bun's WriteStream constructor calls fstat(2) on
+            # its inherited pipe file descriptors (stdout/stderr) at startup for ANSI
+            # color/TTY detection (internal:util/colors, fs/streams:244). Pipe fds have no
+            # filesystem vnode path, so they don't match any path-scoped file-read-metadata
+            # literal. Under deny-default this returns EPERM, crashing the Bun process
+            # before any stream-json output is produced — the root cause of the 60s connect
+            # timeout. Granting file-read-metadata globally (no path filter) allows fstat()
+            # on any fd including pipes. This does NOT grant file data access (file-read*),
+            # only inode metadata (stat/fstat/access/getattrlist). Risk: stat-oracle —
+            # sandboxed agent can confirm file existence on the whole filesystem without
+            # reading content. Acceptable for single-tenant developer use; flag for
+            # multi-tenant deployments. Analogous to the existing global (allow file-ioctl).
+            "(allow file-read-metadata)",
             "",
             ";; /dev access. Read-only for the whole tree (device-node",
             ";; metadata, /dev/null content, /dev/urandom, /dev/fd/N for",
@@ -793,8 +852,20 @@ def _build_profile(
     if extra_read_paths:
         lines.append("")
         lines.append(";; Helper interpreter visibility (argv[0] parents)")
-        for path in extra_read_paths:
-            lines.append(f"(allow file-read* (subpath {_quote(str(path))}))")
+        for read_path in extra_read_paths:
+            lines.append(f"(allow file-read* (subpath {_quote(str(read_path))}))")
+
+    # ----------------------------------------------------------------
+    # Exec-chain symlink hops + launcher target. Literal (not subpath)
+    # because the kernel reads a symlink at its literal path during
+    # execve resolution while subpath rules match canonical paths; a
+    # literal on a symlink exposes only its target string.
+    # ----------------------------------------------------------------
+    if extra_read_literals:
+        lines.append("")
+        lines.append(";; Exec-chain symlink hops + launcher target (literal reads)")
+        for read_literal in extra_read_literals:
+            lines.append(f"(allow file-read* (literal {_quote(str(read_literal))}))")
 
     # ----------------------------------------------------------------
     # Scratch tmpdir — always RW; surfaced via $TMPDIR for the helper.
@@ -883,7 +954,7 @@ def _build_profile(
         allowed_paths=_collect_allowed_paths(
             cwd=cwd,
             scratch=scratch,
-            extra_read_paths=extra_read_paths or [],
+            extra_read_paths=[*(extra_read_paths or []), *(extra_read_literals or [])],
             policy=policy,
             dyld_cache=dyld_cache,
         ),
@@ -918,21 +989,34 @@ def _build_profile(
         safe_roots=safe_roots,
         max_entries=policy.cwd_hidden_scan_max_entries,
         overflow=policy.cwd_hidden_scan_overflow,
+        recursive=policy.cwd_hidden_scan_recursive,
         logger_name=__name__,
     )
     for entry in mask_entries:
         seen_mask_paths.add(str(entry.path))
     mask_entries.extend(
-        _scan_read_paths_mask_entries(
+        _scan_extra_roots_mask_entries(
             policy,
             cwd,
             safe_roots,
             already_seen=seen_mask_paths,
         )
     )
+    # Explicit operator-declared masks: deny these regardless of name
+    # or depth, on top of the dotfile walk. A directory becomes a
+    # ``(subpath ...)`` deny and a file/other a ``(literal ...)`` deny.
+    # ``is_dir`` follows symlinks (unlike the walker); a missing path
+    # still emits a harmless literal deny (no re-stat drop like bwrap).
+    for mask_path in policy.mask_paths or []:
+        key = str(mask_path)
+        if key in seen_mask_paths:
+            continue
+        seen_mask_paths.add(key)
+        kind: MaskKind = "dir" if mask_path.is_dir() else "file"
+        mask_entries.append(MaskedEntry(path=mask_path, kind=kind))
     if mask_entries:
         lines.append("")
-        lines.append(";; Dotfile / escaping-symlink mask (cwd + read_paths)")
+        lines.append(";; Dotfile / escaping-symlink mask (cwd + read_paths + write_paths)")
         for entry in mask_entries:
             quoted = _quote(str(entry.path))
             if entry.kind == "dir":
@@ -965,16 +1049,15 @@ def _build_profile(
     # ----------------------------------------------------------------
     lines.append("")
     lines.append(";; Network policy")
-    egress_active = policy.egress_relay_port is not None and policy.egress_socket_path is not None
-    if egress_active:
+    socket_path = policy.egress_socket_path
+    relay_port = policy.egress_relay_port
+    if socket_path is not None and relay_port is not None:
         # Hard enforcement: deny all network (already covered by
         # (deny default)) except loopback to the relay and the
         # parent's Unix socket. ``allow_network`` is intentionally
         # ignored here — egress mode always overrides it, matching
         # the bwrap behaviour where ``--unshare-net`` is added
         # whenever egress is active regardless of ``allow_network``.
-        socket_path = policy.egress_socket_path
-        relay_port = policy.egress_relay_port
         lines.append(";; Egress active — loopback to relay + Unix socket to parent")
         # SBPL host syntax: ``(remote ip "HOST:PORT")`` and
         # ``(local ip "HOST:PORT")`` require ``HOST`` to be either
@@ -1217,6 +1300,16 @@ def _ensure_executable_visible(
             # ``/Users`` widening that the H1/H2/H3 hardening
             # explicitly closed.
             install_root = _interpreter_install_root(exe)
+            # Two-hop symlink case: the literal path is a tool-venv
+            # proxy (e.g. ``~/.local/share/uv/tools/<pkg>/bin/python``)
+            # whose grandparent lacks CPython layout markers, while the
+            # resolved target (``~/.local/share/uv/python/cpython-.../
+            # bin/python3.12``) does carry them.  Resolve once and retry
+            # before giving up.
+            if install_root is None:
+                exe_resolved_inner = exe.resolve(strict=False)
+                if exe_resolved_inner != exe:
+                    install_root = _interpreter_install_root(exe_resolved_inner)
             if install_root is not None and str(install_root) not in _UNSAFE_WIDEN_ANCESTORS:
                 if any(_is_within_literal(install_root, root) for root in covered_prefixes):
                     return
@@ -1246,12 +1339,12 @@ def _ensure_executable_visible(
                 f"That grants the sandboxed helper read access to every "
                 f"other user's home (or to system runtime state) and is a "
                 f"sandbox-defeating widening. Auto-detection of a narrow "
-                f"Python install root (``<root>/bin/python*`` + "
+                f"CPython install root (``<root>/bin/python*`` + "
                 f"``<root>/lib/python*`` or ``<root>/lib/libpython*``) "
-                f"did not match the layout at this path. Remediate by "
-                f"either: (1) using a Homebrew or system Python interpreter "
-                f"(``/opt/homebrew/...`` or ``/usr/bin/python3``, both "
-                f"covered by default RO subpaths); (2) placing the venv "
+                f"did not match the literal or resolved path at this location. "
+                f"Remediate by either: (1) using a Homebrew or system "
+                f"interpreter (``/opt/homebrew/...`` or ``/usr/bin/python3``, "
+                f"both covered by default RO subpaths); (2) placing the venv "
                 f"under cwd (e.g. ``./.venv/bin/python``); or "
                 f"(3) adding a narrower ``read_paths`` entry covering "
                 f"only the interpreter tree (e.g. "
@@ -1267,6 +1360,145 @@ def _ensure_executable_visible(
     if exe_resolved != exe_literal:
         _add_topmost(exe_resolved)
     return extras
+
+
+def _symlink_hop_literals(start: Path, covered_prefixes: Sequence[Path]) -> list[Path]:
+    """
+    Collect the symlinks ``execve`` will read while resolving *start*.
+
+    Mirrors the hop-by-hop walk in
+    :func:`omnigent.inner.bwrap_sandbox._ensure_executable_visible`:
+    follow the final component's symlink chain (40-hop cap, matching
+    MAXSYMLINKS), and at every hop collect each path component — the
+    hop itself and any intermediate directory — that is a symlink.
+    The kernel reads each such symlink at its LITERAL path during
+    path resolution, and SBPL subpath rules match only the
+    kernel-canonical path, so every uncovered symlink needs an
+    ``(allow file-read* (literal ...))`` grant. Reading a symlink
+    exposes only its target string, so these grants never widen the
+    sandbox beyond the exec chain itself.
+
+    The canonical failure this closes: uv installs a version-floating
+    dir symlink (``cpython-3.12 -> cpython-3.12.13``) between a tool
+    venv's ``bin/python`` and the real interpreter. The resolved
+    install root gets a subpath grant, but the literal hop through
+    the versionless dir was denied — so ``sandbox-exec``'s execvp of
+    the helper interpreter failed with EPERM and every jailed helper
+    spawn died at boot.
+
+    :param start: The literal path execve will be called with
+        (``argv[0]`` or the launcher target).
+    :param covered_prefixes: Roots whose subtrees are already
+        readable at their literal paths (default RO subtrees + cwd +
+        spec read roots); symlinks under them need no extra grant.
+    :returns: De-duplicated literal symlink paths, in walk order.
+    """
+    literals: list[Path] = []
+    seen: set[Path] = set()
+
+    def _collect_component_symlinks(path: Path) -> None:
+        for prefix in (*reversed(path.parents), path):
+            if str(prefix) in ("/", ""):
+                continue
+            if prefix in seen:
+                continue
+            try:
+                if not prefix.is_symlink():
+                    continue
+            except OSError:
+                continue
+            seen.add(prefix)
+            if any(_is_within_literal(prefix, root) for root in covered_prefixes):
+                continue
+            literals.append(prefix)
+
+    visited: set[Path] = set()
+    current = Path(os.path.abspath(str(start)))
+    for _ in range(40):  # MAXSYMLINKS parity with the bwrap walk
+        if current in visited:
+            break
+        visited.add(current)
+        _collect_component_symlinks(current)
+        try:
+            if not current.is_symlink():
+                break
+            link = os.readlink(str(current))
+        except OSError:
+            break
+        if link.startswith("/"):
+            current = Path(link)
+        else:
+            current = Path(os.path.normpath(str(current.parent / link)))
+    return literals
+
+
+def _target_visibility_grants(
+    target: str,
+    covered_prefixes: Sequence[Path],
+    already_granted: Sequence[Path],
+) -> tuple[list[Path], list[Path]]:
+    """
+    Compute read grants so the launcher's final *target* binary is
+    exec-able inside the sandbox.
+
+    Parity with the bwrap backend, which bind-mounts the target's
+    directory chain when given (its ``wrap_launcher_argv`` calls
+    ``_ensure_executable_visible([target], ...)``). For seatbelt the
+    equivalent is: literal reads for the symlink chain to the binary
+    (:func:`_symlink_hop_literals`) plus a subpath grant on the
+    RESOLVED binary's parent directory — exec of a resolved binary
+    empirically requires a ``subpath`` rule on a parent, and the
+    binary's own directory is the narrowest one that works (e.g. the
+    claude CLI's ``~/.local/share/claude/versions/<v>/``).
+
+    Unlike the interpreter lane, this never raises: the target is
+    harness-supplied (a CLI being wrapped), so an un-grantable layout
+    degrades to a literal grant on the resolved binary plus an audit
+    WARNING instead of failing the spawn. The parent-dir subpath is
+    refused when it would be sandbox-defeating: ``/``, an entry of
+    :data:`_UNSAFE_WIDEN_ANCESTORS`, ``$HOME``, or an ancestor of
+    ``$HOME``.
+
+    :param target: Absolute path to the final exec target.
+    :param covered_prefixes: Literal-coverage roots (default RO
+        subtrees + cwd + spec read roots).
+    :param already_granted: Subpath grants already computed for the
+        helper interpreter; a target inside one of them adds nothing.
+    :returns: ``(subpaths, literals)`` to merge into the profile's
+        extra read grants.
+    """
+    literals = _symlink_hop_literals(Path(target), covered_prefixes)
+    resolved = Path(target).resolve(strict=False)
+    covered = [*covered_prefixes, *already_granted]
+    if any(_is_within_literal(resolved, root) for root in covered):
+        return [], literals
+    parent = resolved.parent
+    home: Path | None
+    try:
+        home = Path(os.path.expanduser("~")).resolve(strict=False)
+        if not home.is_absolute() or str(home) in ("", "/"):
+            home = None
+    except (OSError, RuntimeError):
+        home = None
+    parent_too_broad = (
+        str(parent) == "/"
+        or str(parent) in _UNSAFE_WIDEN_ANCESTORS
+        or (home is not None and _is_within_literal(home, parent))
+    )
+    if parent_too_broad:
+        _LOGGER.warning(
+            "darwin_seatbelt: launcher target %r resolves to %r whose parent "
+            "directory %r is too broad to grant (subpath) on. Granting a "
+            "literal read on the binary only; if the exec still fails with "
+            "EPERM, add a narrow read_paths entry covering the install tree.",
+            target,
+            str(resolved),
+            str(parent),
+        )
+        if resolved not in literals:
+            literals.append(resolved)
+        return [], literals
+    return [parent], literals
 
 
 def _interpreter_install_root(exe: Path) -> Path | None:
@@ -1549,25 +1781,28 @@ def _sensitive_home_subpath_denials(policy: SandboxPolicy) -> list[Path]:
     return denials
 
 
-def _scan_read_paths_mask_entries(
+def _scan_extra_roots_mask_entries(
     policy: SandboxPolicy,
     cwd: Path,
     safe_roots: list[Path],
     *,
     already_seen: set[str],
-) -> list:  # list[MaskedEntry] — typed loosely to avoid the forward ref dance.
+) -> list[MaskedEntry]:
     """
-    Walk every ``read_paths`` root the operator granted and identify
-    dotfile / escaping-symlink entries to mask, using the same rules
-    the cwd walker applies (see
+    Walk every ``read_paths`` AND ``write_paths`` root the operator
+    granted and identify dotfile / escaping-symlink entries to mask,
+    using the same rules the cwd walker applies (see
     :func:`omnigent.inner._cwd_scan.scan_cwd_mask_entries`).
 
-    Roots that are at-or-under ``cwd`` are skipped — the cwd walker
-    already covered them. ``already_seen`` (a set of stringified
-    paths from a prior call, typically the cwd scan's emitted
-    entries) is updated in place so the caller can dedupe across
-    overlapping grants without re-emitting the same SBPL / bwrap
-    line twice.
+    :func:`omnigent.inner._cwd_scan.merge_scan_roots` folds the two
+    grant lists into one deduplicated, ancestor-first set: roots
+    at-or-under ``cwd`` are dropped (the cwd walker already covered
+    them) and a root nested under another kept root is walked once, so
+    a path granted read *and* write — or a subdir of a broader grant —
+    is not scanned twice. ``already_seen`` (a set of stringified paths
+    from a prior call, typically the cwd scan's emitted entries) is
+    updated in place so the caller can dedupe emitted entries across
+    overlapping grants without re-emitting the same SBPL line twice.
 
     The walker's per-root entry cap and overflow behaviour come from
     ``policy.cwd_hidden_scan_max_entries`` /
@@ -1578,20 +1813,17 @@ def _scan_read_paths_mask_entries(
     grant (which is the right answer almost every time — see the
     ``_SENSITIVE_HOME_SUBPATHS_DARWIN`` rationale).
     """
-    from ._cwd_scan import scan_cwd_mask_entries  # local import — avoids module-load order tangles
-
-    entries: list = []
-    if not policy.read_roots:
+    entries: list[MaskedEntry] = []
+    if not policy.read_roots and not policy.write_roots:
         return entries
     allow_hidden = policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else []
-    for root in policy.read_roots:
-        # Skip roots fully covered by the cwd scan that already ran.
-        # Comparing both ways: skip when root IS cwd, or when root
-        # is under cwd (cwd ancestor of root → cwd scan walked it),
-        # but NOT when cwd is under root (we still need to walk the
-        # rest of root that's outside cwd).
-        if _is_within(root, cwd):
-            continue
+    for root in merge_scan_roots(
+        cwd,
+        policy.read_roots,
+        policy.write_roots,
+        recursive=policy.cwd_hidden_scan_recursive,
+        skip_roots=policy.mask_scan_skip_roots,
+    ):
         try:
             root_entries = scan_cwd_mask_entries(
                 root,
@@ -1599,18 +1831,19 @@ def _scan_read_paths_mask_entries(
                 safe_roots=safe_roots,
                 max_entries=policy.cwd_hidden_scan_max_entries,
                 overflow=policy.cwd_hidden_scan_overflow,
+                recursive=policy.cwd_hidden_scan_recursive,
                 logger_name=__name__,
-                scope_label="read_paths",
+                scope_label="read_paths/write_paths",
             )
         except OSError as err:
-            # Re-raise with read_paths-specific advice, forwarding the
+            # Re-raise with grant-specific advice, forwarding the
             # walker's own message verbatim — it already names the
             # overflowed root (passed as the walk's scope) and the
             # unfinished directories, so we don't want to drop that
             # detail by rewriting the text from scratch.
             raise OSError(
-                f"dotfile mask scan overflowed while walking read_paths root "
-                f"{root}. Narrow the grant or tune the scan limits. {err}"
+                f"dotfile mask scan overflowed while walking read_paths/write_paths "
+                f"root {root}. Narrow the grant or tune the scan limits. {err}"
             ) from err
         for entry in root_entries:
             key = str(entry.path)

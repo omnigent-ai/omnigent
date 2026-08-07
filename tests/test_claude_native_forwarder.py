@@ -29,7 +29,16 @@ from omnigent.claude_native_bridge import (
     write_active_session_id,
 )
 from omnigent.claude_native_forwarder import (
+    CompactionForwardState,
+    _claim_standalone_completion,
+    _consume_pending_compaction,
+    _handle_compact_summary_item,
+    _note_precompact,
     _persist_native_compaction_item,
+    _PostRetryTracker,
+    _prescan_precompact_edges,
+    _read_compaction_state,
+    _reset_compaction_skip_stats,
     forward_claude_transcript_to_session,
 )
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
@@ -3401,34 +3410,42 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
 
 
-def test_model_alias_for_collapses_concrete_id_to_tier_alias() -> None:
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-opus-4-8", "opus"),
+        ("anthropic/claude-opus-4-7", "opus"),
+        # The default Sonnet (4.6) collapses to the generic "sonnet" alias —
+        # the row it is bound to.
+        ("databricks-claude-sonnet-4-6", "sonnet"),
+        ("claude-sonnet-4-6", "sonnet"),
+        ("claude-haiku-4-5", "haiku"),
+        # Fable (the tier above Opus) collapses to its own alias — a miss
+        # here means a TUI switch to claude-fable-5 never reaches the picker.
+        ("claude-fable-5", "fable"),
+        ("databricks-claude-fable-5", "fable"),
+        # Sonnet 5 routes to its own opt-in picker slot, not the generic
+        # "sonnet" row — both ids contain the substring "sonnet", so a miss
+        # here means a TUI switch to the newer Sonnet generation would
+        # wrongly light up the default-Sonnet row instead.
+        ("anthropic/claude-sonnet-5", "sonnet_5"),
+        ("databricks-claude-sonnet-5", "sonnet_5"),
+        # Unknown family or empty → None (don't surface an unrenderable id).
+        ("gpt-5-4-mini", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_model_alias_for_collapses_concrete_id_to_tier_alias(
+    model: str | None, expected: str | None
+) -> None:
     """
     ``_model_alias_for`` maps a concrete transcript model id to the
     picker's tier alias so a TUI ``/model`` switch lands on a picker
     row. Covers Anthropic + Databricks-gateway id shapes and the
     no-match / empty cases (caller skips the post on ``None``).
     """
-    assert forwarder._model_alias_for("claude-opus-4-8") == "opus"
-    assert forwarder._model_alias_for("anthropic/claude-opus-4-7") == "opus"
-    # The default Sonnet (4.6) collapses to the generic "sonnet" alias — the
-    # row it is bound to.
-    assert forwarder._model_alias_for("databricks-claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-haiku-4-5") == "haiku"
-    # Fable (the tier above Opus) collapses to its own alias — a miss
-    # here means a TUI switch to claude-fable-5 never reaches the picker.
-    assert forwarder._model_alias_for("claude-fable-5") == "fable"
-    assert forwarder._model_alias_for("databricks-claude-fable-5") == "fable"
-    # Sonnet 5 routes to its own opt-in picker slot, not the generic "sonnet"
-    # row — both ids contain the substring "sonnet", so a miss here means
-    # a TUI switch to the newer Sonnet generation would wrongly light up
-    # the default-Sonnet row instead.
-    assert forwarder._model_alias_for("anthropic/claude-sonnet-5") == "sonnet_5"
-    assert forwarder._model_alias_for("databricks-claude-sonnet-5") == "sonnet_5"
-    # Unknown family or empty → None (don't surface an unrenderable id).
-    assert forwarder._model_alias_for("gpt-5-4-mini") is None
-    assert forwarder._model_alias_for("") is None
-    assert forwarder._model_alias_for(None) is None
+    assert forwarder._model_alias_for(model) == expected
 
 
 @pytest.mark.asyncio
@@ -5279,6 +5296,201 @@ def test_delta_forward_state_round_trips(tmp_path: Path) -> None:
     assert forwarder._read_delta_forward_state(bridge_dir).byte_offset == 512
 
 
+def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -> None:
+    """
+    The turn-settle latch survives a forwarder restart via the cursor file.
+
+    A restart inside a scheduled-wake gap must still mark the wake; a
+    pre-latch state file (no ``settled_response_id`` key) loads as None.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b2", workspace=tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript,
+        line_cursor=3,
+        byte_offset=64,
+        current_response_id="resp_a",
+        settled_response_id="resp_a",
+        pending_settled_response_id="resp_b",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    loaded = forwarder._read_forward_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.settled_response_id == "resp_a"
+    assert loaded.pending_settled_response_id == "resp_b"
+
+    raw = json.loads((bridge_dir / forwarder._FORWARDER_STATE_FILE).read_text("utf-8"))
+    del raw["settled_response_id"]
+    (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text(json.dumps(raw), "utf-8")
+    legacy = forwarder._read_forward_state(bridge_dir)
+    assert legacy is not None
+    assert legacy.settled_response_id is None
+
+
+def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
+    """
+    A pending settle activates only once its turn has no output in flight.
+
+    The turn's final message can be delta-held across polls and forward
+    AFTER its Stop edge posted — promoting while that batch still
+    carries the turn's output would mis-read the tail as a scheduled
+    wake and split the answer into a phantom new turn.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    dedupe.pending_settled_response_id = "resp_a"
+    tail = ClaudeTranscriptItem(
+        source_id="s1:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "tail"}]},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [tail]) is False
+    assert dedupe.settled_response_id is None
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # A late tool result also defers: it can surface EARLIER than the
+    # held assistant tail, and promoting on it would mis-mark that tail.
+    late_result = ClaudeTranscriptItem(
+        source_id="s2:0:function_call_output",
+        item_type="function_call_output",
+        data={"call_id": "c1", "output": "done"},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [late_result]) is False
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # Items for OTHER turns don't defer; a truly quiet batch promotes.
+    other = ClaudeTranscriptItem(
+        source_id="s3:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
+        response_id="resp_b",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [other]) is True
+    assert dedupe.settled_response_id == "resp_a"
+    assert dedupe.pending_settled_response_id is None
+
+    # Idempotent once promoted.
+    assert forwarder._promote_pending_settle(dedupe, []) is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wake_forwards_marker_and_new_running_edge(tmp_path: Path) -> None:
+    """
+    The full wake pipeline: settle → quiet-poll promote → marked new turn.
+
+    Poll 1 forwards a turn; its Stop edge records the pending settle
+    (covered by the status-events test — recorded directly here). Poll 2
+    is quiet and promotes the settle, persisting it. Poll 3 sees new
+    assistant entries — a cron firing writes no user entry — and must
+    POST a fresh turn-start ``running`` edge plus the scheduled-wake
+    marker ahead of the resumed output, all under a new response id.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "iter-one",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Iteration 1: all green."}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every forwarder POST, recording its payload.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        payload = json.loads(request.content.decode("utf-8"))
+        assert isinstance(payload, dict)
+        requests.append(payload)
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        after_turn = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        turn_one_id = after_turn.current_response_id
+        assert turn_one_id is not None
+
+        # The turn ends: the Stop edge records the pending settle.
+        dedupe.pending_settled_response_id = turn_one_id
+        quiet = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=after_turn,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert dedupe.settled_response_id == turn_one_id
+        assert quiet.settled_response_id == turn_one_id
+
+        # A cron firing appends assistant output with NO user entry.
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "iter-two",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Iteration 2: still green."}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        requests.clear()
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=quiet,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    kinds = [request["type"] for request in requests]
+    assert kinds[0] == "external_session_status"
+    running = requests[0]["data"]
+    wake_turn_id = running["response_id"]
+    assert running["status"] == "running"
+    assert wake_turn_id != turn_one_id
+    items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    assert [item["item_data"]["role"] for item in items] == ["user", "assistant"]
+    assert items[0]["item_data"]["content"] == [
+        {"type": "input_text", "text": "[System: scheduled prompt fired]"}
+    ]
+    assert {item["response_id"] for item in items} == {wake_turn_id}
+
+
 async def test_post_external_output_text_delta_sends_expected_payload(tmp_path: Path) -> None:
     """
     The single-delta POST helper sends the canonical event body.
@@ -6388,6 +6600,13 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             "transcript_path": str(transcript_path),
         },
     )
+    # PreCompact mints the pending token the completion signal consumes.
+    # A real compaction always fires PreCompact before the compact
+    # SessionStart; the hook path only persists when that token exists.
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
     # Post-compaction SessionStart — the completion signal.
     record_hook_event(
         bridge_dir,
@@ -6420,8 +6639,18 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             )
         )
         try:
-            # Wait for the compaction status POST to arrive.
-            request = await _get_recorded_request(server)
+            # Wait for the compaction-completed status POST to arrive
+            # (the leading PreCompact in_progress edge is skipped).
+            request = None
+            for _ in range(10):
+                candidate = await _get_recorded_request(server)
+                if (
+                    candidate["body"].get("type") == "external_compaction_status"
+                    and candidate["body"]["data"].get("status") == "completed"
+                ):
+                    request = candidate
+                    break
+            assert request is not None, "compaction-completed status was never posted"
             # Wait for _persist_native_compaction_item to be called
             # (it runs right after the POST in the same await chain).
             await asyncio.wait_for(persist_called.wait(), timeout=5.0)
@@ -6433,7 +6662,7 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             server.server_close()
             thread.join(timeout=5.0)
 
-    # The recording server captured the compaction status POST.
+    # The recording server captured the compaction-completed status POST.
     assert request["body"]["type"] == "external_compaction_status"
     assert request["body"]["data"]["status"] == "completed"
     # _persist_native_compaction_item was called with the right session id.
@@ -6498,6 +6727,673 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Durable compaction-boundary reconciliation (native resume/replay fix)
+# ---------------------------------------------------------------------------
+
+
+def _compact_summary_item(text: str = "compaction summary text") -> ClaudeTranscriptItem:
+    """
+    Build a transcript item flagged as a Claude ``isCompactSummary`` record.
+
+    :param text: The continuation-summary text carried by the item.
+    :returns: A ``ClaudeTranscriptItem`` with ``is_compact_summary=True``.
+    """
+    return ClaudeTranscriptItem(
+        source_id="summary-uuid:0:compact_summary",
+        item_type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        response_id="resp_summary",
+        is_compact_summary=True,
+    )
+
+
+def _persist_mock() -> AsyncMock:
+    """
+    Build an ``AsyncMock`` standing in for ``_persist_native_compaction_item``.
+
+    :returns: An async mock that records calls and returns ``None``.
+    """
+    return AsyncMock(return_value=None)
+
+
+@pytest.mark.asyncio
+async def test_missing_compact_session_start_still_persists_from_transcript(
+    tmp_path: Path,
+) -> None:
+    """
+    A transcript ``isCompactSummary`` record persists the boundary alone.
+
+    Reproduces the core bug: the flaky ``SessionStart source=compact`` hook
+    never fires, so only the transcript summary is available. The transcript
+    path must still persist exactly one compaction boundary (carrying the
+    summary text) once a ``PreCompact`` token is pending.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_missing_hook",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("the summary"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    assert persist.call_args[1]["session_id"] == "conv_missing_hook"
+    assert persist.call_args[1]["summary_override"] == "the summary"
+    # Boundary marked persisted; pending cleared.
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert 1 in state.persisted_seqs
+
+
+@pytest.mark.asyncio
+async def test_normal_hook_after_transcript_does_not_double_persist(tmp_path: Path) -> None:
+    """
+    The completion hook does not re-persist a boundary the transcript wrote.
+
+    After the transcript path persists the boundary and marks the sequence
+    done, a later ``SessionStart source=compact`` hook finds no consumable
+    pending token, so ``_consume_pending_compaction`` returns ``None`` and no
+    second boundary is written.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # Transcript path persists first.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_dedupe",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert persist.call_count == 1
+
+    # Hook path arrives later — the token is already consumed.
+    seq = await _consume_pending_compaction(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    assert seq is None
+
+
+@pytest.mark.asyncio
+async def test_failed_boundary_post_is_retried_not_consumed(tmp_path: Path) -> None:
+    """
+    A hard POST failure leaves the summary unconsumed for retry.
+
+    ``_handle_compact_summary_item`` must return ``False`` (so the caller
+    holds the transcript cursor before the summary record) and must NOT mark
+    the sequence persisted, so the boundary is retried on a later poll rather
+    than silently lost — which would make resume reload the full history.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    # A definitively-permanent 400 (not an ambiguous/network failure).
+    request = httpx.Request("POST", "http://x/events")
+    response = httpx.Response(400, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("bad", request=request, response=response)
+    )
+
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_retry",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is False
+    state = _read_compaction_state(bridge_dir)
+    # Pending still set, nothing persisted — the summary will be retried.
+    assert state.pending is not None
+    assert state.pending.seq == 1
+    assert state.persisted_seqs == ()
+
+
+@pytest.mark.asyncio
+async def test_restart_reattach_does_not_repersist_completed_boundary(tmp_path: Path) -> None:
+    """
+    An already-persisted boundary is never re-persisted after a rewind.
+
+    Simulates a process restart / cursor rewind that re-reads a summary whose
+    boundary already POSTed: ``persisted_seqs`` records the sequence, so
+    ``_consume_pending_compaction`` returns ``None`` and
+    ``_handle_compact_summary_item`` drops the record without persisting.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Durable state as it would exist after a completed compaction: seq 1
+    # persisted, but a stale pending token for the same seq lingers (e.g.
+    # crash between POST success and mark). The persisted set must win.
+    from omnigent.claude_native_forwarder import _PendingCompaction, _write_compaction_state
+
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            pending=_PendingCompaction(seq=1, claude_session_id="claude-1"),
+            last_seq=1,
+            persisted_seqs=(1,),
+        ),
+    )
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_restart",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_repeated_compactions_persist_distinct_boundaries(tmp_path: Path) -> None:
+    """
+    Two compaction cycles persist two distinct boundaries.
+
+    Each ``PreCompact`` mints a fresh monotonic sequence, so a second
+    compaction is not blocked by the first's ``persisted_seqs`` entry.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    persist = _persist_mock()
+
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # First compaction.
+        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_repeat",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("first"),
+            retry_tracker=_PostRetryTracker(),
+        )
+        # Second compaction, later in the same session.
+        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_repeat",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("second"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert persist.call_count == 2
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert set(state.persisted_seqs) == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` record with no pending PreCompact is dropped.
+
+    On a cold resume the transcript may contain a historical compact-summary
+    record from a prior compaction with no live ``PreCompact`` token. It must
+    not persist a spurious boundary, and must not be forwarded as a user
+    bubble — ``_handle_compact_summary_item`` returns handled with no persist.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()  # no _note_precompact — no pending token
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_historical",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+    assert _read_compaction_state(bridge_dir).persisted_seqs == ()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
+    """
+    An ambiguous POST failure is treated as delivered (no duplicate boundary).
+
+    Mirrors the item-forwarding rule: when the server may already have
+    committed the boundary (e.g. a dropped response on a 2xx), retrying would
+    risk a duplicate compaction bubble, so the sequence is marked persisted
+    and the record advanced.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
+
+    with (
+        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous),
+        patch("omnigent.claude_native_forwarder.post_may_have_been_delivered", return_value=True),
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_ambiguous",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    state = _read_compaction_state(bridge_dir)
+    assert 1 in state.persisted_seqs
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_precompact_and_summary_same_poll_persists_boundary(tmp_path: Path) -> None:
+    """
+    P1-1: a PreCompact + summary first visible in one poll persists a boundary.
+
+    The transcript forwarder (which consumes the ``isCompactSummary`` record)
+    runs before the hook forwarder (which mints the ``PreCompact`` token)
+    within a single poll. Without the pre-items prescan, a ``PreCompact`` and
+    its summary that both first appear in the same poll would lose the
+    boundary — the summary is consumed with no token yet minted.
+    ``_prescan_precompact_edges`` mints the token first, so the summary that
+    follows in the same poll finds it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A PreCompact hook is written but the hook cursor has NOT advanced past
+    # it yet (mirrors the same-poll ordering: hooks are forwarded AFTER items).
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-1"},
+    )
+    hook_state = await forwarder._ensure_hook_state(
+        bridge_dir, start_at_end=False, session_id="conv_same_poll"
+    )
+
+    # No pending token before the prescan.
+    assert _read_compaction_state(bridge_dir).pending is None
+
+    # Prescan mints the token BEFORE the transcript summary is processed.
+    await _prescan_precompact_edges(bridge_dir, hook_state)
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.pending.seq == 1
+
+    # The summary in the same poll now finds the token and persists once.
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_same_poll",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("same-poll summary"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    state = _read_compaction_state(bridge_dir)
+    assert 1 in state.persisted_seqs
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_prescan_is_idempotent_with_hook_phase(tmp_path: Path) -> None:
+    """
+    P1-1: the prescan and the main hook phase mint one token per PreCompact.
+
+    Both scans see the same ``PreCompact`` record each poll. The
+    ``event_cursor`` idempotency key must keep them converging on a single
+    pending token — never two — so a re-mint cannot overwrite a token whose
+    boundary is mid-persist.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-1"},
+    )
+    hook_state = await forwarder._ensure_hook_state(
+        bridge_dir, start_at_end=False, session_id="conv_idem"
+    )
+
+    # Prescan mints seq 1.
+    await _prescan_precompact_edges(bridge_dir, hook_state)
+    first = _read_compaction_state(bridge_dir)
+    assert first.pending is not None and first.pending.seq == 1
+    assert first.last_precompact_cursor == 1
+
+    # The main hook phase would note the SAME edge (same event_cursor=1).
+    # It must be a no-op: same seq, no second token.
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=1
+    )
+    second = _read_compaction_state(bridge_dir)
+    assert second.pending is not None and second.pending.seq == 1
+    assert second.last_seq == 1
+
+    # A genuinely NEW PreCompact edge (higher cursor) mints the next seq.
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=2
+    )
+    third = _read_compaction_state(bridge_dir)
+    assert third.pending is not None and third.pending.seq == 2
+    assert third.last_precompact_cursor == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_completion_hook_persists_without_pending(tmp_path: Path) -> None:
+    """
+    P1-2: a compact SessionStart with no pending token still persists a boundary.
+
+    Restores the legacy standalone-completion safety. When the
+    ``PreCompact`` hook was dropped (or the forwarder attached after it
+    fired) AND no transcript summary has persisted a boundary, the
+    ``SessionStart source=compact`` completion hook must still persist
+    exactly one boundary — otherwise resume reloads the full pre-compaction
+    history. ``_claim_standalone_completion`` mints the sequence for it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # No _note_precompact, no persisted boundary — genuinely standalone.
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq == 1
+    state = _read_compaction_state(bridge_dir)
+    # A pending token is installed so a later transcript summary reconciles
+    # against the same sequence instead of double-persisting.
+    assert state.pending is not None
+    assert state.pending.seq == 1
+
+    # After the caller persists and marks it done, the boundary is recorded.
+    from omnigent.claude_native_forwarder import _mark_compaction_persisted
+
+    await _mark_compaction_persisted(bridge_dir, seq)
+    final = _read_compaction_state(bridge_dir)
+    assert 1 in final.persisted_seqs
+    assert final.pending is None
+
+
+@pytest.mark.asyncio
+async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Path) -> None:
+    """
+    P1-2: a completion hook trailing a transcript-persisted boundary is absorbed.
+
+    The transcript ``isCompactSummary`` path and the
+    ``SessionStart source=compact`` hook are two completion signals for the
+    SAME compaction. When the transcript path persists first it arms the
+    completion-ack window; the trailing hook must be absorbed (return
+    ``None``, no new sequence) rather than persist a spurious standalone
+    boundary.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # Transcript path persists the boundary; arms expect_completion_ack.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_absorb",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert persist.call_count == 1
+    armed = _read_compaction_state(bridge_dir)
+    assert armed.expect_completion_ack is True
+
+    # The trailing completion hook finds no pending token and is absorbed.
+    seq = await _consume_pending_compaction(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    assert seq is None
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq is None  # absorbed, NOT a new standalone boundary
+    after = _read_compaction_state(bridge_dir)
+    assert after.expect_completion_ack is False
+    assert after.persisted_seqs == (1,)  # still exactly one boundary
+
+
+@pytest.mark.asyncio
+async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
+    """
+    P1-3: a summary skipped with no token and no boundary is counted as a miss.
+
+    A skipped ``isCompactSummary`` with no pending token AND no boundary ever
+    persisted is the observable ``PreCompact``-miss failure mode — it must
+    bump the ``precompact_miss`` counter (not be silently dropped). A skip
+    that follows a persisted boundary is an expected replay/dedupe and bumps
+    ``expected_skip`` instead.
+    """
+    _reset_compaction_skip_stats()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()  # no PreCompact, no persisted boundary
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_miss",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+    assert forwarder._compaction_skip_stats.precompact_miss == 1
+    assert forwarder._compaction_skip_stats.expected_skip == 0
+
+    # A skip AFTER a boundary was persisted is an expected replay, not a miss.
+    from omnigent.claude_native_forwarder import _write_compaction_state
+
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(pending=None, last_seq=1, persisted_seqs=(1,)),
+    )
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_miss",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert forwarder._compaction_skip_stats.precompact_miss == 1  # unchanged
+    assert forwarder._compaction_skip_stats.expected_skip == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_completion_ack_does_not_swallow_a_later_boundary(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: a completion ack is bound to its seq and is one-shot per boundary.
+
+    The lost-boundary hazard: compaction A persists via the transcript path
+    and arms ``expect_completion_ack``; A's own ``SessionStart source=compact``
+    hook never fires (flaky), so the flag stays armed. A later compaction B's
+    ``PreCompact`` is *also* dropped, then B's completion hook fires. With a
+    bare unattributed flag, B's hook would be absorbed as A's stale ack and
+    B's boundary lost.
+
+    Binding the ack to a ``seq`` and making absorption one-shot fixes it: the
+    window is consumed exactly once (the trailing hook for A), and any
+    *further* standalone completion — B's — falls through to a fresh persist
+    instead of being swallowed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # Compaction A persists via the transcript path → arms the ack for A's seq.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_p21",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    armed = _read_compaction_state(bridge_dir)
+    assert armed.expect_completion_ack is True
+    assert armed.expect_completion_ack_seq == 1  # bound to A's seq, not a bare bool
+    assert armed.persisted_seqs == (1,)
+
+    # A's own trailing completion hook arrives late and is absorbed (one-shot).
+    absorbed = await _claim_standalone_completion(bridge_dir)
+    assert absorbed is None
+    after_absorb = _read_compaction_state(bridge_dir)
+    assert after_absorb.expect_completion_ack is False
+    assert after_absorb.expect_completion_ack_seq == 0  # window closed
+
+    # Compaction B: its PreCompact was dropped too, so B arrives as a
+    # standalone completion hook with NO pending token and NO armed ack. It
+    # must persist a fresh boundary, not be swallowed as A's stale ack.
+    b_seq = await _claim_standalone_completion(bridge_dir)
+    assert b_seq == 2, "B's boundary must be persisted, not lost to a stale ack"
+    final = _read_compaction_state(bridge_dir)
+    assert final.pending is not None
+    assert final.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: an ack armed for a seq that is NOT persisted persists (bias-to-safe).
+
+    If durable state is somehow armed (corrupt/partial write, or a legacy
+    ``compaction_forwarder.json`` from before ``expect_completion_ack_seq``
+    existed so the seq reads back as ``0``) the standalone path cannot prove
+    the arriving hook is a duplicate. A lost boundary reloads the full
+    pre-compaction history on resume — far worse than an at-most-once
+    duplicate — so the path biases to persisting a fresh boundary rather than
+    silently absorbing the hook.
+    """
+    from omnigent.claude_native_forwarder import _write_compaction_state
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Legacy/corrupt shape: flag armed but the seq it points at is not in
+    # persisted_seqs (here it reads back as 0, mimicking an old state file).
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            pending=None,
+            last_seq=1,
+            persisted_seqs=(),
+            expect_completion_ack=True,
+            expect_completion_ack_seq=0,
+        ),
+    )
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq == 2, "bias-to-safe: persist rather than absorb an unprovable ack"
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-2: a standalone-completion persist failure holds the hook cursor.
+
+    A ``SessionStart source=compact`` with no pending token and no transcript
+    summary is a hook-only standalone compaction. If its boundary POST fails
+    transiently the forwarder must NOT advance past the hook (losing the
+    boundary, since no transcript summary will ever retry it) — it holds the
+    hook cursor and retries next poll, mirroring the transcript path. The
+    pending token minted by ``_claim_standalone_completion`` makes the retry
+    idempotent: the re-seen hook re-consumes the same seq. A later successful
+    POST persists exactly one boundary.
+    """
+    bridge_dir = tmp_path / "bridge"
+    # A lone compact SessionStart (no preceding PreCompact) — standalone.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": "claude-standalone",
+        },
+    )
+    start_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+
+    request = httpx.Request("POST", "http://test/items")
+    response = httpx.Response(503, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("boom", request=request, response=response)
+    )
+
+    async def _run_once(state: forwarder.HookForwardState) -> forwarder.HookForwardState:
+        # The best-effort spinner status post is orthogonal to the durable
+        # persist under test; stub it so the client mock stays quiet.
+        with patch(
+            "omnigent.claude_native_forwarder._post_external_compaction_status",
+            AsyncMock(return_value=None),
+        ):
+            return await forwarder._forward_available_status_events(
+                client=AsyncMock(),
+                session_id="conv_p22",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=_PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+
+    # Poll 1: persist fails → cursor is held BEFORE the compaction hook record,
+    # a pending token is minted, and no boundary is marked persisted.
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+        after_fail = await _run_once(start_state)
+    assert failing.await_count == 1
+    assert after_fail.event_cursor == start_state.event_cursor  # cursor held
+    held = _read_compaction_state(bridge_dir)
+    assert held.pending is not None  # token minted, awaiting a durable persist
+    assert not held.persisted_seqs  # nothing marked persisted on failure
+    minted_seq = held.pending.seq
+
+    # Poll 2 (retry): the same hook record is re-seen; the persist succeeds and
+    # re-consumes the SAME seq (idempotent), marking exactly one boundary.
+    ok = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ok):
+        after_ok = await _run_once(after_fail)
+    assert ok.await_count == 1
+    persisted = _read_compaction_state(bridge_dir)
+    assert persisted.persisted_seqs == (minted_seq,)  # exactly one boundary
+    assert persisted.pending is None
+    assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
 
 
 def test_forward_failures_escalate_to_degraded_once() -> None:
@@ -6830,6 +7726,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
         return httpx.Response(200, json={})
 
     transport = httpx.MockTransport(handler)
+    dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
         hook_state = await forwarder._ensure_hook_state(
             bridge_dir, start_at_end=False, session_id="conv_abc"
@@ -6840,11 +7737,17 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
             bridge_dir=bridge_dir,
             state=hook_state,
             retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
             task_subjects={},
             task_statuses={},
             task_order=[],
             response_id="resp_turn_1",
         )
+
+    # The posted turn-end edge records the turn as a PENDING settle for
+    # scheduled-wake detection (it activates once the transcript is quiet).
+    assert dedupe.pending_settled_response_id == "resp_turn_1"
+    assert dedupe.settled_response_id is None
 
     assert bodies == [
         {
@@ -7071,3 +7974,52 @@ async def test_forwarder_does_not_leave_running_open_for_slash_command_only_turn
         request["data"] for request in requests if request["type"] == "external_conversation_item"
     ]
     assert any(item["item_type"] == "slash_command" for item in forwarded)
+
+
+# _PostRetryTracker: bounded subagent_delivery_not_confirmed retries (L2)
+# ---------------------------------------------------------------------------
+
+
+def _http_status_error(status_code: int, body: object) -> httpx.HTTPStatusError:
+    """Build an httpx.HTTPStatusError whose response.json() returns `body`."""
+    request = httpx.Request("POST", "http://omnigent/v1/sessions/conv_x/events")
+    content = json.dumps(body).encode() if body is not None else b""
+    response = httpx.Response(status_code, request=request, content=content)
+    return httpx.HTTPStatusError("rejected", request=request, response=response)
+
+
+def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(
+        503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_work_entry"}
+    )
+    # Attempts 1 and 2 keep retrying...
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    # ...attempt 3 hits the not-confirmed budget and gives up.
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(503, {"error": "internal_error"})
+    for _ in range(10):
+        assert tracker.record_failure("k", exc).exhausted is False
+
+
+def test_permanent_4xx_still_exhausts_at_three() -> None:
+    tracker = forwarder._PostRetryTracker(max_permanent_attempts=3)
+    exc = _http_status_error(400, {"error": "bad_request"})
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_is_subagent_delivery_not_confirmed_classifier() -> None:
+    yes = _http_status_error(503, {"error": "subagent_delivery_not_confirmed"})
+    no_status = _http_status_error(500, {"error": "subagent_delivery_not_confirmed"})
+    no_body = _http_status_error(503, {"error": "something_else"})
+    assert forwarder._is_subagent_delivery_not_confirmed(yes) is True
+    assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False

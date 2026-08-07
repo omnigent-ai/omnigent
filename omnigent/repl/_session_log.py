@@ -59,10 +59,14 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from omnigent_client import OmnigentClient
 from omnigent_ui_sdk import state_dir
+
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    ConversationStore,
+)
 
 # Schema version — bump only on breaking shape changes. Readers MAY
 # accept earlier versions; writers SHOULD always emit the current
@@ -282,7 +286,7 @@ async def write_session_log(
         visited,
     )
 
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "version": _LOG_SCHEMA_VERSION,
         "written_at": datetime.now(timezone.utc).isoformat(),
         "format": _LOG_FORMAT,
@@ -297,7 +301,7 @@ async def _build_node_async(
     client: OmnigentClient,
     conversation_id: str,
     visited: set[str],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """
     Build one node of the session tree (id + items + children)
     via the SDK, recursing into sub-agent children.
@@ -410,7 +414,7 @@ def _extract_child_conversation_ids(items: list[dict[str, object]]) -> list[str]
 
 
 def write_session_log_from_store(
-    conv_store: Any,
+    conv_store: ConversationStore,
     conversation_id: str,
     *,
     agent_name: str,
@@ -444,7 +448,7 @@ def write_session_log_from_store(
     visited: set[str] = set()
     root_node = _build_node_sync(conv_store, conversation_id, visited)
 
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "version": _LOG_SCHEMA_VERSION,
         "written_at": datetime.now(timezone.utc).isoformat(),
         "format": _LOG_FORMAT,
@@ -456,10 +460,10 @@ def write_session_log_from_store(
 
 
 def _build_node_sync(
-    conv_store: Any,
+    conv_store: ConversationStore,
     conversation_id: str,
     visited: set[str],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """
     Sync sibling of :func:`_build_node_async`. Same recursion +
     cycle handling, just driven by direct store calls.
@@ -479,6 +483,8 @@ def _build_node_sync(
     visited.add(conversation_id)
 
     conversation = conv_store.get_conversation(conversation_id)
+    if conversation is None:
+        raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
     items = _fetch_all_items_sync(conv_store, conversation_id)
     children = []
     for child_id in _extract_child_conversation_ids(items):
@@ -495,7 +501,10 @@ def _build_node_sync(
     }
 
 
-def _fetch_all_items_sync(conv_store: Any, conversation_id: str) -> list[dict[str, object]]:
+def _fetch_all_items_sync(
+    conv_store: ConversationStore,
+    conversation_id: str,
+) -> list[dict[str, object]]:
     """
     Sync sibling of :func:`_fetch_all_items` that pages through a
     :class:`ConversationStore` directly. See that function's
@@ -561,7 +570,7 @@ async def _fetch_all_items_via_sessions(
             after=cursor,
             order="asc",
         )
-        if not page:
+        if page is None or not page:
             return collected
         collected.extend(page)
         last_id = page[-1].get("id")

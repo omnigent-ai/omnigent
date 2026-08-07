@@ -22,7 +22,7 @@ from omnigent.server.routes._host_launch import (
 class _FakeHost:
     host_id: str = "host_1"
     name: str = "test-host"
-    owner: str = "alice"
+    user_id: str = "alice"
 
 
 @dataclass
@@ -60,20 +60,20 @@ class TestResolveHostOwner:
         assert exc_info.value.status_code == 404
 
     def test_wrong_owner_403(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         with pytest.raises(HTTPException) as exc_info:
             resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
         assert exc_info.value.status_code == 403
 
     def test_correct_owner(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         store = _FakeHostStore(hosts={"host_1": host})
         result = resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
         assert result.host_id == "host_1"
 
     def test_no_auth_skips_owner_check(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         result = resolve_host_owner(user_id=None, host_id="host_1", host_store=store)
         assert result.host_id == "host_1"
@@ -84,7 +84,7 @@ class TestResolveHostOwner:
 
 class TestResolveHostLaunch:
     def test_host_offline_409(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry()  # empty = no connections
         conv_store = _FakeConversationStore()
@@ -101,7 +101,7 @@ class TestResolveHostLaunch:
         assert exc_info.value.status_code == 409
 
     def test_missing_session_404(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         conn = object()
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry(conns={"host_1": conn})
@@ -119,7 +119,7 @@ class TestResolveHostLaunch:
         assert exc_info.value.status_code == 404
 
     def test_success_no_auth(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         conn = object()
         conv = Conversation(
             id="s1",

@@ -6,9 +6,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from starlette.requests import HTTPConnection
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as app_module
+from omnigent.server.auth import AuthProvider
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -283,6 +285,40 @@ async def test_me_header_mode_behaviors(
     # Reserved name is rejected (returns None → route returns null).
     assert reserved.status_code == 200
     assert reserved.json() == {"user_id": None, "is_admin": False}
+
+
+async def test_custom_auth_provider_skips_unified_login_routes(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    class _CustomAuthProvider(AuthProvider):
+        login_url = "/custom/login"
+
+        def get_user_id(self, request: HTTPConnection) -> str | None:
+            return "custom@example.com"
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = app_module.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=_CustomAuthProvider(),
+    )
+
+    assert "/auth/login" not in {route.path for route in app.routes if hasattr(route, "path")}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/me")
+
+    assert response.status_code == 200
+    assert response.json() == {"user_id": "custom@example.com", "is_admin": False}
 
 
 async def test_me_is_admin_honors_admin_list_before_db_promotion(

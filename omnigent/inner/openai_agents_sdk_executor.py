@@ -19,18 +19,21 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
+from omnigent import model_catalog
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
+from .async_utils import run_sync_on_thread
 from .executor import (
     Executor,
     ExecutorConfig,
@@ -54,9 +57,6 @@ from .open_responses_sdk import (
 
 logger = logging.getLogger(__name__)
 
-_OPENAI_AGENTS_DEFAULT_MODEL = "gpt-5.3-codex"
-_DATABRICKS_OPENAI_AGENTS_DEFAULT_MODEL = "databricks-gpt-5-5"
-
 # Total run attempts per turn (1 initial + retries). The Databricks
 # gateway occasionally returns a completed-but-empty turn (status
 # completed, no text / no tool calls / no output items); a single
@@ -72,6 +72,7 @@ _EMPTY_TURN_MAX_ATTEMPTS = 2
 # direction: an unknown future item type counts as output and is NOT
 # retried.
 _NON_OUTPUT_ITEM_TYPES: frozenset[str] = frozenset({"reasoning_item", "compaction_item"})
+
 
 # Replay items persisted to the SDK Session — heterogeneous Responses-API
 # input items (function_call / function_call_output / message / etc.).
@@ -111,8 +112,8 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 
 def _normalize_responses_items_for_chat(
-    items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    items: list[_JsonObject],
+) -> list[_JsonObject]:
     """Apply :func:`_normalize_content_blocks_for_chat` to every message item.
 
     Walks the full Responses-API item list produced by
@@ -125,7 +126,7 @@ def _normalize_responses_items_for_chat(
     :returns: New list with normalised ``input_file`` blocks in message
         content.  Items without ``input_file`` blocks are returned as-is.
     """
-    result: list[dict[str, Any]] = []
+    result: list[_JsonObject] = []
     for item in items:
         if item.get("type") == "message":
             raw_content = item.get("content")
@@ -138,8 +139,8 @@ def _normalize_responses_items_for_chat(
 
 
 def _normalize_content_blocks_for_chat(
-    content: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    content: list[_JsonObject],
+) -> list[_JsonObject]:
     """Normalize content blocks before handing them to the openai-agents Runner.
 
     Converts ``input_file`` blocks whose ``file_data`` is a ``data:`` URI into
@@ -171,13 +172,14 @@ def _normalize_content_blocks_for_chat(
         (non-``text/*``) file blocks, undecodable, or empty file blocks are
         silently dropped.  Unknown block types pass through unchanged.
     """
-    result: list[dict[str, Any]] = []
+    result: list[_JsonObject] = []
     changed = False
     for block in content:
         block_type = block.get("type")
         if block_type == "input_file":
             changed = True
-            file_data: str = block.get("file_data", "")
+            raw_file_data = block.get("file_data", "")
+            file_data = raw_file_data if isinstance(raw_file_data, str) else ""
             if file_data.startswith("data:"):
                 try:
                     meta, b64 = file_data.split(",", 1)
@@ -208,7 +210,7 @@ def _normalize_content_blocks_for_chat(
     return result if changed else content
 
 
-def _copy_known_keys(block: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+def _copy_known_keys(block: _JsonObject, keys: tuple[str, ...]) -> _JsonObject:
     """Return *block* with only keys accepted by provider content schemas.
 
     Omnigent content blocks can carry UI/history metadata such as
@@ -371,7 +373,7 @@ def _patch_openai_sse_keepalive_tolerance() -> None:
 
     _orig_decode = decoder.decode
 
-    def decode(self: Any, line: str) -> Any:  # type: ignore[explicit-any]
+    def decode(self: object, line: str) -> object:
         sse = _orig_decode(self, line)
         if sse is not None and not (getattr(sse, "data", None) or "").strip():
             # Empty-data keepalive frame: drop it so the client never calls
@@ -379,8 +381,8 @@ def _patch_openai_sse_keepalive_tolerance() -> None:
             return None
         return sse
 
-    decoder.decode = decode  # type: ignore[method-assign]
-    decoder._omnigent_keepalive_patch = True  # type: ignore[attr-defined]
+    decoder.decode = decode
+    decoder._omnigent_keepalive_patch = True
 
 
 def _ensure_agents_sdk() -> ModuleType:
@@ -434,11 +436,10 @@ def _get_openai_async_client(
     :param databricks_auth_command: Shell command from ucode state that
         prints a bearer token, e.g.
         ``"databricks auth token --host https://example.databricks.com ..."``.
-    :param model: The model name that will be used. When set to a
-        non-Databricks model (i.e. does not start with ``"databricks-"``),
-        both the explicit ``profile`` block and the ambient Databricks
-        credential fallback are skipped — the caller must supply
-        ``OPENAI_API_KEY`` (and optionally ``OPENAI_BASE_URL``) instead.
+    :param model: The model or model-service name that will be used. An
+        explicit ``profile`` selects Databricks regardless of this value.
+        Without a profile, only legacy ``"databricks-"`` names enable
+        ambient Databricks credential fallback.
     :raises DatabricksAuthError: When an explicit ``profile`` is given,
         authentication fails, and no ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY``
         env-var fallbacks are available.
@@ -498,11 +499,11 @@ def _get_openai_async_client(
             **retry_kwargs,
         )
 
-    is_databricks_model = model is None or model.startswith("databricks-")
+    allow_ambient_databricks = model is None or model.startswith("databricks-")
 
-    # Databricks profile auth only applies when the model is Databricks-hosted.
-    # An explicit spec/provider profile wins over ambient env vars.
-    if is_databricks_model and profile:
+    # An explicit Databricks profile is authoritative; model-service names
+    # are opaque Unity Catalog identifiers such as catalog.schema.service.
+    if profile:
         from .databricks_executor import DatabricksAuthError, _resolve_databricks_auth
 
         try:
@@ -547,17 +548,17 @@ def _get_openai_async_client(
     if api_key:
         return AsyncOpenAI(api_key=api_key, **retry_kwargs)
 
-    # Non-Databricks model with no OpenAI credentials — fail loudly rather
-    # than silently routing to the Databricks AI Gateway, which will 404.
-    if not is_databricks_model:
+    # Without an explicit profile, only legacy Databricks model names opt in
+    # to ambient Databricks credentials.
+    if not profile and not allow_ambient_databricks:
         raise ValueError(
-            f"Model {model!r} is not a Databricks-hosted model but no OpenAI "
-            "credentials were found. Set OPENAI_API_KEY (and optionally "
-            "OPENAI_BASE_URL) to use this model, or use a 'databricks-' "
-            "prefixed model name to route through Databricks."
+            f"No provider credentials were configured for model {model!r}. "
+            "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
+            "Databricks profile, or use a 'databricks-' prefixed model name "
+            "for legacy automatic Databricks routing."
         )
 
-    # No profile, no env — final fallback via ambient Databricks credentials.
+    # No env client: use the explicit profile or legacy ambient Databricks auth.
     try:
         from .databricks_executor import _resolve_databricks_auth
 
@@ -668,11 +669,11 @@ class _AgentsSessionState:
         before starting. Set by :meth:`interrupt_session`.
     """
 
-    sdk_session: Any  # type: ignore[explicit-any]  # _SanitizingSession or OpenAIResponsesCompactionSession
+    sdk_session: _SDKSession
     started: bool = False
     # agents.Agent[Any] instance; cached for reuse across turns.
     agent: SDKAgent = None
-    agent_signature: tuple[str, str, str, str, str] | None = None
+    agent_signature: tuple[str, str, str, str, str, str] | None = None
     resume_state: _RunState | None = None
     active_result: _RunResult | None = None
     interrupt_requested: bool = False
@@ -940,7 +941,7 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     return client
 
 
-def _count_output_items(new_items: list[Any]) -> int:  # type: ignore[explicit-any]
+def _count_output_items(new_items: Sequence[object]) -> int:
     """Count run items that represent user-visible output.
 
     Excludes bookkeeping items (reasoning, compaction) per
@@ -956,7 +957,7 @@ def _count_output_items(new_items: list[Any]) -> int:  # type: ignore[explicit-a
     )
 
 
-def _sum_output_tokens(raw_responses: list[Any] | None) -> int:  # type: ignore[explicit-any]
+def _sum_output_tokens(raw_responses: Sequence[object] | None) -> int:
     """Sum ``output_tokens`` across a run's raw model responses.
 
     :param raw_responses: ``RunResult.raw_responses``; each element has a
@@ -965,13 +966,16 @@ def _sum_output_tokens(raw_responses: list[Any] | None) -> int:  # type: ignore[
     """
     if not raw_responses:
         return 0
-    return sum(getattr(r.usage, "output_tokens", 0) or 0 for r in raw_responses)
+    return sum(
+        getattr(getattr(response, "usage", None), "output_tokens", 0) or 0
+        for response in raw_responses
+    )
 
 
 def _is_empty_turn(
     final_text: str,
     saw_tool_activity: bool,
-    new_items: list[Any],  # type: ignore[explicit-any]
+    new_items: Sequence[object],
 ) -> bool:
     """Whether a completed run produced literally nothing worth surfacing.
 
@@ -1117,14 +1121,17 @@ class OpenAIAgentsSDKExecutor(Executor):
             return state
 
         underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
-        sdk_session: Any = underlying  # type: ignore[explicit-any]
+        sdk_session: _SDKSession = underlying
         # Wrap with compaction session when the client targets a real
         # HTTP endpoint. Skip for bare object() clients in unit tests
         # that lack base_url.
         _base = str(getattr(self._client, "base_url", ""))
         if _base.startswith("http"):
             try:
-                from agents.memory import OpenAIResponsesCompactionSession
+                from agents.memory import (
+                    OpenAIResponsesCompactionArgs,
+                    OpenAIResponsesCompactionSession,
+                )
 
                 class _SafeCompactionSession(OpenAIResponsesCompactionSession):
                     """Compaction session that treats compaction failures as non-fatal.
@@ -1135,7 +1142,10 @@ class OpenAIAgentsSDKExecutor(Executor):
                     without compaction.
                     """
 
-                    async def run_compaction(self, args=None):  # type: ignore[override]
+                    async def run_compaction(
+                        self,
+                        args: OpenAIResponsesCompactionArgs | None = None,
+                    ) -> None:
                         try:
                             await super().run_compaction(args)
                         except Exception:  # noqa: BLE001
@@ -1145,10 +1155,13 @@ class OpenAIAgentsSDKExecutor(Executor):
                                 exc_info=True,
                             )
 
-                sdk_session = _SafeCompactionSession(
-                    session_id=session_key,
-                    underlying_session=underlying,  # type: ignore[arg-type]
-                    client=self._client,
+                sdk_session = cast(
+                    _SDKSession,
+                    _SafeCompactionSession(
+                        session_id=session_key,
+                        underlying_session=underlying,  # type: ignore[arg-type]
+                        client=self._client,
+                    ),
                 )
             except (ImportError, AttributeError, ValueError) as exc:
                 logger.debug(
@@ -1443,15 +1456,15 @@ class OpenAIAgentsSDKExecutor(Executor):
         # cfg.model (per-request /model override; agent name no longer
         # leaks here) wins over the spec default
         # (HARNESS_OPENAI_AGENTS_MODEL → self._model_override).
-        model = (
-            cfg.model
-            or self._model_override
-            or (
-                _DATABRICKS_OPENAI_AGENTS_DEFAULT_MODEL
-                if self._databricks
-                else _OPENAI_AGENTS_DEFAULT_MODEL
+        model = cfg.model or self._model_override
+        if model is None:
+            provider_name = "databricks" if self._databricks else "openai"
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                provider_name,
+                family="openai",
             )
-        )
+            model = resolution.model_id
         agents_sdk = cast(_AgentsSDK, _ensure_agents_sdk())
         session_key = self._session_key(messages)
         try:
@@ -1522,7 +1535,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                         ]
                         _last_user_msg = " ".join(_parts)[:500]
                     break
-            _req_data: dict[str, Any] = {
+            _req_data: _JsonObject = {
                 "model": model,
                 "messages_count": len(messages),
                 "tools_count": len(tools),
@@ -1798,7 +1811,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         # re-sends the full history); the last sub-turn's total is
         # stable. Always set so the REPL and compaction don't fall
         # back to total_tokens (which sums across ALL sub-turns).
-        turn_usage: dict[str, Any] | None = None
+        turn_usage: _JsonObject | None = None
         raw_responses = getattr(result, "raw_responses", None)
         if raw_responses:
             in_tok = sum(getattr(r.usage, "input_tokens", 0) or 0 for r in raw_responses)
@@ -1845,8 +1858,10 @@ class OpenAIAgentsSDKExecutor(Executor):
 
                     _compaction_tokens = 0
                     if turn_usage is not None:
-                        _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
-                    _compacted: list[dict[str, Any]] | None = None
+                        context_tokens = turn_usage.get("context_tokens")
+                        if isinstance(context_tokens, int):
+                            _compaction_tokens = context_tokens
+                    _compacted: list[ReplayItem] | None = None
                     try:
                         _compacted = await state.sdk_session.get_items()
                     except Exception:  # noqa: BLE001

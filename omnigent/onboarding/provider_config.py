@@ -49,6 +49,8 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from omnigent.env_credentials import (
+    _ENV_REF_RE,
+    env_names_with_omnigent_prefix,
     expand_envvars_with_omnigent_prefix,
     getenv_with_omnigent_prefix,
     omnigent_prefixed_env_name,
@@ -119,7 +121,7 @@ KEY_KIND = "key"
 SUBSCRIPTION_KIND = "subscription"
 GATEWAY_KIND = "gateway"
 LOCAL_KIND = "local"
-DATABRICKS_KIND = "databricks"
+DATABRICKS_KIND: Literal["databricks"] = "databricks"
 CLI_CONFIG_KIND = "cli-config"
 BEDROCK_KIND = "bedrock"
 _VALID_KINDS = (
@@ -955,6 +957,50 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
     return result
 
 
+def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
+    """Return the env var names referenced by provider ``api_key_ref`` entries.
+
+    Scans all inline-family providers (``key`` / ``gateway`` / ``local``) in
+    *config* and collects the names of environment variables they reference for
+    credentials, including the ``OMNIGENT_``-prefixed alias for each.  Two
+    reference shapes are recognised:
+
+    - ``api_key_ref: env:<VAR>`` — the explicit env-ref form.
+    - ``api_key: $VAR`` / ``api_key: ${VAR}`` — an inline ``$VAR`` reference
+      stored in the raw ``api_key`` field before lazy expansion.
+
+    This is used by the runner-spawn layer to automatically forward custom
+    credential env vars into the runner subprocess without requiring the user
+    to list them in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` by hand.
+
+    Only ``env:``-style references are included.  ``keychain:`` refs resolve
+    through the secret store and are never env vars.  ``auth_command`` is a
+    shell command, not a static env var.  ``base_url`` env-refs are omitted
+    because the URL is not a credential.
+
+    :param config: The parsed ``~/.omnigent/config.yaml`` mapping.
+    :returns: Env var names (and their ``OMNIGENT_`` aliases) that provider
+        credential fields reference, e.g.
+        ``frozenset({"MY_TOKEN", "OMNIGENT_MY_TOKEN"})``.
+    """
+    names: set[str] = set()
+    for entry in load_providers(config).values():
+        for family in entry.families.values():
+            # api_key_ref: env:VAR — explicit env reference.
+            if family.api_key_ref is not None and family.api_key_ref.startswith("env:"):
+                var = family.api_key_ref[len("env:") :]
+                for n in env_names_with_omnigent_prefix(var):
+                    names.add(n)
+            # api_key: $VAR or ${VAR} — inline $VAR reference (unresolved at
+            # parse time; expanded lazily by _expand_family).
+            if family.api_key is not None:
+                for match in _ENV_REF_RE.finditer(family.api_key):
+                    var = match.group(1) or match.group(2)
+                    for n in env_names_with_omnigent_prefix(var):
+                        names.add(n)
+    return frozenset(names)
+
+
 def harness_family(harness: str) -> str | None:
     """Return the single model family a harness consumes, or ``None``.
 
@@ -1288,6 +1334,36 @@ def _source_descriptor(family: FamilyConfig) -> str:
     )
 
 
+def harness_owns_its_credential(harness: str) -> bool:
+    """Whether *harness* carries its own auth, so Omnigent resolves none.
+
+    True for ACP-backed harnesses whose spawn wires no Omnigent provider
+    (``acp``/``acp:<slug>``, goose, and unmapped community ACP plugins):
+    the external agent authenticates itself, so describing an Omnigent
+    provider for one would name a credential the session never uses.
+
+    A harness mapped in :data:`_HARNESS_FAMILY` is provider-routed at spawn
+    (e.g. qwen consumes the openai family via its gateway env) even when its
+    capability record declares own-auth for the unconfigured fallback, so it
+    is never declined here — its family default is genuinely what it runs on.
+
+    :param harness: The harness name, canonical or ``acp:<slug>``.
+    :returns: ``True`` when the harness owns its own credential.
+    """
+    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
+
+    canonical = canonicalize_harness(harness) or harness
+    if canonical in _HARNESS_FAMILY:
+        return False
+    caps = harness_capabilities().get(canonical)
+    if caps is None:
+        return False
+    return (
+        caps.integration_mode is IntegrationMode.ACP_SUBPROCESS and caps.auth is AuthModel.OWN_AUTH
+    )
+
+
 def describe_active_credential(
     config: dict[str, object],
     harness: str,
@@ -1313,6 +1389,9 @@ def describe_active_credential(
     :raises OmnigentError: If the resolved provider is malformed, or more
         than one default serves the family.
     """
+    if harness_owns_its_credential(harness):
+        return None
+
     provider = default_provider_for_harness(config, harness)
     if provider is None:
         return None

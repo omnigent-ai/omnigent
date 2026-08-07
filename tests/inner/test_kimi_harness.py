@@ -72,6 +72,7 @@ def test_executor_factory_reads_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("HARNESS_KIMI_MODEL", "kimi-k2-turbo")
     monkeypatch.setenv("HARNESS_KIMI_CWD", "/tmp/kimi-cwd")
     monkeypatch.setenv("HARNESS_KIMI_PATH", "/custom/bin/kimi")
+    monkeypatch.delenv("OMNIGENT_KIMI_PATH", raising=False)
     monkeypatch.setenv("HARNESS_KIMI_PLAN", "yes")
     monkeypatch.setenv("HARNESS_KIMI_CONTINUE_LAST", "true")
     monkeypatch.setenv("HARNESS_KIMI_SKILLS_DIRS", json.dumps(["/a", "/b"]))
@@ -106,6 +107,8 @@ def test_executor_factory_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatc
         # Cleared too: cwd now falls back to it, so a dev with it exported
         # mustn't flip this default-path assertion.
         "OMNIGENT_RUNNER_WORKSPACE",
+        # Canonical path env var — would shadow the legacy HARNESS_* delenv above.
+        "OMNIGENT_KIMI_PATH",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -202,13 +205,22 @@ def test_parse_truthy(value: str | None, expected: bool) -> None:
 
 
 def test_resolve_kimi_binary_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OMNIGENT_KIMI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_KIMI_PATH", raising=False)
     assert _resolve_kimi_binary() == "kimi"
 
 
 def test_resolve_kimi_binary_explicit_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_KIMI_PATH", "/opt/bin/kimi")
+    # Canonical OMNIGENT_KIMI_PATH wins.
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", "/opt/bin/kimi")
     assert _resolve_kimi_binary() == "/opt/bin/kimi"
+
+
+def test_resolve_kimi_binary_legacy_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Deprecated HARNESS_KIMI_PATH still honored as a fallback.
+    monkeypatch.delenv("OMNIGENT_KIMI_PATH", raising=False)
+    monkeypatch.setenv("HARNESS_KIMI_PATH", "/legacy/bin/kimi")
+    assert _resolve_kimi_binary() == "/legacy/bin/kimi"
 
 
 def test_latest_user_text_string_message() -> None:

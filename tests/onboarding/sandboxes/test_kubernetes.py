@@ -10,6 +10,7 @@ fakes — there is no exec transport to fake.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -23,7 +24,9 @@ from omnigent.host.identity import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
-from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
+from omnigent.onboarding.sandboxes.base import (
+    render_host_config_write_command,
+)
 from omnigent.onboarding.sandboxes.kubernetes import (
     KubernetesSandboxLauncher,
     build_pod_manifest,
@@ -45,6 +48,9 @@ _MANIFEST_KW = {
     "node_selector": None,
     "workspace": "/home/omnigent/workspace",
 }
+
+# Minimal valid host_config exercised by the injection tests below.
+_HOST_CONFIG: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
 
 
 # ── pure manifest / rendering tests (no SDK) ────────────────
@@ -89,6 +95,103 @@ def test_build_pod_manifest_without_repo_has_no_clone() -> None:
     script = manifest["spec"]["initContainers"][0]["command"][2]
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone" not in script
+
+
+def test_build_pod_manifest_host_config_is_written_by_init_container() -> None:
+    """host_config rides the init container script, after mkdir/clone, before the host."""
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "clone_dir": "/home/omnigent/workspace/repo"},
+        repo_url="https://github.com/org/repo.git",
+        host_config=_HOST_CONFIG,
+    )
+    script = manifest["spec"]["initContainers"][0]["command"][2]
+    write_command = render_host_config_write_command(_HOST_CONFIG)
+    assert write_command in script
+    # Ordering within the script: workspace prep and clone come first.
+    assert script.index("mkdir -p") < script.index("git clone") < script.index(write_command)
+    # The main container is untouched — the write happens before the host boots.
+    assert write_command not in manifest["spec"]["containers"][0]["command"][2]
+
+
+def test_build_pod_manifest_forwards_config_home_to_init_container() -> None:
+    """Init and host resolve injected config under the same configured directory."""
+    manifest = build_pod_manifest(
+        **{
+            **_MANIFEST_KW,
+            "env_literals": {
+                "OMNIGENT_CONFIG_HOME": "/home/omnigent/custom-config",
+                "PLAIN_CONFIG": "host-only",
+            },
+        },
+        host_config=_HOST_CONFIG,
+    )
+
+    init_env = manifest["spec"]["initContainers"][0]["env"]
+    host_env = manifest["spec"]["containers"][0]["env"]
+    assert init_env == [
+        {"name": "HOME", "value": "/home/omnigent"},
+        {
+            "name": "OMNIGENT_CONFIG_HOME",
+            "value": "/home/omnigent/custom-config",
+        },
+    ]
+    assert {entry["name"] for entry in host_env} >= {
+        "OMNIGENT_CONFIG_HOME",
+        "PLAIN_CONFIG",
+    }
+
+
+@pytest.mark.parametrize(
+    "config_home",
+    ["/tmp/elsewhere", "/home/omnigent-other", "/home/omnigent/../tmp", "../etc"],
+)
+def test_build_pod_manifest_rejects_config_home_outside_home_dir(config_home: str) -> None:
+    """
+    Init and host share only the HOME emptyDir, so a config dir that resolves
+    outside it would make the injected config invisible to the host. Fail the
+    launch loudly — including paths that only escape after normalizing ``..``.
+    """
+    with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must resolve under"):
+        build_pod_manifest(
+            **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": config_home}},
+            host_config=_HOST_CONFIG,
+        )
+
+
+@pytest.mark.parametrize(
+    "config_home",
+    ["/home/omnigent", "/home/omnigent/", "/home/omnigent/cfg", "cfg", "relative/dir", ".", ""],
+)
+def test_build_pod_manifest_accepts_config_home_at_or_under_home_dir(config_home: str) -> None:
+    """
+    A dir at or under HOME (absolute or relative to the shared workingDir) is on
+    the shared volume — allowed. An empty value is treated as unset by the
+    writer, so it is forwarded without validation. All are forwarded to init.
+    """
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": config_home}},
+        host_config=_HOST_CONFIG,
+    )
+    assert {"name": "OMNIGENT_CONFIG_HOME", "value": config_home} in manifest["spec"][
+        "initContainers"
+    ][0]["env"]
+
+
+def test_build_pod_manifest_config_home_outside_home_dir_ok_without_host_config() -> None:
+    """Without host_config the init container writes nothing, so the path is moot."""
+    manifest = build_pod_manifest(
+        **{**_MANIFEST_KW, "env_literals": {"OMNIGENT_CONFIG_HOME": "/tmp/elsewhere"}},
+    )
+    init_env = manifest["spec"]["initContainers"][0]["env"]
+    assert {"name": "OMNIGENT_CONFIG_HOME", "value": "/tmp/elsewhere"} in init_env
+
+
+def test_build_pod_manifest_without_host_config_has_no_config_write() -> None:
+    """No host_config → the init container only preps the workspace."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    script = manifest["spec"]["initContainers"][0]["command"][2]
+    assert "config.yaml" not in script
+    assert "python3 -c" not in script
 
 
 def test_build_pod_manifest_token_rides_secret_ref_not_the_spec() -> None:
@@ -147,6 +250,167 @@ def test_build_pod_manifest_node_selector_can_override_arch() -> None:
     selector = manifest["spec"]["nodeSelector"]
     assert selector["kubernetes.io/arch"] == "arm64"
     assert selector["disktype"] == "ssd"
+
+
+def test_build_pod_manifest_pvc_mounts_land_on_host_container_only() -> None:
+    """Each pvc_mounts entry becomes a persistentVolumeClaim volume mounted on host only."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        pvc_mounts=[
+            {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True},
+            {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+        ],
+    )
+    spec = manifest["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["pvc-0"]["persistentVolumeClaim"] == {
+        "claimName": "omnigent-datasets",
+        "readOnly": True,
+    }
+    assert volumes["pvc-1"]["persistentVolumeClaim"] == {"claimName": "scratch"}
+    host_mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
+    assert host_mounts["pvc-0"] == {
+        "name": "pvc-0",
+        "mountPath": "/mnt/datasets",
+        "readOnly": True,
+    }
+    assert host_mounts["pvc-1"] == {"name": "pvc-1", "mountPath": "/mnt/scratch"}
+    # The init container keeps exactly its HOME emptyDir — no dataset exposure at clone time.
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_without_pvc_mounts_is_unchanged() -> None:
+    """No pvc_mounts → the single home emptyDir, exactly as before."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["spec"]["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert manifest["spec"]["containers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_secret_mounts_land_on_host_container_only() -> None:
+    """Each secret_mounts entry becomes a read-only secret volume mounted on host only."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        secret_mounts=[
+            {"secret_name": "git-token", "mount_path": "/mnt/secrets/git"},
+            {"secret_name": "npm-token", "mount_path": "/mnt/secrets/npm"},
+        ],
+    )
+    spec = manifest["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["secret-0"]["secret"] == {
+        "secretName": "git-token",
+        "optional": False,
+        "defaultMode": 0o440,
+    }
+    assert volumes["secret-1"]["secret"] == {
+        "secretName": "npm-token",
+        "optional": False,
+        "defaultMode": 0o440,
+    }
+    host_mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
+    assert host_mounts["secret-0"] == {
+        "name": "secret-0",
+        "mountPath": "/mnt/secrets/git",
+        "readOnly": True,
+    }
+    assert host_mounts["secret-1"] == {
+        "name": "secret-1",
+        "mountPath": "/mnt/secrets/npm",
+        "readOnly": True,
+    }
+    # Init container keeps only HOME — no credential exposure at clone time.
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_pvc_and_secret_mounts_coexist() -> None:
+    """PVC and Secret mounts get independent name spaces (pvc-N / secret-N) on the host."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        pvc_mounts=[{"claim_name": "datasets", "mount_path": "/mnt/datasets", "read_only": True}],
+        secret_mounts=[{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+    )
+    volume_names = {v["name"] for v in manifest["spec"]["volumes"]}
+    assert volume_names == {"home", "pvc-0", "secret-0"}
+    host_mount_names = {m["name"] for m in manifest["spec"]["containers"][0]["volumeMounts"]}
+    assert host_mount_names == {"home", "pvc-0", "secret-0"}
+
+
+def test_build_pod_manifest_without_secret_mounts_is_unchanged() -> None:
+    """No secret_mounts → the single home emptyDir, exactly as before."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["spec"]["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert manifest["spec"]["containers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_stamps_agent_label_alongside_reserved_pair() -> None:
+    """A valid agent name adds the omnigent.ai/agent classifier; reserved pair stays."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="research-agent")
+    assert manifest["metadata"]["labels"] == {
+        "app.kubernetes.io/managed-by": "omnigent",
+        "omnigent.ai/role": "sandbox-host",
+        "omnigent.ai/agent": "research-agent",
+    }
+
+
+def test_build_pod_manifest_echoes_valid_agent_name_verbatim() -> None:
+    """The label value equals the agent name exactly — case, dots, and underscores
+    are all valid label characters, so a valid name is never rewritten."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="Research.Agent_v2")
+    assert manifest["metadata"]["labels"]["omnigent.ai/agent"] == "Research.Agent_v2"
+
+
+def test_build_pod_manifest_without_agent_label_keeps_only_reserved_pair() -> None:
+    """No agent → labels are exactly the reserved managed-by/role pair."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["metadata"]["labels"] == {
+        "app.kubernetes.io/managed-by": "omnigent",
+        "omnigent.ai/role": "sandbox-host",
+    }
+
+
+def test_build_pod_manifest_empty_agent_label_is_omitted() -> None:
+    """An empty agent name is treated as no agent — no omnigent.ai/agent key."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="")
+    assert "omnigent.ai/agent" not in manifest["metadata"]["labels"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Research Agent",  # space is not a valid label character
+        "agent/v2:beta",  # '/' and ':' are not valid label characters
+        "--weird__name..",  # does not start/end alphanumeric
+        "a" * 64,  # exceeds the 63-char label-value limit
+        "///...---",  # nothing valid survives
+    ],
+)
+def test_build_pod_manifest_omits_agent_label_needing_transformation(
+    raw: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A name that is not ALREADY a valid label value is omitted, never coerced —
+    two distinct names must never collapse onto one credential-selecting value.
+
+    The omission is WARNED, not silent: the resolve upstream has already logged
+    this agent as classified, so a silent drop here would point an operator
+    debugging an uninjected credential at a log line claiming success.
+    """
+    with caplog.at_level(logging.WARNING):
+        manifest = build_pod_manifest(**_MANIFEST_KW, agent_name=raw)
+    assert "omnigent.ai/agent" not in manifest["metadata"]["labels"]
+    assert any(
+        "stays unclassified" in r.getMessage() and r.levelno == logging.WARNING
+        for r in caplog.records
+    ), f"the dropped label was not warned about: {[r.getMessage() for r in caplog.records]}"
 
 
 def test_build_pod_manifest_is_restricted_and_least_privilege() -> None:
@@ -378,6 +642,83 @@ def test_launch_host_creates_secret_then_pod_and_returns_workspace(
     assert fake_core.deleted_pods == []
 
 
+def test_launch_host_threads_pvc_mounts_into_the_pod(fake_core: _FakeCore) -> None:
+    """A launcher built with pvc_mounts creates Pods carrying the PVC volume."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pvc_mounts=[
+            {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True}
+        ],
+    )
+    launcher.start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert {
+        "name": "pvc-0",
+        "persistentVolumeClaim": {"claimName": "omnigent-datasets", "readOnly": True},
+    } in fake_core.created_pods[0]["spec"]["volumes"]
+
+
+def test_launch_host_threads_secret_mounts_into_the_pod(fake_core: _FakeCore) -> None:
+    """A launcher built with secret_mounts creates Pods carrying the secret volume."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        secret_mounts=[{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+    )
+    launcher.start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert {
+        "name": "secret-0",
+        "secret": {"secretName": "git-token", "optional": False, "defaultMode": 0o440},
+    } in fake_core.created_pods[0]["spec"]["volumes"]
+
+
+def test_launch_host_threads_agent_label_into_the_pod(fake_core: _FakeCore) -> None:
+    """start_host stamps the resolved agent on the created Pod's labels."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        agent_name="research-agent",
+    )
+    labels = fake_core.created_pods[0]["metadata"]["labels"]
+    assert labels["omnigent.ai/agent"] == "research-agent"
+    assert labels["app.kubernetes.io/managed-by"] == "omnigent"
+
+
+def test_launch_host_without_agent_label_keeps_reserved_labels(fake_core: _FakeCore) -> None:
+    """No agent_name → the created Pod carries only the reserved managed-by/role pair."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert "omnigent.ai/agent" not in fake_core.created_pods[0]["metadata"]["labels"]
+
+
 def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:
     """With a repo, the returned workspace is the cloned directory under the workspace."""
     fake_core.read_queue = [_pod(phase="Running")]
@@ -406,6 +747,33 @@ def test_launch_host_cleans_up_on_create_failure(fake_core: _FakeCore) -> None:
         )
     assert "omnigent-pod-3-token" in fake_core.deleted_secrets
     assert "omnigent-pod-3" in fake_core.deleted_pods
+
+
+def test_launch_host_invalid_config_home_fails_before_creating_secret(
+    fake_core: _FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An out-of-HOME config dir must fail while the manifest is built — before the
+    token Secret is created — so no credential-bearing Secret is orphaned.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", "/tmp/outside")
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=["OMNIGENT_CONFIG_HOME"],
+    )
+    with pytest.raises(ValueError, match=r"OMNIGENT_CONFIG_HOME.*must resolve under"):
+        launcher.start_host(
+            "omnigent-pod-x",
+            token=_TOKEN,
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="http://srv.example.com",
+            host_config=_HOST_CONFIG,
+        )
+    assert "create_secret" not in fake_core.calls
+    assert fake_core.created_secrets == []
 
 
 def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
@@ -490,12 +858,18 @@ def test_terminate_retries_transient_then_gives_up_best_effort(
     assert fake_core.deleted_secrets == ["omnigent-pod-8-token"]
 
 
-def test_provision_reserves_pod_name_and_run_is_unsupported() -> None:
-    """provision reserves a Pod name (no Pod created); run has no exec transport."""
+def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
+    """provision reserves a Pod name (no Pod created); no exec transport."""
     launcher = _launcher()
     # provision reserves the id — it does NOT create a Pod and does NOT raise.
     name = launcher.provision("managed-abc")
     assert name.startswith("omnigent-managed-abc-")
-    # run is unsupported: the host is the Pod entrypoint, there is no exec-in.
-    with pytest.raises(SandboxCapabilityError):
-        launcher.run("sb", "echo hi")
+    # Kubernetes is an entrypoint-as-host provider: it has no ``run()`` method
+    # at all (no exec transport), unlike exec-model providers that inherit
+    # ``ExecModelHostLauncher``.
+    assert not hasattr(launcher, "run")
+    # CLI bootstrap is not supported.
+    assert launcher.capabilities.cli_bootstrap is False
+    # It classifies runners by agent, so the managed launch path threads
+    # ``agent_name`` into its ``start_host`` (exec-model providers do not).
+    assert launcher.capabilities.classifies_runner_by_agent is True

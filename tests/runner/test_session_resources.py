@@ -1474,6 +1474,8 @@ class _WatcherCapture:
         ``None`` if none was wired.
     :param on_exit: The exit callback the registry passed, or ``None`` if none
         was wired.
+    :param on_tick: The per-tick callback the registry passed (drives the
+        claude-native status-file poller), or ``None`` if none was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1484,6 +1486,7 @@ class _WatcherCapture:
     on_activity: Callable[[], None] | None = None
     on_idle: Callable[[], None] | None = None
     on_exit: Callable[[], None] | None = None
+    on_tick: Callable[[], None] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
     replace: bool = False
@@ -1518,6 +1521,7 @@ def _make_capturing_instance(
         *,
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
+        on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1526,6 +1530,7 @@ def _make_capturing_instance(
         capture.on_idle = on_idle
         capture.on_activity = on_activity
         capture.on_exit = on_exit
+        capture.on_tick = on_tick
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
         capture.replace = replace
@@ -1622,7 +1627,9 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
     status_edges: list[_StatusEdge] = []
     registry.set_terminal_activity_publisher(lambda _sid, _tid: None)
     registry.set_session_status_publisher(
-        lambda sid, status: status_edges.append(_StatusEdge(session_id=sid, status=status))
+        lambda sid, status, _reason=None: status_edges.append(
+            _StatusEdge(session_id=sid, status=status)
+        )
     )
 
     await registry.launch_required_terminal(
@@ -1750,7 +1757,7 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
     registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
     # The idle-reset behaviour is only wired for the claude-native role, so
     # the status publisher must be installed to exercise on_idle.
-    registry.set_session_status_publisher(lambda _sid, _status: None)
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
 
     await registry.launch_required_terminal(
         session_id="conv_throttle",
@@ -2195,7 +2202,9 @@ async def test_claude_terminal_ensure_concurrent_calls_create_once(
         terminal_ready = True
         return fake_view
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", fake_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", fake_auto_create
+    )
 
     async def fake_get_terminal_resource(
         self: Any,

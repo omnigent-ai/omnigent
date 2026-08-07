@@ -122,10 +122,10 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **`uv`** (required). https://docs.astral.sh/uv/getting-started/installation/
   The installer offers to set this up for you.
 - **`git`** (required).
-- **Node.js 22 LTS or newer** with **`npm`**, for the npm-installed coding
-  harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
-  harness CLI you pick.
-  https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- **Node.js 22 LTS or newer** with **`npm`** (for the coding-harness CLIs
+  installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
+  both from a single Node install; pnpm is available via
+  `corepack enable` or `npm install -g pnpm`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
@@ -267,6 +267,9 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
+its coding agents or drive a live OpenClaw Gateway session over ACP.
+
 #### 🐙 Polly and 🟠🔵 Debby
 
 Two example agents ship with the repo, and they make good first sessions:
@@ -274,6 +277,7 @@ Two example agents ship with the repo, and they make good first sessions:
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
+omnigent run examples/deep-research/
 
 # ...or on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness <harness>
@@ -291,15 +295,22 @@ side by side. Type `/debate` and the heads critique each other for a few
 rounds before converging. (She needs both a Claude and an OpenAI credential;
 see step 3.)
 
-**Prefer the browser?** Start a server and register your machine as a host:
+**🔎 Deep Research** is a single agent that answers a question with a cited,
+cross-checked report. It plans sub-queries, searches the live web and reads
+full pages through an MCP search server, and verifies each claim across
+independent sources. It's also the simplest example to copy from: one agent
+plus one `tools/mcp/*.yaml` server, no sub-agents.
+
+**Prefer the browser?** One command starts the local server and registers this
+machine as a host:
 
 ```bash
-omnigent server start   # start the local server and web UI in the background
-omnigent host           # (separate terminal) register this machine as a host
+omnigent start   # starts the local server and registers this machine as a host
 ```
 
-In the web UI, hit **New Chat**, pick your machine, and go. Check status with
-`omnigent server status`; stop everything with `omnigent stop`.
+Open the server URL it prints, hit **New Chat**, pick your machine, and go.
+Check status with `omnigent server status`; stop everything with
+`omnigent stop`.
 
 ### 3. Choose & switch models
 
@@ -374,7 +385,7 @@ Omnigent supports **multi-user accounts**, controlled by one environment
 variable:
 
 ```bash
-OMNIGENT_AUTH_ENABLED=1 omnigent server start
+OMNIGENT_AUTH_ENABLED=1 omnigent server --background
 ```
 
 The **Docker deploy in [step 4](#4-deploy-a-server-and-use-it-from-your-phone)
@@ -505,6 +516,17 @@ omnigent run path/to/my_agent.yaml
 The same file can declare sub-agents and reviewers. For a fuller example, see
 Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/examples/polly/), and the
 [Agent YAML spec](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md) for the full schema.
+
+---
+
+## Telemetry
+
+Omnigent collects anonymized usage data (telemetry) by default. This data
+contains no sensitive or personally identifiable information. If you're using
+Omnigent through a managed service or distribution, please consult your managed
+service agreement to determine any data collection that may impact your use of
+the service. To opt out, follow our instructions in
+[Usage Telemetry](https://omnigent.ai/docs/deploy/telemetry).
 
 ---
 

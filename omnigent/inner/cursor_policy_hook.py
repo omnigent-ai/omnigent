@@ -54,27 +54,36 @@ def main() -> None:
         },
     }
 
-    url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/policies/evaluate"
-
     try:
         from omnigent.native_policy_hook import (
+            _RELAY_TOKEN_ENV,
+            _RELAY_URL_ENV,
             policy_hook_reauth,
             policy_hook_request_headers,
             post_evaluate_with_retry,
+            relay_policy_evaluate_url,
         )
 
-        headers = policy_hook_request_headers()
-        reauth = policy_hook_reauth(server_url, headers)
-        resp, _ = post_evaluate_with_retry(
+        relay_url = os.environ.get(_RELAY_URL_ENV, "")
+        relay_token = os.environ.get(_RELAY_TOKEN_ENV, "")
+        if relay_url and relay_token:
+            url = relay_policy_evaluate_url(relay_url)
+            headers: dict[str, str] = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {relay_token}",
+            }
+            reauth = None
+        else:
+            url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/policies/evaluate"
+            headers = policy_hook_request_headers()
+            reauth = policy_hook_reauth(server_url, headers)
+
+        resp, api_error = post_evaluate_with_retry(
             url=url,
             headers=headers,
             eval_request=eval_body,
-            # One day — must match the hooks.json ``timeout`` and the
-            # server's ``ask_timeout`` so the hook stays alive while the
-            # human responds to the web-UI approval card.
             read_timeout=86400.0,
             hook_label="cursor preToolUse",
-            # Re-mint the baked one-shot token if it lapses mid-session.
             reauth=reauth,
         )
     except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
@@ -82,15 +91,23 @@ def main() -> None:
         return
 
     if resp is None:
-        # Network error / retry budget exhausted -- fail open (allow) so a
-        # transient server outage doesn't block the Cursor turn.
-        json.dump({"permission": "allow"}, sys.stdout)
+        detail = api_error or (reauth.failure_reason if reauth else None)
+        message = f"Tool '{tool_name}' blocked: Omnigent policy evaluation unavailable"
+        if detail:
+            message += f" ({detail})"
+        json.dump({"permission": "deny", "agent_message": message}, sys.stdout)
         return
 
     try:
         result = resp.json()
     except Exception:  # noqa: BLE001
-        json.dump({"permission": "allow"}, sys.stdout)
+        json.dump(
+            {
+                "permission": "deny",
+                "agent_message": f"Tool '{tool_name}' blocked: malformed Omnigent policy response",
+            },
+            sys.stdout,
+        )
         return
 
     action = result.get("result", "POLICY_ACTION_ALLOW")

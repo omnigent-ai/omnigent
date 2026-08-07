@@ -113,9 +113,10 @@ export function MainTerminalView({
 
   return (
     // Outer wrapper fills the main column. `pt-14` clears the 56px
-    // absolute-positioned AppShell header on desktop (matching the
-    // workspace rail's `mt-14`, so the two cards' tops line up); iOS
-    // native gets a safe-area-aware override in index.css. `px-3` gives a
+    // absolute-positioned AppShell header on desktop. The workspace rail now
+    // extends beside that header at the outer inset; this main-column surface
+    // still clears it. iOS native gets a safe-area-aware override in index.css.
+    // `px-3` gives a
     // 12px gutter on
     // the sides. The card stretches to full width and height of the
     // available area. The ConnectionIndicator pill renders just below
@@ -130,7 +131,7 @@ export function MainTerminalView({
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {terminals.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
+          <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
             No terminals available.
           </div>
         ) : (
@@ -138,7 +139,7 @@ export function MainTerminalView({
             {isShellView && activeTerminal && (
               // Shell header — identity + close, nothing else.
               <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-2 pt-1 pb-2">
-                <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-xs">
+                <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-sm">
                   <TerminalIcon className="size-3 shrink-0" />
                   <span className="max-w-[8rem] truncate">{activeTerminal.name}</span>
                   <span className="shrink-0 text-muted-foreground/60">
@@ -159,7 +160,13 @@ export function MainTerminalView({
             )}
             <div className="min-h-0 flex-1">
               {activeTerminal && (
-                <div key={activeTerminal.id} className="flex h-full flex-col">
+                // Scope the key to the session: agent terminals share a fixed
+                // id across same-shape sessions (e.g. `terminal_claude_main`),
+                // so id alone reuses the xterm mount and shows stale scrollback.
+                <div
+                  key={`${conversationId}:${activeTerminal.id}`}
+                  className="flex h-full flex-col"
+                >
                   <TerminalView
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}

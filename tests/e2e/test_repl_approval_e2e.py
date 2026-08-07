@@ -1140,8 +1140,10 @@ def test_repl_label_driven_ask_approves(
         )
         child.send("y" + "\r")
         child.expect("approved", timeout=5)
-        # Turn 2 completes — LLM replies normally.
-        _wait_for_turn_complete(child, timeout=45)
+        # Sync on the scripted reply rather than the cosmetic `· ready`
+        # idle marker, which can fail to render under CI load even after
+        # the turn has completed.
+        child.expect("Continuing as requested", timeout=45)
     finally:
         try:
             child.send("/quit" + "\r")

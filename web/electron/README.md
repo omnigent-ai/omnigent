@@ -67,15 +67,18 @@ adds native niceties:
   OS-level mic gate is open too (packaged builds ship
   `NSMicrophoneUsageDescription`).
 
-  > **Caveat — Web Speech may still not transcribe in Electron.** Granting the
+  > **Caveat — Web Speech does not transcribe in Electron.** Granting the
   > mic clears the _permission_ gate, but `SpeechRecognition` also depends on
   > Google's cloud speech backend keyed to official Google Chrome builds, which
-  > Electron's bundled Chromium does **not** ship. So recognition can still
-  > fail (typically a `network` error) even with the mic allowed. The web app
-  > degrades gracefully (the button shows "Dictation unavailable" rather than
-  > crashing). Fully reliable in-app dictation would require a MediaRecorder
-  > capture + a server-side transcription endpoint (e.g. Whisper) wired to the
-  > composer's existing `onAudioRecorded` fallback — not yet implemented.
+  > Electron's bundled Chromium does **not** ship. Electron therefore uses the
+  > **server-side dictation fallback** instead: when the connected server has
+  > the `dictation` extra and models installed (`GET /v1/info` reports
+  > `dictation_available`), a take that fails with Web Speech's `network`
+  > error falls back to streaming audio to `WS /v1/dictation/stream` and
+  > transcribing on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, the button still
+  > renders (the constructor exists) but shows "Dictation unavailable" when
+  > clicked, as before.
 
 ## How it works (zero UI duplication)
 
@@ -343,7 +346,7 @@ app open?" error rather than hanging.
 
 ## Prerequisites
 
-- **Node** 22.x + npm (already used by `web`).
+- **Node** 22.x + pnpm (already used by `web`).
 - Electron ships its own Chromium/Node, so no system webview libs are needed
   on Linux for _running_ the built app, though packaging tools may pull a few
   build deps.
@@ -353,8 +356,8 @@ app open?" error rather than hanging.
 From the `web/electron/` directory:
 
 ```bash
-npm install     # installs electron + electron-builder
-npm start        # launches the Electron shell
+pnpm install     # installs electron + electron-builder
+pnpm start        # launches the Electron shell
 ```
 
 The shell opens on the bundled setup page. Point it at a running Omnigent
@@ -362,18 +365,18 @@ server (see below), Connect, and you're in.
 
 > Note: this loads the UI from whatever server URL you give it — it does
 > **not** run the Vite dev server. To develop the web UI itself with hot
-> reload, run `npm run dev` (plain Vite in a browser) from `web/` as usual.
+> reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
 ## Build a distributable
 
 From `web/electron/`:
 
 ```bash
-npm run build             # current platform
-npm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
-npm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
-npm run build:linux       # AppImage + .deb
-npm run build:win         # NSIS installer
+pnpm run build             # current platform
+pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
+pnpm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
+pnpm run build:linux       # AppImage + .deb
+pnpm run build:win         # NSIS installer
 ```
 
 Output lands in `electron/dist/` (the DMG is named
@@ -401,7 +404,7 @@ Create it at <https://developer.apple.com/account/resources/certificates>
 (or via Xcode → Settings → Accounts → Manage Certificates), then either:
 
 - **Keychain (local builds):** install the cert + private key into your
-  login keychain. electron-builder auto-discovers it — `npm run build:mac`
+  login keychain. electron-builder auto-discovers it — `pnpm run build:mac`
   just works. Verify with
   `security find-identity -v -p codesigning` (you should see
   `Developer ID Application: <Your Name> (<TEAMID>)`).
@@ -414,7 +417,7 @@ Create it at <https://developer.apple.com/account/resources/certificates>
   ```
 
 To force an **unsigned** build even when a cert is present (faster dev
-iteration): `CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:mac`.
+iteration): `CSC_IDENTITY_AUTO_DISCOVERY=false pnpm run build:mac`.
 
 ### 2. Notarize (release builds)
 
@@ -440,7 +443,7 @@ export APPLE_TEAM_ID=<TEAMID>
 then:
 
 ```bash
-npm run build:mac:release
+pnpm run build:mac:release
 ```
 
 This is the same build with `mac.notarize=true` switched on; expect the
@@ -517,7 +520,7 @@ to a **remote** server never needs the CLI — only "Start locally" and hosting 
 
 ### Start locally
 
-**"Start a server on this machine"** runs `omnigent server start` (idempotent —
+**"Start a server on this machine"** runs `omnigent server --background` (idempotent —
 reuses a healthy one) and then connects this window to its
 `http://127.0.0.1:<port>` URL through the normal connect flow. It does not
 connect this machine as a runner — that stays an explicit step in the app.
@@ -562,47 +565,22 @@ _invisible_ — the passkey sheet you see in Chrome/Safari is browser chrome,
 which Electron doesn't ship. Touching the key completes the ceremony with no
 UI.
 
-For a visual flow, the shell enables Electron's **Touch ID platform
-authenticator** (`app.configureWebAuthn`, Electron ≥ 42, macOS only):
-registering or signing in with a platform passkey then shows the native
-macOS Touch ID / keychain dialog, and a native chooser appears when several
-saved passkeys match. Three pieces must agree before this activates:
+The shell intentionally does **not** enable Electron's Touch ID platform
+authenticator (`app.configureWebAuthn`). Doing so routes the entire WebAuthn
+ceremony through Apple's AuthenticationServices provider, which cannot
+complete a roaming USB security-key request (e.g. YubiKey) against a
+third-party SSO relying party — the ceremony dies with an opaque
+`NotAllowedError` ("The operation either timed out or was not allowed").
+Leaving it off keeps security keys on Chromium's built-in CTAP path, which
+handles both roaming keys and Touch-ID-as-security-key. The native Touch ID
+platform passkey served no supported sign-in path: Databricks Touch ID
+sign-in goes through Okta FastPass (Okta Verify over the localhost loopback),
+not WebAuthn, and browser-registered passkeys are invisible to the app's
+keychain-access group anyway.
 
-1. `WEBAUTHN_KEYCHAIN_ACCESS_GROUP` in `src/main.js` —
-   `"<TEAM_ID>.ai.omnigent.desktop"`.
-2. The same string in the `keychain-access-groups` entitlement in
-   `signing/entitlements.mac.plist`.
-3. An **embedded Developer ID provisioning profile**
-   (`signing/omnigent.provisionprofile`, wired via `provisioningProfile`
-   in `package.json`). `keychain-access-groups` is a _restricted_
-   entitlement: a Developer ID signature alone doesn't authorize it, and
-   AMFI SIGKILLs the app at launch ("Launchd job spawn failed", POSIX
-   error 163). Create the profile in the Apple Developer portal: an App ID
-   for `ai.omnigent.desktop` (no extra capabilities — every profile
-   automatically authorizes keychain groups under `<TEAM_ID>.*`), then
-   Profiles → Distribution → Developer ID for that App ID. Verify with
-   `security cms -D -i signing/omnigent.provisionprofile`.
-
-The signing identity's team must match the group prefix —
-`package.json` pins `"identity"` for this reason (with several certs in
-the keychain, electron-builder's auto-discovery can pick the wrong one).
-Helpers must NOT inherit the keychain entitlement
-(`entitlementsInherit` points at the minimal
-`signing/entitlements.mac.inherit.plist`; a restricted entitlement on a
-helper shows up as a "GPU process exited unexpectedly" crash loop).
-
-It only works in a **code-signed** build, on Macs with a Secure Enclave.
-Until all three are set — and always in unsigned `npm start` dev runs —
-the platform authenticator stays off and security keys remain the
-(working, silent) path.
-
-Caveats: these passkeys are device-bound in the app's own keychain access
-group — they are **not** synced via iCloud Keychain, and passkeys you saved
-in Safari/Chrome are not visible to the app (and vice versa). Showing the
-full system passkey sheet (iCloud Keychain, cross-device QR) for arbitrary
-user-chosen servers would require Apple's browser-only
-`web-browser.public-key-credential` entitlement, or per-domain associated
-domains — neither fits an app whose servers are user-deployed.
+Because no restricted entitlements are used, a Developer ID certificate
+alone is sufficient for signing — no embedded provisioning profile is
+needed.
 
 ## Localhost access (auth flows)
 

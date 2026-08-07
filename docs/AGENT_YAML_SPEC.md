@@ -6,8 +6,9 @@ Omnigent can run an agent from a single YAML file:
 omnigent run path/to/agent.yaml
 ```
 
-Use this file to choose the harness/model, write the system prompt, and declare
-which tools, sub-agents, OS access, and policies the agent can use.
+Use this file to choose the harness/model, write the agent-owned system
+instructions, and declare which tools, sub-agents, OS access, and policies the
+agent can use.
 
 ## Minimal agent
 
@@ -28,12 +29,17 @@ executor:
 `prompt` may also be replaced by `instructions: AGENTS.md`; relative paths are
 resolved from the YAML file's directory.
 
+These fields define the portable, agent-authored portion of the system prompt.
+Omnigent may append framework-owned lifecycle or metadata instructions at
+runtime after agent and per-request instructions; those additions are not part
+of the agent YAML.
+
 ## Common top-level fields
 
 | Field | Required? | Purpose |
 | --- | --- | --- |
 | `name` | Recommended | Stable identifier shown in sessions and logs. |
-| `prompt` | Usually | Inline system prompt. |
+| `prompt` | Usually | Inline agent-owned system instructions. |
 | `instructions` | Optional | Inline instructions or a path to an instructions file. If set, it takes precedence over `prompt`. |
 | `executor` | Recommended | Harness, model, and auth settings. |
 | `tools` | Optional | MCP tools, Python function tools, sub-agents, handoffs, or inherited tools. |
@@ -163,6 +169,28 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+## Custom ACP agents
+
+`harness: acp:<slug>` runs any configured Agent Client Protocol server command.
+Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
+derived from the agent name.
+
+OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
+`mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
+use its own tools, routing, memory, and channels:
+
+```yaml
+acp:
+  agents:
+    - name: OpenClaw
+      command: openclaw acp --url <gateway-url> --token-file <token-file>
+      omnigent_mcp: false
+```
+
+Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
+app. See the [OpenClaw integration guide](openclaw.md) for registry import,
+Gateway setup, and compatibility details.
+
 ## Local OS access
 
 Declare `os_env` only for agents that need local file/shell tools.
@@ -192,10 +220,57 @@ Prefer the narrowest filesystem and network access that supports the task. Do
 not pass secrets through the environment unless the tool genuinely needs them.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
-the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS), so the
-same YAML works across platforms. For the full set of sandbox options, how to
-share one policy across `sys_os_*` and terminals, and how to set up network
-egress rules, see the `sandbox:` examples below and the sandbox source under `omnigent/inner/`.
+the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
+`windows_jobobject` on Windows), so the same YAML works across platforms. Use
+`type: auto` to explicitly request the platform-default sandbox backend:
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+```
+
+`auto` and an omitted `type` resolve identically. `type: null` and `type: none`
+both explicitly disable the sandbox. For the full set of sandbox options, how
+to share one policy across `sys_os_*` and terminals, and how to set up network
+egress rules, see the `sandbox:` examples below and the sandbox source under
+`omnigent/inner/`.
+
+### Secretless credential proxy
+
+`sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts
+without the real secret ever entering the sandbox: the mandatory L7 egress proxy
+attaches the credential on the way out. It requires `egress_rules` and a
+network-isolating backend (`linux_bwrap` or `darwin_seatbelt`). See
+`designs/SANDBOX_CREDENTIAL_PROXY.md` for the full type table.
+
+The `databricks_cli` type proxies the Databricks CLI. List the profiles to
+proxy; only those are materialized into the sandbox (with placeholder tokens)
+and swapped by the proxy. As with every other credential-proxy type, you must
+list each workspace host in `egress_rules` yourself — the proxy does not widen
+egress on its own. OAuth tokens are refreshed for the life of the session.
+Requires the `databricks` extra and `linux_bwrap` (the Go CLI ignores
+`SSL_CERT_FILE` on macOS, so `darwin_seatbelt` is rejected).
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    egress_rules:
+      - "* pypi.org/**"                              # your other egress needs
+      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**"  # the proxied workspace
+    credential_proxy:
+      - type: databricks_cli
+        profiles: [dbc-adb7b1a3-9097, oss]
+        default: dbc-adb7b1a3-9097   # optional; sets DATABRICKS_CONFIG_PROFILE
+```
+
+Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
 ## Tools
 
@@ -254,11 +329,15 @@ Use `container_image` for new specs; `docker_image` remains accepted as a
 deprecated alias for backwards compatibility. Set `container_runtime: podman` to
 run the image with Podman instead of Docker.
 
+The runtime can also be set globally via the `OMNIGENT_CONTAINER_RUNTIME`
+environment variable (accepted values: `docker`, `podman`). The per-agent
+`container_runtime` YAML key takes precedence over the environment variable.
+
 ```yaml
 tools:
   sandbox:
     container_image: python:3.12-slim
-    container_runtime: podman  # optional; defaults to docker
+    container_runtime: podman  # optional; defaults to docker (or OMNIGENT_CONTAINER_RUNTIME)
 ```
 
 ### Sub-agent tool

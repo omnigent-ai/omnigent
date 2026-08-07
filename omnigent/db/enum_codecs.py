@@ -85,6 +85,14 @@ POLICY_TYPE: dict[str, int] = {
     "url": 2,
 }
 
+DEVICE_GRANT_STATUS: dict[str, int] = {
+    "pending": 1,
+    "approved": 2,
+    "denied": 3,
+    "redeemed": 4,
+    "revoked": 5,
+}
+
 HOST_STATUS: dict[str, int] = {
     "online": 1,
     "offline": 2,
@@ -250,6 +258,16 @@ def encode_account_token_kind(name: str) -> int:
 def decode_account_token_kind(code: int) -> str:
     """Decode an ``account_tokens.kind`` int code to its name."""
     return _decode(ACCOUNT_TOKEN_KIND, code, field="account_tokens.kind")
+
+
+def encode_device_grant_status(name: str) -> int:
+    """Encode a ``device_grants.status`` name to its int code."""
+    return _encode(DEVICE_GRANT_STATUS, name, field="device_grants.status")
+
+
+def decode_device_grant_status(code: int) -> str:
+    """Decode a ``device_grants.status`` int code to its name."""
+    return _decode(DEVICE_GRANT_STATUS, code, field="device_grants.status")
 
 
 def encode_policy_type(name: str) -> int:

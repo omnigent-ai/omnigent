@@ -6,16 +6,22 @@ import contextlib
 import logging
 import os
 import re
+from pathlib import Path
 
 import pytest
 
 from omnigent._platform import IS_POSIX
 from omnigent.process_logging import (
+    DATA_DIR_ENV_VAR,
     LOG_FORCE_COLOR_ENV_VAR,
     LOG_TO_STDERR_ENV_VAR,
     LOG_TTY_FD_ENV_VAR,
+    PROCESS_LOG_FILE_ENV_VAR,
     TerminalLogFormatter,
     child_logging_popen_kwargs,
+    configure_process_logging,
+    current_process_log_path,
+    process_log_reference,
     terminal_stream_handler,
     terminal_supports_color,
 )
@@ -166,3 +172,75 @@ def test_terminal_supports_color_checks_explicit_log_fd(
                 continue
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+def test_process_log_reference_names_this_process_log_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The reference points at the captured log file, home-collapsed.
+
+    Error messages that tell the reader to "see the runner log" embed this
+    string, so it must name the exact file and stay free of the account name.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir, used as a fake ``$HOME``.
+    """
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    log_path = tmp_path / ".omnigent" / "logs" / "runner" / "runner-conv_ab12.log"
+    monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(log_path))
+
+    assert process_log_reference("runner") == "~/.omnigent/logs/runner/runner-conv_ab12.log"
+
+
+def test_process_log_reference_falls_back_to_the_destination_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without a captured log file the reference points at the log directory.
+
+    A runner started with stdio inherited has no log file of its own; the
+    error must still say where that destination's logs live.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir, used as the runtime data dir.
+    """
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
+    monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path / "data"))
+
+    assert process_log_reference("runner") == f"{tmp_path / 'data' / 'logs' / 'runner'}/"
+
+
+def test_configure_process_logging_publishes_its_log_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A process that allocates its own log file reports that file.
+
+    ``current_process_log_path`` is what lets an error name the real log even
+    when no parent published one in the environment.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temp dir holding the log file.
+    """
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
+    log_path = tmp_path / "runner-self-allocated.log"
+    logger_name = "omnigent.test_process_logging"
+
+    configure_process_logging(
+        "runner",
+        log_path=log_path,
+        logger_names=(logger_name,),
+        root=False,
+    )
+    try:
+        assert current_process_log_path() == log_path
+    finally:
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()

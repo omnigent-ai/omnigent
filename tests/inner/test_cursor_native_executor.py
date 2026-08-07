@@ -52,10 +52,12 @@ class TestContentExtraction:
         content = [
             {"type": "input_text", "text": "one"},
             {"type": "text", "text": "two"},
-            # invalid data URI -> materialize_attachment returns None -> no line
+            # invalid data URI -> not materialized -> visible marker line
             {"type": "input_image", "image_url": "data:..."},
         ]
-        assert _content_to_text(content, tmp_path) == "one\n\ntwo"
+        assert _content_to_text(content, tmp_path) == (
+            "[Attachment attachment could not be loaded]\n\none\n\ntwo"
+        )
 
     def test_real_image_attachment_materialized(self, tmp_path: Path) -> None:
         # a tiny valid base64 PNG data URI should be written to disk + referenced
@@ -273,6 +275,39 @@ class TestBridge:
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
         assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+
+    def test_write_mcp_config_preserves_user_servers(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"atlassian": {"command": "atlassian-mcp"}},
+                    "someOtherKey": {"keep": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        path = write_mcp_config(workspace, tmp_path / "bridge", python_executable="python-test")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["mcpServers"]["atlassian"] == {"command": "atlassian-mcp"}
+        assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+        assert payload["someOtherKey"] == {"keep": True}
+
+    @pytest.mark.parametrize("body", ["[]", "null", '"text"', '{"mcpServers": null}', "not json"])
+    def test_write_mcp_config_survives_malformed_config(self, tmp_path: Path, body: str) -> None:
+        workspace = tmp_path / "workspace"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "mcp.json").write_text(body, encoding="utf-8")
+
+        path = write_mcp_config(workspace, tmp_path / "bridge", python_executable="python-test")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
 
     def test_write_mcp_bridge_config_is_idempotent(self, tmp_path: Path) -> None:
         write_mcp_bridge_config(tmp_path)

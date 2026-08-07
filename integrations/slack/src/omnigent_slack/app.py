@@ -1,95 +1,186 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 
-from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from omnigent_slack.config import load_settings
-from omnigent_slack.omnigent import OmnigentAuth, OmnigentClient
+from omnigent_slack.approvals import (
+    ACTION_APPROVE,
+    ACTION_DENY,
+    ACTION_FORM_ANSWER,
+    ACTION_FORM_CANCEL,
+    ACTION_FORM_SUBMIT,
+    route_elicitation_click,
+)
+from omnigent_slack.auth_manager import AuthManager, pack_user_key
+from omnigent_slack.config import ConfigError, load_settings
+from omnigent_slack.databricks_oauth import DatabricksOAuthClient
+from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
+from omnigent_slack.setup import SetupFlow
 from omnigent_slack.store import SQLiteStore
+from omnigent_slack.tokens import EncryptedTokenStore, InMemoryTokenStore, TokenStore
+from omnigent_slack.webauth import WebAuthServer
 
 
 async def run() -> None:
-    load_dotenv()
-    settings = load_settings()
+    # Config comes from real environment variables only — mirroring `omni
+    # server` (the core CLI loads no .env). Whatever populates the environment
+    # (your shell, `uv run`, the Docker/Databricks deploy) is the single source
+    # of truth; there is no in-app .env loading. See integrations/slack/README.
+    #
+    # A missing/invalid config raises ConfigError with an operator-friendly,
+    # pre-formatted message. Print it plainly and exit non-zero — no traceback,
+    # no logging setup (which hasn't run yet). SystemExit(2) is the conventional
+    # "usage/config" exit code and is what the foreground CLI surfaces.
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print(f"omnigent-slack: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    # force=True so this wins even when an entry point (e.g. the Databricks App
+    # wrapper) already called basicConfig at import — otherwise a second
+    # basicConfig is a no-op and LOG_LEVEL is silently ignored, pinning us to
+    # whatever the first call set and hiding slack_sdk's connection diagnostics.
     logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
+    # The Slack SDK/Bolt loggers carry the connection diagnostics (DNS, TLS,
+    # websocket handshake) needed to diagnose an outbound-egress failure. Pin
+    # them to the configured level so LOG_LEVEL=DEBUG actually surfaces them.
+    for name in ("slack_sdk", "slack_bolt"):
+        logging.getLogger(name).setLevel(level)
     logger = logging.getLogger(__name__)
     logger.info(
-        "Starting Omnigent Slack bot base_url=%s database=%s runner_workspace=%s",
-        settings.omnigent_base_url,
+        "Starting Omnigent Slack bot server=%s database=%s",
+        settings.server_url,
         settings.database_path,
-        settings.omnigent_runner_workspace,
     )
 
     store = SQLiteStore(settings.database_path)
     await store.initialize()
 
-    omnigent = OmnigentClient(
-        base_url=str(settings.omnigent_base_url),
-        auth=OmnigentAuth(
-            email=settings.omnigent_auth_email,
-            header_name=settings.omnigent_auth_header_name,
-            session_cookie=settings.omnigent_session_cookie,
-        ),
-        runner_workspace=settings.omnigent_runner_workspace,
-        runner_host_id=settings.omnigent_runner_host_id,
-        runner_launch_timeout_seconds=settings.omnigent_runner_launch_timeout_seconds,
+    # Delegated auth (RFC 8628): per-user tokens for auth-enabled servers.
+    # With an encryption key, tokens persist to disk encrypted at rest. Without
+    # one, they live only in memory — the integration still works, but tokens
+    # are lost on restart so users re-authenticate. We never write bearer
+    # credentials to disk in the clear.
+    token_store: TokenStore
+    if settings.token_encryption_key:
+        token_store = EncryptedTokenStore(settings.database_path, settings.token_encryption_key)
+    else:
+        logger.warning(
+            "OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY not set — delegated tokens will "
+            "be kept in memory only and lost on restart (users re-authenticate). "
+            "Set the key to persist them encrypted at rest."
+        )
+        token_store = InMemoryTokenStore()
+    await token_store.initialize()
+
+    # The bot talks to one operator-configured Omnigent server
+    # (settings.server_url) — never a user-supplied URL. The pool holds one
+    # client per (server, packed-user) carrying that user's delegated bearer
+    # token. Created first so the auth manager can invalidate a cached client
+    # the moment a token is stored/removed (login/logout).
+    pool = OmnigentClientPool()
+
+    async def _on_token_changed(team_id: str, user_id: str, server_url: str) -> None:
+        await pool.invalidate(server_url, pack_user_key(team_id, user_id))
+
+    # Databricks web-auth mode: the server is fronted by the Databricks Apps
+    # proxy, which the device/OIDC probe can't drive. Instead the bot runs its
+    # own custom U2M OAuth app (authorization code + PKCE, offline_access) via an
+    # enrollment page it serves as a Databricks App: a Slack user signs in and
+    # the bot stores the resulting durable, refreshable token as their bearer.
+    # The OAuth client is shared as the AuthManager's rotator so refresh/revoke
+    # hit the workspace, not the Omnigent server. The web server shares the token
+    # store, so a token it writes is immediately usable by the bot.
+    webauth: WebAuthServer | None = None
+    enrollment_url = None
+    rotator: DatabricksOAuthClient | None = None
+    if settings.server_auth_mode == "databricks":
+        rotator = DatabricksOAuthClient(
+            settings.databricks_workspace_host or "",
+            client_id=settings.databricks_oauth_client_id or "",
+            client_secret=settings.databricks_oauth_client_secret or "",
+            scopes=settings.databricks_oauth_scopes_normalized,
+            redirect_uri=settings.databricks_redirect_uri,
+        )
+        webauth = WebAuthServer(
+            settings, token_store, on_enrolled=_on_token_changed, oauth_client=rotator
+        )
+        enrollment_url = webauth.enrollment_url
+
+    auth_manager = AuthManager(
+        token_store,
+        on_token_changed=_on_token_changed,
+        client_secret=settings.device_client_secret,
+        rotator=rotator,
     )
-    logger.info("Checking Omnigent server availability base_url=%s", settings.omnigent_base_url)
-    try:
-        agents = await omnigent.list_agents()
-    except Exception:
-        logger.exception(
-            "Omnigent server is not reachable at %s; aborting startup", settings.omnigent_base_url
-        )
-        await omnigent.aclose()
-        raise
-    logger.info("Omnigent server is up; found %s built-in agents", len(agents))
+    pool.set_auth_resolver(auth_manager.resolve_auth)
 
-    agent_id = _resolve_agent_id(agents, settings.omnigent_agent_name)
-    if agent_id is None:
-        available = ", ".join(sorted(str(a.get("name")) for a in agents if a.get("name"))) or "none"
-        await omnigent.aclose()
-        raise RuntimeError(
-            f"No Omnigent agent named {settings.omnigent_agent_name!r} was found. "
-            f"Available agents: {available}"
-        )
-    logger.info("Resolved Omnigent agent name=%s to id=%s", settings.omnigent_agent_name, agent_id)
-
+    setup = SetupFlow(
+        store=store,
+        pool=pool,
+        server_url=settings.server_url,
+        auth_manager=auth_manager,
+        enrollment_url=enrollment_url,
+    )
     service = SlackOmnigentService(
         store=store,
-        omnigent=omnigent,
-        omnigent_agent_id=agent_id,
-        update_interval_seconds=settings.slack_update_interval_seconds,
+        pool=pool,
+        setup=setup,
+        server_url=settings.server_url,
     )
 
     app = AsyncApp(token=settings.slack_bot_token)
+    setup.register(app)
     register_handlers(app, service)
+    _register_error_handler(app, logger)
 
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     try:
+        # Inside the try so a webauth-start failure still runs the finally cleanup
+        # (store/pool/auth_manager close, webauth.stop is idempotent).
+        if webauth is not None:
+            await webauth.start()
         logger.info("Connecting to Slack Socket Mode")
         await handler.start_async()  # type: ignore[no-untyped-call]
+    except Exception:
+        # The initial reach-out to Slack (apps.connections.open over HTTPS, then
+        # the wss:// socket) is the most likely outbound failure — restricted
+        # egress, DNS, or a bad app token. Log it explicitly with a traceback so
+        # it's not swallowed into a generic "failed to start" upstream.
+        logger.exception("Could not connect to Slack Socket Mode")
+        raise
     finally:
         logger.info("Shutting down Omnigent Slack bot")
         await service.shutdown()
-        await omnigent.aclose()
+        # Cancel any in-flight login/enrollment poll tasks (and their httpx
+        # clients) so they aren't abandoned mid-poll.
+        await auth_manager.shutdown()
+        await pool.aclose_all()
+        if webauth is not None:
+            await webauth.stop()
 
 
-def _resolve_agent_id(agents: list[dict[str, Any]], agent_name: str) -> str | None:
-    for agent in agents:
-        if agent.get("name") == agent_name:
-            agent_id = agent.get("id")
-            if isinstance(agent_id, str):
-                return agent_id
-    return None
+def _register_error_handler(app: AsyncApp, logger: logging.Logger) -> None:
+    """Log any listener/API error Bolt would otherwise swallow at DEBUG.
+
+    Without a registered handler, Bolt logs unhandled listener exceptions at a
+    level that's easy to miss and returns a generic ack. This surfaces every
+    one (including outbound Web API failures inside a handler) with a traceback.
+    """
+
+    @app.error
+    async def _on_error(error: Exception, body: dict[str, Any]) -> None:
+        logger.exception("Unhandled Slack listener error; body_type=%s", body.get("type"))
 
 
 def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:
@@ -112,3 +203,29 @@ def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:
         if not body.get("team_id") and not event.get("team"):
             return
         await service.handle_message(body=body, event=event, client=client, context=context)
+
+    @app.action(ACTION_APPROVE)
+    async def handle_approve(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=True)
+
+    @app.action(ACTION_DENY)
+    async def handle_deny(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=False)
+
+    @app.action(ACTION_FORM_SUBMIT)
+    async def handle_form_submit(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=True, is_form_submit=True)
+
+    @app.action(ACTION_FORM_CANCEL)
+    async def handle_form_cancel(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=False, is_form_submit=True)
+
+    @app.action(ACTION_FORM_ANSWER)
+    async def handle_form_answer(ack: Any) -> None:
+        # Radio/checkbox selection changes are read from state.values at submit
+        # time; ack each change so Slack doesn't flag an unhandled interaction.
+        await ack()

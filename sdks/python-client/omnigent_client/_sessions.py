@@ -21,9 +21,10 @@ callers obtain it via ``client.sessions.create()``.
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -132,6 +133,12 @@ class Session:
     :param status: Session lifecycle status. One of ``"idle"``,
         ``"running"``, or ``"failed"``.
     :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of the last persisted session
+        activity. Advances when conversation items are appended and on session
+        metadata edits (rename, agent switch, archive), so a mid-stall rename
+        resets the clock — treat it as a session-write heartbeat, not a pure
+        item-append signal. ``None`` when connected to an older server that
+        does not return the field.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -179,6 +186,7 @@ class Session:
     agent_id: str
     status: str
     created_at: int
+    updated_at: int | None = None
     agent_name: str | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
@@ -208,11 +216,13 @@ class Session:
         labels_raw = raw.get("labels", {})
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
+        raw_updated_at = raw.get("updated_at")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
+            updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
             agent_name=raw.get("agent_name"),
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
@@ -304,6 +314,21 @@ class SessionListItem:
         )
 
 
+@dataclass(frozen=True)
+class RegisteredAgent:
+    """
+    A server-registered agent resolved by display name.
+
+    :param id: The agent's durable identifier, e.g. ``"ag_abc123"``.
+    :param harness: Harness the agent runs on, e.g.
+        ``"openai-agents"``. ``None`` when the server did not report
+        one.
+    """
+
+    id: str
+    harness: str | None = None
+
+
 class SessionsNamespace:
     """
     Client namespace for ``/v1/sessions`` endpoints.
@@ -390,6 +415,165 @@ class SessionsNamespace:
         created = require_json_object(resp, "POST /v1/sessions")
         session_id = str(created["session_id"])
         return await self.get(session_id)
+
+    async def create_from_agent_id(
+        self,
+        agent_id: str,
+        *,
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+    ) -> Session:
+        """
+        Create a new session bound to an already-registered agent.
+
+        Calls JSON ``POST /v1/sessions`` with an ``agent_id`` body. This
+        is the path for a client with no local bundle to upload — the
+        agent is already registered on the server, as when connecting to
+        a remote URL. Unlike :meth:`create`, the JSON route returns the
+        full session snapshot, so no follow-up ``GET`` is needed.
+
+        :param agent_id: Durable identifier of a registered agent, e.g.
+            ``"ag_abc123"``.
+        :param title: Optional human-readable title for the session,
+            e.g. ``"debugging auth flow"``.
+        :param labels: Initial guardrails labels to set. ``None``
+            starts with no labels.
+        :param reasoning_effort: Optional per-session reasoning
+            effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param workspace: Optional absolute starting cwd to record on
+            the session, e.g. ``"/Users/corey/projects/myapp"``.
+        :returns: The newly created :class:`Session` snapshot.
+        :raises OmnigentError: If the server returns a non-2xx
+            status.
+        """
+        body: dict[str, Any] = {"agent_id": agent_id}
+        if title is not None:
+            body["title"] = title
+        if labels is not None:
+            body["labels"] = labels
+        if reasoning_effort is not None:
+            body["reasoning_effort"] = reasoning_effort
+        if workspace is not None:
+            body["workspace"] = workspace
+        resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
+        raise_for_status(resp.status_code, response_body(resp))
+        created = require_json_object(resp, "POST /v1/sessions")
+        return Session.from_dict(created)
+
+    async def resolve_agent(self, agent_name: str) -> RegisteredAgent:
+        """
+        Resolve a registered agent's id and harness from its display name.
+
+        Used by clients that only know the name the user picked — the
+        remote-URL chat picker lists names, but session creation binds
+        by id. ``GET /v1/agents`` lists only server-registered
+        (``session_id IS NULL``) agents, so a session-scoped agent is
+        not resolvable this way and raises ``LookupError``.
+
+        Follows the listing cursor, so an agent past the first page
+        still resolves.
+
+        :param agent_name: Agent display name, e.g. ``"hello_world"``.
+        :returns: The matching agent's id and advertised harness.
+        :raises OmnigentError: If the listing returns a non-2xx status.
+        :raises LookupError: If no registered agent has that name.
+        """
+        # Cap the miss-path name list: a large deployment should not
+        # build thousands of names just to render one error message.
+        names: list[str] = []
+        truncated = False
+        after: str | None = None
+        while True:
+            params: dict[str, str | int] = {"limit": 1000}
+            if after is not None:
+                params["after"] = after
+            resp = await self._http.get(f"{self._base}/v1/agents", params=params)
+            raise_for_status(resp.status_code, response_body(resp))
+            listing = require_json_object(resp, "GET /v1/agents")
+            data = listing.get("data", [])
+            for item in data if isinstance(data, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if name == agent_name:
+                    harness = item.get("harness")
+                    return RegisteredAgent(
+                        id=str(item["id"]),
+                        harness=str(harness) if isinstance(harness, str) else None,
+                    )
+                if isinstance(name, str):
+                    if len(names) < 50:
+                        names.append(name)
+                    else:
+                        truncated = True
+            if not listing.get("has_more"):
+                break
+            last_id = listing.get("last_id")
+            if not last_id:
+                break
+            after = str(last_id)
+        available = ", ".join(names) + (", …" if truncated else "")
+        raise LookupError(
+            f"No agent named {agent_name!r} is registered on this server. Available: {available}"
+        )
+
+    async def resolve_online_runner(
+        self,
+        *,
+        harness: str | None = None,
+        canonicalize: Callable[[str], str] | None = None,
+    ) -> str | None:
+        """
+        Find an online runner on the server that can drive *harness*.
+
+        A remote-URL client has no local runner of its own, but the
+        session still needs one bound before a turn can dispatch.
+        ``GET /v1/runners`` lists the online runners owned by the
+        requesting user along with the harnesses each advertises, so
+        the client can bind to one the server already has.
+
+        :param harness: Harness the session needs, e.g.
+            ``"openai-agents"``. ``None`` accepts any online runner.
+        :param canonicalize: Optional harness-name normalizer applied to
+            both sides of the comparison, so a spec spelling that is an
+            alias (``"claude"``) still matches a runner advertising the
+            canonical name (``"claude-sdk"``). Mirrors the server's own
+            matching. ``None`` compares the names as given.
+        :returns: A matching runner id, or ``None`` when the server has
+            no online runner that advertises *harness*.
+        :raises OmnigentError: If the listing returns a non-2xx status.
+        """
+        resp = await self._http.get(f"{self._base}/v1/runners")
+        raise_for_status(resp.status_code, response_body(resp))
+        listing = require_json_object(resp, "GET /v1/runners")
+        data = listing.get("data", [])
+        # Accept either spelling on either side, as the server does.
+        wanted = {harness} if harness is not None else set()
+        if harness is not None and canonicalize is not None:
+            wanted.add(canonicalize(harness))
+        # Prefer a runner that advertises the harness; fall back to any
+        # online runner that didn't report its harness list at all.
+        unknown_harness: str | None = None
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict) or not item.get("online"):
+                continue
+            runner_id = item.get("runner_id")
+            if not isinstance(runner_id, str) or not runner_id:
+                continue
+            advertised = item.get("harnesses")
+            if not isinstance(advertised, list):
+                unknown_harness = unknown_harness or runner_id
+                continue
+            if not wanted:
+                return runner_id
+            names = {name for name in advertised if isinstance(name, str)}
+            if canonicalize is not None:
+                names |= {canonicalize(name) for name in names}
+            if wanted & names:
+                return runner_id
+        return unknown_harness
 
     async def list(
         self,
@@ -652,7 +836,7 @@ class SessionsNamespace:
         limit: int = 100,
         after: str | None = None,
         order: str = "asc",
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """
         List items in a session with cursor-based pagination.
 
@@ -679,14 +863,15 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
-        return body.get("data", [])
+        data = body.get("data", [])
+        return data if isinstance(data, list) else []
 
     async def child_sessions(
         self,
         session_id: str,
         *,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """
         List sub-agent (child) sessions under a parent session.
 
@@ -712,7 +897,8 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
-        return body.get("data", [])
+        data = body.get("data", [])
+        return data if isinstance(data, list) else []
 
     async def child_sessions_tree(
         self,
@@ -720,7 +906,7 @@ class SessionsNamespace:
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
         :meth:`child_sessions` is one level deep; this recurses it breadth-first

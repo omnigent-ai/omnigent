@@ -71,5 +71,7 @@ jobs:
           # OpenAI-compatible gateway (same secrets the e2e suites use).
           OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
-          E2E_UI_JUDGE_MODEL: databricks-gpt-5-4
-        run: bash .github/scripts/e2e-ui-required/check.sh
+          E2E_UI_JUDGE_MODEL: ${{ vars.OMNIGENT_CI_E2E_JUDGE_MODEL }}
+        run: |
+          : "${E2E_UI_JUDGE_MODEL:?Set OMNIGENT_CI_E2E_JUDGE_MODEL repository variable}"
+          bash .github/scripts/e2e-ui-required/check.sh

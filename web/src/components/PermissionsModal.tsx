@@ -15,7 +15,8 @@ import {
   useRef,
   useState,
 } from "react";
-import { CheckIcon, LinkIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -87,6 +88,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
+  const [showQr, setShowQr] = useState(false);
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
@@ -170,8 +172,8 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {publicSharingEnabled && (
           <div className="flex items-center justify-between rounded-lg border px-3 py-2">
             <div>
-              <p className="text-sm font-medium">Public access</p>
-              <p className="text-xs text-muted-foreground">Anyone can view this session</p>
+              <p className="text-ui font-medium">Public access</p>
+              <p className="text-sm text-muted-foreground">Anyone can view this session</p>
             </div>
             <Switch
               checked={isPublic}
@@ -186,17 +188,17 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             track's min-content and pushes every row past the dialog edge. */}
         <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
-            <p className="text-sm text-muted-foreground py-2">Loading…</p>
+            <p className="text-ui text-muted-foreground py-2">Loading…</p>
           ) : userGrants.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-2">No grants yet.</p>
+            <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (
             <>
               {/* Column headers */}
               <div className="flex items-center gap-2 px-2 pb-0.5">
-                <span className="flex-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="flex-1 text-sm font-medium uppercase tracking-wide text-muted-foreground">
                   Name
                 </span>
-                <span className="w-28 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="w-28 text-sm font-medium uppercase tracking-wide text-muted-foreground">
                   Permission
                 </span>
                 <span className="size-7 shrink-0" aria-hidden="true" />
@@ -220,13 +222,13 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {/* Add grant form */}
         <form onSubmit={handleGrant} className="flex items-end gap-2">
           <div className="flex-1">
-            <label htmlFor="perm-user" className="text-xs font-medium text-muted-foreground">
+            <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
               User ID
             </label>
             <AddUserField value={newUserId} onChange={setNewUserId} />
           </div>
           <div>
-            <label htmlFor="perm-level" className="text-xs font-medium text-muted-foreground">
+            <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
               Level
             </label>
             <Select value={newLevel} onValueChange={setNewLevel}>
@@ -246,15 +248,29 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
           </Button>
         </form>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <p className="text-sm text-destructive">{error}</p>}
 
         <DialogFooter className="flex-row justify-between sm:justify-between">
-          <CopyLinkButton sessionId={sessionId} />
+          <div className="flex items-center gap-2">
+            <CopyLinkButton sessionId={sessionId} />
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowQr(true)}
+              className="gap-1.5 text-primary"
+            >
+              <QrCodeIcon className="size-3.5" />
+              Open in mobile app
+            </Button>
+          </div>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Done
           </Button>
         </DialogFooter>
       </DialogContent>
+
+      {/* Separate modal for the QR code so the share dialog stays compact. */}
+      <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
     </Dialog>
   );
 }
@@ -389,11 +405,11 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
       />
       {isOpen && (
         // Wider than the (narrow) field so suggested emails aren't truncated.
-        <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
+        <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu">
           {isLoading ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">Searching…</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">Searching…</div>
           ) : suggestions.length === 0 ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">No matches</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">No matches</div>
           ) : (
             <div ref={listRef} id={listId} role="listbox" className="max-h-72 overflow-y-auto">
               {suggestions.map((s, index) => (
@@ -408,8 +424,8 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                     commit(index);
                   }}
                   className={cn(
-                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm",
-                    index === activeIndex && "bg-muted",
+                    "flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-ui",
+                    index === activeIndex && "bg-muted dark:bg-muted/50",
                   )}
                 >
                   {/* Primary label fills the row and truncates. When the host
@@ -418,7 +434,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                       distinct display name to pair it with. */}
                   <span className="min-w-0 flex-1 truncate">{s.displayName ?? s.userId}</span>
                   {s.displayName && s.displayName !== s.userId && (
-                    <span className="ml-2 shrink-0 truncate text-xs text-muted-foreground">
+                    <span className="ml-2 shrink-0 truncate text-sm text-muted-foreground">
                       {s.userId}
                     </span>
                   )}
@@ -441,6 +457,25 @@ function getShareableLink(sessionId: string, rebasePath: (path: string) => strin
   const path = rebasePath(`/c/${sessionId}`);
   const transform = getOmnigentTransformShareLink();
   return transform ? transform(path) : `${window.location.origin}${path}`;
+}
+
+/**
+ * The `omnigent://<host>/c/<session_id>` deep link encoded into the share QR
+ * code. The host (with port when non-default) is parsed from the same shareable
+ * URL `getShareableLink` resolves — so standalone and embedded (host-transformed)
+ * origins agree on the same server the desktop shell's deep-link handler keys
+ * off of (see `electron/src/deepLink.js`). The path is always basename-less
+ * `/c/<id>`; the workspace mount is server-determined and intentionally absent.
+ */
+function getDeepLink(sessionId: string, rebasePath: (path: string) => string): string {
+  const url = getShareableLink(sessionId, rebasePath);
+  try {
+    const { host } = new URL(url);
+    return `omnigent://${host}/c/${sessionId}`;
+  } catch {
+    // Unparseable transform output: fall back to the current origin's host.
+    return `omnigent://${window.location.host}/c/${sessionId}`;
+  }
 }
 
 function CopyLinkButton({ sessionId }: { sessionId: string }) {
@@ -471,6 +506,62 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   );
 }
 
+/**
+ * A separate modal showing a QR code encoding the session's
+ * `omnigent://<host>/c/<id>` deep link so a user can scan it with their phone
+ * to open the session in the Omnigent app. The code is rendered on a fixed
+ * white tile so it stays scannable regardless of the app's dark/light theme
+ * (a dark-on-dark QR won't read). Error correction is bumped to M for
+ * resilience against partial occlusion.
+ */
+function QrCodeDialog({
+  sessionId,
+  open,
+  onOpenChange,
+}: {
+  sessionId: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const rebasePath = useRebasePath();
+  const deepLink = getDeepLink(sessionId, rebasePath);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <QrCodeIcon className="size-4" />
+            Open in mobile app
+          </DialogTitle>
+          <DialogDescription>
+            Scan with your phone's camera to open this session in the Omnigent app.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex justify-center">
+          <div className="rounded-lg bg-white p-3">
+            <QRCodeSVG
+              value={deepLink}
+              size={200}
+              level="M"
+              // White tile + explicit module colors keep the code scannable in dark
+              // mode; the padding also serves as the QR quiet zone.
+              bgColor="#ffffff"
+              fgColor="#000000"
+              aria-label="QR code to open this session in the Omnigent app"
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function GrantRow({
   permission,
   onRevoke,
@@ -498,11 +589,11 @@ function GrantRow({
       {/* Tail truncation keeps the local part — the distinguishing half when
           every grantee shares one company domain — and the title tooltip
           carries the full id. */}
-      <span className="flex-1 truncate text-sm" title={permission.user_id}>
+      <span className="flex-1 truncate text-ui" title={permission.user_id}>
         {permission.user_id}
       </span>
       {fixedLevel ? (
-        <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
+        <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
           {LEVEL_LABELS[permission.level] ?? "Read"}
         </span>
       ) : (

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HostBadge, resolveHostBadge } from "./HostBadge";
@@ -216,6 +216,53 @@ describe("HostBadge", () => {
     useSessionHostOnlineMock.mockReturnValue(null);
     render(<HostBadge sessionId="conv_1" />);
     expect(screen.getByTestId("host-badge").textContent).toBe("mac-laptop, status unknown");
+  });
+
+  it("keeps the host name while making an offline host clickable to reconnect", () => {
+    // The one disconnect shape: name + red dot, never swapped for generic
+    // "Host is offline" copy — the user must still read WHICH host dropped —
+    // and clicking it opens the reconnect help.
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).toBe("BUTTON");
+    expect(badge.textContent).toBe("mac-laptop, offline — click to reconnect");
+    expect(badge.getAttribute("title")).toBe("Host mac-laptop, offline — click to reconnect");
+    fireEvent.click(badge);
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays passive for an online host even when onReconnect is set", () => {
+    // onReconnect is wired for every host-bound session; a reachable host has
+    // nothing to reconnect, so the badge must not become a button.
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).not.toBe("BUTTON");
+    expect(badge.textContent).toBe("mac-laptop, online");
+  });
+
+  it("stays passive for a dormant resumable managed host", () => {
+    // A resumable sandbox host reads offline while idle-stopped, but the next
+    // message wakes it — offering `omnigent host` there would be wrong.
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_a1b2", hostResumable: true },
+      isLoading: false,
+      error: null,
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).not.toBe("BUTTON");
+    expect(badge.textContent).toBe("mac-laptop, offline");
+  });
+
+  it("renders nothing when onReconnect is set but the session isn't host-bound", () => {
+    // The reconnect affordance still gates on there being a host to reconnect
+    // to — an unbound session has no badge slot to host it.
+    useSessionMock.mockReturnValue({ session: { hostId: null }, isLoading: false, error: null });
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    expect(screen.queryByTestId("host-badge")).toBeNull();
   });
 
   it("shows unknown while the host list is still loading", () => {

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
 
 # Default wait budget for a UI verdict, in seconds. Held at one day
 # (86400s) — matching the deciding policy's default ``ask_timeout``: an ASK
@@ -74,6 +73,11 @@ def has_pending(conversation_id: str) -> bool:
     :returns: ``True`` when at least one approval is parked for the session.
     """
     return _session_pending.get(conversation_id, 0) > 0
+
+
+def has_any_pending() -> bool:
+    """Return whether any unresolved approval verdict is registered."""
+    return any(not fut.done() for fut in _pending.values())
 
 
 def register(elicitation_id: str) -> asyncio.Future[bool]:
@@ -134,7 +138,7 @@ async def wait_for_user_approval(
     *,
     elicitation_id: str,
     conversation_id: str,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
 ) -> bool:
     """

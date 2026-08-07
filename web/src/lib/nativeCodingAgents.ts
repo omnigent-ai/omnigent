@@ -23,10 +23,23 @@ export interface NativeCodingAgentSpec {
   agentName: string;
   harness: string;
   wrapperLabel: string;
+  /**
+   * `omnigent.wrapper` value stamped on the children this vendor spawns
+   * inside its own CLI (Claude's Task tool, Codex collab threads). Mirrors
+   * `NativeCodingAgent.subagent_wrapper_label` on the server. Absent for
+   * vendors that don't register sub-agent children.
+   */
+  subagentWrapperLabel?: string;
   displayName: string;
   iconKind: NativeCodingAgentIconKind;
   sortRank: number;
   capabilities?: readonly NativeCodingAgentCapability[];
+  /**
+   * A fully supported harness — the integration we maintain and test end to
+   * end. Only these lead the picker's primary list; every other harness folds
+   * into the "More" group regardless of whether it is configured on the host.
+   */
+  fullySupported?: boolean;
 }
 
 export const NATIVE_CODING_AGENTS = [
@@ -35,26 +48,31 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "claude-native-ui",
     harness: "claude-native",
     wrapperLabel: "claude-code-native-ui",
+    subagentWrapperLabel: "claude-code-native-ui-subagent",
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
     capabilities: ["permissionMode"],
+    fullySupported: true,
   },
   {
     key: "codex",
     agentName: "codex-native-ui",
     harness: "codex-native",
     wrapperLabel: "codex-native-ui",
+    subagentWrapperLabel: "codex-native-ui-subagent",
     displayName: "Codex",
     iconKind: "codex",
     sortRank: 20,
     capabilities: ["approvalMode"],
+    fullySupported: true,
   },
   {
     key: "opencode",
     agentName: "opencode-native-ui",
     harness: "opencode-native",
     wrapperLabel: "opencode-native-ui",
+    subagentWrapperLabel: "opencode-native-ui-subagent",
     displayName: "OpenCode",
     iconKind: "opencode",
     sortRank: 25,
@@ -157,14 +175,22 @@ export const NATIVE_CODING_AGENTS = [
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
-const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.agentName, agent]),
 );
-const BY_HARNESS: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_HARNESS = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.harness, agent]),
 );
-const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
+const BY_WRAPPER = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
+);
+// Kept out of BY_WRAPPER: a sub-agent child is NOT a native-terminal session
+// (it owns no PTY and takes no input), so `isNativeWrapper` must keep
+// returning false for these labels.
+const BY_SUBAGENT_WRAPPER = new Map<string, NativeCodingAgentSpec>(
+  NATIVE_CODING_AGENTS.flatMap((agent) =>
+    "subagentWrapperLabel" in agent ? [[agent.subagentWrapperLabel, agent] as const] : [],
+  ),
 );
 
 // Reversed harness spellings that fold to a canonical native `harness`.
@@ -202,6 +228,20 @@ export function nativeCodingAgentForWrapper(
   return wrapper == null ? undefined : BY_WRAPPER.get(wrapper);
 }
 
+/**
+ * Resolve the vendor that spawned a native sub-agent child from its
+ * `omnigent.wrapper` label (e.g. `"claude-code-native-ui-subagent"` →
+ * the Claude Code spec). These children reuse the parent's agent row and
+ * carry the VENDOR-side agent type as their `sub_agent_name` (Claude's
+ * `subagent_type`, e.g. `"general-purpose"`), so the wrapper label is the
+ * only signal for which product is running them.
+ */
+export function nativeCodingAgentForSubagentWrapper(
+  wrapper: string | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  return wrapper == null ? undefined : BY_SUBAGENT_WRAPPER.get(wrapper);
+}
+
 export function nativeCodingAgentForAvailableAgent(
   agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
 ): NativeCodingAgentSpec | undefined {
@@ -215,8 +255,51 @@ export function isNativeCodingAgent(
   return nativeCodingAgentForAvailableAgent(agent) !== undefined;
 }
 
+/**
+ * Whether a harness is fully supported — the maintained, end-to-end tested
+ * integrations that lead the picker. Everything else (including non-native
+ * agents) belongs in the "More" group regardless of host readiness.
+ */
+export function isFullySupportedNativeCodingAgent(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+): boolean {
+  return nativeCodingAgentForAvailableAgent(agent)?.fullySupported === true;
+}
+
+/**
+ * Whether ``agent``'s harness is one of ``recentHarnesses``. Compares resolved
+ * specs rather than raw strings so a stored reversed alias (``native-pi``) still
+ * matches the canonical spelling (``pi-native``).
+ */
+export function isRecentHarness(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+  recentHarnesses: readonly string[],
+): boolean {
+  const spec = nativeCodingAgentForAvailableAgent(agent);
+  if (spec === undefined) return false;
+  return recentHarnesses.some((h) => nativeCodingAgentForHarness(h)?.key === spec.key);
+}
+
 export function isNativeWrapper(wrapper: string | null | undefined): boolean {
   return nativeCodingAgentForWrapper(wrapper) !== undefined;
+}
+
+/**
+ * Whether a session runs a native terminal harness — by its `omnigent.wrapper`
+ * label OR its resolved harness. Mirrors the server's
+ * `_native_coding_agent_for_session`: a session is native-terminal if either
+ * signal matches (a built-in wrapper agent sets the label; a custom agent bound
+ * to a native harness has no label but still runs the native CLI). Native CLIs
+ * bake the model at launch and can't per-turn route, so callers use this to hide
+ * per-turn Smart Routing from these sessions.
+ */
+export function isNativeTerminalSession(
+  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+): boolean {
+  if (session == null) return false;
+  const wrapper = session.labels?.[WRAPPER_LABEL_KEY];
+  if (isNativeWrapper(wrapper)) return true;
+  return nativeCodingAgentForHarness(session.harness) !== undefined;
 }
 
 export function nativeWrapperLabelsForAgent(

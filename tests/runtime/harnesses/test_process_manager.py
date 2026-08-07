@@ -460,6 +460,58 @@ async def test_get_client_respawns_on_harness_change(
         _HARNESS_MODULES.pop("test2", None)
 
 
+async def test_get_client_respawns_on_model_change(
+    manager: HarnessProcessManager,
+) -> None:
+    """A different model for the same conversation respawns the subprocess.
+
+    Mirrors the harness-change branch above: the model is baked into the
+    subprocess env at spawn time, so a later turn with a different model
+    must respawn, or the cached process keeps serving the old one. Covers
+    the real ``/model`` switch path via ``post_responses`` in production,
+    previously untested. Also checks the inverse: same model, no respawn.
+    """
+    await manager.start()
+    try:
+        client_first = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-a"},
+        )
+        pid_first = (await client_first.get("/pid")).json()["pid"]
+
+        # Same conversation, SAME model → must reuse the cached subprocess.
+        client_same = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-a"},
+        )
+        pid_same = (await client_same.get("/pid")).json()["pid"]
+        assert pid_same == pid_first
+
+        # Same conversation, DIFFERENT model → must respawn.
+        client_second = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-b"},
+        )
+        pid_second = (await client_second.get("/pid")).json()["pid"]
+
+        # Different PID proves the model-change branch tore down the old
+        # subprocess and spawned a new one. Same PID would mean the model
+        # switch kept serving the old model (the bug this branch guards).
+        assert pid_second != pid_first
+        assert _pid_alive(pid_second)
+        # The original subprocess was terminated by the respawn's close.
+        for _ in range(40):
+            if not _pid_alive(pid_first):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid_first)
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_any_harness_sentinel_reuses_subprocess(
     manager: HarnessProcessManager,
 ) -> None:

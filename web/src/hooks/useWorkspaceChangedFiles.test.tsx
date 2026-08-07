@@ -440,7 +440,7 @@ describe("useWorkspaceEnvironment gating", () => {
   it("marks the environment unavailable when the server omits metadata.root", async () => {
     onlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValue(jsonResponse({ metadata: {} }));
-    const results: Array<{ available: boolean; root: string | null; home: string | null }> = [];
+    const results: { available: boolean; root: string | null; home: string | null }[] = [];
 
     render(
       <Wrap>
@@ -459,7 +459,7 @@ describe("useWorkspaceEnvironment gating", () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ metadata: { root: "/home/u/ws", home: "/home/u" } }),
     );
-    const results: Array<{ available: boolean; root: string | null; home: string | null }> = [];
+    const results: { available: boolean; root: string | null; home: string | null }[] = [];
 
     render(
       <Wrap>

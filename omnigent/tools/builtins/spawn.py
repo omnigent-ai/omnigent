@@ -127,8 +127,10 @@ class SysSessionSendTool(Tool):
             "of (agent + title) or session_id, always with args. "
             "Returns the child's output when its turn completes. To run "
             "multiple sessions in parallel, emit multiple "
-            "sys_session_send tool_calls in the same response — they "
-            "dispatch concurrently. "
+            "sys_session_send tool_calls in the same response with a "
+            "distinct task-based title for each independent session — "
+            "they dispatch concurrently. Reusing a title continues the "
+            "same session and cannot run another turn concurrently. "
             "To attach previously-uploaded files, "
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
@@ -227,13 +229,14 @@ def _build_sys_session_send_schema(
                 "type": "string",
                 "description": (
                     "Named mode: a unique-within-this-parent "
-                    "label for the sub-agent session, e.g. "
-                    "'auth' or 'payments'. Lets later turns "
-                    "reuse the same conversation via another "
-                    "sys_session_send call with the same "
-                    "title. Titles must be distinct under one "
-                    "parent for the same agent. Pair with "
-                    "'agent'; omit when using 'session_id'."
+                    "task-based identity for the sub-agent session, "
+                    "e.g. 'auth' or 'payments'. Reusing it in a later "
+                    "sys_session_send call continues the same "
+                    "conversation. Every independent parallel call "
+                    "for the same agent must use a distinct title; "
+                    "reusing a title cannot start another concurrent "
+                    "turn. Pair with 'agent'; omit when using "
+                    "'session_id'."
                 ),
             },
         }
@@ -599,8 +602,11 @@ class SysSessionGetInfoTool(Tool):
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
     connectivity, host, reasoning effort, effective model, parent
-    linkage, workspace / git branch, and the count of outstanding
-    approval prompts. For the conversation transcript, use
+    linkage, workspace / git branch, persisted last-activity time, and
+    the count of outstanding approval prompts. Comparing
+    ``last_activity_at`` across polls distinguishes a running session that
+    is advancing from one whose persisted output has stalled. For the
+    conversation transcript, use
     ``sys_session_get_history`` instead.
 
     ``session_id`` is optional — when omitted, the caller's own
@@ -625,7 +631,8 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host, reasoning effort, model, parent session, workspace, "
-            "and outstanding approval prompts. Global read — any "
+            "persisted last-activity time, and outstanding approval "
+            "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
             "use sys_session_get_history for the conversation transcript."
@@ -922,11 +929,11 @@ class SysSessionCreateTool(Tool):
                         "model": {
                             "type": "string",
                             "description": (
-                                "Optional model override for the child "
-                                "session, e.g. 'databricks-glm-5-2' or "
-                                "'databricks-claude-opus-4-8'. Sets the "
-                                "harness model at session creation; "
-                                "omit to use the agent's default."
+                                "Optional provider-configured model id for "
+                                "the child session, e.g. 'provider/model-id' "
+                                "or 'provider-local-model-id'. Sets the harness "
+                                "model at session creation; omit to use the "
+                                "agent's default."
                             ),
                         },
                     },

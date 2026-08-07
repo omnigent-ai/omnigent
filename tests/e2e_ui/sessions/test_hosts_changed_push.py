@@ -185,8 +185,9 @@ def test_hosts_changed_frame_updates_host_badge(
     def _handle_ws(ws: WebSocketRoute) -> None:
         ws_routes.append(ws)
         # Swallow client messages (watch-set frames) without connecting to the
-        # real server. The stream never pushes host_online, so liveOnline stays
-        # undefined and the badge falls back to the useHosts status field.
+        # real server — the stream won't push host_online. Combined with the
+        # /health stub (empty sessions), liveOnline stays undefined so the
+        # badge falls back to the useHosts status field.
         ws.on_message(lambda _msg: None)
 
     # Register routes before navigation so they're active on first request.
@@ -194,6 +195,21 @@ def test_hosts_changed_frame_updates_host_badge(
     _patch_session_list(page, session_id)
     _patch_health_drops_session(page, session_id)
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), _handle_ws)
+
+    # Stub /health to return no session-level host_online data. The
+    # RunnerHealthProvider health-polls the active session and uses
+    # host_online from the response to set liveOnline — if that's present
+    # (even null), it overrides the useHosts status field. An empty
+    # sessions dict keeps liveOnline === undefined, forcing the badge to
+    # read its status from useHosts, which is what this test exercises.
+    page.route(
+        re.compile(r"/health(\?|$)"),
+        lambda r: r.fulfill(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps({"sessions": {}, "session": None}),
+        ),
+    )
 
     # Start with "online" so we can observe a transition to "offline".
     hosts_status = {"current": "online"}

@@ -130,10 +130,12 @@ class _ConversationStore:
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        copy_terminal_launch_args: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Record the fork call and return a fixed new conversation.
@@ -149,6 +151,9 @@ class _ConversationStore:
         :param cloned_agent_description: Optional clone description.
         :param copy_model_settings: Whether the source's model settings
             carry over (route passes ``False`` on a cross-family switch).
+        :param copy_terminal_launch_args: Whether the source's launch args
+            carry over (route passes ``False`` on any agent switch — launch
+            flags are CLI-specific and would break a different target CLI).
         :param carry_history_into_native: Whether to mark the fork for
             native transcript rebuild (route passes ``True`` for any
             native target, regardless of family).
@@ -162,6 +167,9 @@ class _ConversationStore:
         :param up_to_response_id: Truncation point, e.g. ``"resp_a"``.
             Mirrors the real store: ``None`` copies everything; a value
             matching no item's ``response_id`` raises ValueError.
+        :param project_id: First-class project the fork is filed into
+            (route passes the source's project only when the forker
+            owns it), or ``None`` for unfiled.
         :returns: A new Conversation with a deterministic ID.
         :raises LookupError: If source is not in our map.
         :raises ValueError: If *up_to_response_id* matches no item.
@@ -175,10 +183,12 @@ class _ConversationStore:
                 "cloned_agent_bundle_location": cloned_agent_bundle_location,
                 "cloned_agent_description": cloned_agent_description,
                 "copy_model_settings": copy_model_settings,
+                "copy_terminal_launch_args": copy_terminal_launch_args,
                 "carry_history_into_native": carry_history_into_native,
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
                 "up_to_response_id": up_to_response_id,
+                "project_id": project_id,
             }
         )
         src = self._convs.get(source_conversation_id)
@@ -925,6 +935,10 @@ async def test_fork_switch_model_and_carry_gating(
         f"{source_harness}->{target_harness}: copy_model_settings should be "
         f"{expect_copy_model} (model id is provider-bound)."
     )
+    assert fork_call["copy_terminal_launch_args"] is False, (
+        f"{source_harness}->{target_harness}: an agent switch must NOT carry the "
+        f"source's launch args (CLI-specific flags break a different target CLI)."
+    )
     assert fork_call["carry_history_into_native"] is expect_carry, (
         f"{source_harness}->{target_harness}: carry_history_into_native should "
         f"be {expect_carry} (only native harnesses with replayable fork history)."
@@ -972,6 +986,9 @@ async def test_fork_no_switch_native_source_carries_history(
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["copy_model_settings"] is True
+    assert fork_call["copy_terminal_launch_args"] is True, (
+        "A same-agent fork keeps the same CLI, so its launch args stay valid and must carry over."
+    )
     assert fork_call["carry_history_into_native"] is True, (
         "A same-agent fork of a native source must mark native carry so the "
         "runner rebuilds the transcript instead of resuming blank."

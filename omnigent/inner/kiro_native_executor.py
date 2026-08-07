@@ -6,9 +6,9 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -35,7 +35,7 @@ class KiroNativeExecutor(Executor):
         """:returns: ``True`` — messages can be injected mid-turn."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """Inject a live steering message into the Kiro terminal."""
         del session_key
         text = _content_to_text(content, self._bridge_dir)
@@ -88,12 +88,12 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     return ""
 
 
-def _content_to_text(content: Any, bridge_dir: Path) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """Normalize executor content into text the Kiro TUI receives."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        from omnigent.inner.native_attachments import materialize_attachment
+        from omnigent.inner.native_attachments import attachment_reference_line
 
         attachment_lines: list[str] = []
         text_parts: list[str] = []
@@ -106,8 +106,6 @@ def _content_to_text(content: Any, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                path = materialize_attachment(block, bridge_dir)
-                if path is not None:
-                    attachment_lines.append(f"[Attached: {path}]")
+                attachment_lines.append(attachment_reference_line(block, bridge_dir))
         return "\n\n".join(attachment_lines + text_parts)
     return ""

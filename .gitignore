@@ -2,6 +2,8 @@
 build/
 dist/
 node_modules/
+.pnpm-store/
+.pnpm-debug.log*
 reviews/
 
 # Generated artifact; never committed.
@@ -57,6 +59,7 @@ dev/omnidev/target/
 
 # Playwright test run output (screenshots, traces, videos).
 test-results/
+output/playwright/
 
 # Visual-snapshot failure output (actual/expected/diff PNGs from the UI diff
 # gate). Regenerated each run; only the baseline under
@@ -82,3 +85,4 @@ omnigent/server/static/web-ui/
 # reason — `bundle deploy` must be able to sync it to the app source folder.
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
+web/package-lock.json

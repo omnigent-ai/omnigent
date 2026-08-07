@@ -26,6 +26,7 @@ from omnigent.entities import (
     ConversationItem,
     MessageData,
 )
+from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -242,16 +243,19 @@ def _clear_binary_content(
     for i, msg in enumerate(messages):
         if i >= protect_from:
             break
-        content = msg.get("content")
-        if not isinstance(content, list):
+        if "content" not in msg:
             continue
-        for block in content:
-            if (
-                isinstance(block, dict)
-                and block.get("type") in ("image", "file")
-                and "data" in block
-            ):
-                block["data"] = _BINARY_CONTENT_CLEARED
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("image", "file") and "data" in block:
+                    block["data"] = _BINARY_CONTENT_CLEARED
+        msg["content"] = redact_inline_data_uris(
+            content,
+            lambda _media_type, _payload_length: _BINARY_CONTENT_CLEARED,
+        )
     return messages
 
 
@@ -324,23 +328,27 @@ def _pair_aware_drop_count(messages: list[dict[str, Any]]) -> int:
     Return how many items to drop from the front to avoid
     orphaning a tool call pair.
 
-    If the first item is a ``function_call`` and the second is its
-    matching ``function_call_output``, both are dropped together.
-    Otherwise, a single item is dropped.
+    Recognizes a leading run of ``function_call`` items immediately
+    followed by a matching run of ``function_call_output`` items
+    (same call_ids) and drops the whole batch together, covering
+    parallel tool calls in one turn, not just a single pair.
+    Otherwise, drops a single item.
 
     :param messages: The messages list (must be non-empty).
-    :returns: Number of items to drop (1 or 2), or 0 if the list
-        is empty.
+    :returns: Number of items to drop, or 0 if the list is empty.
     """
     if not messages:
         return 0
-    if (
-        len(messages) >= 2
-        and messages[0].get("type") == "function_call"
-        and messages[1].get("type") == "function_call_output"
-        and messages[0].get("call_id") == messages[1].get("call_id")
-    ):
-        return 2
+    call_count = 0
+    while call_count < len(messages) and messages[call_count].get("type") == "function_call":
+        call_count += 1
+    if call_count == 0:
+        return 1
+    call_ids = {m.get("call_id") for m in messages[:call_count]}
+    outputs = messages[call_count : call_count * 2]
+    output_ids = {m.get("call_id") for m in outputs if m.get("type") == "function_call_output"}
+    if len(outputs) == call_count and output_ids == call_ids:
+        return call_count * 2
     return 1
 
 
@@ -449,6 +457,7 @@ async def _summarize_via_runner_uncached(
     :returns: Dict with ``"text"`` (summary) and ``"token_count"``
         (approximate tiktoken estimate) keys.
     :raises httpx.HTTPStatusError: On non-2xx responses from the runner.
+    :raises RuntimeError: If the runner returns a malformed summary payload.
     """
     payload: dict[str, Any] = {"messages": messages_to_summarize, "model": model}
     if connection:
@@ -457,7 +466,18 @@ async def _summarize_via_runner_uncached(
         payload["session_id"] = conversation_id
     resp = await runner_client.post("/v1/summarize", json=payload, timeout=120.0)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("runner summarize response was not an object")
+    text = data.get("text")
+    token_count = data.get("token_count")
+    if (
+        not isinstance(text, str)
+        or not isinstance(token_count, int)
+        or isinstance(token_count, bool)
+    ):
+        raise RuntimeError("runner summarize response had invalid summary fields")
+    return {"text": text, "token_count": token_count}
 
 
 def compaction_to_history_items(
