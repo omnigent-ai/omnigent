@@ -13,9 +13,9 @@ name: Issue Triage
 # exfiltrate secrets. All GitHub mutations happen in steps the LLM
 # cannot influence.
 #
-# Runs on issue open, and again when someone removes the `needs-info` label —
-# the re-triage path reads the reporter's follow-up comments and classifies +
-# assigns the issue (re-adding `needs-info` only if it is still too vague).
+# Runs on issue open, and is called by needs-info-response.yml after an issue
+# author supplies follow-up details. The re-triage path reads those comments and
+# classifies + assigns the issue (re-adding `needs-info` if it is still vague).
 #
 # What the bot does:
 #   1. Removes `needs-triage`, adds `triaged`
@@ -30,10 +30,17 @@ name: Issue Triage
 
 on:
   issues:
-    # `unlabeled` re-runs triage when someone removes `needs-info` (see the job
-    # `if:` below) — that removal is the signal the issue now has enough detail
-    # to classify and assign.
-    types: [opened, unlabeled]
+    types: [opened]
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Issue to re-triage
+        required: true
+        type: number
+      retriage:
+        description: Treat this invocation as a needs-info re-triage
+        required: true
+        type: boolean
   # Manual dry run against any issue: classify and log the decision. Both
   # inputs default off, and with them off nothing is written — no label,
   # comment, assignment, or closure.
@@ -76,25 +83,15 @@ jobs:
   triage:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Run on:
-    #   - a newly opened issue by a non-bot author (initial triage), OR
-    #   - the `needs-info` label being REMOVED from an open issue (re-triage:
-    #     the removal signals the issue now has enough detail to classify).
-    # The `unlabeled` path intentionally allows a bot actor: the removal is made
-    # by the omnigent-ci App (see needs-info-response.yml) whose login ends in
-    # `[bot]`, and only an App-token/human removal re-triggers at all — this
-    # workflow's own label edits use the default GITHUB_TOKEN, which never emits
-    # re-triggering events, so there is no loop to guard against here.
+    # Initial triage ignores bot-authored issues. Re-triage is an explicit call
+    # from needs-info-response.yml after the issue author supplies more detail.
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      inputs.retriage ||
       (
+        github.event_name == 'issues' &&
         github.event.action == 'opened' &&
         !endsWith(github.event.issue.user.login, '[bot]')
-      ) ||
-      (
-        github.event.action == 'unlabeled' &&
-        github.event.label.name == 'needs-info' &&
-        github.event.issue.state == 'open'
       )
     steps:
       - name: Check LLM credentials available
@@ -454,6 +451,7 @@ jobs:
           # into the repo default.
           EVENT_ACTION: ${{ github.event.action }}
           IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          IS_RETRIAGE: ${{ inputs.retriage }}
           DISPATCH_APPLY_LABELS: ${{ inputs.apply_labels }}
           DISPATCH_POST_COMMENT: ${{ inputs.post_comment }}
           ISSUE_PRIORITIZATION_V2_ENABLED: ${{ vars.ISSUE_PRIORITIZATION_V2_ENABLED }}
@@ -508,7 +506,10 @@ jobs:
           # duplicate path runs, but every write is opt-in: each dispatch input
           # decides on its own, never falling back to the repo default.
           is_dispatch = flag("IS_DISPATCH")
-          is_open_event = is_dispatch or os.environ.get("EVENT_ACTION") == "opened"
+          is_retriage = flag("IS_RETRIAGE")
+          is_open_event = not is_retriage and (
+              is_dispatch or os.environ.get("EVENT_ACTION") == "opened"
+          )
           apply_labels = flag("DISPATCH_APPLY_LABELS") if is_dispatch else True
           post_comment_enabled = (
               flag("DISPATCH_POST_COMMENT") if is_dispatch else flag("POST_DUPLICATE_COMMENTS")
