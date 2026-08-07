@@ -129,7 +129,7 @@ try:
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
-    from omnigent.server.auth import create_auth_provider
+    from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
 
     # OTel: the Databricks Apps platform auto-injects
     # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
@@ -206,11 +206,7 @@ try:
     # provider always wins over the enable switch).
     os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
 
-    # Header mode here relies on the proxy injecting the identity header. A
-    # single-user marker in the deploy env would turn an un-proxied request
-    # into the "local" user instead, so surface that if it is ever set.
-    from omnigent.server.auth import warn_if_single_user_exposed
-
+    # A single-user marker here would serve un-proxied requests as "local".
     _exposure = warn_if_single_user_exposed("0.0.0.0")
     if _exposure:
         logger.warning("%s", _exposure)

@@ -76,11 +76,9 @@ def test_run_harness_without_agent_live_repl_round_trip(
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
 
-    # Harnesses that register a background session-title generator issue an
-    # extra model call that races the user turn for this same keyed queue, so
-    # the number of calls per run is not fixed. A fallback makes the marker the
-    # answer to EVERY call on this key — whichever call wins, the turn renders
-    # the marker instead of the queue's generic default.
+    # A background session-title generator races the user turn for this same
+    # keyed queue, so the call count per run is not fixed. The fallback answers
+    # every call with the marker, so whichever wins, the turn still renders it.
     configure_mock_llm(
         mock_llm_server_url,
         [{"text": marker}],

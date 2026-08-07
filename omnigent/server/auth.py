@@ -27,6 +27,7 @@ and closed over by route factories — no per-request import cost.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import time
@@ -220,18 +221,14 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 def bind_host_is_loopback(host: str) -> bool:
     """Whether *host* only accepts connections from this machine.
 
-    Recognizes the common literals directly and otherwise defers to
-    :mod:`ipaddress`, so any address in ``127.0.0.0/8`` counts. A
-    wildcard (``0.0.0.0`` / ``::``) is NOT loopback — it accepts traffic
-    from every reachable interface. Unparseable values (a hostname we
-    can't resolve here) are treated as non-loopback: for a warning gate,
-    guessing "reachable" is the safe direction.
+    A wildcard (``0.0.0.0`` / ``::``) is not loopback — it accepts traffic
+    from every reachable interface. Unparseable values (an unresolved
+    hostname) count as non-loopback, so a warning gated on this errs
+    toward "reachable".
 
     :param host: Bind host, e.g. ``"127.0.0.1"``, ``"0.0.0.0"``.
     :returns: ``True`` when the bind is loopback-only.
     """
-    import ipaddress
-
     if host in _LOOPBACK_HOSTS:
         return True
     try:
@@ -244,13 +241,12 @@ def warn_if_single_user_exposed(host: str) -> str | None:
     """Return a warning when a single-user server is network-reachable.
 
     Header mode with the single-user marker serves every unauthenticated
-    request as :data:`RESERVED_USER_LOCAL`. That is the intended local
-    posture on loopback, but on a reachable interface it hands the
-    ``"local"`` identity to anyone who can connect. Gated on the
-    *resolved* source being ``header``: an accounts/oidc server routes
-    identity through the cookie path, so there is no such exposure.
+    request as :data:`RESERVED_USER_LOCAL` — the intended posture on
+    loopback, but on a reachable interface it hands that identity to
+    anyone who can connect. Accounts/oidc route identity through the
+    cookie path, so they are not exposed and stay silent.
 
-    Callers own how the text surfaces — Click's stderr for the CLI, a
+    Callers own how the text surfaces: Click's stderr for the CLI, a
     logger for container entrypoints where stderr is buried.
 
     :param host: The resolved bind host, e.g. ``"0.0.0.0"``.

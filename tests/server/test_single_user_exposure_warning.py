@@ -1,12 +1,10 @@
 """Unit tests for the single-user exposure warning helpers.
 
-``warn_if_single_user_exposed`` is the one rule every spawn path shares —
-the CLI prints it to stderr, the container entrypoints log it — so the
-gating lives here rather than being re-derived per adapter.
-
-The warning fires only where the exposure is real: a reachable bind, a
-truthy single-user marker, AND a resolved source of ``header`` (the one
-mode where the unauthenticated ``"local"`` fallback is live).
+``warn_if_single_user_exposed`` is the rule every spawn path shares — the
+CLI prints it to stderr, the container entrypoints log it. It fires only
+where the exposure is real: a reachable bind, a truthy single-user
+marker, and a resolved source of ``header`` (the one mode where the
+unauthenticated ``"local"`` fallback is live).
 """
 
 from __future__ import annotations
@@ -49,11 +47,7 @@ def test_non_loopback_hosts_recognized(host: str) -> None:
 
 
 def test_unresolvable_host_treated_as_reachable() -> None:
-    """An unparseable host errs toward "reachable" so the warning still fires.
-
-    For a security warning, over-warning on a name we can't classify is the
-    safe direction.
-    """
+    """An unparseable host errs toward "reachable" so the warning still fires."""
     assert bind_host_is_loopback("some-k8s-service.internal") is False
 
 
@@ -101,8 +95,7 @@ def test_silent_under_explicit_login_provider(
 ) -> None:
     """An explicit login provider routes identity through the cookie path.
 
-    Login really is required there, so claiming unauthenticated exposure
-    would be false.
+    Login is required there, so claiming exposure would be false.
     """
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", provider)
@@ -123,8 +116,7 @@ def test_warns_under_explicit_header_provider(monkeypatch: pytest.MonkeyPatch) -
 def test_warns_under_auth_enabled_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     """``AUTH_ENABLED=0`` is set-but-falsy, resolving to header mode.
 
-    This is the Docker kill-switch posture, which also sets the marker —
-    exactly the container case CLI stderr never covered.
+    The Docker kill-switch posture, which also sets the marker.
     """
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
