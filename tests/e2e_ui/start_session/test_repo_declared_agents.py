@@ -330,12 +330,23 @@ async def _drive_acp_consent(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("review the changes")
             await page.get_by_test_id("new-chat-landing-submit").click()
             await expect(page.get_by_test_id("repo-config-consent-summary")).to_be_visible()
-            await page.get_by_role("button", name="Cancel", exact=True).click()
+            # Radix animates the dialog open; a Cancel click landing during the
+            # animation can be swallowed by the overlay's pointer-events guard,
+            # leaving the modal up to block the next picker click. Click until
+            # the dialog actually closes.
+            dialog = page.get_by_test_id("repo-harness-consent-dialog")
+            for _ in range(3):
+                await page.get_by_role("button", name="Cancel", exact=True).click()
+                try:
+                    await expect(dialog).to_be_hidden(timeout=2_000)
+                    break
+                except AssertionError:
+                    continue
+            await expect(dialog).to_be_hidden()
 
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             await page.get_by_test_id("new-chat-landing-agent-repo-acp:repo-echo").click()
             await page.get_by_test_id("new-chat-landing-submit").click()
-            dialog = page.get_by_test_id("repo-harness-consent-dialog")
             await expect(dialog).to_be_visible()
             await expect(dialog.locator("pre")).to_have_text(_ACP_ROW["command"])
             assert create_buffers == [], "consent must gate the create"
