@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import mimetypes
 import urllib.parse
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -302,7 +304,7 @@ def register_resources_routes(
         host_params: dict[str, Any],
         runner_path: str,
         runner_params: dict[str, str] | None = None,
-        host_workspace: str | None = None,
+        host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -320,6 +322,14 @@ def register_resources_routes(
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.
+        :param host_workspace_resolver: Resolves the absolute root the host
+            reader should be rooted at, for an absolute browse target.
+            Awaited ONLY when the fallback is actually taken: a live runner
+            authorizes the path itself against its own resolved policy, and
+            a runner-only session (no host, so no recorded ``workspace``)
+            has nothing for this to resolve against. Resolving it eagerly
+            would refuse absolute browsing on exactly those sessions even
+            though the online runner can serve them.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
             host cannot serve the read either.
@@ -335,6 +345,7 @@ def register_resources_routes(
                 raise
             runner_offline = exc
 
+        host_workspace = await host_workspace_resolver() if host_workspace_resolver else None
         payload = await _read_workspace_via_host(
             session_id, op, host_params, workspace_override=host_workspace
         )
@@ -1653,7 +1664,9 @@ def register_resources_routes(
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/search{suffix}?{qs}"
         )
-        host_workspace = await _authorize_absolute_browse(session_id, path) if absolute else None
+        resolver = (
+            functools.partial(_authorize_absolute_browse, session_id, path) if absolute else None
+        )
         return await _fs_get_with_host_fallback(
             session_id,
             op="search",
@@ -1665,7 +1678,7 @@ def register_resources_routes(
                 "path": "" if absolute else path,
             },
             runner_path=runner_path,
-            host_workspace=host_workspace,
+            host_workspace_resolver=resolver,
         )
 
     @router.get(
@@ -1792,9 +1805,13 @@ def register_resources_routes(
             f"/{environment_id}/filesystem/{runner_rel}?{qs}"
         )
         # Offline, the host reads whatever root it is handed, so the server
-        # authorizes the target itself before rooting the reader there.
-        host_workspace = (
-            await _authorize_absolute_browse(session_id, relative_path) if absolute else None
+        # authorizes the target itself before rooting the reader there. Deferred:
+        # a live runner does its own authorization, and a runner-only session has
+        # no recorded workspace for this to resolve against.
+        resolver = (
+            functools.partial(_authorize_absolute_browse, session_id, relative_path)
+            if absolute
+            else None
         )
         return await _fs_get_with_host_fallback(
             session_id,
@@ -1807,7 +1824,7 @@ def register_resources_routes(
                 "order": order,
             },
             runner_path=path,
-            host_workspace=host_workspace,
+            host_workspace_resolver=resolver,
         )
 
     @router.put(
