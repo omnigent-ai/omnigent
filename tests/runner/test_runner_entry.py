@@ -787,7 +787,7 @@ def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
     assert captured["binding_token"] == "the-binding-token"
 
 
-def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
+def test_managed_mint_factory_keeps_ingress_bearer_separate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After the first mint, the factory uses the minted JWT as proxy bearer on re-mints."""
@@ -816,8 +816,28 @@ def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
     factory._cached_expires_at = 0.0  # expire
     factory()
 
-    assert mint_call_bearers[0] == "Bearer seed-bearer"
-    assert mint_call_bearers[1] == "Bearer minted-jwt"
+    assert mint_call_bearers == ["Bearer seed-bearer", "Bearer seed-bearer"]
+    assert factory.ingress_bearer == "seed-bearer"
+
+
+def test_runner_databricks_auth_sends_apps_and_owner_headers() -> None:
+    """Managed requests separate ingress OAuth from application identity."""
+    from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+    class _Factory:
+        ingress_bearer = "apps-sp-token"
+
+        def __call__(self) -> str:
+            return "owner-jwt"
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/v1/session")
+    captured = _drive_auth_flow(
+        _RunnerDatabricksAuth(_Factory()),
+        request,
+        httpx.Response(200),
+    )
+    assert captured == ["Bearer apps-sp-token"]
+    assert request.headers[RUNNER_OWNER_TOKEN_HEADER] == "owner-jwt"
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:

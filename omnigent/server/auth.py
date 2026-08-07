@@ -562,12 +562,17 @@ class UnifiedAuthProvider(AuthProvider):
 
         if self._runner_token_secret is None:
             return None
-        auth_header = request.headers.get("authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return None
+        from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+        token = request.headers.get(RUNNER_OWNER_TOKEN_HEADER, "").strip()
+        if not token:
+            auth_header = request.headers.get("authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return None
+            token = auth_header[7:]
         try:
             payload = jwt.decode(
-                auth_header[7:],
+                token,
                 self._runner_token_secret,
                 algorithms=["HS256"],
             )

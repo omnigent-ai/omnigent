@@ -327,7 +327,14 @@ class _RunnerDatabricksAuth(httpx.Auth):
                     yield request
                     return
                 raise httpx.RequestError("Databricks token refresh returned no token")
-            request.headers["Authorization"] = f"Bearer {token}"
+            ingress_bearer = getattr(self._factory, "ingress_bearer", None)
+            if ingress_bearer:
+                from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+                request.headers["Authorization"] = f"Bearer {ingress_bearer}"
+                request.headers[RUNNER_OWNER_TOKEN_HEADER] = token
+            else:
+                request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
             return
@@ -335,7 +342,14 @@ class _RunnerDatabricksAuth(httpx.Auth):
             _invalidate_auth_token_factory(self._factory)
             token = self._factory()
             if token:
-                request.headers["Authorization"] = f"Bearer {token}"
+                ingress_bearer = getattr(self._factory, "ingress_bearer", None)
+                if ingress_bearer:
+                    from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+                    request.headers["Authorization"] = f"Bearer {ingress_bearer}"
+                    request.headers[RUNNER_OWNER_TOKEN_HEADER] = token
+                else:
+                    request.headers["Authorization"] = f"Bearer {token}"
                 yield request
 
 
@@ -743,10 +757,8 @@ class _ManagedMintTokenFactory:
         :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
         :param server_url: Omnigent server base URL.
         :param binding_token: The runner's tunnel binding token.
-        :param proxy_bearer: Optional bearer for the Apps proxy. Seeded with
-            the host's initial bearer; replaced by the minted JWT after the
-            first successful mint so the proxy sees a valid credential on
-            every subsequent refresh.
+        :param proxy_bearer: Optional OAuth bearer for the Apps proxy. It stays
+            separate from the minted owner JWT, which the proxy does not accept.
         """
         self._mint_url = mint_url
         self._server_url = server_url
@@ -811,10 +823,12 @@ class _ManagedMintTokenFactory:
             return self._still_valid_cached_token(now)
         self._cached_token = token
         self._cached_expires_at = expires_at
-        # Promote the minted JWT to proxy bearer so subsequent refreshes
-        # through the Apps proxy are authenticated with a valid credential.
-        self._proxy_bearer = token
         return token
+
+    @property
+    def ingress_bearer(self) -> str | None:
+        """Return the OAuth bearer reserved for a Databricks Apps ingress."""
+        return self._proxy_bearer
 
     def _still_valid_cached_token(self, now: float) -> str | None:
         """Return the cached token if it hasn't expired outright.
