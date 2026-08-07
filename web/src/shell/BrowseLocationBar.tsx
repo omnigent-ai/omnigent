@@ -12,6 +12,13 @@ interface BrowseLocationBarProps {
   workspace: string;
   /** Host whose filesystem the picker browses, or null when not host-bound. */
   hostId: string | null;
+  /**
+   * Whether THIS viewer may browse outside the workspace. Distinct from
+   * {@link reach}, which describes what the *environment* can reach and is
+   * identical for every viewer of a session — a collaborator who is not the
+   * owner is refused (403) however wide the environment's own reach is.
+   */
+  canBrowseOutside: boolean;
   /** The session's reported reach, or null while the metadata loads. */
   reach: WorkspaceReach | null;
   /** Navigate to an absolute path. */
@@ -29,13 +36,16 @@ interface BrowseLocationBarProps {
  * show-hidden along with it. Navigation applies live as the user browses (no
  * separate confirm), matching the new-session chip.
  *
- * Falls back to a plain label when the session has nowhere else to go — a
- * confined agent, or a session with no host to browse — so the affordance
- * appears only when it does something.
+ * Falls back to a plain label when there is nowhere else to go OR this
+ * viewer may not go there — a confined agent, a session with no host, or a
+ * non-owner collaborator. Offering a control that is guaranteed to 403 is
+ * worse than not offering it: the picker browses the owner-scoped host
+ * filesystem, so for a collaborator it opens onto an error.
  *
  * @param current Absolute path currently shown.
  * @param workspace Absolute workspace root, for the picker's return button.
  * @param hostId Host whose filesystem to browse.
+ * @param canBrowseOutside Whether this viewer is allowed to leave the workspace.
  * @param reach The session's reported reach, or null while loading.
  * @param onNavigate Fired with the absolute path to browse to.
  * @param error Message to show when the last navigation was refused.
@@ -44,12 +54,13 @@ export function BrowseLocationBar({
   current,
   workspace,
   hostId,
+  canBrowseOutside,
   reach,
   onNavigate,
   error,
 }: BrowseLocationBarProps) {
   const [open, setOpen] = useState(false);
-  const canRoam = (reach?.unconfined ?? false) && hostId !== null;
+  const canRoam = canBrowseOutside && (reach?.unconfined ?? false) && hostId !== null;
 
   if (!canRoam) {
     return (

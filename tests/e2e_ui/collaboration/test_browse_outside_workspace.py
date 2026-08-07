@@ -15,9 +15,11 @@ browser contexts carrying different identities. If the wiring between a
 genuinely shared session and the gate ever broke, the stubs would not notice
 and this would.
 
-The decisive assertion is per-identity: the owner's panel lists a file that
-exists only OUTSIDE the workspace; the collaborator's never does, and the
-same request over their own authenticated context is refused.
+The decisive assertions are per-identity: the owner's panel offers the
+navigation control and lists a file that exists only OUTSIDE the workspace;
+the collaborator is not offered the control at all, and the same request over
+their own authenticated context is refused. Both layers are asserted on
+purpose -- hiding the control is presentation, the 403 is the boundary.
 """
 
 from __future__ import annotations
@@ -265,31 +267,18 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         _open_files_tree(bob_page, live_server, session_id)
         bob_rail = bob_page.get_by_role("complementary", name="Workspace")
 
-        bob_path = bob_rail.get_by_test_id("browse-location-path")
-        expect(bob_path).to_be_visible(timeout=30_000)
-        bob_path.click()
-        bob_picker = bob_page.get_by_test_id("workspace-picker")
-        expect(bob_picker).to_be_visible(timeout=15_000)
-        bob_picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+        # Positive signal first: bob's panel really rendered. Without this the
+        # "control is absent" assertion below would also pass on a panel that
+        # failed to load at all.
+        expect(bob_rail.get_by_role("radiogroup", name="File scope")).to_be_visible(timeout=30_000)
 
-        # Bob got as far as the owner did -- the panel really re-rooted, so
-        # the assertions below are about the FETCH being refused, not about
-        # the navigation silently not happening.
-        expect(bob_path).to_contain_text(outside.name, timeout=15_000)
-
-        # A positive signal, not merely the absence of a file: a bare
-        # "owner-only.txt is not present" assertion is satisfied instantly,
-        # before the request even resolves, so it would pass with the gate
-        # removed. The panel names the reason instead of showing an empty tree.
-        # Rendered in two places (the header hint and the tree's load error),
-        # so scope to the first rather than trip strict mode.
-        expect(bob_rail.get_by_text(re.compile("needs owner permission")).first).to_be_visible(
-            timeout=15_000
-        )
+        # The control is not offered at all. `reachable` is identical for every
+        # viewer (it describes the ENVIRONMENT), so the panel must additionally
+        # consult who is asking -- and a collaborator is not the owner. Showing
+        # the control would open the owner-scoped host browser onto a 403.
+        expect(bob_rail.get_by_test_id("browse-location-path")).to_have_count(0)
         expect(bob_rail.get_by_text("owner-only.txt")).to_have_count(0)
 
-        # Decisive, and independent of how the panel renders a failure: the
-        # same request over bob's own authenticated context is refused.
         refused = bob_page.request.get(_absolute_fs_url(live_server, session_id, outside))
         assert refused.status == 403, refused.text()
     finally:

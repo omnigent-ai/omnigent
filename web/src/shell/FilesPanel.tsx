@@ -15,6 +15,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -427,6 +428,7 @@ export function FilesPanel({
             current={workingDir}
             workspace={workspaceRoot}
             hostId={session?.hostId ?? null}
+            canBrowseOutside={isOwnerLevel(session?.permissionLevel ?? null)}
             reach={envQuery.data?.reachable ?? null}
             onNavigate={navigateTo}
             error={locationError}

@@ -14,6 +14,7 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
+import { useSession } from "@/hooks/useSession";
 import { useChatStore } from "@/store/chatStore";
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
@@ -1563,5 +1564,74 @@ describe("FilesPanel tells the agent where the user is looking", () => {
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
 
     expect(useChatStore.getState().browseLocation).toBe("/etc");
+  });
+});
+
+describe("FilesPanel browse permission", () => {
+  const UNCONFINED_REACH = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  afterEach(() => {
+    // Restore the suite default (owner) — `vi.clearAllMocks` clears calls but
+    // keeps an implementation set via mockReturnValue, which would leak.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test" },
+    } as unknown as ReturnType<typeof useSession>);
+  });
+
+  it("hides the control from a collaborator who is not the session owner", () => {
+    // `reachable` describes what the ENVIRONMENT can reach and is identical
+    // for every viewer, so it cannot decide this on its own. Everything past
+    // the workspace is the owner's own machine: a collaborator's browse is
+    // refused 403, and the picker itself reads the owner-scoped host
+    // filesystem endpoint — so the control would open onto an error.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: 2 },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_collaborator",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.queryByTestId("browse-location-path")).toBeNull();
+    // Still the plain label — the collaborator keeps the workspace view.
+    expect(screen.getByText("proj")).toBeInTheDocument();
+  });
+
+  it("keeps the control for the session owner", () => {
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: 4 },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_owner",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
+  });
+
+  it("keeps the control when the level is unknown (single-user)", () => {
+    // A single-user local server reports no level at all. Treating that as
+    // "not the owner" would remove browsing from the ONLY user.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: null },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_single_user",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
   });
 });
