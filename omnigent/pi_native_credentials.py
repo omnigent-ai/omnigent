@@ -847,6 +847,8 @@ def _inline_family_order(model: str | None) -> tuple[str, ...]:
     OpenAI-compatible wire by nearly every gateway, so it leads with OpenAI.
     With no model to go on, Anthropic leads: Pi speaks it natively.
     """
+    # An Anthropic-wire-only non-Claude id would prefer the wrong surface here;
+    # only a dual-surface provider is exposed, since the loop falls through.
     if model and model_catalog.model_family_token(model) != "claude":
         return ("openai", "anthropic")
     return ("anthropic", "openai")
