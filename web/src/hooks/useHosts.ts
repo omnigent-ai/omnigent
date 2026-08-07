@@ -116,6 +116,8 @@ export interface WorkspaceAcpAgent {
   model: string | null;
   session_id_mode: "server" | "client";
   send_model: boolean;
+  /** Lend Omnigent's builtin MCP relay in session/new (default true). */
+  omnigent_mcp: boolean;
   /** Soft hint: the command's binary resolves on the host's PATH. */
   command_found: boolean;
 }

@@ -2228,6 +2228,7 @@ class HostProcess:
                     "model": entry.model,
                     "session_id_mode": entry.session_id_mode,
                     "send_model": entry.send_model,
+                    "omnigent_mcp": entry.omnigent_mcp,
                     "command_found": command_binary_on_path(entry.command),
                 }
                 for entry in entries

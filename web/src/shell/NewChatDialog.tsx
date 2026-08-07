@@ -45,6 +45,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import {
   CLAUDE_NATIVE_EFFORTS,
@@ -3772,6 +3773,7 @@ export function NewChatLandingScreen() {
               model: pickedRepoAgent.model ?? undefined,
               sessionIdMode: pickedRepoAgent.session_id_mode,
               sendModel: pickedRepoAgent.send_model,
+              omnigentMcp: pickedRepoAgent.omnigent_mcp,
             },
           }
         : null;

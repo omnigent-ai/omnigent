@@ -543,6 +543,7 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
         "system.ai.claude-opus-4-8",
     ]
 
+
 async def test_handle_workspace_harnesses_reads_repo_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -574,6 +575,7 @@ async def test_handle_workspace_harnesses_reads_repo_config(
                 "model": None,
                 "session_id_mode": "server",
                 "send_model": False,
+                "omnigent_mcp": True,
                 "command_found": False,
             }
         ],

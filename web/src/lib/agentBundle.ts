@@ -42,6 +42,8 @@ export interface AgentBundleInput {
     model?: string;
     sessionIdMode?: "server" | "client";
     sendModel?: boolean;
+    /** Lend Omnigent's builtin MCP relay (default true; emitted only when false). */
+    omnigentMcp?: boolean;
   };
   /** MCP server declarations to include as inline tools entries. */
   mcpServers?: MCPServerInput[];
@@ -82,6 +84,9 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
     }
     if (input.acpAgent.sendModel) {
       lines.push("    send_model: true");
+    }
+    if (input.acpAgent.omnigentMcp === false) {
+      lines.push("    omnigent_mcp: false");
     }
   }
   lines.push("  config:");

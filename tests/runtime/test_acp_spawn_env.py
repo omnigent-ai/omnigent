@@ -146,6 +146,7 @@ def test_embedded_omnigent_mcp_flag_forwarded() -> None:
     )
     assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
 
+
 def test_embedded_agent_takes_precedence_over_config(_isolate_config: Path) -> None:
     """An embedded ``acp_agent`` wins over the slug's configured command."""
     _write_acp_config(_isolate_config)
