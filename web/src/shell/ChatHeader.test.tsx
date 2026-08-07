@@ -291,17 +291,17 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("mounts the ViewModeToggle for a terminal-first session", () => {
     renderHeaderWithSession(makeTerminalFirstCtx());
     expect(
-      screen.getByRole("button", { name: /switch between chat and terminal/i }),
+      screen.getByRole("group", { name: /switch between chat and terminal/i }),
     ).toBeInTheDocument();
   });
 
   it("omits the toggle for a non-terminal-first session", () => {
     renderHeaderWithSession(makeTerminalFirstCtx({ isTerminalFirst: false }));
-    expect(screen.queryByRole("button", { name: /switch between chat and terminal/i })).toBeNull();
+    expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
   });
 
   it("omits the toggle when there is no TerminalFirst context", () => {
     renderHeaderWithSession(null);
-    expect(screen.queryByRole("button", { name: /switch between chat and terminal/i })).toBeNull();
+    expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
   });
 });
