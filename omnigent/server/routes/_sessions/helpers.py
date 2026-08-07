@@ -1652,6 +1652,7 @@ def _resolve_llm_model(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         return loaded.spec.llm.model if loaded.spec.llm else None
+    # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
     except (
         KeyError,
         AttributeError,
@@ -1744,6 +1745,7 @@ def _resolve_harness_impl(
             or executor.type
         )
         return canonicalize_harness(harness) or harness
+    # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
     except (
         KeyError,
         AttributeError,

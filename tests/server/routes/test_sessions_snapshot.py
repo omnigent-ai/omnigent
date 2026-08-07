@@ -345,7 +345,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.llm_model == "openai-codex/gpt-5.6-sol:medium"
     assert child.context_window == 100_000
     assert child.harness == "codex"
-    assert cache_loads == [False, True, False, True]
+    assert cache_loads == [True, True, True, True]
 
 
 @pytest.mark.asyncio

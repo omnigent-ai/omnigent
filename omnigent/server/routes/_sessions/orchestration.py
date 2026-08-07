@@ -8793,7 +8793,10 @@ async def _get_session_snapshot(
                     # blocking IO that would otherwise stall the single-worker
                     # event loop on every page-load snapshot.
                     loaded = await asyncio.to_thread(
-                        agent_cache.load, agent.id, agent.bundle_location
+                        agent_cache.load,
+                        agent.id,
+                        agent.bundle_location,
+                        expand_env=agent.session_id is None,
                     )
                     spec = loaded.spec
                     if conv.sub_agent_name:
