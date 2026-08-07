@@ -1785,13 +1785,14 @@ function HarnessConfigModal({
         <DialogFooter className="border-t-0 bg-transparent">
           <Button
             type="button"
+            size="lg"
             variant="outline"
             onClick={() => onOpenChange(false)}
             data-testid="new-chat-landing-config-cancel"
           >
             Cancel
           </Button>
-          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save">
+          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save" size="lg">
             Save
           </Button>
         </DialogFooter>

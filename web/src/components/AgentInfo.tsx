@@ -622,7 +622,7 @@ function AddPolicyDialog({
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">
-            <button
+            <Button
               type="button"
               onClick={() => {
                 // With a policy selected, Cancel steps back to the list so the
@@ -635,18 +635,13 @@ function AddPolicyDialog({
                   onOpenChange(false);
                 }
               }}
-              className="rounded px-3 py-1.5 text-sm hover:bg-muted"
+              variant="outline"
             >
               Cancel
-            </button>
-            <button
-              type="button"
-              onClick={handleAdd}
-              disabled={!selected || addPolicy.isPending}
-              className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
-            >
+            </Button>
+            <Button type="button" onClick={handleAdd} disabled={!selected || addPolicy.isPending}>
               {addPolicy.isPending ? "Adding..." : "Add"}
-            </button>
+            </Button>
           </div>
         </div>
       </DialogContent>
