@@ -510,7 +510,6 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_host_runner as _stop_session_host_runner,
     _stored_file_to_resource as _stored_file_to_resource,
     _stream_live_events as _stream_live_events,
-    _strip_pending_author_prefix as _strip_pending_author_prefix,
     _structured_ask_user_question as _structured_ask_user_question,
     _targeted_elicitation_event as _targeted_elicitation_event,
     _title_content_from_item as _title_content_from_item,
