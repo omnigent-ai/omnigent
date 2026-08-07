@@ -704,17 +704,15 @@ def _seed_and_load_labels(
         labels.
     """
     existing = _load_existing_labels(conversation_id, conversation_store)
-    to_seed = {
-        key: ldef.initial
-        for key, ldef in label_defs.items()
-        if ldef.initial is not None and key not in existing
-    }
-    if to_seed:
-        conversation_store.set_labels(conversation_id, to_seed)
-        # Re-read to pick up the freshly seeded values plus any
-        # writes that landed concurrently from another workflow.
-        existing = _load_existing_labels(conversation_id, conversation_store)
-    return existing
+    declared = {key: ldef.initial for key, ldef in label_defs.items() if ldef.initial is not None}
+    if not declared:
+        return existing
+    # Insert-if-absent in one statement, NOT "diff against the snapshot then
+    # upsert": a policy write landing between the snapshot and the seed would
+    # be overwritten back to the initial value by an upsert. The database
+    # decides which keys are missing, and the returned snapshot is read in
+    # the same transaction as the insert.
+    return conversation_store.seed_labels_if_absent(conversation_id, declared)
 
 
 def _load_existing_labels(

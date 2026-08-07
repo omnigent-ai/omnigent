@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import replace
 from typing import Any
 
@@ -27,7 +28,7 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -557,9 +558,43 @@ class PolicyEngine:
             else:
                 session_ops.append(op)
         if session_ops:
-            for op in session_ops:
-                _apply_one(self._session_state, op)
-            self._store.set_session_state(self._conversation_id, self._session_state)
+            # Merge under a row lock rather than overwriting the whole blob
+            # from this engine's snapshot: concurrent evaluations (parallel
+            # tool calls on one session) each hold their own snapshot, and a
+            # blind write dropped the other's counter increments / appends.
+            def _merge(state: dict[str, Any]) -> None:
+                for op in session_ops:
+                    _apply_one(state, op)
+
+            # Closed over today's two-member StateUpdateAction enum (SET, DELETE):
+            # a future third action would need its own inclusion/exclusion here.
+            deleted_keys = {op.key for op in session_ops if op.action == StateUpdateAction.DELETE}
+            merged = self._store.mutate_session_state(self._conversation_id, _merge)
+            # Hot cache: persisted truth (``merged``) is authoritative for
+            # every key it holds. For a key it DOESN'T hold, though, absence
+            # is ambiguous — a blanket union with the old cache
+            # (``{**old, **merged}``) resolved it one way unconditionally,
+            # which is wrong for a genuine delete: a key this call just
+            # deleted is correctly missing from ``merged``, and re-adding it
+            # from the old cache silently undoes the delete.
+            #
+            # The two cases are told apart by what this call actually asked
+            # for, not by key identity: a key missing from ``merged`` that
+            # THIS BATCH deleted stays gone; a key missing from ``merged``
+            # that this batch never touched was never part of this
+            # conversation's own persisted row to begin with (the two
+            # sub-agent root-inherited cost-approval keys, which are routed
+            # to the ROOT's row above and never reach ``session_ops`` at
+            # all; or any value seeded straight into the engine's
+            # constructor without ever being written through the store) and
+            # survives from the old cache, exactly as it did before this
+            # call.
+            preserved = {
+                key: value
+                for key, value in self._session_state.items()
+                if key not in merged and key not in deleted_keys
+            }
+            self._session_state = {**merged, **preserved}
 
     def _record_root_cost_ask_approved(self, op: StateUpdate) -> None:
         """
@@ -573,13 +608,20 @@ class PolicyEngine:
         sub-agent); a top-level session writes through the normal
         per-conversation path (root == self).
 
-        :param op: The ``SET`` op carrying the approved checkpoint value, e.g.
+        :param op: The ``SET`` or ``DELETE`` op on one of the two reserved
+            cost-approval keys, e.g.
             ``StateUpdate(key=..., action=StateUpdateAction.SET, value=0.05)``.
         """
-        root_conv = self._store.get_conversation(self._root_conversation_id)
-        root_state = dict(root_conv.session_state) if root_conv is not None else {}
-        _apply_one(root_state, op)
-        self._store.set_session_state(self._root_conversation_id, root_state)
+        # Same atomic merge as the per-conversation path: a sibling sub-agent
+        # approving concurrently must not lose this checkpoint (or vice versa).
+        # A root deleted while this sub-agent runs has nowhere to hold the
+        # checkpoint. Recording it here was always best-effort (a lost approval
+        # re-prompts, it does not overspend), so keep the in-memory mirror below
+        # and let the turn continue rather than failing the tool call.
+        with contextlib.suppress(ConversationNotFoundError):
+            self._store.mutate_session_state(
+                self._root_conversation_id, lambda state: _apply_one(state, op)
+            )
         # Also mirror into this engine's hot in-memory state so a subsequent
         # evaluate() within the same sub-agent turn sees the approval (its
         # session_state was seeded from the root at construction, but a fresh

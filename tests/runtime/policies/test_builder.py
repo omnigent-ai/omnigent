@@ -1001,3 +1001,238 @@ def test_normalize_usage_for_engine_drops_display_fields() -> None:
     assert "by_model" not in normalized3
     assert "policy_cost_usd" not in normalized3
     assert normalized3["input_tokens"] == 0
+
+
+def test_initial_label_seed_does_not_clobber_a_concurrent_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Seeding declared initials must not overwrite a value written between the
+    snapshot read and the seed.
+
+    The race is constructed, not simulated: a store proxy commits a policy
+    write while the seeding helper is reading its snapshot, so the helper
+    holds a view that is already stale by the time it decides what is
+    missing. Insert-if-absent leaves the persisted value alone because the
+    database makes that decision inside the same statement; the previous
+    diff-then-upsert path recomputed "missing" from the stale snapshot and
+    reset a live value to its initial.
+    """
+    from omnigent.runtime.policies.builder import _seed_and_load_labels
+    from omnigent.spec.types import LabelDef
+
+    conv = conversation_store.create_conversation()
+
+    class _WriteDuringSnapshot:
+        """Commits a competing label write during the snapshot read."""
+
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+            self._fired = False
+
+        def get_conversation(self, conversation_id: str):
+            row = self._inner.get_conversation(conversation_id)
+            if not self._fired:
+                self._fired = True
+                self._inner.set_labels(conversation_id, {"integrity": "7"})
+            return row
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+    result = _seed_and_load_labels(
+        conversation_id=conv.id,
+        label_defs={"integrity": LabelDef(initial="0")},
+        conversation_store=_WriteDuringSnapshot(conversation_store),  # type: ignore[arg-type]
+    )
+
+    assert result["integrity"] == "7", "seed overwrote a concurrent write"
+    persisted = dict(conversation_store.get_conversation(conv.id).labels)
+    assert persisted["integrity"] == "7"
+
+
+def test_increments_from_independent_snapshots_merge(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two engines holding independent snapshots each INCREMENT one key, and
+    both increments survive. A blind whole-blob write persisted 1.
+
+    Sequential by construction, and named for what it proves: the MERGE, not
+    the race. Serialisation of overlapping transactions is a store-level
+    property and is pinned there, against each dialect's own mechanism
+    (``test_two_real_writers_race_on_one_metadata_row``) — this test stays
+    green with the row lock removed and should not be read as covering it.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-race")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    op = StateUpdate(key="risk", action=StateUpdateAction.INCREMENT, value=1)
+    engine_a.apply_state_updates([op])
+    engine_b.apply_state_updates([op])
+
+    persisted = conversation_store.get_conversation(conv.id)
+    assert dict(persisted.session_state)["risk"] == 2
+
+
+def test_sets_from_independent_snapshots_preserve_other_keys(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A second engine's SET must not drop a key the first one wrote.
+
+    Sequential, like its sibling above: the merge is the contract here.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-keys")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    engine_a.apply_state_updates(
+        [StateUpdate(key="from_a", action=StateUpdateAction.SET, value="a")]
+    )
+    engine_b.apply_state_updates(
+        [StateUpdate(key="from_b", action=StateUpdateAction.SET, value="b")]
+    )
+
+    state = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert state["from_a"] == "a", state
+    assert state["from_b"] == "b", state
+
+
+def test_delete_survives_the_hot_cache_overlay(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A DELETE must actually remove the key, not just from the persisted row.
+
+    ``apply_state_updates`` merges under a store-side lock and then folds the
+    result onto the engine's in-memory cache. The persisted row was already
+    correct after a delete — ``mutate_session_state``'s callback pops the key
+    from the fresh state it is handed. The hot cache was not: a blanket union
+    ``{**old_cache, **merged}`` cannot express "this key is now gone", since a
+    key ``merged`` no longer has is simply missing from the right-hand side of
+    the union and the union keeps whatever the left-hand (stale) cache still
+    holds. The next evaluation reads that stale cache, not the store.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-delete")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    engine.apply_state_updates(
+        [
+            StateUpdate(key="risk", action=StateUpdateAction.SET, value=1),
+            StateUpdate(key="keep", action=StateUpdateAction.SET, value=2),
+        ]
+    )
+    engine.apply_state_updates([StateUpdate(key="risk", action=StateUpdateAction.DELETE)])
+
+    assert "risk" not in engine.session_state, engine.session_state
+    assert engine.session_state["keep"] == 2, engine.session_state
+
+    persisted = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert "risk" not in persisted, persisted
+    assert persisted["keep"] == 2, persisted
+
+
+def test_delete_of_a_root_inherited_key_does_not_resurrect_from_the_snapshot(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A sub-agent deleting its inherited approval key must not have the overlay
+    bring it back from the construction-time snapshot.
+
+    This key never reaches ``session_ops`` at all for a sub-agent — a write
+    to it (SET or DELETE) is always diverted to
+    ``_record_root_cost_ask_approved``, which applies the op straight to the
+    hot cache itself. So this test doesn't exercise the merge/overlay
+    machinery; it pins that the diversion still produces the right answer for
+    a DELETE, since only SET was previously exercised anywhere.
+    """
+    from omnigent.policies.schema import SESSION_COST_ASK_APPROVED_STATE_KEY
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    parent = conversation_store.create_conversation()
+    conversation_store.set_session_state(parent.id, {SESSION_COST_ASK_APPROVED_STATE_KEY: 0.05})
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    spec = AgentSpec(spec_version=1, name="x")
+    engine = build_policy_engine(
+        spec=spec, conversation_id=child.id, conversation_store=conversation_store
+    )
+    # Inherited at construction, per build_policy_engine's root-seeding.
+    assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
+
+    engine.apply_state_updates(
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+    )
+
+    assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state
+
+    # The diversion writes straight to the root's row, not just the child's
+    # cache — assert the persisted root, or a wrongly-local DELETE would pass.
+    root_state = dict(conversation_store.get_conversation(parent.id).session_state)
+    assert SESSION_COST_ASK_APPROVED_STATE_KEY not in root_state, root_state
+
+
+def test_delete_of_the_same_key_name_on_a_top_level_session_removes_it(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The same key name is ordinary state on a top-level session, and a delete
+    of it must stick — it must not be mistaken for the sub-agent inheritance
+    case just because the name matches.
+
+    For a top-level session (root == self) an op on
+    ``SESSION_COST_ASK_APPROVED_STATE_KEY`` goes through the same
+    ``session_ops``/merge path as any other key, never through
+    ``_record_root_cost_ask_approved`` (sub-agent only). The overlay tells
+    "genuinely never persisted" apart from "just deleted" by which keys THIS
+    call's ops named, not by a fixed key list — an earlier, key-list-based
+    version of this fix got exactly this case wrong.
+    """
+    from omnigent.policies.schema import SESSION_COST_ASK_APPROVED_STATE_KEY
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    root = conversation_store.create_conversation(title="root-own-approval-key")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine = build_policy_engine(
+        spec=spec, conversation_id=root.id, conversation_store=conversation_store
+    )
+
+    engine.apply_state_updates(
+        [
+            StateUpdate(
+                key=SESSION_COST_ASK_APPROVED_STATE_KEY,
+                action=StateUpdateAction.SET,
+                value=0.05,
+            )
+        ]
+    )
+    assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
+
+    engine.apply_state_updates(
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+    )
+
+    assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state
+    persisted = dict(conversation_store.get_conversation(root.id).session_state)
+    assert SESSION_COST_ASK_APPROVED_STATE_KEY not in persisted, persisted
