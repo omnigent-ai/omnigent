@@ -135,30 +135,27 @@ async def _proxy_workspace_harnesses(
 ) -> dict[str, Any]:
     """Ask a host for the repo-declared harnesses in a workspace."""
     request_id = secrets.token_hex(8)
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
     host_conn.pending_workspace_harnesses[request_id] = future
     frame = encode_host_frame(
         HostWorkspaceHarnessesFrame(request_id=request_id, path=path),
     )
     try:
-        try:
-            host_registry.send_text(host_conn, frame)
-        except ConnectionError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"host '{host_conn.host_id}' connection lost",
-            ) from exc
-        try:
-            return await asyncio.wait_for(future, timeout=_WORKSPACE_HARNESSES_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not resolve workspace harnesses "
-                    f"within {_WORKSPACE_HARNESSES_TIMEOUT_S:.0f}s"
-                ),
-            ) from exc
+        host_registry.send_text(host_conn, frame)
+        return await asyncio.wait_for(future, timeout=_WORKSPACE_HARNESSES_TIMEOUT_S)
+    except ConnectionError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"host '{host_conn.host_id}' connection lost",
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"host '{host_conn.host_id}' did not resolve workspace harnesses "
+                f"within {_WORKSPACE_HARNESSES_TIMEOUT_S:.0f}s"
+            ),
+        ) from exc
     finally:
         host_conn.pending_workspace_harnesses.pop(request_id, None)
 
@@ -172,8 +169,7 @@ async def _proxy_package_workspace_agent(
 ) -> dict[str, Any]:
     """Ask a host to package a repo-declared agent config for upload."""
     request_id = secrets.token_hex(8)
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
     host_conn.pending_package_workspace_agents[request_id] = future
     frame = encode_host_frame(
         HostPackageWorkspaceAgentFrame(
@@ -183,26 +179,21 @@ async def _proxy_package_workspace_agent(
         ),
     )
     try:
-        try:
-            host_registry.send_text(host_conn, frame)
-        except ConnectionError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"host '{host_conn.host_id}' connection lost",
-            ) from exc
-        try:
-            return await asyncio.wait_for(
-                future,
-                timeout=_PACKAGE_WORKSPACE_AGENT_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not package the workspace agent "
-                    f"within {_PACKAGE_WORKSPACE_AGENT_TIMEOUT_S:.0f}s"
-                ),
-            ) from exc
+        host_registry.send_text(host_conn, frame)
+        return await asyncio.wait_for(future, timeout=_PACKAGE_WORKSPACE_AGENT_TIMEOUT_S)
+    except ConnectionError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"host '{host_conn.host_id}' connection lost",
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"host '{host_conn.host_id}' did not package the workspace agent "
+                f"within {_PACKAGE_WORKSPACE_AGENT_TIMEOUT_S:.0f}s"
+            ),
+        ) from exc
     finally:
         host_conn.pending_package_workspace_agents.pop(request_id, None)
 
