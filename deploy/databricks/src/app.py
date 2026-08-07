@@ -216,6 +216,20 @@ try:
         logger.warning("%s", _exposure)
 
     auth_provider = create_auth_provider()
+    sandbox_config = None
+    coda_app_name = os.environ.get("CODA_APP_NAME", "").strip()
+    coda_app_url = os.environ.get("CODA_APP_URL", "").strip()
+    public_server_url = os.environ.get("OMNIGENT_PUBLIC_SERVER_URL", "").strip()
+    if coda_app_name and coda_app_url and public_server_url:
+        from omnigent.server.managed_hosts import parse_sandbox_config
+
+        sandbox_config = parse_sandbox_config(
+            {
+                "provider": "coda",
+                "server_url": public_server_url,
+                "coda": {"app_name": coda_app_name, "app_url": coda_app_url},
+            }
+        )
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -229,6 +243,7 @@ try:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
+        sandbox_config=sandbox_config,
     )
 
     if __name__ == "__main__":
