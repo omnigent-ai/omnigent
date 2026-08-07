@@ -2041,7 +2041,7 @@ async def _auto_create_pi_terminal(
         write_extension_files,
     )
     from omnigent.pi_native_bridge import extension_path as pi_extension_path
-    from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runner._entry import _make_auth_token_factory, _runner_request_headers
 
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
@@ -2054,16 +2054,11 @@ async def _auto_create_pi_terminal(
     pi_extension = pi_extension_path(bridge_dir)
     session_dir = pi_session_dir(bridge_dir)
     auth_factory = _make_auth_token_factory()
-    auth_token = auth_factory() if auth_factory is not None else None
     # Route the extension's out-of-process POSTs (/events, /mcp,
-    # /policies/evaluate) through the shared header builder so they carry the
-    # workspace / deployment routing selectors, not just a bare bearer. A bare
-    # bearer skips those selectors and can land on a different server instance
-    # than the one the runner (and the web UI) are on, so live-streamed items
-    # never reach the browser's in-process event stream (they only appear on reload).
-    from omnigent.cli_auth import databricks_request_headers
-
-    auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
+    # /policies/evaluate) through the same routing + dual-auth header builder as
+    # runner callbacks. Managed runners need the Apps SP bearer at ingress and
+    # the owner JWT in the internal owner-token header.
+    auth_headers = _runner_request_headers(auth_factory, launch_config.server_url)
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's

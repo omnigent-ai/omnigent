@@ -34,6 +34,7 @@ from omnigent.runner._entry import (
     _run_inactivity_monitor,
     _run_parent_death_killer,
     _runner_parent_pid_from_env,
+    _runner_request_headers,
     _runner_threadpool_max_workers,
     _runner_tunnel_binding_token_from_env,
     _runner_workspace_from_env,
@@ -840,6 +841,21 @@ def test_runner_databricks_auth_sends_apps_and_owner_headers() -> None:
     )
     assert captured == ["Bearer apps-sp-token"]
     assert request.headers[RUNNER_OWNER_TOKEN_HEADER] == "owner-jwt"
+
+
+def test_runner_request_headers_sends_apps_and_owner_headers() -> None:
+    """Out-of-process clients get the same managed dual-header contract."""
+
+    class _Factory:
+        ingress_bearer = "apps-sp-token"
+
+        def __call__(self) -> str:
+            return "owner-jwt"
+
+    headers = _runner_request_headers(_Factory(), "https://app.databricksapps.com")
+
+    assert headers["Authorization"] == "Bearer apps-sp-token"
+    assert headers[RUNNER_OWNER_TOKEN_HEADER] == "owner-jwt"
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:

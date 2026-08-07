@@ -251,6 +251,29 @@ async def _run_inactivity_monitor(
         await asyncio.sleep(min(poll_interval_s, idle_timeout_s - elapsed_s))
 
 
+def _runner_request_headers(
+    factory: Callable[[], str | None] | None,
+    server_url: str,
+) -> dict[str, str]:
+    """Build routing and dual-auth headers for runner-owned HTTP clients.
+
+    A managed runner's owner JWT authenticates inside Omnigent, while the
+    host-provided service-principal bearer is still required to cross a
+    Databricks Apps ingress. Callers outside :class:`_RunnerDatabricksAuth`
+    (notably the native-Pi extension) must preserve the same separation.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+
+    token = factory() if factory is not None else None
+    ingress_bearer = getattr(factory, "ingress_bearer", None)
+    headers = databricks_request_headers(server_url, bearer_token=ingress_bearer or token)
+    if ingress_bearer and token:
+        from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+        headers[RUNNER_OWNER_TOKEN_HEADER] = token
+    return headers
+
+
 class _RunnerDatabricksAuth(httpx.Auth):
     """httpx Auth that mints a fresh Databricks OAuth token per request.
 
