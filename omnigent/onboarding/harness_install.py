@@ -106,8 +106,16 @@ KIRO_KEY = "kiro"
 #   CLI loses only smart-routing spawn gating, not the ability to launch.
 # - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
-# - kimi: first ``kimi-cli`` release after 2026-06-01 is 1.47.0
-#   (https://github.com/MoonshotAI/kimi-cli/blob/main/CHANGELOG.md).
+# - kimi: the binary this spec gates is Kimi *Code*
+#   (https://github.com/MoonshotAI/kimi-code, installed by the ``code.kimi.com``
+#   script below), which ships a 0.x series — NOT the separate 1.x
+#   ``kimi-cli`` project (https://github.com/MoonshotAI/kimi-cli), whose
+#   command surface is explicitly rejected here (see
+#   ``tests/onboarding/test_harness_install.py``). Pin the floor to the oldest
+#   Kimi Code the native harness has actually been verified against, 0.29.1
+#   (the login/logout/credential behaviour documented on ``KIMI_KEY`` below and
+#   in ``onboarding/kimi_auth.py``). A 1.x floor is unreachable for every real
+#   Kimi Code install and reads as a permanent "Needs upgrade".
 # - hermes: parent_session_id schema was introduced in v0.17.0, but Hermes now
 #   ships date-tagged releases; the first one after 2026-06-01 is 2026.06.05.
 _CODEX_MIN_VERSION = "0.137.0"
@@ -118,7 +126,7 @@ _HERMES_MIN_VERSION = "2026.06.05"
 _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
-_KIMI_MIN_VERSION = "1.47.0"
+_KIMI_MIN_VERSION = "0.29.1"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -243,8 +251,9 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         login_args=("login",),
         install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
-        # First kimi-cli release after 2026-06-01. Older builds may lack
-        # newer TUI/session wiring needed by the native harness.
+        # Oldest Kimi Code (0.x series — see the note above) the native
+        # harness is verified against. Older builds may lack the TUI/session
+        # wiring the bridge drives.
         min_version=_KIMI_MIN_VERSION,
     ),
     KIRO_KEY: HarnessInstallSpec(
