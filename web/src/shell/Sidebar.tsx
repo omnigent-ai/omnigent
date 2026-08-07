@@ -756,11 +756,7 @@ export function Sidebar({
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
         <>
-          <div
-            className={cn("flex h-12 shrink-0 items-center justify-between pr-3 pl-4", {
-              // hidden: peek,
-            })}
-          >
+          <div className="flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
