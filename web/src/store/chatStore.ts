@@ -78,6 +78,7 @@ import type {
   StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
+import { acquireStreamSlot } from "@/lib/streamTabRegistry";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -3286,6 +3287,11 @@ export async function startStreamPump(
   // established stream — failed opens leave it false so a recovered first
   // connect is still treated as initial, not a reconnect.
   let hasConnected = false;
+  // Advertise this tab's held stream for the duration of the binding, so other
+  // tabs can count how many of the browser's ~6 per-origin HTTP connections are
+  // occupied by SSE streams. Scoped to the whole loop (not per attempt) because
+  // a reconnect gap still belongs to a bound stream. Released in the `finally`.
+  const releaseStreamSlot = acquireStreamSlot();
   // A reconnect loop is inherently sequential — open → pump → reconnect —
   // so its awaits cannot be parallelized; no-await-in-loop doesn't apply.
   /* eslint-disable no-await-in-loop */
@@ -3399,6 +3405,7 @@ export async function startStreamPump(
       }
     }
   } finally {
+    releaseStreamSlot();
     if (get().abortController === controller) {
       set({ abortController: null });
     }
