@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import mimetypes
+import ntpath
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -430,11 +431,26 @@ def register_resources_routes(
         the path and nothing else: it cannot see who is asking, so it does
         not try to — it enforces the sandbox grants, this enforces identity.
 
+        ``ntpath.isabs`` is used deliberately, and on every platform: it is
+        true for BOTH a POSIX leading slash (the wire form this API defines)
+        and a Windows drive or UNC root. A gate about identity has to fail
+        closed on anything that could be absolute *anywhere*, not just on the
+        shape the current deployment happens to send — otherwise a
+        ``C:\\Users\\...`` path would slip through at the collaborator level
+        and be stopped only by the runner rejecting it further down.
+
+        Note this is the AUTHORIZATION predicate, not the wire-format one.
+        Deciding how to encode the path for the runner stays
+        ``startswith("/")``, because that is a URL question and URLs use ``/``
+        on every platform. The two can disagree only for a Windows-style
+        path, where the result is a stricter gate plus a runner-side refusal
+        — closed on both counts.
+
         :param client_path: Client-supplied path; a leading ``/`` is absolute.
         :param within_workspace: Level required for a workspace-relative path.
         :returns: The required permission level.
         """
-        return LEVEL_OWNER if client_path.startswith("/") else within_workspace
+        return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
 
     async def _authorize_absolute_browse(session_id: str, absolute_path: str) -> str:
         """Authorize an absolute browse target for the host-served path.

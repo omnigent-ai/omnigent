@@ -535,3 +535,32 @@ async def test_filesystem_relative_search_stays_open_to_collaborators(
 
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path_segment",
+    ["C:%5CUsers%5Ccorey%5Csecret.txt", "%5C%5Cserver%5Cshare%5Csecret.txt"],
+    ids=["windows-drive", "windows-unc"],
+)
+async def test_filesystem_windows_absolute_is_owner_gated_too(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    path_segment: str,
+) -> None:
+    """A Windows-shaped absolute path is gated at owner as well.
+
+    The wire form this API defines is a POSIX leading slash, so a
+    ``C:\\Users\\...`` path is not what a client should send -- but the gate
+    decides *identity*, and must fail closed on anything absolute on any
+    platform rather than trust the shape. Before this, such a path was
+    treated as workspace-relative and admitted at the collaborator level,
+    stopped only by the runner refusing it further down; the identity
+    decision should not depend on a later layer catching it.
+    """
+    resp = await client.get(
+        f"{_FS_BASE}/{path_segment}", headers={"X-Forwarded-Email": "owner@example.com"}
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
