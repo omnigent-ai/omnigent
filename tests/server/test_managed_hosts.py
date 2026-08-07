@@ -1595,6 +1595,8 @@ def _capability_probe_app(
         # Launch-capable provider configured → the web UI may offer the
         # sandbox option, labeled with the provider name ("Modal Sandbox").
         ({"provider": "modal", "server_url": "https://s.example.com"}, True, "modal"),
+        # Blaxel supports managed launch and must be exposed to the web UI.
+        ({"provider": "blaxel", "server_url": "https://s.example.com"}, True, "blaxel"),
         # No `sandbox:` section → a managed create would 400; the option
         # must not be advertised and no provider is named.
         (None, False, None),

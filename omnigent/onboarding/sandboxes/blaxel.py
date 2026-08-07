@@ -730,7 +730,7 @@ class BlaxelSandboxLauncher(ExecModelHostLauncher):
             raise click.ClickException(
                 "No complete Blaxel credentials were found. Set BL_WORKSPACE and "
                 "BL_API_KEY, or install the Blaxel CLI and run `bl login` for a "
-                "non-production workspace."
+                "workspace."
             )
         for name in (
             "api_key",
