@@ -112,6 +112,7 @@
     0 4px 16px -2px rgb(var(--ui-shadow-warm-rgb) / 0.1),
     0 1px 0 rgb(var(--ui-shadow-neutral-rgb) / 0.02);
   --shadow-tooltip: 0 3px 6px rgb(var(--ui-shadow-neutral-rgb) / 0.05);
+  --shadow-dialog: 0 16px 48px rgb(var(--ui-shadow-neutral-rgb) / 0.2);
 }
 
 /* The two body text steps. Keep these non-inline: `@theme inline` bakes the

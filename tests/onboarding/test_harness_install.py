@@ -1111,13 +1111,13 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
     [
         (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
-        (hi.KIMI_KEY, "1.47.0", None),
+        (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
         (hi.PI_KEY, "0.79.0", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
-        (hi.HERMES_KEY, "2026.06.05", None),
+        (hi.HERMES_KEY, "0.17.0", None),
         (hi.KIRO_KEY, "2.10.0", None),
     ],
 )
@@ -1214,6 +1214,55 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
+def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current ``kimi-code`` build must read as installed, not too-low.
+
+    The floor tracks Moonshot's ``kimi-code`` CLI (a 0.x series, the binary
+    this spec's installer puts on PATH), not the separately numbered
+    ``kimi-cli`` project. Pinning it to a 1.x version made every shipping
+    ``kimi`` fail the range, so ``harness_is_configured`` stayed false and the
+    host refused every kimi-native launch.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="0.34.0\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_the_hermes_floor_accepts_the_shipping_version_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes' semver ``--version`` line must satisfy the floor.
+
+    Hermes prints ``Hermes Agent v0.19.1 (2026.7.30)`` — a semver with the
+    build date beside it — so the parser reads ``0.19.1``. A date-shaped floor
+    could never be met by that string, which left hermes-native unlaunchable.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="Hermes Agent v0.19.1 (2026.7.30)\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.HERMES_KEY) is True
+
+
 def test_harness_cli_installed_true_when_version_in_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1263,8 +1312,8 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     "key,outdated,satisfying",
     [
         (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
-        (hi.KIMI_KEY, "1.46.0", "1.48.0"),
-        (hi.HERMES_KEY, "2026.05.29", "2026.06.19"),
+        (hi.KIMI_KEY, "0.6.0", "0.34.0"),
+        (hi.HERMES_KEY, "0.16.9", "0.19.1"),
     ],
 )
 def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(

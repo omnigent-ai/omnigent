@@ -1670,18 +1670,6 @@
       "GrantPermissionRequest": {
         "description": "Request body for `PUT /v1/sessions/{id}/permissions`.",
         "properties": {
-          "can_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Whether the owner delegates privileged-action approval authority to this user.",
-            "title": "Can Approve"
-          },
           "level": {
             "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
             "maximum": 3.0,
@@ -2556,12 +2544,6 @@
       "PermissionObject": {
         "description": "API representation of a session permission grant.",
         "properties": {
-          "can_approve": {
-            "default": false,
-            "description": "Whether this grantee may approve privileged actions.",
-            "title": "Can Approve",
-            "type": "boolean"
-          },
           "conversation_id": {
             "description": "The session, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",
@@ -4213,18 +4195,6 @@
             "title": "Archived",
             "type": "boolean"
           },
-          "can_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Whether the requesting user may accept privileged actions for this session. `None` when permissions are disabled.",
-            "title": "Can Approve"
-          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -4953,18 +4923,6 @@
             ],
             "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
             "title": "Background Task Count"
-          },
-          "can_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Whether the requesting user may accept privileged actions for this session. `None` when permissions are disabled.",
-            "title": "Can Approve"
           },
           "context_window": {
             "anyOf": [

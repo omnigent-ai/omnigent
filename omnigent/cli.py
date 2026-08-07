@@ -1301,8 +1301,9 @@ def _apply_bind_auth_defaults(host: str) -> None:
 
     The bind address is the discriminator for the *implicit* (env-unset)
     auth posture. Explicit operator choices always win — an
-    ``OMNIGENT_AUTH_PROVIDER`` keeps header/oidc, and
-    ``OMNIGENT_AUTH_ENABLED`` (or its deprecated alias) pins auth on/off.
+    ``OMNIGENT_AUTH_PROVIDER`` keeps header/oidc,
+    ``OMNIGENT_AUTH_ENABLED`` pins auth on/off, and a truthy
+    ``OMNIGENT_LOCAL_SINGLE_USER`` declares a single-user server.
 
     Decision matrix for the env-unset default:
 
@@ -1318,6 +1319,15 @@ def _apply_bind_auth_defaults(host: str) -> None:
       login. First-admin setup happens via the web Create-admin form
       (the server boots and serves; no terminal prompt). Mirrors the
       Docker/Cloudflare/k8s entrypoints.
+    - **Non-loopback + a truthy ``OMNIGENT_LOCAL_SINGLE_USER``** → leave
+      header mode alone and warn via
+      :func:`~omnigent.server.auth.warn_if_single_user_exposed`. The
+      operator declared a single-operator server, so auto-enabling
+      accounts would route identity through
+      :meth:`UnifiedAuthProvider._check_cookie`, where neither the
+      ``"local"`` fallback nor the identity header is reachable — 401 on
+      every request and 403 on the host tunnel, a total outage rather
+      than a login prompt.
 
     Uses ``setdefault`` throughout so an operator's explicit value wins.
     Must run before ``create_auth_provider()``, which reads these vars.
@@ -1326,9 +1336,14 @@ def _apply_bind_auth_defaults(host: str) -> None:
         ``"0.0.0.0"``.
     :returns: None.
     """
-    from omnigent.server.auth import resolve_auth_source as _resolve_auth_source
+    from omnigent.server.auth import (
+        bind_host_is_loopback,
+        env_var_is_truthy,
+        resolve_auth_source,
+        warn_if_single_user_exposed,
+    )
 
-    _is_loopback_bind = host in ("127.0.0.1", "localhost", "::1")
+    _is_loopback_bind = bind_host_is_loopback(host)
     # Compose-style deploys pass OMNIGENT_AUTH_PROVIDER as an empty
     # string when unset ("${VAR:-}"), so empty and missing both mean
     # "not explicitly pinned".
@@ -1336,12 +1351,21 @@ def _apply_bind_auth_defaults(host: str) -> None:
     _auth_provider_explicit = bool(_raw_auth_provider and _raw_auth_provider.strip())
 
     # Loopback + header default → single-user marker (no login).
-    if _is_loopback_bind and not _auth_provider_explicit and _resolve_auth_source() == "header":
+    if _is_loopback_bind and not _auth_provider_explicit and resolve_auth_source() == "header":
         os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
+
+    # Only truthy counts: LOCAL_SINGLE_USER=0 is an explicit opt-out and must
+    # not suppress the accounts auto-enable below.
+    _single_user_requested = env_var_is_truthy("OMNIGENT_LOCAL_SINGLE_USER")
 
     # Non-loopback + no explicit auth → accounts (login) mode.
     _auth_enabled_explicit = bool(os.environ.get("OMNIGENT_AUTH_ENABLED", "").strip())
-    if not _is_loopback_bind and not _auth_provider_explicit and not _auth_enabled_explicit:
+    if (
+        not _is_loopback_bind
+        and not _auth_provider_explicit
+        and not _auth_enabled_explicit
+        and not _single_user_requested
+    ):
         os.environ.setdefault("OMNIGENT_AUTH_ENABLED", "1")
         click.echo(
             f"  ⚠ Binding to non-local interface {host}: enabling accounts "
@@ -1352,6 +1376,11 @@ def _apply_bind_auth_defaults(host: str) -> None:
             "single-user mode.",
             err=True,
         )
+    else:
+        # Self-gates on a reachable bind and a resolved source of "header".
+        _exposure = warn_if_single_user_exposed(host)
+        if _exposure:
+            click.echo(f"  ⚠ {_exposure}", err=True)
 
 
 def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)
@@ -1604,8 +1633,8 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     }
 
 
-def _help_style(text: str, **style: object) -> str:
-    """Colorize *text* for help output, honoring ``NO_COLOR``.
+def _cli_style(text: str, **style: object) -> str:
+    """Colorize *text* for terminal output, honoring ``NO_COLOR``.
 
     Click's ``echo`` already strips ANSI when the sink is not a TTY, so
     this only needs to guard the explicit ``NO_COLOR`` opt-out; on an
@@ -1629,7 +1658,7 @@ class _OmnigentCLI(click.Group):
     def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Render the usage line with an accent-colored ``Usage:`` prefix."""
         pieces = self.collect_usage_pieces(ctx)
-        prefix = f"{_help_style('Usage:', fg=_ACCENT_RGB, bold=True)} "
+        prefix = f"{_cli_style('Usage:', fg=_ACCENT_RGB, bold=True)} "
         formatter.write_usage(ctx.command_path, " ".join(pieces), prefix=prefix)
 
     def format_options(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
@@ -1638,9 +1667,9 @@ class _OmnigentCLI(click.Group):
         for param in self.get_params(ctx):
             rv = param.get_help_record(ctx)
             if rv is not None:
-                opts.append((_help_style(rv[0], fg="green"), rv[1]))
+                opts.append((_cli_style(rv[0], fg="green"), rv[1]))
         if opts:
-            with formatter.section(_help_style("Options", fg=_ACCENT_RGB, bold=True)):
+            with formatter.section(_cli_style("Options", fg=_ACCENT_RGB, bold=True)):
                 formatter.write_dl(opts)
         self.format_commands(ctx, formatter)
 
@@ -1688,10 +1717,10 @@ class _OmnigentCLI(click.Group):
         def _emit(title: str, rows: list[tuple[str, click.Command]], name_fg: object) -> None:
             if not rows:
                 return
-            with formatter.section(_help_style(title, fg=_ACCENT_RGB, bold=True)):
+            with formatter.section(_cli_style(title, fg=_ACCENT_RGB, bold=True)):
                 formatter.write_dl(
                     [
-                        (_help_style(name, fg=name_fg), cmd.get_short_help_str(limit))
+                        (_cli_style(name, fg=name_fg), cmd.get_short_help_str(limit))
                         for name, cmd in rows
                     ]
                 )
@@ -1700,7 +1729,7 @@ class _OmnigentCLI(click.Group):
         if any_hidden:
             formatter.write_paragraph()
             formatter.write_text(
-                _help_style(
+                _cli_style(
                     "Some harnesses need an optional extra — run `omnigent setup` to enable them.",
                     dim=True,
                 )
@@ -1827,6 +1856,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "sandbox",
         "server",
         "setup",
+        "start",
         "stop",
         "uninstall",
         "update",
@@ -4142,6 +4172,47 @@ def server_status(json_output: bool) -> None:
     click.echo(f"  host daemon attached: {'yes' if daemon_attached else 'no'}")
 
 
+@cli.command("start")
+@click.option("--server", default=None, help="Omnigent server URL to host on.")
+@click.option(
+    "--non-interactive",
+    "non_interactive",
+    is_flag=True,
+    default=False,
+    help=(
+        "Never prompt for sign-in. When the server requires auth and you "
+        "are not logged in, fail with the `omnigent login` hint instead of "
+        "launching the browser login flow. Use this in scripts and CI."
+    ),
+)
+def start(server: str | None, non_interactive: bool) -> None:
+    """Start Omnigent on this machine, in the background.
+
+    The on switch, and the counterpart of ``omnigent stop``: brings up the
+    local server (web UI / history) and registers this machine as a host, then
+    returns. With a configured or explicit ``--server`` it hosts on that server
+    instead, and no local server is started.
+
+    An alias of ``omnigent host --background`` — reach for that spelling when
+    a script wants the host lifecycle by name (``omnigent host status`` /
+    ``omnigent host stop``). Sign-in happens here, in your terminal, before the
+    daemon detaches.
+
+    :param server: Omnigent server URL to host on, e.g.
+        ``"https://example.databricksapps.com"``. ``None`` falls back to
+        config; empty string forces local mode.
+    :param non_interactive: When ``True``, never launch the browser login for
+        an un-authed remote server — fail with the ``omnigent login`` hint
+        instead.
+    :returns: None.
+    """
+    _run_background_host(
+        _resolve_host_server(server),
+        stop_command="omnigent stop",
+        non_interactive=non_interactive,
+    )
+
+
 @cli.command("stop")
 @click.option(
     "--force",
@@ -4151,10 +4222,11 @@ def server_status(json_output: bool) -> None:
 def stop(force: bool) -> None:
     """Stop everything Omnigent is running on this machine.
 
-    The off switch: stops every host daemon (local and remote-targeted)
-    and the detached background server. Runners are reaped when their daemon
-    exits. To stop only hosting while keeping the local server (web UI /
-    history) up, use ``omnigent host stop`` instead.
+    The off switch, and the counterpart of ``omnigent start``: stops every host
+    daemon (local and remote-targeted) and the detached background server.
+    Runners are reaped when their daemon exits. To stop only hosting while
+    keeping the local server (web UI / history) up, use ``omnigent host stop``
+    instead.
 
     :param force: Continue past individual failures and SIGKILL daemons that
         do not exit on SIGTERM.
@@ -7642,8 +7714,147 @@ def _prompt_stop_local_server() -> None:
         click.echo(f"Left the local server running at {url}.")
 
 
+# Grace period a freshly spawned background host daemon must survive before
+# `host --background` reports success. A daemon that dies on startup (bad
+# server URL, missing credentials) leaves nothing on the terminal, so we wait
+# this long and surface its log instead of falsely reporting success.
+_BACKGROUND_HOST_GRACE_S = 2.0
+
+
+def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
+    """Fail loud if a freshly spawned background host daemon dies at once.
+
+    :param record: Registry record of the spawned daemon.
+    :raises click.ClickException: If the daemon exits within
+        :data:`_BACKGROUND_HOST_GRACE_S`.
+    """
+    deadline = time.time() + _BACKGROUND_HOST_GRACE_S
+    while True:
+        if not _pid_alive(record.pid):
+            from omnigent._runner_startup import format_runner_log_tail
+
+            log_path = Path(record.log_path) if record.log_path else None
+            raise click.ClickException(
+                "The host daemon exited immediately after starting."
+                f"{format_runner_log_tail(log_path)}"
+            )
+        if time.time() >= deadline:
+            return
+        time.sleep(0.1)
+
+
+def _run_background_host(
+    server: str | None,
+    *,
+    stop_command: str,
+    non_interactive: bool,
+) -> None:
+    """Spawn (or reuse) the detached host daemon and report it.
+
+    The background counterpart of the foreground ``omnigent host`` body,
+    selected by ``--background`` (and the whole of ``omnigent start``): the
+    same daemon loop runs detached (see :func:`_ensure_host_daemon`) so the
+    command returns instead of blocking.
+
+    Sign-in stays in the foreground. The detached daemon has no terminal to
+    prompt on, so a Databricks-fronted server is authenticated here, before the
+    spawn — otherwise the daemon would die in the background with an opaque
+    redirect error.
+
+    :param server: Resolved Omnigent server URL, e.g.
+        ``"https://example.databricksapps.com"``. ``None`` or ``""`` selects
+        local mode (the daemon starts or reuses a local Omnigent server).
+    :param stop_command: Command to echo for stopping this daemon, e.g.
+        ``"omnigent stop"`` — each entry point suggests the teardown that
+        matches how it was invoked.
+    :param non_interactive: When ``True``, never launch the browser login —
+        fail with the ``omnigent login`` hint instead.
+    :raises click.ClickException: If the daemon cannot be spawned, exits
+        immediately after starting, or (local mode) never serves its local
+        Omnigent server.
+    """
+    if server:
+        _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+    target = _normalize_daemon_target(server)
+    previous = _find_daemon_record(target)
+    _ensure_host_daemon(server or None)
+    record = _find_daemon_record(target)
+    if record is None:
+        # No record for this target: either the live local-mode daemon already
+        # serves the requested URL, or the spawn itself failed.
+        if _local_daemon_serves_target(target, server or None):
+            click.echo(f"The local host daemon already serves {target}.")
+            return
+        raise click.ClickException(
+            "Could not spawn the background host daemon. See ~/.omnigent/logs/host/ for details."
+        )
+    if previous is not None and previous.pid == record.pid:
+        headline = _cli_style("Host daemon already running", fg="yellow", bold=True)
+    else:
+        _confirm_background_host_alive(record)
+        headline = _cli_style("Started the host daemon in the background", fg="green", bold=True)
+    click.echo(f"{headline} (pid {record.pid}).")
+    if record.mode == "local":
+        # A local-mode daemon owns the local Omnigent server, so this command is
+        # the whole "start everything" step — wait for that server and report
+        # its URL, otherwise the Web UI is unreachable without a follow-up
+        # `omnigent server status`. Resolved after the headline above so a cold
+        # start isn't a silent terminal.
+        server_url = _discover_local_server_url()
+        _update_daemon_resolved_server_url(target, server_url)
+    else:
+        server_url = target
+    _echo_host_field("server", _cli_style(server_url, fg="cyan"))
+    if record.log_path is not None:
+        _echo_host_field("log", _display_path(Path(record.log_path)))
+    click.echo()
+    click.echo(_cli_style("Stop it with:", dim=True))
+    click.echo(f"  {_cli_style(stop_command, bold=True)}")
+
+
+def _echo_host_field(label: str, value: str) -> None:
+    """Echo one aligned ``label: value`` detail row.
+
+    :param label: Row label without its colon, e.g. ``"server"``.
+    :param value: Row value, possibly already ANSI-styled — padding is
+        applied to the label so escape codes can't skew the alignment.
+    """
+    click.echo(f"  {label + ':':<8}{value}")
+
+
+def _host_stop_command(explicit_server: str | None) -> str:
+    """Build the ``host stop`` command that mirrors how ``host`` was invoked.
+
+    ``host`` and ``host stop`` resolve their target the same way (the
+    ``--server`` value, else config, else local), so repeating the flag the
+    user omitted would be noise — and repeating the one they passed keeps the
+    command correct when config names a different target.
+
+    :param explicit_server: The ``--server`` value as the user spelled it,
+        e.g. ``"https://example.databricksapps.com"`` or ``""`` for local
+        mode. ``None`` when the option was omitted.
+    :returns: A copy-pasteable command, e.g. ``"omnigent host stop"``.
+    """
+    if explicit_server is None:
+        return "omnigent host stop"
+    stop_target = explicit_server if explicit_server else '""'
+    return f"omnigent host stop --server {stop_target}"
+
+
 @cli.group("host", cls=_HostGroup, invoke_without_command=True)
 @click.option("--server", default=None, help="Remote omnigent server URL.")
+@click.option(
+    "--background",
+    "background",
+    is_flag=True,
+    default=False,
+    help=(
+        "Spawn the host daemon as a detached background process (returning "
+        "immediately) instead of running it in the foreground. Reuses a "
+        "healthy daemon if one is already up. Sign-in still happens in the "
+        "foreground, before the spawn."
+    ),
+)
 @click.option(
     "--non-interactive",
     "non_interactive",
@@ -7656,7 +7867,12 @@ def _prompt_stop_local_server() -> None:
     ),
 )
 @click.pass_context
-def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
+def host(
+    ctx: click.Context,
+    server: str | None,
+    background: bool,
+    non_interactive: bool,
+) -> None:
     """
     Register this machine as a host with a server.
 
@@ -7665,6 +7881,7 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
       omnigent host https://omnigent-app.databricksapps.com
       omnigent host --server https://omnigent-app.databricksapps.com
       omnigent host ""   # spawn + connect to a local server
+      omnigent host --background   # spawn detached, return immediately
 
     The server URL may be given positionally (``omnigent host
     <url>``) or via ``--server <url>``. A leading ``status``, ``stop``,
@@ -7674,13 +7891,16 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     in, ``host`` runs the same flow ``omnigent login`` would before
     connecting (an interactive browser flow). Pass ``--non-interactive``
     to keep the old scripted behavior: fail with the login command to run
-    instead of prompting.
+    instead of prompting. This holds for ``--background`` too: the login
+    flow runs here, in your terminal, before the daemon is detached.
 
     :param ctx: Click invocation context. ``ctx.invoked_subcommand`` is
         set when a management subcommand such as ``"status"`` is running.
     :param server: Remote Omnigent server URL, e.g.
         ``"https://example.databricksapps.com"``. ``None`` falls back
         to config; empty string selects local mode.
+    :param background: When ``True``, spawn the daemon detached and return
+        instead of running the daemon loop in the foreground.
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
@@ -7689,6 +7909,9 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     ctx.obj["server"] = server
     if ctx.invoked_subcommand is not None:
         return
+    # Kept before the config fallback below: `--background` echoes a `host
+    # stop` command that mirrors how this command was invoked.
+    explicit_server = server
     cfg = _load_effective_config()
     if server is None:
         server = cfg.get("server")
@@ -7698,6 +7921,14 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     # ``server`` to the spawned loopback URL — only a remote target needs
     # the sign-in pre-flight.
     remote_mode = bool(server)
+
+    if background:
+        _run_background_host(
+            server,
+            stop_command=_host_stop_command(explicit_server),
+            non_interactive=non_interactive,
+        )
+        return
 
     from omnigent.host.connect import run_host_process
 
@@ -8319,6 +8550,71 @@ def _host_markup(text: _HostJsonValue, *, missing: str = "-") -> str:
     return escape(_host_display_value(text, missing=missing))
 
 
+_HOST_LINK_UNSAFE_CHARS = frozenset(" \t\n\r\x7f[]")
+
+
+def _host_link_safe(url: str) -> bool:
+    """
+    Report whether a URL can be embedded in Rich link markup.
+
+    Whitespace and control characters break the OSC 8 sequence, and square
+    brackets terminate the ``[link=...]`` tag early.
+
+    :param url: Candidate hyperlink target, e.g. ``"https://example.com"``.
+    :returns: ``True`` when the URL is safe to embed.
+    """
+    return bool(url) and not any(char in _HOST_LINK_UNSAFE_CHARS or char < " " for char in url)
+
+
+def _host_link_target(value: _HostJsonValue) -> str | None:
+    """
+    Build a hyperlink target from a server URL.
+
+    :param value: Candidate URL, e.g. ``"https://example.com"``.
+    :returns: The URL when it can be linked, otherwise ``None``.
+    """
+    url = _host_display_value(value, missing="")
+    if not url.startswith(("http://", "https://")):
+        return None
+    return url if _host_link_safe(url) else None
+
+
+def _host_log_link_target(value: _HostJsonValue) -> str | None:
+    """
+    Build a ``file://`` hyperlink target from a daemon log path.
+
+    :param value: Candidate log path, e.g. ``"/tmp/daemon.log"``.
+    :returns: The file URI when it can be linked, otherwise ``None``.
+    """
+    path_text = _host_display_value(value, missing="")
+    if not path_text:
+        return None
+    try:
+        url = Path(path_text).absolute().as_uri()
+    except ValueError:
+        return None
+    return url if _host_link_safe(url) else None
+
+
+def _host_linked(text: str, *, target: str | None) -> str:
+    """
+    Render display text as an explicit terminal hyperlink.
+
+    Terminals guess where a bare URL ends, so a shortened URL or one that
+    fills the line is opened with the surrounding status text glued on. An
+    OSC 8 link carries the real target and its exact bounds instead, which
+    lets the visible text stay shortened without breaking the click.
+
+    :param text: Display text, possibly shortened to fit the terminal.
+    :param target: Hyperlink target, or ``None`` to render plain text.
+    :returns: Rich markup for the display text.
+    """
+    escaped = _host_markup(text)
+    if target is None:
+        return escaped
+    return f"[link={target}]{escaped}[/link]"
+
+
 def _host_target_label(payload: _HostPayload, *, width: int) -> str:
     """
     Build a compact daemon target label.
@@ -8483,7 +8779,9 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
         target = _host_target_label(payload, width=max(24, min(console.width - 2, 96)))
         process = _host_display_value(payload.get("process"), missing="unknown")
         host_status = _host_display_value(payload.get("host_status"), missing="unknown")
-        console.print(f"[bold cyan]{_host_markup(target)}[/bold cyan]")
+        server_link = _host_link_target(payload.get("server_url"))
+        target_link = server_link or _host_link_target(payload.get("target"))
+        console.print(f"[bold cyan]{_host_linked(target, target=target_link)}[/bold cyan]")
         console.print(
             "  "
             f"mode={_host_markup(payload.get('mode'))}  "
@@ -8495,10 +8793,15 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
             payload.get("server_url"),
             max_chars=max(24, console.width - 11),
         )
-        console.print(f"  server={_host_markup(server_text)}")
+        console.print(f"  server={_host_linked(server_text, target=server_link)}")
         console.print(f"  host_id={_host_markup(payload.get('host_id'))}")
         if payload.get("log_path"):
-            console.print(f"  log={_host_markup(payload.get('log_path'))}")
+            log_text = _host_shorten(
+                payload.get("log_path"),
+                max_chars=max(24, console.width - 8),
+            )
+            log_link = _host_log_link_target(payload.get("log_path"))
+            console.print(f"  log={_host_linked(log_text, target=log_link)}")
         if payload.get("error"):
             message = _host_truncate(
                 payload.get("error"),

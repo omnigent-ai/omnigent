@@ -36,7 +36,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import ValidationError
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -86,7 +86,6 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
-from omnigent.runtime.prompt import model_author_prefix
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
@@ -1116,20 +1115,6 @@ def _permission_level_from_grants(
     return None
 
 
-def _approval_access_from_grants(
-    user_id: str | None,
-    grants: list[SessionPermission],
-    is_admin: bool,
-) -> bool | None:
-    """Derive effective approval authority from pre-fetched grants."""
-    if user_id is None:
-        return None
-    if is_admin:
-        return True
-    user_grant = next((grant for grant in grants if grant.user_id == user_id), None)
-    return user_grant is not None and (user_grant.level >= LEVEL_OWNER or user_grant.can_approve)
-
-
 def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
     """
     Find the session owner from a pre-fetched list of grants.
@@ -1625,15 +1610,22 @@ def _publish_external_assistant_message(
     session_stream.publish(session_id, event.model_dump())
 
 
-def _resolve_llm_model(conv: Conversation | None) -> str | None:
+def _resolve_llm_model(
+    conv: Conversation | None,
+    *,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+) -> str | None:
     """
     Resolve the LLM model identifier from a conversation's agent spec.
 
-    Uses the global agent cache to load the parsed spec and read
-    ``spec.llm.model``. Returns ``None`` when the conversation has
-    no agent binding or the spec cannot be loaded.
+    Uses injected agent dependencies when available, falling back to the
+    runtime globals for legacy callers. Returns ``None`` when the conversation
+    has no agent binding or the spec cannot be loaded.
 
     :param conv: The conversation entity, or ``None``.
+    :param agent_store: Optional store for resolving the bound agent.
+    :param agent_cache: Optional cache for loading the bound agent spec.
     :returns: Model string (e.g. ``"databricks-gpt-5-5"``), or
         ``None`` when unavailable.
     """
@@ -1645,21 +1637,31 @@ def _resolve_llm_model(conv: Conversation | None) -> str | None:
         # module-level name is a facade proxy that bypasses that patch).
         from omnigent.runtime import get_agent_cache
 
-        agent_cache = get_agent_cache()
-        # The agent store is injected at app startup; access it
-        # through the runtime globals.
-        from omnigent.runtime._globals import _agent_store
+        if agent_store is None:
+            from omnigent.runtime._globals import _agent_store
 
-        if _agent_store is None:
+            agent_store = _agent_store
+        if agent_store is None:
             return None
-        agent = _agent_store.get(conv.agent_id)
+        if agent_cache is None:
+            agent_cache = get_agent_cache()
+        agent = agent_store.get(conv.agent_id)
         if agent is None:
             return None
         loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         return loaded.spec.llm.model if loaded.spec.llm else None
-    except (KeyError, AttributeError, ValueError, ImportError, OSError, RuntimeError):
+    # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
+    except (
+        KeyError,
+        AttributeError,
+        ValueError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        StatementError,
+    ):
         # ``RuntimeError`` covers ``get_agent_cache()`` before the runtime is
         # initialized: this is a best-effort display resolver (now also called
         # on native cost-only broadcasts), so an uninitialized runtime must
@@ -1674,7 +1676,12 @@ def _resolve_harness(*args: Any, **kwargs: Any) -> str | None:
     return _facade._resolve_harness(*args, **kwargs)
 
 
-def _resolve_harness_impl(conv: Conversation | None) -> str | None:
+def _resolve_harness_impl(
+    conv: Conversation | None,
+    *,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
 
@@ -1688,6 +1695,8 @@ def _resolve_harness_impl(conv: Conversation | None) -> str | None:
     model, e.g. a generic-provider launcher).
 
     :param conv: The conversation entity, or ``None``.
+    :param agent_store: Optional store for resolving the bound agent.
+    :param agent_cache: Optional cache for loading the bound agent spec.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -1703,14 +1712,19 @@ def _resolve_harness_impl(conv: Conversation | None) -> str | None:
     try:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime import get_agent_cache
-        from omnigent.runtime._globals import _agent_store
 
-        if _agent_store is None:
+        if agent_store is None:
+            from omnigent.runtime._globals import _agent_store
+
+            agent_store = _agent_store
+        if agent_store is None:
             return None
-        agent = _agent_store.get(conv.agent_id)
+        if agent_cache is None:
+            agent_cache = get_agent_cache()
+        agent = agent_store.get(conv.agent_id)
         if agent is None:
             return None
-        loaded = get_agent_cache().load(
+        loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
         executor = loaded.spec.executor
@@ -1731,7 +1745,16 @@ def _resolve_harness_impl(conv: Conversation | None) -> str | None:
             or executor.type
         )
         return canonicalize_harness(harness) or harness
-    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+    # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
+    except (
+        KeyError,
+        AttributeError,
+        ValueError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        StatementError,
+    ):
         return None
 
 
@@ -3369,27 +3392,6 @@ def _merge_pending_file_blocks(
         return item
     merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
     return item.model_copy(update={"data": merged_data})
-
-
-def _strip_pending_author_prefix(
-    item: NewConversationItem,
-    pending_content: list[dict[str, Any]],
-    created_by: str | None,
-) -> NewConversationItem:
-    """Remove a runner-added author prefix from mirrored native text."""
-    if not isinstance(item.data, MessageData) or not created_by:
-        return item
-    original_text = _message_text(pending_content)
-    mirrored_text = _message_text(item.data.content)
-    prefix = model_author_prefix(created_by)
-    if original_text is None or mirrored_text != prefix + original_text:
-        return item
-    content = [dict(block) for block in item.data.content]
-    for block in content:
-        if block.get("type") == "input_text" and isinstance(block.get("text"), str):
-            block["text"] = block["text"][len(prefix) :]
-            break
-    return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
 
 
 def _message_text(content: list[dict[str, Any]]) -> str | None:
@@ -6703,22 +6705,33 @@ def _build_policy_engine_from_spec_impl(
     spec: AgentSpec,
     session_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> PolicyEngine:
+    """Build an engine for *spec*, reusing a conversation row when held.
+
+    Every caller of this wrapper already loaded the conversation to
+    resolve *spec*; passing it lets the builder skip its own read. Only
+    the row's immutable identity is reused — the builder re-derives
+    labels, session_state and model from a fresh read (see
+    :func:`build_policy_engine`).
+    """
     caps = get_caps()
     host_connection = (
         caps.policy_llm_connection_factory() if caps.policy_llm_connection_factory else None
     )
-    return cast(
-        PolicyEngine,
-        build_policy_engine(
-            spec=spec,
-            conversation_id=session_id,
-            conversation_store=conversation_store,
-            default_policies=caps.default_policies,
-            policy_store=get_policy_store(),
-            server_llm=caps.llm,
-            host_connection=host_connection,
-        ),
+    return build_policy_engine(
+        spec=spec,
+        conversation_id=session_id,
+        conversation_store=conversation_store,
+        conversation=conversation,
+        # The spec was resolved from this row's agent binding; the builder
+        # confirms it against its own fresh read and fails closed if a
+        # switch-agent landed in between.
+        expected_agent_id=conversation.agent_id if conversation is not None else None,
+        default_policies=caps.default_policies,
+        policy_store=get_policy_store(),
+        server_llm=caps.llm,
+        host_connection=host_connection,
     )
 
 
@@ -6770,22 +6783,27 @@ async def _apply_pending_policy_ask_writes(
         return
     # Non-MCP relay path: pop and apply writes here since no retry
     # will arrive.
-    _pending_policy_ask_writes.pop(elicitation_id, None)
     # Resolve the agent spec + build the engine off the event loop: the
     # lookup, cold-cache bundle fetch, and engine construction are all
     # blocking DB/IO.
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
+        _pending_policy_ask_writes.pop(elicitation_id, None)
         return
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
+    # Pop only after the engine build succeeds: a raise here (e.g. a
+    # concurrent agent rebind) would otherwise lose the approved writes
+    # with no retry possible.
+    _pending_policy_ask_writes.pop(elicitation_id, None)
     # The label/state writes hit the DB synchronously too — keep them
     # off the loop.
     if pending.set_labels:
         await asyncio.to_thread(engine.apply_label_writes, pending.set_labels)
     if pending.state_updates:
-        await asyncio.to_thread(engine.apply_state_updates, pending.state_updates)
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(engine.apply_state_updates, pending.state_updates)
 
 
 def _build_actor(user_id: str | None) -> dict[str, str] | None:
@@ -6892,11 +6910,13 @@ def _build_evaluation_context(
             harness=hook_harness,
         )
     # REQUEST / RESPONSE — content is the user/assistant text. The wire ``data``
-    # is a dict for the native command hooks (``{"text"|"content": ...}``), but
-    # may be a bare string — opencode's policy plugin sends the prompt text
-    # directly for ``PHASE_REQUEST``. Accept both, and NEVER raise here: a crash
-    # 500s the evaluate endpoint, which silently fails the request/result gate
-    # OPEN (the exact symptom that let cost-over-budget terminal prompts through).
+    # is a dict for every current first-party producer (``{"text"|"content":
+    # ...}``, including OpenCode's plugin, which sends ``{"text": ...}``), but
+    # a bare string is still accepted for ``PHASE_REQUEST`` for compatibility
+    # with older or third-party callers that send the prompt text directly.
+    # Accept both, and NEVER raise here: a crash 500s the evaluate endpoint,
+    # which silently fails the request/result gate OPEN (the exact symptom
+    # that let cost-over-budget terminal prompts through).
     if isinstance(data, str):
         text = data
     elif isinstance(data, dict):
@@ -7181,7 +7201,7 @@ async def _evaluate_output_policy(
         return None
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     ctx = EvaluationContext(
         phase=Phase.RESPONSE,
@@ -7872,6 +7892,56 @@ def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, 
             _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE,
         }
     return {}
+
+
+def _repl_terminal_ui_labels(
+    *,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+    harness_override: str | None,
+) -> dict[str, str]:
+    """
+    Resolve the terminal-view label for a session that gets a REPL terminal.
+
+    A non-native session's runner auto-creates the ``omnigent`` REPL
+    terminal and stamps ``omnigent.ui: terminal`` only *after* that
+    terminal exists. The web UI's "Starting up…" indicator needs the
+    label while the terminal is still missing, so that window is empty by
+    construction and such sessions fall back to the passive "Connecting…"
+    band instead. Stamping the same label at creation closes the gap.
+
+    Mirrors the runner's own auto-create predicate (non-native harness,
+    top-level session — see ``_auto_create_repl_terminal``'s call site in
+    ``omnigent/runner/app.py``); the caller adds the host-bound check.
+
+    :param agent: The agent row backing the session.
+    :param agent_cache: Cache used to load the parsed bundle. ``None``
+        disables resolution (returns an empty dict).
+    :param harness_override: The session's stored harness override, if
+        any. ``"auto"`` defers the harness to the first-message router,
+        so nothing is stamped.
+    :returns: ``{ui_key: "terminal"}`` when the runner will host a REPL
+        terminal, else ``{}``.
+    """
+    from omnigent.harness_aliases import is_native_harness
+
+    if agent_cache is None or harness_override == "auto":
+        return {}
+    if harness_override:
+        harness = harness_override
+    else:
+        try:
+            spec = agent_cache.load(
+                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            ).spec
+        except Exception:  # noqa: BLE001
+            # Can't resolve the harness -> leave the label to the runner's
+            # own later stamp rather than guessing at creation.
+            return {}
+        harness = _spec_harness(spec)
+    if is_native_harness(harness):
+        return {}
+    return {_CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
 
 
 def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
@@ -9150,7 +9220,6 @@ __all__ = [
     "_announce_session_added",
     "_apply_liveness_to_items",
     "_apply_pending_policy_ask_writes",
-    "_approval_access_from_grants",
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
@@ -9295,6 +9364,7 @@ __all__ = [
     "_relay_persist",
     "_relay_persist_error_once",
     "_remove_session_worktree_best_effort",
+    "_repl_terminal_ui_labels",
     "_replace_text_in_message_body",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",
@@ -9325,7 +9395,6 @@ __all__ = [
     "_stop_session_via_runner",
     "_stored_file_to_resource",
     "_stream_live_events",
-    "_strip_pending_author_prefix",
     "_structured_ask_user_question",
     "_targeted_elicitation_event",
     "_title_content_from_item",

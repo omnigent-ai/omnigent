@@ -67,6 +67,7 @@ import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
+import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
@@ -133,6 +134,10 @@ import type { RightRailTab } from "./railTabs";
  * more than one agent (the root has at least one child).
  */
 export function AppShell() {
+  // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
+  // here so it works on every chat route, regardless of where focus sits.
+  useApproveHotkey();
+
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
@@ -152,10 +157,17 @@ export function AppShell() {
   // width. The panel can be dragged wider, but this floor keeps it usable at
   // its default; widening past it is the user's choice via the inline handle.
   const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // Reads the same module-level store Sidebar drives, so the rail's ceiling
+  // tracks the live sidebar width (including a drag) rather than a guess.
+  const { width: sidebarWidth } = useResizableSidebar();
+  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
+    useResizableInlinePanel(
+      conversationId ?? null,
+      inlinePanelMinWidth,
+      sidebarOpen ? sidebarWidth : 0,
+    );
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -356,10 +368,6 @@ export function AppShell() {
     conversationId,
     conversationsData !== undefined,
   );
-  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
-  // Cmd/Ctrl+Enter accepts the pending prompt only when this viewer has
-  // owner or delegated approval authority.
-  useApproveHotkey(canApprove);
   // Labels can come from the sidebar row (``activeConv``) for top-level
   // sessions OR the per-session snapshot (``activeSession``) for ALL
   // sessions including children. The sidebar list omits child (sub-agent)
@@ -1638,7 +1646,6 @@ export function AppShell() {
               sessionId={conversationId}
               open={shareOpen}
               onOpenChange={setShareOpen}
-              canDelegateApprovals={isOwnerLevel(permissionLevel)}
             />
           )}
           {conversationId && (

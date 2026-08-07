@@ -82,9 +82,14 @@ def ensure_agy_onboarding_complete() -> None:
     Idempotently seeds ``onboardingComplete`` (and the sibling consumer/enterprise
     flags) into agy's ``~/.gemini/antigravity-cli/cache/onboarding.json`` so the
     interactive TUI onboarding wizard does not stall a host-spawned or headless
-    ``agy`` launch that has no TTY to answer it. Call once before launching agy
-    (see :func:`omnigent.runner.app._auto_create_antigravity_terminal` and the CLI
-    ``_launch_and_record`` path).
+    ``agy`` launch that has no TTY to answer it.
+
+    .. deprecated:: 0.9.0
+        No longer called by either launch path; slated for removal in 0.10.0.
+        Both launches now scope agy to a per-session ``--gemini_dir``, where
+        :func:`seed_isolated_agy_home` writes this same marker — so seeding the
+        real ``~/.gemini`` copy only wrote the user's tree for a file agy never
+        reads. Use :func:`seed_isolated_agy_home` instead.
 
     Any unrecognised keys already in the file are preserved (the three known keys
     are merged over them), and the write is skipped entirely when all three
@@ -333,6 +338,10 @@ _AGY_ENABLED_TOOLS = [
 # of the real tree).
 _AGY_SEED_FILES = (
     Path("oauth_creds.json"),
+    # Account identity agy writes beside the credential. Without it agy can hold a
+    # valid token yet still prompt for account selection in a fresh Gemini dir,
+    # which reads as "not signed in" on a headless launch (#1477).
+    Path("google_accounts.json"),
     Path("antigravity-cli") / "antigravity-oauth-token",
     Path("installation_id"),
     Path("antigravity-cli") / "installation_id",
@@ -624,16 +633,12 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     if data.get(_AGY_FEEDBACK_SURVEY_SETTING) is False:
         return  # already disabled — avoid a needless rewrite
     data[_AGY_FEEDBACK_SURVEY_SETTING] = False
-    # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer
-    # never sees a torn file. On macOS the harness runs agy under the user's REAL
-    # ~/.gemini (the #1477 Keychain trade-off), so this file is shared across
-    # concurrent sessions and with agy itself: the atomic replace prevents
-    # corruption but not lost updates. That window is self-limiting — the
-    # idempotent short-circuit above makes every launch after the first disable
-    # read-only, so a racing agy trust/model write can only be clobbered on the
-    # one-time first disable, and the clobbered values fail safe (lost trust is
-    # re-prompted, lost model defaults). A cross-process lock is intentionally not
-    # taken (a separately-launched agy would not honor it).
+    # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer never
+    # sees a torn file. Both launch paths pass the per-session isolated agy dir, so
+    # the only writer that can race here is the session's own agy; the idempotent
+    # short-circuit above makes every launch after the first disable read-only, and
+    # a clobbered value fails safe (lost trust is re-prompted, lost model defaults).
+    # A cross-process lock is intentionally not taken (agy would not honor it).
     try:
         settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))

@@ -1785,13 +1785,14 @@ function HarnessConfigModal({
         <DialogFooter className="border-t-0 bg-transparent">
           <Button
             type="button"
+            size="lg"
             variant="outline"
             onClick={() => onOpenChange(false)}
             data-testid="new-chat-landing-config-cancel"
           >
             Cancel
           </Button>
-          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save">
+          <Button type="button" onClick={save} data-testid="new-chat-landing-config-save" size="lg">
             Save
           </Button>
         </DialogFooter>
@@ -1878,10 +1879,12 @@ export function NewChatLandingScreen() {
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
-  const dictation = useDictationInsert(setMessage);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Declared after textareaRef so dictation can place the caret after the
+  // text it inserts (and insert at the caret rather than the draft's end).
+  const dictation = useDictationInsert(message, setMessage, textareaRef);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
@@ -2139,9 +2142,13 @@ export function NewChatLandingScreen() {
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped just before we navigate to a freshly-created
-  // session so the snapshot is dropped instead of resurrected.
+  // `submittedRef` is flipped once the draft is sent to a create, so the
+  // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
+  // Whether this composer is still on screen. The create POST can outlive
+  // it — the user opens another session while the session bootstraps — and
+  // the post-create navigation must not follow them there.
+  const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
     message,
@@ -2164,7 +2171,11 @@ export function NewChatLandingScreen() {
     costControlMode,
   };
   useEffect(() => {
+    // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
+    // doesn't leave the screen marked gone.
+    onScreenRef.current = true;
     return () => {
+      onScreenRef.current = false;
       landingDraft = submittedRef.current ? null : draftRef.current;
     };
   }, []);
@@ -2388,6 +2399,74 @@ export function NewChatLandingScreen() {
     [homeListing, homeListingIsPlaceholder],
   );
 
+  // Fill the branch field with a unique auto-generated name so the user can
+  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
+  // available in every browser the app targets; the short prefix keeps the
+  // dir/branch readable (worktree-1a2b3c4d).
+  const generateBranchName = useCallback(() => {
+    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    setBranchName(`worktree-${suffix}`);
+  }, []);
+  // The project's stored default base branch (Project settings), trimmed. Wins
+  // over the user-global default (Settings › Git); an unset project default
+  // falls through to the global one, then to blank (fork from current branch).
+  const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
+
+  // The path the once-per-host auto-seed WOULD land on: the most-recent path,
+  // else the derived home. Exposed as a memo so we can probe its repo for
+  // worktrees before committing to it (see the fork-fresh redirect below).
+  const autoSeedCandidate = useMemo(() => recent[0] ?? derivedHome ?? null, [recent, derivedHome]);
+  // "Fork fresh from default": when the project defines a default base branch,
+  // a fresh new-chat must NOT silently continue in the last-used worktree — it
+  // should fork a new branch off that default. The auto-seed can land on a
+  // linked worktree (a recent path that happens to be one), which prefills its
+  // branch and suppresses the base-branch fill. So when a default is set, probe
+  // the seed candidate's repo and redirect the seed to the MAIN work tree. Only
+  // armed until the host is seeded (the once-per-host guard), and skipped for
+  // sandboxes (no host worktrees).
+  const forkFreshArmed =
+    prefillSettled &&
+    selectedHostId !== null &&
+    !sandboxSelected &&
+    projectBaseBranch !== null &&
+    seededHostRef.current !== selectedHostId &&
+    autoSeedCandidate !== null;
+  const {
+    data: seedWorktrees,
+    isPlaceholderData: seedWorktreesArePlaceholder,
+    isError: seedWorktreesErrored,
+  } = useHostWorktrees(
+    forkFreshArmed ? selectedHostId : null,
+    forkFreshArmed ? autoSeedCandidate : null,
+  );
+  // Resolve the fork-fresh redirect to a STABLE value so the seed effect can
+  // depend on the decision, not the worktree array (whose identity churns every
+  // render). `undefined` = probe still loading (wait); `null` = not armed or no
+  // redirect (seed the candidate as-is); a string = the MAIN repo path to
+  // redirect the seed to (the candidate is a linked worktree we should fork off
+  // the project default instead of reusing).
+  const forkFreshMainPath = useMemo<string | null | undefined>(() => {
+    if (!forkFreshArmed) return null;
+    // A probe error (non-400; the hook already maps 400 → []) leaves data
+    // undefined for good. Treat it as "no redirect" so the seed still lands on
+    // the candidate as-is, rather than waiting on data that never arrives and
+    // leaving the workspace blank forever.
+    if (seedWorktreesErrored) return null;
+    if (seedWorktreesArePlaceholder || seedWorktrees === undefined) return undefined;
+    const norm = normalizeWorkspacePath(autoSeedCandidate);
+    const candIsLinkedWorktree = seedWorktrees.some(
+      (w) => !w.is_main && normalizeWorkspacePath(w.path) === norm,
+    );
+    const mainPath = seedWorktrees.find((w) => w.is_main)?.path ?? null;
+    return candIsLinkedWorktree && mainPath !== null ? mainPath : null;
+  }, [
+    forkFreshArmed,
+    seedWorktrees,
+    seedWorktreesArePlaceholder,
+    seedWorktreesErrored,
+    autoSeedCandidate,
+  ]);
+
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the
   // derived home (which can arrive a render later, hence the dep). Holds
@@ -2396,11 +2475,39 @@ export function NewChatLandingScreen() {
     if (!prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
-    const candidate = recent[0] ?? derivedHome;
-    if (!candidate) return;
+    if (autoSeedCandidate === null) return;
+    // Fork-fresh redirect pending: wait for the probe rather than seeding the
+    // wrong path (and locking the once-per-host guard).
+    if (forkFreshMainPath === undefined) return;
+
+    const didForkFresh = forkFreshMainPath !== null;
+    const candidate = didForkFresh ? forkFreshMainPath : autoSeedCandidate;
     seededHostRef.current = selectedHostId;
-    setWorkspace((cur) => (cur === "" ? candidate : cur));
-  }, [selectedHostId, recent, derivedHome, prefillSettled]);
+    // Seed into an empty field only, so a config-supplied (or explicitly
+    // picked) workspace isn't clobbered.
+    const seededWorkspace = workspace === "";
+    if (seededWorkspace) setWorkspace(candidate);
+    // Fork fresh only when we actually seeded the redirect AND no branch is set
+    // — a project that supplies its own workspace keeps a plain launch, and a
+    // branch typed/picked while the probe was loading isn't overwritten (the
+    // same guards the opt-in-worktree effect below enforces).
+    if (didForkFresh && seededWorkspace && branchName === "" && prefilledBranch === "") {
+      // Preempt the opt-in-worktree effect so it can't also seed a branch, then
+      // name one here to fork fresh off the project default. Store the ref in
+      // the raw representation that effect compares against (workspaceTrimmed).
+      worktreeSeededForRef.current = candidate;
+      generateBranchName();
+    }
+  }, [
+    selectedHostId,
+    autoSeedCandidate,
+    prefillSettled,
+    forkFreshMainPath,
+    workspace,
+    branchName,
+    prefilledBranch,
+    generateBranchName,
+  ]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -2900,7 +3007,6 @@ export function NewChatLandingScreen() {
   // current default. The project's stored default (Project settings) wins over
   // the user-global one (Settings › Git); an unset project default falls
   // through to the global one, then to blank (fork from current branch).
-  const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
   useEffect(() => {
     if (!shouldCreateWorktree) {
       // No base field shown: reset so the next named branch re-seeds cleanly.
@@ -2924,14 +3030,6 @@ export function NewChatLandingScreen() {
       (w) => (w.branch ?? "").toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
     );
   }, [linkedWorktrees, branchName]);
-  // Fill the branch field with a unique auto-generated name so the user can
-  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
-  // available in every browser the app targets; the short prefix keeps the
-  // dir/branch readable (worktree-1a2b3c4d).
-  const generateBranchName = useCallback(() => {
-    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-    setBranchName(`worktree-${suffix}`);
-  }, []);
   // Project prefill: seed host / workspace / agent from the project's stored
   // config, then settle so the generic defaults fill any slot the config left
   // unset. An opt-in worktree is generated by the dedicated effect below once
@@ -3325,6 +3423,14 @@ export function NewChatLandingScreen() {
     }
   }
 
+  // No session was created after all, so the draft is the user's again —
+  // including when they navigated away and the unmount cleanup already
+  // dropped it on the strength of the submit.
+  function returnDraftToUser() {
+    submittedRef.current = false;
+    if (!onScreenRef.current) landingDraft = draftRef.current;
+  }
+
   async function handleCreate() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
@@ -3332,6 +3438,12 @@ export function NewChatLandingScreen() {
     if (!canSubmit) return;
     setCreating(true);
     setCreateError(null);
+    // The draft is spent from the moment it is submitted: it belongs to the
+    // session now being created, so a detour back to this screen must not
+    // hand it back pre-filled. Flipped here rather than on the response
+    // because the create outlives an unmount; a create that fails hands the
+    // draft back via returnDraftToUser.
+    submittedRef.current = true;
     try {
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -3569,6 +3681,7 @@ export function NewChatLandingScreen() {
         // the workspace and agent, so winning on the push can't skip past an
         // error the user needed to see on this screen.
         if ("error" in created) {
+          returnDraftToUser();
           setCreateError(created.error);
           return;
         }
@@ -3626,13 +3739,17 @@ export function NewChatLandingScreen() {
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
-      // The session was created — drop the preserved draft so the next visit
-      // to the landing screen starts clean (and the unmount cleanup below
-      // doesn't resurrect what we just sent).
-      submittedRef.current = true;
+      // The session was created — drop any draft a detour back to this
+      // screen stashed, so the next visit starts clean.
       landingDraft = null;
-      navigate(`/c/${data.id}`);
+      // Only follow the create while the user is still on the landing
+      // screen. A create that outlived it means they moved on to another
+      // session; jumping them into this one now would hijack that. The
+      // session is created either way and its first message stays held
+      // for whenever they open it.
+      if (onScreenRef.current) navigate(`/c/${data.id}`);
     } catch {
+      returnDraftToUser();
       setCreateError("Couldn't reach the server. Check your connection and try again.");
     } finally {
       setCreating(false);
@@ -3672,8 +3789,8 @@ export function NewChatLandingScreen() {
           840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-sans">
+      <div className="flex w-full max-w-[840px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
@@ -3685,9 +3802,9 @@ export function NewChatLandingScreen() {
               </div>
             </span>
           ) : (
-            <OttoEyes className="h-16 w-auto shrink-0" />
+            <OttoEyes className="h-14 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-[28px] leading-8 font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+          <h1 className="min-w-0 break-words text-center text-[1.5em] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
             {selectedProject || "What should we build?"}
           </h1>
         </div>
@@ -3751,6 +3868,11 @@ export function NewChatLandingScreen() {
                       )
                     : null,
                 );
+              }}
+              onFocus={() => {
+                // From here the textarea's caret is one the user placed, so
+                // dictation inserts there instead of at the end of the draft.
+                dictation.noteFocus();
               }}
               onBlur={() => {
                 // Dismiss the mention menu when focus leaves the textarea; menu

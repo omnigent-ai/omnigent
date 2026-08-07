@@ -35,11 +35,43 @@ class IssueType(StrEnum):
         }[self]
 
 
-class Severity(StrEnum):
-    S0 = "S0"
-    S1 = "S1"
-    S2 = "S2"
-    S3 = "S3"
+class Impact(StrEnum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+    @classmethod
+    def parse(cls, value: object) -> Impact:
+        normalized = str(value).strip().casefold()
+        # Remove S-code aliases in v0.3.0 after cached classifications migrate.
+        aliases = {
+            "critical": cls.CRITICAL,
+            "high": cls.HIGH,
+            "medium": cls.MEDIUM,
+            "low": cls.LOW,
+            "s0": cls.CRITICAL,
+            "s1": cls.HIGH,
+            "s2": cls.MEDIUM,
+            "s3": cls.LOW,
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported impact: {value!r}") from exc
+
+    @property
+    def label(self) -> str:
+        return self.value.title()
+
+    @property
+    def legacy_code(self) -> str:
+        return {
+            Impact.CRITICAL: "S0",
+            Impact.HIGH: "S1",
+            Impact.MEDIUM: "S2",
+            Impact.LOW: "S3",
+        }[self]
 
 
 class Priority(StrEnum):
@@ -55,7 +87,7 @@ class Issue:
     title: str
     url: str
     issue_type: IssueType
-    severity: Severity
+    impact: Impact
     area_keys: tuple[str, ...] = ()
     component_labels: tuple[str, ...] = ()
     classification_reasoning: str = ""
@@ -74,7 +106,7 @@ class Issue:
             title=str(value.get("title", "")),
             url=str(value.get("url", "")),
             issue_type=IssueType.parse(value["type"]),
-            severity=Severity(str(value["severity"])),
+            impact=Impact.parse(value.get("impact", value.get("severity"))),
             area_keys=_string_tuple(value.get("area_keys", ())),
             component_labels=_string_tuple(value.get("component_labels", ())),
             classification_reasoning=str(

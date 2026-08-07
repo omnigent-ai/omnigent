@@ -53,7 +53,7 @@ class BronzeIssue:
             title=self.title,
             url=self.url,
             issue_type=classification.issue_type,
-            severity=classification.severity,
+            impact=classification.impact,
             area_keys=classification.area_keys,
             component_labels=classification.component_labels,
             classification_reasoning=classification.reasoning,

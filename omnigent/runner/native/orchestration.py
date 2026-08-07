@@ -2144,7 +2144,10 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
-            credential_warning = provider.credential_warning
+            # An unroutable model leaves Pi unable to select it, which looks
+            # like a silent hang; prefer that notice over the credential one
+            # since it names the model the user actually picked.
+            credential_warning = provider.unroutable_model_warning() or provider.credential_warning
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -3731,7 +3734,10 @@ async def _auto_create_codex_terminal(
     # synthesis can stamp session_meta.model_provider with the provider
     # this launch actually routes through.
     default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
-    _codex_launch = resolve_native_codex_launch(model=default_model)
+    # Thread the spec so its executor.auth / legacy profile win over
+    # machine-level config, parity with the in-process harness (#2744).
+    _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     from omnigent.inner.codex_executor import _find_codex_cli
 
@@ -4524,7 +4530,6 @@ async def _auto_create_antigravity_terminal(
         agy_home_dir,
         clear_bridge_state,
         ensure_agy_feedback_survey_disabled,
-        ensure_agy_onboarding_complete,
         prepare_bridge_dir,
         seed_isolated_agy_home,
         write_bridge_state,
@@ -4595,11 +4600,11 @@ async def _auto_create_antigravity_terminal(
     # conversation id (the cold-start mints it below) instead of a prior run's.
     clear_bridge_state(bridge_dir)
 
-    # Pre-accept agy's first-run onboarding wizard (HOME-global) before launch:
-    # a host-spawned agy terminal has no TTY to answer it and would hang with a
-    # blank web UI. Mirrors the ``ensure_claude_workspace_trusted`` seed on the
-    # Claude auto-create path. Idempotent; offloaded to a thread (file I/O).
-    await asyncio.to_thread(ensure_agy_onboarding_complete)
+    # agy's first-run onboarding wizard would hang a host-spawned terminal (no TTY
+    # to answer it, blank web UI). Its completion marker is pre-accepted below by
+    # ``seed_isolated_agy_home``, in the isolated dir agy reads under
+    # ``--gemini_dir``; seeding the real ``~/.gemini`` marker as well would write
+    # the user's tree for a file this launch never reads.
 
     argv, env_overrides = build_agy_launch(
         conversation_id=external_session_id if resume else None,
@@ -6046,7 +6051,17 @@ async def _auto_create_claude_terminal(
     )
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
-    bridge_dir = prepare_bridge_dir(session_id, bridge_id=bridge_id, workspace=Path(workspace))
+    # Resolved once here and reused below (env_spec) so the bridge's own
+    # sys_os_* tools and the terminal process see the same sandbox — the
+    # agent's declared os_env.sandbox, already overridden by any
+    # enforce_sandbox/force_sandbox policy verdict upstream.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
+    bridge_dir = prepare_bridge_dir(
+        session_id,
+        bridge_id=bridge_id,
+        workspace=Path(workspace),
+        sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+    )
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
@@ -6424,7 +6439,8 @@ async def _auto_create_claude_terminal(
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_terminal falls back to
     # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    agent_os_env = _agent_os_env_from_spec(agent_spec)
+    # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
+    # so the terminal process and the bridge's sys_os_* tools agree.
     env_spec = TerminalEnvSpec(
         os_env=OSEnvSpec(
             type="caller_process",

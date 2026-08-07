@@ -51,7 +51,11 @@ import {
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
-import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
+import {
+  BlockRenderer,
+  FilePathAwareMessageResponse,
+  rendersOnlyWorkedFold,
+} from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
@@ -1202,7 +1206,6 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
@@ -1257,7 +1260,6 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
-      canApprove={canApprove}
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
@@ -1487,8 +1489,6 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
-  /** Whether this viewer may accept privileged actions. */
-  canApprove: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   effortLevels: readonly string[];
@@ -1574,7 +1574,6 @@ function MainAgentSurface({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
-  canApprove,
   readOnlyReason,
   effortLevels,
   showEffort,
@@ -1924,7 +1923,6 @@ function MainAgentSurface({
                   <BubbleView
                     key={bubbleKey(bubble)}
                     bubble={bubble}
-                    canApprove={canApprove}
                     isLastAssistant={bubbleIndex === lastAssistantIndex}
                     showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
                   />
@@ -1946,7 +1944,7 @@ function MainAgentSurface({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} canApprove={canApprove} />
+                      <ElicitationCard item={item} />
                     </MessageContent>
                   </Message>
                 ))}
@@ -3365,12 +3363,10 @@ function CompactionLoadingIndicator() {
 export const BubbleView = memo(
   function BubbleView({
     bubble,
-    canApprove = true,
     isLastAssistant = false,
     showsWorking = false,
   }: {
     bubble: Bubble;
-    canApprove?: boolean;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
   }) {
@@ -3393,14 +3389,12 @@ export const BubbleView = memo(
     return (
       <AssistantBubble
         bubble={bubble}
-        canApprove={canApprove}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
       />
     );
   },
   (prev, next) =>
-    prev.canApprove === next.canApprove &&
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
@@ -3626,12 +3620,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
 
 function AssistantBubble({
   bubble,
-  canApprove,
   isLastAssistant = false,
   showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
-  canApprove: boolean;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
 }) {
@@ -3657,6 +3649,18 @@ function AssistantBubble({
 
   const markdownText = collectBubbleMarkdown(bubble.items);
 
+  // The bubble collapses to nothing but the "Worked for" row — its text
+  // all sits inside the fold, and its answer lands in a later bubble.
+  const foldOnly = rendersOnlyWorkedFold({
+    items: bubble.items,
+    sessionStatus,
+    turnLifecycle: bubble.lifecycle,
+    continued: bubble.continued,
+    isLastAssistant,
+    hasPendingElicitation,
+    showsWorking,
+  });
+
   // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
@@ -3671,11 +3675,15 @@ function AssistantBubble({
         data-role="assistant"
         className={isWide ? "max-w-full" : "max-w-3xl"}
       >
-        <MessageContent className={isWide ? "w-full" : undefined}>
+        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
+            rather than shrink-wrapping to the summary row's ~110px, which
+            collapsed the row's trailing hairline (a flex-1 span) to zero
+            and stopped its click target short of the column. Keeping the
+            cap lands the hairline where an answered turn's does. */}
+        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
-            canApprove={canApprove}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
             continued={bubble.continued}
@@ -3694,7 +3702,10 @@ function AssistantBubble({
             <span>Interrupted</span>
           </p>
         )}
-        {markdownText && (
+        {/* Skipped on a fold-only bubble: the actions belong to content
+            the user can see, and hanging them off a collapsed row spaced
+            consecutive rows unevenly depending on hidden narration. */}
+        {markdownText && !foldOnly && (
           <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
             <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
@@ -4261,7 +4272,6 @@ export function Composer({
   onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
-  const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4290,6 +4300,9 @@ export function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Declared after textareaRef so dictation can place the caret after the
+  // text it inserts (and insert at the caret rather than the draft's end).
+  const dictation = useDictationInsert(value, setValue, textareaRef);
   const isComposingRef = useRef(false);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
@@ -5222,6 +5235,11 @@ export function Composer({
               // reset for that one tick.
               if (recallingRef.current) recallingRef.current = false;
               else resetCursor();
+            }}
+            onFocus={() => {
+              // From here the textarea's caret is one the user placed, so
+              // dictation inserts there instead of at the end of the draft.
+              dictation.noteFocus();
             }}
             onCompositionStart={() => {
               isComposingRef.current = true;

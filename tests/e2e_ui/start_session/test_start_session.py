@@ -863,6 +863,262 @@ async def _drive_open_before_create_responds(base_url: str, session_id: str) -> 
             await browser.close()
 
 
+def test_start_session_no_redirect_after_navigating_away(
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """A create that lands after the user left must not yank them into it.
+
+    The create POST is slow (session bootstrap + runner launch), so the
+    user often opens another session while it is still in flight. When
+    the response finally arrives, following it would tear the user out
+    of the session they deliberately navigated to — a hijacked view,
+    seconds after the fact. The redirect belongs to the landing screen:
+    it may only fire while the user is still sitting on it.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _run_in_fresh_loop(_drive_no_redirect_after_navigating_away(base_url, session_a, session_b))
+
+
+async def _drive_no_redirect_after_navigating_away(
+    base_url: str, session_a: str, session_b: str
+) -> None:
+    """Async body of the late-create redirect test.
+
+    :param base_url: Spawned server base URL.
+    :param session_a: Pre-seeded session the faked create returns — the
+        one the late redirect would wrongly jump to.
+    :param session_b: Pre-seeded session the user opens mid-create, and
+        must still be on once the create lands.
+    """
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            # Holds the create POST open so the navigate-away happens
+            # strictly inside the in-flight window, as it does for a real
+            # multi-second create.
+            release_create = asyncio.Event()
+            # Set when the browser receives the create response, so the
+            # settle window below starts only once the redirect could fire.
+            create_answered = asyncio.Event()
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_events(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    create_bodies.append(route.request.post_data_json)
+                    await release_create.wait()
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": session_a}),
+                    )
+                else:
+                    await route.continue_()
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(_SESSIONS_RE, handle_sessions)
+
+            # Keep the agent-discovery scan empty so only the stubbed Claude
+            # agent feeds the picker (see _drive_permission_mode for why).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            def note_create_response(response) -> None:
+                if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
+                    create_answered.set()
+
+            page.on("response", note_create_response)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            # The create is in flight and parked on the gate.
+            await _wait_until(lambda: len(create_bodies) == 1)
+
+            # Leave for another session via the sidebar — a client-side
+            # navigation, so the create fetch keeps running (a reload would
+            # abort it and the race would never happen).
+            await page.locator(f'a[href="/c/{session_b}"]').click()
+            await page.wait_for_url(re.compile(rf"/c/{re.escape(session_b)}$"))
+
+            # Let the create land. Waiting on the response (rather than a
+            # bare sleep) keeps the assertion honest: a create that never
+            # completed would fail here instead of passing vacuously.
+            release_create.set()
+            await asyncio.wait_for(create_answered.wait(), timeout=30.0)
+
+            # Watch the URL for a while: the regression navigates within a
+            # tick of the response, but `expect` would happily pass on the
+            # pre-redirect URL, so sample instead of retrying-until-true.
+            visited: list[str] = []
+            for _ in range(50):
+                url = page.url
+                if not visited or visited[-1] != url:
+                    visited.append(url)
+                await asyncio.sleep(0.05)
+
+            assert all(f"/c/{session_a}" not in url for url in visited), visited
+            assert page.url.endswith(f"/c/{session_b}"), page.url
+        finally:
+            await browser.close()
+
+
+def test_start_session_landing_clears_after_navigating_away(
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Coming back to the landing screen mid-create must not restore the draft.
+
+    The composer stashes its half-composed draft on unmount so a detour
+    into another session doesn't lose a half-typed thought. But a draft
+    that has already been *submitted* is spent: it belongs to the session
+    now being created. Restoring it hands the user a composer pre-filled
+    with the message they just sent — and a second Send would create a
+    duplicate session.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _run_in_fresh_loop(_drive_landing_clears_after_navigating_away(base_url, session_a, session_b))
+
+
+async def _drive_landing_clears_after_navigating_away(
+    base_url: str, session_a: str, session_b: str
+) -> None:
+    """Async body of the spent-draft test.
+
+    :param base_url: Spawned server base URL.
+    :param session_a: Pre-seeded session the faked create returns.
+    :param session_b: Pre-seeded session the user detours through before
+        returning to the landing screen.
+    """
+    message = "set up the project"
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            release_create = asyncio.Event()
+            create_answered = asyncio.Event()
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_events(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    create_bodies.append(route.request.post_data_json)
+                    await release_create.wait()
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": session_a}),
+                    )
+                else:
+                    await route.continue_()
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(_SESSIONS_RE, handle_sessions)
+
+            # Keep the agent-discovery scan empty so only the stubbed Claude
+            # agent feeds the picker (see _drive_permission_mode for why).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            def note_create_response(response) -> None:
+                if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
+                    create_answered.set()
+
+            page.on("response", note_create_response)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            landing_input = page.get_by_test_id("new-chat-landing-input")
+            await landing_input.wait_for(state="visible", timeout=30_000)
+
+            await landing_input.fill(message)
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await _wait_until(lambda: len(create_bodies) == 1)
+
+            # Detour through another session and come straight back, all
+            # while the create is still bootstrapping.
+            await page.locator(f'a[href="/c/{session_b}"]').click()
+            await page.wait_for_url(re.compile(rf"/c/{re.escape(session_b)}$"))
+            await page.get_by_test_id("new-chat-button").click()
+            await landing_input.wait_for(state="visible", timeout=30_000)
+
+            # A spent draft must not come back — not while the create is
+            # still running, nor once it lands.
+            await expect(landing_input).to_have_value("")
+            release_create.set()
+            await asyncio.wait_for(create_answered.wait(), timeout=30.0)
+            for _ in range(20):
+                assert await landing_input.input_value() == "", "submitted draft was restored"
+                await asyncio.sleep(0.05)
+        finally:
+            await browser.close()
+
+
 def test_start_session_remembers_last_picked_host(seeded_session: tuple[str, str]) -> None:
     """The host chip restores the last explicitly-picked host after a reload.
 

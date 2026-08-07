@@ -1,9 +1,9 @@
 {
-  "severity_weights": {
-    "S0": 100,
-    "S1": 60,
-    "S2": 30,
-    "S3": 10
+  "impact_weights": {
+    "critical": 100,
+    "high": 60,
+    "medium": 30,
+    "low": 10
   },
   "priority_thresholds": {
     "P0-critical": 100,

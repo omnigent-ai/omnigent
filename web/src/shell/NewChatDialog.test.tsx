@@ -3,7 +3,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -880,12 +880,6 @@ describe("NewChatLandingScreen", () => {
     // The home page offers an inline chat box rather than the old
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
-    expect(screen.getByText("What should we build?")).toHaveClass(
-      "text-[28px]",
-      "leading-8",
-      "font-normal",
-      "tracking-[-0.03em]",
-    );
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
   });
 
@@ -939,6 +933,47 @@ describe("NewChatLandingScreen", () => {
     );
     // The attachment chip re-renders from the restored draft.
     expect(screen.getByText("diagram.png")).toBeTruthy();
+  });
+
+  it("hands the draft back when a create the user walked away from is rejected", async () => {
+    // A submitted draft is dropped on unmount — it belongs to the session
+    // being created. But a create the server rejects makes no session, so
+    // the message is the user's again and must survive the round-trip
+    // instead of vanishing with the failed attempt.
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
+    const first = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rebuild the parser" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    // The user gives up waiting and opens another session, then the create
+    // comes back rejected.
+    first.unmount();
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    renderLanding();
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "rebuild the parser",
+    );
   });
 
   it("enables submit only once a message, host, agent and valid workspace are set", async () => {

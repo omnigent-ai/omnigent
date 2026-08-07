@@ -33,8 +33,6 @@ interface ExitPlanModeReviewProps {
   onAccept: () => void;
   /** Reject; `feedback` is the user's typed revision guidance (`""` when none). */
   onReject: (feedback: string) => void;
-  /** Whether this viewer may approve the plan. */
-  canApprove?: boolean;
 }
 
 export function ExitPlanModeReview({
@@ -42,7 +40,6 @@ export function ExitPlanModeReview({
   onAcceptAuto,
   onAccept,
   onReject,
-  canApprove = true,
 }: ExitPlanModeReviewProps) {
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
@@ -78,11 +75,11 @@ export function ExitPlanModeReview({
         </div>
       ) : (
         <div className="flex flex-wrap gap-2 pt-1">
-          <Button size="sm" onClick={onAcceptAuto} disabled={!canApprove}>
+          <Button size="sm" onClick={onAcceptAuto}>
             <ZapIcon className="mr-1 size-3.5" />
             Yes, and use auto mode
           </Button>
-          <Button size="sm" variant="outline" onClick={onAccept} disabled={!canApprove}>
+          <Button size="sm" variant="outline" onClick={onAccept}>
             <CheckIcon className="mr-1 size-3.5" />
             Yes, manually approve edits
           </Button>

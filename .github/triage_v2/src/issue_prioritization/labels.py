@@ -4,6 +4,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+# Remove this cleanup list in v0.3.0 after the apply backfill completes.
+LEGACY_SEVERITY_LABELS = frozenset(f"severity:S{level}" for level in range(4))
+
 
 @dataclass(frozen=True)
 class LabelDefinition:
@@ -29,10 +32,6 @@ class LabelManifest:
                 for item in value["labels"]
             )
         )
-
-    @property
-    def severity_labels(self) -> set[str]:
-        return {label.name for label in self.labels if label.name.startswith("severity:")}
 
     @property
     def component_labels(self) -> set[str]:

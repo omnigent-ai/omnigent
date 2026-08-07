@@ -545,22 +545,22 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
-     * `Menu`. Lists the current server (disabled header), other recent servers,
-     * Reload, and Connect to New Server. Tapping a recent server switches
-     * directly without leaving the app; "Connect to New Server" opens
-     * [ConnectActivity] for manual URL entry.
+     * `Menu`. Lists the current server (disabled header), the other servers on
+     * offer (organization presets, then recents), Reload, and Connect to New
+     * Server. Tapping a server switches directly without leaving the app;
+     * "Connect to New Server" opens [ConnectActivity] for manual URL entry.
      */
     private fun showServerSwitcherMenu(anchor: View) {
         val store = ServerStore(this)
         val currentUrl = store.currentServerUrl()
-        val otherServers = store.recentServers().filter { originOf(it) != pinnedOrigin }
+        val otherServers = store.offeredServers().filter { originOf(it) != pinnedOrigin }
 
         val popup = PopupMenu(this, anchor, Gravity.TOP)
         MenuCompat.setGroupDividerEnabled(popup.menu, true)
         popup.menu.apply {
             // Group 0: current server — disabled header.
             add(0, 0, 0, hostLabelOf(currentUrl)).isEnabled = false
-            // Group 1: other recent servers (divider before this group).
+            // Group 1: the other servers on offer (divider before this group).
             otherServers.forEachIndexed { i, url ->
                 add(1, 100 + i, 0, hostLabelOf(url))
             }

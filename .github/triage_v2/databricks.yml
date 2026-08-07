@@ -34,7 +34,7 @@ variables:
   artifact_volume_name:
     default: issue_priority_artifacts
   model_endpoint:
-    description: Model Serving endpoint used for S0-S3 classification.
+    description: Model Serving endpoint used for impact classification.
     default: ""
   github_repo:
     default: omnigent-ai/omnigent

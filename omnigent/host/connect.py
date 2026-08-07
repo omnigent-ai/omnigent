@@ -1258,7 +1258,7 @@ class HostProcess:
         # zygote would retain its exit status forever. On cancellation we let
         # the spawn land and then tear that runner down.
         spawn = asyncio.ensure_future(
-            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug)
+            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
         )
         try:
             proc, log_path = await asyncio.shield(spawn)
@@ -1312,6 +1312,7 @@ class HostProcess:
         self,
         env: dict[str, str],
         session_slug: str,
+        workspace: Path,
     ) -> tuple[subprocess.Popen[bytes] | ZygoteRunnerProc, Path]:
         """Open the session log and spawn the runner, via zygote or direct Popen.
 
@@ -1325,6 +1326,7 @@ class HostProcess:
         :param env: Runner environment from :func:`_build_runner_env` (its
             ``RUNNER_PARENT_PID`` is the daemon pid; overridden on the zygote path).
         :param session_slug: Sanitized session id fragment for the log filename.
+        :param workspace: Existing session workspace to use as the runner's cwd.
         :returns: ``(process_handle, log_path)`` — the handle quacks like Popen.
         :raises OSError: If the log file or a direct Popen spawn fails.
         """
@@ -1340,7 +1342,7 @@ class HostProcess:
                     # getppid()-based orphan check must watch the zygote pid.
                     zygote_env = dict(env)
                     zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
-                    proc = zygote.fork_runner(zygote_env, str(log_path))
+                    proc = zygote.fork_runner(zygote_env, str(log_path), str(workspace))
                     _logger.info(
                         "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
                         zygote.pid,
@@ -1364,6 +1366,8 @@ class HostProcess:
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "omnigent.runner._entry"],
                     env=env,
+                    # A daemon may outlive the checkout it started from.
+                    cwd=str(workspace),
                     # Runners are WS-tunnel clients with no interactive input.
                     # Give them a clean /dev/null stdin instead of inheriting the
                     # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
