@@ -491,6 +491,103 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     return _get_backend(sandbox_spec.type).resolve(spec, cwd)
 
 
+@dataclass(frozen=True)
+class ReachableRoot:
+    """
+    One path an environment's file tools are permitted to reach.
+
+    Produced by :func:`reachable_roots`, which is the single source of
+    truth for the grant boundary: the same list drives enforcement (in
+    :func:`omnigent.inner.os_env._assert_within_reach`) and the reach
+    the file-browsing APIs advertise, so the two cannot drift.
+
+    :param path: Resolved absolute path of the grant, e.g.
+        ``Path("/Users/corey/data")``.
+    :param access: ``"write"`` when the grant admits reads and writes,
+        ``"read"`` when it admits reads only.
+    :param origin: Which declaration produced this grant — ``"cwd"``,
+        ``"read_paths"``, ``"write_paths"``, or ``"write_files"``.
+        Carried for display; enforcement uses :attr:`kind` and
+        :attr:`access`.
+    :param kind: ``"tree"`` when the grant covers the subtree rooted at
+        :attr:`path`, ``"file"`` when it covers exactly that one path.
+    """
+
+    path: Path
+    access: str
+    origin: str
+    kind: str
+
+    def contains(self, resolved: Path) -> bool:
+        """
+        Whether *resolved* falls inside this grant.
+
+        :param resolved: Fully-resolved candidate path.
+        :returns: ``True`` when the grant covers it.
+        """
+        if self.kind == "file":
+            return resolved == self.path
+        try:
+            resolved.relative_to(self.path)
+        except ValueError:
+            return False
+        return True
+
+
+def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
+    """
+    Enumerate the paths an environment's file tools may reach.
+
+    Mirrors the grant vocabulary the sandbox backends already populate:
+    *cwd* is always reachable for read and write; ``write_paths`` /
+    ``write_files`` admit reads and writes of their target; ``read_paths``
+    admits reads only. With no grants declared the result is *cwd* alone
+    — the historical confinement, unchanged.
+
+    This describes the FILE-TOOL boundary only. It is deliberately not
+    widened when the policy is inactive: under ``sandbox.type: none`` the
+    co-resident shell is unconfined, but ``sys_os_read`` and friends stay
+    confined here on purpose. Callers that browse on a human's behalf
+    should consult :func:`is_unconfined` separately rather than expecting
+    this list to grow.
+
+    :param cwd: The environment root.
+    :param policy: Resolved sandbox policy carrying the declared grants.
+    :returns: Grants in precedence order, cwd first. Never empty.
+    """
+    roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
+    roots += [
+        ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
+        for root in policy.write_roots
+    ]
+    roots += [
+        ReachableRoot(path=grant, access="write", origin="write_files", kind="file")
+        for grant in policy.write_files
+    ]
+    roots += [
+        ReachableRoot(path=root, access="read", origin="read_paths", kind="tree")
+        for root in (policy.read_roots or [])
+    ]
+    return roots
+
+
+def is_unconfined(policy: SandboxPolicy) -> bool:
+    """
+    Whether the policy leaves the environment without OS-level confinement.
+
+    ``True`` for ``sandbox.type: none``, where no bwrap / seatbelt wrap is
+    applied and the environment's shell runs with the caller's own
+    privileges. File *tools* remain confined to :func:`reachable_roots`
+    regardless; this reports only that the process itself is not boxed in,
+    which is what lets a human-facing browser show paths the shell could
+    already read anyway.
+
+    :param policy: Resolved sandbox policy.
+    :returns: ``True`` when no sandbox backend is active.
+    """
+    return not policy.active
+
+
 def activate_sandbox(policy: SandboxPolicy) -> None:
     if not policy.active:
         return

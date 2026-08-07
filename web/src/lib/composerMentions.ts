@@ -91,6 +91,27 @@ export function mentionMarkerFor(harness: string | null, path: string): string {
   return isCodex ? `[Attached file: ${path}]` : `[Attached: ${path}]`;
 }
 
+/**
+ * Build the marker that tells the agent which directory the user is looking
+ * at in the files panel.
+ *
+ * Distinct from an ``[Attached: …]`` mention on purpose: the user did not
+ * choose to attach this, they merely navigated there, so it reads as ambient
+ * context rather than an instruction to go read it. Phrased as a sentence
+ * because it lands verbatim in the message text — the only channel a native
+ * harness has (``claude_native_executor.py`` discards the system prompt).
+ *
+ * Emitted only while the panel is pointed somewhere other than the session's
+ * workspace; at the workspace the agent is already there and the line would
+ * be noise.
+ *
+ * :param path: Absolute directory the panel is browsing.
+ * :returns: A single-line marker for the message preamble.
+ */
+export function browsingMarkerFor(path: string): string {
+  return `[The user's file browser is open at: ${path}]`;
+}
+
 /** Default cap on how many mention rows the menu renders for one directory. */
 export const MENTION_MATCH_CAP = 50;
 

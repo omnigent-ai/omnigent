@@ -1570,3 +1570,138 @@ async def test_worktree_session_uses_session_workspace_for_changes(
             "The /changes endpoint is reading from the runner's global "
             "workspace instead of the session's worktree workspace."
         )
+
+
+@pytest.mark.asyncio
+async def test_search_scopes_to_a_subdirectory(client: httpx.AsyncClient) -> None:
+    """Search covers exactly what the tree is showing. Scoped to a directory it
+    reports the resolved base and returns paths relative to it, so a panel
+    browsing that directory does not show hits from outside it."""
+    scoped = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search/src?q=."
+    )
+    assert scoped.status_code == 200, scoped.text
+    body = scoped.json()
+    paths = {e["path"] for e in body["data"]}
+
+    assert body["base"].endswith("/src")
+    # Paths are relative to the scoped base (no "src/" prefix), and the
+    # parent's files are absent -- search covers exactly the scoped tree.
+    assert paths == {"main.py"}, paths
+
+
+@pytest.mark.asyncio
+async def test_search_reports_untruncated_for_a_small_tree(client: httpx.AsyncClient) -> None:
+    """``truncated`` distinguishes "searched everything, found nothing" from
+    "ran out of scan budget". A small workspace always completes, so a caller
+    can trust an empty result here to mean there really are no matches."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/search?q=zzq9xnomatchzz"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["data"] == []
+    assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_scan_budget_bounds_a_no_match_walk(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A query matching nothing never fills the result cap, so the walk needs
+    its own bound. With the scan budget lowered, a tree larger than the budget
+    stops early and says so rather than walking to completion."""
+    import omnigent.runner.environment_filesystem as efs
+
+    deep = tmp_path / "many"
+    deep.mkdir()
+    for i in range(60):
+        (deep / f"f{i}.txt").write_text("x")
+
+    monkeypatch.setattr(efs, "_SEARCH_SCAN_BUDGET", 10)
+    fs = efs.CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, truncated = await fs.search_files("zzq9xnomatchzz")
+
+    assert entries == []
+    assert truncated is True, "a budget-exhausted search must not look like 'no matches'"
+
+
+@pytest.mark.asyncio
+async def test_write_outside_workspace_requires_the_server_vouch(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Writing an absolute path is only accepted when the server vouches for the
+    caller. The runner cannot see who is asking, so without the vouch the
+    absolute form is not accepted at all -- the historical contract."""
+    target = tmp_path / "outside.txt"
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    encoded = "%2F" + str(target).lstrip("/")
+    body = {"content": "written\n", "encoding": "utf-8"}
+
+    refused = await client.put(f"{base}/{encoded}", json=body)
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["code"] == "invalid_path"
+    assert not target.exists()
+
+    vouched = await client.put(f"{base}/{encoded}?browse_outside_workspace=true", json=body)
+    assert vouched.status_code == 200, vouched.text
+    assert target.read_text() == "written\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_and_delete_outside_workspace_round_trip(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Edit and delete follow write outside the workspace. Edit in particular
+    has to report a path it can echo back: the response entry cannot be made
+    relative to the workspace root, which previously turned a successful edit
+    into a 400."""
+    target = tmp_path / "roundtrip.txt"
+    target.write_text("alpha beta\n")
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    url = f"{base}/%2F{str(target).lstrip('/')}?browse_outside_workspace=true"
+
+    edited = await client.patch(url, json={"old_text": "alpha", "new_text": "gamma"})
+    assert edited.status_code == 200, edited.text
+    assert target.read_text() == "gamma beta\n"
+
+    removed = await client.request("DELETE", url)
+    assert removed.status_code == 200, removed.text
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_unwritable_target_reports_an_error_not_a_crash(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """An ordinary OS permission denial must surface as a filesystem error. The
+    in-process route bypasses the helper subprocess, which is what normally
+    converts a raised OSError into an error payload."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)  # read+execute only: no new entries
+    try:
+        base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+        url = f"{base}/%2F{str(locked / 'nope.txt').lstrip('/')}?browse_outside_workspace=true"
+
+        resp = await client.put(url, json={"content": "x", "encoding": "utf-8"})
+
+        assert resp.status_code < 500, f"expected a handled error, got {resp.status_code}"
+        assert "error" in resp.json()
+    finally:
+        locked.chmod(0o700)

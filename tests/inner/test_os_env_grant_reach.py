@@ -23,9 +23,16 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.entities.environment_filesystem import PathUnreachable
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import _handle_helper_request
-from omnigent.inner.sandbox import SandboxPolicy, resolve_sandbox
+from omnigent.inner.sandbox import (
+    SandboxPolicy,
+    is_unconfined,
+    reachable_roots,
+    resolve_sandbox,
+)
+from omnigent.runner.environment_filesystem import resolve_browse_target
 
 
 def _grant_policy(
@@ -386,3 +393,146 @@ def test_inactive_policy_with_grants_survives_jsonable_round_trip(tmp_path: Path
     assert rebuilt.read_roots == [read_root]
     assert rebuilt.write_roots == [write_root]
     assert rebuilt.write_files == [write_file]
+
+
+def test_reachable_roots_lists_cwd_and_every_grant(tmp_path: Path) -> None:
+    """``reachable_roots`` is the list ``_assert_within_reach`` enforces and the
+    filesystem APIs advertise; it must name cwd plus each declared grant with
+    the access and match-kind that enforcement applies."""
+    cwd = (tmp_path / "ws").resolve()
+    read_root = (tmp_path / "ro").resolve()
+    write_root = (tmp_path / "rw").resolve()
+    write_file = (tmp_path / "single.json").resolve()
+    policy = _grant_policy(
+        read_roots=[read_root], write_roots=[write_root], write_files=[write_file]
+    )
+
+    roots = reachable_roots(cwd, policy)
+
+    assert [(r.path, r.access, r.origin, r.kind) for r in roots] == [
+        (cwd, "write", "cwd", "tree"),
+        (write_root, "write", "write_paths", "tree"),
+        (write_file, "write", "write_files", "file"),
+        (read_root, "read", "read_paths", "tree"),
+    ]
+
+
+def test_reachable_roots_with_no_grants_is_cwd_alone(tmp_path: Path) -> None:
+    """The default-unchanged invariant, stated on the advertised list: with no
+    grants the only reachable root is cwd, so the browser cannot offer more
+    than the file tools allow."""
+    cwd = (tmp_path / "ws").resolve()
+
+    roots = reachable_roots(cwd, _grant_policy())
+
+    assert [(r.path, r.access) for r in roots] == [(cwd, "write")]
+
+
+def test_reachable_roots_not_widened_when_sandbox_inactive(tmp_path: Path) -> None:
+    """``sandbox.type: none`` leaves the shell unconfined, but the FILE TOOLS
+    stay confined. ``reachable_roots`` must not grow just because the policy is
+    inactive -- widening it would silently hand ``sys_os_read`` the whole
+    filesystem. Browsers consult ``is_unconfined`` instead."""
+    cwd = (tmp_path / "ws").resolve()
+    spec = OSEnvSpec(type="caller_process", cwd=".", sandbox=OSEnvSandboxSpec(type="none"))
+    policy = resolve_sandbox(spec, cwd)
+
+    assert is_unconfined(policy) is True
+    assert [r.path for r in reachable_roots(cwd, policy)] == [cwd]
+
+
+def test_reachable_root_contains_matches_enforcement_shape(tmp_path: Path) -> None:
+    """A ``tree`` grant covers its subtree; a ``file`` grant covers exactly one
+    path. This is the distinction ``_assert_within_reach`` relies on, so a
+    sibling file must not ride in on a single-file grant."""
+    write_file = (tmp_path / "dir" / "f.json").resolve()
+    tree_root = (tmp_path / "dir").resolve()
+    policy = _grant_policy(write_roots=[tree_root], write_files=[write_file])
+
+    _cwd, tree, single = reachable_roots(tmp_path / "ws", policy)
+
+    assert tree.contains(tree_root / "nested" / "deep.txt") is True
+    assert single.contains(write_file) is True
+    assert single.contains(write_file.parent / "sibling.json") is False
+
+
+def test_is_unconfined_false_for_an_active_backend(tmp_path: Path) -> None:
+    """An active bwrap / seatbelt policy IS confined, so a browser must not be
+    told it can range over the filesystem."""
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=None,
+        write_roots=[tmp_path.resolve()],
+        write_files=[],
+        allow_network=True,
+    )
+
+    assert is_unconfined(policy) is False
+
+
+def test_browse_target_allows_grants_but_not_beyond_when_confined(tmp_path: Path) -> None:
+    """Browsing authorization reuses the same grants the file tools enforce. A
+    CONFINED environment gets no widening: a path outside every grant is
+    refused even though a human is asking."""
+    cwd = (tmp_path / "ws").resolve()
+    granted = (tmp_path / "data").resolve()
+    granted.mkdir(parents=True)
+    outside = (tmp_path / "elsewhere").resolve()
+    outside.mkdir()
+    roots = reachable_roots(cwd, _grant_policy(read_roots=[granted]))
+
+    assert resolve_browse_target(str(granted), roots, unconfined=False) == granted
+
+    with pytest.raises(PathUnreachable) as excinfo:
+        resolve_browse_target(str(outside), roots, unconfined=False)
+    assert str(cwd) in excinfo.value.reachable_roots
+
+
+def test_browse_target_admits_reads_and_writes_when_unconfined(tmp_path: Path) -> None:
+    """With no OS-level sandbox the co-resident shell can already read AND write
+    anywhere, so permitting both beyond the grants grants no reach that was
+    being withheld. The caller has also cleared the permission level that
+    grants shell, so this is not a new capability for them either."""
+    cwd = (tmp_path / "ws").resolve()
+    outside = (tmp_path / "elsewhere").resolve()
+    outside.mkdir(parents=True)
+    roots = reachable_roots(cwd, _grant_policy())
+
+    assert resolve_browse_target(str(outside), roots, unconfined=True) == outside
+    assert resolve_browse_target(str(outside), roots, unconfined=True, need_write=True) == outside
+
+
+def test_browse_target_never_widens_writes_when_confined(tmp_path: Path) -> None:
+    """The invariant the unconfined widening must NOT leak into: a confined
+    environment's grants are the whole story, and a read grant still never
+    confers write — the human browsing does not get to exceed the sandbox."""
+    cwd = (tmp_path / "ws").resolve()
+    read_only = (tmp_path / "ro").resolve()
+    read_only.mkdir(parents=True)
+    outside = (tmp_path / "elsewhere").resolve()
+    outside.mkdir()
+    roots = reachable_roots(cwd, _grant_policy(read_roots=[read_only]))
+
+    # Readable, but a read grant admits no write.
+    assert resolve_browse_target(str(read_only), roots, unconfined=False) == read_only
+    with pytest.raises(PathUnreachable):
+        resolve_browse_target(str(read_only), roots, unconfined=False, need_write=True)
+
+    # Ungranted entirely: neither read nor write.
+    with pytest.raises(PathUnreachable):
+        resolve_browse_target(str(outside), roots, unconfined=False, need_write=True)
+
+
+def test_browse_target_resolves_traversal_before_authorizing(tmp_path: Path) -> None:
+    """An absolute path carrying ``..`` is normalized and resolved BEFORE the
+    grant comparison, so it cannot be pointed out of a grant by traversal."""
+    cwd = (tmp_path / "ws").resolve()
+    granted = (tmp_path / "data").resolve()
+    granted.mkdir(parents=True)
+    roots = reachable_roots(cwd, _grant_policy(read_roots=[granted]))
+
+    escaping = str(granted / ".." / "elsewhere")
+
+    with pytest.raises(PathUnreachable):
+        resolve_browse_target(escaping, roots, unconfined=False)

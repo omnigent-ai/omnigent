@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import urllib.parse
+from pathlib import Path
 from typing import Annotated, Any, cast
 
 import httpx
@@ -301,6 +302,7 @@ def register_resources_routes(
         host_params: dict[str, Any],
         runner_path: str,
         runner_params: dict[str, str] | None = None,
+        host_workspace: str | None = None,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -333,17 +335,100 @@ def register_resources_routes(
                 raise
             runner_offline = exc
 
-        payload = await _read_workspace_via_host(session_id, op, host_params)
+        payload = await _read_workspace_via_host(
+            session_id, op, host_params, workspace_override=host_workspace
+        )
         if payload is None:
             # No reachable host either — surface the original offline
             # error (503) so the client shows its reconnect affordance.
             raise runner_offline
         return payload
 
+    async def _environment_reach_for_session(
+        session_id: str,
+    ) -> tuple[list[Any], bool, str] | None:
+        """Compute a session's browse reach without consulting the runner.
+
+        Lets the offline (host-served) path authorize an absolute target
+        with the same grants the runner would apply, so browsing behaves
+        identically whether or not the agent is awake. The host is never
+        trusted to enforce this — it reads whatever root it is handed, so
+        the decision has to be made here.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
+            session has no workspace or spec to resolve.
+        """
+        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not conv.workspace:
+            return None
+        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+        spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
+        if spec_os_env is None:
+            return None
+        root = Path(conv.workspace)
+        policy = resolve_sandbox(spec_os_env, root)
+        return reachable_roots(root, policy), is_unconfined(policy), conv.workspace
+
+    def _mutating_runner_path(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+    ) -> str:
+        """Build the runner URL for a write / edit / delete.
+
+        A leading slash means an absolute location rather than a path under
+        the workspace, and the runner refuses those unless the server vouches
+        for the caller. These routes already require ``LEVEL_EDIT`` — the same
+        level that grants shell, which on an unconfined session can already
+        write anywhere — so reaching here IS the vouch.
+
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Client-supplied path.
+        :returns: The runner-relative URL.
+        """
+        absolute = relative_path.startswith("/")
+        # Encode only the leading slash: a literal "//" is what proxies
+        # collapse, while interior slashes travel fine.
+        encoded = (
+            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
+        )
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{environment_id}/filesystem/{encoded}"
+        )
+        return f"{path}?browse_outside_workspace=true" if absolute else path
+
+    async def _authorize_absolute_browse(session_id: str, absolute_path: str) -> str:
+        """Authorize an absolute browse target for the host-served path.
+
+        :param session_id: Session/conversation identifier.
+        :param absolute_path: Absolute path the caller asked for.
+        :returns: The resolved, authorized absolute path.
+        :raises HTTPException: 403 when no grant covers it and the
+            environment is confined.
+        """
+        from omnigent.entities.environment_filesystem import PathUnreachable
+        from omnigent.runner.environment_filesystem import resolve_browse_target
+
+        reach = await _environment_reach_for_session(session_id)
+        if reach is None:
+            raise HTTPException(status_code=403, detail="session has no browsable environment")
+        roots, unconfined, _workspace = reach
+        try:
+            return str(resolve_browse_target(absolute_path, roots, unconfined=unconfined))
+        except PathUnreachable as exc:
+            raise HTTPException(status_code=403, detail=exc.message) from exc
+
     async def _read_workspace_via_host(
         session_id: str,
         op: str,
         host_params: dict[str, Any],
+        *,
+        workspace_override: str | None = None,
     ) -> dict[str, Any] | None:
         """Read the session's workspace over its host tunnel.
 
@@ -374,7 +459,7 @@ def register_resources_routes(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 op=op,
-                workspace=conv.workspace,
+                workspace=workspace_override or conv.workspace,
                 session_id=session_id,
                 params=host_params,
             )
@@ -1483,19 +1568,104 @@ def register_resources_routes(
         :param limit: Maximum number of results (1-500, default 500).
         :returns: JSON list response with matching filesystem entries.
         """
+        return await _proxy_search(
+            request,
+            session_id,
+            environment_id,
+            "",
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/search/{path:path}",
+        response_model=None,
+    )
+    async def search_environment_files_under(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        path: str,
+        q: str = Query(min_length=1, pattern=r".*\S.*"),
+        include: str | None = Query(default=None),
+        exclude: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """
+        Search under a directory rather than the whole workspace.
+
+        Takes the same path shape as the filesystem routes: relative to the
+        workspace, or absolute with a leading slash. Keeps search covering
+        exactly what the file tree is showing.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param path: Directory to search under.
+        :param q: Case-insensitive search substring.
+        :param include: Comma-separated include globs.
+        :param exclude: Comma-separated exclude globs.
+        :param limit: Maximum number of results (1-500, default 500).
+        :returns: JSON list response with matching filesystem entries.
+        """
+        return await _proxy_search(
+            request,
+            session_id,
+            environment_id,
+            path,
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    async def _proxy_search(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        path: str,
+        *,
+        q: str,
+        include: str | None,
+        exclude: str | None,
+        limit: int,
+    ) -> Any:
         params: dict[str, str] = {"q": q, "limit": str(limit)}
         if include is not None:
             params["include"] = include
         if exclude is not None:
             params["exclude"] = exclude
+
+        absolute = path.startswith("/")
+        if absolute:
+            await _validate_session(session_id, request, LEVEL_EDIT)
+            params["browse_outside_workspace"] = "true"
+        else:
+            await _validate_session(session_id, request, LEVEL_READ)
+
         qs = urllib.parse.urlencode(params)
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/search?{qs}"
-        await _validate_session(session_id, request, LEVEL_READ)
+        suffix = ""
+        if path:
+            suffix = "/" + ("%2F" + urllib.parse.quote(path.lstrip("/")) if absolute else path)
+        runner_path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{environment_id}/search{suffix}?{qs}"
+        )
+        host_workspace = await _authorize_absolute_browse(session_id, path) if absolute else None
         return await _fs_get_with_host_fallback(
             session_id,
             op="search",
-            host_params={"q": q, "include": include, "exclude": exclude, "limit": limit},
-            runner_path=path,
+            host_params={
+                "q": q,
+                "include": include,
+                "exclude": exclude,
+                "limit": limit,
+                "path": "" if absolute else path,
+            },
+            runner_path=runner_path,
+            host_workspace=host_workspace,
         )
 
     @router.get(
@@ -1599,23 +1769,45 @@ def register_resources_routes(
             params["after"] = after
         if before is not None:
             params["before"] = before
+
+        # A leading slash means an absolute location rather than a path under
+        # the workspace. Browsing there exposes what this session's shell can
+        # already read, so it takes the same permission level as running one —
+        # a read-only share keeps seeing the workspace and nothing more.
+        absolute = relative_path.startswith("/")
+        if absolute:
+            await _validate_session(session_id, request, LEVEL_EDIT)
+            params["browse_outside_workspace"] = "true"
+        else:
+            await _validate_session(session_id, request, LEVEL_READ)
+
         qs = urllib.parse.urlencode(params)
+        # Encode only the leading slash: a literal "//" is what proxies
+        # collapse, while interior slashes travel fine and keep logs readable.
+        runner_rel = (
+            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
+        )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}?{qs}"
+            f"/{environment_id}/filesystem/{runner_rel}?{qs}"
         )
-        await _validate_session(session_id, request, LEVEL_READ)
+        # Offline, the host reads whatever root it is handed, so the server
+        # authorizes the target itself before rooting the reader there.
+        host_workspace = (
+            await _authorize_absolute_browse(session_id, relative_path) if absolute else None
+        )
         return await _fs_get_with_host_fallback(
             session_id,
             op="list_or_read",
             host_params={
-                "path": relative_path,
+                "path": "" if absolute else relative_path,
                 "limit": limit,
                 "after": after,
                 "before": before,
                 "order": order,
             },
             runner_path=path,
+            host_workspace=host_workspace,
         )
 
     @router.put(
@@ -1639,10 +1831,7 @@ def register_resources_routes(
         :returns: Write result.
         """
         body = await request.json()
-        path = (
-            f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}"
-        )
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
             "PUT",
@@ -1673,10 +1862,7 @@ def register_resources_routes(
         :returns: Edit result.
         """
         body = await request.json()
-        path = (
-            f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}"
-        )
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
             "PATCH",
@@ -1706,10 +1892,7 @@ def register_resources_routes(
         :param relative_path: Path relative to environment root.
         :returns: Delete result.
         """
-        path = (
-            f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}"
-        )
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
             "DELETE",

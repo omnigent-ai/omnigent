@@ -117,6 +117,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import {
+  browsingMarkerFor,
   buildMentionPreamble,
   detectMentionAt,
   type MentionItem,
@@ -205,6 +206,11 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+// Ambient browse-location context the composer prepends when the files panel
+// is pointed away from the workspace. Stripped from the bubble for the same
+// reason as the attachment markers: it is plumbing, not something the user
+// typed.
+const BROWSING_RE = /\[The user's file browser is open at:\s*([^\]]*)\]\s*/g;
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
 type ServerInfoValue = ServerInfo | "loading";
@@ -257,6 +263,7 @@ function extractUserText(content: MessageContentBlock[]): string {
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
+    .replace(BROWSING_RE, "")
     .trim();
 }
 
@@ -4314,6 +4321,9 @@ export function Composer({
   // Harness/agent identity shown in the status tray below the card, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // Null while the files panel shows the workspace, which is where the agent
+  // already is; set only when it has been pointed somewhere else.
+  const browseLocation = useChatStore((s) => s.browseLocation);
   const subAgentName = useChatStore((s) => s.subAgentName);
   const brainHarnessLabels = useBrainHarnessLabels();
   const harnessLabel = composerHarnessLabel(
@@ -4897,8 +4907,16 @@ export function Composer({
     // (codex says "Attached file:"). Folders carry a trailing "/" so the
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
+    // Navigating the files panel cannot move the agent's working directory
+    // (the session workspace is fixed at create time), so when the panel is
+    // pointed elsewhere the only way the agent can act on "these files" is to
+    // be told where the user is looking.
+    const browsingPreamble = browseLocation ? `${browsingMarkerFor(browseLocation)}\n\n` : "";
     const messageText =
-      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
+      browsingPreamble +
+      buildMentionPreamble(mentionedItems, sessionHarness) +
+      quotePreamble +
+      trimmed;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still

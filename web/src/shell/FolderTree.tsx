@@ -196,6 +196,7 @@ export function FolderTree({
   isSearching = false,
   isSearchError = false,
   searchError = null,
+  browseLocation = "",
 }: {
   files: WorkspaceFile[] | undefined;
   isLoading: boolean;
@@ -225,6 +226,11 @@ export function FolderTree({
   isSearchError?: boolean;
   /** Error from a failed search request. */
   searchError?: Error | null;
+  /**
+   * Absolute path currently browsed, or "" for the workspace root. Lazy
+   * directory expansion resolves node paths against it.
+   */
+  browseLocation?: string;
 }) {
   // Initialise from the module-level cache so expanded state survives
   // unmount/remount (e.g. opening the FileViewer and navigating back).
@@ -403,6 +409,7 @@ export function FolderTree({
             changedFileMap={changedFileMap}
             dirtyDirMap={dirtyDirMap}
             sort={sort}
+            browseLocation={browseLocation}
           />
         ))}
       </ul>
@@ -596,6 +603,7 @@ function TreeNodeRow({
   changedFileMap,
   dirtyDirMap,
   sort,
+  browseLocation,
 }: {
   node: TreeNode;
   depth: number;
@@ -607,6 +615,8 @@ function TreeNodeRow({
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
   dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
   sort: ChangedSort;
+  /** Absolute path currently browsed; node paths resolve against it. */
+  browseLocation: string;
 }) {
   const open = node.type === "dir" && expandedPaths.has(node.path);
   const isLazyDir = node.type === "dir" && node.lazy === true;
@@ -615,6 +625,7 @@ function TreeNodeRow({
   const { data: lazyData, isLoading: lazyLoading } = useWorkspaceDirectory(
     conversationId,
     isLazyDir && open ? node.path : null,
+    browseLocation,
   );
 
   if (node.type === "file") {
@@ -728,6 +739,7 @@ function TreeNodeRow({
               changedFileMap={changedFileMap}
               dirtyDirMap={dirtyDirMap}
               sort={sort}
+              browseLocation={browseLocation}
             />
           ))}
         </ul>

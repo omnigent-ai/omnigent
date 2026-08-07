@@ -41,8 +41,10 @@ from typing import TypeAlias, cast
 
 from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
+from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
 from omnigent.runner.environment_filesystem import (
+    _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
     _validate_path,
     split_glob_list,
@@ -323,6 +325,8 @@ class WorkspaceReader:
         exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in split_glob_list(exclude)]
 
         results: list[_WorkspacePayload] = []
+        scanned = 0
+        truncated = False
         for dirpath, dirnames, filenames in os.walk(self._root):
             rel_dir = os.path.relpath(dirpath, self._root)
             # Prune excluded subtrees so a "**/node_modules" pattern
@@ -333,7 +337,10 @@ class WorkspaceReader:
                 if any(r.match(dp) for r in exc):
                     continue
                 kept.append(d)
+            # Spend the scan budget on the real tree first, as the runner does.
+            kept.sort(key=lambda d: d in _DEFAULT_DEPRIORITIZED_DIRS)
             dirnames[:] = kept
+            scanned += len(kept) + len(filenames)
             for fname in sorted(filenames):
                 p = os.path.normpath(os.path.join("" if rel_dir == "." else rel_dir, fname))
                 if exc and any(r.match(p) for r in exc):
@@ -364,8 +371,19 @@ class WorkspaceReader:
                     break
             if len(results) >= limit:
                 break
+            # A query matching little or nothing never fills the result cap, so
+            # the walk needs its own bound -- the same one the runner applies,
+            # so a search behaves identically whether the agent is awake.
+            if scanned >= _SEARCH_SCAN_BUDGET:
+                truncated = True
+                break
         results.sort(key=lambda entry: cast(str, entry["path"]))
-        return {"object": "list", "data": results, "has_more": len(results) >= limit}
+        return {
+            "object": "list",
+            "data": results,
+            "has_more": len(results) >= limit,
+            "truncated": truncated,
+        }
 
     # ── Changed files / diff ───────────────────────────────────────
 
