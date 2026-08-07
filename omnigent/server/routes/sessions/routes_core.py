@@ -423,6 +423,8 @@ def register_core_routes(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    agent_store=agent_store,
+                    agent_id=conv.agent_id if conv is not None else None,
                 )
             )
             _managed_launch_tasks.add(launch_task)

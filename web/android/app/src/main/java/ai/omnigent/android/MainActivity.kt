@@ -602,10 +602,9 @@ class MainActivity : AppCompatActivity() {
         // pendingNavigatePath or push insets into a page that can't consume them.
         if (originOf(url) != pinnedOrigin) return
         // First authenticated app page: drop everything before it from the
-        // back/forward list. Otherwise Back walks into the pre-auth root and the
-        // login-redirect reload (the `loadUrl(origin)` after the cookie injection),
-        // which bounces to login or shows a blank — "back lands on the wrong
-        // screen" / "exits the app". After this the SPA builds clean history.
+        // back/forward list — the pre-auth root, any IdP pages, and the post-login
+        // reload all bounce to login or show a blank if Back reaches them. After
+        // this the SPA builds clean history.
         if (!historyCleared) {
             historyCleared = true
             webView.clearHistory()

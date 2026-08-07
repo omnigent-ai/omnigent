@@ -110,7 +110,12 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { isNativeTerminalSession, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession,
+  nativeCodingAgentForHarness,
+  nativeCodingAgentForSubagentWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -1234,6 +1239,7 @@ export function ChatPage() {
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
+      wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
     />
   );
 
@@ -1482,6 +1488,8 @@ interface MainAgentSurfaceProps {
    * ``subAgentComposerLabel``.
    */
   subAgentLabel: string | null;
+  /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
+  wrapperLabel: string | null;
 }
 
 /**
@@ -1548,6 +1556,7 @@ function MainAgentSurface({
   costRoutingEligible,
   subagentRoutingEligible,
   subAgentLabel,
+  wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
@@ -2022,6 +2031,7 @@ function MainAgentSurface({
         costRoutingEligible={costRoutingEligible}
         subagentRoutingEligible={subagentRoutingEligible}
         subAgentLabel={subAgentLabel}
+        wrapperLabel={wrapperLabel}
         onGrowthChange={publishComposerGrowth}
       />
 
@@ -3572,8 +3582,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         </MessageContent>
       </div>
       {text && (
-        <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" onClick={handleCopy}>
+        <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
             {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
           </MessageAction>
         </MessageActions>
@@ -3653,8 +3663,8 @@ function AssistantBubble({
           </p>
         )}
         {markdownText && (
-          <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" onClick={handleCopy}>
+          <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
+            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
             {/* Fork from this response: clone the session with history
@@ -3664,6 +3674,7 @@ function AssistantBubble({
             {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
               <MessageAction
                 tooltip="Fork from here"
+                size="icon-xxs"
                 data-testid="fork-from-response"
                 onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
               >
@@ -3795,6 +3806,13 @@ interface ComposerProps {
    * tray above the card. See ``subAgentComposerLabel``.
    */
   subAgentLabel?: string | null;
+  /**
+   * The session's ``omnigent.wrapper`` label, or ``null`` when it carries
+   * none. Only the identity label reads it — to name the vendor running a
+   * native sub-agent child (see ``composerHarnessLabel``). Behavior gates
+   * keep using ``modelPickerKind`` / ``isNativeWrapper``.
+   */
+  wrapperLabel?: string | null;
   /**
    * Reports how many pixels taller than its resting height the composer has
    * grown. The composer keeps that growth out of the column's flex layout
@@ -3970,10 +3988,19 @@ export function formatModelEffortStatusLabel(
  * with the brain harness in parens ("Polly (Pi)"). Lives in the status tray
  * below the composer, separate from the read-only model/effort label.
  *
+ * A native sub-agent child (a Claude Code Task, a Codex collab thread) reads
+ * as its vendor's product name ("Claude Code"), matching the Agents rail's
+ * main row. Its ``sub_agent_name`` is the VENDOR's agent type — Claude's
+ * ``subagent_type``, e.g. ``"general-purpose"`` — not an Omnigent agent, so
+ * the wrapper label has to win over the name-based path below; the instance
+ * itself is already named in the "Chatting with sub-agent …" tray.
+ *
  * @param modelPickerKind - Native picker family, when the session is a
  *   claude-/codex-/cursor-native wrapper.
  * @param agentName - Bound agent name (lowercase slug), if any.
  * @param sessionHarness - Effective brain harness id (override-aware).
+ * @param harnessLabels - harness id → picker label.
+ * @param wrapper - The session's ``omnigent.wrapper`` label, if any.
  * @returns Display label, or ``null`` when nothing is known.
  */
 export function composerHarnessLabel(
@@ -3981,7 +4008,10 @@ export function composerHarnessLabel(
   agentName: string | null | undefined,
   sessionHarness: string | null,
   harnessLabels: Record<string, string> = BRAIN_HARNESS_LABELS,
+  wrapper: string | null = null,
 ): string | null {
+  const nativeSubagent = nativeCodingAgentForSubagentWrapper(wrapper);
+  if (nativeSubagent) return nativeSubagent.displayName;
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
   if (modelPickerKind === "cursor") return "Cursor";
@@ -4195,6 +4225,7 @@ export function Composer({
   costRoutingEligible = false,
   subagentRoutingEligible = false,
   subAgentLabel = null,
+  wrapperLabel = null,
   onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
@@ -4265,12 +4296,15 @@ export function Composer({
     // For a sub-agent (head) session, identify the head family being viewed
     // (e.g. the GPT head → "Gpt") rather than the bundle orchestrator
     // ("Debby") — the bundle is already named in the breadcrumb / Agents rail.
+    // A native sub-agent's name is vendor-side, not an Omnigent head, so the
+    // wrapper below outranks it.
     subAgentName ??
       agents?.find((a) => a.id === selectedAgentId)?.name ??
       agents?.[0]?.name ??
       null,
     sessionHarness,
     brainHarnessLabels,
+    wrapperLabel,
   );
 
   // Preserve unsent text + file attachments per session so switching

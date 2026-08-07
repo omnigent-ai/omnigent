@@ -131,6 +131,7 @@ import {
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
+import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
@@ -361,7 +362,41 @@ function defaultModelLabel(
   return dflt ? `Default (${display(dflt)})` : "Default";
 }
 
-function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
+/** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
+export function displayNameForHost(
+  host: Pick<Host, "host_id" | "name">,
+  thisMachineHostId: string | null,
+  userAgent: string,
+): string {
+  if (thisMachineHostId === null || host.host_id !== thisMachineHostId) return host.name;
+  if (/iPhone/i.test(userAgent)) return "This iPhone";
+  if (/iPad/i.test(userAgent)) return "This iPad";
+  if (/Android/i.test(userAgent)) return "This Android";
+  if (/Windows/i.test(userAgent)) return "This Windows";
+  if (/Macintosh|Mac OS X/i.test(userAgent)) return "This Mac";
+  if (/Linux|X11/i.test(userAgent)) return "This machine";
+  return host.name;
+}
+
+/** Resolve this machine exactly from Electron, or conservatively from a local single-host server. */
+export function resolveThisMachineHostId(
+  desktopHostId: string | null,
+  serverIsLocal: boolean,
+  onlineHostIds: readonly string[],
+): string | null {
+  if (desktopHostId !== null) return desktopHostId;
+  return serverIsLocal && onlineHostIds.length === 1 ? onlineHostIds[0] : null;
+}
+
+function HostOption({
+  host,
+  displayName = host.name,
+  subtitle,
+}: {
+  host: Host;
+  displayName?: string;
+  subtitle?: string;
+}) {
   const isOnline = host.status === "online";
   return (
     <span className="flex min-w-0 items-center gap-2">
@@ -372,7 +407,7 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
       )}
       <span className="flex min-w-0 flex-col">
         <span className="flex items-center gap-2">
-          <span className="truncate text-sm">{host.name}</span>
+          <span className="truncate text-sm">{displayName}</span>
           <span
             className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
           >
@@ -2141,11 +2176,17 @@ export function NewChatLandingScreen() {
   const onlineHosts = allHosts.filter((h) => h.status === "online");
   const offlineHosts = allHosts.filter((h) => h.status === "offline");
 
-  // Identify the current desktop machine and whether we can connect it. When
-  // it's already in the host list (online or offline) we connect via that row;
-  // only when it's absent do we show a standalone "Run on this machine" item —
-  // so the machine never appears twice.
-  const thisMachineHostId = desktopHost?.hostId ?? null;
+  // Identify this machine exactly through Electron. A standalone browser cannot
+  // read local host config, so a loopback server with exactly one online host
+  // uses that host as a conservative local-development fallback.
+  const thisMachineHostId = resolveThisMachineHostId(
+    desktopHost?.hostId ?? null,
+    isCurrentServerLocal(),
+    onlineHosts.map((host) => host.host_id),
+  );
+  // When it's already in the host list (online or offline) we connect via that
+  // row; only when it's absent do we show a standalone "Run on this machine"
+  // item, so the machine never appears twice.
   const thisMachineInList =
     thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
   const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
@@ -3136,14 +3177,17 @@ export function NewChatLandingScreen() {
   const workspaceLabel = workspaceTrimmed
     ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
     : "Working directory";
+  const selectedHostDisplayName = selectedHost
+    ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
+    : null;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : sandboxSelected
       ? sandboxLabel
-      : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
+      : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
   // The chip shows just the branch (the "(existing)" distinction lives in the
   // popover's warning; appending it here only gets clipped by the chip's cap).
-  const worktreeLabel = branchName.trim() || "No worktree";
+  const worktreeLabel = branchName.trim() || "Worktree";
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
   const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
@@ -3601,11 +3645,7 @@ export function NewChatLandingScreen() {
       {/* Label collapses to icon-only on narrow viewports (mobile). Capped
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
-      <span
-        className={`hidden max-w-40 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
-      >
-        {workspaceLabel}
-      </span>
+      <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
     </button>
   );
 
@@ -3622,25 +3662,25 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-display-alt">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 font-sans">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
-            // to Otto's h-18 box so the centered composer doesn't shift when
+            // to Otto's h-16 box so the centered composer doesn't shift when
             // toggling between the two landings.
-            <span className="flex h-18 shrink-0 items-center">
+            <span className="flex h-16 shrink-0 items-center">
               <div className="w-14 h-14 flex rounded-xl bg-tag-pink items-center justify-center">
                 <FolderIcon className="size-6 text-brand-accent" />
               </div>
             </span>
           ) : (
-            <OttoEyes className="h-18 w-auto shrink-0" />
+            <OttoEyes className="h-16 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-[1.75em] font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
+          <h1 className="min-w-0 break-words text-center text-[28px] leading-8 font-normal tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
             {selectedProject || "What should we build?"}
           </h1>
         </div>
-        <div className="relative flex w-full flex-col gap-3">
+        <div className="relative flex w-full flex-col gap-1">
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -3650,13 +3690,12 @@ export function NewChatLandingScreen() {
             onDragOver={handleDragOver}
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
-            // Two visual states only (no hover): resting --border, and
-            // --foreground while the textarea itself has focus (has-[]
-            // scopes it so focusing footer buttons doesn't trigger it).
-            // dark:bg-card-solid: opaque fill so dark glass --card doesn't
-            // show through; mirrors the chat composer. Drag-over inset ring.
+            // A home-specific focus shadow adds depth without a resting shadow
+            // or focus border.
+            // dark:bg-card-solid stays opaque so dark glass --card doesn't show
+            // through. Drag-over keeps its separate inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-composer transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground has-[textarea:focus]:shadow-composer-focus",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -3786,16 +3825,17 @@ export function NewChatLandingScreen() {
               // Compose-pill text spec: SF Pro Text system stack at
               // 14px/20px. (Note: sub-16px inputs make mobile Safari
               // auto-zoom on focus — accepted tradeoff per the design.)
-              // Heights are border-box (16px top + 4px bottom padding lives
+              // Heights are border-box (12px top + 8px bottom padding lives
               // inside them): max 200px = the spec's 180px of content.
-              // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              // A 60px floor holds two 20px lines plus that padding;
+              // useAutoGrowTextarea expands from there to the unchanged cap.
+              className="min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
                 textarea; the pills themselves opt back in. */}
             {pillSkills.length > 0 && message.length === 0 && (
-              <div className="pointer-events-none absolute inset-x-4 top-4 flex flex-wrap items-center gap-2">
+              <div className="pointer-events-none absolute inset-x-4 top-3 flex flex-wrap items-center gap-2">
                 <span className="font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-muted-foreground">
                   Describe a task, or try a skill
                 </span>
@@ -3878,7 +3918,10 @@ export function NewChatLandingScreen() {
             {/* No own bg — the pill paints the surface. An explicit bg-card
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
-            <div className="flex items-center justify-between pt-1 pr-4 pb-3 pl-2">
+            <div
+              className="flex items-center justify-between px-2 pb-2"
+              data-testid="new-chat-landing-actions"
+            >
               {/* Attach + dictate — left side, mirroring the in-session composer. */}
               <div className="flex items-center gap-0.5">
                 <Button
@@ -4050,9 +4093,12 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </form>
-          {/* Footer tray (host / cwd / worktree). z-0 under the pill; -mt-9
-              tucks under it. Padding-driven height so chips can wrap. */}
-          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl pt-8 pr-3 pb-2 pl-2">
+          {/* Footer tray (host / cwd / worktree). Sits below the composer with
+              symmetric vertical padding and no overlap. */}
+          <div
+            className="relative z-0 flex w-full items-center rounded-b-2xl py-1.5 pr-4 pl-2"
+            data-testid="new-chat-landing-footer"
+          >
             <div className="flex flex-wrap items-center gap-1">
               {/* Host chip */}
               <DropdownMenu
@@ -4071,16 +4117,17 @@ export function NewChatLandingScreen() {
                     className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
-                    {isCloudHost ? (
+                    {selectedHost?.status === "online" && !sandboxSelected ? (
+                      <>
+                        <span aria-hidden className="size-2 shrink-0 rounded-full bg-success" />
+                        <span className="sr-only">Online</span>
+                      </>
+                    ) : isCloudHost ? (
                       <MonitorCloudIcon className="ui-icon" />
                     ) : (
                       <MonitorIcon className="ui-icon" />
                     )}
-                    <span
-                      className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
-                    >
-                      {hostLabel}
-                    </span>
+                    <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -4150,7 +4197,11 @@ export function NewChatLandingScreen() {
                     >
                       <HostOption
                         host={host}
-                        subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                        displayName={displayNameForHost(
+                          host,
+                          thisMachineHostId,
+                          navigator.userAgent,
+                        )}
                       />
                     </DropdownMenuItem>
                   ))}
@@ -4171,11 +4222,12 @@ export function NewChatLandingScreen() {
                         >
                           <HostOption
                             host={host}
-                            subtitle={
-                              connectingThisMachine
-                                ? "connecting…"
-                                : "this machine · select to connect"
-                            }
+                            displayName={displayNameForHost(
+                              host,
+                              thisMachineHostId,
+                              navigator.userAgent,
+                            )}
+                            subtitle={connectingThisMachine ? "connecting…" : "select to connect"}
                           />
                         </DropdownMenuItem>
                       );
@@ -4184,7 +4236,11 @@ export function NewChatLandingScreen() {
                       <DropdownMenuItem key={host.host_id} disabled className="text-sm">
                         <HostOption
                           host={host}
-                          subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                          displayName={displayNameForHost(
+                            host,
+                            thisMachineHostId,
+                            navigator.userAgent,
+                          )}
                         />
                       </DropdownMenuItem>
                     );
@@ -4235,9 +4291,7 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span
-                        className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
-                      >
+                      <span className="hidden max-w-40 truncate text-sm sm:block">
                         {sandboxRepoLabel}
                       </span>
                     </button>
@@ -4344,9 +4398,7 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span
-                        className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
-                      >
+                      <span className="hidden max-w-32 truncate text-sm sm:block">
                         {worktreeLabel}
                       </span>
                     </button>

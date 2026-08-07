@@ -23,6 +23,13 @@ export interface NativeCodingAgentSpec {
   agentName: string;
   harness: string;
   wrapperLabel: string;
+  /**
+   * `omnigent.wrapper` value stamped on the children this vendor spawns
+   * inside its own CLI (Claude's Task tool, Codex collab threads). Mirrors
+   * `NativeCodingAgent.subagent_wrapper_label` on the server. Absent for
+   * vendors that don't register sub-agent children.
+   */
+  subagentWrapperLabel?: string;
   displayName: string;
   iconKind: NativeCodingAgentIconKind;
   sortRank: number;
@@ -41,6 +48,7 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "claude-native-ui",
     harness: "claude-native",
     wrapperLabel: "claude-code-native-ui",
+    subagentWrapperLabel: "claude-code-native-ui-subagent",
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
@@ -52,6 +60,7 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "codex-native-ui",
     harness: "codex-native",
     wrapperLabel: "codex-native-ui",
+    subagentWrapperLabel: "codex-native-ui-subagent",
     displayName: "Codex",
     iconKind: "codex",
     sortRank: 20,
@@ -63,6 +72,7 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "opencode-native-ui",
     harness: "opencode-native",
     wrapperLabel: "opencode-native-ui",
+    subagentWrapperLabel: "opencode-native-ui-subagent",
     displayName: "OpenCode",
     iconKind: "opencode",
     sortRank: 25,
@@ -174,6 +184,14 @@ const BY_HARNESS = new Map<string, NativeCodingAgentSpec>(
 const BY_WRAPPER = new Map<string, NativeCodingAgentSpec>(
   NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
 );
+// Kept out of BY_WRAPPER: a sub-agent child is NOT a native-terminal session
+// (it owns no PTY and takes no input), so `isNativeWrapper` must keep
+// returning false for these labels.
+const BY_SUBAGENT_WRAPPER = new Map<string, NativeCodingAgentSpec>(
+  NATIVE_CODING_AGENTS.flatMap((agent) =>
+    "subagentWrapperLabel" in agent ? [[agent.subagentWrapperLabel, agent] as const] : [],
+  ),
+);
 
 // Reversed harness spellings that fold to a canonical native `harness`.
 // Mirrors omnigent.harness_aliases.NATIVE_HARNESSES on the server, which
@@ -208,6 +226,20 @@ export function nativeCodingAgentForWrapper(
   wrapper: string | null | undefined,
 ): NativeCodingAgentSpec | undefined {
   return wrapper == null ? undefined : BY_WRAPPER.get(wrapper);
+}
+
+/**
+ * Resolve the vendor that spawned a native sub-agent child from its
+ * `omnigent.wrapper` label (e.g. `"claude-code-native-ui-subagent"` →
+ * the Claude Code spec). These children reuse the parent's agent row and
+ * carry the VENDOR-side agent type as their `sub_agent_name` (Claude's
+ * `subagent_type`, e.g. `"general-purpose"`), so the wrapper label is the
+ * only signal for which product is running them.
+ */
+export function nativeCodingAgentForSubagentWrapper(
+  wrapper: string | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  return wrapper == null ? undefined : BY_SUBAGENT_WRAPPER.get(wrapper);
 }
 
 export function nativeCodingAgentForAvailableAgent(

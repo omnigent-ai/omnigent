@@ -3,7 +3,6 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist-mono";
-@import "@fontsource-variable/hanken-grotesk";
 
 /* Streamdown ships utility classes pre-compiled in its dist; this @source
  * pragma tells Tailwind v4 to scan those files so the classes survive the
@@ -26,11 +25,6 @@
     ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
     "Noto Color Emoji";
   --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, monospace;
-  /* Hanken Grotesk — self-hosted via @fontsource-variable (no CDN). Generates
-     * the `font-display-alt` utility; falls back to the UI stack if the woff2
-     * hasn't loaded. Variable file covers 100-900, so set font-weight at the
-     * usage site (the design calls for 400). */
-  --font-display-alt: "Hanken Grotesk Variable", var(--font-sans);
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
   --text-3xl: 32px;
@@ -154,6 +148,8 @@
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 60 40 10;
+  --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
+  --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -313,6 +309,8 @@
   /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
+  --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 80%);
+  --composer-shadow-focus: 0 0 14px -8px rgb(0 0 0 / 90%);
   --background: #0e1013;
   --foreground: oklch(0.965 0.003 240);
   --card: rgba(31, 39, 45, 0.6);
@@ -876,16 +874,11 @@ html:not(.dark) .conversations-sidebar {
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection tracks the palette's brand accent so it stays cohesive
-   * across themes (pink on Omni, blue on GitHub, coral on Claude, …). Light:
-   * gentle accent wash + accent-colored text. Dark: solid accent + white. */
+  /* Text selection mirrors the sidebar's active-item treatment in every
+   * palette and color mode. */
   ::selection {
-    background: color-mix(in srgb, var(--brand-accent) 22%, transparent);
-    color: var(--brand-accent);
-  }
-  .dark ::selection {
-    background: var(--brand-accent);
-    color: #ffffff;
+    background: var(--sidebar-active);
+    color: var(--sidebar-active-foreground);
   }
 }
 

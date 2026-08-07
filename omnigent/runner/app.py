@@ -7299,14 +7299,22 @@ def create_runner_app(
         session_id: str,
         environment_id: str,  # noqa: ARG001
     ) -> JSONResponse:
+        import asyncio as _asyncio
+
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
         try:
+            # ``list_changed_files`` shells out to ``git status`` synchronously,
+            # which on a large repo (cold untracked cache) can take seconds.
+            # Offload to a thread so it never blocks the event loop — a blocked
+            # loop can't answer the server's runner-stream relay probe and the
+            # session's first turn 503s with runner_unavailable.
             raw_changes = (
-                session_registry.list_changed_files(
+                await _asyncio.to_thread(
+                    session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
                 )
@@ -7375,11 +7383,17 @@ def create_runner_app(
                 },
             )
 
+        import asyncio as _asyncio
+
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         try:
+            # Offloaded like list_filesystem_changes: get_changed_file shells out
+            # to git (status + show) synchronously, so keep it off the loop.
             record = (
-                session_registry.get_changed_file(session_id, relative_path)
+                await _asyncio.to_thread(
+                    session_registry.get_changed_file, session_id, relative_path
+                )
                 if session_registry is not None
                 else None
             )
@@ -7402,8 +7416,6 @@ def create_runner_app(
                 },
             )
         is_deleted = record.get("status") == "deleted"
-
-        import asyncio as _asyncio
 
         before: str | None = (
             await _asyncio.to_thread(session_registry.get_baseline, relative_path)

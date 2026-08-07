@@ -14,11 +14,14 @@ the local send lifecycle into ``streaming``, so the composer showed
 "Send a follow-up (queued)" and held every message in the client-side
 queue strip until the background work finished.
 
-The ``waiting`` edge is published LIVE (after navigation) so it arrives via
-the SSE ``session.status`` path — the one the fix targets. Publishing it
-before navigation is not equivalent: this suite's ``openai-agents`` runner
-collapses a posted ``waiting`` to ``running`` in the snapshot projection, so
-a pre-navigation post would not reproduce the ``waiting`` state at all.
+Both the live SSE path and the snapshot path are covered. The snapshot one
+is the load-bearing case: the server records a background-task ``waiting``
+as ``idle`` (the turn ended), so opening the session fresh serves a status
+the composer can send against. When it recorded ``waiting``, the snapshot
+projection collapsed that to ``running`` while still carrying the ended
+turn's ``active_response_id`` — so every fresh open reopened the settled
+turn as "streaming" and stranded the composer on the queue until the
+background work finished.
 
 Like ``test_working_indicator_background_tasks``, this drives the real
 status edge through the Sessions events route (the same path the
@@ -36,6 +39,7 @@ _WORKING = '[data-testid="working-indicator"]'
 _COMPOSER_PLACEHOLDER_IDLE = "Ask the agent anything…"
 
 _SEND_MSG = "sentinel-bg-send-2a9c sent while a background task runs"
+_RELOAD_SEND_MSG = "sentinel-bg-send-7f31 sent after reopening the session"
 
 
 def _publish_status(
@@ -121,4 +125,47 @@ def test_message_sends_directly_while_background_task_runs(
     composer.fill(_SEND_MSG)
     page.get_by_role("button", name="Send", exact=True).click()
     expect(_user_bubble(page, _SEND_MSG)).to_be_visible(timeout=10_000)
+    expect(page.locator(_QUEUED_STRIP)).to_have_count(0)
+
+
+def test_message_sends_directly_after_reopening_with_background_task(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A message sends immediately when the session is opened mid-background-work.
+
+    Same Stop-hook edge, but published BEFORE navigation so the composer
+    hydrates from the snapshot instead of a live SSE edge. This is the path
+    the live test cannot reach: the snapshot used to project the recorded
+    ``waiting`` as ``running`` while still carrying the ended turn's
+    ``active_response_id``, reopening it as "streaming" — so every fresh open
+    or reload queued every message behind the background work.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server
+        fixture.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _publish_status(
+        base_url,
+        session_id,
+        "waiting",
+        response_id="resp_bg_2",
+        background_task_count=1,
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible()
+    # The shells are still reported (the tally rides the snapshot) …
+    expect(page.locator(_WORKING)).to_contain_text(
+        "1 background task still running", timeout=15_000
+    )
+    # … but the turn is over, so the composer is free.
+    expect(composer).to_have_attribute("placeholder", _COMPOSER_PLACEHOLDER_IDLE, timeout=15_000)
+
+    composer.fill(_RELOAD_SEND_MSG)
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(_user_bubble(page, _RELOAD_SEND_MSG)).to_be_visible(timeout=10_000)
     expect(page.locator(_QUEUED_STRIP)).to_have_count(0)

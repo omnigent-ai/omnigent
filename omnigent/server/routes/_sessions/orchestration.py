@@ -591,6 +591,7 @@ async def _best_effort_stop(
     try:
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
         status = _session_status_with_child_rollup(session_id, descendant_ids)
+        own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
@@ -599,7 +600,13 @@ async def _best_effort_stop(
         )
         return
 
-    if status != "running":
+    # Background shells outlive their turn without making the session read as
+    # running (the sidebar must not spin for an ended turn), but they are live
+    # work on the runner — a destructive action still has to stop them.
+    has_background_tasks = (
+        own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
+    )
+    if status != "running" and not has_background_tasks:
         return
 
     async def _stop(target_id: str) -> None:
@@ -612,10 +619,6 @@ async def _best_effort_stop(
                 exc_info=True,
             )
 
-    own_status = _session_status_from_cache(session_id)
-    has_background_tasks = (
-        own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
-    )
     if own_status == "running" or has_background_tasks:
         await _stop(session_id)
     for descendant_id in descendant_ids:
@@ -2499,6 +2502,8 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    agent_store: AgentStore | None = None,
+    agent_id: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2547,7 +2552,31 @@ async def _run_managed_launch(
     :param relaunch_host: Existing managed host row to relaunch a new
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
+    The runner's agent classifier is resolved here rather than by the
+    caller, so the read runs on the task that already owns the
+    single-flight claim: the request path keeps no ``await`` between
+    claiming and spawning, and only the winning caller reaches this
+    function, so a losing concurrent message pays nothing for it. It is
+    re-derived on every launch through the built-in gate, so there is no
+    stored classifier to keep in sync — or to forge.
+
+    :param agent_store: Store the classifier is resolved from, or
+        ``None`` (a stripped test wiring) to leave the runner
+        unclassified.
+    :param agent_id: Agent the session is bound to, resolved through the
+        built-in gate into the runner Pod's ``omnigent.ai/agent``
+        classifier, or ``None`` to leave it unstamped.
     """
+    from omnigent.server.managed_hosts import resolve_managed_agent_label
+
+    agent_name: str | None = None
+    if agent_store is not None and agent_id is not None:
+        agent_name = await asyncio.to_thread(
+            resolve_managed_agent_label,
+            agent_store,
+            agent_id,
+            session_id=session_id,
+        )
     managed = await _provision_managed_sandbox(
         session_id=session_id,
         owner=owner,
@@ -2556,6 +2585,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        agent_name=agent_name,
     )
     if managed is None:
         return
@@ -3014,21 +3044,31 @@ def _kick_managed_relaunch(
     """
     Register and spawn the background relaunch for a dead sandbox.
 
-    Recovers the session's create-time repository workspace from its
-    label so the fresh generation re-clones it, registers the tracker
-    entry, and schedules :func:`_run_managed_launch` with the existing
-    host row.
+    Recovers the session's create-time repository workspace from its label so
+    the fresh generation re-clones it, claims the single-flight tracker entry,
+    and schedules :func:`_run_managed_launch` with the existing host row. The
+    new Pod re-hits admission, so its ``omnigent.ai/agent`` classifier is
+    re-stamped — resolved by the launch task through the same built-in gate the
+    initial launch uses, never read from a stored label.
+
+    Stays synchronous so no ``await`` falls between the caller's
+    ``tracker.get`` check and the ``tracker.begin`` claim, and none falls
+    between that claim and the task that settles it.
 
     :param session_id: Session/conversation identifier.
-    :param conv: The session row (supplies the repo label).
+    :param conv: The session row (supplies the repo label and bound agent).
     :param host: The dead managed host row to relaunch.
     :param sandbox_config: The deployment's sandbox config.
     :param tracker: The app's launch tracker.
     :param conversation_store: Store holding the session row.
     :param host_store: Persistent host registrations.
-    :param app_state: ``request.app.state`` — supplies the registries.
+    :param app_state: ``request.app.state`` — supplies the registries and the
+        agent store the classifier is re-derived from.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, parse_repo_workspace
+    from omnigent.server.managed_hosts import (
+        MANAGED_REPO_LABEL_KEY,
+        parse_repo_workspace,
+    )
 
     # Re-clone the repository the session was created with so the
     # fresh generation's workspace matches the create-time state.
@@ -3057,6 +3097,12 @@ def _kick_managed_relaunch(
     # Seed the relaunch's progress indicator immediately — the user is
     # typically watching the session page when "wake the sandbox" runs.
     _publish_sandbox_status(session_id, "provisioning")
+    agent_store = getattr(app_state, "agent_store", None)
+    if agent_store is None:
+        _logger.warning(
+            "session %s: relaunch has no agent store; runner stays unclassified",
+            session_id,
+        )
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
             session_id=session_id,
@@ -3069,6 +3115,8 @@ def _kick_managed_relaunch(
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             relaunch_host=host,
+            agent_store=agent_store,
+            agent_id=conv.agent_id,
         )
     )
     _managed_launch_tasks.add(relaunch_task)
