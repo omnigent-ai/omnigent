@@ -745,11 +745,16 @@ function enterSendChain(conversationId: string | null): {
   return {
     priorSend,
     rekey: (resolvedConversationId) => {
-      // A brand-new chat's id exists only after `createSession`, and
-      // `ensureBoundSession` publishes it to the store BEFORE this send's POST.
-      // A send issued in that window pins the real id, so it would look up an
-      // empty chain and overtake us. Move our slot onto the real id so it
-      // chains behind this POST instead.
+      // A brand-new chat's id exists only after `createSession`, so this slot
+      // starts under the new-session key. `ensureBoundSession` then publishes
+      // that id to the store and awaits its bind — a send issued in that window
+      // resolves the real id, and would find an empty chain and overtake us.
+      //
+      // So this MUST run while the id is still private to the creating call:
+      // `ensureBoundSession` invokes it via `onSessionResolved`, immediately
+      // after `createSession` and before anything publishes the id. Calling it
+      // after the await would leave the window open (and could clobber a slot
+      // the second send had already taken).
       if (key === resolvedConversationId) return;
       if (sendChains.get(key) === slot) sendChains.delete(key);
       key = resolvedConversationId;
@@ -1334,11 +1339,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     try {
       await priorSend;
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId);
+      // `rekey` runs INSIDE the call, the moment `createSession` returns and
+      // before the new id is published — a send issued during the bind would
+      // otherwise resolve that id, find an empty chain, and overtake this POST.
+      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      // A new chat's session now exists: move our chain slot onto its real id
-      // so a follow-up send queues behind this POST.
-      rekey(sessionId);
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -1493,10 +1498,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     try {
       await priorSend;
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId);
+      // See `send`: rekey inside the call, before the new id is visible.
+      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      // See `send`: rekey a new chat's slot onto its real session id.
-      rekey(sessionId);
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
@@ -2222,6 +2226,10 @@ function deferredNativeStickyModel(session: Session): string | null {
  *     e.g. ``"conv_abc123"``; the send routes here even after a session
  *     switch. ``null`` / ``undefined`` falls back to the live
  *     ``conversationId`` (brand-new-chat path).
+ * :param onSessionResolved: Fires with the new session id the instant
+ *     ``createSession`` returns — BEFORE the id is published to the store, so
+ *     the caller can move its send-chain slot onto the real id before any other
+ *     send can resolve that id and key an empty chain. See `enterSendChain`.
  * :returns: The bound session id.
  * :raises Error: Re-raises a ``conversationLoadError`` if a needed rebind
  *     of an existing session fails to establish the stream.
@@ -2231,6 +2239,7 @@ async function ensureBoundSession(
   get: Getter,
   opts?: SendOptions,
   pinnedConversationId?: string | null,
+  onSessionResolved?: (sessionId: string) => void,
 ): Promise<string> {
   // Use the session pinned at submit time so a queued send still targets
   // where it was composed, not wherever the user switched to meanwhile.
@@ -2246,6 +2255,12 @@ async function ensureBoundSession(
     // missed). Bind the stream FIRST, then post the first message.
     const session = await createSession(agentId, []);
     sessionId = session.id;
+    // Claim the send chain for this id NOW, while it is still private to this
+    // call. Everything below publishes it (the store write, the navigate
+    // callback, the sidebar invalidation) and awaits network work, so a send
+    // issued from here on resolves this id — and would find an empty chain and
+    // overtake us if our slot were still under the new-session key.
+    onSessionResolved?.(sessionId);
     // Native runners read reasoning_effort during bind.
     const preBindEffort = useChatStore.getState().selectedEffort;
     if (preBindEffort != null && supportsEffortControl(session)) {

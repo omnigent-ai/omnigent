@@ -1350,6 +1350,93 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(eventBodies.map(textOf)).toEqual(["1", "2", "3"]);
   });
 
+  it("serializes a second send issued while a NEW chat's session is still being created", async () => {
+    // The narrowest ordering window, and the one a per-conversation chain
+    // opens: the first send from `/` has no conversation id, so it takes a slot
+    // under the new-session key. `ensureBoundSession` then publishes the real id
+    // to the store BEFORE that send's POST — so a second send fired in that
+    // window pins the real id and would key on an EMPTY chain, overtaking the
+    // first. The first send's slot has to reach the real id before the id
+    // becomes visible to anyone else.
+    const eventBodies: string[] = [];
+    const resolvers: (() => void)[] = [];
+    seedSession("conv_new");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_new/events" && init?.method === "POST") {
+        eventBodies.push(init.body as string);
+        return new Promise<Response>((resolve) => {
+          resolvers.push(() => resolve(mockResponse({ queued: true, item_id: "ci_mock" })));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const textOf = (body: string): string =>
+      (JSON.parse(body).data.content[0] as { text: string }).text;
+
+    // Hold the bind's snapshot GET so `ensureBoundSession` parks INSIDE
+    // `bindStream` — after it published the real id to the store, but before
+    // the first send reaches its POST. That is the window, and it lasts as long
+    // as the bind's network work does.
+    let releaseSnapshot: (() => void) | null = null;
+    const baseHandler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      // Only the FIRST snapshot GET is held; later ones (the second send's
+      // rebind check) pass through, so the latch isolates the window under test.
+      if (
+        /^\/v1\/sessions\/conv_new(\?|$)/.test(url) &&
+        (init?.method ?? "GET") === "GET" &&
+        releaseSnapshot === null
+      ) {
+        return new Promise<Response>((resolve) => {
+          releaseSnapshot = () => resolve(baseHandler(input, init) as Promise<Response>);
+        });
+      }
+      return baseHandler(input, init);
+    });
+
+    // First send from the landing route (conversationId === null).
+    const p1 = useChatStore.getState().send("first", "agent_xyz");
+    await tick();
+    await tick();
+    await tick();
+    // The id is visible to any other send, but the first send is still parked
+    // in its bind and has not reached `rekey` yet.
+    expect(useChatStore.getState().conversationId).toBe("conv_new");
+    expect(releaseSnapshot).not.toBeNull();
+
+    // Second send now resolves `conv_new` as its own submit-time target.
+    const p2 = useChatStore.getState().send("second", "agent_xyz");
+    await tick();
+    await tick();
+
+    // The first send is still parked in its bind, so ITS post hasn't fired.
+    // The second must not overtake it: pre-fix it keyed an empty chain (the
+    // first send's slot was still under the new-session key) and fired here,
+    // reaching the server before "first".
+    expect(eventBodies.map(textOf)).toEqual([]);
+
+    releaseSnapshot!();
+    await tick();
+    await tick();
+    // The bind finished; the first send's POST goes out first, alone.
+    expect(eventBodies.map(textOf)).toEqual(["first"]);
+
+    // Releasing the first POST hands the chain to the second, which then runs
+    // its own bind check + upload before posting.
+    resolvers[0]!();
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 6; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    expect(eventBodies.map(textOf)).toEqual(["first", "second"]);
+
+    resolvers[1]!();
+    await Promise.all([p1, p2]);
+    // Delivery order is submission order.
+    expect(eventBodies.map(textOf)).toEqual(["first", "second"]);
+  });
+
   it("PATCHes sticky effort onto a brand-new session before binding the runner", async () => {
     seedSession("conv_new");
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
