@@ -634,3 +634,29 @@ def test_contained_realpath_returns_an_ordinary_path(tmp_path: Path) -> None:
 
     assert got == str(target)
     assert not got.endswith(os.sep)
+
+
+def test_contained_realpath_admits_a_symlink_loop_but_it_reaches_nothing(
+    tmp_path: Path,
+) -> None:
+    """A symlink cycle inside the boundary is admitted, and that is safe.
+
+    This is the ONE behavioural difference from the previous
+    ``Path.resolve()`` + ``relative_to`` idiom: ``resolve()`` raised ``ELOOP``
+    (refused at the check), whereas ``realpath`` returns the path unresolved,
+    so containment admits it. Nothing escapes -- the cycle stays under the
+    boundary and every syscall through it fails with ELOOP, so the refusal
+    just happens at the read instead of at the check. Pinned so nobody
+    "hardens" this back into a special case believing it was a hole.
+    """
+    root = (tmp_path / "ws").resolve()
+    root.mkdir()
+    (root / "a").symlink_to(root / "b")
+    (root / "b").symlink_to(root / "a")
+
+    admitted = contained_realpath(str(root / "a"), containment_prefix(root))
+
+    assert admitted is not None
+    assert admitted.startswith(str(root))
+    with pytest.raises(OSError):
+        (Path(admitted)).read_bytes()
