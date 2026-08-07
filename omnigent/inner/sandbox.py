@@ -507,6 +507,10 @@ class ReachableRoot:
         ``"read"`` when it admits reads only.
     :param origin: Which declaration produced this grant — ``"cwd"``,
         ``"read_paths"``, ``"write_paths"``, or ``"write_files"``.
+        ``"unconfined"`` marks the synthetic filesystem-root grant that
+        :func:`omnigent.runner.environment_filesystem.resolve_browse_target`
+        adds for an unconfined policy; it is never advertised or returned
+        by :func:`reachable_roots`.
         Carried for display; enforcement uses :attr:`kind` and
         :attr:`access`.
     :param kind: ``"tree"`` when the grant covers the subtree rooted at
@@ -555,6 +559,9 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     :param policy: Resolved sandbox policy carrying the declared grants.
     :returns: Grants in precedence order, cwd first. Never empty.
     """
+    # codeql[py/path-injection]: `cwd` is the environment root the runner was
+    # launched with, not caller input; resolving it is what makes the grants
+    # comparable to a resolved candidate path.
     roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
     roots += [
         ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
