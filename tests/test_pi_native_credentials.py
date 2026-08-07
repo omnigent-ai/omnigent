@@ -1394,6 +1394,79 @@ def test_anthropic_protocol_proxy_serves_non_claude_model() -> None:
     assert provider.unroutable_model_warning() is None
 
 
+def _dual_family_config(anthropic: bool = True, openai: bool = True) -> dict[str, object]:
+    """A proxy entry exposing an Anthropic surface, an OpenAI surface, or both."""
+    proxy: dict[str, object] = {"kind": "gateway", "default": True}
+    if anthropic:
+        proxy["anthropic"] = {
+            "base_url": "https://litellm.internal.example.com/anthropic",
+            "api_key": "sk-a",
+        }
+    if openai:
+        proxy["openai"] = {
+            "base_url": "https://litellm.internal.example.com/v1",
+            "api_key": "sk-o",
+        }
+    return {"providers": {"proxy": proxy}}
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_api", "expected_base_url"),
+    [
+        (
+            "claude-sonnet-4-6",
+            "anthropic-messages",
+            "https://litellm.internal.example.com/anthropic",
+        ),
+        ("gpt-5-5", "openai-responses", "https://litellm.internal.example.com/v1"),
+        ("glm-5-2", "openai-responses", "https://litellm.internal.example.com/v1"),
+        # Tokens as "other", but no gateway serves it over Anthropic Messages.
+        ("gemini-3-5-flash", "openai-responses", "https://litellm.internal.example.com/v1"),
+        ("llama-4-maverick", "openai-responses", "https://litellm.internal.example.com/v1"),
+    ],
+)
+def test_dual_family_provider_matches_model_family(
+    model: str, expected_api: str, expected_base_url: str
+) -> None:
+    """A provider offering both surfaces serves each model from its own family.
+
+    The family loop used to return on the first configured family, so a proxy
+    with both surfaces sent every model to Anthropic Messages. A non-translating
+    proxy rejects that and the turn hangs with no reply.
+    """
+    config = _dual_family_config()
+
+    provider = creds.resolve_pi_native_provider(model=model, config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == expected_api
+    assert provider.base_url == expected_base_url
+
+
+@pytest.mark.parametrize(
+    ("model", "anthropic", "openai", "expected_api"),
+    [
+        ("gpt-5-5", True, False, "anthropic-messages"),
+        ("claude-sonnet-4-6", False, True, "openai-responses"),
+    ],
+)
+def test_single_family_provider_serves_any_model(
+    model: str, anthropic: bool, openai: bool, expected_api: str
+) -> None:
+    """One configured family serves every model — it may be protocol-translating.
+
+    Preferring the model's family must not become a requirement: a LiteLLM
+    ``/anthropic`` passthrough serves GPT ids, and an OpenAI-compatible proxy
+    serves Claude ids. Excluding them would strand both.
+    """
+    config = _dual_family_config(anthropic=anthropic, openai=openai)
+
+    provider = creds.resolve_pi_native_provider(model=model, config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == expected_api
+
+
 def test_databricks_builders_carry_reachable_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Databricks profile path records every surface its credential reaches."""
     _mock_databricks_profile(monkeypatch)
