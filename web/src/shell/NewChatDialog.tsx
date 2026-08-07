@@ -2379,7 +2379,11 @@ export function NewChatLandingScreen() {
     projectBaseBranch !== null &&
     seededHostRef.current !== selectedHostId &&
     autoSeedCandidate !== null;
-  const { data: seedWorktrees, isPlaceholderData: seedWorktreesArePlaceholder } = useHostWorktrees(
+  const {
+    data: seedWorktrees,
+    isPlaceholderData: seedWorktreesArePlaceholder,
+    isError: seedWorktreesErrored,
+  } = useHostWorktrees(
     forkFreshArmed ? selectedHostId : null,
     forkFreshArmed ? autoSeedCandidate : null,
   );
@@ -2391,6 +2395,11 @@ export function NewChatLandingScreen() {
   // the project default instead of reusing).
   const forkFreshMainPath = useMemo<string | null | undefined>(() => {
     if (!forkFreshArmed) return null;
+    // A probe error (non-400; the hook already maps 400 → []) leaves data
+    // undefined for good. Treat it as "no redirect" so the seed still lands on
+    // the candidate as-is, rather than waiting on data that never arrives and
+    // leaving the workspace blank forever.
+    if (seedWorktreesErrored) return null;
     if (seedWorktreesArePlaceholder || seedWorktrees === undefined) return undefined;
     const norm = normalizeWorkspacePath(autoSeedCandidate);
     const candIsLinkedWorktree = seedWorktrees.some(
@@ -2398,7 +2407,13 @@ export function NewChatLandingScreen() {
     );
     const mainPath = seedWorktrees.find((w) => w.is_main)?.path ?? null;
     return candIsLinkedWorktree && mainPath !== null ? mainPath : null;
-  }, [forkFreshArmed, seedWorktrees, seedWorktreesArePlaceholder, autoSeedCandidate]);
+  }, [
+    forkFreshArmed,
+    seedWorktrees,
+    seedWorktreesArePlaceholder,
+    seedWorktreesErrored,
+    autoSeedCandidate,
+  ]);
 
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the

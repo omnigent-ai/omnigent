@@ -393,4 +393,29 @@ describe("NewChatLandingScreen project prefill", () => {
     // Plain launch — no worktree fork was manufactured from the config workspace.
     expect(body.git).toBeUndefined();
   });
+
+  it("still seeds the recent workspace when the worktree probe errors", async () => {
+    // A non-400 failure from /worktrees leaves the hook's data undefined for
+    // good. The seed must fall back to the candidate as-is (treat the probe
+    // error as "no redirect") rather than blocking on data that never arrives
+    // and leaving the working directory blank forever.
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
+    vi.mocked(useHostWorktrees).mockReturnValue({
+      data: undefined,
+      isPlaceholderData: false,
+      isError: true,
+    } as ReturnType<typeof useHostWorktrees>);
+    setProjectConfig({ host_id: "host_1", base_branch: "develop" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "feature-x",
+      ),
+    );
+    const body = await submitAndReadBody();
+    // Seeded the recent path as-is; no redirect, no fabricated fork.
+    expect(body.workspace).toBe(LINKED_WORKTREE);
+    expect(body.git).toBeUndefined();
+  });
 });
