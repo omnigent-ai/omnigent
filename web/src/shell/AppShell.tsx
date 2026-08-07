@@ -989,6 +989,15 @@ export function AppShell() {
     setRightPanelOpen(next);
   };
 
+  // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
+  // sidebar counts as open, so toggling collapses it; either way peek is
+  // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
+  // floating-card layout the rest of the shell treats as a pushing panel).
+  const toggleLeftSidebar = () => {
+    setSidebarOpen(!(sidebarOpen || sidebarPeek));
+    setSidebarPeek(false);
+  };
+
   // Toggle the workspace rail's full-screen (maximized) state. Entering
   // collapses the left sidebar (the maximized rail wants the full width) after
   // stashing its prior open-state; exiting restores that state. The sidebar
@@ -1011,7 +1020,7 @@ export function AppShell() {
   // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
   // here where both panels' open-state lives.
   useSidebarToggleHotkeys({
-    onToggleLeft: () => setSidebarOpen((prev) => !prev),
+    onToggleLeft: toggleLeftSidebar,
     onToggleRight: toggleRightPanel,
   });
 
@@ -1730,7 +1739,7 @@ export function AppShell() {
           <CommandPalette
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
-            onToggleLeftSidebar={() => setSidebarOpen((prev) => !prev)}
+            onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
           />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
