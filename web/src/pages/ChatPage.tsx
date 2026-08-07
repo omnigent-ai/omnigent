@@ -1199,7 +1199,6 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
@@ -1254,7 +1253,6 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
-      canApprove={canApprove}
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
@@ -1484,8 +1482,6 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
-  /** Whether this viewer may accept privileged actions. */
-  canApprove: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   effortLevels: readonly string[];
@@ -1571,7 +1567,6 @@ function MainAgentSurface({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
-  canApprove,
   readOnlyReason,
   effortLevels,
   showEffort,
@@ -1921,7 +1916,6 @@ function MainAgentSurface({
                   <BubbleView
                     key={bubbleKey(bubble)}
                     bubble={bubble}
-                    canApprove={canApprove}
                     isLastAssistant={bubbleIndex === lastAssistantIndex}
                     showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
                   />
@@ -1943,7 +1937,7 @@ function MainAgentSurface({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} canApprove={canApprove} />
+                      <ElicitationCard item={item} />
                     </MessageContent>
                   </Message>
                 ))}
@@ -3362,12 +3356,10 @@ function CompactionLoadingIndicator() {
 export const BubbleView = memo(
   function BubbleView({
     bubble,
-    canApprove = true,
     isLastAssistant = false,
     showsWorking = false,
   }: {
     bubble: Bubble;
-    canApprove?: boolean;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
   }) {
@@ -3390,14 +3382,12 @@ export const BubbleView = memo(
     return (
       <AssistantBubble
         bubble={bubble}
-        canApprove={canApprove}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
       />
     );
   },
   (prev, next) =>
-    prev.canApprove === next.canApprove &&
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
@@ -3623,12 +3613,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
 
 function AssistantBubble({
   bubble,
-  canApprove,
   isLastAssistant = false,
   showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
-  canApprove: boolean;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
 }) {
@@ -3689,7 +3677,6 @@ function AssistantBubble({
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
-            canApprove={canApprove}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
             continued={bubble.continued}

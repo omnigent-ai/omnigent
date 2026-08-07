@@ -332,7 +332,6 @@ const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
-  canApprove?: boolean;
   /**
    * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
    * `"streaming"` keeps the process trace expanded; any settled state
@@ -486,7 +485,6 @@ type ToolRunFragment =
 export function BlockRenderer({
   items,
   sessionStatus,
-  canApprove = true,
   turnLifecycle,
   workedForS,
   continued = false,
@@ -577,17 +575,16 @@ export function BlockRenderer({
     return (
       <>
         <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
-          {renderSequence(process, { liveEdge: false, canApprove })}
+          {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
-        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false, canApprove))}
-        {renderSequence(final, { liveEdge: false, canApprove, indexBase: finalStart })}
+        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false))}
+        {renderSequence(final, { liveEdge: false, indexBase: finalStart })}
       </>
     );
   }
 
   return renderSequence(items, {
     liveEdge: isTurnLive,
-    canApprove,
     suppressReasoningDuration: showsWorking,
   });
 }
@@ -601,7 +598,7 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, canApprove, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
+  { liveEdge, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -663,7 +660,6 @@ function renderSequence(
         i === reasoningStreamingIdx,
         suppressReasoningDuration,
         followsText,
-        canApprove,
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -674,7 +670,6 @@ function renderSequence(
 
 interface TurnSequenceOptions {
   liveEdge: boolean;
-  canApprove: boolean;
   suppressReasoningDuration?: boolean;
   indexBase?: number;
 }
@@ -997,7 +992,6 @@ function renderItem(
   isReasoningStreaming: boolean,
   suppressReasoningDuration = false,
   followsText = false,
-  canApprove = true,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -1094,7 +1088,7 @@ function renderItem(
         />
       );
     case "elicitation":
-      return <ElicitationCard key={key} item={item} canApprove={canApprove} />;
+      return <ElicitationCard key={key} item={item} />;
   }
 }
 

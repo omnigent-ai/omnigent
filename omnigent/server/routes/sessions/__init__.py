@@ -351,7 +351,6 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added as _announce_session_added,
     _apply_liveness_to_items as _apply_liveness_to_items,
     _apply_pending_policy_ask_writes as _apply_pending_policy_ask_writes,
-    _approval_access_from_grants as _approval_access_from_grants,
     _attachment_disposition as _attachment_disposition,
     _authorize_bundled_parent_and_inherit_runner as _authorize_bundled_parent_and_inherit_runner,
     _await_settled_managed_launch as _await_settled_managed_launch,

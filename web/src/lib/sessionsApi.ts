@@ -186,8 +186,6 @@ interface SessionResponseWire {
    * entirely, and absent on older recorded fixtures.
    */
   permission_level?: number | null;
-  /** Whether this viewer may accept privileged actions for the session. */
-  can_approve?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` (or absent on older fixtures)
@@ -314,7 +312,6 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
     })),
     permissionLevel: wire.permission_level ?? null,
-    canApprove: wire.can_approve ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
