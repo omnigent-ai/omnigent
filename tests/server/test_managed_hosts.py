@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
+from omnigent.onboarding.sandboxes.coda import CodaProvider
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -2289,6 +2291,69 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, gen2_token)
     assert resolved is not None and resolved.host_id == first.host_id
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
+
+
+async def test_relaunch_sets_coda_lease_owner_and_keeps_host_identity(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CoDA relaunch reuses the host owner for its new lease."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="cda00000000000000000000000000001",
+        name="managed-coda",
+        user_id=_OWNER,
+        token="old-token",
+        provider="coda",
+        sandbox_id="coda:omnigent#old-lease",
+        token_expires_at=now_epoch() + 3600,
+    )
+    requests: list[tuple[str, Mapping[str, object] | None]] = []
+
+    def request_fn(
+        method: str, path: str, body: Mapping[str, object] | None
+    ) -> Mapping[str, object]:
+        requests.append((method, body))
+        if method == "POST" and path == "/api/omnigent-host/lease":
+            assert body is not None
+            assert body["owner"] == _OWNER
+            assert isinstance(body["lease_id"], str) and body["lease_id"]
+            return {"lease_id": body["lease_id"]}
+        return {"ready": True}
+
+    launcher = CodaProvider(
+        app_name="omnigent",
+        app_url="https://coda.example.com",
+        request_fn=request_fn,
+        app_getter=lambda _name: SimpleNamespace(compute_status=SimpleNamespace(state="ACTIVE")),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts._launcher_for_teardown",
+        lambda _host, _config: launcher,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts._terminate_sandbox_best_effort",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    async def _arm(**kwargs: Any) -> str:
+        assert kwargs["host_id"] == host.host_id
+        assert kwargs["owner"] == _OWNER
+        return "/app/python/source_code"
+
+    monkeypatch.setattr("omnigent.server.managed_hosts._arm_and_start_host", _arm)
+    result = await relaunch_managed_host(
+        config=ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+        ),
+        host=host,
+        host_store=host_store,
+    )
+
+    assert result.host_id == host.host_id
+    lease_calls = [body for method, body in requests if method == "POST"]
+    assert len(lease_calls) == 1
 
 
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:

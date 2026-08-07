@@ -2392,6 +2392,11 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
+    if launcher.provider == "coda":
+        from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+        if isinstance(launcher, CodaProvider):
+            launcher.set_lease_owner(host.user_id)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
