@@ -587,12 +587,20 @@ html:not(.dark) .conversations-sidebar {
 /* Right rail (workspace panel) in dark: blends into the canvas, keeping only
  * its left divider. Excluded from the glass rule above, so this just clears
  * the rail's md:bg-card fill and the bg-card fills its panel contents paint
- * (FilesPanel/TerminalsPanel/SubagentsPanel + the graph surface). */
-.dark aside[aria-label="Workspace"],
+ * (FilesPanel/TerminalsPanel/SubagentsPanel + the graph surface).
+ * Skip when maximized — the panel covers the full content area and needs an
+ * opaque background so the chat beneath doesn't bleed through. */
+.dark aside[aria-label="Workspace"]:not([data-maximized]),
 .dark
-  aside[aria-label="Workspace"]
+  aside[aria-label="Workspace"]:not([data-maximized])
   :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
   background: transparent !important;
+}
+
+/* When maximized the workspace panel covers the full content area; use an
+ * opaque background so the chat underneath doesn't bleed through. */
+aside[aria-label="Workspace"][data-maximized] {
+  background: var(--card-solid) !important;
 }
 
 /* Popovers/menus — same glass treatment */
@@ -1776,17 +1784,17 @@ html:not(.dark) .conversations-sidebar {
 }
 @media (min-width: 48rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
-    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
     background-color: var(--custom-light-sidebar);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   .dark[data-theme="custom"][data-custom-translucent-sidebar]
-    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
     background-color: var(--custom-dark-sidebar);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   :root[data-theme="custom"][data-custom-translucent-sidebar]
-    aside[aria-label="Workspace"]
+    aside[aria-label="Workspace"]:not([data-maximized])
     :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
     background-color: transparent;
   }
