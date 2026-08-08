@@ -69,6 +69,7 @@ def test_plugin_state_loads_builtins() -> None:
     assert "modal" in state
     assert "blaxel" in state
     assert "gensee" in state
+    assert "databricks" in state
     assert "kubernetes" in state
 
 
@@ -96,6 +97,7 @@ def test_available_providers_returns_builtins() -> None:
     assert "modal" in names
     assert "blaxel" in names
     assert "gensee" in names
+    assert "databricks" in names
     assert "kubernetes" in names
 
 
@@ -141,6 +143,13 @@ def test_instantiate_loads_gensee_from_core() -> None:
     launcher = instantiate("gensee")
     assert launcher.provider == "gensee"
     assert launcher.__class__.__module__ == "omnigent.onboarding.sandboxes.gensee"
+
+
+def test_instantiate_loads_databricks_without_optional_sdk() -> None:
+    """The Databricks launcher uses only the public CLI and core dependencies."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("databricks")
+    assert launcher.provider == "databricks"
 
 
 def test_instantiate_unknown_raises() -> None:

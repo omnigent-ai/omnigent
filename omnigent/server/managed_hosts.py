@@ -33,8 +33,8 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|
-         # kubernetes|microsandbox|gensee
+         # databricks|lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|
+         # e2b|openshell|kubernetes|microsandbox|gensee
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -142,9 +142,14 @@ stores into ``create_app``):
    or ``sandbox.openshell.cluster``), so the server process needs
    OpenShell gateway access. The microsandbox launcher needs no
    credentials at all: VMs run embedded on the server host itself
-   (Apple Silicon macOS / KVM Linux). Every provider except
-   ``lakebox`` has managed-launch support; ``lakebox`` parses but
-   rejects at launch.
+   (Apple Silicon macOS / KVM Linux). The ``databricks`` launcher needs no API
+   key either: it shells out to the public ``databricks sandbox`` CLI,
+   so the server process needs that CLI on ``PATH`` and an authenticated
+   profile (``sandbox.databricks.profile`` selects one). Every provider
+   except ``lakebox`` has managed-launch support; ``lakebox`` parses but
+   rejects at launch — its launcher module ships only in the internal
+   build, so an OSS deployment wanting Databricks Sandbox should name
+   ``databricks``.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -207,6 +212,7 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
     {
         "lakebox",
+        "databricks",
         "modal",
         "daytona",
         "blaxel",
@@ -223,6 +229,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
     {
+        "databricks",
         "modal",
         "daytona",
         "blaxel",
@@ -280,6 +287,14 @@ BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # The seven-day policy keeps live VMs reconnecting while stale tokens expire.
 # A relaunch mints a fresh token.
 MICROSANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML databricks path. Databricks
+# Sandboxes have no platform lifetime cap — they auto-stop on idle (which
+# the launcher disables by default) and restart with their disk intact —
+# so the bound is policy, not platform: 7 days mirrors Daytona. A stopped
+# sandbox that the wake path resumes keeps its id, so the token must
+# outlive an idle weekend.
+DATABRICKS_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are
 # deleted by managed-session teardown; use the same 7-day policy bound
@@ -1542,6 +1557,22 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # Derived from OMNIGENT_CWSANDBOX_MAX_LIFETIME_S so the token always
         # outlives the (operator-overridable) sandbox lifetime.
         token_ttl_s = managed_token_ttl_s()
+    elif provider == "databricks":
+        databricks_section = _parse_provider_section(raw, "databricks")
+        if databricks_section is not None:
+            _reject_unknown_keys(
+                databricks_section,
+                {"cli_path", "profile", "idle_timeout", "no_autostop"},
+                "sandbox.databricks",
+            )
+        no_autostop = _parse_provider_bool(raw, "databricks", "no_autostop")
+        launcher_factory = _databricks_launcher_factory(
+            cli_path=_parse_provider_string(raw, "databricks", "cli_path"),
+            profile=_parse_provider_string(raw, "databricks", "profile"),
+            idle_timeout=_parse_provider_string(raw, "databricks", "idle_timeout"),
+            no_autostop=True if no_autostop is None else no_autostop,
+        )
+        token_ttl_s = DATABRICKS_MANAGED_TOKEN_TTL_S
     elif provider == "islo":
         launcher_factory = _islo_launcher_factory(
             image=_parse_provider_image(raw, "islo"),
@@ -2404,6 +2435,45 @@ def _islo_launcher_factory(
             memory_mb=memory_mb,
             disk_gb=disk_gb,
             idle_pause_after_s=idle_pause_after_s,
+        )
+
+    return _build
+
+
+def _databricks_launcher_factory(
+    *,
+    cli_path: str | None,
+    profile: str | None,
+    idle_timeout: str | None,
+    no_autostop: bool,
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: databricks`` path.
+
+    :param cli_path: Databricks CLI executable to invoke, e.g.
+        ``"/opt/databricks/bin/databricks"``, or ``None`` to resolve
+        ``databricks`` on ``PATH``.
+    :param profile: ``~/.databrickscfg`` profile passed to every CLI
+        call, e.g. ``"sandbox-sp"`` for a service-principal M2M profile,
+        or ``None`` to use the CLI's own credential resolution.
+    :param idle_timeout: Per-sandbox idle timeout applied at provision,
+        e.g. ``"4h"``, or ``None`` for the workspace default. Ignored
+        while *no_autostop* is ``True``.
+    :param no_autostop: Whether provisioned sandboxes are exempt from
+        idle auto-stop. Defaults to ``True`` at the parse site, since a
+        managed host must survive idle gaps between turns.
+    :returns: A factory producing parameterized Databricks launchers.
+    """
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the Databricks Sandbox launcher."""
+        from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+
+        return DatabricksSandboxLauncher(
+            cli_path=cli_path,
+            profile=profile,
+            idle_timeout=idle_timeout,
+            no_autostop=no_autostop,
         )
 
     return _build
