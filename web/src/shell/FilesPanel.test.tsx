@@ -6,12 +6,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type WorkspaceChangedFile,
   type WorkspaceFile,
+  PathUnreachableError,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import type * as WorkspacePickerModule from "./WorkspacePicker";
+import { useSession } from "@/hooks/useSession";
+import { useChatStore } from "@/store/chatStore";
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
@@ -23,9 +27,30 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceDirectory: vi.fn(),
   useWorkspaceEnvironment: vi.fn(),
   useWorkspaceFileSearch: vi.fn(),
-  // Real export consumed by FlatFileList's `instanceof` check; the full
-  // module mock would otherwise drop it (undefined → instanceof throws).
+  // Real exports consumed by `instanceof` checks (FlatFileList's offline
+  // hint, FilesPanel's unreachable-location message); the full module mock
+  // would otherwise drop them (undefined → instanceof throws).
   RunnerOfflineError: class RunnerOfflineError extends Error {},
+  PathUnreachableError: class extends Error {
+    reachableRoots: string[] = [];
+  },
+}));
+
+// Stub only the browser component -- its own suite covers its behaviour, and
+// driving its host-filesystem fetches here would test the wrong thing. The
+// real path helpers stay, since other code under test imports them.
+vi.mock("./WorkspacePicker", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspacePickerModule>()),
+  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
+    <button type="button" data-testid="stub-picker-navigate" onClick={() => onNavigate?.("/etc")}>
+      pick /etc
+    </button>
+  ),
+}));
+
+// The panel reads the session's host to point the directory browser at it.
+vi.mock("@/hooks/useSession", () => ({
+  useSession: vi.fn(() => ({ session: { hostId: "host_test" } })),
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
@@ -88,9 +113,15 @@ function directoryResult(files: WorkspaceFile[] = []) {
   } as unknown as ReturnType<typeof useWorkspaceDirectory>;
 }
 
-function environmentResult(root: string | null = null) {
+function environmentResult(
+  root: string | null = null,
+  reachable: {
+    unconfined: boolean;
+    roots: { path: string; access: string; origin: string }[];
+  } | null = null,
+) {
   return {
-    data: { available: true, root },
+    data: { available: true, root, home: "/home/user", reachable },
     isLoading: false,
     isError: false,
     error: null,
@@ -117,6 +148,7 @@ function renderPanel({
   workingDir = null,
   treeSearchResults = [],
   isSearching = false,
+  reachable = null,
 }: {
   conversationId: string;
   flatView?: boolean;
@@ -127,11 +159,15 @@ function renderPanel({
   workingDir?: string | null;
   treeSearchResults?: WorkspaceFile[] | undefined;
   isSearching?: boolean;
+  reachable?: {
+    unconfined: boolean;
+    roots: { path: string; access: string; origin: string }[];
+  } | null;
 }) {
   useAllFilesMock.mockReturnValue(allFilesResult(files));
   useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
   useDirectoryMock.mockReturnValue(directoryResult());
-  useEnvironmentMock.mockReturnValue(environmentResult(workingDir));
+  useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
   useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching));
 
   return render(
@@ -276,12 +312,15 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
     expect(useChangedFilesMock).toHaveBeenCalledWith("conv_changed_only", {
       enabled: true,
     });
-    expect(useAllFilesMock).toHaveBeenCalledWith("conv_changed_only", {
-      enabled: false,
-    });
-    expect(useSearchMock).toHaveBeenCalledWith("conv_changed_only", "", "", "", {
-      enabled: false,
-    });
+    expect(useAllFilesMock).toHaveBeenCalledWith("conv_changed_only", { enabled: false }, "");
+    expect(useSearchMock).toHaveBeenCalledWith(
+      "conv_changed_only",
+      "",
+      "",
+      "",
+      { enabled: false },
+      "",
+    );
   });
 
   it("enables the root filesystem listing while showing All files", () => {
@@ -292,12 +331,15 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
       changedFiles: [changedFile("src/App.tsx")],
     });
 
-    expect(useAllFilesMock).toHaveBeenCalledWith("conv_all_files", {
-      enabled: true,
-    });
-    expect(useSearchMock).toHaveBeenCalledWith("conv_all_files", "", "", "", {
-      enabled: false,
-    });
+    expect(useAllFilesMock).toHaveBeenCalledWith("conv_all_files", { enabled: true }, "");
+    expect(useSearchMock).toHaveBeenCalledWith(
+      "conv_all_files",
+      "",
+      "",
+      "",
+      { enabled: false },
+      "",
+    );
   });
 
   it("shows the scope switch in frameless (inline right-rail) mode", () => {
@@ -1390,5 +1432,206 @@ describe("FolderTree expanded state across conversation switches", () => {
     // Switch back to A in place: its collapsed state is restored.
     view.rerender(tree("conv_tree_resync_a"));
     expect(screen.queryByText("App.tsx")).toBeNull();
+  });
+});
+
+describe("FilesPanel browse location", () => {
+  const CONFINED = {
+    unconfined: false,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+  const UNCONFINED = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  it("stays a plain label when the session has nowhere else to go", () => {
+    // A confined agent with no declared grants can only ever see its
+    // workspace, so the navigation affordance must not appear at all --
+    // the panel looks exactly as it did before this control existed.
+    renderPanel({
+      conversationId: "conv_confined",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: CONFINED,
+    });
+
+    expect(screen.queryByTestId("browse-location-path")).toBeNull();
+    expect(screen.getByText("proj")).toBeInTheDocument();
+  });
+
+  it("shows the full path, clickable, when the session is unconfined", () => {
+    renderPanel({
+      conversationId: "conv_unconfined",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    // The whole path, not just the basename -- the point of the control is to
+    // tell you where you are before you decide to go elsewhere.
+    const trigger = screen.getByTestId("browse-location-path");
+    expect(trigger).toHaveTextContent("/home/user/proj");
+  });
+
+  it("re-roots both the tree and search when a directory is picked", () => {
+    // The bug this feature fixes is a tree showing one directory while search
+    // reports on another, so both queries must move together.
+    renderPanel({
+      conversationId: "conv_reroot",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
+    expect(useSearchMock).toHaveBeenLastCalledWith(
+      "conv_reroot",
+      "",
+      "",
+      "",
+      expect.anything(),
+      "/etc",
+    );
+  });
+
+  it("surfaces a refused location instead of an empty tree", () => {
+    // An empty tree reads as "this directory is empty", which is a different
+    // fact from "you may not look here".
+    const err = new PathUnreachableError("Path '/etc' is outside this session's reach", [
+      "/home/user/proj",
+    ]);
+    useAllFilesMock.mockReturnValue({
+      data: undefined,
+      error: err,
+      isError: true,
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceAllFiles>);
+    useChangedFilesMock.mockReturnValue(changedFilesResult([]));
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(environmentResult("/home/user/proj", CONFINED));
+    useSearchMock.mockReturnValue(searchResult(undefined, false));
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_refused"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                onFlatViewChange={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    // Confined sessions render the plain label, so the message rides with the
+    // panel rather than the (absent) location bar.
+    expect(screen.getByText(/outside this session's reach/)).toBeInTheDocument();
+  });
+});
+
+describe("FilesPanel tells the agent where the user is looking", () => {
+  const UNCONFINED_REACH = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  it("publishes the browsed directory so the composer can pass it on", () => {
+    // Navigating a viewer cannot move the agent's working directory, so the
+    // only way it can act on "these files" is for the composer to tell it.
+    // The panel and composer are sibling subtrees, hence the store hop.
+    renderPanel({
+      conversationId: "conv_publish",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+    expect(useChatStore.getState().browseLocation).toBeNull();
+
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    expect(useChatStore.getState().browseLocation).toBe("/etc");
+  });
+});
+
+describe("FilesPanel browse permission", () => {
+  const UNCONFINED_REACH = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  afterEach(() => {
+    // Restore the suite default (owner) — `vi.clearAllMocks` clears calls but
+    // keeps an implementation set via mockReturnValue, which would leak.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test" },
+    } as unknown as ReturnType<typeof useSession>);
+  });
+
+  it("hides the control from a collaborator who is not the session owner", () => {
+    // `reachable` describes what the ENVIRONMENT can reach and is identical
+    // for every viewer, so it cannot decide this on its own. Everything past
+    // the workspace is the owner's own machine: a collaborator's browse is
+    // refused 403, and the picker itself reads the owner-scoped host
+    // filesystem endpoint — so the control would open onto an error.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: 2 },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_collaborator",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.queryByTestId("browse-location-path")).toBeNull();
+    // Still the plain label — the collaborator keeps the workspace view.
+    expect(screen.getByText("proj")).toBeInTheDocument();
+  });
+
+  it("keeps the control for the session owner", () => {
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: 4 },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_owner",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
+  });
+
+  it("keeps the control when the level is unknown (single-user)", () => {
+    // A single-user local server reports no level at all. Treating that as
+    // "not the owner" would remove browsing from the ONLY user.
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel: null },
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({
+      conversationId: "conv_single_user",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
   });
 });

@@ -15,6 +15,7 @@ vi.mock("@/store/chatStore", () => ({
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
+  type WorkspaceEnvironment,
   MAX_RUNNER_OFFLINE_RETRIES,
   RunnerOfflineError,
   isRunnerUnavailable503,
@@ -108,7 +109,7 @@ function EnvironmentDataProbe({
   onData,
 }: {
   id: string | undefined;
-  onData: (data: { available: boolean; root: string | null; home: string | null }) => void;
+  onData: (data: WorkspaceEnvironment) => void;
 }) {
   const query = useWorkspaceEnvironment(id);
   useEffect(() => {
@@ -313,6 +314,37 @@ describe("useWorkspaceChangedFiles gating", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("surfaces the session's reach so the panel knows where it may navigate", async () => {
+    // The panel decides whether to offer navigation at all from this field;
+    // if it were dropped the control would never appear.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        metadata: {
+          root: "/home/u/ws",
+          home: "/home/u",
+          reachable: {
+            unconfined: true,
+            roots: [{ path: "/home/u/ws", access: "write", origin: "cwd" }],
+          },
+        },
+      }),
+    );
+    const results: WorkspaceEnvironment[] = [];
+
+    render(
+      <Wrap>
+        <EnvironmentDataProbe id="conv_live" onData={(data) => results.push(data)} />
+      </Wrap>,
+    );
+    await waitFor(() =>
+      expect(results.at(-1)?.reachable).toEqual({
+        unconfined: true,
+        roots: [{ path: "/home/u/ws", access: "write", origin: "cwd" }],
+      }),
+    );
+  });
+
   it("does not fetch when disabled by the caller", async () => {
     onlineMock.mockReturnValue(true);
 
@@ -440,7 +472,7 @@ describe("useWorkspaceEnvironment gating", () => {
   it("marks the environment unavailable when the server omits metadata.root", async () => {
     onlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValue(jsonResponse({ metadata: {} }));
-    const results: { available: boolean; root: string | null; home: string | null }[] = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -448,7 +480,12 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: false, root: null, home: null }),
+      expect(results.at(-1)).toEqual({
+        available: false,
+        root: null,
+        home: null,
+        reachable: null,
+      }),
     );
   });
 
@@ -459,7 +496,7 @@ describe("useWorkspaceEnvironment gating", () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ metadata: { root: "/home/u/ws", home: "/home/u" } }),
     );
-    const results: { available: boolean; root: string | null; home: string | null }[] = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -467,7 +504,12 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: true, root: "/home/u/ws", home: "/home/u" }),
+      expect(results.at(-1)).toEqual({
+        available: true,
+        root: "/home/u/ws",
+        home: "/home/u",
+        reachable: null,
+      }),
     );
   });
 

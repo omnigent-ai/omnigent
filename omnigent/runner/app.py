@@ -2479,12 +2479,20 @@ def create_runner_app(
             FilesystemPathNotFound,
             FileTooLarge,
             InvalidPath,
+            PathUnreachable,
             UnsupportedMediaType,
         )
 
         status = 500
+        error: dict[str, object] = {"code": exc.code, "message": exc.message}
         if isinstance(exc, FilesystemPathNotFound):
             status = 404
+        elif isinstance(exc, PathUnreachable):
+            # 403, not 400: the path is well-formed, the caller just may not
+            # see it. Carries the reachable roots so a UI can say what IS
+            # available without a second round trip.
+            status = 403
+            error["reachable_roots"] = exc.reachable_roots
         elif isinstance(exc, InvalidPath):
             status = 400
         elif isinstance(exc, DirectoryNotEmpty):
@@ -2495,9 +2503,7 @@ def create_runner_app(
             status = 415
         return JSONResponse(
             status_code=status,
-            content={
-                "error": {"code": exc.code, "message": exc.message},
-            },
+            content={"error": error},
         )
 
     @app.get("/health")
@@ -6572,6 +6578,39 @@ def create_runner_app(
             order=order,
         )
 
+    def _environment_reach(root: str, agent_spec: AgentSpec | None) -> dict[str, object]:
+        """Describe what the default environment's file browsing can reach.
+
+        ``unconfined`` reports that no OS-level sandbox is applied, so the
+        environment's shell already reads anything the runner can and a
+        browser may range beyond the listed roots. ``roots`` always names
+        the grants the environment's own file tools reach, workspace first,
+        so a caller can anchor on the workspace and label the rest.
+
+        :param root: Resolved absolute environment root.
+        :param agent_spec: Agent spec for the session, if any.
+        :returns: JSON-ready ``{"unconfined": bool, "roots": [...]}``.
+        """
+        from omnigent.inner.sandbox import (
+            ReachableRoot,
+            is_unconfined,
+            reach_payload,
+            reachable_roots,
+            resolve_sandbox,
+        )
+
+        root_path = Path(root)
+        spec_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
+        if spec_os_env is None:
+            # No spec to resolve (dev/standalone): report the root alone
+            # rather than guessing a wider reach.
+            return reach_payload(
+                [ReachableRoot(path=root_path, access="write", origin="cwd", kind="tree")],
+                unconfined=False,
+            )
+        policy = resolve_sandbox(spec_os_env, root_path)
+        return reach_payload(reachable_roots(root_path, policy), unconfined=is_unconfined(policy))
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}")
     async def get_session_environment(
         session_id: str,
@@ -6606,6 +6645,7 @@ def create_runner_app(
                 home = os.path.expanduser("~")
                 if os.path.isabs(home):
                     metadata["home"] = home
+                metadata["reachable"] = _environment_reach(root, agent_spec)
                 content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,
@@ -7221,6 +7261,49 @@ def create_runner_app(
         exclude: str | None = Query(default=None),
         limit: int = Query(default=500, ge=1, le=500),
     ) -> JSONResponse:
+        return await _fs_search(
+            session_id,
+            environment_id,
+            "",
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    @app.get(
+        "/v1/sessions/{session_id}/resources/environments/{environment_id}/search/{path:path}"
+    )
+    async def search_environment_files_under(
+        session_id: str,
+        environment_id: str,
+        path: str,
+        q: str = Query(min_length=1, pattern=r".*\S.*"),
+        include: str | None = Query(default=None),
+        exclude: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> JSONResponse:
+        """Search under a directory, so results match what the tree shows."""
+        return await _fs_search(
+            session_id,
+            environment_id,
+            path,
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    async def _fs_search(
+        session_id: str,
+        environment_id: str,
+        path: str,
+        *,
+        q: str,
+        include: str | None,
+        exclude: str | None,
+        limit: int,
+    ) -> JSONResponse:
         from omnigent.runner.environment_filesystem import (
             CallerProcessFilesystem,
             split_glob_list,
@@ -7233,8 +7316,9 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env)
-        entries = await fs.search_files(
+        entries, truncated = await fs.search_files(
             q,
+            path=path,
             include=include_patterns,
             exclude=exclude_patterns,
             limit=limit,
@@ -7242,7 +7326,15 @@ def create_runner_app(
         data = [_fs_entry_to_dict(e) for e in entries]
         return JSONResponse(
             status_code=200,
-            content={"object": "list", "data": data, "has_more": len(entries) >= limit},
+            content={
+                "object": "list",
+                "base": str(fs._resolve(path)),
+                "data": data,
+                "has_more": len(entries) >= limit,
+                # The scan budget ran out before the tree did, so "no matches"
+                # here would be a lie — the caller must be able to say so.
+                "truncated": truncated,
+            },
         )
 
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
@@ -7954,6 +8046,9 @@ def create_runner_app(
                 status_code=200,
                 content={
                     "object": "list",
+                    # Absolute base the entry paths are relative to. Callers
+                    # that only ever browse the workspace can keep ignoring it.
+                    "base": str(resolved),
                     "data": data,
                     "first_id": page.first_id,
                     "last_id": page.last_id,
