@@ -979,6 +979,8 @@ def _ensure_builtin_backends() -> None:
     # solely on Windows to keep the POSIX import graph clean.
     if os.name == "nt" and "windows_jobobject" not in _BACKENDS:
         from . import windows_jobobject_sandbox  # noqa: F401
+    if "linux_landlock" not in _BACKENDS:
+        from . import landlock_sandbox  # noqa: F401
 
 
 def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
