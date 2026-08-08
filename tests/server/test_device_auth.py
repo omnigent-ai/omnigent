@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -31,19 +31,85 @@ _KEY = b"k" * 32
 # ── Router mount guard (unit) ─────────────────────────────────────
 
 
-@pytest.mark.parametrize("source", ["oidc", "header"])
-def test_router_factory_rejects_non_accounts_mode(source: str, tmp_path: Path) -> None:
-    """The device grant is accounts-mode only. OIDC delegates login to the IdP
-    (cli-ticket flow) and never uses these routes; header can't mint identity.
-    ``create_device_auth_router`` must refuse to build for either."""
+def test_router_factory_rejects_header_mode(tmp_path: Path) -> None:
+    """Header mode has no server-mintable session: identity is asserted by an
+    upstream proxy, so there is nothing to delegate FROM and no login to bounce
+    a consenting browser through. The factory must refuse to build."""
     from types import SimpleNamespace
 
     from omnigent.server.routes.device_auth import create_device_auth_router
 
-    provider = SimpleNamespace(_source=source)
+    provider = SimpleNamespace(_source="header")
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
-    with pytest.raises(RuntimeError, match="accounts"):
+    with pytest.raises(RuntimeError, match="no server-minted session"):
         create_device_auth_router(provider, store)  # type: ignore[arg-type]
+
+
+def _oidc_provider(provider_type: str) -> object:
+    """A minimal OIDC-shaped provider stub for the mount-guard tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(
+            cookie_secret=b"o" * 32,
+            base_url="https://omnigent.example.com",
+            session_cookie_name="__Host-ap_session",
+            provider_type=provider_type,
+        ),
+        _accounts_config=None,
+        login_url="/auth/login",
+    )
+
+
+def test_router_factory_rejects_github_oauth(tmp_path: Path) -> None:
+    """GitHub is an ``oidc`` source pointed at a NON-OIDC endpoint.
+
+    ``OIDCConfig.from_env`` sets ``provider_type="github"`` and
+    ``authorization_endpoint=https://github.com/login/oauth/authorize`` —
+    plain OAuth 2.0, which has no ``prompt`` parameter. It would ignore
+    ``prompt=login``, reuse its session, and hand back a callback whose fresh
+    ``iat`` clears the consent gate. Refused outright: a grant issued behind a
+    gate that cannot hold is worse than no grant, because it looks protected.
+    """
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    with pytest.raises(RuntimeError, match="not full OIDC"):
+        create_device_auth_router(_oidc_provider("github"), store)  # type: ignore[arg-type]
+
+
+def test_unsupported_reason_admits_standard_oidc_and_accounts() -> None:
+    """The predicate must not over-refuse: real OIDC and accounts both pass."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.device_auth import unsupported_reason
+
+    assert unsupported_reason(_oidc_provider("oidc")) is None  # type: ignore[arg-type]
+    assert unsupported_reason(SimpleNamespace(_source="accounts")) is None  # type: ignore[arg-type]
+    assert unsupported_reason(_oidc_provider("github")) is not None  # type: ignore[arg-type]
+    assert unsupported_reason(SimpleNamespace(_source="header")) is not None  # type: ignore[arg-type]
+
+
+def test_router_factory_builds_in_oidc_mode_from_the_oidc_config(tmp_path: Path) -> None:
+    """OIDC owns the same HS256 session cookie accounts does, so the grant
+    works there — the IdP simply decides how the user proves themselves.
+
+    The config must come from ``_oidc_config``: reading ``_accounts_config``
+    (None under OIDC) would trip the assert, and reading the wrong secret would
+    sign device codes and refresh tokens with a key nothing else validates.
+    """
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    provider = _oidc_provider("oidc")
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+
+    router = create_device_auth_router(provider, store)  # type: ignore[arg-type]
+
+    paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
+    assert "/oauth/device/authorize" in paths
+    assert "/oauth/token" in paths
+    assert "/oauth/revoke" in paths
 
 
 # ── Store invariants (unit) ───────────────────────────────────────
@@ -275,6 +341,129 @@ def _build_accounts_app(
         yield client
 
 
+def _build_oidc_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider_type: str = "oidc",
+    provider: object | None = None,
+) -> Iterator[TestClient]:
+    """Build a real app through ``create_app`` with an OIDC auth provider.
+
+    The provider is constructed directly rather than through
+    ``create_auth_provider`` so no IdP discovery request is made; everything
+    downstream — including the device-grant mount decision — is the
+    production path. ``provider`` overrides it outright, for modes that need
+    no OIDC config at all.
+    """
+    monkeypatch.setenv("OMNIGENT_DEVICE_GRANT_ENABLED", "1")
+    if provider is None:
+        monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.runtime import init as init_runtime
+    from omnigent.runtime import telemetry
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.oidc import OIDCConfig
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    get_or_create_engine(db_url)
+    telemetry.init()
+    permission_store = SqlAlchemyPermissionStore(db_url)
+    agent_store = SqlAlchemyAgentStore(db_url)
+    conversation_store = SqlAlchemyConversationStore(db_url)
+    file_store = SqlAlchemyFileStore(db_url)
+    comment_store = SqlAlchemyCommentStore(db_url)
+    host_store = HostStore(db_url)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+    init_runtime(
+        agent_cache=agent_cache,
+        caps=RuntimeCaps(),
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        comment_store=comment_store,
+    )
+
+    config = OIDCConfig(
+        issuer="https://accounts.google.com",
+        client_id="cid",
+        client_secret="secret",
+        redirect_uri="http://localhost:8000/auth/callback",
+        cookie_secret=bytes.fromhex("bb" * 32),
+        scopes="openid email profile",
+        session_ttl_hours=8,
+        logout_redirect_uri=None,
+        allowed_domains=None,
+        provider_type=provider_type,
+        authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+        userinfo_endpoint=None,
+        allow_invites=False,
+    )
+    app = create_app(
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=agent_cache,
+        comment_store=comment_store,
+        permission_store=permission_store,
+        host_store=host_store,
+        auth_provider=provider or UnifiedAuthProvider(source="oidc", oidc_config=config),
+    )
+    with TestClient(app) as client:
+        yield client
+
+
+def test_create_app_mounts_the_grant_under_oidc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mount decision must be exercised through ``create_app`` itself.
+
+    Testing the factory directly proves the router builds; it does not prove
+    the app ever calls it. A typo in the mount condition would silently leave
+    ``/oauth/*`` absent under OIDC with every other test still green.
+    """
+    for client in _build_oidc_app(tmp_path, monkeypatch):
+        res = client.post("/oauth/device/authorize", json={"client_id": "polly"})
+        assert res.status_code == 200, f"/oauth/device/authorize returned {res.status_code}"
+        assert res.json()["user_code"]
+
+
+def test_create_app_refuses_the_grant_for_github_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GitHub is an ``oidc`` source that cannot honour the re-auth gate.
+
+    The app must boot without it rather than mount routes whose security
+    property does not hold.
+    """
+    for client in _build_oidc_app(tmp_path, monkeypatch, provider_type="github"):
+        # Asserted against the route table, not a status code: the SPA
+        # catch-all answers unmounted paths, so "not 200" would also pass if
+        # the routes were mounted and merely erroring.
+        oauth_routes = [
+            route.path
+            for route in client.app.routes  # type: ignore[attr-defined]
+            if getattr(route, "path", "").startswith("/oauth/")
+        ]
+        assert oauth_routes == [], f"the grant must not mount for GitHub OAuth: {oauth_routes}"
+
+
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     yield from _build_accounts_app(tmp_path, monkeypatch)
@@ -376,7 +565,20 @@ def test_consent_page_requires_login(app: TestClient) -> None:
     """The consent page bounces an unauthenticated visitor to login."""
     r = app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
     assert r.status_code == 302
-    assert "/login" in r.headers["location"]
+    assert r.headers["location"].startswith("/login?"), r.headers["location"]
+
+
+def test_consent_forces_reauth_even_with_no_session_at_all(app: TestClient) -> None:
+    """The bounce for a caller with NO session must force re-authentication too.
+
+    Under accounts, "no session" means no credential and the SPA shows the
+    password form either way. Under OIDC it does not: the caller may still
+    hold a live IdP session, which would satisfy an unforced bounce silently
+    and return a fresh ``iat`` that clears the consent gate. The consent page
+    cannot tell the two apart, so every bounce is forced.
+    """
+    r = app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
+    assert "reauth=1" in r.headers["location"]
 
 
 def test_consent_forces_reauth_for_stale_session(app: TestClient) -> None:
@@ -402,7 +604,8 @@ def test_consent_forces_reauth_for_stale_session(app: TestClient) -> None:
     r = app.get(f"/oauth/device?user_code={user_code}", follow_redirects=False)
     assert r.status_code == 302, r.text
     loc = r.headers["location"]
-    assert "/login" in loc and "reauth=1" in loc
+    assert loc.startswith("/login?"), loc
+    assert "reauth=1" in loc
 
     # Approve POST refuses the stale session too (defense in depth — a direct
     # POST must not bypass the GET's gate).
@@ -533,7 +736,7 @@ def test_browser_consent_not_gated_by_client_secret(secret_app: TestClient) -> N
     r = secret_app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
     # Bounces to login (unauthenticated), NOT a 401 invalid_client.
     assert r.status_code == 302
-    assert "/login" in r.headers["location"]
+    assert r.headers["location"].startswith("/login?"), r.headers["location"]
 
 
 def test_no_secret_configured_stays_public(app: TestClient) -> None:
@@ -542,8 +745,12 @@ def test_no_secret_configured_stays_public(app: TestClient) -> None:
     assert r.status_code == 200, r.text
 
 
-def _capture_app_warnings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Build the accounts app and return WARNING messages from ``server.app``.
+def _capture_app_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: Callable[[], Iterator[TestClient]] | None = None,
+) -> list[str]:
+    """Build an app and return WARNING messages from ``server.app``.
 
     Attaches a handler directly to the ``omnigent.server.app`` logger rather
     than using ``caplog``: the server's telemetry/logging init runs during the
@@ -561,7 +768,7 @@ def _capture_app_warnings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> li
     handler = _Collector()
     logger.addHandler(handler)
     try:
-        for _ in _build_accounts_app(tmp_path, monkeypatch):
+        for _ in builder() if builder else _build_accounts_app(tmp_path, monkeypatch):
             break  # build (and immediately tear down) so the mount runs
     finally:
         logger.removeHandler(handler)
@@ -588,3 +795,116 @@ def test_startup_silent_when_client_secret_set(
     monkeypatch.setenv("OMNIGENT_DEVICE_CLIENT_SECRET", _SECRET)
     warnings = _capture_app_warnings(tmp_path, monkeypatch)
     assert not any("OMNIGENT_DEVICE_CLIENT_SECRET is not set" in m for m in warnings)
+
+
+def _build_header_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """A header/proxy-mode app with the device grant requested."""
+    monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "1")
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    yield from _build_oidc_app(
+        tmp_path, monkeypatch, provider=UnifiedAuthProvider(source="header")
+    )
+
+
+def test_refusal_is_explained_in_header_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Header mode must still learn WHY /oauth/* is missing.
+
+    It is one of the two cases ``unsupported_reason`` exists to explain, and
+    also the mode where the auth router itself never mounts (``login_url`` is
+    None). Deciding device-grant support inside that mount block meant the
+    operator most likely to be confused saw only silence.
+    """
+    warnings = _capture_app_warnings(
+        tmp_path, monkeypatch, builder=lambda: _build_header_app(tmp_path, monkeypatch)
+    )
+
+    assert any(
+        "OMNIGENT_DEVICE_GRANT_ENABLED is set" in message and "no server-minted session" in message
+        for message in warnings
+    ), warnings
+
+
+def test_refusal_is_explained_for_github_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same for a GitHub-backed OIDC deployment."""
+    warnings = _capture_app_warnings(
+        tmp_path,
+        monkeypatch,
+        builder=lambda: _build_oidc_app(tmp_path, monkeypatch, provider_type="github"),
+    )
+
+    assert any(
+        "OMNIGENT_DEVICE_GRANT_ENABLED is set" in message and "not full OIDC" in message
+        for message in warnings
+    ), warnings
+
+
+def test_a_supported_deployment_logs_no_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The predicate must not over-refuse: real OIDC mounts silently."""
+    warnings = _capture_app_warnings(
+        tmp_path, monkeypatch, builder=lambda: _build_oidc_app(tmp_path, monkeypatch)
+    )
+
+    assert not any("routes are NOT mounted" in message for message in warnings), warnings
+
+
+def test_unsupported_reason_refuses_an_unaudited_provider_type() -> None:
+    """Allowlisted, not denylisted.
+
+    ``from_env`` yields only ``github`` or ``oidc`` today, so denying the one
+    known-bad value happened to be equivalent. The next OAuth dialect modelled
+    under this source — or a directly-constructed config — would have been
+    admitted by default, behind a gate that cannot hold for it.
+    """
+
+    from omnigent.server.routes.device_auth import unsupported_reason
+
+    for provider_type in ("github", "gitlab", "oauth2", ""):
+        reason = unsupported_reason(_oidc_provider(provider_type))  # type: ignore[arg-type]
+        assert reason is not None, provider_type
+        assert repr(provider_type) in reason, "the reason must name the value it refused"
+
+    assert unsupported_reason(_oidc_provider("oidc")) is None  # type: ignore[arg-type]
+
+
+def test_unsupported_reason_refuses_oidc_with_no_config() -> None:
+    """A missing config is not a supported deployment."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.device_auth import unsupported_reason
+
+    provider = SimpleNamespace(_source="oidc", _oidc_config=None, _accounts_config=None)
+    assert unsupported_reason(provider) is not None  # type: ignore[arg-type]
+
+
+def test_bounce_percent_encodes_the_return_to(app: TestClient) -> None:
+    """The consent URL must survive the bounce whatever the code contains.
+
+    ``html.escape`` is an HTML escaper, not a URL one: it leaves ``?``,
+    ``=``, ``#`` and ``+`` untouched. A ``#`` therefore ended the URL and
+    turned everything after it into a fragment, silently truncating the
+    ``return_to`` the user is meant to come back to. Percent-encoding is the
+    correct tool for a query value.
+
+    The ``&reauth=1`` that follows survived only because ``html.escape``
+    happens to turn ``&`` into ``&amp;`` — an accident of the escaper, not a
+    property the forced-re-auth invariant should rest on.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    r = app.get("/oauth/device?user_code=AB%23CD%26reauth=0", follow_redirects=False)
+
+    assert r.status_code == 302
+    query = parse_qs(urlparse(r.headers["location"]).query)
+    assert query["return_to"] == ["/oauth/device?user_code=AB#CD&reauth=0"], (
+        "the consent URL must round-trip intact"
+    )
+    assert query["reauth"] == ["1"], "and the forced re-auth must be the only one"

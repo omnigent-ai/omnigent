@@ -299,6 +299,9 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            # The server verified the credential itself just now, so this is
+            # a local fact rather than a third party's claim about one.
+            auth_time=int(time.time()),
         )
 
         user = account_store.get_user(username)
@@ -446,6 +449,9 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            # The server verified the credential itself just now, so this is
+            # a local fact rather than a third party's claim about one.
+            auth_time=int(time.time()),
         )
         resp = JSONResponse(
             status_code=200,
@@ -545,6 +551,9 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            # The server verified the credential itself just now, so this is
+            # a local fact rather than a third party's claim about one.
+            auth_time=int(time.time()),
         )
         resp = JSONResponse(
             status_code=200,
@@ -631,6 +640,9 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            # The server verified the credential itself just now, so this is
+            # a local fact rather than a third party's claim about one.
+            auth_time=int(time.time()),
         )
         resp = RedirectResponse(url="/", status_code=302)
         _set_session_cookie(
