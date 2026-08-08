@@ -47,6 +47,7 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
     split_transient_tail,
 )
 from .open_responses_sdk import (
@@ -1472,7 +1473,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "OpenAI Agents SDK", OPENAI_AGENTS_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
         state = self._get_or_create_session_state(agents_sdk, session_key)
