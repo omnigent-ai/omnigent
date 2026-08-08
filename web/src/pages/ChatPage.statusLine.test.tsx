@@ -4,9 +4,10 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -26,10 +27,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // renders deterministically without a QueryClient / RunnerHealth provider. The
 // default is "not host-bound", so the badge self-hides and the existing branch/
 // ring/harness assertions are unchanged; host-aware tests override per case.
-const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
+const { useSessionMock, useHostsMock, useSessionHostOnlineMock, copyTextMock } = vi.hoisted(() => ({
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
+  copyTextMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
@@ -53,6 +55,9 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+}));
+vi.mock("@/lib/clipboard", () => ({
+  copyText: (text: string) => copyTextMock(text),
 }));
 
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
@@ -104,9 +109,9 @@ function statusLine(): Element | null {
 }
 
 /** Bind the active session to an online host named `name` so HostBadge shows. */
-function bindHost(name: string) {
+function bindHost(name: string, session: Partial<Session> = {}) {
   useSessionMock.mockReturnValue({
-    session: { hostId: "host_a1b2" },
+    session: { hostId: "host_a1b2", ...session },
     isLoading: false,
     error: null,
   });
@@ -118,16 +123,17 @@ function bindHost(name: string) {
   useSessionHostOnlineMock.mockReturnValue(true);
 }
 
-describe("Composer status line (branch + context ring)", () => {
+describe("Composer status line (environment + context ring)", () => {
   beforeEach(() => {
     // Default: no host bound, so HostBadge renders nothing.
     useSessionMock.mockReset().mockReturnValue({
-      session: { hostId: null },
+      session: { hostId: null, workspace: null },
       isLoading: false,
       error: null,
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
+    copyTextMock.mockReset().mockResolvedValue(undefined);
     useChatStore.setState({
       conversationId: "conv_test",
       skills: [],
@@ -175,20 +181,6 @@ describe("Composer status line (branch + context ring)", () => {
     // 25k of 100k → 25% used; a wrong value means the ring wired the
     // wrong store fields through its props.
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
-  });
-
-  it("no longer renders the harness label in the status tray (moved to the config gear)", () => {
-    // The harness identity moved from the tray into the config gear's hover
-    // tooltip, so it must never resurface in the status line — for a native
-    // vendor session or an SDK/bundle session.
-    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, sessionHarness: "pi" });
-    renderComposer({
-      modelPickerKind: "codex",
-      agents: [{ id: "a1", name: "polly" }],
-      selectedAgentId: "a1",
-    });
-
-    expect(screen.queryByTestId("composer-harness")).toBeNull();
   });
 
   it("no longer renders model/effort in the status tray (moved to the composer label)", () => {
@@ -254,6 +246,10 @@ describe("Composer status line (branch + context ring)", () => {
     // `truncate` (overflow-hidden + ellipsis + nowrap) is the guard that
     // keeps a long branch from wrapping the tray onto a second line.
     expect(branch).toHaveClass("truncate");
+    expect(screen.getByTestId("composer-worktree")).toHaveAttribute(
+      "title",
+      "Isolated worktree: feature/a-very-long-worktree-branch-name-that-would-wrap",
+    );
   });
 
   it("renders the tray with a branch even when the ring is absent", () => {
@@ -296,12 +292,100 @@ describe("Composer status line (branch + context ring)", () => {
     // host badge + context footer with it. A host-bound session (e.g. a codex
     // session with no worktree branch, before the ring populates) still shows
     // the tray so the host indicator is visible.
-    bindHost("mac-laptop");
+    bindHost("mac-laptop", { workspace: "/Users/alice/projects/omnigent" });
     useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
     renderComposer();
 
     expect(statusLine()).not.toBeNull();
     expect(screen.getByTestId("host-badge")).toHaveTextContent("mac-laptop");
+    expect(screen.getByTestId("composer-workspace")).toHaveTextContent("…/projects/omnigent");
+  });
+
+  it("shows the working directory inline without a worktree branch", () => {
+    bindHost("mac-laptop", { workspace: "/Users/alice/projects/omnigent" });
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer();
+
+    const trigger = screen.getByTestId("session-environment-trigger");
+    const workspace = screen.getByTestId("composer-workspace");
+    expect(trigger).toHaveAttribute("title", "/Users/alice/projects/omnigent");
+    expect(trigger).toHaveTextContent("Details");
+    expect(workspace).toHaveTextContent("…/projects/omnigent");
+    expect(workspace).toHaveClass("hidden", "truncate", "sm:block");
+    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("shows host, directory, worktree, and native harness in one popover", async () => {
+    const workspacePath = "/Users/alice/omnigent-worktrees/feature-session-context";
+    const branch = `feature-${"x".repeat(80)}`;
+    bindHost("mac-laptop", { workspace: workspacePath });
+    useChatStore.setState({
+      gitBranch: branch,
+      sessionHarness: "codex-native",
+    });
+    renderComposer({ modelPickerKind: "codex" });
+
+    expect(screen.queryByTestId("session-environment-popover")).toBeNull();
+    fireEvent.click(screen.getByTestId("session-environment-trigger"));
+
+    const popover = await screen.findByTestId("session-environment-popover");
+    expect(
+      within(screen.getByTestId("session-environment-host")).getByText("mac-laptop"),
+    ).toBeInTheDocument();
+    const workspaceRow = screen.getByTestId("session-environment-workspace");
+    expect(workspaceRow).toHaveTextContent(workspacePath);
+    const copyButton = within(workspaceRow).getByRole("button", {
+      name: "Copy working directory",
+    });
+    fireEvent.click(copyButton);
+    expect(copyTextMock).toHaveBeenCalledWith(workspacePath);
+    const worktreeRow = screen.getByTestId("session-environment-worktree");
+    const worktreeBranch = within(worktreeRow).getByText(branch);
+    expect(worktreeBranch).toHaveClass("[overflow-wrap:anywhere]");
+    expect(worktreeRow).toHaveTextContent(workspacePath);
+    expect(screen.getByTestId("session-environment-harness")).toHaveTextContent("Codex");
+    expect(popover).toBeInTheDocument();
+  });
+
+  it("reports no worktree while keeping the directory and SDK harness available", async () => {
+    bindHost("mac-laptop", { workspace: "/Users/alice/projects/omnigent" });
+    useChatStore.setState({ sessionHarness: "pi", gitBranch: null });
+    renderComposer({
+      agents: [{ id: "a1", name: "polly" }],
+      selectedAgentId: "a1",
+    });
+
+    fireEvent.click(screen.getByTestId("session-environment-trigger"));
+    await screen.findByTestId("session-environment-popover");
+
+    expect(screen.getByTestId("session-environment-worktree")).toHaveTextContent("None");
+    expect(screen.getByTestId("session-environment-harness")).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("shows environment details for a local session with no host binding", async () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: null, workspace: "/Users/alice/imported-session" },
+      isLoading: false,
+      error: null,
+    });
+    useChatStore.setState({ sessionHarness: "claude-sdk", gitBranch: null });
+    renderComposer({
+      agents: [{ id: "a1", name: "polly" }],
+      selectedAgentId: "a1",
+    });
+
+    expect(statusLine()).not.toBeNull();
+    expect(screen.queryByTestId("host-badge")).toBeNull();
+    expect(screen.getByTestId("composer-workspace")).toHaveTextContent("…/alice/imported-session");
+    fireEvent.click(screen.getByTestId("session-environment-trigger"));
+    await screen.findByTestId("session-environment-popover");
+
+    expect(screen.getByTestId("session-environment-host")).toHaveTextContent(
+      "Local (no host binding)",
+    );
+    expect(screen.getByTestId("session-environment-harness")).toHaveTextContent(
+      "Polly (Claude SDK)",
+    );
   });
 
   it("shows the host badge to the left of the worktree branch", () => {
@@ -357,6 +441,7 @@ describe("Composer status line (branch + context ring)", () => {
     renderComposer({ subAgentLabel: "check-eligibility" });
 
     expect(screen.queryByTestId("host-badge")).toBeNull();
+    expect(screen.queryByTestId("session-environment-trigger")).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
   });
 });
