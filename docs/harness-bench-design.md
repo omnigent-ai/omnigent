@@ -153,15 +153,20 @@ being reimplemented under tests.
 
 - **Layer 0 — Profile / manifest.** Static facts and declared verdicts are
   derived from `harness_capabilities()` plus the existing e2e harness metadata.
-- **Layer 1 — Offline conformance.** No network or credentials. It validates
+- **Layer 1 — Offline smoke (today) / offline conformance (aspirational).**
+  `--no-live` needs no network or credentials. **Today** it only smoke-tests
   registration, profile shape, capability derivation, transport resolution,
-  rendering, and orchestration behavior in normal CI.
+  rendering, and orchestration: every applicable cell is observed as
+  `SKIPPED`, so `reconcile` can never emit `DRIFT`. It is **not** a
+  capability-conformance gate. Making Layer 1 real requires concrete offline
+  observations (see [Making Layer 1 real](#making-layer-1-real) below).
 - **Layer 2 — Live probes.** Drivers execute behavioral probes through the
   wrap boundary or the real server/runner session API. Missing credentials,
-  vendor binaries, or vendor login produce capability-neutral skips.
+  vendor binaries, or vendor login produce capability-neutral skips. This is
+  where `DRIFT` is detectable today.
 - **Report.** The CLI renders the declared matrix offline or reconciles live
   observations into terminal, Markdown, and JSON reports. `DRIFT` produces a
-  non-zero exit status.
+  non-zero exit status (live only, with the current offline path).
 
 ### Build on `HarnessProbe`, don't reinvent it
 
@@ -309,10 +314,63 @@ The bench on `main` includes:
 
 ## CI integration
 
-- **Every PR:** Layer 1 offline conformance (fast, no network, no creds).
-- **Nightly / on-demand:** Layer 2 live probes (real API cost + flake surface),
-  gated on CLI + creds, P0 blocking, P1 report-only. Follows the existing
-  nightly/flake-stress pattern rather than blocking every PR on live turns.
+- **Every PR (smoke only):** `Harness bench (smoke)` runs
+  `python -m tests.harness_bench --no-live`. It asserts the CLI imports,
+  orchestrates, and renders a non-empty declared matrix. It is **not** in
+  merge-ready `REQUIRED` and does **not** detect capability drift (see below).
+  Substantive Layer 0/1 shape checks (e.g. every P0 dimension declared) live in
+  `tests/harness_bench/` and already run under the Pytest (misc) shard.
+- **Nightly / on-demand (not yet wired as a dedicated job):** Layer 2 live
+  probes (real API cost + flake surface), gated on CLI + creds, P0 blocking,
+  P1 report-only. Follows the existing nightly/flake-stress pattern rather than
+  blocking every PR on live turns.
+
+### What `--no-live` actually does today
+
+As of the CI wiring, a full offline run covers **14 harnesses × 12 dimensions =
+168 cells**. Observed breakdown: **164 `SKIPPED`**, **4 `NOT_APPLICABLE`**,
+**0 concrete** (`SUPPORTED` / `UNSUPPORTED` / `PARTIAL`). `has_drift` is always
+false. The table glyphs you see are the *declared* values painted for display
+(`declared=True` in the renderer), not probe results.
+
+Root cause (structural, not a bug in `reconcile`):
+
+1. `run_harness(..., live=False)` short-circuits before any driver or probe
+   runs and builds a uniform report with
+   `ProbeResult.skipped("offline (declared shown)")`
+   (`tests/harness_bench/bench.py`).
+2. `reconcile(observed, declared)` only returns `DRIFT` when **both** sides are
+   concrete (`SUPPORTED` / `UNSUPPORTED` / `PARTIAL` / `NOT_APPLICABLE`).
+   `SKIPPED` and `UNKNOWN` are excluded by design
+   (`tests/harness_bench/verdict.py`: "Unknown or skipped results cannot
+   establish drift").
+3. Therefore `reconcile(SKIPPED, SUPPORTED) → SKIPPED`. Flipping a declared
+   capability (e.g. `cursor-native` `streaming=False→True`) changes the
+   rendered glyph and still exits 0.
+
+Do not treat a green `--no-live` run as evidence that declarations match
+reality. That signal only exists under `--live` (Layer 2) today.
+
+### Making Layer 1 real
+
+To make offline mode a true every-PR conformance gate, offline runs must
+produce **concrete** observed verdicts without credentials or vendor CLIs.
+What would need to change (record only — not designed here):
+
+- **Seam that yields SKIPPED today:** `run_harness` when `live=False` never
+  enters a driver; it returns `_uniform_report(..., ProbeResult.skipped(...))`.
+  That short-circuit is the origin of every offline `SKIPPED` cell.
+- **What has to replace it:** offline (or fake) drivers / probe doubles that
+  return concrete `SUPPORTED` / `UNSUPPORTED` / `PARTIAL` for each P0
+  dimension without spawning a gateway turn — e.g. replaying recorded event
+  streams, or a deterministic in-process fake that exercises the same probe
+  assertions the live drivers do.
+- **What can stay:** `reconcile` itself is already correct for gating once
+  observations are concrete; the CLI exit-on-`has_drift` path is already wired.
+  The gap is upstream of reconcile, in the offline orchestration/driver layer.
+- **Until that exists:** keep `--no-live` as a smoke, keep shape/invariant
+  coverage in pytest, and treat Layer 2 live (or a future offline-concrete
+  path) as the only drift detector.
 
 ## Running the bench and reading the result
 
@@ -335,10 +393,12 @@ missing credentials select the offline declared matrix. Native harnesses also
 need their vendor CLI installed and logged in; the bench cannot provision those
 accounts, so unavailable harnesses skip without aborting the run.
 
-Offline conformance covers every registered harness in CI. Live runs are
-spot-checks of observed behavior and can vary with model behavior and timing;
-re-run an isolated timeout or skip before treating it as a regression. The
-signals that matter most are `DRIFT` and repeatable unexpected
+`--no-live` renders the declared matrix for every registered harness (CI smoke).
+It does **not** reconcile observations against declarations — offline cells are
+`SKIPPED`, so `DRIFT` cannot fire (see [CI integration](#ci-integration)). Live
+runs are the spot-checks of observed behavior and can vary with model behavior
+and timing; re-run an isolated timeout or skip before treating it as a
+regression. The signals that matter most are `DRIFT` and repeatable unexpected
 `UNSUPPORTED`/`PARTIAL` verdicts on a runnable harness.
 
 ## Streaming is a binary declared capability
