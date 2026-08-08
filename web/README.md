@@ -30,6 +30,27 @@ The Vite dev server proxies `/v1` and `/api` to `http://localhost:6767`. Set
 OMNIGENT_URL=http://localhost:9000 pnpm run dev
 ```
 
+### Pointing at a deployed Databricks App
+
+A deployed app (`https://<app>.databricksapps.com`) is OAuth-gated by the
+workspace that hosts it, so the proxy has to attach a bearer token. Name the
+`.databrickscfg` profile for that workspace and the proxy mints one, re-minting
+it before it expires:
+
+```bash
+OMNIGENT_URL=https://<app>.aws.databricksapps.com \
+OMNIGENT_AUTH_PROFILE=<profile> \
+pnpm run dev
+```
+
+Log in first if the CLI has no session: `databricks auth login -p <profile>`.
+
+| Variable                | Description                                                          |
+| ----------------------- | -------------------------------------------------------------------- |
+| `OMNIGENT_AUTH_PROFILE` | `.databrickscfg` profile to mint the token from. Preferred.          |
+| `OMNIGENT_AUTH_HOST`    | Workspace host to mint against, when no profile is named.            |
+| `OMNIGENT_AUTH_TOKEN`   | Explicit bearer, used verbatim. Not refreshed — expires in ~an hour. |
+
 Additional `omnigent server` options:
 
 | Flag                  | Default                | Description                          |
