@@ -253,6 +253,61 @@ async def teardown_all_codex_native_app_servers() -> None:
             await teardown_codex_native_app_server(session_id)
 
 
+async def teardown_opencode_native_server(session_id: str) -> None:
+    """
+    Tear down a host-spawned opencode-native session's ``opencode serve``.
+
+    The opencode counterpart of :func:`teardown_codex_native_app_server`.
+    Only the ``DELETE /v1/sessions`` teardown runs the full native cleanup;
+    the opencode TUI pane can also disappear on its own — the idle pane
+    reaper closes the tmux pane after the idle window, and an unexpected TUI
+    exit (crash / OOM / host recycle) evicts it — neither of which cancels
+    the forwarder. Left alone, the per-session ``opencode serve`` (and its
+    forwarder) survives with no TUI, so a long-lived multi-session runner
+    accumulates orphaned ``opencode`` processes.
+
+    Cancelling the forwarder closes the server via
+    :func:`_supervise_opencode_forwarder`'s own ``finally``; the pop below is
+    the belt-and-suspenders close for the case where no forwarder ever
+    adopted the server. No-op for a session that has no registered opencode
+    server, so this is safe to call from the shared pane-teardown paths
+    regardless of harness.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+    if session_id not in _AUTO_OPENCODE_SERVERS:
+        return
+    await _cancel_auto_forwarder_task(session_id)
+    leftover_server = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+    if leftover_server is not None:
+        with contextlib.suppress(Exception):
+            await leftover_server.close()
+
+
+async def teardown_all_opencode_native_servers() -> None:
+    """
+    Tear down every host-spawned opencode-native server on this runner.
+
+    The opencode counterpart of
+    :func:`teardown_all_codex_native_app_servers`, called from the runner's
+    shutdown path (``_stop_pm``) so a graceful host or runner stop takes the
+    per-session ``opencode serve`` subprocesses down with it. Per-session
+    teardown normally runs on ``DELETE /v1/sessions``, but a host stop tears
+    the runner down without deleting each session first, so those never fire.
+
+    Iterates a snapshot of the registered session ids and delegates to
+    :func:`teardown_opencode_native_server` (which cancels the forwarder and
+    closes the server). Best-effort and idempotent: a session already torn
+    down is a no-op.
+
+    :returns: None.
+    """
+    for session_id in list(_AUTO_OPENCODE_SERVERS):
+        with contextlib.suppress(Exception):
+            await teardown_opencode_native_server(session_id)
+
+
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.
