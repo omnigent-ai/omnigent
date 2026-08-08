@@ -5,6 +5,10 @@ generated at release time from each PR's `## Changelog` section, tagged by the
 PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
 website under `/releases`.
 
+## [v0.8.2] — 2026-08-04
+
+- [Bug fix] Claude sessions routed through the Databricks AI gateway now send the `x-databricks-use-coding-agent-mode` header the gateway requires (#4086)
+
 ## [v0.8.1] — 2026-08-03
 
 - [UI] Reverted the v0.8.0 "Chat/Terminal switcher in the header" change; the
