@@ -160,6 +160,7 @@ _CATALOG_PROVIDER_FAMILY: dict[str, str] = {
     "mistral": OPENAI_FAMILY,
     "together_ai": OPENAI_FAMILY,
     "fireworks_ai": OPENAI_FAMILY,
+    "novita": OPENAI_FAMILY,
 }
 
 
@@ -194,6 +195,7 @@ _KEY_PROVIDER_ENDPOINT: dict[str, _VendorEndpoint] = {
     "mistral": _VendorEndpoint("https://api.mistral.ai/v1", CHAT_WIRE_API),
     "together_ai": _VendorEndpoint("https://api.together.xyz/v1", CHAT_WIRE_API),
     "fireworks_ai": _VendorEndpoint("https://api.fireworks.ai/inference/v1", CHAT_WIRE_API),
+    "novita": _VendorEndpoint("https://api.novita.ai/openai/v1", CHAT_WIRE_API),
 }
 
 
