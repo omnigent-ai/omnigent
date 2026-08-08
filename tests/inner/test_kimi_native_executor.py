@@ -11,11 +11,14 @@ per-spawn MCP config), so the MCP-config tests have no analogue here.
 
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
 
 import pytest
 
 from omnigent import kimi_native_bridge
+from omnigent.inner import kimi_native_executor
+from omnigent.inner.executor import ExecutorError
 from omnigent.inner.kimi_native_executor import (
     KimiNativeExecutor,
     _content_to_text,
@@ -29,6 +32,7 @@ from omnigent.kimi_native_bridge import (
     bridge_dir_for_session_id,
     build_kimi_native_spawn_env,
     inject_approval_keystroke,
+    inject_user_message,
     read_tmux_info,
     write_tmux_target,
 )
@@ -80,6 +84,28 @@ class TestExecutorCapabilities:
         assert ex.supports_streaming() is False
         # Web-UI messages can be injected mid-turn (steering).
         assert ex.supports_live_message_queue() is True
+
+
+@pytest.mark.asyncio
+async def test_run_turn_surfaces_injection_failure_as_actionable_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("Kimi TUI input box did not become ready")
+
+    monkeypatch.setattr(kimi_native_executor, "inject_user_message", _fail)
+    events = [
+        event
+        async for event in KimiNativeExecutor(tmp_path).run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "retry the turn after the Kimi terminal is ready" in events[0].message
 
 
 class TestPastePayload:
@@ -159,15 +185,30 @@ class TestApprovalKeystroke:
         assert inject_approval_keystroke(tmp_path, key=DENY_KEY) is True
         assert sent[0] == ("send-keys", "-t", "main", DENY_KEY)
 
-    def test_skips_when_menu_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Prompt already answered in the terminal → marker gone → no keystroke.
-        sent = self._stub_tmux(monkeypatch, pane="● Hello! How can I help?")
-        assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is False
-        assert sent == []
+    @pytest.mark.parametrize("marker", ["Approve for session", "Reject with feedback"])
+    def test_matches_alternate_menu_markers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
+    ) -> None:
+        sent = self._stub_tmux(monkeypatch, pane=f"▶ 2. {marker}")
+        assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is True
+        assert sent[-1] == ("send-keys", "-t", "main", "Enter")
 
-    def test_skips_when_tui_exited(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_raises_when_menu_absent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sent = self._stub_tmux(monkeypatch, pane="● Hello! How can I help?")
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
+        assert sent == []
+        assert "permission menu markers missing" in caplog.text
+
+    def test_raises_when_tui_exited(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         sent = self._stub_tmux(monkeypatch, pane="▶ 1. Approve once", alive=False)
-        assert inject_approval_keystroke(tmp_path, key=APPROVE_KEY) is False
+        with pytest.raises(kimi_native_bridge.KimiApprovalPromptNotFoundError):
+            inject_approval_keystroke(tmp_path, key=APPROVE_KEY)
         assert sent == []
 
 
@@ -176,36 +217,111 @@ class TestSettlePaneReadiness:
     the first capture — a wrong marker silently burns the full readiness timeout
     on every web→TUI injection (the original web→TUI latency bug)."""
 
-    def test_marker_matches_live_kimi_footer(self) -> None:
+    def test_requires_input_box_and_live_kimi_footer(self) -> None:
         # Footer chrome captured verbatim from a live K2.7 session.
         footer = (
             " K2.7 Code thinking  ~/omnigent  pr521-kimi-native [+61 -8]"
             '   ask Kimi to schedule tasks, e.g. "remind me at 5pm"\n'
             "   context: 6.5% (17.0k/262.1k)"
         )
-        assert any(m in footer for m in kimi_native_bridge._INPUT_READY_MARKERS)
+        pane = "alice✨ " + "\n" + footer
+        assert kimi_native_bridge._kimi_tui_ready(pane)
         # The cursor-native strings carried over unverified never appeared.
         assert "Plan, search, build" not in footer
         assert "Add a follow-up" not in footer
 
-    def test_settle_returns_on_first_capture_when_ready(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_settle_waits_for_both_markers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captures = {"n": 0}
+        panes = iter(["alice✨ ", "alice✨ \ncontext: 6.5% (17.0k/262.1k)"])
 
         def _capture(_s: str, _t: str) -> str:
             captures["n"] += 1
-            return "context: 6.5% (17.0k/262.1k)"
+            return next(panes)
 
         monkeypatch.setattr(kimi_native_bridge, "_capture_pane", _capture)
-        # If the marker fails to match, this would loop until the deadline; a
-        # tiny timeout keeps the test fast either way, but it must return after
-        # exactly one capture with no sleep.
-        slept: list[float] = []
-        monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda s: slept.append(s))
+        monkeypatch.setattr(kimi_native_bridge.time, "sleep", lambda _s: None)
         kimi_native_bridge._settle_pane("/s", "main", timeout_s=30.0)
-        assert captures["n"] == 1
-        assert slept == []
+        assert captures["n"] == 2
+
+    def test_settle_raises_when_tui_never_mounts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda _s, _t: "booting")
+        with pytest.raises(kimi_native_bridge.KimiTuiNotReadyError, match="not delivered"):
+            kimi_native_bridge._settle_pane("/s", "main", timeout_s=0.0)
+
+    def test_readiness_budget_is_separate_and_long_enough(self) -> None:
+        assert kimi_native_bridge._KIMI_READY_TIMEOUT_S >= 120.0
+        assert kimi_native_bridge._KIMI_READY_TIMEOUT_S != kimi_native_bridge._TMUX_READY_TIMEOUT_S
+        assert (
+            signature(kimi_native_bridge.inject_interrupt).parameters["timeout_s"].default
+            == kimi_native_bridge._TMUX_READY_TIMEOUT_S
+        )
+        assert (
+            signature(kimi_native_bridge.inject_approval_keystroke).parameters["timeout_s"].default
+            == kimi_native_bridge._TMUX_READY_TIMEOUT_S
+        )
+        assert (
+            signature(kimi_native_bridge.kill_session).parameters["timeout_s"].default
+            == kimi_native_bridge._TMUX_READY_TIMEOUT_S
+        )
+
+
+class TestUserMessageInjection:
+    def _stub_tui(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        submit_after_enters: int | None,
+    ) -> list[tuple[str, ...]]:
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+        write_tmux_target(bridge_dir, socket_path=Path("/tmp/x/tmux.sock"), tmux_target="main")
+        sent: list[tuple[str, ...]] = []
+        tui = {"pane": "alice✨ "}
+        enters = {"count": 0}
+
+        monkeypatch.setattr(
+            kimi_native_bridge,
+            "_wait_for_tmux_info",
+            lambda _bridge_dir, *, timeout_s: {
+                "socket_path": "/tmp/x/tmux.sock",
+                "tmux_target": "main",
+            },
+        )
+        monkeypatch.setattr(kimi_native_bridge, "_session_alive", lambda _s, _t: True)
+        monkeypatch.setattr(kimi_native_bridge, "_settle_pane", lambda _s, _t, *, timeout_s: None)
+        monkeypatch.setattr(kimi_native_bridge, "_capture_pane", lambda _s, _t: tui["pane"])
+        monkeypatch.setattr(kimi_native_bridge, "_PASTE_SETTLE_S", 0.0)
+        monkeypatch.setattr(kimi_native_bridge, "_POLL_INTERVAL_S", 0.001)
+        monkeypatch.setattr(kimi_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.1)
+        monkeypatch.setattr(kimi_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.1)
+        monkeypatch.setattr(kimi_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.001)
+
+        def _run_tmux(_socket_path: str, *args: str) -> None:
+            sent.append(args)
+            if "paste-buffer" in args:
+                tui["pane"] = "alice✨ fix the flaky test"
+            elif args[-1] == "Enter":
+                enters["count"] += 1
+                if submit_after_enters is not None and enters["count"] >= submit_after_enters:
+                    tui["pane"] = "alice✨ "
+
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
+        return sent
+
+    def test_retries_enter_until_draft_leaves_input_box(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=2)
+        inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter", "Enter"]
+
+    def test_raises_when_draft_never_submits(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._stub_tui(monkeypatch, tmp_path, submit_after_enters=None)
+        with pytest.raises(RuntimeError, match="not delivered"):
+            inject_user_message(tmp_path / "bridge", content="fix the flaky test")
 
 
 class TestRegistration:

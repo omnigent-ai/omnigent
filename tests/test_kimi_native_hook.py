@@ -243,3 +243,43 @@ def test_verdict_from_response(response: object, expected: str | None) -> None:
 
 def test_unknown_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
     assert kimi_native_hook.main(["bogus", "--bridge-dir", "/tmp/x"]) == 2
+
+
+def test_request_web_approval_reparks_after_poll_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = [
+        httpx.Response(200, content=b"", request=httpx.Request("POST", "http://server")),
+        httpx.Response(
+            200,
+            json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+            request=httpx.Request("POST", "http://server"),
+        ),
+    ]
+    requests: list[dict[str, object]] = []
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            requests.append({"url": url, "json": json})
+            return responses.pop(0)
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+    monkeypatch.setattr(kimi_native_hook, "_PERMISSION_RETRY_DELAY_S", 0.0)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval("http://server", {}, body) == "allow"
+    assert len(requests) == 2
+    assert requests[0]["json"] == requests[1]["json"] == body
+
+
+def test_permission_poll_budget_is_below_kimi_hook_ceiling() -> None:
+    assert kimi_native_hook._PERMISSION_REQUEST_TIMEOUT_S < 600.0

@@ -39,6 +39,7 @@ import argparse
 import json
 import secrets
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -67,10 +68,11 @@ from omnigent.native_policy_hook import (
 _EVALUATE_POLICY_TIMEOUT_S = 70.0
 # Short timeout for the keystroke-injection tmux round-trip; never delay the TUI.
 _SURFACE_TIMEOUT_S = 10.0
-# Long-poll budget for the web approval verdict — the human may take a while.
-# On timeout the server returns an empty 200 and we fall back to kimi's own TUI
-# prompt (manual approval in the terminal).
-_PERMISSION_REQUEST_TIMEOUT_S = 3600.0
+# Kimi kills command hooks at 600s; leave room to re-park once.
+_KIMI_HOOK_TIMEOUT_S = 600.0
+_PERMISSION_REQUEST_TIMEOUT_S = _KIMI_HOOK_TIMEOUT_S - 60.0
+_PERMISSION_RETRY_WINDOW_S = _KIMI_HOOK_TIMEOUT_S - 10.0
+_PERMISSION_RETRY_DELAY_S = 0.1
 _HARNESS = "kimi-native"
 
 
@@ -256,28 +258,49 @@ def _request_web_approval(
 ) -> str | None:
     """POST the approval card and long-poll for the web verdict.
 
-    :returns: ``"allow"`` / ``"deny"``, or ``None`` on timeout (server returns
-        an empty 200), transport failure, or an unparseable verdict — all of
-        which fall back to kimi's own TUI prompt.
+    :returns: ``"allow"`` / ``"deny"``, or ``None`` after the bounded re-park
+        window, a transport failure, or an unparseable verdict.
     """
-    timeout = httpx.Timeout(_PERMISSION_REQUEST_TIMEOUT_S, connect=_SURFACE_TIMEOUT_S)
-    try:
-        with httpx.Client(headers=headers, timeout=timeout) as client:
-            resp = client.post(url, json=body)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        print(
-            f"omnigent kimi permission-request hook: approval request failed: {exc}",
-            file=sys.stderr,
-        )
-        return None
-    if not resp.content:
-        return None
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        return None
-    return _verdict_from_response(data)
+    deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(
+                "omnigent kimi permission-request hook: approval poll budget exhausted",
+                file=sys.stderr,
+            )
+            return None
+        timeout_s = min(_PERMISSION_REQUEST_TIMEOUT_S, remaining)
+        timeout = httpx.Timeout(timeout_s, connect=min(_SURFACE_TIMEOUT_S, timeout_s))
+        try:
+            with httpx.Client(headers=headers, timeout=timeout) as client:
+                resp = client.post(url, json=body)
+                resp.raise_for_status()
+        except httpx.TimeoutException as exc:
+            print(
+                f"omnigent kimi permission-request hook: approval poll ended; re-parking: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        except httpx.HTTPError as exc:
+            print(
+                f"omnigent kimi permission-request hook: approval request failed: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        if not resp.content:
+            print(
+                "omnigent kimi permission-request hook: approval poll expired; re-parking",
+                file=sys.stderr,
+            )
+            if _PERMISSION_RETRY_DELAY_S:
+                time.sleep(min(_PERMISSION_RETRY_DELAY_S, max(0.0, deadline - time.monotonic())))
+            continue
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            return None
+        return _verdict_from_response(data)
 
 
 def _verdict_from_response(data: object) -> str | None:

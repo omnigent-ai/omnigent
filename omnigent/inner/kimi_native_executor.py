@@ -91,7 +91,12 @@ class KimiNativeExecutor(Executor):
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
         except RuntimeError as exc:
-            yield ExecutorError(message=str(exc))
+            yield ExecutorError(
+                message=(
+                    f"Kimi native turn injection failed: {exc}; "
+                    "retry the turn after the Kimi terminal is ready"
+                )
+            )
             return
         yield TurnComplete(response=None)
 

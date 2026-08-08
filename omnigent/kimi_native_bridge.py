@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -35,6 +36,7 @@ _TMUX_FILE = "tmux.json"
 # PermissionRequest read-only surface).
 _HOOK_CONFIG_FILE = "hook_config.json"
 _TMUX_READY_TIMEOUT_S = 30.0
+_KIMI_READY_TIMEOUT_S = 120.0
 _TMUX_SEND_TIMEOUT_S = 5.0
 _POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -43,17 +45,24 @@ _PASTE_BUFFER = "omnigent-kimi-paste"
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
-# kimi TUI readiness markers — substrings that appear once the TUI has mounted
-# its input box, gating the pre-paste wait in ``_settle_pane``. The footer
-# context-window indicator (``context: 6.5% (17.0k/262.1k)``) is verified
-# present in EVERY mounted state of a live K2.7 session — idle, thinking, and
-# while an approval menu is up — so the gate returns on the first capture
-# instead of blocking the full readiness timeout before each paste. (The old
-# ``"Plan, search, build"`` / ``"Add a follow-up"`` strings were carried over
-# from cursor-native unverified and never matched, so every injection ate the
-# whole 30s timeout — the web→TUI latency the markers were meant to avoid.)
-_INPUT_READY_MARKERS = ("context:",)
+# Kimi renders an input symbol and a context footer after the TUI mounts.
+_INPUT_BOX_MARKERS = ("✨", "$ ")
+_FOOTER_MARKERS = ("context:",)
+_INPUT_BOX_SCAN_TAIL_LINES = 8
+_SUBMIT_VERIFY_TIMEOUT_S = 10.0
+_SUBMIT_RETRY_INTERVAL_S = 1.0
+_DRAFT_NEEDLE_MAX_CHARS = 24
 _TRUST_MARKER = "Trust this workspace"
+
+_logger = logging.getLogger(__name__)
+
+
+class KimiTuiNotReadyError(RuntimeError):
+    """The Kimi TUI did not mount an input box before the readiness deadline."""
+
+
+class KimiApprovalPromptNotFoundError(RuntimeError):
+    """The Kimi permission menu was not visible when approval was injected."""
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -265,27 +274,65 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
 
 def _submit_needle(content: str) -> str:
     """A stable single-line substring used to confirm the paste rendered in the pane."""
-    for line in content.splitlines():
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    for line in normalized.splitlines():
         stripped = line.strip()
-        if len(stripped) >= 4:
-            return stripped[:24]
-    stripped = content.strip()
-    return stripped[:24] if len(stripped) >= 4 else ""
+        if not stripped:
+            continue
+        for char_index, character in enumerate(stripped):
+            if ord(character) < 0x20:
+                stripped = stripped[:char_index]
+                break
+        if stripped:
+            return stripped[:_DRAFT_NEEDLE_MAX_CHARS]
+    return ""
+
+
+def _input_box_lines(pane: str) -> list[str]:
+    """Return the pane tail where Kimi renders its input row."""
+    lines = [line for line in pane.splitlines() if line.strip()]
+    return lines[-_INPUT_BOX_SCAN_TAIL_LINES:]
+
+
+def _input_box_line(pane: str) -> str | None:
+    """Return the latest line carrying a Kimi input marker."""
+    for line in reversed(_input_box_lines(pane)):
+        if any(marker in line for marker in _INPUT_BOX_MARKERS):
+            return line
+    return None
+
+
+def _kimi_tui_ready(pane: str) -> bool:
+    """Return whether both the Kimi input row and context footer are visible."""
+    tail = "\n".join(_input_box_lines(pane))
+    return _input_box_line(pane) is not None and any(marker in tail for marker in _FOOTER_MARKERS)
+
+
+def _draft_in_input_box(pane: str, needle: str) -> bool:
+    """Return whether the pasted draft is visible after Kimi's input marker."""
+    if not needle:
+        return False
+    line = _input_box_line(pane)
+    if line is None:
+        return False
+    marker_matches = [
+        (line.rfind(marker), marker) for marker in _INPUT_BOX_MARKERS if marker in line
+    ]
+    marker_position, marker = max(marker_matches)
+    return needle in line[marker_position + len(marker) :]
 
 
 def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
-    """Best-effort wait until the Kimi input box is ready to receive a paste.
+    """Wait until the Kimi input box is ready to receive a paste.
 
     Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
-    so the input box can mount, then returns as soon as the TUI chrome is present
-    (see :data:`_INPUT_READY_MARKERS`). Falls through after the timeout (e.g. a
-    boot that never renders) rather than raising — the paste still lands.
+    so the input box can mount, then returns when the input row and footer appear.
     """
     deadline = time.monotonic() + timeout_s
     trust_accepted = False
-    while time.monotonic() < deadline:
+    while True:
         pane = _capture_pane(socket_path, tmux_target)
-        if any(marker in pane for marker in _INPUT_READY_MARKERS):
+        if _kimi_tui_ready(pane):
             return
         # One-shot, only when no input marker is up (so a later transcript that
         # merely echoes the phrase can't spray repeated keystrokes into the TUI).
@@ -293,14 +340,20 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
             trust_accepted = True
             with contextlib.suppress(RuntimeError):
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
+        if time.monotonic() >= deadline:
+            break
         time.sleep(_POLL_INTERVAL_S)
+    raise KimiTuiNotReadyError(
+        f"Kimi TUI input box did not become ready within {timeout_s:.0f}s; "
+        "the message was not delivered. Restart the Kimi terminal and retry."
+    )
 
 
 def inject_user_message(
     bridge_dir: Path,
     *,
     content: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    timeout_s: float = _KIMI_READY_TIMEOUT_S,
 ) -> None:
     """Deliver a web-UI user message into the Kimi TUI via a tmux bracketed paste.
 
@@ -310,13 +363,13 @@ def inject_user_message(
 
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
-    :param timeout_s: Per-readiness-gate timeout.
+    :param timeout_s: Kimi TUI readiness timeout; override for slow boots.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
         command fails.
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
@@ -351,19 +404,38 @@ def inject_user_message(
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
-    # Wait until the paste is visibly committed to the input box before Enter.
-    # Submitting mid-paste folds the Enter in as a newline (the kimi TUI
-    # coalesces rapid stdin bursts), leaving the message unsent. Poll for the
-    # text, then submit; fall through to a blind submit if no needle is usable.
+    # Wait until the paste is visible before sending the submit key.
     needle = _submit_needle(content)
-    if needle:
-        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-        while time.monotonic() < deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
-                break
-            time.sleep(_POLL_INTERVAL_S)
+    if not needle:
+        raise RuntimeError(
+            "Kimi could not identify the pasted draft; the message was not delivered"
+        )
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+            break
+        time.sleep(_POLL_INTERVAL_S)
+    else:
+        raise RuntimeError(
+            f"Kimi TUI did not render the pasted message within {_PASTE_COMMIT_TIMEOUT_S}s; "
+            "the message was not delivered"
+        )
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+    last_enter = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+        pane = _capture_pane(socket_path, tmux_target)
+        if not _draft_in_input_box(pane, needle):
+            return
+        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = time.monotonic()
+    raise RuntimeError(
+        f"Kimi TUI did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s; "
+        "the draft is still in the input box and the message was not delivered"
+    )
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
@@ -381,9 +453,13 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
 
-#: Tool-independent label proving kimi's permission menu is on screen — guards
-#: against injecting a stray digit once the prompt was already answered.
-_PERMISSION_PROMPT_MARKER = "Approve once"
+#: Menu labels proving Kimi's permission prompt is on screen.
+_PERMISSION_PROMPT_MARKERS = (
+    "Approve once",
+    "Approve for session",
+    "Reject",
+    "Reject with feedback",
+)
 
 #: Web-UI approve/deny → option digit in kimi's fixed numbered menu
 #: (1=Approve once, 2=Approve for session, 3=Reject, 4=Reject with feedback).
@@ -401,25 +477,26 @@ def inject_approval_keystroke(
     ``1/2/3/4 choose · ↵ confirm``; the web-UI Approve/Deny buttons map to
     :data:`APPROVE_KEY` / :data:`DENY_KEY`. This types *key* then ``Enter``.
 
-    Captures the pane first and injects ONLY when the permission menu is
-    actually showing (:data:`_PERMISSION_PROMPT_MARKER`), so a web verdict that
-    lands after the user already answered in the terminal (or after the prompt
-    closed) is a no-op rather than a stray keystroke leaking into whatever is on
-    screen next.
+    Captures the pane first and injects only when a permission-menu label is
+    visible, preventing a verdict from leaking into the next TUI prompt.
 
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param key: The option digit to select (e.g. :data:`APPROVE_KEY`).
-    :returns: ``True`` if the keystroke was injected; ``False`` if the
-        permission menu was not present (already answered / closed / TUI gone).
+    :returns: ``True`` if the keystroke was injected.
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     if not _session_alive(socket_path, tmux_target):
-        return False
-    if _PERMISSION_PROMPT_MARKER not in _capture_pane(socket_path, tmux_target):
-        return False
+        message = "Kimi permission menu unavailable because the TUI session is not running"
+        _logger.warning(message)
+        raise KimiApprovalPromptNotFoundError(message)
+    pane = _capture_pane(socket_path, tmux_target)
+    if not any(marker in pane for marker in _PERMISSION_PROMPT_MARKERS):
+        message = "Kimi permission menu markers missing; approval keystroke was not sent"
+        _logger.warning("%s; pane tail=%r", message, pane[-240:])
+        raise KimiApprovalPromptNotFoundError(message)
     # ``key`` is a single documented option digit; Enter confirms (the footer
     # lists "choose" and "confirm" separately, so a digit selects and ↵ commits).
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
