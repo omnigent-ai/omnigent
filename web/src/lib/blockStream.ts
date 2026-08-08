@@ -205,6 +205,7 @@ function ctx(
     // under the item's true id without moving the reducer's active id.
     responseId: responseId || state.responseId,
     itemId,
+    createdAtS: Math.floor(Date.now() / 1000),
   };
 }
 
