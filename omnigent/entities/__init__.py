@@ -4,6 +4,8 @@ from omnigent.entities.account import Account, AccountToken
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.conversation import (
+    MAX_CONVERSATION_TITLE_CHARS,
+    MAX_LLM_TITLE_CHARS,
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
     Conversation,
@@ -40,6 +42,8 @@ from omnigent.entities.session_resources import (
 
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
+    "MAX_CONVERSATION_TITLE_CHARS",
+    "MAX_LLM_TITLE_CHARS",
     "NON_CONTENT_ITEM_TYPES",
     "Account",
     "AccountToken",
