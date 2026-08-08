@@ -751,6 +751,110 @@ describe("buildBubbles — tool joining", () => {
   });
 });
 
+describe("buildBubbles — session-driven trailing tool spinner", () => {
+  // claude-native has no streaming `activeResponse` — its running/idle lives
+  // in `sessionStatus`. The `sessionRunning` arg spins the newest turn's
+  // trailing tool phase so a dispatched-but-unresolved tool shows a spinner
+  // instead of "No output", without any bubble reaching lifecycle "streaming".
+  function toolState(bubbles: Bubble[]): string {
+    const asst = bubbles[bubbles.length - 1] as Extract<Bubble, { kind: "assistant" }>;
+    const tool = asst.items.find(
+      (item): item is Extract<RenderItem, { kind: "tool" }> => item.kind === "tool",
+    );
+    expect(tool).toBeDefined();
+    return tool!.state;
+  }
+
+  const danglingToolTurn: AnyBlock[] = [
+    {
+      type: "tool_group",
+      ctx: ctx({ itemId: "fc_1", responseId: "resp_1" }),
+      executions: [mkExec("Bash", "c1")],
+      iteration: 0,
+    },
+  ];
+
+  it("spins the newest turn's trailing tool while the session is running", () => {
+    // No activeResponse (claude-native never opens one), sessionRunning=true.
+    const bubbles = buildBubbles(danglingToolTurn, null, undefined, [], true);
+    expect(toolState(bubbles)).toBe("input-available");
+  });
+
+  it("does not spin when the session is idle (dangling tool resolves to no-output)", () => {
+    // The idle edge can land before the tool's result block — the tool must
+    // settle, not spin forever. This is the property the never-spin tests pin,
+    // now exercised through the session-driven path.
+    const bubbles = buildBubbles(danglingToolTurn, null, undefined, [], false);
+    expect(toolState(bubbles)).toBe("no-output");
+  });
+
+  it("a resolved tool shows its output regardless of session running", () => {
+    const blocks: AnyBlock[] = [
+      ...danglingToolTurn,
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_1", responseId: "resp_1" }),
+        name: "",
+        callId: "c1",
+        agentName: "test",
+        output: "done",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    expect(toolState(bubbles)).toBe("output-available");
+  });
+
+  it("only the NEWEST turn spins — an earlier turn's dangling tool stays no-output", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_old", responseId: "resp_old" }),
+        executions: [mkExec("Read", "c_old")],
+        iteration: 0,
+      },
+      { type: "user_message", ctx: ctx({ itemId: "u1", responseId: "" }), content: [] },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_new", responseId: "resp_new" }),
+        executions: [mkExec("Bash", "c_new")],
+        iteration: 0,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    const assistants = bubbles.filter(
+      (b): b is Extract<Bubble, { kind: "assistant" }> => b.kind === "assistant",
+    );
+    const oldTool = assistants[0].items.find((item) => item.kind === "tool");
+    const newTool = assistants[1].items.find((item) => item.kind === "tool");
+    expect((oldTool as Extract<RenderItem, { kind: "tool" }>).state).toBe("no-output");
+    expect((newTool as Extract<RenderItem, { kind: "tool" }>).state).toBe("input-available");
+  });
+
+  it("a trailing user message means no live turn — nothing spins", () => {
+    // A just-sent prompt with no assistant output yet: newestAssistantTurnId
+    // returns null, so the earlier turn's tool does not spin.
+    const blocks: AnyBlock[] = [
+      ...danglingToolTurn,
+      { type: "user_message", ctx: ctx({ itemId: "u1", responseId: "" }), content: [] },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    const asst = bubbles.find(
+      (b): b is Extract<Bubble, { kind: "assistant" }> => b.kind === "assistant",
+    )!;
+    const tool = asst.items.find((item) => item.kind === "tool");
+    expect((tool as Extract<RenderItem, { kind: "tool" }>).state).toBe("no-output");
+  });
+
+  it("the cache re-walks on a running→idle flip so a dangling tool stops spinning", () => {
+    // The flip carries no block change; the cache key must still see it move.
+    const cache = createBubbleCache();
+    expect(toolState(buildBubbles(danglingToolTurn, null, cache, [], true))).toBe(
+      "input-available",
+    );
+    expect(toolState(buildBubbles(danglingToolTurn, null, cache, [], false))).toBe("no-output");
+  });
+});
+
 describe("buildBubbles — cross-bubble tool_result pairing", () => {
   function resultBlock(
     callId: string,

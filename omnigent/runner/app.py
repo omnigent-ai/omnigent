@@ -8593,6 +8593,18 @@ def create_runner_app(
             )
 
     async def _catch_up_scan() -> None:
+        # The tunnel just reconnected, which usually means the SERVER restarted
+        # (deploy, crash, replica failover) and lost its in-memory session-status
+        # cache. This runner did not restart, so every status source still
+        # believes its last edge was delivered and nothing re-asserts — a
+        # native session mid-turn during the restart would sit on a stale
+        # ``idle`` for the rest of the turn. Re-arm them before the item scan
+        # below (which skips native harnesses entirely).
+        if resource_registry is not None:
+            try:
+                resource_registry.resync_session_statuses()
+            except Exception:  # noqa: BLE001 — best-effort; never block catch-up.
+                _logger.warning("Session status resync failed after reconnect", exc_info=True)
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue

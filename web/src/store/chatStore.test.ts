@@ -51,7 +51,6 @@ import {
   consumePendingInitialPrompt,
   handleSessionEvent,
   isStaleCompletedResponse,
-  reviveStrayCompletedResponse,
   initChatStore,
   pumpStreamEvents,
   setPendingInitialPrompt,
@@ -2303,45 +2302,16 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
-    // The server's deny short-circuit still publishes a session-level
-    // running→idle pair for the denied out-of-band input, and the client
-    // trusts `session.status` 1:1 — so this stray idle flips
-    // `sessionStatus` AND finalizes the streaming turn (a bare terminal
-    // edge is the NORMAL turn-end shape for id-less emitters like the
-    // PTY-activity relay, so it must settle the bubble; see the bare-idle
-    // tests below). The deny corner is healed by the live-delta revive:
-    // the still-streaming turn's next delta reopens it
-    // (reviveStrayCompletedResponse), so the misread is a brief flicker,
-    // not a mid-turn fold.
-    handleSessionEvent({
-      type: "session_status",
-      conversationId: "conv_abc",
-      status: "idle",
-    });
-    const afterIdle = useChatStore.getState();
-    expect(afterIdle.sessionStatus).toBe("idle");
-    expect(afterIdle.status).toBe("idle");
-    expect(afterIdle.activeResponse).toEqual({
-      responseId: "resp_in_flight",
-      state: "completed",
-      error: null,
-      completedAt: expect.any(Number),
-    });
-
-    // The turn was actually still live — its next delta revives it, and
-    // the session's busy signal comes back with it: leaving
-    // sessionStatus "idle" let a mid-turn send bypass shouldQueueSend's
-    // queue gate. Local `status` stays "idle" — this client sent
-    // nothing, so no local send is in flight.
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse).toEqual({
+    // The deny publishes no session-status pair at all: the agent never ran,
+    // so there is no turn to report. The live turn streaming alongside it is
+    // therefore untouched — no stray idle to fold its bubble, and no
+    // client-side revive needed to undo one.
+    expect(state.sessionStatus).toBe("running");
+    expect(state.activeResponse).toEqual({
       responseId: "resp_in_flight",
       state: "streaming",
       error: null,
-      completedAt: expect.any(Number),
     });
-    expect(useChatStore.getState().sessionStatus).toBe("running");
-    expect(useChatStore.getState().status).toBe("idle");
   });
 
   it("finalizes a streaming turn on a bare idle edge (no response id)", () => {
@@ -2386,7 +2356,7 @@ describe("chatStore — send while streaming (queueing)", () => {
 
   it("preserves a cancelled turn across a bare idle edge", () => {
     // The user's interrupt verdict must survive the trailing idle the
-    // teardown publishes — and the revive must never resurrect it.
+    // teardown publishes.
     useChatStore.setState({
       conversationId: "conv_abc",
       status: "idle",
@@ -2398,8 +2368,6 @@ describe("chatStore — send while streaming (queueing)", () => {
       conversationId: "conv_abc",
       status: "idle",
     });
-    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
-    reviveStrayCompletedResponse(useChatStore.setState);
     expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
   });
 
@@ -2441,54 +2409,6 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
     expect(state.status).toBe("streaming");
-  });
-
-  it("revive is a no-op for failed and absent responses", () => {
-    useChatStore.setState({
-      conversationId: "conv_abc",
-      sessionStatus: "idle",
-      activeResponse: { responseId: "resp_a", state: "failed", error: "boom" },
-    });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse?.state).toBe("failed");
-    expect(useChatStore.getState().sessionStatus).toBe("idle");
-
-    useChatStore.setState({ activeResponse: null });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse).toBeNull();
-    expect(useChatStore.getState().sessionStatus).toBe("idle");
-  });
-
-  it("gates the revive to a window after the finalize", () => {
-    // A scheduled wake's first deltas stream ahead of the batch that
-    // names the new turn; reviving the minutes-old finished turn
-    // popped its "Worked for" fold open at every /loop iteration. A
-    // finalize moments ago is a plausible stray idle and still revives.
-    useChatStore.setState({
-      conversationId: "conv_abc",
-      sessionStatus: "idle",
-      activeResponse: {
-        responseId: "resp_prev_iter",
-        state: "completed",
-        error: null,
-        completedAt: Date.now() - 60_000,
-      },
-    });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse?.state).toBe("completed");
-    expect(useChatStore.getState().sessionStatus).toBe("idle");
-
-    useChatStore.setState({
-      activeResponse: {
-        responseId: "resp_live",
-        state: "completed",
-        error: null,
-        completedAt: Date.now() - 1_000,
-      },
-    });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse?.state).toBe("streaming");
-    expect(useChatStore.getState().sessionStatus).toBe("running");
   });
 
   it("isStaleCompletedResponse: only an old finalize is stale", () => {
@@ -3351,12 +3271,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       // sessionStatus tracks the server's session-level status 1:1 — a server
       // idle means idle, and the "Working…" indicator (which reads only
       // sessionStatus) must turn off. The bubble lifecycle settles on the
-      // same edge: a bare (id-less) idle is the NORMAL turn-end shape for
-      // the PTY-activity relay and orchestration teardown, and leaving the
-      // turn "streaming" hid its "Worked for" fold and Fork action until a
-      // reload. A stray idle for a turn that is actually still live (the
-      // policy-deny short-circuit) is healed by the live-delta revive —
-      // see reviveStrayCompletedResponse.
+      // same edge: a bare (id-less) idle is the NORMAL turn-end shape for the
+      // status file and orchestration teardown, and leaving the turn
+      // "streaming" hid its "Worked for" fold and Fork action until a reload.
+      // Every idle that reaches here is a real turn end — control signals no
+      // longer publish status.
       expect(state.sessionStatus).toBe("idle");
       expect(state.status).toBe("idle");
       expect(state.activeResponse).toEqual({
@@ -6931,7 +6850,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
 
     expect(opens).toBe(11); // 1 initial open + 10 retries, then gives up
-    expect(useChatStore.getState().sessionStatus).toBe("failed");
+    // Giving up on OUR stream says nothing about what the agent is doing, so
+    // the session's own status is left alone — only the server may declare a
+    // session failed. The dropped stream surfaces as offline liveness.
+    expect(useChatStore.getState().sessionStatus).toBe("running");
     expect(useChatStore.getState().abortController).toBeNull();
   });
 
@@ -7633,10 +7555,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
 
   it("keeps the synthetic response id when no turn is tracked", async () => {
     // A preview that lands before any turn id is known keeps its own id, so
-    // it can't be grouped into an unrelated bubble. (A `completed` turn does
-    // NOT hit this path: a live delta proves that turn is still running, so
-    // `reviveStrayCompletedResponse` reopens it first and the preview
-    // correctly joins it.)
+    // it can't be grouped into an unrelated bubble.
     useChatStore.setState({
       conversationId: "conv_live_norid",
       blocks: [],

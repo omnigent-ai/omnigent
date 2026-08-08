@@ -775,6 +775,54 @@ describe("computeShowsWorking", () => {
       false,
     );
   });
+
+  it("an in-flight local send lights the indicator before any server edge", () => {
+    // Pressing Enter sets chatStore.status = "streaming" synchronously, while
+    // `sessionStatus` stays `idle` until the server publishes `running` (for
+    // claude-native, until the status file's next poll). The sidebar row
+    // already lights up off this flag, so the chat pane must too or the two
+    // disagree for the whole dispatch round-trip.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: true }))).toBe(true);
+  });
+
+  it("an in-flight local send survives a stale offline poll", () => {
+    // Sending to an asleep runner relaunches it; `/health` reads stale-offline
+    // during that window (10s cadence). The user dispatched, so the indicator
+    // must not be suppressed — same reasoning as live running/waiting above.
+    expect(
+      computeShowsWorking("idle", opts({ localSendInFlight: true, runnerOnline: false })),
+    ).toBe(true);
+  });
+
+  it("a spin-up in flight yields the slot to the Starting-up cue", () => {
+    // ChatPage passes `localSendInFlight: status === "streaming" && !spinUpInFlight`.
+    // `RunnerStartingIndicator` renders only when the shimmer is absent, and its
+    // copy ("Starting up…" / "Cloning repository…") is strictly more informative
+    // than a generic shimmer — so during a boot the optimistic path stands down.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
+  });
+
+  it("a server-confirmed running still wins during a spin-up", () => {
+    // Once the harness reports work the spin-up cue has self-gated to null, so
+    // suppressing the shimmer too would leave the turn with no indicator at all.
+    // `localSendInFlight` is the only thing the spin-up gate touches.
+    expect(computeShowsWorking("running", opts({ localSendInFlight: false }))).toBe(true);
+  });
+
+  it("a pending elicitation still outranks an in-flight local send", () => {
+    // The elicitation prompt owns the in-progress slot; the two must never
+    // stack, so the suppression applies regardless of how the work was
+    // signalled.
+    expect(
+      computeShowsWorking("idle", opts({ localSendInFlight: true, hasPendingElicitation: true })),
+    ).toBe(false);
+  });
+
+  it("no local send in flight leaves an idle session idle", () => {
+    // The flag is opt-in: a cross-client or TUI-typed turn sets no local
+    // status here, so an idle session with no send stays dark.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
+  });
 });
 
 // ── shouldShowWorkingIndicator ──────────────────────────────────────────────

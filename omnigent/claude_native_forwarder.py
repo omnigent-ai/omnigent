@@ -250,17 +250,23 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 # published on the per-conversation SSE stream. Unmapped events emit
 # no status.
 #
-# ``Stop`` → idle and ``StopFailure`` → failed are the authoritative
-# turn-end edges (each fires once when Claude finishes / errors a turn);
-# they drive sub-agent terminal delivery via the codex-shared
-# ``external_session_status`` path (→ parent inbox + wake). The
-# PTY-activity ``idle`` cannot: it is a ~1s-quiescence heuristic that
-# oscillates on every mid-turn lull, so delivering on it fired a
-# premature completion and idempotently locked out the real one.
-# ``UserPromptSubmit`` → running stays PTY-derived — the pane watcher
-# drives the UI running/idle badge and catches what ``Stop`` misses
-# (interrupts, compaction failures, TUI edits). ``_publish_status``
-# keeps ``failed`` sticky against the trailing PTY idle.
+# Claude's own ``sessions/<pid>.json`` owns the running/idle badge (see
+# :mod:`omnigent.claude_native_status_file`), so these two hooks exist for
+# what the file cannot express:
+#
+# - ``Stop`` → idle: the sub-agent terminal-delivery edge (→ parent inbox +
+#   wake, via the codex-shared ``external_session_status`` path). It fires
+#   exactly once per finished turn, where the PTY-activity ``idle`` was a
+#   ~1s-quiescence heuristic that oscillated on mid-turn lulls, firing a
+#   premature completion that idempotently locked out the real one. It also
+#   carries the background-shell count. It agrees with the file rather than
+#   competing with it, so arrival order does not matter — the shared edge
+#   dedup collapses the pair.
+# - ``StopFailure`` → failed: the file has no failure literal (it returns to
+#   ``idle`` on a turn error exactly as on success), so this is the only
+#   source of the red pill, ``last_task_error``, and a failed scheduled run.
+#   ``_publish_status`` keeps it sticky against a trailing ``idle``; the
+#   file's next ``busy`` clears it on the following turn.
 _HOOK_EVENT_TO_STATUS: dict[str, str] = {
     "Stop": "idle",
     "StopFailure": "failed",
@@ -657,12 +663,6 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
-    # Response id of the last turn-start ``running`` status POSTed, so the
-    # id-bearing running edge fires exactly once per turn even when an
-    # assistant item is held across polls for delta ordering (which leaves
-    # ``state.current_response_id`` unadvanced). ``None`` until the first
-    # turn-start edge. Reset on /clear and /fork like the other baselines.
-    posted_running_response_id: str | None = None
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -3030,19 +3030,18 @@ async def _forward_available_status_events(
         retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
-        effective_status = status
-        if status == "idle" and record.background_task_count > 0:
-            effective_status = "waiting"
         try:
             await post_external_session_status(
                 client,
                 session_id=session_id,
-                status=effective_status,
+                status=status,
                 response_id=response_id,
-                # Only the ``Stop`` (idle/waiting) edge carries an authoritative
+                # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
-                # ``StopFailure`` (failed) clears it on the server regardless, so
-                # leave its count off the wire.
+                # This is the one thing the status file cannot report: its
+                # ``shell`` literal is a boolean, and the indicator renders a
+                # number. ``StopFailure`` (failed) clears it on the server
+                # regardless, so leave its count off the wire.
                 background_task_count=(
                     None if status == "failed" else record.background_task_count
                 ),
@@ -3175,31 +3174,6 @@ async def _ensure_state_for_transcript(
     )
     await _write_forward_state_async(bridge_dir, state)
     return state
-
-
-def _turn_has_assistant_output(items: list[ClaudeTranscriptItem], response_id: str) -> bool:
-    """
-    Whether ``response_id`` has assistant-generated output among ``items``.
-
-    The turn-start ``running`` edge should open a streaming turn only for an id
-    that a later ``Stop``/``StopFailure`` hook will close — i.e. one produced by
-    an actual LLM turn. Assistant text (``message`` with ``role=assistant``) and
-    tool calls (``function_call``) qualify; a ``slash_command`` (``/model``,
-    ``/effort``) or ``terminal_command`` (``!cmd``) item opens an id with no LLM
-    turn behind it, so it must not.
-
-    :param items: Transcript items read this poll.
-    :param response_id: The current turn's response id.
-    :returns: ``True`` when an assistant-output item carries ``response_id``.
-    """
-    for item in items:
-        if item.response_id != response_id:
-            continue
-        if item.item_type == "function_call":
-            return True
-        if item.item_type == "message" and item.data.get("role") == "assistant":
-            return True
-    return False
 
 
 def _promote_pending_settle(
@@ -3460,55 +3434,15 @@ async def _forward_available_items(
     current_response_id = result.current_response_id
     seen_source_ids = list(state.seen_source_ids)
     seen = set(seen_source_ids)
-    # NOTE: the old "re-assert running on resumed agent output" hack lived
-    # here. It only existed to paper over the hook model's compaction
-    # blind spot (``Stop`` → idle, then an ``isCompactSummary`` resume that
-    # never fired ``UserPromptSubmit``). PTY-activity status makes it
-    # obsolete: the pane keeps changing through a mid-turn compaction, so
-    # the runner's watcher holds the session ``running`` directly.
-    #
-    # Turn-start edge: the first time we see a turn's response id, publish a
-    # ``running`` status carrying it. The PTY watcher already drives the
-    # running/idle BADGE with a bare (id-less) status; this id-bearing edge is
-    # what lets ap-web open a *streaming* ``activeResponse`` for the turn, so
-    # the forwarded tool-call cards (which carry the same response id) render
-    # LIVE — spinner + elapsed timer — instead of as static completed cards.
-    # Deduped on the persistent ``dedupe`` baseline (NOT ``state``): when an
-    # assistant item is held across polls for delta ordering, this function
-    # early-returns with ``state`` unadvanced, so a ``state``-based guard would
-    # re-fire ``running`` every poll of the hold window. Best-effort — a failed
-    # status post must not abort item forwarding (the items below are the
-    # primary payload); the turn-end idle/failed edge still carries the id to
-    # close the lifecycle, and the badge is unaffected either way.
-    #
-    # Only open the streaming turn for an id that has ASSISTANT output in this
-    # poll's items. A surfaced CLI built-in (``/model``, ``/effort``) or a
-    # ``!cmd`` becomes a slash_command / terminal_command item that opens its
-    # own response id but runs no LLM turn, so no ``Stop`` hook ever fires to
-    # close it — a ``running`` opened for it would strand the web composer in
-    # its "Stop"/busy state until the next real message. A skill that DOES
-    # trigger an LLM turn shares its id with the assistant text it produces, so
-    # ``running`` still fires — one poll later, when that output appears.
-    if (
-        current_response_id is not None
-        and dedupe.posted_running_response_id != current_response_id
-        and _turn_has_assistant_output(items, current_response_id)
-    ):
-        try:
-            await post_external_session_status(
-                client,
-                session_id=session_id,
-                status="running",
-                response_id=current_response_id,
-            )
-            dedupe.posted_running_response_id = current_response_id
-        except httpx.HTTPError:
-            _logger.warning(
-                "Failed to forward Claude turn-start running status; session=%s response_id=%s",
-                session_id,
-                current_response_id,
-                exc_info=True,
-            )
+    # This function publishes no session status. Claude's own
+    # ``sessions/<pid>.json`` owns the running/idle badge (see
+    # :mod:`omnigent.claude_native_status_file`), and it reports the turn ending
+    # the moment Claude settles. A status edge derived from the transcript can
+    # only fire once a poll has parsed assistant output, so it lands *after* the
+    # file's ``idle`` on a short turn and re-asserts ``running`` on a session
+    # that already finished — the user sees idle → running → idle. Items carry
+    # their own ``response_id`` (see :func:`_post_external_conversation_item`),
+    # so the transcript's job here is items, not status.
     updated = state
     for item in items:
         if item.source_id in seen:
