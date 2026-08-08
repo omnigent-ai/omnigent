@@ -123,7 +123,7 @@
             "type": "array"
           },
           "skills": {
-            "description": "Skills bundled in the agent spec (`skills/<name>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
+            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },

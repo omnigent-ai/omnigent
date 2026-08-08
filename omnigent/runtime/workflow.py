@@ -1313,7 +1313,7 @@ def _build_codex_spawn_env(
         agent cache). Threaded through as
         ``HARNESS_CODEX_BUNDLE_DIR`` so the harness wrap's executor
         can also source bundled skills from
-        ``<bundle>/skills/<name>/``.
+        ``<bundle>/skills/<dir>/``.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1385,7 +1385,7 @@ def _build_pi_spawn_env(
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<name>/``.
+        from ``<bundle>/skills/<dir>/``.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """

@@ -2149,7 +2149,7 @@ def test_materialize_bundle_overrides_brain_harness(
         assert worker_harnesses == expected_workers, (
             f"Sub-agent harnesses changed under a brain-only override: "
             f"{worker_harnesses}. The override must rewrite only the "
-            f"top-level config.yaml, never agents/<name>/config.yaml."
+            f"top-level config.yaml, never agents/<dir>/config.yaml."
         )
     finally:
         _cleanup_materialized_override_bundle(materialized)

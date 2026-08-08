@@ -2138,7 +2138,7 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
     Parse the top-level YAML ``skills:`` field into a host-skill
     filter string or list of names.
 
-    Distinct from the bundle-side ``skills/<name>/SKILL.md`` files
+    Distinct from the bundle-side ``skills/<dir>/SKILL.md`` files
     discovered by :func:`_discover_skills` — that's the agent's own
     bundled skills, always loaded. This filter only controls
     HOST-scope skills that the harness picks up from the user's
@@ -2931,7 +2931,12 @@ def _discover_sub_agents(
         config_yaml = agent_dir / "config.yaml"
         if not config_yaml.exists():
             continue
-        sub_agents.append(parse(agent_dir, expand_env=expand_env))
+        sub_spec = parse(agent_dir, expand_env=expand_env)
+        # Provenance for bundle-dir resolution: the directory name, never
+        # the YAML ``name``. A child's skills and local tools live under
+        # ``<parent bundle>/agents/<dir>``, and the two can differ.
+        sub_spec.source_rel_dir = agent_dir.name
+        sub_agents.append(sub_spec)
     return sub_agents
 
 

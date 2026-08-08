@@ -166,7 +166,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
     # ``"inherit"`` sentinel at translation time so it never
     # reaches the forward path as a string.
     # Bundle root: derived from any bundled skill's ``skill_dir``
-    # (each lives at ``<bundle>/skills/<name>/`` per AGENTSPEC.md).
+    # (each lives at ``<bundle>/skills/<dir>/`` per AGENTSPEC.md).
     # Without it the Claude SDK harness can't expose bundled skills
     # via ``--plugin-dir``. ``None`` when the spec has no skills —
     # nothing to expose, nothing to set.

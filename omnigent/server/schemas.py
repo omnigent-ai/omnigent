@@ -246,7 +246,7 @@ class AgentObject(BaseModel):
         phases. Empty list when the spec declares no policies
         or when the bundle cannot be loaded.
     :param skills: Skills bundled in the agent spec
-        (``skills/<name>/SKILL.md``). Lets the Web UI's
+        (``skills/<dir>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
         session (and its runner) exists. Host-discovered skills
         are runner-owned, so they are NOT listed here — the

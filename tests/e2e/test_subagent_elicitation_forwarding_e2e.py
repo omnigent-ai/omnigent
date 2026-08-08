@@ -537,7 +537,7 @@ def agent_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     Writes the inlined supervisor + sub-agent specs in the on-disk bundle
     layout ``omnigent run`` expects (``config.yaml`` at the root,
-    ``agents/<name>/config.yaml`` per sub-agent).
+    ``agents/<dir>/config.yaml`` per sub-agent).
 
     :param tmp_path_factory: Pytest tmp-dir factory (module-scoped so all
         parametrized cases share one bundle).

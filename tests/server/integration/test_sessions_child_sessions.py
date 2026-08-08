@@ -1145,7 +1145,7 @@ def _bundle_with_harnessed_subagents(name: str, sub_agents: list[dict[str, Any]]
 
     ``tests.server.helpers.build_agent_bundle`` writes sub-agent configs
     without an ``executor`` block, so it can't express a native harness.
-    This minimal builder writes ``agents/<name>/config.yaml`` with the
+    This minimal builder writes ``agents/<dir>/config.yaml`` with the
     given ``harness`` so the create-session path can resolve a native
     sub-agent's harness from the parent bundle.
 
