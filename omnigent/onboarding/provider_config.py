@@ -164,9 +164,9 @@ _HARNESS_FAMILY: dict[str, str] = {
     # normally maps it down via _provider_harness_name; accept both spellings
     # here so callers that pass the spec/CLI spelling directly resolve too.
     "openai-agents-sdk": OPENAI_FAMILY,
-    # Antigravity is Gemini-native but routes generic-provider traffic over
-    # the OpenAI-compatible wire, so it consumes the ``openai`` family.
-    "antigravity": OPENAI_FAMILY,
+    # Antigravity's SDK consumes Gemini credentials directly; it has no
+    # OpenAI-compatible provider path.
+    "antigravity": GEMINI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``

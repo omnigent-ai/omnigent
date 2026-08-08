@@ -76,6 +76,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
+    GEMINI_FAMILY,
     KEY_KIND,
     OPENAI_FAMILY,
     SUBSCRIPTION_KIND,
@@ -180,7 +181,9 @@ _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
-    "antigravity": OPENAI_FAMILY,
+    # Antigravity's SDK is Gemini-native.  Treating it as OpenAI here made
+    # an unrelated Codex subscription fallback appear as its vendor identity.
+    "antigravity": GEMINI_FAMILY,
     "qwen": OPENAI_FAMILY,
 }
 

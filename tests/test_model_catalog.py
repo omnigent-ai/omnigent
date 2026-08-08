@@ -1012,6 +1012,33 @@ def test_unconfigured_listing_does_not_claim_the_worker_cannot_run(
     assert "cannot run here" not in listing.note
 
 
+def test_antigravity_resolves_the_gemini_provider_not_codex_subscription(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SIL-1039: Antigravity is Gemini-family, never a Codex CLI alias."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  codex:\n"
+        "    kind: subscription\n"
+        "    cli: codex\n"
+        "    default: [openai]\n"
+        "  gemini:\n"
+        "    kind: key\n"
+        "    default: [gemini]\n"
+        "    gemini:\n"
+        "      base_url: https://generativelanguage.googleapis.com\n"
+        "      api_key: $GEMINI_API_KEY\n",
+    )
+
+    provider = resolve_model_provider(_worker_spec("antigravity"), "antigravity")
+    assert provider.kind == "key"
+    assert provider.family == "gemini"
+    assert provider.cli is None
+
+
 @pytest.mark.parametrize("harness", ["goose", "goose-native", "hermes-native", "opencode-native"])
 def test_self_authenticating_harness_reports_self_managed_not_none(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
