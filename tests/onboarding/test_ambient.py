@@ -16,7 +16,11 @@ from __future__ import annotations
 import pytest
 
 from omnigent.onboarding import ambient
-from omnigent.onboarding.ambient import DetectedProvider, detect_providers
+from omnigent.onboarding.ambient import (
+    DetectedProvider,
+    codex_config_provider_has_credential,
+    detect_providers,
+)
 
 # Every provider env var ambient may read — cleared in the base fixture so
 # the host's own keys don't leak into the deterministic detection tests.
@@ -681,6 +685,162 @@ def test_codex_config_other_self_contained_auth_detected(
     )
     detected = detect_providers()
     assert [d.model_provider for d in detected] == ["Custom"]
+
+
+# ── Codex config self-authentication (readiness, not adoption) ──────────────
+
+
+def _codex_config_path(home):
+    """Return the ``config.toml`` path under the test HOME.
+
+    :param home: The tmp HOME directory (from the ``clean_env`` fixture).
+    :returns: Path to ``<home>/.codex/config.toml``.
+    """
+    return home / ".codex" / "config.toml"
+
+
+@pytest.mark.parametrize(
+    "label,body",
+    [
+        # Env-var bearer: the shape adoption deliberately skips but Codex
+        # itself authenticates with, since it keeps its own config.
+        (
+            "env-key",
+            'model_provider = "Gw"\n[model_providers.Gw]\nenv_key = "GW_TOKEN"\n',
+        ),
+        # Env-var auth header, the header-shaped equivalent of env_key.
+        (
+            "env-http-headers",
+            'model_provider = "Gw"\n'
+            "[model_providers.Gw.env_http_headers]\n"
+            'Authorization = "GW_TOKEN"\n',
+        ),
+        # An active profile selecting the provider, like codex's own merge.
+        (
+            "profile-selected",
+            'profile = "work"\n'
+            '[profiles.work]\nmodel_provider = "Gw"\n'
+            '[model_providers.Gw]\nenv_key = "GW_TOKEN"\n',
+        ),
+    ],
+)
+def test_codex_config_env_auth_has_credential(
+    clean_env, monkeypatch: pytest.MonkeyPatch, label: str, body: str
+) -> None:
+    """A populated env-based credential counts as authenticated.
+
+    Failure is the reported bug: readiness falls through to ``auth.json``, calls
+    an authenticated custom provider ``needs-auth``, and asks for a
+    ``codex login`` that would bypass the gateway.
+    """
+    _write_codex_config(clean_env, body)
+    monkeypatch.setenv("GW_TOKEN", "tok-123")
+
+    assert codex_config_provider_has_credential(_codex_config_path(clean_env)) is True
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_codex_config_env_auth_unpopulated_has_no_credential(
+    clean_env, monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    """An unset or blank env var carries no credential to send."""
+    _write_codex_config(
+        clean_env, 'model_provider = "Gw"\n[model_providers.Gw]\nenv_key = "GW_TOKEN"\n'
+    )
+    if value is None:
+        monkeypatch.delenv("GW_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GW_TOKEN", value)
+
+    assert codex_config_provider_has_credential(_codex_config_path(clean_env)) is False
+
+
+def test_codex_config_env_auth_resolves_in_supplied_env(clean_env) -> None:
+    """An explicit ``env`` decides, so a caller can pass its launch env.
+
+    The native Codex launch hands the CLI a filtered environment; resolving in
+    that env keeps readiness and the launch reading the same variables.
+    """
+    _write_codex_config(
+        clean_env, 'model_provider = "Gw"\n[model_providers.Gw]\nenv_key = "GW_TOKEN"\n'
+    )
+    config_path = _codex_config_path(clean_env)
+
+    assert codex_config_provider_has_credential(config_path, env={"GW_TOKEN": "tok"}) is True
+    assert codex_config_provider_has_credential(config_path, env={}) is False
+
+
+@pytest.mark.parametrize(
+    "label,body",
+    [
+        # Self-contained auth needs no environment at all.
+        (
+            "auth-command",
+            'model_provider = "Gw"\n[model_providers.Gw.auth]\ncommand = "print-token"\n',
+        ),
+        (
+            "bearer-token",
+            'model_provider = "Gw"\n[model_providers.Gw]\nexperimental_bearer_token = "tok"\n',
+        ),
+    ],
+)
+def test_codex_config_self_contained_auth_has_credential(clean_env, label: str, body: str) -> None:
+    """Self-contained provider auth counts without any env var."""
+    _write_codex_config(clean_env, body)
+
+    assert codex_config_provider_has_credential(_codex_config_path(clean_env)) is True
+
+
+@pytest.mark.parametrize(
+    "label,body",
+    [
+        # The built-in provider is codex's own login — auth.json's territory.
+        ("builtin-provider", 'model_provider = "openai"\n'),
+        # No selection at all → codex defaults to the built-in provider.
+        ("no-model-provider", '[model_providers.Gw]\nenv_key = "GW_TOKEN"\n'),
+        # Selected provider is never defined — codex itself would fail.
+        ("missing-table", 'model_provider = "Ghost"\n'),
+        # Rides the ChatGPT login, so auth.json is the real credential.
+        (
+            "requires-openai-auth",
+            'model_provider = "Gw"\n'
+            "[model_providers.Gw]\n"
+            "requires_openai_auth = true\n"
+            'env_key = "GW_TOKEN"\n',
+        ),
+        # A provider table naming no credential at all.
+        (
+            "no-auth-fields",
+            'model_provider = "Gw"\n[model_providers.Gw]\nbase_url = "https://gw.example/v1"\n',
+        ),
+        # A non-auth env header is not a credential.
+        (
+            "non-auth-env-header",
+            'model_provider = "Gw"\n'
+            "[model_providers.Gw.env_http_headers]\n"
+            'X-Tenant = "GW_TOKEN"\n',
+        ),
+        # Malformed TOML must read as "no credential", not crash readiness.
+        ("malformed-toml", "model_provider = [unclosed\n"),
+    ],
+)
+def test_codex_config_has_no_credential(
+    clean_env, monkeypatch: pytest.MonkeyPatch, label: str, body: str
+) -> None:
+    """Configs that name no usable credential must not report one.
+
+    Failure fails open: the harness shows ready and then fails to authenticate
+    on the first turn.
+    """
+    _write_codex_config(clean_env, body)
+    monkeypatch.setenv("GW_TOKEN", "tok-123")
+
+    assert codex_config_provider_has_credential(_codex_config_path(clean_env)) is False
+
+
+def test_codex_config_missing_file_has_no_credential(clean_env) -> None:
+    """An absent ``config.toml`` carries no credential."""
+    assert codex_config_provider_has_credential(_codex_config_path(clean_env)) is False
 
 
 # ── Claude on Vertex AI (GCP ADC) detection ──────────────────────────────────
