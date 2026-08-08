@@ -159,6 +159,8 @@ export function AppShell() {
   const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  const [sidebarPeek, setSidebarPeek] = useState(false);
+
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
   const { width: sidebarWidth } = useResizableSidebar();
@@ -987,6 +989,15 @@ export function AppShell() {
     setRightPanelOpen(next);
   };
 
+  // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
+  // sidebar counts as open, so toggling collapses it; either way peek is
+  // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
+  // floating-card layout the rest of the shell treats as a pushing panel).
+  const toggleLeftSidebar = () => {
+    setSidebarOpen(!(sidebarOpen || sidebarPeek));
+    setSidebarPeek(false);
+  };
+
   // Toggle the workspace rail's full-screen (maximized) state. Entering
   // collapses the left sidebar (the maximized rail wants the full width) after
   // stashing its prior open-state; exiting restores that state. The sidebar
@@ -1009,7 +1020,7 @@ export function AppShell() {
   // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
   // here where both panels' open-state lives.
   useSidebarToggleHotkeys({
-    onToggleLeft: () => setSidebarOpen((prev) => !prev),
+    onToggleLeft: toggleLeftSidebar,
     onToggleRight: toggleRightPanel,
   });
 
@@ -1415,8 +1426,16 @@ export function AppShell() {
             )}
             <Sidebar
               open={sidebarOpen}
+              onOpen={() => {
+                setSidebarOpen(true);
+                setSidebarPeek(false);
+              }}
+              peek={sidebarPeek}
               dragProgress={sidebarDragProgress}
-              onClose={() => setSidebarOpen(false)}
+              onClose={() => {
+                setSidebarOpen(false);
+                setSidebarPeek(false);
+              }}
               onOpenSearch={() => setCommandPaletteOpen(true)}
             />
 
@@ -1446,8 +1465,16 @@ export function AppShell() {
                 }
               >
                 <ChatHeader
-                  sidebarOpen={sidebarOpen}
-                  onOpenSidebar={() => setSidebarOpen(true)}
+                  sidebarOpen={sidebarOpen || sidebarPeek}
+                  onOpenSidebar={(peek?: boolean) => {
+                    if (peek) {
+                      setSidebarPeek(true);
+                      setSidebarOpen(false);
+                    } else {
+                      setSidebarOpen(true);
+                      setSidebarPeek(false);
+                    }
+                  }}
                   isChildSession={isChildSession}
                   parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
@@ -1712,7 +1739,7 @@ export function AppShell() {
           <CommandPalette
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
-            onToggleLeftSidebar={() => setSidebarOpen((prev) => !prev)}
+            onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
           />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so

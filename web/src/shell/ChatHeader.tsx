@@ -26,9 +26,11 @@ import { AgentInfoButton } from "@/components/AgentInfo";
 import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
+import { useCallback, useEffect, useRef } from "react";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -97,7 +99,7 @@ interface ChatHeaderProps {
   /** Whether the left sidebar is open (hides the open-sidebar button). */
   sidebarOpen: boolean;
   /** Open the left sidebar. */
-  onOpenSidebar: () => void;
+  onOpenSidebar: (peek?: boolean) => void;
   /** Whether the active session is a sub-agent (shows the back link). */
   isChildSession: boolean;
   /** Parent session id for the back link's destination (when a child). */
@@ -183,6 +185,26 @@ export function ChatHeader({
   onToggleRightPanel,
   mobileMenu,
 }: ChatHeaderProps) {
+  // Dwell on the toggle for 1s to peek the sidebar; leaving before then cancels
+  // the pending peek so a quick pass-over never opens it. Peek is a desktop
+  // hover affordance — on mobile the toggle just opens the full-screen overlay,
+  // so a tap's synthetic pointerenter must not trigger it.
+  const isMobile = useIsMobileViewport();
+  const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPeek = useCallback(() => {
+    if (peekTimer.current) {
+      clearTimeout(peekTimer.current);
+      peekTimer.current = null;
+    }
+  }, []);
+  const onPeekSidebar = useCallback(() => {
+    if (isMobile) return;
+    cancelPeek();
+    peekTimer.current = setTimeout(() => {
+      onOpenSidebar(true);
+    }, 400);
+  }, [isMobile, onOpenSidebar, cancelPeek]);
+  useEffect(() => cancelPeek, [cancelPeek]);
   // A native sub-agent (a Claude Code Task, a Codex collab thread) is bound to
   // its parent's `<vendor>-native-ui` row, so its agent name is an internal
   // the server itself hides (`public_agent_name`). Name the product instead,
@@ -223,8 +245,13 @@ export function ChatHeader({
                 variant="ghost"
                 size="icon"
                 aria-label="Open sidebar"
-                onClick={onOpenSidebar}
+                onClick={() => {
+                  cancelPeek();
+                  onOpenSidebar(false);
+                }}
                 className="text-muted-foreground hover:text-foreground"
+                onPointerEnter={onPeekSidebar}
+                onPointerLeave={cancelPeek}
               >
                 <PanelLeftIcon className="size-4" />
               </Button>
