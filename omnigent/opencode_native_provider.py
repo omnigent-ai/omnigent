@@ -42,6 +42,27 @@ DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
 
+# Generic OpenAI-compatible gateway for opencode-native, configured purely by
+# env — mirrors the HARNESS_*_GATEWAY_* convention the other harnesses use, but
+# opencode consumes it via the synthesized config file (see module docstring).
+# Lets a deployment route opencode through any gateway (e.g. Bifrost) without
+# the Databricks SDK. BASE_URL is the switch; API_KEY defaults to a dummy for
+# keyless gateways; MODEL is the default model id sent to the gateway.
+ENV_GATEWAY_BASE_URL = "HARNESS_OPENCODE_GATEWAY_BASE_URL"
+ENV_GATEWAY_API_KEY = "HARNESS_OPENCODE_GATEWAY_API_KEY"
+ENV_GATEWAY_MODEL = "HARNESS_OPENCODE_GATEWAY_MODEL"
+ENV_GATEWAY_PROVIDER_ID = "HARNESS_OPENCODE_GATEWAY_PROVIDER_ID"
+ENV_GATEWAY_PROVIDER_NAME = "HARNESS_OPENCODE_GATEWAY_PROVIDER_NAME"
+# Additional models to register on the SAME gateway provider, beyond the
+# default in ENV_GATEWAY_MODEL, so opencode's own model switcher can list them
+# — a multi-model gateway (e.g. an OpenRouter-backed Bifrost) otherwise has no
+# way to surface anything past the one pinned default. Comma-separated, e.g.
+# "moonshotai/kimi-k3,deepseek/deepseek-v4". Each may optionally carry the same
+# "<provider_id>/" prefix ENV_GATEWAY_MODEL accepts; it's stripped the same way.
+ENV_GATEWAY_EXTRA_MODELS = "HARNESS_OPENCODE_GATEWAY_EXTRA_MODELS"
+_DEFAULT_ENV_GATEWAY_PROVIDER_ID = "gateway"
+_DEFAULT_ENV_GATEWAY_PROVIDER_NAME = "LLM Gateway"
+
 
 @dataclass(frozen=True)
 class OpenCodeGatewayResolution:
@@ -53,6 +74,9 @@ class OpenCodeGatewayResolution:
     :param model_id: The endpoint/model id, e.g. ``"databricks-claude-sonnet-4-6"``.
     :param provider_id: opencode provider id, e.g. ``"databricks-gateway"``.
     :param provider_name: Human label for the opencode provider block.
+    :param extra_model_ids: Additional model ids to register on the same
+        provider (selectable in opencode's own model switcher), beyond
+        *model_id* which is always the session's default/pinned model.
     """
 
     base_url: str
@@ -60,6 +84,7 @@ class OpenCodeGatewayResolution:
     model_id: str
     provider_id: str = DATABRICKS_GATEWAY_PROVIDER_ID
     provider_name: str = DATABRICKS_GATEWAY_PROVIDER_NAME
+    extra_model_ids: tuple[str, ...] = ()
 
     @property
     def qualified_model(self) -> str:
@@ -89,9 +114,16 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
     """
     Build the ``opencode.json`` declaring a custom OpenAI-compatible provider.
 
-    :param resolution: The resolved gateway (base URL + key + model).
+    Registers *model_id* plus any *extra_model_ids* under the same provider,
+    so a multi-model gateway (e.g. an OpenRouter-backed Bifrost) surfaces more
+    than just the one pinned default in opencode's own model switcher.
+
+    :param resolution: The resolved gateway (base URL + key + model(s)).
     :returns: A config dict ready to serialize to ``opencode.json``.
     """
+    models = {resolution.model_id: {"name": resolution.model_id}}
+    for extra_id in resolution.extra_model_ids:
+        models.setdefault(extra_id, {"name": extra_id})
     return {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
@@ -102,7 +134,7 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
                     "baseURL": resolution.base_url,
                     "apiKey": resolution.api_key,
                 },
-                "models": {resolution.model_id: {"name": resolution.model_id}},
+                "models": models,
             }
         },
     }
@@ -306,6 +338,74 @@ def resolve_databricks_gateway(
         base_url=f"{host}/{_SERVING_ENDPOINTS_PATH}",
         api_key=token,
         model_id=resolved_model,
+    )
+
+
+def resolve_env_gateway(*, model_id: str | None = None) -> OpenCodeGatewayResolution | None:
+    """
+    Resolve a generic OpenAI-compatible gateway for opencode from env.
+
+    Reads ``HARNESS_OPENCODE_GATEWAY_*`` (see the constants above): ``BASE_URL``
+    is the switch, ``API_KEY`` defaults to a dummy for keyless gateways, and the
+    model is *model_id* (the session's pinned model) else ``..._MODEL``.
+    ``..._EXTRA_MODELS`` registers additional models on the same provider so
+    opencode's own model switcher can list them too — useful when the gateway
+    fronts several models (e.g. an OpenRouter-backed Bifrost) rather than one
+    fixed endpoint. Lets a deployment route opencode through any gateway (e.g.
+    an in-cluster Bifrost) with no Databricks SDK. Returns ``None`` when no
+    base URL is set.
+
+    :param model_id: The session's pinned model, e.g. ``"bedrock/claude-sonnet-4-6"``
+        or a ``<provider_id>/<model>`` already qualified with our provider id.
+    :returns: A resolution, or ``None`` when no gateway is configured.
+    """
+    base_url = os.environ.get(ENV_GATEWAY_BASE_URL, "").strip()
+    if not base_url:
+        return None
+    provider_id = (
+        os.environ.get(ENV_GATEWAY_PROVIDER_ID, "").strip() or _DEFAULT_ENV_GATEWAY_PROVIDER_ID
+    )
+    if "/" in provider_id or any(ch.isspace() for ch in provider_id):
+        # A "/" or whitespace makes the synthesized "<provider_id>/<model>" id
+        # ambiguous to parse back apart (the prefix-strip below, and the
+        # runner's relaunch path, both split on the first "/"), which can
+        # corrupt resume/summarize. Fall back to the always-valid default
+        # rather than write a provider config we can't reliably read back.
+        _logger.warning(
+            "%s=%r is not a valid opencode provider id (contains '/' or "
+            "whitespace); falling back to %r",
+            ENV_GATEWAY_PROVIDER_ID,
+            provider_id,
+            _DEFAULT_ENV_GATEWAY_PROVIDER_ID,
+        )
+        provider_id = _DEFAULT_ENV_GATEWAY_PROVIDER_ID
+
+    def _strip_own_prefix(candidate: str) -> str:
+        # A model id may already be qualified as "<provider_id>/<model>" (the
+        # runner sets model_override to gateway.qualified_model on relaunch) —
+        # strip it so the provider config declares the bare gateway model id.
+        if provider_id and candidate.startswith(f"{provider_id}/"):
+            return candidate[len(provider_id) + 1 :]
+        return candidate
+
+    model = _strip_own_prefix(
+        (model_id or "").strip() or os.environ.get(ENV_GATEWAY_MODEL, "").strip()
+    )
+    if not model:
+        return None
+    extra_models = tuple(
+        stripped
+        for raw in os.environ.get(ENV_GATEWAY_EXTRA_MODELS, "").split(",")
+        if (stripped := _strip_own_prefix(raw.strip())) and stripped != model
+    )
+    return OpenCodeGatewayResolution(
+        base_url=base_url,
+        api_key=os.environ.get(ENV_GATEWAY_API_KEY, "").strip() or "gateway-no-auth",
+        model_id=model,
+        provider_id=provider_id,
+        provider_name=os.environ.get(ENV_GATEWAY_PROVIDER_NAME, "").strip()
+        or _DEFAULT_ENV_GATEWAY_PROVIDER_NAME,
+        extra_model_ids=extra_models,
     )
 
 

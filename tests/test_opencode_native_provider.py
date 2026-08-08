@@ -11,6 +11,12 @@ from pathlib import Path
 import pytest
 
 from omnigent.opencode_native_provider import (
+    ENV_GATEWAY_API_KEY,
+    ENV_GATEWAY_BASE_URL,
+    ENV_GATEWAY_EXTRA_MODELS,
+    ENV_GATEWAY_MODEL,
+    ENV_GATEWAY_PROVIDER_ID,
+    ENV_GATEWAY_PROVIDER_NAME,
     OpenCodeGatewayResolution,
     _gateway_endpoint_for_model,
     _strip_jsonc_comments,
@@ -20,6 +26,7 @@ from omnigent.opencode_native_provider import (
     build_opencode_provider_config,
     maybe_merge_user_provider_config,
     resolve_databricks_gateway,
+    resolve_env_gateway,
     write_opencode_provider_config,
 )
 
@@ -189,6 +196,165 @@ def test_resolve_gateway_defaults_non_gateway_model(monkeypatch: pytest.MonkeyPa
 def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token=None)
     assert resolve_databricks_gateway("oss") is None
+
+
+def _clear_env_gateway_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        ENV_GATEWAY_BASE_URL,
+        ENV_GATEWAY_API_KEY,
+        ENV_GATEWAY_MODEL,
+        ENV_GATEWAY_PROVIDER_ID,
+        ENV_GATEWAY_PROVIDER_NAME,
+        ENV_GATEWAY_EXTRA_MODELS,
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_resolve_env_gateway_none_without_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    assert resolve_env_gateway() is None
+
+
+def test_resolve_env_gateway_none_without_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    assert resolve_env_gateway() is None
+
+
+def test_resolve_env_gateway_model_id_takes_priority_over_env_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    res = resolve_env_gateway(model_id="bedrock/claude-sonnet-4-6")
+    assert res is not None
+    assert res.model_id == "bedrock/claude-sonnet-4-6"
+
+
+def test_resolve_env_gateway_falls_back_to_env_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    res = resolve_env_gateway()
+    assert res is not None
+    assert res.model_id == "openrouter/z-ai/glm-5.2"
+
+
+def test_resolve_env_gateway_strips_own_provider_prefix_from_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The runner relaunches a session with model_override set to the previous
+    # qualified_model ("<provider_id>/<model>"); resolving again must not
+    # double-qualify it.
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_PROVIDER_ID, "bifrost")
+    res = resolve_env_gateway(model_id="bifrost/openrouter/z-ai/glm-5.2")
+    assert res is not None
+    assert res.model_id == "openrouter/z-ai/glm-5.2"
+    assert res.qualified_model == "bifrost/openrouter/z-ai/glm-5.2"
+
+
+def test_resolve_env_gateway_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    res = resolve_env_gateway()
+    assert res is not None
+    assert res.base_url == "http://bifrost.internal:4000/v1"
+    assert res.api_key == "gateway-no-auth"
+    assert res.provider_id == "gateway"
+    assert res.provider_name == "LLM Gateway"
+
+
+def test_resolve_env_gateway_custom_api_key_provider_id_and_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    monkeypatch.setenv(ENV_GATEWAY_API_KEY, "sk-real-key")
+    monkeypatch.setenv(ENV_GATEWAY_PROVIDER_ID, "bifrost")
+    monkeypatch.setenv(ENV_GATEWAY_PROVIDER_NAME, "Bifrost")
+    res = resolve_env_gateway()
+    assert res is not None
+    assert res.api_key == "sk-real-key"
+    assert res.provider_id == "bifrost"
+    assert res.provider_name == "Bifrost"
+
+
+@pytest.mark.parametrize("bad_provider_id", ["has/slash", "has space"])
+def test_resolve_env_gateway_rejects_invalid_provider_id(
+    monkeypatch: pytest.MonkeyPatch, bad_provider_id: str
+) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    monkeypatch.setenv(ENV_GATEWAY_PROVIDER_ID, bad_provider_id)
+    res = resolve_env_gateway()
+    assert res is not None
+    assert res.provider_id == "gateway"
+
+
+def test_resolve_env_gateway_parses_extra_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    monkeypatch.setenv(
+        ENV_GATEWAY_EXTRA_MODELS,
+        "moonshotai/kimi-k3, deepseek/deepseek-v4",
+    )
+    res = resolve_env_gateway()
+    assert res is not None
+    assert res.model_id == "openrouter/z-ai/glm-5.2"
+    assert res.extra_model_ids == ("moonshotai/kimi-k3", "deepseek/deepseek-v4")
+
+
+def test_resolve_env_gateway_extra_models_strip_own_prefix_and_dedupe_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_PROVIDER_ID, "bifrost")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    # One entry re-qualified with our own provider id (as a relaunch would),
+    # and one entry that duplicates the default model — neither should appear
+    # twice / qualified in the result.
+    monkeypatch.setenv(
+        ENV_GATEWAY_EXTRA_MODELS,
+        "bifrost/moonshotai/kimi-k3,openrouter/z-ai/glm-5.2",
+    )
+    res = resolve_env_gateway()
+    assert res is not None
+    assert res.extra_model_ids == ("moonshotai/kimi-k3",)
+
+
+def test_resolve_env_gateway_no_extra_models_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env_gateway_vars(monkeypatch)
+    monkeypatch.setenv(ENV_GATEWAY_BASE_URL, "http://bifrost.internal:4000/v1")
+    monkeypatch.setenv(ENV_GATEWAY_MODEL, "openrouter/z-ai/glm-5.2")
+    res = resolve_env_gateway()
+    assert res is not None
+    assert res.extra_model_ids == ()
+
+
+def test_build_provider_config_lists_extra_models() -> None:
+    res = OpenCodeGatewayResolution(
+        base_url="http://bifrost.internal:4000/v1",
+        api_key="gateway-no-auth",
+        model_id="openrouter/z-ai/glm-5.2",
+        provider_id="bifrost",
+        extra_model_ids=("moonshotai/kimi-k3", "deepseek/deepseek-v4"),
+    )
+    cfg = build_opencode_provider_config(res)
+    models = cfg["provider"]["bifrost"]["models"]
+    assert set(models) == {
+        "openrouter/z-ai/glm-5.2",
+        "moonshotai/kimi-k3",
+        "deepseek/deepseek-v4",
+    }
 
 
 def test_build_mcp_block_stdio_and_http() -> None:
