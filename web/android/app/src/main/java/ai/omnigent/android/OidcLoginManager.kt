@@ -5,9 +5,11 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import androidx.annotation.VisibleForTesting
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -30,19 +32,36 @@ import java.util.concurrent.atomic.AtomicBoolean
  * injects it into the WebView's CookieManager and reloads — authenticated.
  */
 class OidcLoginManager {
-    private val io = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
-    private val inFlight = AtomicBoolean(false)
 
-    // Held only for the duration of a login; nulled by [shutdown] so a poll that
-    // finishes after the host is destroyed can neither invoke into a dead
-    // Activity nor pin it (and its View tree) for the poll's lifetime.
-    @Volatile private var sessionCallback: ((String) -> Unit)? = null
+    // One executor per login flow, so cancel() can shut a flow down (interrupting
+    // its polling sleep) without a stale poll blocking or outliving the next one.
+    // Only touched on the main thread.
+    private var flow: Flow? = null
+
+    // A cancelled flow never delivers, so a poll that finishes after the host is
+    // destroyed — or after a switch to another server — can't invoke into it.
+    private class Flow(
+        val executor: ExecutorService,
+    ) {
+        val cancelled = AtomicBoolean(false)
+    }
+
+    // The flow's two network steps, substitutable so tests can drive a token
+    // through the completion path without a server.
+    @VisibleForTesting
+    internal var requestTicket: (origin: String) -> Ticket? = { httpRequestTicket(it) }
+
+    @VisibleForTesting
+    internal var pollForToken: (origin: String, ticket: String) -> String? = { origin, ticket ->
+        httpPollForToken(origin, ticket)
+    }
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
      * polls in the background; [onSession] is invoked on the main thread with the
-     * session JWT once the browser flow completes.
+     * origin the flow was started for and the session JWT once the browser flow
+     * completes.
      *
      * Returns true if this call started a flow, or false if one was already in
      * flight (a second concurrent call is ignored). The caller uses the result so
@@ -51,11 +70,12 @@ class OidcLoginManager {
     fun start(
         activity: Activity,
         origin: String,
-        onSession: (String) -> Unit,
+        onSession: (origin: String, token: String) -> Unit,
     ): Boolean {
-        if (!inFlight.compareAndSet(false, true)) return false
-        sessionCallback = onSession
-        io.execute {
+        if (flow != null) return false
+        val current = Flow(Executors.newSingleThreadExecutor())
+        flow = current
+        current.executor.execute {
             var token: String? = null
             try {
                 val ticket = requestTicket(origin)
@@ -68,32 +88,48 @@ class OidcLoginManager {
                     )
                 }
             } catch (_: InterruptedException) {
-                // shutdown() interrupted the poll — the host is going away; drop.
+                // cancel() interrupted the poll — this flow is abandoned; drop.
             } catch (t: Throwable) {
                 authLog("login flow error: ${t.javaClass.simpleName}")
             } finally {
-                inFlight.set(false)
+                current.executor.shutdown()
             }
             val result = token
-            // sessionCallback is null once shutdown() ran — never invoke into a
-            // destroyed host.
-            if (result != null) main.post { sessionCallback?.invoke(result) }
+            main.post {
+                // Deliver only for a flow that wasn't cancelled — a cancelled flow's
+                // token belongs to a server the host has switched away from.
+                if (result != null && !current.cancelled.get()) {
+                    onSession(origin, result)
+                }
+                // Free the slot for the next login — unless onSession already
+                // started one (a re-login) or cancel() moved on to another flow.
+                if (flow === current) flow = null
+            }
         }
         return true
     }
 
-    /** Cancel an in-flight login and release the host. Call from onDestroy. */
-    fun shutdown() {
-        sessionCallback = null
-        io.shutdownNow() // interrupts the polling sleep so the task exits promptly
+    /**
+     * Abandon any in-flight login: no callback will fire, and a new [start] is
+     * immediately possible. Safe to call with no flow in flight.
+     */
+    fun cancel() {
+        flow?.let {
+            it.cancelled.set(true)
+            it.executor.shutdownNow() // interrupts the polling sleep so the task exits promptly
+        }
+        flow = null
     }
 
-    private data class Ticket(
+    /** Release the host entirely. Call from onDestroy. */
+    fun shutdown() = cancel()
+
+    internal data class Ticket(
         val id: String,
         val loginUrl: String,
     )
 
-    private fun requestTicket(origin: String): Ticket? {
+    private fun httpRequestTicket(origin: String): Ticket? {
         val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
         conn.requestMethod = "POST"
         // Bodyless POST — set Content-Length explicitly; some servers/WAFs reject
@@ -133,7 +169,7 @@ class OidcLoginManager {
         runCatching { activity.startActivity(intent) }
     }
 
-    private fun pollForToken(
+    private fun httpPollForToken(
         origin: String,
         ticket: String,
     ): String? {
