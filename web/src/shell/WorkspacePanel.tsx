@@ -865,21 +865,23 @@ export function WorkspacePanel({
         {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
             which absorbs the free space before it. When open tabs exist their
             ≥500px flex-1 region absorbs the space instead, so the button still
-            hugs the right. */}
-        <WorkspaceTabTooltip
-          label={maximized ? "Exit full screen" : "Full screen"}
-          className="ml-auto"
-        >
-          <button
-            type="button"
-            aria-label={maximized ? "Exit full screen" : "Full screen"}
-            aria-pressed={maximized}
-            onClick={onToggleMaximized}
-            className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            hugs the right. Hidden when the panel has no meaningful content. */}
+        {(changedCount > 0 || selectedFilePath !== null || selectedTerminalKey !== null) && (
+          <WorkspaceTabTooltip
+            label={maximized ? "Exit full screen" : "Full screen"}
+            className="ml-auto"
           >
-            {maximized ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
-          </button>
-        </WorkspaceTabTooltip>
+            <button
+              type="button"
+              aria-label={maximized ? "Exit full screen" : "Full screen"}
+              aria-pressed={maximized}
+              onClick={onToggleMaximized}
+              className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              {maximized ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
+            </button>
+          </WorkspaceTabTooltip>
+        )}
       </div>
       {/* Tab content — single slot. An open shell tab holds its xterm; a
           file tab holds FileViewer; the Files tab shows FilesPanel; the
