@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent.native_bridge_ids import normalize_bridge_id
+
 _logger = logging.getLogger(__name__)
 
 ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.antigravity_native.bridge_id"
@@ -205,11 +207,13 @@ def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
     """
     Return the bridge directory for a native Antigravity bridge id.
 
-    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
+    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``. A legacy
+        ``conv_``-prefixed id is normalised, so both spellings of a session
+        share one directory.
     :returns: Absolute bridge directory under
         ``~/.omnigent/antigravity-native``.
     """
-    digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(normalize_bridge_id(bridge_id).encode("utf-8")).hexdigest()[:32]
     return _BRIDGE_ROOT / digest
 
 
