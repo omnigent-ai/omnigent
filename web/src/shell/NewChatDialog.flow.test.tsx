@@ -90,6 +90,8 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
 }));
+// No operator-configured claude_profiles → picker hidden; inert here.
+vi.mock("@/hooks/useClaudeProfiles", () => ({ useClaudeProfiles: () => ({ data: [] }) }));
 // The home listing is only consulted when there's no recent; the recent is
 // always set here, so keep this inert (returns no listing).
 vi.mock("@/hooks/useHostFilesystem", () => ({

@@ -290,6 +290,7 @@ from omnigent.server.routes._sessions.helpers import (
     _usage_by_model_for_display,
     _validate_session_workspace,
     _validate_terminal_launch_args,
+    _validated_claude_profile,
     _validated_cost_control_mode_override,
     _validated_harness_override,
     _validated_harness_override_executor_type,
@@ -4867,6 +4868,10 @@ async def _forward_event_to_runner(
     _effective_harness = _routed_harness or conv.harness_override
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
+    # Per-session Claude Code account profile (issue #503) — create-time
+    # only; the persisted override is the source.
+    if conv.claude_profile is not None:
+        runner_body["claude_profile"] = conv.claude_profile
 
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
@@ -7566,6 +7571,13 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    # Per-session Claude Code account profile (issue #503). Validated
+    # against a conservative charset before any row exists; the runner
+    # resolves the name to a config_dir against its local config so
+    # existence is not checked server-side. None defers to the spec's
+    # declared profile, else the CLI's default ~/.claude.
+    claude_profile = _validated_claude_profile(body.claude_profile)
+
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
@@ -7730,6 +7742,7 @@ async def _create_session_from_existing_agent(
         or cost_control_mode_override is not None
         or subagent_routing_override is not None
         or harness_override is not None
+        or claude_profile is not None
     ):
         # ``create_conversation`` has no override params; reuse the
         # PATCH path's store write before the runner reads the snapshot
@@ -7743,6 +7756,7 @@ async def _create_session_from_existing_agent(
             cost_control_mode_override=cost_control_mode_override,
             subagent_routing_override=subagent_routing_override,
             harness_override=harness_override,
+            claude_profile=claude_profile,
         )
         if updated_conv is None:
             raise OmnigentError(
