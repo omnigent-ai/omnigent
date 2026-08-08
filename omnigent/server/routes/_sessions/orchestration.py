@@ -5896,10 +5896,26 @@ async def _relay_runner_stream(
         else:
             # Publish a failed status so the client's SSE stream sees a
             # clean error event instead of silent truncation (#1114).
-            disconnect_error = ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            )
+            # Tunnel loss deregisters first; stream errors with a live
+            # tunnel are not runner disconnect.
+            transport = getattr(runner_client, "_transport", None)
+            registry = getattr(transport, "_registry", None)
+            runner_id = getattr(transport, "_runner_id", None)
+            if (
+                registry is not None
+                and runner_id is not None
+                and registry.get(runner_id) is not None
+            ):
+                code, message = (
+                    "session_stream_lost",
+                    "Session stream lost unexpectedly.",
+                )
+            else:
+                code, message = (
+                    "runner_disconnected",
+                    "Runner disconnected unexpectedly.",
+                )
+            disconnect_error = ErrorDetail(code=code, message=message)
             _publish_status(session_id, "failed", disconnect_error)
             # Persist the disconnect cause as durable labels so the
             # distinction survives into snapshots and child-session
