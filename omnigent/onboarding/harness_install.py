@@ -1034,10 +1034,13 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     if binary is None:
         return False
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
+    # Spawn the resolved path, never the bare name: on Windows an npm-installed
+    # CLI is a ``.CMD`` shim that ``CreateProcess`` can't launch by name, so the
+    # probe would raise ``FileNotFoundError`` and report a signed-in CLI as
+    # needing auth.
     try:
         result = subprocess.run(
-            [argv_binary, *spec.status_args],
+            [binary, *spec.status_args],
             check=False,
             timeout=timeout,
             capture_output=True,
@@ -1087,7 +1090,6 @@ def harness_login(key: str) -> bool:
     binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     if binary is None:
         return False
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     if harness_cli_logged_in(key):
         return True
     try:
@@ -1103,7 +1105,7 @@ def harness_login(key: str) -> bool:
                 tty_fd = os.open("/dev/tty", os.O_RDWR)
             except OSError:
                 tty_fd = None
-        argv = [argv_binary, *spec.login_args]
+        argv = [binary, *spec.login_args]
         try:
             if tty_fd is not None:
                 subprocess.run(

@@ -524,8 +524,8 @@ def test_try_install_prepends_resolved_dir_so_login_can_find_binary(
     """After install, the resolving dir is on ``PATH`` for the later login step.
 
     The install verdict resolves via the full ladder, but the setup wizard's
-    subsequent ``harness_login`` / ``harness_cli_logged_in`` shell out with the
-    bare binary name and only bare ``shutil.which`` (i.e. ``PATH``). If install
+    subsequent ``harness_login`` / ``harness_cli_logged_in`` locate the binary
+    with bare ``shutil.which`` (i.e. ``PATH``) alone. If install
     succeeds via a fallback dir (nvm/homebrew/…) without putting that dir on
     ``PATH``, login would fail to find the binary just installed. Assert the
     install prepends the resolving dir so a bare ``PATH`` lookup then succeeds —
@@ -672,8 +672,8 @@ def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPa
 @pytest.mark.parametrize(
     "key,expected_argv",
     [
-        (ANTHROPIC_FAMILY, ["claude", "auth", "login", "--claudeai"]),
-        (OPENAI_FAMILY, ["codex", "login"]),
+        (ANTHROPIC_FAMILY, ["/usr/bin/claude", "auth", "login", "--claudeai"]),
+        (OPENAI_FAMILY, ["/usr/bin/codex", "login"]),
         (GEMINI_FAMILY, ["/usr/bin/agy"]),
     ],
 )
@@ -898,13 +898,33 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["claude", "auth", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/claude", "auth", "status"]  # the status subcommand
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is expected
+
+
+def test_harness_cli_logged_in_spawns_resolved_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The status probe spawns the resolved path, not the bare binary name.
+
+    On Windows an npm-installed CLI resolves to a ``.CMD`` shim, which
+    ``CreateProcess`` cannot launch by name — spawning ``"claude"`` raises
+    ``FileNotFoundError`` and a signed-in user is reported as needing auth.
+    """
+    shim = r"C:\Users\u\AppData\Roaming\npm\claude.CMD"
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim)
+
+    def _run(argv: list[str], **k: object):
+        assert argv[0] == shim
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
 
 
 @pytest.mark.parametrize(
@@ -925,7 +945,7 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["codex", "login", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/codex", "login", "status"]  # the status subcommand
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -956,7 +976,7 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["cursor-agent", "status", "--format", "json"]
+        assert argv == ["/usr/bin/cursor-agent", "status", "--format", "json"]
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
