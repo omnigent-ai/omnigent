@@ -82,6 +82,7 @@ _ENV_KEY_FAMILY: dict[str, str | None] = {
     "anthropic": ANTHROPIC_FAMILY,
     "openai": OPENAI_FAMILY,
     "openrouter": OPENAI_FAMILY,
+    "edenai": OPENAI_FAMILY,
     "gemini": GEMINI_FAMILY,
 }
 

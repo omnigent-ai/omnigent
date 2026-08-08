@@ -37,6 +37,13 @@ from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_m
             ),
         ),
         (
+            "edenai/mistral/mistral-small-latest",
+            RoutedModel(
+                provider="edenai",
+                model="mistral/mistral-small-latest",
+            ),
+        ),
+        (
             "ollama/llama3",
             RoutedModel(provider="ollama", model="llama3"),
         ),
