@@ -1,4 +1,4 @@
-"""Regression: the turn path must not re-swap an already-swapped child spec.
+"""Regression: a sub-agent turn must not warn when it already holds the child.
 
 Field symptom (polly dispatching a sub-agent): every turn of a healthy child
 session logged
@@ -18,11 +18,19 @@ always misses and the warning fires on a session that resolved perfectly.
 
 The warning matters because it names a real, silent failure mode (a child
 booting as a clone of an orchestrator parent), so firing it on healthy
-sessions makes the genuine case unreadable. The fix skips the swap when the
-spec in hand is already the child (its ``name`` is the sub-agent name) and
-keeps warning when a sub-agent name genuinely does not resolve.
+sessions makes the genuine case unreadable. The turn path therefore still
+looks the sub-agent up unconditionally and still swaps whenever it resolves;
+only the warning is gated, suppressed on a miss where the spec in hand
+already carries the sub-agent's name.
 
-The reported bundle was polly's ``pi`` worker; the defect is in the spec-swap
+Gating the LOOKUP on that same name check would be wrong, which is what the
+third test pins. A root may legally share its sub-agent's name — the
+uniqueness check never compares the root's own name — and
+``_find_spec_by_name`` still resolves the child there, so skipping the lookup
+drops a swap that would have succeeded and boots the child as a parent clone
+with no warning at all.
+
+The reported bundle was polly's ``pi`` worker; the defect is in the warning
 gate and is independent of the child's harness, so these tests use the
 ``claude_code`` / ``claude-native`` child that the rest of the runner suite
 already exercises hermetically.
@@ -188,8 +196,9 @@ async def test_declared_sub_agent_turn_does_not_warn_about_resolution(
 ) -> None:
     """A turn for a DECLARED sub-agent must log no "did not resolve" warning.
 
-    The spec cache already holds the swapped child spec, so the turn must
-    recognise it instead of re-searching it for its own name and warning.
+    The spec cache already holds the swapped child spec, so the turn's lookup
+    finds nothing to swap — a miss that means the child is in hand, not that
+    anything fell back to the parent.
     """
     pm, records = await _prime_spec_cache_then_turn(SUB_AGENT_NAME, caplog)
 
