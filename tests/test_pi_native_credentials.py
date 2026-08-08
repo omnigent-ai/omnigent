@@ -14,6 +14,7 @@ from omnigent import pi_native_credentials as creds
 
 @pytest.fixture(autouse=True)
 def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(creds, "read_ucode_agent_model", lambda profile, agent_name: None)
     monkeypatch.setattr(
         "omnigent.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
@@ -56,6 +57,34 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
     # apiKey is a "!command" so Pi refreshes the gateway token per request.
     assert provider.api_key.startswith("!")
     assert "demo-staging" in provider.api_key
+
+
+def test_databricks_default_uses_ucode_pi_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native Pi uses the model ucode selected for the Databricks profile."""
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _ucode_model(workspace_url: str | None, agent_name: str) -> str:
+        assert workspace_url == "https://wkspc.example.com"
+        assert agent_name == "pi"
+        return "system.ai.claude-opus-4-8"
+
+    monkeypatch.setattr(creds, "read_ucode_agent_model", _ucode_model)
+    monkeypatch.setattr(
+        creds.model_catalog,
+        "resolve_catalog_model",
+        lambda *args, **kwargs: pytest.fail("catalog fallback should not run"),
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-opus-4-8"
 
 
 def test_databricks_unresolvable_host_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -442,6 +471,36 @@ def test_cli_config_databricks_resolves_to_anthropic_gateway(
     assert provider.api_key == (
         "!jq -r .access_token /Users/me/.databricks/model-serving-token.json"
     )
+
+
+def test_cli_config_databricks_uses_ucode_pi_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The omni setup cli-config path uses ucode's Pi model selection."""
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        creds,
+        "_databricks_workspace_url_for_gateway",
+        lambda _base_url: "https://wkspc.example.com",
+    )
+
+    def _ucode_model(workspace_url: str | None, agent_name: str) -> str:
+        assert workspace_url == "https://wkspc.example.com"
+        assert agent_name == "pi"
+        return "system.ai.claude-opus-4-8"
+
+    monkeypatch.setattr(creds, "read_ucode_agent_model", _ucode_model)
+    monkeypatch.setattr(
+        creds.model_catalog,
+        "resolve_catalog_model",
+        lambda *args, **kwargs: pytest.fail("catalog fallback should not run"),
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-opus-4-8"
 
 
 def test_cli_config_databricks_respects_model_override(

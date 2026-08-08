@@ -463,6 +463,46 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
+def test_build_codex_native_server_uses_ucode_agent_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native Codex uses the model ucode selected for the profile."""
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._databricks_gateway_host",
+        lambda _profile: "https://example.cloud.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.read_ucode_agent_model",
+        lambda profile, agent_name: "system.ai.gpt-5",
+    )
+
+    def _unexpected_catalog(*args: object, **kwargs: object) -> object:
+        raise AssertionError("catalog fallback should not run when ucode defines a model")
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.model_catalog.resolve_catalog_model",
+        _unexpected_catalog,
+    )
+
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile="oss",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    assert 'model="system.ai.gpt-5"' in app_server.config_overrides
+
+
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

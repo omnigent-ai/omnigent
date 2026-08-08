@@ -208,6 +208,24 @@ def read_ucode_state(workspace_url: str) -> UcodeWorkspaceState | None:
     )
 
 
+def read_ucode_agent_model(workspace_url: str | None, agent_name: str) -> str | None:
+    """Return ucode's configured model for one workspace and agent.
+
+    :param workspace_url: Databricks workspace URL, e.g.
+        ``"https://example.databricks.com"``.
+    :param agent_name: ucode agent key, e.g. ``"codex"`` or ``"pi"``.
+    :returns: The configured model id, or ``None`` when the workspace state,
+        agent entry, or model is unavailable.
+    """
+    if not workspace_url:
+        return None
+    state = read_ucode_state(workspace_url)
+    if state is None:
+        return None
+    agent = state.agent(agent_name)
+    return agent.model if agent is not None else None
+
+
 def read_current_ucode_state() -> UcodeWorkspaceState | None:
     """Return the current ucode workspace state, or ``None``.
 

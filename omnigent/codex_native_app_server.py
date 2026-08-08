@@ -60,6 +60,7 @@ from omnigent.inner.codex_executor import (
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
+from omnigent.onboarding.ucode_state import read_ucode_agent_model
 
 _logger = logging.getLogger(__name__)
 
@@ -1801,9 +1802,11 @@ def build_codex_native_server(
                 "with a host visible to the runner process."
             )
         host = host.rstrip("/")
+        default_model = read_ucode_agent_model(host, "codex")
         config_overrides.extend(
             _databricks_codex_config_overrides(
                 model=model
+                or default_model
                 or model_catalog.resolve_catalog_model("databricks", family="openai").model_id,
                 base_url=_databricks_codex_base_url(host),
                 auth_command=_databricks_codex_auth_command(host, profile),
