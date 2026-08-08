@@ -6,11 +6,14 @@ import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.TouchDelegate
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -157,7 +160,21 @@ class MainActivity : AppCompatActivity() {
         // Wrap the WebView in a FrameLayout so the floating server-switcher
         // pill can sit on top of it. The pill uses the app's brand palette
         // (values/values-night colors.xml) so it adapts to light/dark mode.
-        val container = FrameLayout(this)
+        //
+        // A plain ViewGroup only consults its own touchDelegate as a last
+        // resort, once every child has already failed to claim the touch —
+        // and the full-bleed WebView underneath the pill claims nearly
+        // every touch itself (it tracks all of them for possible scroll/
+        // zoom), so a delegate installed the ordinary way would never run.
+        // Override dispatch to check it first instead.
+        val container =
+            object : FrameLayout(this) {
+                override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                    val delegate = touchDelegate
+                    if (delegate != null && delegate.onTouchEvent(ev)) return true
+                    return super.dispatchTouchEvent(ev)
+                }
+            }
         container.addView(webView)
         val dp = resources.displayMetrics.density
         switchButton =
@@ -185,6 +202,17 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
+        // The pill's visual size (12sp text + 6dp vertical padding) measures to
+        // roughly 27dp tall, well under Android's 48dp minimum interactive
+        // target — and it's the only entry point to the server-switcher menu.
+        // A TouchDelegate on the parent floors the *touch* target without
+        // changing the pill's appearance, growing downward into the free
+        // space below it (growing upward would push the target into the
+        // status bar). Reinstalled on every layout change so it tracks the
+        // pill as the insets listener repositions it.
+        switchButton.addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
+            container.touchDelegate = switchButtonTouchDelegate(left, top, right, bottom)
+        }
         setContentView(container)
         applySystemBarContrast()
         installBridge()
@@ -451,6 +479,30 @@ class MainActivity : AppCompatActivity() {
                     c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' || c == '-' || c == '_'
                 }
         }
+    }
+
+    /**
+     * Build a [TouchDelegate] that floors the switch button's touch target at
+     * [MIN_TOUCH_TARGET_DP], growing downward from its laid-out bounds.
+     *
+     * @param left the switch button's current laid-out bounds, as reported by
+     *     its [View.OnLayoutChangeListener] — parent-relative (i.e. relative
+     *     to `container`), same as the [TouchDelegate] this builds.
+     * @param top see [left].
+     * @param right see [left].
+     * @param bottom see [left].
+     * @return a delegate to install on the switch button's parent.
+     */
+    private fun switchButtonTouchDelegate(
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int,
+    ): TouchDelegate {
+        val minHeightPx = (MIN_TOUCH_TARGET_DP * resources.displayMetrics.density).toInt()
+        val deficit = minHeightPx - (bottom - top)
+        val expandedBottom = if (deficit > 0) bottom + deficit else bottom
+        return TouchDelegate(Rect(left, top, right, expandedBottom), switchButton)
     }
 
     /**
@@ -780,6 +832,10 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val MAX_LOGIN_ATTEMPTS = 3
+
+        // Android's recommended minimum interactive target — see
+        // https://developer.android.com/guide/topics/ui/accessibility/apps#large-tap-targets
+        const val MIN_TOUCH_TARGET_DP = 48
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it
