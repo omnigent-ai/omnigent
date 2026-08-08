@@ -24,8 +24,10 @@ import {
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  insertItemsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
+  PROJECT_LABEL_KEY,
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
@@ -41,14 +43,25 @@ const DEBOUNCE_MS = 250;
 // drop out the same way they do from the default sidebar list.
 const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
 
+/** Whether a row belongs to a project, whose folder fetches its own list. */
+function isFiled(item: SessionListWireItem): boolean {
+  return item.project_id != null || item.labels?.[PROJECT_LABEL_KEY] != null;
+}
+
 /**
  * Overlay wire items onto every cached `["conversations", ...]` variant.
  *
+ * Ids the cache has never seen are spliced in rather than merged: the frame
+ * carries the same full row the list endpoint returns, so a session created
+ * anywhere (this tab, another tab, the CLI) enters the sidebar on the push
+ * itself instead of waiting on a list round-trip. Only rows the local sort
+ * can place are inserted; the rest fall back to a server reconcile.
+ *
  * @param queryClient - The app QueryClient.
  * @param items - Wire items from a snapshot/changed frame.
- * @returns Ids not found in any cached page and whether any patched row
- *   needs a server refetch to preserve filtered-query membership or sort
- *   order.
+ * @returns Ids that still need a server list reconcile and whether any
+ *   patched row needs a server refetch to preserve filtered-query membership
+ *   or sort order.
  */
 function applyItemsToCache(
   queryClient: QueryClient,
@@ -93,8 +106,32 @@ function applyItemsToCache(
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
   }
+  const missing = [...itemsById.values()].filter((item) => !foundAnywhere.has(item.id));
+  const placed = new Set<string>();
+  // Steady-state snapshot ticks restate rows the cache already holds, so the
+  // common case skips the second pass entirely.
+  if (missing.length > 0) {
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["conversations"],
+    })) {
+      const { data: next, inserted } = insertItemsIntoPages(
+        data,
+        missing,
+        filtersFromConversationQueryKey(key),
+      );
+      for (const id of inserted) placed.add(id);
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+  }
   return {
-    missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
+    // A placed row already renders where the server's sort would put it, so
+    // only ones we couldn't place still need the list. Sub-agent children are
+    // never sidebar rows (the endpoint lists `kind=default`), so a watched
+    // child missing from every page is expected, not a stale list.
+    missingIds: missing
+      .filter((item) => item.parent_session_id == null)
+      .filter((item) => !placed.has(item.id) || isFiled(item))
+      .map((item) => item.id),
     needsRefetch,
   };
 }
@@ -276,10 +313,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             frame.items,
             activeIdRef.current,
           );
-          // A watched id absent from every page is a new session whose sort
-          // position we can't place locally. Membership-affecting deltas
-          // (archive/search/connected filters) and updated_at resorting need
-          // the same server-side reconciliation.
+          // What's left is a row the local splice couldn't place (it sorts onto
+          // an unloaded page, or into a search list only the server can decide)
+          // or one filed into a project, whose folder fetches its own list.
+          // Membership-affecting deltas (archive/search/connected filters) and
+          // updated_at resorting need the same server-side reconciliation.
           //
           // Skip the active session: its updated_at bumps on open before the
           // initial list fetch returns, so it lands in missingIds even though

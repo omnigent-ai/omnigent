@@ -214,3 +214,52 @@ def test_session_created_elsewhere_appears_via_push(
         expect(page.locator(f'a[href="/c/{new_id}"]')).to_be_visible(timeout=20_000)
     finally:
         httpx.delete(f"{base_url}/v1/sessions/{new_id}", timeout=10.0)
+
+
+def test_new_session_row_renders_without_a_list_refetch(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The pushed row itself puts the session in the sidebar — no list GET.
+
+    The discovery frame carries the same full row ``GET /v1/sessions`` would
+    return, so the client places it directly. Treating the push as a mere
+    signal to refetch costs a round-trip the user waits through, and where the
+    list is served by an asynchronously-updated search index the refetch comes
+    back *without* the new session — leaving it invisible for seconds. So the
+    row appearing while zero list requests have fired is the behaviour to hold
+    onto: a regression that went back to invalidating would show a
+    ``/v1/sessions?...`` hit here.
+
+    :param page: Playwright page (default desktop viewport).
+    :param seeded_session: ``(base_url, existing_session_id)`` from the fixture
+        — gives the tab a session to open so the sidebar + stream are live.
+    """
+    base_url, existing_id = seeded_session
+    hits = _count_session_list_requests(page)
+    page.goto(f"{base_url}/c/{existing_id}")
+    expect(page.locator(f'a[href="/c/{existing_id}"]')).to_be_visible()
+    # Let the initial load's fetch flurry settle so the count below covers only
+    # what the create triggers.
+    page.wait_for_timeout(6_000)
+    baseline = len(hits)
+
+    resp = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    new_id = resp.json()["session_id"]
+    try:
+        expect(page.locator(f'a[href="/c/{new_id}"]')).to_be_visible(timeout=20_000)
+        # KEY ASSERTION: the row got there without the client asking the server
+        # for the list again.
+        refetches = hits[baseline:]
+        assert refetches == [], (
+            f"expected the pushed row to render with no list refetch, "
+            f"but saw {len(refetches)}: {refetches}"
+        )
+    finally:
+        httpx.delete(f"{base_url}/v1/sessions/{new_id}", timeout=10.0)

@@ -306,6 +306,55 @@ describe("SessionUpdatesProvider fingerprint pruning", () => {
 });
 
 describe("SessionUpdatesProvider list invalidation", () => {
+  it("splices a newly-created session into the sidebar instead of refetching the list", () => {
+    // The discovery push carries the same full row the list endpoint returns,
+    // so the sidebar can render it immediately. A refetch would cost a
+    // round-trip — and where the list is served by an async search index, it
+    // comes back without the row and the session stays invisible for seconds.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_old"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_new"), updated_at: 5_000 }] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      const list = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(list!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+      expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still reconciles when the new session is filed into a project", () => {
+    // Folders fetch their own ["project-sessions", <name>] list, which the
+    // splice above can't place a row into (it keys off the project's name).
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_old"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_filed"), updated_at: 5_000, project_id: "proj_1" }],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("invalidates the archived-project-names scan on a remote removal", () => {
     // Another client archiving/relabeling/deleting must refresh the Archived
     // view's project picker — only local mutations invalidate it otherwise.
