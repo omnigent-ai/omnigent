@@ -43,6 +43,7 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
@@ -80,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 Available user-facing extras include:
 
 - **Model providers:** `databricks`, `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
+- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `cwsandbox`, `e2b`,
   `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`

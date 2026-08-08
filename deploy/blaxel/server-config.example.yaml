@@ -1,0 +1,12 @@
+sandbox:
+  provider: blaxel
+  server_url: https://omnigent.example.com
+  blaxel:
+    # Optional override for a fixed published tag.
+    # Defaults to the public blaxel/omnigent-host:latest image.
+    # image: blaxel/omnigent-host:TAG
+    env:
+      - OPENAI_API_KEY
+    # region: us-was-1
+    # memory_mb: 4096
+    # ttl: 24h  # default maximum age; set another bounded value if needed
