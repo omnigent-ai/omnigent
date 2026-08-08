@@ -386,8 +386,10 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     type("@");
     fireEvent.click(screen.getByTitle("Attach readme.md"));
     expect(screen.getByText("@readme.md")).toBeInTheDocument();
+    expect(textarea()).toHaveAttribute("data-unpersisted-mentions", "true");
     fireEvent.click(screen.getByLabelText("Remove readme.md"));
     expect(screen.queryByText("@readme.md")).not.toBeInTheDocument();
+    expect(textarea()).not.toHaveAttribute("data-unpersisted-mentions");
   });
 
   it("dedups re-attaching the same file via '@' to a single chip", () => {

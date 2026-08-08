@@ -1,11 +1,11 @@
-"""E2E: Cmd/Ctrl+Arrow switches sessions from the page body, but not the composer.
+"""E2E: Cmd/Ctrl+Arrow traverses from empty, but not drafted, composers.
 
 ``useSessionSwitchHotkey`` (window keydown) steps the sidebar's ordered
 sessions on Cmd/Ctrl+Up/Down. It bails when the keydown target is inside an
-editable field (``textarea``, ``input``, ``[contenteditable="true"]``) so
-typing in the composer keeps its native caret-to-start/end and the user isn't
-yanked to another session mid-edit. The chord still navigates when focus is
-outside an editable field.
+non-empty editable field (``textarea``, ``input``, or
+``[contenteditable="true"]``) so typing in the composer keeps its native
+caret-to-start/end and the user isn't yanked to another session mid-edit. An
+empty focused editable still allows session traversal.
 
 This exercises both halves of that contract through the real chain the unit
 tests mock out: live session list -> sidebar render order -> window keydown
@@ -14,9 +14,9 @@ handler -> client-side navigation to ``/c/{id}``.
 - ``test_ctrl_arrow_does_not_switch_session_from_focused_composer``: focus the
   composer, leave a draft, press Ctrl+Down, and assert the route stays put.
   A regression that drops the editable-field guard would route away here.
-- ``test_ctrl_arrow_still_switches_session_from_body_focus``: blur the
-  composer so the keydown targets the body, press Ctrl+Down, and assert the
-  route leaves the current session — the happy path the guard must preserve.
+- ``test_empty_focused_composer_does_not_block_session_switching``: focus the
+  empty composer once, press Ctrl+Down three times with no intervening focus
+  changes, and assert every press navigates.
 
 No LLM turn is needed — pure client-side keyboard + routing — so this skips the
 nightly/real-agent markers the approval suites carry. Two runner-bound
@@ -26,8 +26,11 @@ sidebar's "Sessions" group, so both are in the hotkey's ordered list.
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 import httpx
 from playwright.sync_api import Page, expect
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 _COMPOSER = "Ask the agent anything…"
 
@@ -40,6 +43,29 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
         timeout=10.0,
     )
     resp.raise_for_status()
+
+
+def _press_down_and_expect_session_change(page: Page) -> None:
+    """Press the traversal chord and require a different session URL."""
+    previous_url = page.url
+    previous_path = urlsplit(previous_url).path
+    assert previous_path.startswith("/c/") and previous_path.count("/") == 2
+
+    page.keyboard.press("ControlOrMeta+ArrowDown")
+    try:
+        page.wait_for_function(
+            """previousPath => {
+                const current = new URL(window.location.href);
+                return current.pathname !== previousPath
+                    && /^\\/c\\/[^/]+$/.test(current.pathname);
+            }""",
+            arg=previous_path,
+            timeout=10_000,
+        )
+    except PlaywrightTimeoutError:
+        raise AssertionError(
+            f"expected a different /c/<id> after session traversal from {previous_url}"
+        ) from None
 
 
 def test_ctrl_arrow_does_not_switch_session_from_focused_composer(
@@ -78,11 +104,11 @@ def test_ctrl_arrow_does_not_switch_session_from_focused_composer(
     expect(page).to_have_url(f"{base_url}/c/{session_a}")
 
 
-def test_ctrl_arrow_still_switches_session_from_body_focus(
+def test_empty_focused_composer_does_not_block_session_switching(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """With focus outside the composer, Ctrl+↓ still steps to a neighbor."""
+    """An empty focused composer must not block repeated Ctrl+↓ traversal."""
     base_url, session_a, session_b = seeded_session_pair
     _set_title(base_url, session_a, "e2e-switch-a")
     _set_title(base_url, session_b, "e2e-switch-b")
@@ -92,22 +118,17 @@ def test_ctrl_arrow_still_switches_session_from_body_focus(
     expect(page.locator(f'a[href="/c/{session_a}"]')).to_be_visible(timeout=30_000)
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible()
 
-    # Move focus off the composer so the editable-field guard doesn't swallow
-    # the chord (the session page autofocuses the composer on load).
-    page.evaluate(
-        "() => { const el = document.activeElement; "
-        "if (el && typeof el.blur === 'function') el.blur(); }"
-    )
+    # Headless Chromium does not retain ChatPage's autofocus after navigation,
+    # so it cannot reproduce the full autofocus interaction chain. Focus the
+    # empty composer once to test the guard invariant directly; the headed
+    # product demo covers the natural flow.
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_have_value("")
+    composer.focus()
 
-    # Dispatch the chord at the body; the keydown bubbles to the window hook,
-    # the guard sees a non-editable target, and we navigate to a neighbor.
-    page.locator("body").press("ControlOrMeta+ArrowDown")
-
-    # Assert we left session_a for another /c/ route. We check "switched away"
-    # rather than a hard-coded target id: the suite shares one server across
-    # tests, so the sidebar may hold sessions beyond this pair — but
-    # navigating at all from body focus is the behavior the guard preserves.
-    expect(page).not_to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
-    assert "/c/" in page.url and session_a not in page.url, (
-        f"expected to switch to another session, still at {page.url}"
-    )
+    # Assert only the traversal invariant. Other sessions may exist in the
+    # sidebar, so seeded sessions are not guaranteed to be adjacent.
+    for _ in range(3):
+        expect(composer).to_have_value("")
+        _press_down_and_expect_session_change(page)
+        expect(composer).to_have_value("")

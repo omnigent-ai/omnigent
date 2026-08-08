@@ -1,6 +1,6 @@
 // Cmd/Ctrl+↓/↑ steps next/prev with wrap; off-list ↓ enters at top, ↑ at
-// bottom; suppressed inside editable fields; ignores Alt/Shift/bare arrows; a
-// no-op step (same id) doesn't navigate.
+// bottom; suppressed inside non-empty editable fields; ignores
+// Alt/Shift/bare arrows; a no-op step (same id) doesn't navigate.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -93,19 +93,72 @@ describe("useSessionSwitchHotkey", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("does not switch while a textarea is focused (composer editing)", () => {
+  it("switches while an empty textarea is focused", () => {
     renderHook(() => useSessionSwitchHotkey(ids, "a"));
     const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    press("ArrowDown", { metaKey: true }, ta);
+    expect(navigate).toHaveBeenCalledWith("/c/b");
+  });
+
+  it("protects unpersisted mentions carried by an empty editable", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    const composer = document.createElement("div");
+    composer.dataset.unpersistedMentions = "true";
+    const ta = document.createElement("textarea");
+    composer.appendChild(ta);
+    document.body.appendChild(composer);
+
+    press("ArrowDown", { metaKey: true }, ta);
+    expect(navigate).not.toHaveBeenCalled();
+
+    delete composer.dataset.unpersistedMentions;
+    press("ArrowDown", { metaKey: true }, ta);
+    expect(navigate).toHaveBeenCalledWith("/c/b");
+  });
+
+  it("does not switch while a textarea contains a draft", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    const ta = document.createElement("textarea");
+    ta.value = "unsent draft";
     document.body.appendChild(ta);
     press("ArrowDown", { metaKey: true }, ta);
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("does not switch while an input is focused", () => {
+  it("switches while an empty input is focused", () => {
     renderHook(() => useSessionSwitchHotkey(ids, "a"));
     const input = document.createElement("input");
     document.body.appendChild(input);
     press("ArrowDown", { metaKey: true }, input);
+    expect(navigate).toHaveBeenCalledWith("/c/b");
+  });
+
+  it("does not switch while an input contains text", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    const input = document.createElement("input");
+    input.value = "query";
+    document.body.appendChild(input);
+    press("ArrowDown", { metaKey: true }, input);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("switches while an empty contenteditable is focused", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    const editor = document.createElement("div");
+    editor.setAttribute("contenteditable", "true");
+    document.body.appendChild(editor);
+    press("ArrowDown", { metaKey: true }, editor);
+    expect(navigate).toHaveBeenCalledWith("/c/b");
+  });
+
+  it("does not switch while a contenteditable contains text", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    const editor = document.createElement("div");
+    editor.setAttribute("contenteditable", "true");
+    editor.textContent = "draft";
+    document.body.appendChild(editor);
+    press("ArrowDown", { metaKey: true }, editor);
     expect(navigate).not.toHaveBeenCalled();
   });
 
