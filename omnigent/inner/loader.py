@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import importlib
-import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeAlias, cast
 
-import yaml
+from omnigent._yaml_compat import SafeLoaderBase, narrow_bools_to_yaml_1_2
+from omnigent._yaml_compat import load as _yaml_load
 
 from .datamodel import (
     AgentDef,
@@ -47,29 +47,21 @@ YamlData: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 DynamicCallable: TypeAlias = Callable[..., object]  # type: ignore[explicit-any]
 
 
-class _OmnigentYamlLoader(yaml.SafeLoader):
+class _OmnigentYamlLoader(SafeLoaderBase):
     """YAML loader with YAML 1.2-style booleans.
 
     PyYAML's default YAML 1.1 resolver treats unquoted keys like ``on`` as a
     boolean. That breaks policy definitions such as ``on: [tool_call]``.
     Keep ``true``/``false`` boolean parsing, but stop treating ``on``/``off``
     and similar legacy literals as booleans.
+
+    The base is libyaml-backed where available (see
+    ``omnigent._yaml_compat``); libyaml's parser calls back into the Python
+    resolver, so the override applies either way.
     """
 
 
-_OmnigentYamlLoader.yaml_implicit_resolvers = {
-    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
-for key, resolvers in list(_OmnigentYamlLoader.yaml_implicit_resolvers.items()):
-    _OmnigentYamlLoader.yaml_implicit_resolvers[key] = [
-        (tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:bool"
-    ]
-# types-PyYAML declares add_implicit_resolver without return annotations.
-_OmnigentYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
-    "tag:yaml.org,2002:bool",
-    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
-    list("tTfF"),
-)
+narrow_bools_to_yaml_1_2(_OmnigentYamlLoader)
 
 
 def load_agent_def(
@@ -105,8 +97,7 @@ def load_agent_def(
     """
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
-        with open(path) as f:
-            data = yaml.load(f, Loader=_OmnigentYamlLoader)
+        data = _yaml_load(path.read_text(), _OmnigentYamlLoader)
         instructions_root: Path | None = path.parent
     else:
         data = path_or_dict
