@@ -89,7 +89,6 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./InlineTerminalsSection", () => ({
   InlineTerminalsSection: () => <div data-testid="inline-terminals-section" />,
 }));
-vi.mock("./TodoPanel", () => ({ TodoPanel: () => <div data-testid="todo-panel" /> }));
 vi.mock("./FilesPanelDrawer", () => ({
   FilesPanelDrawer: () => <div data-testid="files-panel-drawer" />,
 }));

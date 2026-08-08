@@ -5,7 +5,6 @@ import {
   FileIcon,
   InfoIcon,
   ListIcon,
-  ListTodoIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
@@ -51,20 +50,12 @@ interface MobileSessionMenuProps {
   subagentsPanelOpen: boolean;
   /** True while the mobile shells drawer is open. */
   shellsPanelOpen: boolean;
-  /** True while the mobile tasks drawer is open. */
-  todosPanelOpen: boolean;
   /** Hide the Shells entry (claude-native sub-agents only). */
   hideTerminalsTab: boolean;
   /** Whether the Shells entry is available. */
   showShellsTab: boolean;
   /** Number of open terminals (entry badge). */
   terminalsLength: number;
-  /** Whether the session publishes a todo list (gates the Tasks entry). */
-  todosSupported: boolean;
-  /** Completed todo count (Tasks entry badge numerator). */
-  todosCompleted: number;
-  /** Total todo count (Tasks entry badge denominator + visibility). */
-  todosTotal: number;
   /** Debug mode — surfaces the Logs entry. */
   debugMode: boolean;
   /** Changed-file count (Files entry badge). */
@@ -82,8 +73,6 @@ interface MobileSessionMenuProps {
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
-  /** Open the mobile tasks drawer. */
-  onOpenTodos: () => void;
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -131,7 +120,7 @@ interface ChatHeaderProps {
   showFilesPanel: boolean;
   /**
    * Whether the right workspace rail has at least one available tab
-   * (files, terminals, sub-agents, or todos). Gates the desktop
+   * (files, terminals, or sub-agents). Gates the desktop
    * collapse toggle — with no rail content the panel doesn't mount
    * (see AppShell), so a toggle would flip an invisible card.
    */
@@ -421,7 +410,6 @@ export function ChatHeader({
           !mobileMenu.filesPanelOpen &&
           !mobileMenu.subagentsPanelOpen &&
           !mobileMenu.shellsPanelOpen &&
-          !mobileMenu.todosPanelOpen &&
           (hasRailContent || mobileMenu.debugMode) && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -493,18 +481,6 @@ export function ChatHeader({
                         {mobileMenu.terminalsLength}
                       </span>
                     )}
-                  </DropdownMenuItem>
-                )}
-                {mobileMenu.todosSupported && mobileMenu.todosTotal > 0 && (
-                  <DropdownMenuItem
-                    onSelect={mobileMenu.onOpenTodos}
-                    className="gap-2.5 px-2.5 py-2 text-ui"
-                  >
-                    <ListTodoIcon className="size-4" />
-                    Tasks
-                    <span className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}>
-                      {mobileMenu.todosCompleted}/{mobileMenu.todosTotal}
-                    </span>
                   </DropdownMenuItem>
                 )}
                 {mobileMenu.debugMode && (

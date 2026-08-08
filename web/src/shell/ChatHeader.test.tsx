@@ -21,13 +21,9 @@ const mobileMenu = {
   filesPanelOpen: false,
   subagentsPanelOpen: false,
   shellsPanelOpen: false,
-  todosPanelOpen: false,
   hideTerminalsTab: false,
   showShellsTab: false,
   terminalsLength: 0,
-  todosSupported: false,
-  todosCompleted: 0,
-  todosTotal: 0,
   debugMode: false,
   changedCount: 0,
   subagentsWorking: 0,
@@ -35,7 +31,6 @@ const mobileMenu = {
   onOpenFiles: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
-  onOpenTodos: () => {},
   onOpenMainExecutionLog: () => {},
 };
 

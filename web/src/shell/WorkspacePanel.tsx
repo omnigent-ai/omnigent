@@ -4,7 +4,6 @@ import {
   FileIcon,
   FilesIcon,
   GlobeIcon,
-  ListTodoIcon,
   Loader2Icon,
   MaximizeIcon,
   MinimizeIcon,
@@ -38,7 +37,6 @@ import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
-import { TodoPanel } from "./TodoPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 
@@ -256,7 +254,7 @@ function NewTabMenu({
 
 // ---------------------------------------------------------------------------
 // FileTabsStrip — open file tabs rendered in the top rail tab strip, as peers
-// of the fixed Files/Terminals/Agents/Tasks tabs. Each tab is a cell with the
+// of the fixed Files/Terminals/Agents tabs. Each tab is a cell with the
 // file's basename and an "x" close button. Clicking the cell activates the
 // tab (opening its viewer); clicking the x closes it. No own scroll container
 // or flex-1: the parent strip's overflow-x-auto scrolls the whole row.
@@ -537,12 +535,6 @@ interface WorkspacePanelProps {
    * badge denominator) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Whether the session publishes a todo list (gates the Tasks tab). */
-  todosSupported: boolean;
-  /** Number of completed todos (Tasks tab badge numerator). */
-  todosCompleted: number;
-  /** Total todo count (Tasks tab badge denominator + visibility gate). */
-  todosTotal: number;
   /**
    * The "root" session id for the Agents tab — the active session's
    * parent when inside a child, else the active id. May be null while
@@ -600,7 +592,7 @@ interface WorkspacePanelProps {
  * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
  * floating card (bg-card, rounded, bordered, shadowed) sitting below the
  * full-width chat header band. Internally tabbed between Files,
- * Terminals, Agents and Tasks so each can claim the full rail height
+ * Terminals and Agents so each can claim the full rail height
  * instead of competing for a vertically-split slot.
  *
  * Desktop-only (``hidden md:flex``): on mobile the rail's contents are
@@ -625,9 +617,6 @@ export function WorkspacePanel({
   terminalsLength,
   subagentsWorking,
   agentCount,
-  todosSupported,
-  todosCompleted,
-  todosTotal,
   rootSessionId,
   selectedFilePath,
   openFiles,
@@ -700,7 +689,7 @@ export function WorkspacePanel({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Tab strip, in display order Files · Agents · Shells · Tasks.
+      {/* Tab strip, in display order Files · Agents · Shells.
           Files and Agents are always present (the Agents panel lists at
           least the main agent). Shells shows whenever AppShell's gate
           allows it (the agent declares shell access, or a shell already
@@ -777,21 +766,6 @@ export function WorkspacePanel({
                   {terminalsLength > 0 && (
                     <span className="sr-only text-muted-foreground">{terminalsLength}</span>
                   )}
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
-            {todosSupported && todosTotal > 0 && (
-              <WorkspaceTabTooltip label="Tasks">
-                <TabsTrigger
-                  value="todos"
-                  aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
-                  className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
-                >
-                  <ListTodoIcon className="size-4" />
-                  <span className="sr-only">Tasks</span>
-                  <span className="sr-only">
-                    {todosCompleted}/{todosTotal}
-                  </span>
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
@@ -914,8 +888,6 @@ export function WorkspacePanel({
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-        ) : rightRailTab === "todos" && todosSupported ? (
-          <TodoPanel frameless />
         ) : rightRailTab === "terminals" && showShellsTab ? (
           <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalTab} />
         ) : (

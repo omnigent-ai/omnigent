@@ -84,7 +84,6 @@ import {
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
 import { TerminalsPanel } from "./TerminalsPanel";
-import { TodoPanel } from "./TodoPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { CommandPalette } from "./CommandPalette";
@@ -270,7 +269,6 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
-  const [todosPanelOpen, setTodosPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -378,15 +376,11 @@ export function AppShell() {
   const sessionLabels = { ...activeConv?.labels, ...activeSession?.labels };
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
-  const todos = useChatStore((s) => s.todos);
-  // The session.todos contract is harness-agnostic; show Tasks when it has data.
-  const todosSupported = todos.length > 0;
   // Native-CLI wrapper of either family. Keys harness behavior gates
   // (composer slash commands, `/model`); terminal-first SDK sessions
   // (embedded Omnigent REPL terminal) have NO wrapper label and must
   // keep regular chat behavior. See TerminalFirstContext.tsx.
   const isNativeWrapper = isNativeWrapperLabel(sessionLabels["omnigent.wrapper"]);
-  const todosCompleted = todos.filter((t) => t.status === "completed").length;
   // Used for the header "Back to parent" link, which is hidden on
   // top-level sessions. The Subagents tab itself is always visible —
   // it lists the root's children plus a "main" entry, so the user
@@ -550,24 +544,23 @@ export function AppShell() {
         // ``railTerminals`` starts empty while the agent loads, so native
         // sessions don't flash the tab.
         terminals: !hideTerminalsTab && railTerminals.length > 0,
-        todos: todosSupported && todos.length > 0,
       }) as const,
-    [showFilesPanel, hideTerminalsTab, railTerminals.length, todosSupported, todos.length],
+    [showFilesPanel, hideTerminalsTab, railTerminals.length],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
-  // no-filesystem agent with no terminals/sub-agents/todos would otherwise
+  // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
   // Keep the selected tab valid. When the current tab disappears — files
   // panel turns off, or the Shells tab hides (native wrapper / no shell
   // and no shell access) — fall back to the first still-visible tab in
-  // display order (Files · Agents · Shells · Tasks · Browser). Picking the first
+  // display order (Files · Agents · Shells · Browser). Picking the first
   // available (rather than ping-ponging between two effects) keeps this
   // convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "subagents", "terminals", "todos", "browser"] as const).find(
+    const next = (["files", "subagents", "terminals", "browser"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -723,7 +716,6 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
-    setTodosPanelOpen(false);
     setFilesPanelShowHidden(false);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
@@ -791,7 +783,7 @@ export function AppShell() {
       if (wasMaximized) restoreSidebarAfterMaximize();
       return false;
     });
-    // A selected file must be visible in the rail. The Agents/Todos/Terminals
+    // A selected file must be visible in the rail. The Agents/Terminals
     // tabs don't render the inline viewer, so pull the rail to Files.
     if (nextSelected && nextTab !== "files") {
       nextTab = "files";
@@ -901,13 +893,10 @@ export function AppShell() {
       setExecutionLogsKey(null); // close execution-logs panel
       setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
       setSubagentsPanelOpen(false); // close mobile agents drawer
-      setTodosPanelOpen(false); // close mobile tasks drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
-      // won't render (Terminals, Subagents, Todos). The Files tab surfaces the
+      // won't render (Terminals, Subagents). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
-      setRightRailTab((prev) =>
-        prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
-      );
+      setRightRailTab((prev) => (prev === "terminals" || prev === "subagents" ? "files" : prev));
       // Reveal the rail so the viewer is actually visible — a session the user
       // collapsed (or one that started collapsed via the Appearance default)
       // would otherwise route the file into an invisible panel. Persist
@@ -1116,7 +1105,6 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
-    setTodosPanelOpen(false); // close mobile tasks drawer
     setPanelInitialKey(key);
   }
 
@@ -1136,7 +1124,6 @@ export function AppShell() {
       setFilesPanelOpen(false);
       setSubagentsPanelOpen(false);
       setShellsPanelOpen(false);
-      setTodosPanelOpen(false);
       setRightPanelOpen(true);
       if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
     },
@@ -1184,7 +1171,6 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
-    setTodosPanelOpen(false); // close mobile tasks drawer
     setExecutionLogsKey(key);
   }
 
@@ -1198,7 +1184,6 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
-    setTodosPanelOpen(false); // close mobile tasks drawer
     setFilesPanelOpen(true);
   }
 
@@ -1211,7 +1196,6 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
-    setTodosPanelOpen(false); // close mobile tasks drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1225,21 +1209,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
-    setTodosPanelOpen(false); // close mobile tasks drawer
     setShellsPanelOpen(true);
-  }
-
-  // Mobile FAB → "Tasks" opens the todo list (the desktop rail's Tasks tab)
-  // as a full-screen drawer.
-  function openTodosPanel() {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setTodosPanelOpen(true);
   }
 
   function openMainExecutionLog() {
@@ -1472,7 +1442,6 @@ export function AppShell() {
                     filesPanelOpen,
                     subagentsPanelOpen,
                     shellsPanelOpen,
-                    todosPanelOpen,
                     hideTerminalsTab,
                     // Mobile: reachable when a shell exists OR the agent
                     // declares shell access (so the drawer's "+ New shell" row
@@ -1481,9 +1450,6 @@ export function AppShell() {
                     showShellsTab:
                       !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
                     terminalsLength: railTerminals.length,
-                    todosSupported,
-                    todosCompleted,
-                    todosTotal: todos.length,
                     debugMode,
                     changedCount,
                     subagentsWorking,
@@ -1491,7 +1457,6 @@ export function AppShell() {
                     onOpenFiles: openFilesPanel,
                     onOpenShells: openShellsPanel,
                     onOpenSubagents: openSubagentsPanel,
-                    onOpenTodos: openTodosPanel,
                     onOpenMainExecutionLog: openMainExecutionLog,
                   }}
                 />
@@ -1538,9 +1503,6 @@ export function AppShell() {
                     terminalsLength={railTerminals.length}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
-                    todosSupported={todosSupported}
-                    todosCompleted={todosCompleted}
-                    todosTotal={todos.length}
                     rootSessionId={rootSessionId}
                     selectedFilePath={selectedFilePath}
                     openFiles={openFiles}
@@ -1632,16 +1594,6 @@ export function AppShell() {
                     // the "+ New shell" create row.
                     showNewShell
                   />
-                </MobilePanelDrawer>
-              )}
-              {conversationId && (
-                <MobilePanelDrawer
-                  open={todosPanelOpen}
-                  title="Tasks"
-                  onClose={() => setTodosPanelOpen(false)}
-                  testId="todos-panel-drawer"
-                >
-                  <TodoPanel frameless />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
