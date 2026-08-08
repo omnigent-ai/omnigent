@@ -878,7 +878,11 @@ export function WorkspacePanel({
               onClick={onToggleMaximized}
               className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             >
-              {maximized ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
+              {maximized ? (
+                <MinimizeIcon className="size-4" />
+              ) : (
+                <MaximizeIcon className="size-4" />
+              )}
             </button>
           </WorkspaceTabTooltip>
         )}
