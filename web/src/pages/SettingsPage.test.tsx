@@ -459,6 +459,8 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
+    // Timestamps default on, so the tweak turns them OFF.
+    fireEvent.click(screen.getByTestId("show-message-timestamps-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -471,6 +473,7 @@ describe("SettingsPage", () => {
     });
 
     // Sanity: the non-default choices were persisted.
+    expect(localStorage.getItem("omnigent:show-message-timestamps")).toBe("false");
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
@@ -507,6 +510,13 @@ describe("SettingsPage", () => {
       "aria-checked",
       "false",
     );
+
+    // Message timestamps are back on and the override key is cleared.
+    expect(screen.getByTestId("show-message-timestamps-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:show-message-timestamps")).toBeNull();
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

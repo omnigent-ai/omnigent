@@ -1625,6 +1625,54 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
         pending_inputs.reset_for_tests()
 
 
+async def test_input_consumed_carries_created_at(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``session.input.consumed`` carries the persisted item's ``created_at``.
+
+    The web client stamps the live user bubble with this value so a live
+    send and a reloaded session show the same server clock. A ``None`` or
+    missing field silently degrades every live bubble to "no timestamp",
+    so pin both the presence and the equality with the snapshot's stamp.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "stamp me"}],
+                },
+                "response_id": "native_turn_1",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    consumed = [ev for _sid, ev in published if ev.get("type") == "session.input.consumed"]
+    assert len(consumed) == 1, f"expected one consumed event, got {published}"
+    created_at = consumed[0]["data"]["created_at"]
+    assert isinstance(created_at, int) and created_at > 0
+
+    # Same clock the session snapshot serves for this item.
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    items = snap.json()["items"]
+    assert len(items) == 1
+    assert items[0]["created_at"] == created_at
+
+
 @pytest.mark.parametrize(
     "interrupt_text",
     ["[Request interrupted by user]", "[Request interrupted by user for tool use]"],

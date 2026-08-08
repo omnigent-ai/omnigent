@@ -1751,3 +1751,62 @@ describe("BlockStream — naming a turn already in flight", () => {
     expect(blocks.filter((b) => b.type === "reasoning_start")).toHaveLength(1);
   });
 });
+
+describe("BlockStream — message_done createdAtS threading", () => {
+  it("stamps the delta-accumulated text block with the finalizing item's stamp", () => {
+    // The common streaming shape: deltas build the text, message_done
+    // closes it. The closing item's server `created_at` must land on the
+    // resulting text_done block (feeds the bubble timestamp).
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_1" }) },
+      { type: "text_delta", delta: "Hello" },
+      {
+        type: "message_done",
+        content: [],
+        itemId: "msg_item_1",
+        responseId: "resp_1",
+        createdAtS: 1_754_000_000,
+      },
+      { type: "response_completed", response: makeResponse({ responseId: "resp_1" }) },
+    ]);
+    const done = blocks.find((b): b is TextDone => b.type === "text_done");
+    expect(done?.ctx.itemId).toBe("msg_item_1");
+    expect(done?.ctx.createdAtS).toBe(1_754_000_000);
+  });
+
+  it("stamps a message_done that arrives without preceding deltas", () => {
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_1" }) },
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "direct" }],
+        itemId: "msg_item_1",
+        responseId: "resp_1",
+        createdAtS: 1_754_000_000,
+      },
+    ]);
+    const done = blocks.find((b): b is TextDone => b.type === "text_done");
+    expect(done?.fullText).toBe("direct");
+    expect(done?.ctx.createdAtS).toBe(1_754_000_000);
+  });
+
+  it("does not stamp the previous response's text on a response switch", () => {
+    // On a switch, event.createdAtS belongs to the NEW message — the old
+    // text block being closed must not inherit it (mirrors the itemId rule).
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_1" }) },
+      { type: "text_delta", delta: "old turn text" },
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "new turn text" }],
+        itemId: "msg_new",
+        responseId: "resp_2",
+        createdAtS: 1_754_000_000,
+      },
+    ]);
+    const dones = blocks.filter((b): b is TextDone => b.type === "text_done");
+    expect(dones).toHaveLength(2);
+    expect(dones[0]!.ctx.createdAtS).toBeUndefined();
+    expect(dones[1]!.ctx.createdAtS).toBe(1_754_000_000);
+  });
+});

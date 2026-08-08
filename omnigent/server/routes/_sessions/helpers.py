@@ -1522,6 +1522,7 @@ def _publish_input_consumed(
             type=item.type,
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
+            created_at=item.created_at,
             cleared_pending_id=cleared_pending_id,
         ),
     )
@@ -6244,18 +6245,23 @@ async def _relay_persist(
     conversation_store: ConversationStore | None,
     session_id: str,
     item: NewConversationItem,
-) -> None:
+) -> ConversationItem | None:
     """
     Persist a single conversation item from the relay.
 
     :param conversation_store: Store instance, or ``None`` to skip.
     :param session_id: Session/conversation identifier.
     :param item: The item to persist.
+    :returns: The persisted item (carrying the store-assigned id and
+        ``created_at``), or ``None`` when persistence was skipped or
+        failed. The relay patches the live event with the persisted
+        ``created_at`` so streamed items carry the same clock as
+        history.
     """
     if conversation_store is None:
-        return
+        return None
     try:
-        await asyncio.to_thread(
+        persisted = await asyncio.to_thread(
             conversation_store.append,
             session_id,
             [item],
@@ -6265,6 +6271,8 @@ async def _relay_persist(
             "Relay persist failed for session=%s",
             session_id,
         )
+        return None
+    return persisted[0] if persisted else None
 
 
 async def _flush_relay_text(

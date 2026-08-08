@@ -181,3 +181,49 @@ describe("parseEvent — session.mcp_startup", () => {
     ).toBeNull();
   });
 });
+
+describe("parseEvent — created_at threading", () => {
+  it("carries a finalized message item's created_at as createdAtS", () => {
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "msg_1",
+        type: "message",
+        response_id: "resp_1",
+        role: "assistant",
+        content: [{ type: "output_text", text: "hi" }],
+        created_at: 1_754_000_000,
+      },
+    });
+    expect(ev).toMatchObject({ type: "message_done", createdAtS: 1_754_000_000 });
+  });
+
+  it("omits createdAtS when the wire item lacks a usable created_at", () => {
+    // Absent and zeroed stamps both read as "unknown" — a 0 would render
+    // as a 1970 label.
+    for (const created_at of [undefined, 0]) {
+      const ev = parseEvent("response.output_item.done", {
+        item: {
+          id: "msg_1",
+          type: "message",
+          response_id: "resp_1",
+          content: [],
+          ...(created_at !== undefined ? { created_at } : {}),
+        },
+      });
+      expect(ev).not.toBeNull();
+      expect((ev as { createdAtS?: number }).createdAtS).toBeUndefined();
+    }
+  });
+
+  it("session.input.consumed carries created_at as createdAtS", () => {
+    const ev = parseEvent("session.input.consumed", {
+      data: {
+        item_id: "msg_1",
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "hi" }] },
+        created_at: 1_754_000_000,
+      },
+    });
+    expect(ev).toMatchObject({ type: "session_input_consumed", createdAtS: 1_754_000_000 });
+  });
+});

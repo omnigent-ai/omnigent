@@ -675,6 +675,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // created_by is at the payload level (beside item_id/type), not in
     // the nested item data. Keep only a real string so null carries no author.
     const createdBy = p.created_by;
+    const createdAt = p.created_at;
     const clearedPendingId = p.cleared_pending_id;
     return {
       type: "session_input_consumed",
@@ -682,6 +683,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       itemType,
       isMeta: payload.is_meta === true,
       ...(typeof createdBy === "string" ? { createdBy } : {}),
+      ...(typeof createdAt === "number" && createdAt > 0 ? { createdAtS: createdAt } : {}),
       data: payload,
       clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
     } satisfies SessionInputConsumedEvent;
@@ -1015,9 +1017,13 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   if (itemType === "message") {
     if (rec.is_meta === true) return null;
     const content = rec.content;
+    const createdAt = rec.created_at;
     return {
       type: "message_done",
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
+      // Keep only a positive epoch stamp so a missing/zeroed field carries
+      // no timestamp (mirrors itemsToBlocks' history-hydration guard).
+      ...(typeof createdAt === "number" && createdAt > 0 ? { createdAtS: createdAt } : {}),
       itemId,
       responseId,
     } satisfies MessageDone;
