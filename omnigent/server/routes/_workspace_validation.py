@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ntpath
+import posixpath
 import secrets
 from typing import Any
 
@@ -33,6 +35,29 @@ from omnigent.host.frames import HostStatFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
 _logger = logging.getLogger(__name__)
+
+#: Error message for a workspace that isn't an absolute host path.
+#: Names both path shapes so the caller knows what's accepted.
+WORKSPACE_NOT_ABSOLUTE_MSG = (
+    "workspace must be an absolute path (e.g. '/home/user/project' or 'C:\\project')"
+)
+
+
+def is_absolute_host_path(workspace: str) -> bool:
+    """
+    Report whether ``workspace`` is absolute on the *host's* OS.
+
+    The server and the connected host can run different operating
+    systems (e.g. a Linux server managing a Windows host), so the
+    server's own ``os.path.isabs`` rules don't apply. Accept a path
+    that is absolute under either POSIX (``/home/user``) or Windows
+    (``C:\\project``, ``\\\\unc\\share``) semantics.
+
+    :param workspace: User-supplied workspace path.
+    :returns: ``True`` if absolute on either platform.
+    """
+    return posixpath.isabs(workspace) or ntpath.isabs(workspace)
+
 
 # Treat these spec cwd values as "relative" — the agent doesn't pin
 # a specific directory and the workspace is unconstrained.
@@ -214,11 +239,11 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
-    if not workspace.startswith("/"):
-        # Belt-and-suspenders. The Pydantic schema layer also
+    if not is_absolute_host_path(workspace):
+        # Belt-and-suspenders. The route/schema layer also
         # rejects this; pin it here so direct callers (tests,
         # other server-internal paths) can't bypass.
-        raise WorkspaceValidationError("workspace must be an absolute path starting with /")
+        raise WorkspaceValidationError(WORKSPACE_NOT_ABSOLUTE_MSG)
 
     display_host = host_name_for_errors or host_id
 
