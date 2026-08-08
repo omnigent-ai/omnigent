@@ -384,6 +384,18 @@ def register_core_routes(
                 parse_repo_workspace,
             )
 
+            # Like the repo parse below: reject an unconfigured provider on
+            # the POST rather than in the background launch.
+            if (
+                body.sandbox_provider is not None
+                and sandbox_config.for_provider(body.sandbox_provider) is None
+            ):
+                offered = ", ".join(sandbox_config.launchable_providers()) or "none"
+                raise OmnigentError(
+                    f"sandbox provider '{body.sandbox_provider}' is not configured "
+                    f"on this server — available: {offered}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             # A managed workspace is a repository URL (schema-
             # validated) the launch clones inside the sandbox; parse
             # it now so a malformed URL is a synchronous 4xx, not a
@@ -419,6 +431,7 @@ def register_core_routes(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    provider=body.sandbox_provider,
                     agent_store=agent_store,
                     agent_id=conv.agent_id if conv is not None else None,
                 )

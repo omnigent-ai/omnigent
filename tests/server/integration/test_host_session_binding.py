@@ -31,6 +31,7 @@ from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
+    ManagedSandboxDeployment,
     parse_sandbox_config,
 )
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -584,6 +585,25 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     assert "takes a git repository URL" in detail[0]["msg"]
 
 
+async def test_managed_session_create_rejects_unconfigured_provider(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    A create naming a provider the server doesn't offer is a synchronous
+    400 (validated at POST, before the background launch), and the error
+    names what IS available so the user can correct it. This env offers
+    only modal, so 'nope' is rejected with modal listed.
+    """
+    agent = await create_test_agent(managed_session_env.client, name="managed-bad-provider-agent")
+    resp = await managed_session_env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed", "sandbox_provider": "nope"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "nope" in resp.text
+    assert "modal" in resp.text
+
+
 async def test_managed_session_create_without_config_fails_clearly(
     runtime_init: None,
     db_uri: str,
@@ -1086,11 +1106,13 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     )
     fake = FakeSandboxLauncher(can_resume=True)
     fake.provider = "islo"  # type: ignore[misc]
-    config = ManagedSandboxConfig(
-        server_url="https://managed-test.example.com",
-        launcher_factory=lambda: fake,
-        token_ttl_s=3600,
-        provider="islo",
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="islo",
+        )
     )
     tracker = ManagedLaunchTracker()
     calls: list[str] = []
@@ -1158,11 +1180,13 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     fake = FakeSandboxLauncher(can_resume=True)
     fake.provider = "islo"  # type: ignore[misc]
     fake.is_running = lambda _sandbox_id: False  # type: ignore[method-assign]
-    config = ManagedSandboxConfig(
-        server_url="https://managed-test.example.com",
-        launcher_factory=lambda: fake,
-        token_ttl_s=3600,
-        provider="islo",
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="islo",
+        )
     )
     tracker = ManagedLaunchTracker()
     calls: list[str] = []
@@ -1255,10 +1279,12 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     await sessions_module._run_managed_wake(
         session_id=session_id,
         conv=conv,  # type: ignore[arg-type]
-        sandbox_config=ManagedSandboxConfig(
-            server_url="https://managed-test.example.com",
-            launcher_factory=lambda: FakeSandboxLauncher(),
-            token_ttl_s=3600,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: FakeSandboxLauncher(),
+                token_ttl_s=3600,
+            )
         ),
         tracker=tracker,
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
@@ -1310,10 +1336,12 @@ async def test_managed_launch_fails_when_runner_never_connects(
             host_id="3c8cdcdb61903904849174c864620a5c",
             workspace="/root/workspace",
         ),
-        sandbox_config=ManagedSandboxConfig(
-            server_url="https://managed-test.example.com",
-            launcher_factory=lambda: FakeSandboxLauncher(),
-            token_ttl_s=3600,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: FakeSandboxLauncher(),
+                token_ttl_s=3600,
+            )
         ),
         tracker=tracker,
         conversation_store=SimpleNamespace(
