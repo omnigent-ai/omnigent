@@ -40,10 +40,17 @@ When omnigent runs on Databricks with the four integration points
 wired:
 
 - **Single trace per agent turn.** Every span the agent emits lands
-  in MLflow Tracing in Unity Catalog with the standard OpenTelemetry
-  GenAI semantic-convention attributes (`gen_ai.operation.name`,
-  `gen_ai.agent.name`, `gen_ai.provider.name`, `gen_ai.request.model`,
-  `tool.name`). Searchable, filterable, retained per UC governance.
+  in MLflow Tracing in Unity Catalog with OpenInference span-kind
+  attributes (`openinference.span.kind=AGENT|LLM|TOOL|GUARDRAIL`),
+  `agent.name`, `tool.name`, `llm.model_name`, and `input.value` /
+  `output.value` for prompts and responses. The agent span carries
+  `gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens`
+  (aggregate per turn) when the executor reports usage on
+  `TurnComplete`. The full GenAI Agent
+  Spans semconv set (`gen_ai.operation.name`, `gen_ai.agent.name`,
+  `gen_ai.provider.name`, `gen_ai.request.model`) lands via
+  [PR #1050](https://github.com/omnigent-ai/omnigent/pull/1050).
+  Searchable, filterable, retained per UC governance.
 - **Per-key LLM cost and audit.** Every LLM call (whether to
   Mosaic AI Foundation Models, OpenAI, Anthropic, or a custom
   endpoint) flows through Mosaic AI Gateway. Per-key cost tracking,
@@ -77,6 +84,11 @@ Gateway, which proxies to either Mosaic AI Foundation Models or an
 external provider (OpenAI, Anthropic) configured as an External Model.
 
 ![omnigent on Databricks architecture](images/databricks/architecture.png)
+
+> The diagrams in this guide (`architecture.png`, `trace-flow.png`)
+> render the target trace shape after PRs #1050 and #1070 land. The
+> attribute names visible in the diagram (`gen_ai.*`) match the post-
+> PR shape, not what `main` emits today.
 
 The boundary stays sharp. omnigent itself remains a standalone Apache
 2.0 Python package. Each integration point is an env var or a config
@@ -507,12 +519,30 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=$DATABRICKS_HOST
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $DATABRICKS_TOKEN"
 ```
 
-omnigent's `telemetry.init()` auto-detects the OTLP endpoint and wires
-up the MLflow OTel exporter. No code changes in the agent.
+omnigent's `telemetry.init()` installs a standard OpenTelemetry
+`TracerProvider` and `BatchSpanProcessor` against the OTLP endpoint.
+The MLflow Tracing OTLP receiver on the Databricks workspace side
+accepts those spans into UC. No code changes in the agent.
 
 ### What the trace looks like
 
-For a single agent turn that calls one tool and one LLM:
+> **Status (2026-06-29):** the trace shape below describes the
+> direction the OTel observability series is heading. On `main` today,
+> the agent, llm, tool, and guardrail spans land with OpenInference
+> attribute names (`openinference.span.kind`, `agent.name`,
+> `tool.name`,
+> `llm.model_name`, `input.value`, `output.value`). The `gen_ai.*`
+> semconv attribute names ship via
+> [PR #1050](https://github.com/omnigent-ai/omnigent/pull/1050). Cross-process
+> correlation of subprocess-emitted LLM spans under the omnigent
+> agent span ships via
+> [PR #1070](https://github.com/omnigent-ai/omnigent/pull/1070) (design
+> in flight). Until both land, expect one agent span per turn with
+> tool spans nested under it, and LLM-call spans landing as separate
+> traces from the executor SDK subprocess.
+
+For a single agent turn that calls one tool and one LLM (target shape
+after PRs #1050 and #1070 land):
 
 ```
 [agent:debby]                         (root span)
@@ -520,10 +550,8 @@ For a single agent turn that calls one tool and one LLM:
   gen_ai.agent.name     = debby
   gen_ai.provider.name  = databricks
   gen_ai.request.model  = databricks-claude-sonnet-4
-  session.id            = conv_e4f5a6b7c8d9e0f1
-  task.id               = resp_d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3
 
-[llm_call]                            (child span)
+[llm_call]                            (child span, emitted by SDK subprocess)
   gen_ai.operation.name              = chat
   gen_ai.provider.name               = databricks
   gen_ai.request.model               = databricks-claude-sonnet-4
@@ -533,18 +561,21 @@ For a single agent turn that calls one tool and one LLM:
 [tool:calculator]                     (child span)
   gen_ai.operation.name = execute_tool
   tool.name             = calculator
-  tool.call_id          = call_abc123
 ```
 
 The trace ID is the hex suffix of the response ID, so you can search
 for a specific request in MLflow by stripping the `resp_` prefix.
 
-### Verified end-to-end
+### Verified end-to-end (synthetic)
 
-Emitted a synthetic trace from a local Python script (using the same
-`mlflow.start_span` API omnigent's `TracingContext` wraps) against the
-e2-dogfood Databricks workspace's MLflow OTLP receiver. Verified the
-trace landed in UC and the spans carry the expected attributes:
+Emitted a synthetic trace from a local Python script against the
+e2-dogfood Databricks workspace's MLflow OTLP receiver. The script
+called `mlflow.start_span` directly and set the `gen_ai.*` attributes
+manually, as a stand-in for what PR #1050 will emit. This
+verifies the OTLP receiver path and the UC trace store work
+end-to-end. It does **not** verify that omnigent's `TracingContext`
+emits those attribute names on `main` today. That ships via
+PR #1050.
 
 ```
 Tracking URI: databricks
@@ -576,15 +607,25 @@ expanded:
 
 ### Content capture and privacy
 
-omnigent does not capture message bodies into traces by default. Set:
+The content-capture gate (`OMNIGENT_OTEL_CAPTURE_CONTENT`) is the
+default-off control for whether user messages, tool arguments, and
+tool results land on spans. On `main` today, the gate is in
+`omnigent.runtime.telemetry.should_capture_content()` and is consulted
+by some emission sites (LLM retry events, for example) but not yet by
+the `TracingContext` span starters that set `input.value` /
+`output.value`. PR #1050 wires the gate through every emission point
+so the default flips to "no content unless opted in".
+
+Today on `main`, content lands on traces unconditionally. After PR
+#1050:
 
 ```bash
 export OMNIGENT_OTEL_CAPTURE_CONTENT=true
 ```
 
-to include user messages and tool arguments in `mlflow.spanInputs` /
-`mlflow.spanOutputs`. Leave unset for production unless you have
-explicit consent and PII handling in place.
+to include user messages and tool arguments. Leave unset for
+production unless you have explicit consent and PII handling in
+place.
 
 ### What you get on Databricks vs DIY OTel collector
 
@@ -607,7 +648,7 @@ explicit consent and PII handling in place.
 | `DATABRICKS_TOKEN` | Personal access token or service principal token | Apps env (Workspace Secret) or local shell |
 | `OPENAI_BASE_URL` | LLM provider endpoint, points at Foundation Models or AI Gateway | Apps env or harness spawn-env |
 | `OPENAI_API_KEY` | Auth for the above endpoint | Apps env or harness spawn-env |
-| `MLFLOW_TRACKING_URI` | Set to `databricks` for workspace-hosted MLflow | Apps env |
+| `MLFLOW_TRACKING_URI` | Set to `databricks` if the agent code calls MLflow APIs (`mlflow.search_traces`, etc.); consumed by the MLflow client SDK, not by the omnigent server itself | Apps env |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | Set to `http/protobuf` for the MLflow OTLP receiver | Apps env |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Workspace URL (same as `DATABRICKS_HOST`) | Apps env |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Bearer $DATABRICKS_TOKEN` | Apps env |
