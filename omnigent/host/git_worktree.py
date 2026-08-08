@@ -262,6 +262,34 @@ def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     )
 
 
+def _branch_checked_out_worktree(repo_root: str, branch_name: str) -> str | None:
+    """Return the worktree path where ``branch_name`` is checked out, or ``None``.
+
+    Parses ``git worktree list --porcelain`` directly against *repo_root*
+    (which is already the main work tree) to avoid the redundant
+    ``_main_work_tree`` resolution that :func:`list_worktrees` performs.
+
+    :param repo_root: Absolute repo work-tree root.
+    :param branch_name: Branch name to look up, e.g. ``"feature/login"``.
+    :returns: Worktree path string if the branch is checked out somewhere,
+        ``None`` otherwise.
+    """
+    result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
+    if result.returncode != 0:
+        raise _git_error("git worktree list failed", result)
+    ref_suffix = f"refs/heads/{branch_name}"
+    path: str | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree ") :].strip()
+        elif line.startswith("branch ") and path is not None:
+            if line[len("branch ") :].strip() == ref_suffix:
+                return path
+        elif line == "":
+            path = None
+    return None
+
+
 def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
     """Compute a collision-free sibling worktree directory path.
 
@@ -352,22 +380,25 @@ def create_worktree(
     branch_name: str,
     base_branch: str | None = None,
 ) -> CreatedWorktree:
-    """Create a git worktree with a new branch checked out.
+    """Create a git worktree, reusing an existing branch when possible.
 
-    Resolves the repo root, picks a collision-free sibling directory,
-    and runs ``git worktree add -b`` (fetching once if ``base_branch``
-    isn't locally resolvable).
+    If ``branch_name`` already exists and is not checked out in another
+    worktree, the branch is reused as-is (``base_branch`` is ignored).
+    Otherwise a new branch is created with ``git worktree add -b``
+    (fetching once if ``base_branch`` isn't locally resolvable).
 
     :param repo_path: Absolute path inside the source repo — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
-    :param branch_name: New branch to create and check out, e.g.
-        ``"feature/login"``.
-    :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
-        branches from the repo's current ``HEAD``.
+    :param branch_name: Branch to check out. Created if it does not
+        exist; reused if it exists and is not checked out elsewhere.
+    :param base_branch: Optional base ref for new branches, e.g.
+        ``"main"``. ``None`` branches from the repo's current ``HEAD``.
+        Ignored when reusing an existing branch.
     :returns: The created worktree's path and branch.
     :raises WorktreeError: If the branch name is invalid, the path is
-        not a git repo, the base ref can't be resolved, or
-        ``git worktree add`` fails (e.g. the branch already exists).
+        not a git repo, the base ref can't be resolved, the branch is
+        already checked out in another worktree, or
+        ``git worktree add`` fails.
     """
     validate_branch_name(branch_name)
     # Always create the worktree off the MAIN work tree, even when
@@ -377,23 +408,33 @@ def create_worktree(
     # (``…/feature-worktrees/<branch>``); resolving to the main repo keeps
     # all worktrees as siblings (``…/myrepo-worktrees/<branch>``).
     repo_root = _main_work_tree(repo_path)
-    # Friendly pre-check before git's raw "branch already exists" error.
-    # We don't reuse the existing worktree: two sessions sharing one
-    # working tree would clobber each other (designs/SESSION_GIT_WORKTREE.md).
-    if _local_branch_exists(repo_root, branch_name):
-        raise WorktreeError(
-            f"a branch named {branch_name!r} already exists; choose a different branch name"
-        )
-    if base_branch is not None:
+
+    branch_exists = _local_branch_exists(repo_root, branch_name)
+    if branch_exists:
+        # The branch exists — reuse is safe only when no worktree has it
+        # checked out; two sessions sharing one working tree would clobber
+        # each other.
+        checked_out_in = _branch_checked_out_worktree(repo_root, branch_name)
+        if checked_out_in is not None:
+            raise WorktreeError(
+                f"branch {branch_name!r} is already checked out in {checked_out_in}; "
+                f"choose a different branch name"
+            )
+
+    if base_branch is not None and not branch_exists:
         _ensure_base_resolvable(repo_root, base_branch)
     worktree_path = _resolve_worktree_path(repo_root, branch_name)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
-    add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
-    if base_branch is not None:
-        # --end-of-options: treat base_branch as a rev, never a git flag, so a
-        # user-supplied value starting with '-' can't inject an option.
-        add_args += ["--end-of-options", base_branch]
+    if branch_exists:
+        # Reuse the existing branch — no -b flag.
+        add_args = ["worktree", "add", str(worktree_path), f"refs/heads/{branch_name}"]
+    else:
+        add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
+        if base_branch is not None:
+            # --end-of-options: treat base_branch as a rev, never a git flag,
+            # so a user-supplied value starting with '-' can't inject an option.
+            add_args += ["--end-of-options", base_branch]
     result = _run_git(add_args, cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)
