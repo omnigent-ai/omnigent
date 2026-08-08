@@ -308,6 +308,11 @@ class SessionResourceRegistry:
         # which the turn-start hook also writes — deduping against that one
         # would swallow the turn's real ``running``.
         self._published_session_status: dict[str, tuple[str, str | None]] = {}
+        # Live claude-native status-file pollers, per session. Held so a
+        # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
+        # poller keeps its own edge/mtime baselines on the watcher thread, and
+        # clearing the registry's baseline alone would leave those intact.
+        self._status_pollers: dict[str, SessionStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
         # lifecycle relationship so the runner can decide whether the owning
@@ -398,6 +403,7 @@ class SessionResourceRegistry:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
             self._published_session_status.pop(session_id, None)
+            self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
 
     def _claim_status_edge(self, session_id: str, status: str, blocked_on: str | None) -> bool:
@@ -422,6 +428,42 @@ class SessionResourceRegistry:
         """Adopt an externally-published *status* as the dedup baseline."""
         with self._lock:
             self._published_session_status[session_id] = (status, None)
+
+    def resync_session_statuses(self) -> None:
+        """Re-arm every status source so it republishes what it already sent.
+
+        Called after the runner's tunnel reconnects. A server recycle (deploy,
+        crash, replica failover) restarts the *listener*, wiping its in-memory
+        status cache — but this runner keeps running, so every dedup baseline
+        still asserts the pre-restart edge was delivered. Nothing re-asserts on
+        its own: Claude's status file is written only when its value *changes*,
+        and the pane watcher's edges are coalesced, so a session mid-turn during
+        the restart would sit on a stale ``idle`` until its next turn boundary —
+        no spinner, no stop button, for the rest of the turn.
+
+        Dropping the published-edge baselines here makes the next poll publish
+        the current status verbatim. The claude-native pollers are re-armed too:
+        they hold their own edge/mtime baselines on the watcher thread, so
+        clearing only this side would leave them silent.
+
+        Deliberately does NOT clear ``_last_session_status`` — that memo
+        classifies terminal exits (clean vs mid-turn crash) and is unrelated to
+        what the server has heard.
+        """
+        with self._lock:
+            sessions = sorted(self._published_session_status)
+            self._published_session_status.clear()
+            pollers = list(self._status_pollers.values())
+        for poller in pollers:
+            poller.resync()
+        if sessions or pollers:
+            _logger.info(
+                "Re-arming session status after tunnel reconnect: "
+                "cleared_edges=%d pollers=%d sessions=%s",
+                len(sessions),
+                len(pollers),
+                sessions,
+            )
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
@@ -1118,6 +1160,9 @@ class SessionResourceRegistry:
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
         )
+        if status_poller is not None:
+            with self._lock:
+                self._status_pollers[session_id] = status_poller
 
         def _on_activity() -> None:
             # Runs on the watcher daemon thread; hop to the loop so the
@@ -1435,6 +1480,10 @@ class SessionResourceRegistry:
                 moved_status = self._last_session_status.pop(source_session_id, None)
                 if moved_status is not None and target_session_id not in self._last_session_status:
                     self._last_session_status[target_session_id] = moved_status
+                # The watcher restart below rebuilds the poller under the
+                # target, so drop the source's entry rather than leaving a
+                # retired poller to be re-armed on every later reconnect.
+                self._status_pollers.pop(source_session_id, None)
             try:
                 await entry.instance.set_conversation_link(
                     self._terminal_registry.conversation_link_for_id(target_session_id)
