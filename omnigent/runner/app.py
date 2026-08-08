@@ -5513,6 +5513,7 @@ def create_runner_app(
                     harness_override=cast(str | None, body.get("harness_override")),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
+                    claude_profile=body.get("claude_profile"),
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
@@ -8762,6 +8763,7 @@ async def _resolve_harness_config(
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
+    claude_profile: str | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -8783,6 +8785,11 @@ async def _resolve_harness_config(
         :func:`_find_spec_by_name` before harness derivation. ``None`` for
         top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
+    :param claude_profile: Per-session Claude Code account profile name
+        (issue #503), forwarded by the server in the message body. The
+        runner resolves it to a config_dir and injects it as
+        ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` so the claude-sdk harness runs
+        the Claude CLI under an isolated ``CLAUDE_CONFIG_DIR``.
     :returns: ``(harness, spawn_env)``; a default for unresolved specs.
     """
     if agent_id and spec_resolver:
@@ -8812,6 +8819,7 @@ async def _resolve_harness_config(
                 workdir=workdir,
                 model_override=model_override,
                 session_id=session_id,
+                claude_profile=claude_profile,
             )
             return harness, spawn_env
 
@@ -8914,6 +8922,7 @@ def _build_spawn_env_from_spec(
     workdir: Path | None = None,
     model_override: str | None = None,
     session_id: str | None = None,
+    claude_profile: str | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -8931,6 +8940,16 @@ def _build_spawn_env_from_spec(
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
         env var here.)
+    :param claude_profile: Per-session Claude Code account profile name
+        (issue #503), e.g. ``"work"``, or ``None``. When set on a
+        ``claude-sdk`` harness, the runner resolves the name to a
+        ``config_dir`` against its local ``~/.omnigent/config.yaml``
+        ``claude_profiles:`` block and overrides
+        ``HARNESS_CLAUDE_SDK_CONFIG_DIR`` so the override takes
+        precedence over the spec's declared profile. The executor
+        injects it as ``CLAUDE_CONFIG_DIR`` on the spawned Claude CLI
+        subprocess, isolating credentials/settings/session state per
+        profile.
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
@@ -9035,6 +9054,36 @@ def _build_spawn_env_from_spec(
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override
+
+    # Per-session Claude Code account profile (issue #503) — create-time
+    # override that takes precedence over the spec's declared profile
+    # (which ``_build_claude_sdk_spawn_env`` already baked into
+    # ``HARNESS_CLAUDE_SDK_CONFIG_DIR``). The runner resolves the name to a
+    # config_dir against its local ``~/.omnigent/config.yaml``
+    # ``claude_profiles:`` block; the executor injects it as
+    # ``CLAUDE_CONFIG_DIR`` on the spawned Claude CLI subprocess. Only
+    # meaningful for the claude-sdk harness (native CLIs get their config dir
+    # via the bridge path, not this spawn env).
+    if claude_profile and harness == "claude-sdk":
+        from omnigent.onboarding.claude_profiles import (
+            resolve_claude_profile_config_dir,
+        )
+
+        config_dir = resolve_claude_profile_config_dir(claude_profile)
+        if config_dir is not None:
+            env["HARNESS_CLAUDE_SDK_CONFIG_DIR"] = config_dir
+        else:
+            # Unknown per-session profile name: the operator typed/picked a
+            # name that isn't in this runner's ``claude_profiles:`` block.
+            # Silently falling back to the spec's dir (or ``~/.claude``) would
+            # hide a misconfiguration — log it so the wrong-account session is
+            # traceable. The env var is left untouched (keeps the spec value,
+            # or unset → CLI default).
+            _logger.warning(
+                "claude_profile %r not found in runner claude_profiles "
+                "config; leaving CLAUDE_CONFIG_DIR at its prior default",
+                claude_profile,
+            )
 
     # Routing visibility: log the resolved gateway target so operators can
     # confirm which provider a turn actually hits (api.anthropic.com /

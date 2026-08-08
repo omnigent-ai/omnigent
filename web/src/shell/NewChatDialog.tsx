@@ -153,6 +153,7 @@ import {
   prefetchAvailableAgentDetails,
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
+import { useClaudeProfiles, type ClaudeProfile } from "@/hooks/useClaudeProfiles";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
@@ -1344,6 +1345,12 @@ export function AgentHarnessPicker({
  * Cancel / dismiss discards. This is the deliberate Save/Cancel UX (the old
  * in-dropdown submenu committed on every change).
  */
+// Select sentinel for "no claude_profile" — Radix Select can't hold an empty
+// string value, and null means "send no per-session override", leaving the
+// runner on whatever login it is already configured for. Reserved server-side
+// so an operator can't declare a real profile the picker could never select.
+const CLAUDE_PROFILE_SELECT_DEFAULT = "__default__";
+
 function HarnessConfigModal({
   open,
   onOpenChange,
@@ -1363,6 +1370,9 @@ function HarnessConfigModal({
   codexModelsLoading,
   pickedEffort,
   pickedHarness,
+  claudeProfiles,
+  pickedProfile,
+  setPickedProfile,
   costControlMode,
   setPermissionMode,
   setApprovalMode,
@@ -1391,6 +1401,9 @@ function HarnessConfigModal({
   codexModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
+  claudeProfiles: ClaudeProfile[];
+  pickedProfile: string | null;
+  setPickedProfile: (profile: string | null) => void;
   costControlMode: CostControlMode;
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
@@ -1423,6 +1436,7 @@ function HarnessConfigModal({
   const [draftCursor, setDraftCursor] = useState(cursorExecMode);
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
+  const [draftProfile, setDraftProfile] = useState<string | null>(pickedProfile);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
 
   useEffect(() => {
@@ -1434,6 +1448,7 @@ function HarnessConfigModal({
     setDraftCursor(cursorExecMode);
     setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
+    setDraftProfile(pickedProfile);
     setDraftRouting(costControlMode);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1522,6 +1537,10 @@ function HarnessConfigModal({
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
     }
+    // The Claude account profile only applies to the claude-sdk harness, so
+    // clear it whenever the picker isn't showing — otherwise switching the
+    // harness would leave a stale pick that still rides along on create.
+    setPickedProfile(showProfiles ? draftProfile : null);
     // Smart Routing rides the Model dropdown on both routable harnesses
     // (Claude Code and Codex), so commit it outside the per-capability branches.
     // Remembered per harness like the model pick, so the next new session with
@@ -1545,6 +1564,12 @@ function HarnessConfigModal({
     }
     onOpenChange(false);
   };
+
+  // Claude Code account profile (issue #503) — only meaningful for the
+  // claude-sdk harness (the one that spawns the `claude` CLI honoring
+  // CLAUDE_CONFIG_DIR) and only when the operator configured >=1 profile.
+  const effectiveHarness = draftHarness ?? brainDefault;
+  const showProfiles = effectiveHarness === "claude-sdk" && claudeProfiles.length > 0;
 
   const brainEntries = brainDefault
     ? Object.entries(brainHarnessLabels).filter(
@@ -1780,6 +1805,46 @@ function HarnessConfigModal({
               />
             </ConfigRow>
           )}
+
+          {showProfiles && (
+            <ConfigRow label="Claude account" description="Which Claude Code login to run under">
+              <Select
+                value={draftProfile ?? CLAUDE_PROFILE_SELECT_DEFAULT}
+                onValueChange={(v: string) =>
+                  setDraftProfile(v === CLAUDE_PROFILE_SELECT_DEFAULT ? null : v)
+                }
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="new-chat-landing-config-claude-profile"
+                  aria-label="Claude account"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent
+                  position="popper"
+                  align="start"
+                  className="[&_[data-slot=select-item]]:pl-2.5"
+                >
+                  <SelectItem
+                    value={CLAUDE_PROFILE_SELECT_DEFAULT}
+                    data-testid="new-chat-landing-claude-profile-default"
+                  >
+                    Default (no override)
+                  </SelectItem>
+                  {claudeProfiles.map((p) => (
+                    <SelectItem
+                      key={p.name}
+                      value={p.name}
+                      data-testid={`new-chat-landing-claude-profile-${p.name}`}
+                    >
+                      {p.display || p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
         </div>
 
         <DialogFooter className="border-t-0 bg-transparent">
@@ -1841,6 +1906,7 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
+  const { data: claudeProfiles } = useClaudeProfiles();
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
@@ -2098,6 +2164,13 @@ export function NewChatLandingScreen() {
       landingDraft?.pickedHarness ??
       readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
   );
+  // Per-session Claude Code account profile (issue #503). Selects which
+  // isolated CLAUDE_CONFIG_DIR the runner uses for the Claude Code CLI.
+  // null = send no override, leaving the runner on whatever login its own
+  // env/config already selects; cleared on every agent switch so a pick never
+  // leaks across agents. Only offered when the operator has configured >=1
+  // claude_profiles entry.
+  const [pickedProfile, setPickedProfile] = useState<string | null>(null);
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
   // are omitted from the create, so Claude Code uses its own configured model.
@@ -2576,11 +2649,17 @@ export function NewChatLandingScreen() {
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
   // lives only in the modal, so an agent with just that still needs the gear.
+  // The Claude account picker (issue #503) is its own reason to show the gear:
+  // a claude-sdk agent with operator-configured profiles has something to
+  // configure even when no other capability applies.
+  const showClaudeProfilePicker =
+    (pickedHarness ?? selectedAgent?.harness) === "claude-sdk" && (claudeProfiles?.length ?? 0) > 0;
   const selectedAgentHasKnobs =
     supportsPermissionMode ||
     supportsApprovalMode ||
     supportsCursorMode ||
     smartRoutingEligible ||
+    showClaudeProfilePicker ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
   // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
@@ -3355,6 +3434,9 @@ export function NewChatLandingScreen() {
       // sentinel so the explicit choice is what survives a reload.
       if (remembered === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
       else setPickedHarness(remembered);
+      // Same isolation for the Claude account profile pick (issue #503) — it is
+      // never persisted per-agent, so a switch always drops it.
+      setPickedProfile(null);
     }
     // Re-picking the agent that top-level Smart Routing binds as its placeholder
     // drops back to that wrapper's own harness — the only way out, since that
@@ -3649,6 +3731,10 @@ export function NewChatLandingScreen() {
               : (pickedHarness ?? undefined),
             smart_routing_message:
               smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
+            // Claude Code account profile pick (issue #503). Omitted when
+            // unset (null) so the session carries no override; the runner
+            // resolves a name to its local CLAUDE_CONFIG_DIR.
+            claude_profile: pickedProfile ?? undefined,
           }),
         });
         // The create doesn't answer until the host has spawned a runner — a
@@ -4183,6 +4269,9 @@ export function NewChatLandingScreen() {
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
+                    claudeProfiles={claudeProfiles ?? []}
+                    pickedProfile={pickedProfile}
+                    setPickedProfile={setPickedProfile}
                     costControlMode={costControlMode}
                     setPermissionMode={setPermissionMode}
                     setApprovalMode={setApprovalMode}
