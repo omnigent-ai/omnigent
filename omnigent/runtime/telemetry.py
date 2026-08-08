@@ -30,6 +30,7 @@ concerns:
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import os
 import re
@@ -130,6 +131,15 @@ _REDACT_KEY_SUBSTRINGS = (
     "api_key",
     "apikey",
 )
+_SECRET_VALUE_RE = r'(?:"[^"]*"|\'[^\']*\'|[^\s&,;]+)'
+_SECRET_ASSIGNMENT_RE = re.compile(
+    rf"(?i)\b(?P<key>{'|'.join(_REDACT_KEY_SUBSTRINGS)})\s*=\s*(?P<value>{_SECRET_VALUE_RE})"
+)
+_SECRET_QUERY_RE = re.compile(
+    rf"(?i)(?P<prefix>[?&](?:{'|'.join(_REDACT_KEY_SUBSTRINGS)})=)(?P<value>[^&#\s]+)"
+)
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 
 
 def _redact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -162,16 +172,50 @@ def _payload_to_attribute(payload: Mapping[str, Any]) -> str:
     :param payload: The message dict to record.
     :returns: A JSON string, truncated to :data:`_CONTENT_MAX_LEN`.
     """
-    import json
+    return redact_and_cap_payload(payload, _CONTENT_MAX_LEN)
 
-    redacted = _redact_payload(payload)
+
+def redact_and_cap_text(value: Any, max_length: int = _CONTENT_MAX_LEN) -> str:
+    """Redact secret-bearing text and cap the retained string."""
+    text = value if isinstance(value, str) else str(value)
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\g<key>=[redacted]", text)
+    text = _SECRET_QUERY_RE.sub(r"\g<prefix>[redacted]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[redacted]@", text)
+    text = _BEARER_RE.sub("Bearer [redacted]", text)
+    suffix = "…[truncated]"
+    return text if len(text) <= max_length else text[: max_length - len(suffix)] + suffix
+
+
+def redact_and_cap_payload(payload: Any, max_length: int = _CONTENT_MAX_LEN) -> str:
+    """Serialize arbitrary payload content after recursive secret redaction."""
+
+    def _redact(value: Any, key: str | None = None) -> Any:
+        if key is not None and any(token in key.lower() for token in _REDACT_KEY_SUBSTRINGS):
+            return "[redacted]"
+        if isinstance(value, Mapping):
+            return {
+                str(child_key): _redact(child, str(child_key))
+                for child_key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact(child) for child in value]
+        if isinstance(value, tuple):
+            return [_redact(child) for child in value]
+        if isinstance(value, str):
+            return redact_and_cap_text(value, max_length)
+        return value
+
+    candidate = payload
+    if isinstance(payload, str):
+        try:
+            candidate = json.loads(payload)
+        except (TypeError, ValueError):
+            candidate = payload
     try:
-        text = json.dumps(redacted, default=str)
+        text = json.dumps(_redact(candidate), default=str, sort_keys=True)
     except (TypeError, ValueError):
-        text = str(redacted)
-    if len(text) > _CONTENT_MAX_LEN:
-        text = text[:_CONTENT_MAX_LEN] + "…[truncated]"
-    return text
+        text = str(_redact(candidate))
+    return redact_and_cap_text(text, max_length)
 
 
 def record_message_payload(

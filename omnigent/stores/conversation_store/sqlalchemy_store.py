@@ -1286,6 +1286,42 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(session_state=json.dumps(state))
             )
 
+    def set_session_state_key(
+        self,
+        conversation_id: str,
+        key: str,
+        value: Any | None,
+    ) -> None:
+        """
+        Atomically replace one JSON session-state key without replacing peers.
+
+        ``SqlConversationMetadata`` lives in the metadata database, so this
+        deliberately uses ``_session`` rather than the conversation session.
+        The row lock makes each JSON read/merge/write a single transaction.
+        """
+        with self._session() as session:
+            metadata = session.scalar(
+                select(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .with_for_update()
+            )
+            if metadata is None:
+                return
+            try:
+                state = json.loads(metadata.session_state or "{}")
+            except (TypeError, ValueError):
+                state = {}
+            if not isinstance(state, dict):
+                state = {}
+            if value is None:
+                state.pop(key, None)
+            else:
+                state[key] = value
+            metadata.session_state = json.dumps(state)
+
     def set_session_usage(
         self,
         conversation_id: str,

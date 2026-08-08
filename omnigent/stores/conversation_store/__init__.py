@@ -950,6 +950,25 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_session_state_key(
+        self,
+        conversation_id: str,
+        key: str,
+        value: Any | None,
+    ) -> None:
+        """
+        Atomically replace or remove one session-state key.
+
+        Implementations preserve all keys other than ``key`` while holding
+        the conversation metadata row lock.
+
+        :param conversation_id: The conversation to update.
+        :param key: Session-state key to replace or remove.
+        :param value: Value to write, or ``None`` to remove the key.
+        """
+        ...
+
+    @abstractmethod
     def set_session_usage(
         self,
         conversation_id: str,

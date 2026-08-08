@@ -17,6 +17,7 @@ from typing import Annotated, Any, Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
 from omnigent.entities import ConversationItem
+from omnigent.runtime.session_checkpoint import SessionCheckpoint
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1499,6 +1500,21 @@ class SessionLabelsResponse(BaseModel):
 
     id: str
     labels: dict[str, str] = Field(default_factory=dict)
+
+
+class SessionCheckpointReplaceRequest(BaseModel):
+    """Replace only the framework checkpoint stored for a session."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    checkpoint: SessionCheckpoint | None = None
+
+
+class SessionCheckpointResponse(BaseModel):
+    """Framework checkpoint response without unrelated session state."""
+
+    session_id: str
+    checkpoint: SessionCheckpoint | None = None
 
 
 # Stages of a managed-sandbox launch, in pipeline order: the sandbox
