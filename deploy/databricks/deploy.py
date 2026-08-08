@@ -25,6 +25,7 @@ including first-time infrastructure setup.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -49,7 +50,13 @@ _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 # silently route us to the wrong workspace, or upload code under the
 # wrong account. The deploy must use --profile / DATABRICKS_HOST +
 # DATABRICKS_CLIENT_ID explicitly.
+#
+# DATABRICKS_HOST is only cleared when --profile names the workspace (see
+# _host_env_keep): both the SDK and `databricks auth env` honour an ambient
+# host, so a stale export would otherwise outrank the profile. Without
+# --profile it is a legitimate auth input and stays.
 _ENV_VARS_TO_CLEAR = (
+    "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
     "ANTHROPIC_API_KEY",
     "CODEX",
@@ -385,6 +392,45 @@ def build_uv_pyproject(
     )
 
 
+def _sanitize_lock_proxy_urls(lock: Path) -> None:
+    """Rewrite internal pypi-proxy URLs in ``uv.lock`` to public PyPI.
+
+    The Databricks Apps build environment cannot reach
+    ``pypi-proxy.cloud.databricks.com``, so any URL pointing at it 404s
+    at install time. But a machine whose global uv config pins the proxy
+    as the default index bakes proxy hostnames into every lock entry
+    regardless of ``--index-url``. The proxy is a caching mirror of PyPI
+    with an identical ``/packages/<hash>/`` layout, so swapping only the
+    hostname preserves every version and sha256 pin; uv re-verifies the
+    hashes on install.
+    """
+    text = lock.read_text()
+    rewritten = (
+        text.replace(
+            "https://pypi-proxy.cloud.databricks.com/packages/",
+            "https://files.pythonhosted.org/packages/",
+        )
+        .replace(
+            "https://pypi-proxy.cloud.databricks.com/simple/",
+            "https://pypi.org/simple/",
+        )
+        .replace(
+            "https://pypi-proxy.cloud.databricks.com/simple",
+            "https://pypi.org/simple",
+        )
+    )
+    if rewritten != text:
+        lock.write_text(rewritten)
+        _log(f"rewrote pypi-proxy URLs → public PyPI in {lock.name}")
+    # Scan unconditionally: a lock carrying only an uncovered proxy form
+    # (a bare host root, a non-packages/simple path) would slip through the
+    # three replaces above and ship an unreachable URL to the Apps build env.
+    if "pypi-proxy.cloud.databricks.com" in rewritten:
+        raise RuntimeError(
+            f"{lock} still references pypi-proxy after rewrite; the Apps build env cannot reach it"
+        )
+
+
 def run_uv_lock(src: Path) -> None:
     """Generate ``uv.lock`` for the Databricks Apps source directory.
 
@@ -406,6 +452,10 @@ def run_uv_lock(src: Path) -> None:
         env=env,
         check=True,
     )
+    # A global uv config pinning the proxy as default can still bake proxy
+    # hostnames into the lock even when we pass --index-url. The Apps build
+    # env can't reach the proxy, so sanitize the resolved lock to public PyPI.
+    _sanitize_lock_proxy_urls(src / "uv.lock")
 
 
 def write_uv_dependency_files(
@@ -524,6 +574,30 @@ def _assert_clean_tree(skip: bool) -> None:
     _log(f"clean tree at origin/main {head[:12]}")
 
 
+# Variables a target must override for --no-otel to actually take effect;
+# `prod-no-otel` in databricks.yml is the reference implementation.
+_OTEL_OFF_VARS = ("app_command", "app_env", "otel_export_destinations")
+
+
+def _target_overrides_otel_vars(target: str) -> bool | None:
+    """Whether ``target`` overrides every OTel-off variable in databricks.yml.
+
+    Returns ``None`` when the bundle can't be inspected (no PyYAML, unreadable
+    or malformed file) so callers warn rather than assert either way.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        bundle = yaml.safe_load((Path(__file__).parent / "databricks.yml").read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    targets = (bundle or {}).get("targets") or {}
+    variables = (targets.get(target) or {}).get("variables") or {}
+    return all(name in variables for name in _OTEL_OFF_VARS)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -565,6 +639,17 @@ def _parse_args() -> argparse.Namespace:
             "UC schema (catalog.schema) holding the OTel destination tables. "
             "The Databricks Apps platform writes logs/metrics/spans to "
             "<schema>.otel_{logs,metrics,spans}."
+        ),
+    )
+    parser.add_argument(
+        "--no-otel",
+        action="store_true",
+        help=(
+            "Deploy without OpenTelemetry: run 'python app.py' instead of "
+            "under opentelemetry-instrument, drop OTEL_TRACES_SAMPLER, and "
+            "drop the platform telemetry_export_destinations. Use for "
+            "workspaces with no OTel collector / UC OTel tables — otherwise "
+            "span exports fail DEADLINE_EXCEEDED to localhost:4317."
         ),
     )
     parser.add_argument(
@@ -634,14 +719,51 @@ def _parse_args() -> argparse.Namespace:
             "known commit on main."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --no-otel selects the tracer-off DAB target (same workspace + state as
+    # `prod`, OTel variables overridden off). Only auto-switch the default
+    # target so an explicit --target still wins — but then the flag is a no-op
+    # unless that target defines the OTel-off overrides itself, so say so
+    # instead of silently deploying with OTel on.
+    if args.no_otel:
+        if args.target == "prod":
+            args.target = "prod-no-otel"
+        elif _target_overrides_otel_vars(args.target) is not True:
+            _log(
+                f"warning: --no-otel has no effect on --target {args.target!r}: it "
+                f"only swaps the default 'prod' target for 'prod-no-otel'. That "
+                f"target does not override {', '.join(_OTEL_OFF_VARS)}, so OTel "
+                "stays ON for this deploy — copy the overrides from the "
+                "prod-no-otel block in databricks.yml, or drop --target."
+            )
+    return args
 
 
-def _clear_env_vars() -> None:
+def _clear_env_vars(keep: Iterable[str] = ()) -> None:
+    keep = set(keep)
     for name in _ENV_VARS_TO_CLEAR:
+        if name in keep:
+            continue
         if name in os.environ:
             _log(f"unsetting {name} to avoid leaking into the SDK")
             del os.environ[name]
+
+
+def _host_env_keep(args: argparse.Namespace) -> set[str]:
+    """Env vars _clear_env_vars must preserve for this invocation.
+
+    With --profile the profile is authoritative, so an ambient
+    DATABRICKS_HOST is cleared. Without one, DATABRICKS_HOST (+
+    DATABRICKS_CLIENT_ID/_SECRET) *is* the auth input and must survive.
+    """
+    return set() if args.profile else {"DATABRICKS_HOST"}
+
+
+def _workspace_client(args: argparse.Namespace) -> WorkspaceClient:
+    """Construct the SDK client."""
+    from databricks.sdk import WorkspaceClient as _WorkspaceClient
+
+    return _WorkspaceClient(profile=args.profile) if args.profile else _WorkspaceClient()
 
 
 def _ensure_bound(args: argparse.Namespace) -> None:
@@ -660,10 +782,9 @@ def _ensure_bound(args: argparse.Namespace) -> None:
     success.
     """
     # Late-import so --help works without the SDK.
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors.platform import NotFound
 
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    wc = _workspace_client(args)
     try:
         wc.apps.get(name=args.app_name)
     except NotFound:
@@ -773,34 +894,38 @@ def _ensure_app_sp_uc_traversal(
     catalog, schema_only, _ = parts
     schema_fqn = f"{catalog}.{schema_only}"
 
-    import json as _json
-
     for kind, fqn, priv in (
         ("catalog", catalog, "USE_CATALOG"),
         ("schema", schema_fqn, "USE_SCHEMA"),
     ):
         _log(f"granting {priv} on {kind} {fqn} → app SP {app_sp}")
-        payload = _json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
-        subprocess.run(
-            [
-                "databricks",
-                "grants",
-                "update",
-                kind,
-                fqn,
-                *_profile_arg(args),
-                "--json",
-                payload,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        payload = json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
+        try:
+            subprocess.run(
+                [
+                    "databricks",
+                    "grants",
+                    "update",
+                    kind,
+                    fqn,
+                    *_profile_arg(args),
+                    "--json",
+                    payload,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            # SP may already have access via group inheritance, or the
+            # deployer lacks MANAGE on a shared catalog; warn, don't abort.
+            detail = exc.stderr.strip()[:200] if exc.stderr else f"rc={exc.returncode}"
+            _log(f"warning: {priv} grant on {fqn} failed ({detail})")
 
 
 def main() -> int:
     args = _parse_args()
-    _clear_env_vars()
+    _clear_env_vars(keep=_host_env_keep(args))
     _assert_clean_tree(skip=args.allow_dirty)
 
     base_version = _read_base_version()
@@ -843,10 +968,7 @@ def main() -> int:
             "because uv lock validates path sources locally."
         )
 
-    # Late-import the SDK so `--help` works without it installed.
-    from databricks.sdk import WorkspaceClient
-
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    wc = _workspace_client(args)
 
     # 1) Prep the bundle's source_code_path (src/) — sweep stale
     # wheels locally, then copy the new small wheels in.
