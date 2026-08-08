@@ -2,16 +2,21 @@
 Integration tests for git worktree creation on ``POST /v1/sessions``.
 
 Drives the JSON create path with a `git` block through the full app and
-a fake host that auto-replies to the worktree control frames. Verifies
-that the request's branch_name + base_branch reach the host's
-``host.create_worktree`` frame, and that the created worktree path and
-branch are persisted on the session. See designs/SESSION_GIT_WORKTREE.md.
+a fake host that auto-replies to the worktree control frames. The
+create returns as soon as the session row exists — worktree creation
+and the runner launch run in a background task — so these tests verify
+the immediate 201 contract (source-repo workspace, no branch yet), that
+the request's branch_name + base_branch reach the host's
+``host.create_worktree`` frame, and that the worktree path and branch
+land on the session row once the background launch settles. See
+designs/SESSION_GIT_WORKTREE.md.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,12 +29,22 @@ from fastapi import FastAPI
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostLaunchRunnerFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
 )
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_agent
 
@@ -37,6 +52,32 @@ pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "2b8753b34a61b09af35a01136d40fadf"
 _SOURCE_REPO = "/Users/alice/myrepo"
+
+
+@pytest.fixture()
+def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
+    """App wired WITH ``host_store`` so the host-launch branch of
+    ``POST /v1/sessions`` — which owns background worktree creation —
+    is active (the shared conftest app passes ``host_store=None``).
+
+    :param runtime_init: Initializes the runtime + mock LLM.
+    :param db_uri: SQLite database URI.
+    :param tmp_path: Pytest temp dir for artifacts and cache.
+    :returns: A configured FastAPI app with the launch branch active.
+    """
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+    )
 
 
 class _FakeWebSocket:
@@ -56,15 +97,17 @@ class _HostCapture:
 
     :param create: ``host.create_worktree`` frames received.
     :param remove: ``host.remove_worktree`` frames received (a non-empty
-        list proves the create-rollback path fired).
+        list proves the orphan-cleanup path fired).
+    :param launch: ``host.launch_runner`` frames received.
     """
 
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
+    launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
 
 
 # Factory yielded by the ``register_worktree_host`` fixture:
-# register(*, create_status=, create_error=) -> _HostCapture.
+# register(*, create_status=, create_error=, hold_create=) -> _HostCapture.
 RegisterHost = Callable[..., _HostCapture]
 
 
@@ -75,24 +118,32 @@ async def register_worktree_host(
 ) -> AsyncIterator[RegisterHost]:
     """Yield a factory that registers a fake host with a replying drain.
 
-    The drain answers ``host.stat`` (so workspace validation passes) and
-    ``host.create_worktree`` (capturing each frame). Every drain started
-    during the test is poisoned and awaited at teardown, so no background
-    task leaks into the next test's event loop (mirrors the cleanup in
-    ``test_host_worktree.py``).
+    The drain answers ``host.stat`` (so workspace validation passes),
+    ``host.create_worktree`` (capturing each frame), and
+    ``host.launch_runner`` (so the background launch settles promptly).
+    Every drain started during the test is poisoned and awaited at
+    teardown, so no background task leaks into the next test's event
+    loop (mirrors the cleanup in ``test_host_worktree.py``).
 
     :param app: App whose ``host_registry`` to register into.
     :param db_uri: DB URI so the ``host_id`` FK target row exists.
     :returns: Async iterator yielding a ``register`` factory. Its
         kwargs: ``create_status`` (``"ok"`` returns a worktree path,
         ``"failed"`` simulates a host git failure such as a bad base
-        ref) and ``create_error`` (the failure message). Returns a
-        ``_HostCapture`` whose ``.create`` / ``.remove`` lists accumulate
-        the create- and remove-worktree frames the host received.
+        ref), ``create_error`` (the failure message), and
+        ``hold_create`` (an event the drain waits on before answering
+        a create-worktree frame — lets a test act while the worktree
+        is still "being created"). Returns a ``_HostCapture`` whose
+        lists accumulate the frames the host received.
     """
     conns: list[HostConnection] = []
 
-    def _register(*, create_status: str = "ok", create_error: str | None = None) -> _HostCapture:
+    def _register(
+        *,
+        create_status: str = "ok",
+        create_error: str | None = None,
+        hold_create: asyncio.Event | None = None,
+    ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
@@ -103,7 +154,7 @@ async def register_worktree_host(
         cap = _HostCapture()
 
         async def _drain() -> None:
-            """Answer stat + create/remove-worktree frames; capture them."""
+            """Answer stat + worktree + launch frames; capture them."""
             while True:
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
@@ -123,6 +174,8 @@ async def register_worktree_host(
                         )
                 elif isinstance(frame, HostCreateWorktreeFrame):
                     cap.create.append(frame)
+                    if hold_create is not None:
+                        await hold_create.wait()
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         if create_status == "ok":
@@ -149,6 +202,11 @@ async def register_worktree_host(
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
+                elif isinstance(frame, HostLaunchRunnerFrame):
+                    cap.launch.append(frame)
+                    fut = conn.pending_launches.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result({"status": "launched", "runner_id": "runner_from_host"})
 
         conn._drain_task_for_test = asyncio.create_task(_drain())  # type: ignore[attr-defined]
         conns.append(conn)
@@ -190,16 +248,46 @@ async def _create_git_session(
     )
 
 
+async def _await_launch_settled(
+    app: FastAPI,
+    session_id: str,
+    *,
+    timeout_s: float = 5.0,
+) -> None:
+    """Wait until the session's background create-launch has settled.
+
+    Success pops the tracker entry; failure retains a settled entry —
+    both count as settled here.
+
+    :param app: App whose ``managed_launches`` tracker to poll.
+    :param session_id: The created session's id.
+    :param timeout_s: Maximum seconds to wait.
+    :raises AssertionError: If the launch hasn't settled in time.
+    """
+    tracker = app.state.managed_launches
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        entry = tracker.get(session_id)
+        if entry is None or entry.settled.is_set():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"background launch for session {session_id!r} never settled")
+
+
 async def test_create_passes_branch_and_base_branch_to_host(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
 ) -> None:
     """The request's branch_name + base_branch reach host.create_worktree,
     and the resulting worktree path + branch are persisted on the session.
 
-    Proves the server route threads ``git.base_branch`` through
-    ``_create_session_worktree`` → ``create_worktree_on_host`` → the
-    frame. If base_branch were dropped on the route, the captured
+    The 201 itself returns the pre-worktree row (source repo, no branch)
+    — worktree creation happens in the background launch task so the web
+    UI can navigate immediately. Once the launch settles, the captured
+    ``host.create_worktree`` frame carries both the new branch and the
+    requested base ref, and the session row is re-pointed at the created
+    worktree. If base_branch were dropped on the route, the captured
     frame's base_branch would be ``None`` and this fails.
     """
     cap = register_worktree_host()
@@ -209,6 +297,13 @@ async def test_create_passes_branch_and_base_branch_to_host(
         client, agent["id"], {"branch_name": "feature/login", "base_branch": "main"}
     )
     assert resp.status_code == 201, resp.text
+    body = resp.json()
+    # Immediate contract: the create returns before the worktree exists,
+    # with the source repo as workspace and no branch recorded yet.
+    assert body["workspace"] == _SOURCE_REPO
+    assert body["git_branch"] is None
+
+    await _await_launch_settled(app, body["id"])
 
     # The host received exactly one create-worktree frame carrying both
     # the new branch and the requested base ref.
@@ -218,16 +313,19 @@ async def test_create_passes_branch_and_base_branch_to_host(
     assert frame.branch_name == "feature/login"
     assert frame.base_branch == "main"
 
-    # The returned worktree path becomes the session workspace, and the
+    # The created worktree path becomes the session workspace, and the
     # branch is persisted (drives sidebar display + delete cleanup).
-    body = resp.json()
-    assert body["git_branch"] == "feature/login"
-    assert body["workspace"] == f"{_SOURCE_REPO}-worktrees/feature-login"
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    updated = snapshot.json()
+    assert updated["git_branch"] == "feature/login"
+    assert updated["workspace"] == f"{_SOURCE_REPO}-worktrees/feature-login"
 
 
 async def test_create_without_base_branch_sends_none(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
 ) -> None:
     """Omitting base_branch sends ``None`` to the host (branch from HEAD).
 
@@ -241,22 +339,26 @@ async def test_create_without_base_branch_sends_none(
     resp = await _create_git_session(client, agent["id"], {"branch_name": "wip"})
     assert resp.status_code == 201, resp.text
 
+    await _await_launch_settled(app, resp.json()["id"])
+
     assert len(cap.create) == 1
     assert cap.create[0].branch_name == "wip"
     assert cap.create[0].base_branch is None
 
 
-async def test_create_with_invalid_base_branch_fails_400(
+async def test_create_with_invalid_base_branch_fails_first_message(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
 ) -> None:
-    """An invalid base branch fails the create with 400 INVALID_INPUT.
+    """A host-rejected base branch surfaces on the first message, not the 201.
 
-    The host rejects the bad base ref (``host.create_worktree`` →
-    ``status: failed``); the server maps that to INVALID_INPUT (400),
-    NOT 500 — it's user-correctable input — and surfaces the host's
-    reason. Worktree creation fails before ``create_conversation``, so
-    no session row is created (the response carries no session id).
+    The create returns 201 before the host runs git; when the background
+    worktree creation then fails (``host.create_worktree`` →
+    ``status: failed``), the launch tracker records the host's reason and
+    a message POST reports it as 503 RUNNER_UNAVAILABLE — instead of a
+    generic "no runner bound". The session row keeps the source repo as
+    workspace (it is never re-pointed at a worktree that doesn't exist).
     """
     register_worktree_host(
         create_status="failed",
@@ -269,18 +371,55 @@ async def test_create_with_invalid_base_branch_fails_400(
         agent["id"],
         {"branch_name": "feature/x", "base_branch": "nope-not-a-branch"},
     )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
 
-    # 400 (not 500): a bad base ref is user input, not a server fault.
+    await _await_launch_settled(app, session_id)
+
+    # The failure is retained on the tracker; a message reports it.
+    message_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert message_resp.status_code == 503, message_resp.text
+    assert "base branch does not exist" in message_resp.text
+
+    # The row was never re-pointed at a worktree.
+    snapshot = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["workspace"] == _SOURCE_REPO
+    assert snapshot.json()["git_branch"] is None
+
+
+async def test_create_with_invalid_branch_name_fails_400(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """A malformed create-mode ``branch_name`` is still a synchronous 400.
+
+    Branch-name validation is the one git check the server can run
+    without the host, so it stays on the create request: the user gets
+    an immediate, correctable error and no session row is created.
+    """
+    register_worktree_host()
+    agent = await create_test_agent(client, name="wt-bad-name-agent")
+
+    resp = await _create_git_session(client, agent["id"], {"branch_name": "bad..branch"})
+
     assert resp.status_code == 400, resp.text
     body = resp.json()
     assert body["error"]["code"] == "invalid_input"
-    # The host's reason is surfaced verbatim so the UI can show it.
-    assert "base branch does not exist" in body["error"]["message"]
+    # The failed create returned an error, not a session.
+    assert "id" not in body
 
 
 async def test_create_with_existing_worktree_persists_without_creating(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
 ) -> None:
     """Starting in an existing worktree persists its branch, creates nothing.
 
@@ -303,14 +442,16 @@ async def test_create_with_existing_worktree_persists_without_creating(
     )
     assert resp.status_code == 201, resp.text
 
-    # No worktree was created — the host received no create frame.
-    assert len(cap.create) == 0, f"expected no create_worktree frame, got {len(cap.create)}"
-
     # The existing worktree's branch is persisted; the workspace is the
     # supplied directory verbatim (no worktree-path rewrite).
     body = resp.json()
     assert body["git_branch"] == "feature/existing"
     assert body["workspace"] == _SOURCE_REPO
+
+    # Even after the background launch settles, no worktree was created —
+    # the host received no create frame.
+    await _await_launch_settled(app, body["id"])
+    assert len(cap.create) == 0, f"expected no create_worktree frame, got {len(cap.create)}"
 
 
 async def test_create_with_invalid_existing_worktree_branch_fails_400(
@@ -351,25 +492,19 @@ async def test_create_failure_never_removes_existing_worktree(
     """A create_conversation failure must NOT destroy the user's worktree.
 
     Regression: the ``existing_worktree`` bind path sets ``git_branch``
-    for a *pre-existing* worktree without Omnigent creating one. The
-    create-rollback (``git worktree remove --force`` + ``git branch -D``)
-    is gated on Omnigent having created a worktree, NOT on ``git_branch``
-    being set — otherwise a persistence failure would force-remove the
-    user's own worktree and delete their branch. Assert no remove frame
-    is sent when ``create_conversation`` raises on this path.
+    for a *pre-existing* worktree without Omnigent creating one. A
+    persistence failure on this path must never translate into a
+    ``git worktree remove --force`` of the user's own directory. Assert
+    no remove frame is sent when ``create_conversation`` raises.
     """
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
-    )
-
     cap = register_worktree_host()
     agent = await create_test_agent(client, name="wt-no-destroy-agent")
 
     # Force the persistence step to fail after the bind path has already
-    # set git_branch — the exact window the rollback guards. Patch the class
-    # method (the store is a thin, stateless db_uri wrapper, and the route
-    # uses its own instance) so the failure hits regardless of which
-    # instance the router closed over.
+    # validated the branch name. Patch the class method (the store is a
+    # thin, stateless db_uri wrapper, and the route uses its own
+    # instance) so the failure hits regardless of which instance the
+    # router closed over.
     def _boom(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("simulated create_conversation failure")
 
@@ -389,30 +524,25 @@ async def test_create_failure_never_removes_existing_worktree(
             },
         )
 
-    # Critically, the user's worktree is left untouched: the create-rollback
-    # did NOT fire, so no remove_worktree frame reached the host.
+    # Critically, the user's worktree is left untouched: no remove_worktree
+    # frame reached the host.
     assert cap.remove == [], (
-        f"create-rollback force-removed the user's existing worktree: {cap.remove}"
+        f"a failed create force-removed the user's existing worktree: {cap.remove}"
     )
 
 
-async def test_create_failure_rolls_back_omnigent_created_worktree(
+async def test_create_failure_creates_no_worktree(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A create_conversation failure DOES clean up an Omnigent-made worktree.
+    """A create_conversation failure leaks no worktree.
 
-    The counterpart to the data-loss guard: when Omnigent creates the
-    worktree (the ``git`` path) and persistence then fails, the orphan
-    worktree it just made must be force-removed. Proves the narrowed
-    rollback guard (gated on Omnigent having created a worktree) still
-    fires for the case it is meant to clean up.
+    The session row is created BEFORE any worktree work is scheduled, so
+    a persistence failure means the host is never asked to create one —
+    there is no orphan to roll back. Assert no create-worktree frame was
+    sent.
     """
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
-    )
-
     cap = register_worktree_host()
     agent = await create_test_agent(client, name="wt-rollback-agent")
 
@@ -424,9 +554,45 @@ async def test_create_failure_rolls_back_omnigent_created_worktree(
     with pytest.raises(RuntimeError, match="simulated create_conversation failure"):
         await _create_git_session(client, agent["id"], {"branch_name": "feature/orphan"})
 
-    # Omnigent created the worktree, so the rollback force-removed it: one
-    # remove frame for the worktree it just made, deleting the branch too.
-    assert len(cap.create) == 1, cap.create
-    assert len(cap.remove) == 1, f"expected a create-rollback remove frame, got {cap.remove}"
-    assert cap.remove[0].branch == "feature/orphan"
+    assert cap.create == [], f"a failed create should never reach the host, got {cap.create}"
+    assert cap.remove == []
+
+
+async def test_session_deleted_during_worktree_creation_removes_worktree(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """Deleting the session mid-worktree-creation cleans up the worktree.
+
+    The create returns while the host is still running git (this test
+    gates the host's reply to hold that window open — also pinning that
+    the 201 does NOT wait for the worktree). A session deleted in that
+    window can't see the worktree (``git_branch`` is only recorded once
+    creation succeeds), so the background task detects the deleted row
+    and removes the fresh worktree — branch included — instead of
+    leaking it.
+    """
+    hold_create = asyncio.Event()
+    cap = register_worktree_host(hold_create=hold_create)
+    agent = await create_test_agent(client, name="wt-delete-race-agent")
+
+    resp = await _create_git_session(client, agent["id"], {"branch_name": "feature/doomed"})
+    # The 201 returned while the create-worktree reply is still gated —
+    # the create does not block on the worktree.
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    delete_resp = await client.delete(f"/v1/sessions/{session_id}")
+    assert delete_resp.status_code in (200, 204), delete_resp.text
+
+    # Let the host "finish" the worktree; the background task then finds
+    # the row gone and removes the orphan.
+    hold_create.set()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not cap.remove:
+        await asyncio.sleep(0.01)
+
+    assert len(cap.remove) == 1, f"expected an orphan-cleanup remove frame, got {cap.remove}"
+    assert cap.remove[0].worktree_path == f"{_SOURCE_REPO}-worktrees/feature-doomed"
+    assert cap.remove[0].branch == "feature/doomed"
     assert cap.remove[0].delete_branch is True
