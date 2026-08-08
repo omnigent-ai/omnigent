@@ -136,6 +136,27 @@ def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
     assert pi.os_env.type == "caller_process"
 
 
+def test_all_os_environments_are_sandboxed(polly_spec: AgentSpec) -> None:
+    """Polly and every worker must be isolated from the host filesystem.
+
+    The workspace remains writable for coding, but an active platform sandbox
+    keeps paths outside it (including unrelated files under ``$HOME``) hidden.
+    Shell terminals inherit the same policy so they cannot bypass the tool
+    sandbox.
+    """
+    assert polly_spec.os_env is not None
+    assert polly_spec.os_env.sandbox is not None
+    assert polly_spec.os_env.sandbox.type != "none"
+
+    for name, terminal in (polly_spec.terminals or {}).items():
+        assert terminal.os_env == "inherit", name
+
+    for worker in polly_spec.sub_agents:
+        assert worker.os_env is not None, worker.name
+        assert worker.os_env.sandbox is not None, worker.name
+        assert worker.os_env.sandbox.type != "none", worker.name
+
+
 def test_spine_skills_present(polly_spec: AgentSpec) -> None:
     """All spine skills are discovered from skills/<name>/SKILL.md."""
     assert sorted(s.name for s in polly_spec.skills) == [
