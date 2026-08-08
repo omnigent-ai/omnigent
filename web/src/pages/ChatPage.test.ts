@@ -794,6 +794,21 @@ describe("computeShowsWorking", () => {
     ).toBe(true);
   });
 
+  it("a spin-up in flight yields the slot to the Starting-up cue", () => {
+    // ChatPage passes `localSendInFlight: status === "streaming" && !spinUpInFlight`.
+    // `RunnerStartingIndicator` renders only when the shimmer is absent, and its
+    // copy ("Starting up…" / "Cloning repository…") is strictly more informative
+    // than a generic shimmer — so during a boot the optimistic path stands down.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
+  });
+
+  it("a server-confirmed running still wins during a spin-up", () => {
+    // Once the harness reports work the spin-up cue has self-gated to null, so
+    // suppressing the shimmer too would leave the turn with no indicator at all.
+    // `localSendInFlight` is the only thing the spin-up gate touches.
+    expect(computeShowsWorking("running", opts({ localSendInFlight: false }))).toBe(true);
+  });
+
   it("a pending elicitation still outranks an in-flight local send", () => {
     // The elicitation prompt owns the in-progress slot; the two must never
     // stack, so the suppression applies regardless of how the work was

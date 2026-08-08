@@ -798,6 +798,9 @@ export function ChatPage() {
   // handling). Overrides the liveness-derived unreachable affordances
   // below, which misread the not-yet-host-bound session as stranded.
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
+  // Terminal-first spin-up state, read here (not just in the child surfaces) so
+  // the working-indicator gate below can defer to the "Starting up…" cue.
+  const chatTerminalFirst = useTerminalFirst();
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
@@ -1007,6 +1010,16 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
+  // A spin-up in flight owns the in-progress slot with more specific copy
+  // ("Starting up…" / "Cloning repository…") than the generic shimmer, and
+  // `RunnerStartingIndicator` only renders when the shimmer is absent. So the
+  // OPTIMISTIC path must stand down here: a send that has to boot a runner is
+  // exactly when the user needs to know it's booting, not just that we asked.
+  // A server-confirmed `running`/`waiting` still wins — by then the harness is
+  // up and the spin-up cue has self-gated to null.
+  const spinUpInFlight =
+    sandboxLaunching ||
+    Boolean(chatTerminalFirst?.isTerminalFirst && chatTerminalFirst.terminalStartingUp);
   const showsWorking = computeShowsWorking(sessionStatus, {
     hasPendingElicitation,
     runnerOnline,
@@ -1015,7 +1028,7 @@ export function ChatPage() {
     // for the server's ``running``. The sidebar row already reads this same
     // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
     // server confirmed; now they agree immediately.
-    localSendInFlight: status === "streaming",
+    localSendInFlight: status === "streaming" && !spinUpInFlight,
   });
 
   // A fork of a coding session carries the source id in this label (set by
