@@ -256,6 +256,43 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
     assert ids == [id_a, id_b]
 
 
+def test_list_by_host_id_returns_pinned_tasks_in_any_state(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """
+    ``list_by_host_id`` returns every task pinned to the host regardless
+    of state, and nothing else.
+
+    Host deregistration reads this to refuse deleting a pinned host, so
+    an unpinned task (which resolves its host at fire time) and a task
+    pinned elsewhere must not block the delete — while a paused task,
+    which breaks the moment it is resumed, must.
+    """
+    host = _uid("host_pinned")
+    for seed, pinned_to, state in (
+        ("st_active", host, "active"),
+        ("st_paused", host, "paused"),
+        ("st_elsewhere", _uid("host_other"), "active"),
+        ("st_unpinned", None, "active"),
+    ):
+        store.create(
+            scheduled_task_id=_uid(seed),
+            name=seed,
+            prompt="do a thing",
+            rrule="FREQ=DAILY",
+            user_id="alice@example.com",
+            agent_id=_uid("ag_pinned"),
+            timezone="UTC",
+            host_id=pinned_to,
+            state=state,
+        )
+
+    pinned = store.list_by_host_id(host)
+
+    assert {t.id for t in pinned} == {_uid("st_active"), _uid("st_paused")}
+    assert store.list_by_host_id(_uid("host_with_nothing")) == []
+
+
 def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) -> None:
     """``list_active`` returns only active tasks, excluding paused/deleted."""
     store.create(

@@ -98,6 +98,23 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def list_by_host_id(self, host_id: str) -> builtins.list[ScheduledTask]:
+        """
+        List every task pinned to *host_id*, in any state.
+
+        Host deregistration uses this to refuse deleting a host that
+        tasks still pin: the pin is a soft reference (no FK, Rule R032),
+        so a deleted host leaves each task failing at fire time with
+        ``host_not_found``. Paused tasks count — they break the same way
+        once resumed.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: Tasks with ``host_id`` matching, ordered like
+            :meth:`list`.
+        """
+        ...
+
+    @abstractmethod
     def list_active(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks ordered by ``created_at ASC, id ASC``.
