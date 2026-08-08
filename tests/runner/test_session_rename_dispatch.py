@@ -26,37 +26,73 @@ def test_native_relay_exposes_session_rename(spec: AgentSpec | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_rename_dispatches_to_current_session() -> None:
+async def test_session_rename_dispatches_repeatable_patch_to_current_session() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(
-            200,
-            json={"renamed": True, "title": "Debug auth timeout", "reason": None},
-        )
+        return httpx.Response(200, json={"id": "conv_current", **json.loads(request.content)})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="http://server",
     ) as server_client:
+        outputs = [
+            await execute_tool(
+                tool_name="sys_session_rename",
+                arguments=json.dumps({"title": title}),
+                server_client=server_client,
+                conversation_id="conv_current",
+                agent_spec=AgentSpec(spec_version=1),
+            )
+            for title in ("Debug auth timeout", "Verify auth timeout fix")
+        ]
+
+    assert [json.loads(output) for output in outputs] == [
+        {"renamed": True, "title": "Debug auth timeout", "reason": None},
+        {"renamed": True, "title": "Verify auth timeout fix", "reason": None},
+    ]
+    assert len(requests) == 2
+    assert all(request.method == "PATCH" for request in requests)
+    assert all(request.url.path == "/v1/sessions/conv_current" for request in requests)
+    assert [json.loads(request.content) for request in requests] == [
+        {"title": "Debug auth timeout"},
+        {"title": "Verify auth timeout fix"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("title", "expected_error"),
+    [
+        ("x", "2-60 characters"),
+        ("  ", "2-60 characters"),
+        ("x" * 61, "2-60 characters"),
+        ("Debug auth\ntimeout", "single line"),
+    ],
+)
+async def test_session_rename_rejects_invalid_titles_before_request(
+    title: str,
+    expected_error: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(500)
+        ),
+        base_url="http://server",
+    ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_rename",
-            arguments=json.dumps({"title": "Debug auth timeout"}),
+            arguments=json.dumps({"title": title}),
             server_client=server_client,
             conversation_id="conv_current",
             agent_spec=AgentSpec(spec_version=1),
         )
 
-    assert json.loads(output) == {
-        "renamed": True,
-        "title": "Debug auth timeout",
-        "reason": None,
-    }
-    assert len(requests) == 1
-    assert requests[0].method == "POST"
-    assert requests[0].url.path == "/v1/sessions/conv_current/auto-title"
-    assert json.loads(requests[0].content) == {"title": "Debug auth timeout"}
+    assert expected_error in json.loads(output)["error"]
+    assert requests == []
 
 
 @pytest.mark.asyncio
@@ -66,6 +102,10 @@ async def test_session_rename_dispatches_to_current_session() -> None:
         (httpx.Response(503, text="server unavailable"), "returned 503"),
         (httpx.Response(200, text="not-json"), "returned invalid JSON"),
         (httpx.Response(200, json=["unexpected"]), "returned a non-object response"),
+        (
+            httpx.Response(200, json={"id": "conv_current", "title": None}),
+            "response omitted the updated title",
+        ),
     ],
 )
 async def test_session_rename_server_failures_are_tool_results(
