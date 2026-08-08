@@ -62,6 +62,11 @@ from omnigent.pi_native_credentials import (
     _is_databricks_ai_gateway_url,
 )
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.runtime.prompt import (
+    PI_AGENT_COMPLETION_INSTRUCTION,
+    PI_TOOL_TURN_CONTINUATION,
+    append_framework_instructions,
+)
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -84,6 +89,8 @@ from .executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+_TOOL_TURN_MAX_CONTINUATIONS = 2
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
@@ -2306,9 +2313,16 @@ class PiExecutor(Executor):
                     self._databricks_token = token
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
+        pi_system_prompt = (
+            append_framework_instructions(
+                system_prompt,
+                (PI_AGENT_COMPLETION_INSTRUCTION,),
+            )
+            or PI_AGENT_COMPLETION_INSTRUCTION
+        )
 
         try:
-            rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
+            rpc = await self._ensure_rpc(session_key, pi_system_prompt, model, tools)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces startup errors as ExecutorError
             yield ExecutorError(message=f"Failed to start Pi: {exc}")
             return
@@ -2359,6 +2373,11 @@ class PiExecutor(Executor):
         # Read events until agent_end.
         response_text = ""
         streamed_any = False
+        saw_tool_activity = False
+        completion_text_ready = False
+        last_tool_failed = False
+        failure_recovery_requested = False
+        tool_turn_continuations = 0
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
         # fallback). Summed into a turn-level usage dict at completion so a
@@ -2376,6 +2395,14 @@ class PiExecutor(Executor):
             if line is None:
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
+                elif saw_tool_activity and (
+                    not completion_text_ready
+                    or (last_tool_failed and not failure_recovery_requested)
+                ):
+                    yield ExecutorError(
+                        message="Pi stopped before completing its tool-driven turn.",
+                        retryable=True,
+                    )
                 elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
@@ -2417,6 +2444,8 @@ class PiExecutor(Executor):
                         yield TextChunk(text=raw_delta)
                         response_text += raw_delta
                         streamed_any = True
+                        if raw_delta.strip():
+                            completion_text_ready = True
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
                     yield ReasoningChunk(delta="", event_type="reasoning_started")
@@ -2429,6 +2458,8 @@ class PiExecutor(Executor):
 
             # Tool execution events.
             if event_type == "tool_execution_start":
+                saw_tool_activity = True
+                completion_text_ready = False
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
                 yield ToolCallRequest(
@@ -2438,6 +2469,7 @@ class PiExecutor(Executor):
                 continue
 
             if event_type == "tool_execution_end":
+                saw_tool_activity = True
                 tool_name = event.get("toolName", "unknown")
                 is_error = event.get("isError", False)
                 result = event.get("result")
@@ -2501,6 +2533,9 @@ class PiExecutor(Executor):
                     status = ToolCallStatus.ERROR
                 else:
                     status = ToolCallStatus.SUCCESS
+                completion_text_ready = False
+                last_tool_failed = status in (ToolCallStatus.BLOCKED, ToolCallStatus.ERROR)
+                failure_recovery_requested = False
 
                 yield ToolCallComplete(
                     name=tool_name,
@@ -2516,22 +2551,74 @@ class PiExecutor(Executor):
                     yield ExecutorError(message=pending_error)
                     return
                 end_messages = event.get("messages", [])
-                if not response_text:
+                end_response_text = ""
+                if isinstance(end_messages, list):
                     for m in reversed(end_messages):
-                        if m.get("role") == "assistant":
-                            content = m.get("content", [])
-                            if isinstance(content, str):
-                                response_text = content
-                            elif isinstance(content, list):
-                                text_parts: list[str] = []
-                                for part in content:
-                                    if not (isinstance(part, dict) and part.get("type") == "text"):
-                                        continue
-                                    part_text = part.get("text")
-                                    if isinstance(part_text, str):
-                                        text_parts.append(part_text)
-                                response_text = "".join(text_parts)
-                            break
+                        if not isinstance(m, dict) or m.get("role") != "assistant":
+                            continue
+                        content = m.get("content", [])
+                        if isinstance(content, str):
+                            end_response_text = content
+                        elif isinstance(content, list):
+                            if any(
+                                isinstance(part, dict) and part.get("type") == "toolCall"
+                                for part in content
+                            ):
+                                break
+                            text_parts: list[str] = []
+                            for part in content:
+                                if not (
+                                    isinstance(part, dict) and part.get("type") == "text"
+                                ):
+                                    continue
+                                part_text = part.get("text")
+                                if isinstance(part_text, str):
+                                    text_parts.append(part_text)
+                            end_response_text = "".join(text_parts)
+                        break
+                if end_response_text.strip():
+                    completion_text_ready = True
+                    if not response_text:
+                        response_text = end_response_text
+
+                needs_completion_text = saw_tool_activity and not completion_text_ready
+                needs_failure_recovery = (
+                    last_tool_failed and not failure_recovery_requested
+                )
+                if needs_completion_text or needs_failure_recovery:
+                    if tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS:
+                        if completion_text_ready:
+                            needs_failure_recovery = False
+                        else:
+                            yield ExecutorError(
+                                message=(
+                                    "Pi ended a tool-driven turn without a final "
+                                    "assistant response after "
+                                    f"{_TOOL_TURN_MAX_CONTINUATIONS} continuations."
+                                ),
+                                retryable=True,
+                            )
+                            return
+                    if needs_completion_text or needs_failure_recovery:
+                        tool_turn_continuations += 1
+                        completion_text_ready = False
+                        if needs_failure_recovery:
+                            failure_recovery_requested = True
+                        try:
+                            await rpc.send_command(
+                                {
+                                    "type": "prompt",
+                                    "message": PI_TOOL_TURN_CONTINUATION,
+                                    "id": f"{cmd_id}_continue_{tool_turn_continuations}",
+                                }
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            yield ExecutorError(
+                                message=f"Failed to continue incomplete Pi tool turn: {exc}",
+                                retryable=True,
+                            )
+                            return
+                        continue
                 # Fallback usage capture: if no ``message_end`` carried
                 # usage, pull it from the last assistant message in
                 # ``messages`` (only the last — ``messages`` may hold the

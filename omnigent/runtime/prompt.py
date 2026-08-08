@@ -34,6 +34,25 @@ SHARED_SESSION_AUTHORSHIP_INSTRUCTION = (
 SHARED_MESSAGE_ATTRIBUTION_ENV = "OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED"
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
+PI_AGENT_COMPLETION_INSTRUCTION = (
+    "Work autonomously until the user's request is resolved. Use tools when they "
+    "can establish facts or complete work. Do not stop at intermediate progress, "
+    "raw tool output, or uncertainty. If an approach fails, inspect the result and "
+    "try a different permitted approach instead of repeating the same call unchanged. "
+    "End the turn only with the completed outcome, or after reasonable permitted "
+    "alternatives are exhausted with the exact blocker, supporting evidence, and "
+    "the alternatives already tried."
+)
+
+PI_TOOL_TURN_CONTINUATION = (
+    "The prior agent loop ended before task closure. Continue working from the tool "
+    "results. If the current approach failed or was inconclusive, diagnose why and "
+    "try a different permitted tool, query, or path. Do not repeat successful calls "
+    "or retry a failed call unchanged. Finish the user's request. If no permitted "
+    "route remains after trying alternatives, state the exact blocker, evidence, and "
+    "attempts in the final response."
+)
+
 
 def shared_message_attribution_enabled() -> bool:
     """Return whether shared-message authors are visible to the model.

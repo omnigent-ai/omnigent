@@ -2145,6 +2145,17 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "The tool failed after the attempted recovery.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2357,18 +2368,10 @@ class TestRunTurn(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> PiExecutor:
-    """
-    Build a :class:`PiExecutor` whose RPC session replays scripted JSONL.
-
-    :param lines: JSONL event lines the fake Pi process emits, in order,
-        e.g. ``[json.dumps({"type": "response", "success": True})]``.
-    :param model: Optional model override (``self._model_override``),
-        used to exercise the usage ``model`` fallback when the assistant
-        message omits its own ``model`` field.
-    :returns: Executor with ``_ensure_rpc`` patched to a fake session
-        pre-loaded with ``lines``.
-    """
+def _executor_and_scripted_rpc(
+    lines: list[str], model: str | None = None
+) -> tuple[PiExecutor, _PiRpcSession]:
+    """Build a Pi executor and expose its scripted RPC session."""
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor(model=model)
     fake_rpc = _PiRpcSession()
@@ -2382,6 +2385,22 @@ def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> P
         return fake_rpc
 
     executor._ensure_rpc = fake_ensure_rpc
+    return executor, fake_rpc
+
+
+def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> PiExecutor:
+    """
+    Build a :class:`PiExecutor` whose RPC session replays scripted JSONL.
+
+    :param lines: JSONL event lines the fake Pi process emits, in order,
+        e.g. ``[json.dumps({"type": "response", "success": True})]``.
+    :param model: Optional model override (``self._model_override``),
+        used to exercise the usage ``model`` fallback when the assistant
+        message omits its own ``model`` field.
+    :returns: Executor with ``_ensure_rpc`` patched to a fake session
+        pre-loaded with ``lines``.
+    """
+    executor, _ = _executor_and_scripted_rpc(lines, model)
     return executor
 
 
@@ -2722,6 +2741,20 @@ class TestBlockedToolDetection(unittest.TestCase):
             fake_rpc._stderr_lines = []
 
             for line in event_lines:
+                fake_rpc._line_queue.put_nowait(line)
+            for line in (
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "No permitted alternative is available.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ):
                 fake_rpc._line_queue.put_nowait(line)
 
             async def fake_ensure_rpc(*args, **kwargs):
@@ -4288,6 +4321,300 @@ def test_pi_usage_sums_across_multiple_message_end() -> None:
         # context fill); summing it would double-count re-sent history. If
         # this equals 4164 (the summed total), the last-call rule regressed.
         assert usage["context_tokens"] == 2414
+
+    _run(_test())
+
+
+def test_pi_retries_empty_completion_after_tool_activity() -> None:
+    """An empty post-tool completion gets a framework continuation."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "oracle__fetch",
+                        "args": {"ref": "oracle://trace/h1"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "The evidence identifies the failure.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "The evidence identifies the failure."
+        assert len([event for event in events if isinstance(event, ToolCallComplete)]) == 1
+        written = b"".join(rpc.process.stdin.data).decode()
+        assert written.count('"type": "prompt"') == 2
+        assert "try a different permitted tool" in written
+
+    _run(_test())
+
+
+def test_pi_appends_the_agent_completion_contract() -> None:
+    """Pi receives the framework-owned completion contract."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Resolved.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+        captured: dict[str, str] = {}
+
+        async def fake_ensure_rpc(session_key, system_prompt, model, tools):
+            captured["system_prompt"] = system_prompt
+            return rpc
+
+        executor._ensure_rpc = fake_ensure_rpc
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "base instructions",
+            )
+        ]
+
+        assert any(isinstance(event, TurnComplete) for event in events)
+        assert captured["system_prompt"].startswith("base instructions")
+        assert "try a different permitted approach" in captured["system_prompt"]
+
+    _run(_test())
+
+
+def test_pi_continues_when_progress_text_precedes_the_last_tool() -> None:
+    """Progress text before a tool does not satisfy task closure."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "I will inspect the evidence. ",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "I will inspect the evidence. ",
+                                    },
+                                    {
+                                        "type": "toolCall",
+                                        "id": "call-1",
+                                        "name": "oracle__fetch",
+                                        "arguments": {},
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "The evidence identifies the failure.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response.endswith("The evidence identifies the failure.")
+        written = b"".join(rpc.process.stdin.data).decode()
+        assert written.count('"type": "prompt"') == 2
+
+    _run(_test())
+
+
+def test_pi_requests_recovery_after_a_failed_tool() -> None:
+    """Pi gets another turn when it gives up after the first failed tool."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": True,
+                        "result": {"error": "reference expired"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "I cannot determine the answer.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "oracle__search",
+                        "args": {"query": "same evidence by subject"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__search",
+                        "isError": False,
+                        "result": {"hits": [{"ref": "oracle://trace/h2"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": " The alternate search found the answer.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        tool_events = [event for event in events if isinstance(event, ToolCallComplete)]
+        assert [event.status for event in tool_events] == [
+            ToolCallStatus.ERROR,
+            ToolCallStatus.SUCCESS,
+        ]
+        assert any(isinstance(event, TurnComplete) for event in events)
+        written = b"".join(rpc.process.stdin.data).decode()
+        assert written.count('"type": "prompt"') == 2
+        assert "try a different permitted tool" in written
+
+    _run(_test())
+
+
+def test_pi_fails_loud_after_bounded_empty_post_tool_continuations() -> None:
+    """Repeated empty completions fail instead of leaving the session idle."""
+
+    async def _test() -> None:
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1
+        assert errors[0].retryable is True
+        assert "after 2 continuations" in errors[0].message
+        assert not any(isinstance(event, TurnComplete) for event in events)
 
     _run(_test())
 
