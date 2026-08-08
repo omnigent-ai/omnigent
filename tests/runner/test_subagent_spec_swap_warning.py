@@ -54,6 +54,12 @@ CHILD_HARNESS = "claude-native"
 UNRESOLVABLE_SUB_AGENT_NAME = "renamed_worker"
 _WARNING_FRAGMENT = "did not resolve in the parent spec"
 
+# A root may legally carry its own sub-agent's name: the uniqueness check
+# (``_check_unique_sub_agent_names``) seeds its ``seen`` set empty and only
+# walks ``spec.sub_agents``, so the root's name is never compared.
+SHADOWED_NAME = "pi"
+SHADOWED_SESSION_ID = "conv_child_shadowed"
+
 
 def _orchestrator_spec_tree() -> AgentSpec:
     """Parent orchestrator (``claude-sdk``) with one declared sub-agent."""
@@ -219,4 +225,121 @@ async def test_unresolvable_sub_agent_turn_still_warns(
         "a sub-agent name absent from the parent tree produced no "
         "unresolved-sub-agent warning; the child silently boots with the "
         "parent's prompt, tools and harness."
+    )
+
+
+def _shadowed_name_spec_tree() -> AgentSpec:
+    """A parent whose OWN name equals its sub-agent's name.
+
+    Legal today: ``_check_unique_sub_agent_names`` never adds the root's name
+    to the ``seen`` set, so this tree validates clean. ``_find_spec_by_name``
+    searches ``spec.sub_agents`` only, so it still resolves the CHILD here —
+    the swap must happen, and any name-equality shortcut would skip it.
+    """
+    child = AgentSpec(
+        spec_version=1,
+        name=SHADOWED_NAME,
+        executor=ExecutorSpec(type="omnigent", config={"harness": CHILD_HARNESS}),
+    )
+    return AgentSpec(
+        spec_version=1,
+        name=SHADOWED_NAME,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        sub_agents=[child],
+    )
+
+
+async def _shadowed_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+    """Resolve any agent_id to the name-shadowing parent tree."""
+    del agent_id, session_id
+    return _shadowed_name_spec_tree()
+
+
+class _ShadowedSnapshotServer(_SubAgentSnapshotServer):
+    """Snapshot server for the name-shadowing session id."""
+
+    def __init__(self) -> None:
+        super().__init__(SHADOWED_NAME)
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        del kwargs
+        u = url.rstrip("/")
+        if u.endswith(SHADOWED_SESSION_ID):
+            return self._Resp(
+                {
+                    "agent_id": PARENT_AGENT_ID,
+                    "sub_agent_name": SHADOWED_NAME,
+                    "parent_session_id": "conv_parent_polly",
+                    "created_at": 0,
+                    "workspace": None,
+                }
+            )
+        if u.endswith("/items"):
+            return self._Resp({"data": [], "has_more": False})
+        return super(_SubAgentSnapshotServer, self)._Response()
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_sharing_the_parent_name_still_swaps_to_the_child(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A parent named after its own sub-agent must still hand over the CHILD.
+
+    Guards the quiet-the-warning fix against a shortcut that skips the swap
+    whenever the spec in hand is *named* for the sub-agent: in this legal
+    tree the spec in hand is the PARENT and the swap is still required.
+    Skipping it boots the child with the parent's prompt, tools and harness —
+    the exact silent parent-clone the warning exists to catch, and the child
+    of a coordinator parent then re-dispatches into itself.
+
+    No priming here on purpose: the turn must resolve the parent tree fresh
+    from the bound ``agent_id`` (the state where the spec in hand really is
+    the parent), which is what makes the missing swap observable.
+    """
+    pm = _FakeProcessManager(
+        _ScriptedHarnessClient(
+            [
+                _sse({"type": "response.created", "response": {"id": "r1"}}),
+                _sse({"type": "response.completed", "response": {"id": "r1"}}),
+            ]
+        )
+    )
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_shadowed_spec_resolver,
+        server_client=_ShadowedSnapshotServer(),  # type: ignore[arg-type]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        async with _runner_client(app) as client:
+            turn = await client.post(
+                f"/v1/sessions/{SHADOWED_SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": PARENT_AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            )
+            assert turn.status_code == 202, f"{turn.status_code} {turn.text}"
+
+            for _ in range(300):
+                if pm.get_client_calls:
+                    break
+                await asyncio.sleep(0.01)
+
+        records = list(caplog.records)
+
+    harnesses = [h for (conv, h, _env) in pm.get_client_calls if conv == SHADOWED_SESSION_ID]
+    assert harnesses, "the turn never asked the process manager for a harness"
+    assert all(h == CHILD_HARNESS for h in harnesses), (
+        f"turn spawned {harnesses!r} for a sub-agent whose parent shares its "
+        f"name; expected only {CHILD_HARNESS!r}. A 'claude-sdk' spawn means the "
+        "swap was skipped and the child is running as a clone of its parent."
+    )
+
+    spurious = [r for r in records if _WARNING_FRAGMENT in r.getMessage()]
+    assert not spurious, (
+        "the name-shadowing tree resolves its sub-agent fine, yet the turn "
+        f"logged: {[r.getMessage() for r in spurious]!r}"
     )

@@ -5189,10 +5189,7 @@ def create_runner_app(
                     )
 
         _sa_name = await _recover_sub_agent_name(conv)
-        # The spec in hand may already BE the child: POST /v1/sessions and
-        # earlier turns cache the swapped sub-spec. Searching that for its own
-        # name always misses, which warned "did not resolve" on every turn.
-        if _sa_name and cached_spec is not None and cached_spec.name != _sa_name:
+        if _sa_name and cached_spec is not None:
             from omnigent.runtime.workflow import _find_spec_by_name
 
             sub_spec = _find_spec_by_name(cached_spec, _sa_name)
@@ -5203,7 +5200,10 @@ def create_runner_app(
                     if cached_spec_workdir is not None
                     else cached_spec
                 )
-            else:
+            elif cached_spec.name != _sa_name:
+                # A miss on a spec already named for the sub-agent means the
+                # cache holds the CHILD (POST /v1/sessions and earlier turns
+                # store the swapped sub-spec), not a parent fallback.
                 _warn_unresolved_sub_agent(conv, _sa_name)
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
