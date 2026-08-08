@@ -15,6 +15,11 @@ mentions three paths in backticks:
   - ``/etc/hosts`` — absolute and OUTSIDE the workspace → stays inert code
     (must never linkify).
 
+The message also includes a standard Markdown anchor whose destination is the
+absolute workspace path with a ``:line`` suffix. It must open the same
+session-scoped FileViewer instead of navigating the browser to a host-local
+URL.
+
 ``~`` expansion can only land inside the workspace when the root is itself
 under the runner's home. The default e2e workspace lives under ``$TMPDIR``
 (not home), so this test pins the agent's ``os_env.cwd`` to a fresh directory
@@ -148,7 +153,13 @@ def linkify_session(
         tilde_path = f"~/{rel_from_home}/{_ROOT_FILE}" if rel_from_home else f"~/{_ROOT_FILE}"
         abs_path = f"{root}/{_ROOT_FILE}"
 
-        message_text = f"Files I referenced:\n\n- `{tilde_path}`\n- `{abs_path}`\n- `/etc/hosts`\n"
+        message_text = (
+            f"Files I referenced:\n\n"
+            f"- `{tilde_path}`\n"
+            f"- `{abs_path}`\n"
+            f"- [README link]({abs_path}:2)\n"
+            f"- `/etc/hosts`\n"
+        )
         event_resp = httpx.post(
             f"{live_server}/v1/sessions/{session_id}/events",
             json={
@@ -184,6 +195,15 @@ def test_chat_linkifies_workspace_paths_including_home_relative(
     # before the fix because it starts with "/").
     expect(page.get_by_role("button", name=abs_path)).to_be_visible()
 
+    # A Markdown anchor to the same absolute path carries an optional line
+    # suffix. Its href must be a session-scoped file deep link, not the raw
+    # host path that the browser would resolve against the Omnigent origin.
+    markdown_link = page.get_by_role("link", name="README link")
+    expect(markdown_link).to_be_visible()
+    expect(markdown_link).to_have_attribute("href", re.compile(r"[?&]file=README\.md(?:&|$)"))
+    markdown_link.click()
+    page.wait_for_url(re.compile(r"[?&]file=README\.md(?:&|$)"), timeout=15_000)
+
     # The negative: an absolute path outside the workspace must NOT be a link and
     # must remain an inert <code> span. A button here would mean we linkified a
     # path the FileViewer can't open.
@@ -194,6 +214,12 @@ def test_chat_linkifies_workspace_paths_including_home_relative(
         "/etc/hosts should stay an inert <code> span, not a link — a different "
         "tag means an outside-workspace path was wrongly linkified."
     )
+
+    # Reset before exercising the existing inline-code link below; both links
+    # target README.md, so leaving ?file set would make its URL assertion vacuous.
+    page.goto(f"{base_url}/c/{session_id}")
+    tilde_link = page.get_by_role("button", name=tilde_path)
+    expect(tilde_link).to_be_visible(timeout=30_000)
 
     # Clicking the tilde link opens the FileViewer on the RESOLVED relative path
     # (README.md), not the literal "~/..." text. The clinching assertion is the
