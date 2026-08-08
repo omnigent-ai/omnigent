@@ -29,72 +29,152 @@ from omnigent._env_compat import mirror_legacy_env as _mirror_legacy_env  # noqa
 
 _mirror_legacy_env()
 
-from omnigent.inner.datamodel import (  # noqa: E402 — must follow md5 patch
-    AgentDef,
-    Connection,
-    Credentials,
-    History,
-    Memory,
-    MemoryConfig,
-    Message,
-    ParamDef,
-    SessionState,
-)
-from omnigent.inner.executor import (  # noqa: E402 — must follow md5 patch
-    Executor,
-    ExecutorConfig,
-    ExecutorError,
-    ExecutorEvent,
-    TextChunk,
-    ToolCallComplete,
-    ToolCallRequest,
-    TurnCancelled,
-    TurnComplete,
-)
-from omnigent.inner.policies import (  # noqa: E402 — must follow md5 patch
-    FunctionPolicy,
-    Policy,
-    PolicyAction,
-    PolicyResult,
-    PromptPolicy,
-)
-from omnigent.inner.tools import (  # noqa: E402 — must follow md5 patch
-    AgentTool,
-    CancellableFunctionTool,
-    FunctionTool,
-    HandoffTool,
-    InheritedTool,
-    MCPTool,
-    SkillTool,
-    Tool,
-)
+from typing import TYPE_CHECKING  # noqa: E402
 
-try:
-    from omnigent.inner.databricks_executor import DatabricksExecutor
-except (OSError, ImportError):
-    DatabricksExecutor = None  # type: ignore[misc,assignment]
-try:
+# Re-exports resolve on first access (PEP 562) instead of at import. Importing
+# this package eagerly pulled the executor / model-catalog / provider-config
+# chain — roughly 700ms — which every short-lived policy-hook subprocess paid at
+# startup while using none of it. The md5 patch and env mirror above stay eager,
+# so the "patch before any dependency import" ordering they require is unchanged
+# (dependencies now load strictly later, never earlier).
+_LAZY_EXPORTS = {
+    "AgentDef": "omnigent.inner.datamodel",
+    "Connection": "omnigent.inner.datamodel",
+    "Credentials": "omnigent.inner.datamodel",
+    "History": "omnigent.inner.datamodel",
+    "Memory": "omnigent.inner.datamodel",
+    "MemoryConfig": "omnigent.inner.datamodel",
+    "Message": "omnigent.inner.datamodel",
+    "ParamDef": "omnigent.inner.datamodel",
+    "SessionState": "omnigent.inner.datamodel",
+    "Executor": "omnigent.inner.executor",
+    "ExecutorConfig": "omnigent.inner.executor",
+    "ExecutorError": "omnigent.inner.executor",
+    "ExecutorEvent": "omnigent.inner.executor",
+    "TextChunk": "omnigent.inner.executor",
+    "ToolCallComplete": "omnigent.inner.executor",
+    "ToolCallRequest": "omnigent.inner.executor",
+    "TurnCancelled": "omnigent.inner.executor",
+    "TurnComplete": "omnigent.inner.executor",
+    "FunctionPolicy": "omnigent.inner.policies",
+    "Policy": "omnigent.inner.policies",
+    "PolicyAction": "omnigent.inner.policies",
+    "PolicyResult": "omnigent.inner.policies",
+    "PromptPolicy": "omnigent.inner.policies",
+    "AgentTool": "omnigent.inner.tools",
+    "CancellableFunctionTool": "omnigent.inner.tools",
+    "FunctionTool": "omnigent.inner.tools",
+    "HandoffTool": "omnigent.inner.tools",
+    "InheritedTool": "omnigent.inner.tools",
+    "MCPTool": "omnigent.inner.tools",
+    "SkillTool": "omnigent.inner.tools",
+    "Tool": "omnigent.inner.tools",
+    "load_agent_def": "omnigent.inner.loader",
+    "disable_tracing": "omnigent.inner.tracing",
+    "enable_tracing": "omnigent.inner.tracing",
+    "is_tracing_enabled": "omnigent.inner.tracing",
+}
+
+# Executors whose extras may be absent. The eager form wrapped each import in
+# ``try/except`` and fell back to ``None``; missing extras must keep degrading
+# gracefully rather than raising at attribute access.
+_OPTIONAL_EXPORTS = {
+    "DatabricksExecutor": ("omnigent.inner.databricks_executor", (OSError, ImportError)),
+    "ClaudeSDKExecutor": ("omnigent.inner.claude_sdk_executor", (ImportError,)),
+    "OpenResponsesExecutor": ("omnigent.inner.open_responses_sdk", (ImportError,)),
+    "OpenAIAgentsSDKExecutor": ("omnigent.inner.openai_agents_sdk_executor", (ImportError,)),
+    "CodexExecutor": ("omnigent.inner.codex_executor", (ImportError,)),
+}
+
+if TYPE_CHECKING:
+    # Static analysers cannot see ``__getattr__``-provided names; re-declare the
+    # re-exports so type checking and IDE completion behave as before.
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-except ImportError:
-    ClaudeSDKExecutor = None  # type: ignore[misc,assignment]
-try:
-    from omnigent.inner.open_responses_sdk import OpenResponsesExecutor
-except ImportError:
-    OpenResponsesExecutor = None  # type: ignore[misc,assignment]
-try:
-    from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
-except ImportError:
-    OpenAIAgentsSDKExecutor = None  # type: ignore[misc,assignment]
-try:
     from omnigent.inner.codex_executor import CodexExecutor
-except ImportError:
-    CodexExecutor = None  # type: ignore[misc,assignment]
-from omnigent.inner.loader import load_agent_def  # noqa: E402 — must follow md5 patch
-from omnigent.inner.tracing import (  # noqa: E402 — must follow md5 patch
-    disable_tracing,
-    enable_tracing,
-    is_tracing_enabled,
-)
+    from omnigent.inner.databricks_executor import DatabricksExecutor
+    from omnigent.inner.datamodel import (
+        AgentDef,
+        Connection,
+        Credentials,
+        History,
+        Memory,
+        MemoryConfig,
+        Message,
+        ParamDef,
+        SessionState,
+    )
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        ExecutorError,
+        ExecutorEvent,
+        TextChunk,
+        ToolCallComplete,
+        ToolCallRequest,
+        TurnCancelled,
+        TurnComplete,
+    )
+    from omnigent.inner.loader import load_agent_def
+    from omnigent.inner.open_responses_sdk import OpenResponsesExecutor
+    from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+    from omnigent.inner.policies import (
+        FunctionPolicy,
+        Policy,
+        PolicyAction,
+        PolicyResult,
+        PromptPolicy,
+    )
+    from omnigent.inner.tools import (
+        AgentTool,
+        CancellableFunctionTool,
+        FunctionTool,
+        HandoffTool,
+        InheritedTool,
+        MCPTool,
+        SkillTool,
+        Tool,
+    )
+    from omnigent.inner.tracing import disable_tracing, enable_tracing, is_tracing_enabled
+
+
+def __getattr__(name: str) -> object:
+    """
+    Resolve a re-exported name on first access.
+
+    :param name: Attribute requested from the ``omnigent`` package.
+    :returns: The re-exported object, or ``None`` for an optional executor
+        whose extra is not installed.
+    :raises AttributeError: If *name* is not a documented re-export.
+    """
+    import importlib
+
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is not None:
+        value = getattr(importlib.import_module(module_name), name)
+        globals()[name] = value
+        return value
+
+    optional = _OPTIONAL_EXPORTS.get(name)
+    if optional is not None:
+        module_name, errors = optional
+        try:
+            value = getattr(importlib.import_module(module_name), name)
+        except (*errors, AttributeError):
+            value = None
+        globals()[name] = value
+        return value
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """
+    List the package's public names, including lazily-resolved re-exports.
+
+    :returns: Sorted public attribute names.
+    """
+    return sorted(set(__all__) | set(globals()))
+
 
 __all__ = [
     "AgentDef",
