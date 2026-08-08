@@ -1,0 +1,22 @@
+<idea-plugin>
+  <id>ai.omnigent.intellij</id>
+  <name>Omnigent</name>
+  <vendor url="https://github.com/omnigent-ai/omnigent">Omnigent</vendor>
+  <description><![CDATA[ Open your running local Omnigent server inside a JCEF tool window. ]]></description>
+  <depends>com.intellij.modules.platform</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <applicationService serviceImplementation="ai.omnigent.intellij.config.OmnigentSettings"/>
+    <applicationConfigurable parentId="tools"
+        id="ai.omnigent.intellij.config.OmnigentConfigurable"
+        instance="ai.omnigent.intellij.config.OmnigentConfigurable"
+        displayName="Omnigent"/>
+    <toolWindow id="Omnigent" anchor="right" secondary="false"
+                icon="/icons/omnigent.svg"
+                factoryClass="ai.omnigent.intellij.toolwindow.OmnigentToolWindowFactory"/>
+  </extensions>
+  <actions>
+    <action id="ai.omnigent.intellij.Open"
+            class="ai.omnigent.intellij.actions.OpenOmnigentAction"
+            text="Omnigent: Open" description="Open the Omnigent tool window"/>
+  </actions>
+</idea-plugin>
