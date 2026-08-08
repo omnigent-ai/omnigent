@@ -1161,6 +1161,9 @@ describe("Workspace rail maximize", () => {
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useChangedFilesMock.mockReturnValue({
+      data: { available: true, data: [{ path: "a.ts", name: "a.ts", status: "modified" as const, bytes: 1 }] },
+    } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
 
     renderShell("/c/conv_abc");
@@ -1195,6 +1198,9 @@ describe("Workspace rail maximize", () => {
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useChangedFilesMock.mockReturnValue({
+      data: { available: true, data: [{ path: "a.ts", name: "a.ts", status: "modified" as const, bytes: 1 }] },
+    } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
 
     renderShell("/c/conv_abc");
@@ -1218,6 +1224,9 @@ describe("Workspace rail maximize", () => {
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useChangedFilesMock.mockReturnValue({
+      data: { available: true, data: [{ path: "a.ts", name: "a.ts", status: "modified" as const, bytes: 1 }] },
+    } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
     mockConversations([
       { id: "conv_abc", permission_level: null },
       { id: "conv_xyz", permission_level: null },
