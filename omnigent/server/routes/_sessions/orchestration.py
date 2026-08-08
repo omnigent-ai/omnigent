@@ -8777,7 +8777,7 @@ async def _get_session_snapshot(
     runner_router = get_runner_router()
     if runner_router is not None:
         try:
-            routed = runner_router.client_for_session_resources(session_id)
+            routed = await runner_router.aclient_for_session_resources(session_id)
             runner_client = routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(

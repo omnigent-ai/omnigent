@@ -410,7 +410,7 @@ class _FakeRunnerRouter:
         self.client = client
         self.session_ids: list[str] = []
 
-    def client_for_existing_conversation(self, session_id: str) -> _FakeRoutedRunner:
+    async def aclient_for_existing_conversation(self, session_id: str) -> _FakeRoutedRunner:
         self.session_ids.append(session_id)
         return _FakeRoutedRunner(self.client)
 

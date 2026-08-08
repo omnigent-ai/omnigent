@@ -898,7 +898,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
     # ensure spy does not chain through — the real helper would spawn
     # an SSE task that errors immediately against the stub client.
     router = ap_app.state.runner_router
-    real_resolver = router.client_for_session_resources
+    real_resolver = router.aclient_for_session_resources
     routed_calls: list[str] = []
     routed_clients: dict[str, Any] = {}
 
@@ -912,14 +912,14 @@ async def test_on_runner_connect_restarts_relay_via_router(
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
             return _StubResponse()
 
-    def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
+    async def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
         routed_calls.append(conv_id)
-        real_routed = real_resolver(conv_id)
+        real_routed = await real_resolver(conv_id)
         fake = RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
         routed_clients[conv_id] = fake.client
         return fake
 
-    router.client_for_session_resources = _spy_resolver  # type: ignore[method-assign]
+    router.aclient_for_session_resources = _spy_resolver  # type: ignore[method-assign]
 
     real_ensure = sessions_routes._ensure_runner_relay
     ensure_calls: list[tuple[str, str | None, Any]] = []
@@ -1023,7 +1023,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
             f"{other_session_id!r} bound to {other_runner_id!r}."
         )
     finally:
-        router.client_for_session_resources = real_resolver  # type: ignore[method-assign]
+        router.aclient_for_session_resources = real_resolver  # type: ignore[method-assign]
         sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
         if new_forwarder_task is not None:
             new_forwarder_task.cancel()
@@ -1063,7 +1063,7 @@ async def _reconnect_fires_connect_hook(
     from omnigent.server.routes import sessions as sessions_routes
 
     router = ap_app.state.runner_router
-    real_resolver = router.client_for_session_resources
+    real_resolver = router.aclient_for_session_resources
 
     class _StubResponse:
         status_code = 200
@@ -1075,11 +1075,11 @@ async def _reconnect_fires_connect_hook(
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
             return _StubResponse()
 
-    def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
-        real_routed = real_resolver(conv_id)
+    async def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
+        real_routed = await real_resolver(conv_id)
         return RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
 
-    router.client_for_session_resources = _spy_resolver  # type: ignore[method-assign]
+    router.aclient_for_session_resources = _spy_resolver  # type: ignore[method-assign]
 
     real_ensure = sessions_routes._ensure_runner_relay
 
@@ -1141,7 +1141,7 @@ async def _reconnect_fires_connect_hook(
 
         yield recovered_calls
     finally:
-        router.client_for_session_resources = real_resolver  # type: ignore[method-assign]
+        router.aclient_for_session_resources = real_resolver  # type: ignore[method-assign]
         sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
         sessions_routes._publish_runner_recovered_status = real_recover  # type: ignore[assignment]
         if forwarder_task is not None:

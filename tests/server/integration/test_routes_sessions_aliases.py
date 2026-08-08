@@ -244,7 +244,7 @@ async def test_delete_session_when_runner_offline(client: httpx.AsyncClient) -> 
     conv_id = snapshot["id"]
 
     class _OfflineRunnerRouter:
-        def client_for_session_resources(self, session_id: str) -> object:
+        async def aclient_for_session_resources(self, session_id: str) -> object:
             del session_id
             raise OmnigentError(
                 "runner 'runner_token_offline' is offline",

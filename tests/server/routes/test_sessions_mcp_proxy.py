@@ -33,7 +33,7 @@ class _RaisingRunnerClient:
 class _RaisingRunnerRouter:
     """RunnerRouter stub that hands back a client whose POST raises."""
 
-    def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+    async def aclient_for_session_resources(self, conversation_id: str) -> RoutedRunner:
         """Return a routed runner whose client fails on use.
 
         :param conversation_id: Ignored session id.

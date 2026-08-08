@@ -2213,7 +2213,15 @@ def create_app(
                 conv.agent_id,
             )
             try:
-                routed = runner_router.client_for_session_resources(conv.id)
+                # conv is already fetched; skip the DB round-trip by using
+                # the pinned runner_id directly.
+                if not conv.runner_id:
+                    _logger.debug(
+                        "_on_runner_connect: session %s has no runner_id, skipping",
+                        conv.id,
+                    )
+                    continue
+                routed = runner_router.client_for_pinned_runner(conv.runner_id)
             except OmnigentError:
                 _logger.exception(
                     "Failed to resolve runner client for session %s on reconnect",

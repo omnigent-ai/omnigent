@@ -4078,7 +4078,7 @@ async def _get_runner_client_impl(
 
     if runner_router is not None:
         try:
-            routed = runner_router.client_for_session_resources(
+            routed = await runner_router.aclient_for_session_resources(
                 session_id,
             )
             return routed.client
@@ -4606,7 +4606,7 @@ async def _get_runner_client_for_resource_access_impl(
 
     runner_router = get_runner_router()
     if runner_router is not None:
-        routed_runner = runner_router.client_for_session_resources(session_id)
+        routed_runner = await runner_router.aclient_for_session_resources(session_id)
         return routed_runner.client
     return cast("httpx.AsyncClient | None", get_runner_client())
 

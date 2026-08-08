@@ -9,6 +9,7 @@ tunnel.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -115,6 +116,60 @@ class RunnerRouter:
             code=ErrorCode.CONFLICT,
         )
 
+    def client_for_pinned_runner(self, runner_id: str) -> RoutedRunner:
+        """Return a runner client when the caller already knows the runner id.
+
+        Avoids a DB round-trip for callers that have a pre-fetched
+        conversation with ``runner_id`` already populated.
+
+        :param runner_id: Runner UUID from ``conversation.runner_id``.
+        :returns: Selected runner id and client.
+        :raises OmnigentError: If the runner is offline.
+        """
+        session = self._registry.get(runner_id)
+        if session is None:
+            raise OmnigentError(
+                f"runner {runner_id!r} is offline",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
+
+    async def aclient_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        """Async variant of :meth:`client_for_session_resources`.
+
+        Fetches the conversation in a thread so the event loop is not
+        blocked by the synchronous DB call.  Prefer this from async
+        request handlers; use :meth:`client_for_session_resources` only
+        from sync contexts.
+
+        :param conversation_id: Conversation/session id, e.g.
+            ``"conv_0123456789abcdef"``.
+        :returns: Selected runner id and client.
+        :raises OmnigentError: If the conversation is missing, the
+            pinned runner is offline, or no online runner is available.
+        """
+        conv = await asyncio.to_thread(
+            self._conversation_store.get_conversation, conversation_id
+        )
+        if conv is None:
+            raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
+        if conv.runner_id:
+            session = self._registry.get(conv.runner_id)
+            if session is None:
+                raise OmnigentError(
+                    f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            return RoutedRunner(
+                runner_id=conv.runner_id,
+                client=self._client_for_runner(conv.runner_id),
+            )
+        raise OmnigentError(
+            f"conversation {conversation_id!r} is not bound to a runner; "
+            "resume the session to bind a registered runner",
+            code=ErrorCode.CONFLICT,
+        )
+
     def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
         """
         Return a runner client for session resource access.
@@ -149,6 +204,38 @@ class RunnerRouter:
             f"conversation {conversation_id!r} is not bound to a runner; "
             "resume the session to bind a registered runner",
             code=ErrorCode.CONFLICT,
+        )
+
+    async def aclient_for_existing_conversation(
+        self, conversation_id: str
+    ) -> RoutedRunner | None:
+        """Async variant of :meth:`client_for_existing_conversation`.
+
+        Fetches the conversation in a thread so the event loop is not
+        blocked by the synchronous DB call.  Prefer this from async
+        request handlers; use :meth:`client_for_existing_conversation`
+        only from sync contexts.
+
+        :param conversation_id: Conversation id, e.g.
+            ``"conv_0123456789abcdef"``.
+        :returns: A routed runner when the conversation is pinned;
+            ``None`` when it is not pinned or not found.
+        :raises OmnigentError: If the pinned runner is offline.
+        """
+        conv = await asyncio.to_thread(
+            self._conversation_store.get_conversation, conversation_id
+        )
+        if conv is None or not conv.runner_id:
+            return None
+        session = self._registry.get(conv.runner_id)
+        if session is None:
+            raise OmnigentError(
+                f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        return RoutedRunner(
+            runner_id=conv.runner_id,
+            client=self._client_for_runner(conv.runner_id),
         )
 
     def client_for_existing_conversation(self, conversation_id: str) -> RoutedRunner | None:

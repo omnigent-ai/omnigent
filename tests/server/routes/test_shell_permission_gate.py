@@ -178,7 +178,7 @@ class _FakeRunnerRouter:
     def __init__(self, client: _RecordingRunnerClient) -> None:
         self.client = client
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    async def aclient_for_session_resources(self, session_id: str) -> _RoutedRunner:
         return _RoutedRunner(self.client)
 
 

@@ -412,7 +412,7 @@ class _FakeRunnerRouter:
         self.client = client
         self.resource_calls: list[str] = []
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    async def aclient_for_session_resources(self, session_id: str) -> _RoutedRunner:
         self.resource_calls.append(session_id)
         return _RoutedRunner(self.client)
 

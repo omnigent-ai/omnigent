@@ -273,7 +273,7 @@ async def _reset_runner_session_agent_cache(
     if runner_router is None:
         return
     try:
-        routed = runner_router.client_for_session_resources(session_id)
+        routed = await runner_router.aclient_for_session_resources(session_id)
     except (LookupError, httpx.HTTPError, OmnigentError):
         # The session may not be runner-bound yet. Persisting the bundle is
         # still correct; the next runner bind resolves the updated spec.
