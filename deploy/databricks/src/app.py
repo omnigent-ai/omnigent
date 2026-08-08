@@ -122,6 +122,17 @@ try:
     import tempfile
     from pathlib import Path
 
+    # The deploy ships the SPA as loose files beside app.py because the bundled
+    # assets take the main wheel over the Workspace 10 MB per-file cap.
+    # omnigent.server.app resolves the asset path at import time, so this has to
+    # run before create_app is imported below.
+    _WEB_UI_DIST = Path(__file__).parent / "web-ui"
+    if (_WEB_UI_DIST / "index.html").is_file():
+        os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(_WEB_UI_DIST))
+        logger.info("Web UI: serving loose assets from %s", _WEB_UI_DIST)
+    else:
+        logger.info("Web UI: no assets at %s; falling back to the wheel", _WEB_UI_DIST)
+
     import uvicorn
 
     from omnigent.runtime import init as init_runtime
