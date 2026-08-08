@@ -419,6 +419,7 @@ class _FakeStatusPoller:
         self.blocked_on: str | None = None
         self.ticks = 0
         self.retired = False
+        self.resyncs = 0
 
     def tick(self) -> None:
         self.ticks += 1
@@ -426,6 +427,9 @@ class _FakeStatusPoller:
     def retire(self) -> None:
         self.retired = True
         self.active = False
+
+    def resync(self) -> None:
+        self.resyncs += 1
 
     def emit(self, status: str, blocked_on: str | None = None) -> None:
         """Simulate the file reporting a new status."""
@@ -595,6 +599,62 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     del callbacks
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resync_republishes_a_running_session(tmp_path: Path) -> None:
+    """A server restart mid-turn must not strand the session on a stale status.
+
+    The tunnel reconnecting means the *listener* restarted and lost its status
+    cache. This runner did not, so its dedup baseline still asserts ``running``
+    was delivered — and Claude's file is written only when its value *changes*,
+    so nothing re-asserts on its own. Without the resync the session would show
+    no spinner and no stop button for the rest of the turn.
+    """
+    _callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_restart"
+    )
+    poller = pollers[0]
+    poller.active = True
+
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Mid-turn, the file's value is unchanged, so a re-read publishes nothing:
+    # this is exactly what leaves the restarted server on a stale status.
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    registry.resync_session_statuses()
+    assert poller.resyncs == 1
+
+    # The same value now republishes, so the fresh server learns the truth.
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Path) -> None:
+    """The resync clears published edges, not the exit memo.
+
+    ``_last_session_status`` decides whether a terminal exit reads as a clean
+    shutdown or a mid-turn crash. It tracks what the PANE last did, not what the
+    server has heard, so a reconnect must leave it alone — clearing it would make
+    a crash right after a reconnect look like a tidy exit.
+    """
+    _callbacks, _statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_memo"
+    )
+    pollers[0].active = True
+    pollers[0].emit("running")
+    await asyncio.sleep(0)
+
+    registry.resync_session_statuses()
+
+    assert registry._take_session_status_memo("conv_memo") == "running"
 
 
 @pytest.mark.asyncio

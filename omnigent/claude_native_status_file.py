@@ -27,11 +27,14 @@ watcher that consumes this treats an unresolved / unreadable file as
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
 
 # Runner-side status vocabulary the file maps onto. ``busy`` and
 # ``waiting`` both mean "the turn is not finished" from the session's point
@@ -343,15 +346,31 @@ class SessionStatusPoller:
     def _try_resolve(self) -> None:
         """Attempt one resolution, retiring to the PTY watcher on timeout."""
         self._attempts += 1
+        pane_pid = self._pane_pid_getter()
         path = resolve_status_file(
-            pane_pid=self._pane_pid_getter(),
+            pane_pid=pane_pid,
             expected_session_id=self._session_id_getter(),
             config_dir=self._config_dir,
         )
         if path is not None:
+            # Log the hit: whether the file was found at all decides which
+            # source owns the session's status, and without this the answer is
+            # only reachable by re-deriving the resolution by hand.
+            _logger.info(
+                "claude status file resolved: path=%s attempts=%d pane_pid=%s",
+                path,
+                self._attempts,
+                pane_pid,
+            )
             self._path = path
             return
         if self._attempts >= _MAX_RESOLVE_ATTEMPTS:
+            _logger.warning(
+                "claude status file never resolved after %d attempts "
+                "(pane_pid=%s); session status falls back to the pane watcher",
+                self._attempts,
+                pane_pid,
+            )
             self._exhausted = True
 
     def retire(self) -> None:
@@ -362,7 +381,26 @@ class SessionStatusPoller:
         the file owns the session's status while it is readable, a dead pane
         must retire it or that final value would pin the session forever.
         """
+        _logger.info("claude status file retired: path=%s", self._path)
         self._exhausted = True
+
+    def resync(self) -> None:
+        """Forget what was published so the next tick re-asserts the file.
+
+        The file is written only when its value *changes*, so a poller that
+        already published ``running`` has nothing more to say until Claude's
+        status moves. That is a problem when the *listener* restarts: a server
+        recycle wipes its status cache, and the session would sit on a stale
+        ``idle`` for the rest of the turn because every source believes it
+        already reported. Dropping the edge/mtime baselines makes the next tick
+        publish the file's current value verbatim.
+
+        Keeps the resolved path and the attempt count — this re-asserts a
+        working poller, it does not restart resolution.
+        """
+        _logger.info("claude status file resync: path=%s", self._path)
+        self._last_mtime = None
+        self._last_edge = None
 
     @property
     def blocked_on(self) -> str | None:

@@ -329,6 +329,64 @@ def test_retire_stops_the_file_owning_status(tmp_path: Path) -> None:
     assert published == [(RUNNING, "input needed")]
 
 
+def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
+    """A resync makes the next tick re-assert the file's current value.
+
+    The file is rewritten only when its value *changes*, so a poller mid-turn
+    has nothing more to say — which strands the server when the SERVER is what
+    restarted and lost its cache. A resync drops the edge/mtime baselines so the
+    same value publishes again.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    # Unchanged file: normally silent, which is the whole problem.
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    poller.resync()
+    poller.tick()
+    assert published == [(RUNNING, None), (RUNNING, None)]
+    # Still reading the same resolved file — a resync re-asserts a working
+    # poller rather than restarting resolution.
+    assert poller.active is True
+
+
+def test_resync_does_not_revive_a_retired_poller(tmp_path: Path) -> None:
+    """A retired poller stays retired across a reconnect.
+
+    Retirement means the pane's process is gone (or no file ever resolved), so
+    the PTY side owns the outcome. A reconnect must not hand ownership back to a
+    dead Claude's leftover record.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    poller.retire()
+
+    poller.resync()
+    poller.tick()
+
+    assert poller.active is False
+    assert published == [RUNNING]
+
+
 def test_waiting_carries_its_reason(tmp_path: Path) -> None:
     """``waiting`` exposes ``waitingFor`` so the UI can say what it is parked on."""
     sessions = tmp_path / "sessions"
