@@ -24,6 +24,7 @@ const ESC = String.fromCharCode(27);
 
 // A stripped launchd-style PATH (the input state this whole module exists to fix).
 const STRIPPED = "/usr/bin:/bin:/usr/sbin:/sbin";
+const STRIPPED_WITH_USR_LOCAL = `${STRIPPED}:/usr/local/bin`;
 const zshUser = { userInfo: () => ({ shell: "/bin/zsh" }) };
 
 describe("extractPath", () => {
@@ -60,12 +61,12 @@ describe("stripAnsi", () => {
 });
 
 describe("isLikelyLoginPath (fast-path skip)", () => {
-  it("is true on darwin when a Homebrew dir is already present", () => {
+  it("is true on darwin when the Apple Silicon Homebrew dir is already present", () => {
     assert.equal(isLikelyLoginPath({ PATH: "/opt/homebrew/bin:/usr/bin" }, "darwin"), true);
-    assert.equal(isLikelyLoginPath({ PATH: "/usr/local/bin:/usr/bin" }, "darwin"), true);
   });
-  it("is false on darwin for a stripped PATH", () => {
+  it("is false on darwin for stripped PATH variants", () => {
     assert.equal(isLikelyLoginPath({ PATH: STRIPPED }, "darwin"), false);
+    assert.equal(isLikelyLoginPath({ PATH: STRIPPED_WITH_USR_LOCAL }, "darwin"), false);
   });
   it("is false off darwin (never skip on Linux)", () => {
     assert.equal(isLikelyLoginPath({ PATH: "/opt/homebrew/bin" }, "linux"), false);
@@ -89,6 +90,21 @@ describe("resolveLoginShellPath", () => {
     // Uses os.userInfo().shell, not $SHELL, and runs interactive+login.
     assert.equal(calls[0].shell, "/bin/zsh");
     assert.equal(calls[0].args[0], "-ilc");
+  });
+
+  it("resolves when a stripped macOS GUI PATH includes /usr/local/bin", () => {
+    let calls = 0;
+    const result = resolveLoginShellPath({
+      execFileSync: () => {
+        calls += 1;
+        return `${START}/opt/homebrew/bin:/usr/bin${END}`;
+      },
+      os: zshUser,
+      env: { PATH: STRIPPED_WITH_USR_LOCAL },
+      platform: "darwin",
+    });
+    assert.equal(result, "/opt/homebrew/bin:/usr/bin");
+    assert.equal(calls, 1);
   });
 
   it("prefers $SHELL when the passwd DB has no shell", () => {
