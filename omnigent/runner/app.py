@@ -5189,7 +5189,10 @@ def create_runner_app(
                     )
 
         _sa_name = await _recover_sub_agent_name(conv)
-        if _sa_name and cached_spec is not None:
+        # The spec in hand may already BE the child: POST /v1/sessions and
+        # earlier turns cache the swapped sub-spec. Searching that for its own
+        # name always misses, which warned "did not resolve" on every turn.
+        if _sa_name and cached_spec is not None and cached_spec.name != _sa_name:
             from omnigent.runtime.workflow import _find_spec_by_name
 
             sub_spec = _find_spec_by_name(cached_spec, _sa_name)
