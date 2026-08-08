@@ -117,7 +117,7 @@ export BL_WORKSPACE=your-non-production-workspace
 export OMNIGENT_BLAXEL_TEST_WORKSPACE=your-non-production-workspace
 # Optional image override:
 # export OMNIGENT_BLAXEL_HOST_IMAGE=blaxel/omnigent-host:<tag>
-uv run --extra blaxel python tests/e2e/integrations/deploy/blaxel/smoke_test.py
+uv run --extra blaxel python tests/e2e/integrations/deploy/blaxel/blaxel_smoke_test.py
 ```
 
 The test checks command success and failure, binary file transfer, streaming, active-process cleanup, attach and running-state lookup, and idempotent deletion with final absence.
