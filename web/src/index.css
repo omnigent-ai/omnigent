@@ -14,6 +14,10 @@
  * app theme customization in this file. */
 @source "../node_modules/streamdown/dist/*.js";
 
+.chat-column-width {
+  max-width: var(--chat-column-max-width, 48rem);
+}
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {

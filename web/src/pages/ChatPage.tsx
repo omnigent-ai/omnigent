@@ -346,7 +346,7 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 }
 
 // All chat-column elements must share this width to stay aligned.
-const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
+const CHAT_COLUMN_WIDTH = "chat-column-width";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
@@ -3666,9 +3666,9 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
-        className={isWide ? "max-w-full" : "max-w-3xl"}
+        className={isWide ? "max-w-full" : CHAT_COLUMN_WIDTH}
       >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
+        {/* A fold-only bubble takes w-full at the ordinary chat-column cap
             rather than shrink-wrapping to the summary row's ~110px, which
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the

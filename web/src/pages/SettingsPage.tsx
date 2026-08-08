@@ -137,6 +137,14 @@ import {
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
+import {
+  applyChatViewWidth,
+  chatViewWidths,
+  CHAT_VIEW_WIDTH_DEFAULT,
+  readChatViewWidth,
+  writeChatViewWidth,
+  type ChatViewWidth,
+} from "@/lib/chatViewWidthPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
@@ -572,6 +580,40 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
+function ChatViewWidthControl() {
+  const [value, setValue] = useState(() => readChatViewWidth());
+  const labelId = useId();
+  const choose = useCallback((next: ChatViewWidth) => {
+    setValue(next);
+    writeChatViewWidth(next);
+  }, []);
+  const labels: Record<ChatViewWidth, string> = {
+    normal: "Normal",
+    wide: "Wide",
+    "extra-wide": "Extra-wide",
+  };
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Chat width"
+      helper="Choose how much horizontal space the conversation and composer use."
+    >
+      <CardRadioGroup<ChatViewWidth>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-3 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={chatViewWidths.map((width) => ({
+          value: width,
+          testId: `chat-view-width-${width}`,
+          body: <span className="text-center text-ui font-medium">{labels[width]}</span>,
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now.
   const { resolvedTheme } = useTheme();
@@ -845,6 +887,8 @@ function AppearanceSection() {
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
+    writeChatViewWidth(CHAT_VIEW_WIDTH_DEFAULT);
+    applyChatViewWidth(CHAT_VIEW_WIDTH_DEFAULT);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
@@ -869,6 +913,7 @@ function AppearanceSection() {
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
           "omnigent:default-workspace-panel",
+          "omnigent:chat-view-width",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -911,6 +956,8 @@ function AppearanceSection() {
         {!isEmbedded && <ColorThemeControl />}
 
         <WorkspacePanelDefaultControl />
+
+        <ChatViewWidthControl />
 
         <HideUnconfiguredHarnessesControl />
 

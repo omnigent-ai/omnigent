@@ -42,11 +42,14 @@ import {
   reactRouterRouting,
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
+import { applyChatViewWidth, readChatViewWidth } from "./lib/chatViewWidthPreferences";
 import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
+
+applyChatViewWidth(readChatViewWidth());
 
 export type { OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";

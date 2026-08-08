@@ -213,6 +213,7 @@ afterEach(() => {
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
   document.documentElement.removeAttribute("data-custom-translucent-sidebar");
+  document.documentElement.style.removeProperty("--chat-column-max-width");
   for (const property of Array.from(document.documentElement.style)) {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
@@ -275,6 +276,22 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "false");
     expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
     expect(localStorage.getItem("omnigent:terminal-theme")).toBeNull();
+  });
+
+  it("persists the selected chat width", () => {
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("chat-view-width-normal")).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(screen.getByTestId("chat-view-width-extra-wide"));
+
+    expect(localStorage.getItem("omnigent:chat-view-width")).toBe("extra-wide");
+    expect(screen.getByTestId("chat-view-width-extra-wide")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(document.documentElement.style.getPropertyValue("--chat-column-max-width")).toBe(
+      "64rem",
+    );
   });
 
   it("renders Terminal theme before Color theme", () => {

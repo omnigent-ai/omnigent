@@ -23,6 +23,7 @@ import {
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
+import { applyChatViewWidth, readChatViewWidth } from "./lib/chatViewWidthPreferences";
 import { initChatStore } from "./store/chatStore";
 import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
@@ -62,6 +63,7 @@ initNativeInsets();
 // Apply the saved desktop UI font size and family before first paint so there's no flash.
 applyDesktopUiFontSize(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
+applyChatViewWidth(readChatViewWidth());
 
 // The standalone sidebar font size control was removed. Clear its legacy value
 // so sidebar items follow the shared desktop interface size.
