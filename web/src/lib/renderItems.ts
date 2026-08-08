@@ -238,6 +238,13 @@ export interface BubbleCache {
   blocks: AnyBlock[] | null;
   activeResponse: ActiveResponse | null;
   interruptedResponseIds: readonly string[] | null;
+  // Response id of the newest assistant turn while the SESSION is running,
+  // or null. Drives the trailing-tool spinner for harnesses whose
+  // running/idle lives in `sessionStatus` rather than a streaming
+  // `activeResponse` (see `newestAssistantTurnId`). Part of the cache key: a
+  // running→idle flip carries no block change, so the identity short-circuit
+  // must see it move or a dangling tool would spin forever.
+  liveTurnId: string | null;
   bubbles: Bubble[];
   lastBubbleStart: number;
   lastBubbleCount: number;
@@ -252,11 +259,45 @@ export function createBubbleCache(): BubbleCache {
     blocks: null,
     activeResponse: null,
     interruptedResponseIds: null,
+    liveTurnId: null,
     bubbles: [],
     lastBubbleStart: -1,
     lastBubbleCount: 1,
     supersededChips: new Set<number>(),
   };
+}
+
+/**
+ * Response id of the newest assistant turn — the turn whose trailing tool
+ * phase should spin while the SESSION is running.
+ *
+ * claude-native's running/idle lives in `sessionStatus` (the status file
+ * drives the badge; no streaming `activeResponse` is ever opened — see the
+ * transcript forwarder), so its in-flight tool calls can't key their spinner
+ * off `lifecycle === "streaming"` the way an in-process harness does. Instead
+ * the caller passes `sessionRunning` and this names which turn is live.
+ *
+ * Scans back from the end: the first assistant-side block carrying a real
+ * (non-anonymous) response id names that turn. A trailing user message (a
+ * just-sent prompt with no assistant output yet), a compaction/routing
+ * boundary, or an empty transcript yields `null` — there is no live turn.
+ */
+function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const b = blocks[i]!;
+    if (
+      b.type === "user_message" ||
+      b.type === "compaction" ||
+      b.type === "compaction_loading" ||
+      b.type === "routing_decision"
+    ) {
+      return null;
+    }
+    if (isNonRenderingBlock(b) || b.type === "tool_result") continue;
+    if (isAnonymousRid(b.ctx.responseId)) continue;
+    return b.ctx.responseId;
+  }
+  return null;
 }
 
 /**
@@ -279,14 +320,24 @@ export function createBubbleCache(): BubbleCache {
  *   and the unit tests rely on.
  * @param interruptedResponseIds - response ids whose bubbles should remain
  *   labelled cancelled even after the active response sidecar has moved on.
+ * @param sessionRunning - whether the SESSION status is running/waiting.
+ *   Lets the newest turn's trailing tool phase spin for a harness whose
+ *   liveness lives in `sessionStatus` rather than a streaming `activeResponse`
+ *   (claude-native). Does NOT change any bubble's `lifecycle` — fork, fold,
+ *   cancelled, and failed are unaffected; it only reaches the tool-state gate.
  */
 export function buildBubbles(
   blocks: AnyBlock[],
   activeResponse: ActiveResponse | null,
   cache?: BubbleCache,
   interruptedResponseIds: readonly string[] = EMPTY_INTERRUPTED_RESPONSE_IDS,
+  sessionRunning = false,
 ): Bubble[] {
   const interruptedResponses = new Set(interruptedResponseIds);
+  // The newest turn spins its trailing tools only while the session runs; an
+  // already-streaming `activeResponse` covers the in-process harnesses without
+  // it, so this is null unless the session is running.
+  const liveTurnId = sessionRunning ? newestAssistantTurnId(blocks) : null;
   // Resolved over the whole transcript before any reuse decision: a create-time
   // chip and the turn chip that repeats it verbatim are one verdict however far
   // apart they landed, and whether the pair is still visible decides whether the
@@ -294,8 +345,16 @@ export function buildBubbles(
   const superseded = supersededRoutingChips(blocks);
   if (cache === undefined) {
     return markContinuedTurns(
-      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map(), superseded)
-        .bubbles,
+      walkBubbles(
+        blocks,
+        activeResponse,
+        interruptedResponses,
+        0,
+        [],
+        new Map(),
+        superseded,
+        liveTurnId,
+      ).bubbles,
       activeResponse,
     );
   }
@@ -304,14 +363,22 @@ export function buildBubbles(
   if (
     cache.blocks === blocks &&
     cache.activeResponse === activeResponse &&
-    cache.interruptedResponseIds === interruptedResponseIds
+    cache.interruptedResponseIds === interruptedResponseIds &&
+    cache.liveTurnId === liveTurnId
   ) {
     return cache.bubbles;
   }
 
   // Try the incremental path: reuse every finalized bubble (all but the
   // last) and rebuild only from where the last cached bubble started.
-  const reuse = reusablePrefix(blocks, activeResponse, interruptedResponses, cache, superseded);
+  const reuse = reusablePrefix(
+    blocks,
+    activeResponse,
+    interruptedResponses,
+    cache,
+    superseded,
+    liveTurnId,
+  );
   if (reuse !== null) {
     const subIndexSeed = new Map<string, number>();
     for (const b of reuse.prefix) {
@@ -327,10 +394,12 @@ export function buildBubbles(
       reuse.prefix,
       subIndexSeed,
       superseded,
+      liveTurnId,
     );
     cache.blocks = blocks;
     cache.activeResponse = activeResponse;
     cache.interruptedResponseIds = interruptedResponseIds;
+    cache.liveTurnId = liveTurnId;
     cache.bubbles = markContinuedTurns(rest.bubbles, activeResponse);
     cache.lastBubbleStart = rest.lastBubbleStart;
     cache.lastBubbleCount = rest.lastBubbleCount;
@@ -347,10 +416,12 @@ export function buildBubbles(
     [],
     new Map(),
     superseded,
+    liveTurnId,
   );
   cache.blocks = blocks;
   cache.activeResponse = activeResponse;
   cache.interruptedResponseIds = interruptedResponseIds;
+  cache.liveTurnId = liveTurnId;
   cache.bubbles = markContinuedTurns(full.bubbles, activeResponse);
   cache.lastBubbleStart = full.lastBubbleStart;
   cache.lastBubbleCount = full.lastBubbleCount;
@@ -495,6 +566,7 @@ function reusablePrefix(
   interruptedResponses: ReadonlySet<string>,
   cache: BubbleCache,
   superseded: ReadonlySet<number>,
+  liveTurnId: string | null,
 ): { prefix: Bubble[]; startBlock: number } | null {
   if (cache.blocks === null || cache.bubbles.length === 0 || cache.lastBubbleStart <= 0) {
     return null;
@@ -548,6 +620,15 @@ function reusablePrefix(
     for (const b of prefix) {
       if (b.kind === "assistant" && b.responseId === activeId) return null;
     }
+  }
+  // Same hazard for the session-driven spinner: the turn that WAS live (its
+  // trailing tool showed a spinner) or the one that IS now must be re-walked,
+  // not reused, so its tool state settles. Guard both — on an A→B transition A
+  // has moved into the prefix carrying its stale spinner, and on a
+  // running→idle flip the still-last bubble must drop it.
+  const liveIds = [liveTurnId, cache.liveTurnId];
+  for (const b of prefix) {
+    if (b.kind === "assistant" && liveIds.includes(b.responseId)) return null;
   }
   for (const b of prefix) {
     if (b.kind === "assistant" && interruptedResponses.has(b.responseId)) {
@@ -629,6 +710,7 @@ function walkBubbles(
   seedBubbles: Bubble[],
   subIndexByResp: Map<string, number>,
   superseded: ReadonlySet<number>,
+  liveTurnId: string | null = null,
 ): { bubbles: Bubble[]; lastBubbleStart: number; lastBubbleCount: number } {
   const bubbles: Bubble[] = [...seedBubbles];
   // One cross-bubble result index per walk: the relay backdates a
@@ -848,7 +930,15 @@ function walkBubbles(
       stableId,
       lifecycle,
       error,
-      items: buildAssistantItems(groupBlocks, lifecycle, crossBubbleResults),
+      // `sessionLive` spins this turn's trailing tools when the session is
+      // running and this is the newest turn — for a harness with no streaming
+      // `activeResponse`. `lifecycle` (and thus fork/fold) is untouched.
+      items: buildAssistantItems(
+        groupBlocks,
+        lifecycle,
+        crossBubbleResults,
+        liveTurnId !== null && groupResponseId === liveTurnId,
+      ),
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
     });
@@ -1194,11 +1284,12 @@ function buildAssistantItems(
   groupBlocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
   crossBubbleResults: Map<string, ToolResultBlock>,
+  sessionLive = false,
 ): RenderItem[] {
   // Results render only by folding into a call's card — strip them so
   // an absorbed out-of-band result can't split a text/reasoning run.
   const blocks = groupBlocks.filter((b) => b.type !== "tool_result");
-  const liveToolCallIds = trailingLiveToolCallIds(blocks, lifecycle);
+  const liveToolCallIds = trailingLiveToolCallIds(blocks, lifecycle, sessionLive);
 
   // Pre-compute: is there any non-empty TextDone in this bubble?
   // Used to drop trailing-empty assistant messages — the server
@@ -1386,9 +1477,17 @@ function buildAssistantItems(
 function trailingLiveToolCallIds(
   blocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
+  sessionLive = false,
 ): Set<string> {
   const callIds = new Set<string>();
-  if (lifecycle !== "streaming") return callIds;
+  // Spin the trailing tool phase when EITHER this bubble is the streaming
+  // `activeResponse` (in-process harnesses) OR the session is running and this
+  // is its newest turn (`sessionLive`, for claude-native, whose liveness lives
+  // in `sessionStatus`). A settled turn — reloaded history, a finished or
+  // cancelled turn, a dead harness whose session reads idle — passes neither,
+  // so a result-less tool still resolves to `no-output`, never a perpetual
+  // spinner.
+  if (lifecycle !== "streaming" && !sessionLive) return callIds;
 
   for (let i = blocks.length - 1; i >= 0; i -= 1) {
     const b = blocks[i]!;
