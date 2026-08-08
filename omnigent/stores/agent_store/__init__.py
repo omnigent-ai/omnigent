@@ -8,6 +8,13 @@ from abc import ABC, abstractmethod
 from omnigent.entities import Agent, PagedList
 
 
+class _UnsetDescription:
+    """Sentinel for bundle-only updates that preserve agent metadata."""
+
+
+_UNSET_DESCRIPTION = _UnsetDescription()
+
+
 class AgentStore(ABC):
     """
     Abstract base for agent persistence.
@@ -120,16 +127,20 @@ class AgentStore(ABC):
         self,
         agent_id: str,
         bundle_location: str,
+        *,
+        description: str | None | _UnsetDescription = _UNSET_DESCRIPTION,
     ) -> Agent | None:
         """
-        Update an agent's bundle location, bump its version, and
-        set ``updated_at``. Returns the updated agent, or ``None``
-        if no agent with the given ID exists.
+        Update an agent's bundle location and optional description,
+        bump its version, and set ``updated_at``. Returns the updated
+        agent, or ``None`` if no agent with the given ID exists.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param description: Replacement description. Omit to preserve
+            the existing description; pass ``None`` to clear it.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
