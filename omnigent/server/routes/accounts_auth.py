@@ -531,15 +531,14 @@ def create_accounts_auth_router(
                 cookie_secret=config.cookie_secret,
                 session_ttl_hours=config.session_ttl_hours,
             )
-            # Single-user continuity: a loopback server flipping into accounts
-            # mode is the same human's laptop. The pre-accounts chats are owned
-            # by the reserved ``local`` user; hand them to the new admin so they
-            # stay visible (sessions are listed by owner, with no admin-sees-all
-            # bypass). Loopback-only, so a multi-user deploy never reassigns one
-            # user's sessions to another.
-            if permission_store is not None:
-                permission_store.ensure_user(username, is_admin=True)
-                permission_store.reassign_user_grants(RESERVED_USER_LOCAL, username)
+        # Single-user continuity: when the first admin is claimed from a DB
+        # that previously held single-user sessions, hand ``local``-owned
+        # sessions to the new admin. This fires for loopback and remote
+        # first-run setups alike; it only touches rows owned by the reserved
+        # ``local`` sentinel, which cannot be created in accounts mode.
+        if permission_store is not None:
+            permission_store.ensure_user(username, is_admin=True)
+            permission_store.reassign_user_grants(RESERVED_USER_LOCAL, username)
         session_jwt = mint_session_cookie(
             user_id=username,
             cookie_secret=config.cookie_secret,
