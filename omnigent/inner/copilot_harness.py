@@ -25,6 +25,10 @@ Env vars read at startup:
 - ``HARNESS_COPILOT_GITHUB_TOKEN``: GitHub token carrying Copilot access, used
   as the SDK ``github_token``. ``None`` falls back to an inherited
   ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``.
+- ``HARNESS_COPILOT_GH_HOST``: GitHub Enterprise host origin (e.g.
+  ``"https://tenant.ghe.com"``), exported into this process's env as
+  ``COPILOT_GH_HOST`` so the SDK-spawned CLI targets that host instead of
+  api.github.com. Unset means github.com.
 - ``HARNESS_COPILOT_OS_ENV``: JSON-encoded :class:`OSEnvSpec` (its ``cwd`` is
   used when ``HARNESS_COPILOT_CWD`` is unset). Defaults to
   ``caller_process + sandbox=none``.
@@ -53,10 +57,28 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_COPILOT_MODEL"
 _ENV_CWD = "HARNESS_COPILOT_CWD"
 _ENV_GITHUB_TOKEN = "HARNESS_COPILOT_GITHUB_TOKEN"
+_ENV_GH_HOST = "HARNESS_COPILOT_GH_HOST"
 _ENV_OS_ENV = "HARNESS_COPILOT_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_COPILOT_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_COPILOT_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_COPILOT_AGENT_NAME"
+
+
+def _apply_gh_host() -> None:
+    """Export the configured GitHub Enterprise host into this process's env.
+
+    The Copilot SDK spawns its bundled CLI inheriting ``os.environ`` and
+    exposes no env or host parameter (see ``CopilotClient(...)`` in
+    ``copilot_executor.py``), so the process env is the only channel for
+    ``COPILOT_GH_HOST``. The harness process serves exactly one conversation,
+    so a process-global export is safe, unlike
+    ``claude_sdk_executor._unset_env_var``, which restores its variable
+    because it mutates around a single spawn. Deliberately never sets
+    ``GH_HOST``: that would retarget every ``gh`` invocation the agent makes.
+    """
+    host = os.environ.get(_ENV_GH_HOST, "").strip()
+    if host:
+        os.environ["COPILOT_GH_HOST"] = host
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -126,6 +148,7 @@ def _build_copilot_executor() -> Executor:
 
     :raises ImportError: If the ``github-copilot-sdk`` package isn't installed.
     """
+    _apply_gh_host()
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
     return CopilotExecutor(

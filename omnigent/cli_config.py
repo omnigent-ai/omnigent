@@ -2701,9 +2701,12 @@ def _manage_copilot_harness() -> None:
     from omnigent.onboarding.copilot_auth import (
         COPILOT_CONFIG_KEY,
         COPILOT_SECRET_NAME,
+        copilot_gh_host,
+        copilot_gh_host_removed_settings,
         copilot_github_token_configured,
         copilot_github_token_ref,
         copilot_sdk_installed,
+        copilot_token_removed_settings,
     )
     from omnigent.onboarding.interactive import select
 
@@ -2718,6 +2721,7 @@ def _manage_copilot_harness() -> None:
     while True:
         config = _load_global_config()
         token_set = copilot_github_token_configured(config)
+        gh_host = copilot_gh_host(config)
 
         rows: list[_HarnessMenuRow] = [
             _HarnessMenuRow(
@@ -2727,11 +2731,21 @@ def _manage_copilot_harness() -> None:
         ]
         if token_set:
             rows.append(_HarnessMenuRow("Remove GitHub token", action="remove_key"))
+        rows.append(
+            _HarnessMenuRow(
+                "Change GitHub Enterprise host" if gh_host else "Set GitHub Enterprise host",
+                action="set_host",
+            )
+        )
+        if gh_host:
+            rows.append(_HarnessMenuRow("Use github.com (clear host)", action="clear_host"))
         rows.append(_HarnessMenuRow("← Back", action="back"))
 
         header = (
             "Copilot — GitHub token configured" if token_set else "Copilot — no GitHub token yet"
         )
+        if gh_host:
+            header += f" · {gh_host.removeprefix('https://')}"
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
             return
@@ -2740,15 +2754,31 @@ def _manage_copilot_harness() -> None:
             return
         if action == "set_key":
             status = _set_copilot_github_token()
+        elif action == "set_host":
+            status = _set_copilot_gh_host()
+        elif action == "clear_host":
+            # Deep-merge cannot delete a nested key, so a removal writes the
+            # remaining block back whole (or unsets an emptied block).
+            settings = copilot_gh_host_removed_settings(config)
+            if settings is None:
+                _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            else:
+                _save_global_config(settings)
+            status = "✓ Copilot now uses github.com"
         elif action == "remove_key":
             ref = copilot_github_token_ref(config)
             # Only the secret we own (``keychain:copilot``) is ours to delete: a
             # hand-edited block may point at a shared ``keychain:<other>`` secret,
             # and an ``env:`` ref names the user's own environment. In both of
-            # those cases just drop the config block and leave the secret.
+            # those cases just drop the token fields and leave the secret. A
+            # configured ``gh_host`` survives the token removal.
             if ref == f"keychain:{COPILOT_SECRET_NAME}":
                 secret_store.delete_secret(COPILOT_SECRET_NAME)
-            _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            settings = copilot_token_removed_settings(config)
+            if settings is None:
+                _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            else:
+                _save_global_config(settings)
             status = "✓ Removed Copilot GitHub token"
 
 
@@ -2766,6 +2796,7 @@ def _set_copilot_github_token() -> str | None:
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.copilot_auth import (
+        COPILOT_CONFIG_KEY,
         COPILOT_SECRET_NAME,
         COPILOT_TOKEN_ENV_VARS,
         copilot_github_token_settings,
@@ -2784,7 +2815,11 @@ def _set_copilot_github_token() -> str | None:
             default=False,
         ):
             return None
-        _save_global_config(copilot_github_token_settings(f"env:{detected_var}"))
+        # Deep-merge the block so a configured ``gh_host`` survives.
+        _save_global_config(
+            copilot_github_token_settings(f"env:{detected_var}"),
+            deep_merge_keys=(COPILOT_CONFIG_KEY,),
+        )
         return f"✓ Copilot GitHub token set (from ${detected_var})"
 
     pasted = prompt_text("GitHub token with Copilot access", hide_input=True).strip()
@@ -2797,8 +2832,49 @@ def _set_copilot_github_token() -> str | None:
     ):
         return None
     secret_store.store_secret(COPILOT_SECRET_NAME, pasted)
-    _save_global_config(copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"))
+    _save_global_config(
+        copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"),
+        deep_merge_keys=(COPILOT_CONFIG_KEY,),
+    )
     return "✓ Copilot GitHub token stored"
+
+
+def _set_copilot_gh_host() -> str | None:
+    """Prompt for and store the Copilot GitHub Enterprise host; return a status line.
+
+    The value is normalized (whitespace / trailing slash) and shape-checked
+    softly: a surprising value warns but can be forced through, mirroring the
+    token-shape check. On a Copilot seat served from a GHE data-residency
+    tenant the runtime exports it as ``COPILOT_GH_HOST`` for the harness, so
+    token validation runs against that host instead of api.github.com. An
+    empty enter keeps the current value (clearing has its own menu row).
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_CONFIG_KEY,
+        copilot_gh_host,
+        copilot_gh_host_settings,
+        looks_like_gh_host,
+        normalize_gh_host,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    current = copilot_gh_host(_load_global_config()) or ""
+    raw = prompt_text(
+        "GitHub Enterprise host (e.g. https://tenant.ghe.com)",
+        default=current,
+    )
+    host = normalize_gh_host(raw)
+    if not host or host == current:
+        return None
+    if not looks_like_gh_host(host) and not click.confirm(
+        f"{host!r} doesn't look like a https://<host> GitHub Enterprise origin. Use it anyway?",
+        default=False,
+    ):
+        return None
+    _save_global_config(copilot_gh_host_settings(host), deep_merge_keys=(COPILOT_CONFIG_KEY,))
+    return f"✓ Copilot host set to {host.removeprefix('https://')}"
 
 
 def _manage_credential(provider: str, family: str) -> str | None:
@@ -3337,6 +3413,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.copilot_auth import (
         COPILOT_EXTRA,
         COPILOT_TOKEN_ENV_VARS,
+        copilot_gh_host,
         copilot_github_token_configured,
         copilot_sdk_installed,
     )
@@ -3703,7 +3780,11 @@ def _run_configure_harnesses_interactive() -> None:
         if copilot_github_token_configured(config) or any(
             os.environ.get(v) for v in COPILOT_TOKEN_ENV_VARS
         ):
-            rows.append((COPILOT_KEY, "Copilot", "GitHub token", "ready", ""))
+            gh_host = copilot_gh_host(config)
+            summary = (
+                f"GitHub token · {gh_host.removeprefix('https://')}" if gh_host else "GitHub token"
+            )
+            rows.append((COPILOT_KEY, "Copilot", summary, "ready", ""))
         elif not copilot_sdk_installed():
             rows.append(
                 (

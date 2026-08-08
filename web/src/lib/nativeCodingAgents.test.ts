@@ -221,3 +221,41 @@ describe("isRecentHarness", () => {
     expect(isRecentHarness(pi, ["not-a-harness"])).toBe(false);
   });
 });
+
+describe("chat-mode registry entries (copilot)", () => {
+  it("binds the copilot entry by agent name with modelPicker capability", async () => {
+    const { nativeCodingAgentForAgentName } = await import("./nativeCodingAgents");
+    const entry = nativeCodingAgentForAgentName("copilot");
+    expect(entry?.key).toBe("copilot");
+    expect(entry?.sessionMode).toBe("chat");
+    expect(entry?.capabilities).toContain("modelPicker");
+  });
+
+  it("does not claim agents by the copilot harness", async () => {
+    // A user-created agent on the copilot harness must stay an ordinary
+    // picker agent instead of being folded into the registry row; only the
+    // seeded `copilot` builtin (name match) becomes the Harnesses entry.
+    const { nativeCodingAgentForAvailableAgent } = await import("./nativeCodingAgents");
+    expect(nativeCodingAgentForHarness("copilot")).toBeUndefined();
+    expect(
+      nativeCodingAgentForAvailableAgent({ name: "my-copilot-variant", harness: "copilot" }),
+    ).toBeUndefined();
+  });
+
+  it("creates chat sessions: no terminal wrapper labels", () => {
+    expect(nativeWrapperLabelsForAgent({ name: "copilot", harness: "copilot" })).toBeUndefined();
+    // Terminal entries keep their labels.
+    expect(
+      nativeWrapperLabelsForAgent({ name: "claude-native-ui", harness: "claude-native" }),
+    ).toMatchObject({ [WRAPPER_LABEL_KEY]: "claude-code-native-ui" });
+  });
+
+  it("never classifies copilot sessions as native terminal sessions", () => {
+    expect(isNativeTerminalSession({ harness: "copilot", labels: {} })).toBe(false);
+    // The terminal classification stays intact for native harnesses.
+    expect(isNativeTerminalSession({ harness: "claude-native", labels: {} })).toBe(true);
+    expect(isNativeTerminalSession({ labels: { [WRAPPER_LABEL_KEY]: "codex-native-ui" } })).toBe(
+      true,
+    );
+  });
+});

@@ -23,15 +23,17 @@ def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
     Cursor readiness keys off a configured ``CURSOR_API_KEY`` and copilot off a
     GitHub token (the ``cursor:`` / ``copilot:`` config blocks or the
-    environment), so point the config home at an empty tmp dir and clear any
-    ambient ``CURSOR_API_KEY`` / ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
-    ``GITHUB_TOKEN`` — otherwise a developer's real key would flip their verdict
-    under these tests.
+    environment) or a Copilot CLI login, so point the config home at an empty
+    tmp dir, clear any ambient ``CURSOR_API_KEY`` / ``COPILOT_GITHUB_TOKEN`` /
+    ``GH_TOKEN`` / ``GITHUB_TOKEN``, and point ``COPILOT_HOME`` at a
+    nonexistent dir; otherwise a developer's real key or ``copilot login``
+    would flip their verdict under these tests.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
     # Codex readiness resolves the binary via resolve_cli_binary, which honors
     # an OMNIGENT_CODEX_PATH override and probes on-disk global install dirs.
     # Clear the override and stub the fallback dirs so a developer's real codex
@@ -617,3 +619,38 @@ def test_antigravity_native_requires_credential(
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     assert harness_is_configured("antigravity-native") is True
     assert harness_is_configured("native-antigravity") is True
+
+
+def test_copilot_ready_via_cli_login_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A Copilot CLI login alone satisfies copilot readiness (no token anywhere).
+
+    With no token configured the SDK leaves the CLI's auto-login on and the
+    runtime authenticates as the ``copilot login`` user, so the probe must
+    accept that marker. Failed before the fix: readiness was
+    token-presence-only and blocked working CLI-login setups (e.g. GitHub
+    Enterprise data-residency seats, whose stored login carries its host).
+    """
+    home = tmp_path / "copilot-home"
+    home.mkdir()
+    (home / "config.json").write_text(
+        "// User settings belong in settings.json.\n"
+        '{"lastLoggedInUser": {"host": "https://example.ghe.com/", "login": "alice"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("COPILOT_HOME", str(home))
+    assert harness_is_configured("copilot") is True
+    assert harness_is_configured("github-copilot") is True
+
+
+def test_copilot_unready_without_token_or_cli_login() -> None:
+    """No token and no CLI login: copilot stays unconfigured.
+
+    The autouse fixture clears the token sources and points ``COPILOT_HOME``
+    at a nonexistent dir, so the setup hint remains truthful in the genuinely
+    unconfigured case.
+    """
+    assert harness_is_configured("copilot") is False
+    assert harness_is_configured("github-copilot") is False

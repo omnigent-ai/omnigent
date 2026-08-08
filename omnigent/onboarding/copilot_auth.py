@@ -15,6 +15,7 @@ dedicated top-level ``copilot:`` block in ``~/.omnigent/config.yaml``::
 
     copilot:
       github_token_ref: keychain:copilot   # or env:GH_TOKEN
+      gh_host: https://bmw.ghe.com         # optional; omit for github.com
 
 The reference is resolved with the same :func:`resolve_secret` resolver the
 provider families use. A dedicated block (rather than the shared global
@@ -31,7 +32,11 @@ accepted by Copilot.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import re
 import subprocess
+from pathlib import Path
 
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.extra_install import extra_install_command
@@ -45,6 +50,12 @@ COPILOT_SECRET_NAME = "copilot"
 COPILOT_CONFIG_KEY = "copilot"
 _TOKEN_REF_FIELD = "github_token_ref"
 _TOKEN_FIELD = "github_token"
+_GH_HOST_FIELD = "gh_host"
+
+# The env var the Copilot CLI/SDK reads to point token validation and the
+# Copilot backend at a GitHub Enterprise host. Deliberately NOT ``GH_HOST``:
+# that would also retarget every ``gh`` invocation the agent makes.
+COPILOT_GH_HOST_ENV_VAR = "COPILOT_GH_HOST"
 
 # Ambient GitHub-token env vars, in the precedence the Copilot CLI/SDK honors.
 COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
@@ -54,6 +65,57 @@ COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # never lock anyone out of their own token. Classic ``ghp_`` PATs are excluded
 # because Copilot rejects them.
 _GITHUB_TOKEN_PREFIXES = ("github_pat_", "gho_", "ghu_", "ghs_")
+
+# The Copilot CLI's state directory override (the CLI's own convention) and the
+# managed config file inside it that records the logged-in user.
+COPILOT_HOME_ENV_VAR = "COPILOT_HOME"
+_CLI_CONFIG_FILENAME = "config.json"
+_CLI_LOGIN_FIELD = "lastLoggedInUser"
+
+
+def _copilot_cli_config_path() -> Path:
+    """Return the Copilot CLI's managed config file path.
+
+    Honors the CLI's ``COPILOT_HOME`` override; defaults to ``~/.copilot``.
+
+    :returns: Path to ``config.json`` inside the Copilot CLI home.
+    """
+    home = os.environ.get(COPILOT_HOME_ENV_VAR, "").strip()
+    base = Path(home) if home else Path.home() / ".copilot"
+    return base / _CLI_CONFIG_FILENAME
+
+
+def copilot_cli_logged_in() -> bool:
+    """Return whether the Copilot CLI has a logged-in user on this machine.
+
+    With no GitHub token configured anywhere, the SDK leaves the CLI's
+    auto-login on (``use_logged_in_user``) and the runtime authenticates as
+    the user from ``copilot login``; the credential also carries its GitHub
+    host, which makes it the working auth source for GitHub Enterprise
+    data-residency seats (``copilot login --host <tenant>.ghe.com``). The
+    login itself lives in the OS keychain, but the CLI records the identity
+    in its managed ``config.json``; that marker is what this probe reads.
+
+    The file is JSONC (the CLI writes ``//`` line comments), so comment
+    lines are stripped before parsing. Any unreadable or unparseable state
+    reads as "not logged in"; this feeds a readiness probe, never an
+    error path.
+
+    :returns: ``True`` when a logged-in user is recorded.
+    """
+    try:
+        raw = _copilot_cli_config_path().read_text(encoding="utf-8")
+    except OSError:
+        return False
+    cleaned = re.sub(r"^\s*//.*$", "", raw, flags=re.M)
+    try:
+        doc = json.loads(cleaned)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    user = doc.get(_CLI_LOGIN_FIELD)
+    return isinstance(user, dict) and bool(user.get("login"))
 
 
 def looks_like_github_copilot_token(value: str) -> bool:
@@ -192,11 +254,117 @@ def copilot_github_token_configured(config: dict[str, object] | None = None) -> 
 def copilot_github_token_settings(ref: str) -> dict[str, object]:
     """Build the ``{"copilot": {...}}`` settings dict that records *ref*.
 
-    Handed to :func:`omnigent.cli._save_global_config` (a shallow update, so it
-    replaces the whole ``copilot:`` block) to persist the reference.
+    Handed to :func:`omnigent.cli._save_global_config` with the ``copilot:``
+    block deep-merged, so an already-configured ``gh_host`` survives a token
+    change (and vice versa).
 
     :param ref: The secret reference to record, e.g. ``"keychain:copilot"`` or
         ``"env:GH_TOKEN"``.
     :returns: ``{"copilot": {"github_token_ref": ref}}``.
     """
     return {COPILOT_CONFIG_KEY: {_TOKEN_REF_FIELD: ref}}
+
+
+def normalize_gh_host(value: str) -> str:
+    """Canonicalize a typed GitHub Enterprise host value.
+
+    Trims whitespace and trailing slashes; an effectively empty input becomes
+    ``""``, which callers treat as "use github.com" (the field is then not
+    written at all).
+
+    :param value: The raw user input, e.g. ``" https://bmw.ghe.com/ "``.
+    :returns: The canonical host string, or ``""`` when empty.
+    """
+    return value.strip().rstrip("/")
+
+
+def looks_like_gh_host(value: str) -> bool:
+    """Return whether *value* has the expected GHE host shape, softly.
+
+    The Copilot CLI was probed with a full ``https://<tenant>.ghe.com``
+    origin; other shapes (a bare hostname, an explicit path) are unverified
+    rather than known-broken, so this check is *soft*: setup warns and lets
+    the user force the value through, mirroring the token-shape check. A
+    ``github.com``/``api.`` value is flagged too: the field exists precisely
+    for the non-default host.
+
+    :param value: A normalized (see :func:`normalize_gh_host`) candidate.
+    :returns: ``True`` when the value looks like a ``https://`` origin
+        without a path and does not point at github.com.
+    """
+    if not value.startswith("https://"):
+        return False
+    rest = value.removeprefix("https://")
+    if not rest or "/" in rest:
+        return False
+    host = rest.split(":", 1)[0].lower()
+    return host != "github.com" and not host.startswith("api.")
+
+
+def copilot_gh_host(config: dict[str, object] | None = None) -> str | None:
+    """Return the configured GitHub Enterprise host for Copilot, if any.
+
+    :param config: A pre-loaded config mapping; ``None`` loads the global
+        config.
+    :returns: The configured host origin, e.g. ``"https://bmw.ghe.com"``, or
+        ``None`` when Copilot authenticates against github.com.
+    """
+    cfg = load_config() if config is None else config
+    block = cfg.get(COPILOT_CONFIG_KEY)
+    if not isinstance(block, dict):
+        return None
+    host = block.get(_GH_HOST_FIELD)
+    if not isinstance(host, str):
+        return None
+    normalized = normalize_gh_host(host)
+    return normalized or None
+
+
+def copilot_gh_host_settings(host: str) -> dict[str, object]:
+    """Build the ``{"copilot": {...}}`` settings dict that records *host*.
+
+    Handed to :func:`omnigent.cli._save_global_config` with the ``copilot:``
+    block deep-merged, so the token reference survives a host change.
+
+    :param host: The normalized host origin to record.
+    :returns: ``{"copilot": {"gh_host": host}}``.
+    """
+    return {COPILOT_CONFIG_KEY: {_GH_HOST_FIELD: host}}
+
+
+def _copilot_block_without(
+    config: dict[str, object], fields: tuple[str, ...]
+) -> dict[str, object] | None:
+    """The ``{"copilot": {...}}`` settings dict minus *fields*, or ``None``.
+
+    ``None`` signals "nothing would remain"; the caller then unsets the whole
+    ``copilot:`` block instead of writing an empty one. Deep-merge cannot
+    delete a nested key, so removals are written as a full-block replace.
+    """
+    block = config.get(COPILOT_CONFIG_KEY)
+    remaining = (
+        {key: value for key, value in block.items() if key not in fields}
+        if isinstance(block, dict)
+        else {}
+    )
+    return {COPILOT_CONFIG_KEY: remaining} if remaining else None
+
+
+def copilot_token_removed_settings(config: dict[str, object]) -> dict[str, object] | None:
+    """Settings that drop the token fields but keep the rest (e.g. ``gh_host``).
+
+    :param config: The pre-loaded global config.
+    :returns: A full-block replacement for :func:`_save_global_config`, or
+        ``None`` when the whole ``copilot:`` block should be unset.
+    """
+    return _copilot_block_without(config, (_TOKEN_REF_FIELD, _TOKEN_FIELD))
+
+
+def copilot_gh_host_removed_settings(config: dict[str, object]) -> dict[str, object] | None:
+    """Settings that drop ``gh_host`` but keep the token reference.
+
+    :param config: The pre-loaded global config.
+    :returns: A full-block replacement for :func:`_save_global_config`, or
+        ``None`` when the whole ``copilot:`` block should be unset.
+    """
+    return _copilot_block_without(config, (_GH_HOST_FIELD,))

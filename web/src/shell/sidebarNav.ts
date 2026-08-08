@@ -113,6 +113,7 @@ export const PI_NATIVE_DEFAULT_LABEL = "Pi";
 export type ConversationIconKind =
   | "claude"
   | "codex"
+  | "copilot"
   | "opencode"
   | "pi"
   | "cursor"

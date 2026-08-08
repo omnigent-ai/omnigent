@@ -2124,6 +2124,21 @@ def _build_copilot_spawn_env(
                 if os.environ.get(_env_var):
                     env["HARNESS_COPILOT_GITHUB_TOKEN"] = os.environ[_env_var]
                     break
+    # GitHub Enterprise: the Copilot CLI/SDK validates a token against
+    # api.github.com unless ``COPILOT_GH_HOST`` names another host, and
+    # ``CopilotClient`` exposes no host parameter, so the harness process env is
+    # the only channel (see ``_apply_gh_host`` in
+    # ``omnigent/inner/copilot_harness.py``). An explicit ``executor.config``
+    # value wins over the host registered once via ``omnigent setup`` (the
+    # ``copilot:`` block); reading the config HERE, in the runner, is what
+    # spares the value the daemon/runner env allowlists above this hop.
+    gh_host = spec.executor.config.get("gh_host")
+    if gh_host is None:
+        from omnigent.onboarding.copilot_auth import copilot_gh_host
+
+        gh_host = copilot_gh_host()
+    if gh_host:
+        env["HARNESS_COPILOT_GH_HOST"] = str(gh_host)
     # Always set so the wrap doesn't fall back to ``"all"`` and override an
     # explicit ``skills: none`` from the spec (parity with the peer builders).
     env["HARNESS_COPILOT_SKILLS_FILTER"] = json.dumps(spec.skills_filter)

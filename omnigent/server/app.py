@@ -159,6 +159,7 @@ _WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_COPILOT_AGENT_NAME = "copilot"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # polly's and debby's multi-file bundles are packaged under
@@ -473,6 +474,7 @@ def _ensure_default_agents(
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_copilot_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -729,6 +731,89 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+
+
+# The packaged copilot chat agent. Inline rather than a resources bundle:
+# unlike polly/debby (multi-file images with sub-agents and skills) this is a
+# single plain spec, and generating it here keeps the seeded content and the
+# seeder in one place. The GitHub Copilot harness is SDK-in-process (chat, no
+# terminal wrapper), so the picker renders this as a chat entry in the
+# Harnesses section (see web/src/lib/nativeCodingAgents.ts, sessionMode
+# "chat").
+_COPILOT_AGENT_SPEC = """\
+spec_version: 1
+name: copilot
+description: GitHub Copilot chat and coding via the Copilot harness.
+
+executor:
+  type: omnigent
+  config:
+    harness: copilot
+
+prompt: |
+  You are a general-purpose coding and chat assistant running on the GitHub
+  Copilot harness. Help the user with whatever they ask: answer questions,
+  read and write code, run commands, and investigate the workspace. Be
+  concise and concrete. When you change files, state exactly what you
+  changed and how you verified it.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+"""
+
+
+def _build_copilot_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the generated copilot agent bundle.
+
+    Writes :data:`_COPILOT_AGENT_SPEC` as a one-file bundle dir and tars it,
+    mirroring the materialize -> bundle -> tar dance of the other seeders.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source = Path(tmpdir) / _COPILOT_AGENT_NAME
+        source.mkdir()
+        (source / "config.yaml").write_text(_COPILOT_AGENT_SPEC, encoding="utf-8")
+        bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_copilot_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register the packaged copilot chat agent.
+
+    Seeding it lets the Web UI's new-session picker offer GitHub Copilot as a
+    first-class entry next to Claude Code and Codex (the picker's Harnesses
+    section binds registry entries to built-in agents by name). Whether the
+    entry renders as ready is the readiness probe's job
+    (:mod:`omnigent.onboarding.harness_readiness`, token or CLI login), not a
+    seeding concern, exactly like the native rows, which are seeded
+    unconditionally too. Content-aware via :func:`_ensure_builtin_agent`: a
+    wheel that ships a changed spec refreshes the row in place.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_COPILOT_AGENT_NAME,
+        bundle_bytes=_build_copilot_bundle(),
     )
 
 
