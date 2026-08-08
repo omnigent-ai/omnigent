@@ -31,6 +31,22 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
+@pytest.fixture(autouse=True)
+def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient ``ANTHROPIC_DEFAULT_*_MODEL`` gateway pins (#4279).
+
+    claude-native model resolution reads these from ``os.environ``; a developer
+    whose shell pins them (anyone driving Claude through a gateway) otherwise
+    gets a different model-change verdict and these tests fail spuriously.
+    """
+    for var in (
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "effort_value",
