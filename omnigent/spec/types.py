@@ -518,6 +518,16 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         the literal string ``"inherit"`` on inline-AgentTool
         sub-specs. Empty dict for other executor types.
 
+        Native-harness autonomy pass-through: for server-spawned
+        sub-agents the session-create path reads ``"yolo"`` (bool or a
+        ``"true"``/``"false"`` string matched case-insensitively, with
+        no whitespace tolerance on the enabling value; enables
+        codex/cursor/kimi bypass flags, opt-out for codex/cursor and
+        opt-in for kimi) and ``"permission_mode"`` (exact-match string;
+        ``bypassPermissions`` maps to the claude-native /
+        antigravity-native skip flags) into the session's
+        ``terminal_launch_args``.
+
         🚨 **TECH DEBT — REMOVE WHEN OMNIGENT COMPAT ENDS.**
         This field exists *solely* to carry harness / profile /
         os_env data for the Omnigent integration (see
