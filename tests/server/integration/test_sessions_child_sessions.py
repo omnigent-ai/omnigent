@@ -31,6 +31,7 @@ import yaml
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions import orchestration as orchestration_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -1708,6 +1709,17 @@ async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str
     return child_resp.json()
 
 
+class _TerminalRecoveryClient:
+    """Record terminal-status re-forwards through a retained live client."""
+
+    def __init__(self) -> None:
+        self.posted: list[str] = []
+
+    async def post(self, url: str, **_kwargs: Any) -> httpx.Response:
+        self.posted.append(url)
+        return httpx.Response(202)
+
+
 async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1717,10 +1729,9 @@ async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale
 
     Reproduces the production hang's server edge: the child's pinned runner is
     gone (direct ``_forward_session_change_to_runner`` returns ``None``), so the
-    terminal-status branch must invoke
-    ``_recover_subagent_status_forward_via_parent`` and, when it lands, accept
-    the event (``202`` — the parent gets the child result) instead of the old
-    hard ``503`` that left the parent hanging.
+    terminal-status branch must retain the preflight's live client and use it
+    for reactive recovery. When that re-forward lands, the route accepts the
+    event instead of returning the old hard 503.
     """
     child = await _create_native_child(client, name="orch-recover-ok")
 
@@ -1728,17 +1739,21 @@ async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale
         """Child's pinned runner is unreachable — the direct forward fails."""
         return
 
-    recovered_for: list[str] = []
+    healed_for: list[str] = []
+    recovery_client = _TerminalRecoveryClient()
 
-    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
-        """Stand in for recovery: record the child and report a delivered 202."""
-        recovered_for.append(child_conv.id)
-        return sessions_module._RunnerForwardResult(status_code=202, body="")
+    async def _heal_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        healed_for.append(child_conv.id)
+        return recovery_client
+
+    async def _no_init(*_args: Any, **_kwargs: Any) -> bool:
+        return False
 
     monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
     monkeypatch.setattr(
-        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+        orchestration_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
     )
+    monkeypatch.setattr(orchestration_module, "_ensure_runner_session_initialized", _no_init)
 
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
@@ -1749,8 +1764,8 @@ async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale
     # was handled (not the old 503 that stranded the parent).
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
-    # Recovery was invoked for THIS child (the stale-binding heal path).
-    assert recovered_for == [child["id"]]
+    assert healed_for == [child["id"]]
+    assert recovery_client.posted == [f"/v1/sessions/{child['id']}/events"]
 
 
 async def test_subagent_background_task_waiting_delivers_to_parent_as_idle(
@@ -1773,16 +1788,21 @@ async def test_subagent_background_task_waiting_delivers_to_parent_as_idle(
         """Force the direct forward to miss so delivery takes the recovery path."""
         return
 
-    recovered_for: list[str] = []
+    healed_for: list[str] = []
+    recovery_client = _TerminalRecoveryClient()
 
-    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
-        recovered_for.append(child_conv.id)
-        return sessions_module._RunnerForwardResult(status_code=202, body="")
+    async def _heal_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        healed_for.append(child_conv.id)
+        return recovery_client
+
+    async def _no_init(*_args: Any, **_kwargs: Any) -> bool:
+        return False
 
     monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
     monkeypatch.setattr(
-        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+        orchestration_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
     )
+    monkeypatch.setattr(orchestration_module, "_ensure_runner_session_initialized", _no_init)
 
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
@@ -1793,10 +1813,11 @@ async def test_subagent_background_task_waiting_delivers_to_parent_as_idle(
     )
 
     # Delivery fired despite the incoming `waiting`: the collapse to `idle`
-    # let the terminal-status branch run for THIS child (recovery invoked,
-    # 202 Accepted) instead of silently skipping and stranding the parent.
+    # let the terminal-status branch run for THIS child instead of silently
+    # skipping and stranding the parent.
     assert resp.status_code == 202, resp.text
-    assert recovered_for == [child["id"]]
+    assert healed_for == [child["id"]]
+    assert recovery_client.posted == [f"/v1/sessions/{child['id']}/events"]
 
 
 async def test_subagent_idle_forward_503s_when_recovery_also_fails(
@@ -1815,13 +1836,13 @@ async def test_subagent_idle_forward_503s_when_recovery_also_fails(
         """Both the direct forward and (below) recovery cannot reach a runner."""
         return
 
-    async def _recover_none(*_args: Any, **_kwargs: Any) -> None:
-        """Recovery also fails to resolve a live parent runner."""
+    async def _heal_none(*_args: Any, **_kwargs: Any) -> None:
+        """The one ancestor walk cannot resolve a live parent runner."""
         return
 
     monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
     monkeypatch.setattr(
-        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_none
+        orchestration_module, "_heal_subagent_runner_binding_via_parent", _heal_none
     )
 
     resp = await client.post(
@@ -2055,3 +2076,102 @@ async def test_sdk_subagent_heal_skips_session_init(
     assert not init_called, (
         "_ensure_runner_session_initialized must not be called for SDK sub-agents after heal"
     )
+
+
+async def test_subagent_terminal_status_route_heals_diverged_runner_end_to_end(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    """
+    Route composition test: the real HTTP route heals a diverged child runner.
+
+    This patches only runner-client resolution and drives the real route and
+    orchestration wiring. The universal preflight heal must rebind the child
+    before the normal first forward, so the stale runner is never contacted
+    and no reactive parent handshake is needed.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name="orch-route-e2e",
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "impl:task-1",
+            "sub_agent_name": "impl",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    child = child_resp.json()
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.replace_runner_id(parent["session_id"], "runner_live")
+    conv_store.replace_runner_id(child["id"], "runner_stale")
+
+    stale_requests: list[str] = []
+    live_requests: list[str] = []
+
+    def _stale_handler(request: httpx.Request) -> httpx.Response:
+        stale_requests.append(request.url.path)
+        return httpx.Response(503)
+
+    def _live_handler(request: httpx.Request) -> httpx.Response:
+        live_requests.append(request.url.path)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                200, json={"session_init_protocol_version": 2, "terminal_ready": True}
+            )
+        return httpx.Response(202)
+
+    stale_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_stale_handler), base_url="http://stale-runner"
+    )
+    live_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_live_handler), base_url="http://live-runner"
+    )
+
+    def _client_for_runner_id(runner_id: str | None) -> httpx.AsyncClient | None:
+        if runner_id is None:
+            return None
+        return live_client if runner_id == "runner_live" else stale_client
+
+    async def _fake_get_runner_client(
+        session_id: str, runner_router: object
+    ) -> httpx.AsyncClient | None:
+        """Route by the session's CURRENT persisted runner_id, like the real router."""
+        del runner_router
+        conv = conv_store.get_conversation(session_id)
+        return _client_for_runner_id(conv.runner_id if conv is not None else None)
+
+    async def _fake_wait_for_runner_client(
+        session_id: str, runner_router: object, tunnel_registry: object, **_kwargs: Any
+    ) -> httpx.AsyncClient | None:
+        """Skip the real tunnel-connect wait — resolve by persisted runner_id instead."""
+        del runner_router, tunnel_registry
+        conv = conv_store.get_conversation(session_id)
+        return _client_for_runner_id(conv.runner_id if conv is not None else None)
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _fake_wait_for_runner_client)
+
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await stale_client.aclose()
+        await live_client.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    # The universal preflight heal keeps the stale runner out of the path.
+    assert stale_requests == []
+    # A successful first forward after healing does not run reactive init.
+    assert live_requests == [f"/v1/sessions/{child['id']}/events"]
+    # The child's runner_id healed to the parent's live one.
+    healed_child = conv_store.get_conversation(child["id"])
+    assert healed_child is not None and healed_child.runner_id == "runner_live"

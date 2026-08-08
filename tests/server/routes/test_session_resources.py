@@ -13,10 +13,20 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
+from omnigent.entities import (
+    DEFAULT_ENVIRONMENT_ID,
+    Conversation,
+    ConversationItem,
+    ErrorData,
+    PagedList,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
-from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
+from omnigent.server.routes.sessions import (
+    _ancestor_session_ids,
+    _RunnerForwardResult,
+    create_sessions_router,
+)
 from omnigent.server.schemas import SessionEventInput
 
 
@@ -957,6 +967,657 @@ async def test_native_subagent_terminal_boot_failure_surfaces_unreachable_runner
     )
     assert fake_runner.post_json_calls[-1][1]["type"] == "external_session_status"
     assert fake_runner.post_json_calls[-1][1]["data"]["status"] == "failed"
+
+
+class _RecoveryConversationStore(_ConversationStore):
+    """A diverged/cold parent+child pair, backed by the full fake store.
+
+    Extends the shared ``_ConversationStore`` (same ``append`` /
+    ``list_items`` / ``update_conversation`` machinery the real
+    ``_persist_native_terminal_failure`` write path needs) with its own
+    parent/child rows and ``replace_runner_id`` support, so these recovery
+    tests can set up a diverged ``runner_id`` pair without touching the
+    shared conv rows the other boot-failure tests above assert exact
+    ``fake_runner.calls`` counts against.
+
+    :param child_runner_id: The child's ``runner_id`` at test start.
+    :param parent_runner_id: The parent's ``runner_id`` at test start.
+    """
+
+    def __init__(self, *, child_runner_id: str | None, parent_runner_id: str | None) -> None:
+        super().__init__()
+        self.parent = Conversation(
+            id="parent_boot_fail",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="parent_boot_fail",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            runner_id=parent_runner_id,
+        )
+        self.child = Conversation(
+            id="child_boot_fail",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="parent_boot_fail",
+            kind="sub_agent",
+            parent_conversation_id="parent_boot_fail",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            runner_id=child_runner_id,
+        )
+        self._conversations[self.parent.id] = self.parent
+        self._conversations[self.child.id] = self.child
+        self.rebinds: list[tuple[str, str]] = []
+
+    def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
+        """Heal the child's ``runner_id`` in place, recording the call."""
+        self.rebinds.append((conversation_id, runner_id))
+        if conversation_id == self.child.id:
+            self.child.runner_id = runner_id
+        return self.child
+
+
+@pytest.mark.asyncio
+async def test_native_subagent_boot_failure_recovers_via_diverged_parent_runner() -> None:
+    """
+    A boot-failure wake with a diverged child ``runner_id`` heals via recovery.
+
+    ``_forward_native_subagent_terminal_failure`` is the OTHER terminal-status
+    call site (a native terminal that never boots, vs. the normal
+    idle/failed edge routes_events.py's post_event handles). It shares
+    :func:`_deliver_subagent_terminal_status_with_recovery` with that main
+    path — this proves the sharing actually works on THIS sibling: a child
+    pinned to a stale ``runner_id`` (its runner was relaunched under a new
+    id and only the parent was rebound) must heal before its normal first
+    forward and deliver through the parent's live runner.
+    """
+    from omnigent.server.routes.sessions import _forward_native_subagent_terminal_failure
+
+    store = _RecoveryConversationStore(
+        child_runner_id="runner_stale", parent_runner_id="runner_live"
+    )
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions": (
+                200,
+                {"session_init_protocol_version": 2, "terminal_ready": True},
+            ),
+        }
+    )
+    runner_router = _FakeRunnerRouter(fake_runner)
+
+    error = ErrorData(
+        source="execution",
+        code="native_terminal_start_failed",
+        message="Native Claude requires the 'claude' CLI on PATH.",
+    )
+
+    # No exception ⇒ _require_external_status_forward saw a real 2xx.
+    await _forward_native_subagent_terminal_failure(
+        "child_boot_fail",
+        store.child,
+        error,
+        runner_router,  # type: ignore[arg-type]
+        store,  # type: ignore[arg-type]
+        None,
+    )
+
+    # The healed first forward succeeds, so reactive session-init does not run.
+    assert fake_runner.calls == [("POST", "/v1/sessions/child_boot_fail/events")]
+    forward_url, forward_body = fake_runner.post_json_calls[-1]
+    assert forward_url == "/v1/sessions/child_boot_fail/events"
+    assert forward_body["data"]["status"] == "failed"
+    # The child's stale binding healed to the parent's live runner.
+    assert store.rebinds == [("child_boot_fail", "runner_live")]
+    assert store.child.runner_id == "runner_live"
+
+
+@pytest.mark.asyncio
+async def test_native_subagent_boot_failure_recovers_via_missing_parent_inbox_503() -> None:
+    """
+    A boot-failure wake recovers when the direct forward 503s missing-inbox.
+
+    Same shared-helper contract as above, but the OTHER recovery trigger:
+    child and parent already share the same ``runner_id`` (no divergence),
+    so the first attempt is a plain direct forward — which 503s
+    ``missing_parent_inbox`` (a cold parent this runner never ran
+    ``create_session`` for). The shared helper must initialize the parent and
+    retry through the retained preflight client rather than surfacing the 503.
+    """
+    from omnigent.server.routes.sessions import _forward_native_subagent_terminal_failure
+
+    store = _RecoveryConversationStore(
+        child_runner_id="runner_same", parent_runner_id="runner_same"
+    )
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions": (
+                200,
+                {"session_init_protocol_version": 2, "terminal_ready": True},
+            ),
+        }
+    )
+    runner_router = _FakeRunnerRouter(fake_runner)
+
+    events_url = "/v1/sessions/child_boot_fail/events"
+    events_call_count = {"n": 0}
+    original_post = fake_runner.post
+
+    async def _post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
+        """First hit on the events URL 503s missing_parent_inbox; the retry succeeds."""
+        if (
+            url == events_url
+            and isinstance(json, dict)
+            and json.get("type") == "external_session_status"
+        ):
+            events_call_count["n"] += 1
+            fake_runner.calls.append(("POST", url))
+            fake_runner.post_json_calls.append((url, json))
+            if events_call_count["n"] == 1:
+                return httpx.Response(
+                    503,
+                    json={
+                        "error": "subagent_delivery_not_confirmed",
+                        "reason": "missing_parent_inbox",
+                    },
+                    request=httpx.Request("POST", url),
+                )
+            return httpx.Response(202, request=httpx.Request("POST", url))
+        return await original_post(url, json=json, timeout=timeout)
+
+    fake_runner.post = _post  # type: ignore[method-assign]
+
+    error = ErrorData(
+        source="execution",
+        code="native_terminal_start_failed",
+        message="Native Claude requires the 'claude' CLI on PATH.",
+    )
+
+    await _forward_native_subagent_terminal_failure(
+        "child_boot_fail",
+        store.child,
+        error,
+        runner_router,  # type: ignore[arg-type]
+        store,  # type: ignore[arg-type]
+        None,
+    )
+
+    # Two attempts on the events URL (503 then 202), proving the retry
+    # actually happened rather than the first 503 being swallowed or
+    # surfaced.
+    assert events_call_count["n"] == 2
+    # The recovery path's session-init handshake ran too (the shared-helper
+    # wiring, not a bare retry of the same failing forward).
+    assert ("POST", "/v1/sessions") in fake_runner.calls
+    # Same runner_id on both sides ⇒ no rebind was needed.
+    assert store.rebinds == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_session_event_threads_tunnel_registry_to_boot_failure_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_dispatch_session_event_to_runner`` must forward ``tunnel_registry`` to
+    the native-boot-failure recovery chain, not silently drop it.
+
+    This is the exact regression class found across three review rounds —
+    round 1 (the main ``post_event`` route defaulted it), round 2
+    (``_dispatch_session_event_to_runner_impl`` itself had no parameter for
+    it), round 3 (``_wake_parent_for_blocked_child`` / the scheduled-task
+    dispatch never received it from their own callers). The two tests above
+    call the LEAF ``_forward_native_subagent_terminal_failure`` directly
+    with an explicit ``tunnel_registry=None`` — a caller-side threading bug
+    (exactly what broke in rounds 2 and 3) would not be caught by them,
+    since they never go through the caller that was actually broken.
+
+    This test instead drives the real entry point,
+    ``_dispatch_session_event_to_runner`` (the same function every caller
+    in the family — the main route, session-create's initial-items
+    dispatch, the blocked-sub-agent wake, and the scheduled-task fire path
+    — funnels through), with a distinct sentinel ``tunnel_registry`` object,
+    and asserts that SAME object reaches ``_wait_for_runner_client`` deep in
+    the recovery chain (``_dispatch_session_event_to_runner`` →
+    ``_persist_native_terminal_failure`` →
+    ``_forward_native_subagent_terminal_failure`` →
+    ``_deliver_subagent_terminal_status_with_recovery`` →
+    ``_heal_subagent_runner_binding_via_parent`` →
+    ``_wait_for_runner_client``). A future refactor that adds a new call
+    site without threading ``tunnel_registry`` through would fail this test
+    the moment that site is exercised via this same helper.
+    """
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _RecoveryConversationStore(
+        child_runner_id="runner_stale", parent_runner_id="runner_live"
+    )
+    # Native-terminal labels so the message dispatch takes the native bypass
+    # branch (_is_native_terminal_session(conv) True) instead of the
+    # generic item-persist path.
+    store.child.labels = {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": "claude-code-native-ui",
+    }
+
+    sentinel_tunnel_registry = object()
+    captured: dict[str, Any] = {}
+
+    async def _fake_ensure_native_terminal_ready(
+        runner_client: Any, session_id: str, conv: Any
+    ) -> Any:
+        """Force the boot-failure branch, as if the native CLI is missing."""
+        from omnigent.server.routes._sessions.helpers import _NativeTerminalEnsureOutcome
+
+        del runner_client, session_id, conv
+        return _NativeTerminalEnsureOutcome(
+            error=ErrorData(
+                source="execution",
+                code="native_terminal_start_failed",
+                message="Native Claude requires the 'claude' CLI on PATH.",
+            ),
+            policy_notice=None,
+        )
+
+    async def _fake_wait_for_runner_client(
+        session_id: str, runner_router: Any, tunnel_registry: Any, **kwargs: Any
+    ) -> None:
+        """Capture what recovery actually resolved the wait with, then give up cleanly."""
+        del runner_router, kwargs
+        captured["session_id"] = session_id
+        captured["tunnel_registry"] = tunnel_registry
+        return
+
+    # ``_ensure_native_terminal_ready`` is a direct implementation (no
+    # facade proxy split), so it must be patched where
+    # ``_dispatch_session_event_to_runner_impl`` actually calls it from —
+    # orchestration's own module globals — not the re-exported facade.
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        _fake_ensure_native_terminal_ready,
+    )
+    # ``_wait_for_runner_client`` IS a call-time facade proxy, so patching
+    # the facade module is honored by orchestration's internal call.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._wait_for_runner_client",
+        _fake_wait_for_runner_client,
+    )
+
+    fake_runner = _FakeRunnerClient()
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "review the PR"}]},
+    )
+
+    # The fake wait deliberately gives up (returns None) so recovery — and
+    # therefore the whole delivery — legitimately fails; only the CAPTURED
+    # kwargs matter here, not whether delivery itself succeeded.
+    with pytest.raises(OmnigentError, match="Could not reach runner"):
+        await _dispatch_session_event_to_runner(
+            "child_boot_fail",
+            store.child,
+            body,
+            store,
+            fake_runner,  # type: ignore[arg-type]
+            agent_name=None,
+            file_store=None,
+            artifact_store=None,
+            runner_router=None,
+            tunnel_registry=sentinel_tunnel_registry,
+        )
+
+    # The recovery chain reached _wait_for_runner_client for the PARENT
+    # (proving the diverged-runner_id recovery path actually ran)...
+    assert captured.get("session_id") == "parent_boot_fail"
+    # ...carrying the SAME sentinel object all the way from the dispatch
+    # call's kwarg — not None, and not a different object.
+    assert captured.get("tunnel_registry") is sentinel_tunnel_registry
+
+
+@pytest.mark.asyncio
+async def test_post_event_route_threads_tunnel_registry_to_boot_failure_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The real ``POST /v1/sessions/{id}/events`` route must thread
+    ``app.state.tunnel_registry`` through to the boot-failure recovery
+    chain — not the inner ``_dispatch_session_event_to_runner`` called
+    directly (see the test above, which proves that function's OWN
+    plumbing but cannot catch a bug in the ROUTE HANDLER that reads
+    ``app.state.tunnel_registry`` and fails to pass it down, which is
+    exactly the class of bug found across rounds 1-3 of a prior review:
+    the round-1 fix was in the route handler itself, and a regression
+    there would leave that inner-call test green).
+
+    Drives a real ASGI request through ``post_event`` (routes_events.py)
+    with ``app.state.tunnel_registry`` set to a sentinel object — the same
+    way ``create_app()`` stamps a real ``TunnelRegistry`` onto
+    ``app.state`` unconditionally at construction time (see
+    ``omnigent/server/app.py``) — and asserts that SAME sentinel reaches
+    ``_wait_for_runner_client`` deep in the recovery chain triggered by a
+    native sub-agent's terminal boot failure.
+    """
+    from omnigent.server.routes._sessions.helpers import _NativeTerminalEnsureOutcome
+
+    store = _RecoveryConversationStore(
+        child_runner_id="runner_stale", parent_runner_id="runner_live"
+    )
+    store.child.labels = {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": "claude-code-native-ui",
+    }
+
+    sentinel_tunnel_registry = object()
+    captured: dict[str, Any] = {}
+
+    async def _fake_ensure_native_terminal_ready(
+        runner_client: Any, session_id: str, conv: Any
+    ) -> Any:
+        del runner_client, session_id, conv
+        return _NativeTerminalEnsureOutcome(
+            error=ErrorData(
+                source="execution",
+                code="native_terminal_start_failed",
+                message="Native Claude requires the 'claude' CLI on PATH.",
+            ),
+            policy_notice=None,
+        )
+
+    async def _fake_wait_for_runner_client(
+        session_id: str, runner_router: Any, tunnel_registry: Any, **kwargs: Any
+    ) -> None:
+        del runner_router, kwargs
+        captured["session_id"] = session_id
+        captured["tunnel_registry"] = tunnel_registry
+        return
+
+    async def _fake_ensure_runner_relay_ready(*_args: Any, **_kwargs: Any) -> None:
+        """Skip the SSE relay entirely — irrelevant to tunnel_registry threading.
+
+        Unlike the shared ``_ConversationStore`` fixture rows (whose
+        ``runner_id`` defaults to ``None``, which makes
+        ``_ensure_runner_relay`` a no-op logging a skip), this test's child
+        has an explicit (stale) ``runner_id`` — required for the divergence
+        this test exercises — which means the relay setup genuinely runs.
+        ``_FakeRunnerClient``'s GET /stream isn't a real SSE stream, so
+        without this stub the relay's readiness wait times out first and
+        the request never reaches the boot-failure path at all.
+        """
+        return
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        _fake_ensure_native_terminal_ready,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._wait_for_runner_client",
+        _fake_wait_for_runner_client,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._ensure_runner_relay_ready",
+        _fake_ensure_runner_relay_ready,
+    )
+
+    fake_runner = _FakeRunnerClient()
+
+    class _DivergedRouter:
+        """Only resolves the PARENT's live runner_id — like a real router.
+
+        ``_FakeRunnerRouter`` resolves the same client for any session id,
+        which would make even the child's stale-runner direct forward
+        trivially succeed and mask the recovery path entirely. This
+        instead re-reads the conversation's CURRENT runner_id on every
+        resolve and raises for anything but ``"runner_live"``, so the
+        plain direct forward against the child's stale binding genuinely
+        fails and recovery is what has to carry the delivery.
+        """
+
+        def client_for_session_resources(self, session_id: str) -> Any:
+            conv = store.get_conversation(session_id)
+            if conv is None or conv.runner_id != "runner_live":
+                raise LookupError(f"runner for {session_id!r} is not live")
+            return type("Routed", (), {"client": fake_runner})()
+
+    runner_router = _DivergedRouter()
+
+    class _StubAgentStore:
+        def get(self, agent_id: str) -> None:
+            return None
+
+    boot_fail_app = FastAPI()
+
+    @boot_fail_app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    boot_fail_app.include_router(
+        create_sessions_router(
+            store,  # type: ignore[arg-type]
+            _StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=runner_router,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    # The real create_app() stamps this unconditionally at construction
+    # time, independent of lifespan startup (see omnigent/server/app.py) —
+    # mirror that exactly rather than relying on lifespan machinery this
+    # bare test app doesn't run.
+    boot_fail_app.state.tunnel_registry = sentinel_tunnel_registry
+
+    transport = httpx.ASGITransport(app=boot_fail_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/sessions/child_boot_fail/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "review the PR"}],
+                },
+            },
+        )
+
+    # The fake _wait_for_runner_client deliberately gives up (returns None),
+    # so recovery — and therefore the whole boot-failure wake — legitimately
+    # fails; the route must surface that as 503, not silently ACK. Only the
+    # CAPTURED kwargs matter to this test, not delivery succeeding.
+    assert resp.status_code == 503, resp.text
+    assert captured.get("session_id") == "parent_boot_fail"
+    assert captured.get("tunnel_registry") is sentinel_tunnel_registry, (
+        "the real POST /v1/sessions/{id}/events route did not thread "
+        "app.state.tunnel_registry through to the boot-failure recovery "
+        "chain — a nested native sub-agent's boot failure would recover "
+        "with no live-parent-reconnect wait."
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_event_no_runner_arm_threads_tunnel_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The "no runner bound at all" arm of ``post_event`` (routes_events.py,
+    around the ``if runner_client is None:`` block that calls
+    ``_persist_native_terminal_failure`` for a native-terminal ``message``,
+    NOT the ensure-probe-fails arm covered by the two tests above) must
+    thread ``app.state.tunnel_registry`` through too.
+
+    Distinct call site from the two tests above: those force
+    ``_ensure_native_terminal_ready`` to fail on an already-resolved runner
+    client; this one never resolves a runner client at all (no router, no
+    host binding), which is the OTHER path into
+    ``_persist_native_terminal_failure`` inside ``post_event`` itself. With
+    ``conv.host_id is None``, the whole host-relaunch/connect-grace block
+    (gated on ``conv.host_id is not None``) is skipped entirely — no
+    ``_wait_for_runner_client`` call happens on this path, so only
+    ``_persist_native_terminal_failure`` itself is spied here (imported via
+    wildcard into routes_events.py, so patching the ``routes_events``
+    module's own global is required — patching the ``sessions`` facade
+    would not affect this already-bound reference).
+    """
+    from omnigent.server.routes.sessions import routes_events as routes_events_module
+
+    store = _ConversationStore()
+    sentinel_tunnel_registry = object()
+    persist_captured: dict[str, Any] = {}
+
+    real_persist = routes_events_module._persist_native_terminal_failure
+
+    async def _spy_persist(*args: Any, **kwargs: Any) -> Any:
+        persist_captured["tunnel_registry"] = kwargs.get("tunnel_registry")
+        return await real_persist(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_events_module,
+        "_persist_native_terminal_failure",
+        _spy_persist,
+    )
+
+    class _StubAgentStore:
+        def get(self, agent_id: str) -> None:
+            return None
+
+    no_runner_app = FastAPI()
+
+    @no_runner_app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    # No runner_router at all — _get_runner_client falls back to the global
+    # singleton, which runner_globals_reset (this file's fixture, not used
+    # here since this test builds its own bare app) leaves unset by
+    # default; explicitly clear it so this test is independent of fixture
+    # ordering.
+    from omnigent.runtime import set_runner_client, set_runner_router
+
+    set_runner_client(None)
+    set_runner_router(None)
+
+    no_runner_app.include_router(
+        create_sessions_router(
+            store,  # type: ignore[arg-type]
+            _StubAgentStore(),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    no_runner_app.state.tunnel_registry = sentinel_tunnel_registry
+
+    transport = httpx.ASGITransport(app=no_runner_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            # 64a784c3aa907d1774f44313546947c6: native-wrapper top-level
+            # session in the shared store, no host_id, no runner_id.
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            },
+        )
+
+    # 202: the AP-server-as-writer failed turn is a successful ACK of the
+    # (consumed + error-recorded) message, not a 503.
+    assert resp.status_code == 202, resp.text
+    assert persist_captured.get("tunnel_registry") is sentinel_tunnel_registry, (
+        "the no-runner-bound arm of post_event did not thread "
+        "app.state.tunnel_registry through to _persist_native_terminal_failure."
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_event_terminal_status_arm_threads_tunnel_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The ``external_session_status`` terminal-delivery arm of ``post_event``
+    (routes_events.py, the ``is_subagent_terminal_delivery`` branch calling
+    ``_deliver_subagent_terminal_status_with_recovery``) must thread
+    ``app.state.tunnel_registry`` through — a third, distinct call site
+    from the ``message``-event arms covered above.
+
+    Drives a real POST of an ``external_session_status: idle`` event for a
+    sub-agent child, with ``_deliver_subagent_terminal_status_with_recovery``
+    spied. Unlike the other two arms (which bind the wildcard-imported name
+    directly into ``routes_events``'s own module globals), THIS call site
+    resolves via ``from omnigent.server.routes import sessions as _sf`` at
+    call time and reads ``_sf.X`` dynamically — so patching the ``sessions``
+    facade module itself (not ``routes_events``) is what the real call
+    observes here.
+    """
+    store = _RecoveryConversationStore(
+        child_runner_id="runner_live", parent_runner_id="runner_live"
+    )
+    sentinel_tunnel_registry = object()
+    captured: dict[str, Any] = {}
+
+    async def _fake_deliver_positional(
+        child_conv: Any,
+        runner_router: Any,
+        tunnel_registry: Any,
+        conversation_store: Any,
+        forward_body: Any,
+    ) -> Any:
+        del child_conv, runner_router, conversation_store, forward_body
+        captured["tunnel_registry"] = tunnel_registry
+        # A real 2xx so the route's _require_external_status_forward passes
+        # and returns 202 — this test cares only about what tunnel_registry
+        # reached this call, not the recovery outcome itself.
+        return _RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._deliver_subagent_terminal_status_with_recovery",
+        _fake_deliver_positional,
+    )
+
+    class _StubAgentStore:
+        def get(self, agent_id: str) -> None:
+            return None
+
+    class _NoOpRouter:
+        def client_for_session_resources(self, session_id: str) -> Any:
+            raise LookupError("no runner in this test")
+
+    status_app = FastAPI()
+
+    @status_app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    status_app.include_router(
+        create_sessions_router(
+            store,  # type: ignore[arg-type]
+            _StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=_NoOpRouter(),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    status_app.state.tunnel_registry = sentinel_tunnel_registry
+
+    transport = httpx.ASGITransport(app=status_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/sessions/child_boot_fail/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+
+    assert resp.status_code == 202, resp.text
+    assert captured.get("tunnel_registry") is sentinel_tunnel_registry, (
+        "the external_session_status terminal-delivery arm of post_event "
+        "did not thread app.state.tunnel_registry through to "
+        "_deliver_subagent_terminal_status_with_recovery."
+    )
 
 
 # ── Phase 1b: typed collections & single-resource proxy tests ────

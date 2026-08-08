@@ -62,10 +62,17 @@ class _DispatchCall:
 
     :param session_id: Session the event was dispatched to.
     :param text: The ``input_text`` body the wake injected.
+    :param tunnel_registry: The ``tunnel_registry`` kwarg the wake actually
+        passed through — asserted against the sentinel
+        :func:`configure_subagent_block_notifier` was given, so a future
+        regression that drops this threading (as happened across rounds
+        1-3 of a prior review) fails here instead of silently defaulting
+        to ``None``.
     """
 
     session_id: str
     text: str
+    tunnel_registry: object | None = None
 
 
 @pytest_asyncio.fixture
@@ -148,6 +155,12 @@ async def test_record_publish_delivers_wake_message_to_parent(
     # Sentinel: only checked for non-None by the wake; the real dispatch
     # is stubbed so no transport is needed.
     sentinel_client = object()
+    # Distinct sentinel for tunnel_registry threading — proves the value
+    # configure_subagent_block_notifier is given actually reaches the
+    # dispatch call, not silently dropped to None along the way (the class
+    # of bug found across three review rounds: the main route, the dispatch
+    # impl itself, and this wake path).
+    sentinel_tunnel_registry = object()
 
     async def _fake_get_runner_client(session_id: str, runner_router: Any) -> object:
         return sentinel_client
@@ -166,11 +179,13 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # The wake passes runner_router through; without it the stub
         # TypeErrors inside the notifier task and no wake lands.
         runner_router: Any | None = None,
+        tunnel_registry: Any | None = None,
     ) -> str:
         delivered.append(
             _DispatchCall(
                 session_id=session_id,
                 text=body.data["content"][0]["text"],
+                tunnel_registry=tunnel_registry,
             )
         )
         fired.set()
@@ -179,7 +194,9 @@ async def test_record_publish_delivers_wake_message_to_parent(
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _record_dispatch)
 
-    uninstall = sessions_module.configure_subagent_block_notifier(conv_store, None)
+    uninstall = sessions_module.configure_subagent_block_notifier(
+        conv_store, None, sentinel_tunnel_registry
+    )
     try:
         pending_elicitations.record_publish(
             child.id,
@@ -200,6 +217,9 @@ async def test_record_publish_delivers_wake_message_to_parent(
         assert call.text.startswith("[System:")
         assert "codex/demo" in call.text
         assert "git fetch" in call.text
+        # The tunnel_registry configure_subagent_block_notifier was given
+        # reached the dispatch call unchanged — not dropped to None.
+        assert call.tunnel_registry is sentinel_tunnel_registry
 
         # Resolving the block sends the woken parent a follow-up through
         # the same wiring, so it stops acting on the stale block notice.

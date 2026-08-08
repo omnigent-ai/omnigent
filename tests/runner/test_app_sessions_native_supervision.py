@@ -969,14 +969,19 @@ async def test_external_status_for_untracked_session_does_not_wake() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> None:
+async def test_tracked_subagent_status_without_parent_inbox_seeds_and_delivers() -> None:
     """
-    A tracked sub-agent terminal status is not ACKed without parent delivery.
+    A tracked sub-agent terminal status seeds a cold parent inbox and delivers.
 
     The parent inbox is the durable handoff point for async sub-agent results.
-    If the runner has a child work entry but the parent inbox is missing, a
-    204 would tell AP/the forwarder the completion was delivered even though
-    the parent can never drain it.
+    A child's own runner is always its parent's runner, so a confirmed parent
+    edge (this child has a real, tracked work entry naming ``parent_id``) with
+    no local inbox means this runner just never ran ``create_session`` for
+    that parent — not that the parent lives elsewhere. The terminal branch
+    must ``setdefault`` the parent's inbox/async-task pair before delivering,
+    mirroring what ``create_session`` would have installed, instead of
+    dropping the completion behind a 503 the parent's orchestrator would wait
+    on forever.
     """
     from omnigent.runner import app as runner_app
 
@@ -1000,20 +1005,23 @@ async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> Non
                 f"/v1/sessions/{child_id}/events",
                 json={
                     "type": "external_session_status",
-                    "data": {"status": "idle", "output": "DONE_BUT_UNDELIVERED"},
+                    "data": {"status": "idle", "output": "DONE_NOW_DELIVERED"},
                 },
             )
         entry = runner_app.get_subagent_work(child_id)
+        inbox = runner_app._session_inboxes_ref.get(parent_id)
     finally:
         runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
 
-    assert resp.status_code == 503, resp.text
-    assert resp.json()["reason"] == "missing_parent_inbox"
+    assert resp.status_code == 204, resp.text
     assert entry is not None
-    # The child is terminal, but not delivered; if delivered were True here,
-    # the runner would have ACKed a result the parent cannot read.
     assert entry.status == "completed"
-    assert entry.delivered is False
+    assert entry.delivered is True
+    assert inbox is not None and inbox.qsize() == 1
+    delivered = inbox.get_nowait()
+    assert delivered["task_id"] == child_id
+    assert delivered["output"] == "DONE_NOW_DELIVERED"
 
 
 def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> None:
