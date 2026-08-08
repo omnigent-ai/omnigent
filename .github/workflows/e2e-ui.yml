@@ -227,6 +227,16 @@ jobs:
         # so never run it under xdist or alongside the live server.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+          # Pin the event-stream transport to SSE, matching the conftest's own
+          # build (this job passes --ui-skip-build, so that build never runs).
+          # Much of this suite drives the SSE transport directly — intercepting
+          # `GET /stream` to inject 404s, monkeypatching `window.fetch` for a
+          # controllable ReadableStream — and Playwright's extra_http_headers
+          # do not apply to a WebSocket handshake, so header-auth'd
+          # multi-viewer presence tests cannot identify themselves over WS.
+          # The WebSocket default has its own coverage, which opts back in via
+          # the omnigent.eventStream.transport localStorage override.
+          VITE_EVENT_STREAM_TRANSPORT: sse
         run: |
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build

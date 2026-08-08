@@ -494,6 +494,67 @@ async def test_stream_overflow_closes_without_done_for_reconnect(
     assert all("[DONE]" not in frame for frame in frames)
 
 
+@pytest.mark.asyncio
+async def test_iter_session_events_yields_validated_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transport-agnostic core yields ``(type, validated_payload)`` pairs.
+
+    This is the shared source under both the SSE route (which SSE-formats
+    each pair) and the event WebSocket (which ``json.dumps`` each payload),
+    so it must emit the validated dict — not the raw publish payload — and
+    NO ``[DONE]`` sentinel (each transport encodes its own terminal signal).
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes.sessions import _iter_session_events
+
+    async def fake_subscribe(*_args: Any, **_kwargs: Any):
+        yield {"type": "session.heartbeat"}
+        yield {"type": "response.output_text.delta", "delta": "hi", "item_id": "m1"}
+
+    monkeypatch.setattr(session_stream, "subscribe", fake_subscribe)
+
+    async def _never_disconnected() -> bool:
+        return False
+
+    pairs = [pair async for pair in _iter_session_events(_never_disconnected, "conv_ws")]
+
+    types = [t for t, _ in pairs]
+    assert types == ["session.heartbeat", "response.output_text.delta"]
+    # Payloads are the validated model dump, and no [DONE]-equivalent leaks
+    # into the pair stream (the WS route closes the socket instead).
+    assert pairs[1][1]["delta"] == "hi"
+    assert all(payload.get("type") != "[DONE]" for _, payload in pairs)
+
+
+@pytest.mark.asyncio
+async def test_iter_session_events_stops_on_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disconnect flip ends the core at its next event (WS receive-loop path)."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes.sessions import _iter_session_events
+
+    async def fake_subscribe(*_args: Any, **_kwargs: Any):
+        yield {"type": "session.heartbeat"}
+        yield {"type": "session.heartbeat"}
+
+    monkeypatch.setattr(session_stream, "subscribe", fake_subscribe)
+
+    disconnected = False
+
+    async def _is_disconnected() -> bool:
+        return disconnected
+
+    events = _iter_session_events(_is_disconnected, "conv_ws")
+    first = await events.__anext__()
+    assert first[0] == "session.heartbeat"
+    disconnected = True
+    # The next poll sees the disconnect and ends iteration.
+    with pytest.raises(StopAsyncIteration):
+        await events.__anext__()
+
+
 def test_publish_session_status_helper_uses_waiting_literal() -> None:
     """``workflow._publish_session_status`` publishes a typed waiting event.
 
