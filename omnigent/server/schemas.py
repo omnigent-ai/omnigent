@@ -184,6 +184,20 @@ class NativeModelOption(BaseModel):
     isDefault: bool | None = None
 
 
+class HostModelOptionsLegacyResponse(BaseModel):
+    """Legacy host model-options envelope: rows in the host's own shape."""
+
+    models: list[dict[str, Any]]
+    routable_models: list[str]
+
+
+class HostModelOptionsResponse(BaseModel):
+    """Standard host model-options envelope (``NativeModelOption`` rows)."""
+
+    models: list[NativeModelOption]
+    routable_models: list[str]
+
+
 class PolicySummary(BaseModel):
     """
     Safe subset of a policy's spec for API exposure.

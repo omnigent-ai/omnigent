@@ -23,7 +23,7 @@ import secrets
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
@@ -52,7 +52,11 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
-from omnigent.server.schemas import SessionGitOptions
+from omnigent.server.schemas import (
+    HostModelOptionsLegacyResponse,
+    HostModelOptionsResponse,
+    SessionGitOptions,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -115,6 +119,32 @@ async def _proxy_model_options(
                 f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
             ),
         ) from exc
+
+
+def _standard_model_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    """
+    Normalize host-resolved picker rows through the standard row contract.
+
+    Same policy as the in-session snapshot's ``model_options`` fill
+    (``_model_options_from_wire``): each row is validated as a
+    ``NativeModelOption``, malformed rows are dropped rather than blanking
+    the catalog, and null/default-valued fields are omitted.
+
+    :param rows: Raw rows from a ``host.model_options`` result frame.
+    :returns: Normalized standard rows, order preserved.
+    """
+    from omnigent.server.schemas import NativeModelOption
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            option = NativeModelOption.model_validate(row)
+        except ValidationError:
+            continue
+        normalized.append(option.model_dump(exclude_defaults=True, exclude_none=True))
+    return normalized
 
 
 async def _proxy_list_dir(
@@ -652,17 +682,15 @@ def create_hosts_router(
             "runners": [],
         }
 
-    @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
-    async def get_host_model_options(
+    async def _host_model_options_result(
         request: Request,
         host_id: str,
         harness: str,
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Return pre-launch model choices resolved by the selected host.
+    ) -> dict[str, Any]:
+        """Resolve a host's pre-launch catalog result for both route forms.
 
-        A preview of the host's ambient default catalog, not a binding
-        snapshot: launch re-resolves with the session's agent spec, and the
-        in-session picker reflects that launch snapshot once the runner is up.
+        :returns: The proxied result dict (``status`` / ``models`` /
+            ``routable_models`` / ``error``).
         """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
@@ -684,8 +712,65 @@ def create_hosts_router(
                 status_code=502,
                 detail=str(result.get("error") or "host model-options lookup failed"),
             )
+        return result
+
+    @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
+    async def get_host_model_options(
+        request: Request,
+        host_id: str,
+        harness: str,
+    ) -> HostModelOptionsLegacyResponse:
+        """Return pre-launch model choices resolved by the selected host.
+
+        A preview of the host's ambient default catalog, not a binding
+        snapshot: launch re-resolves with the session's agent spec, and the
+        in-session picker reflects that launch snapshot once the runner is up.
+        Rows pass through in the host's own shape (legacy form); prefer the
+        ``/hosts/{host_id}/model-options?harness=`` form, which normalizes
+        rows through the standard picker contract.
+        """
+        result = await _host_model_options_result(request, host_id, harness)
         models = result.get("models")
-        return {"models": models if isinstance(models, list) else []}
+        routable = result.get("routable_models")
+        return HostModelOptionsLegacyResponse(
+            models=[m for m in models if isinstance(m, dict)] if isinstance(models, list) else [],
+            routable_models=(
+                [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
+            ),
+        )
+
+    @router.get(
+        "/hosts/{host_id}/model-options",
+        response_model_exclude_defaults=True,
+        response_model_exclude_none=True,
+    )
+    async def get_host_model_options_by_harness(
+        request: Request,
+        host_id: str,
+        harness: str = Query(..., description="Harness name, e.g. 'codex-native'."),
+    ) -> HostModelOptionsResponse:
+        """Pre-launch model choices for *harness*, in the standard row shape.
+
+        The query-parameter successor to
+        ``/hosts/{host_id}/harnesses/{harness}/model-options``: same
+        host-side resolution, but rows are normalized through the standard
+        picker contract (``NativeModelOption``) and the envelope carries
+        ``routable_models`` — every id the harness's endpoint serves,
+        including generations no picker row names.
+        """
+        result = await _host_model_options_result(request, host_id, harness)
+        models = result.get("models")
+        routable = result.get("routable_models")
+        return HostModelOptionsResponse.model_validate(
+            {
+                "models": _standard_model_rows(models if isinstance(models, list) else []),
+                "routable_models": (
+                    [m for m in routable if isinstance(m, str)]
+                    if isinstance(routable, list)
+                    else []
+                ),
+            }
+        )
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(

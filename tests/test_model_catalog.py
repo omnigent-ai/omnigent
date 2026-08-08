@@ -1626,3 +1626,99 @@ def test_keychain_credential_ref_degrades_not_crashes(
     assert listing.source == "none"
     assert not listing.models
     assert listing.note, "degraded keychain row must carry an explanatory note"
+
+
+def _stub_databricks_provider() -> model_catalog.ResolvedModelProvider:
+    return model_catalog.ResolvedModelProvider(
+        kind="databricks", profile="oss", detail="provider 'databricks'"
+    )
+
+
+def _sdk_listing() -> model_catalog.ModelListing:
+    return model_catalog.ModelListing(
+        source="gateway",
+        verified=True,
+        models=(
+            model_catalog.ModelEntry(id="databricks-gpt-5-6-sol", family="openai"),
+            model_catalog.ModelEntry(id="databricks-gpt-oss-120b", family="openai"),
+            model_catalog.ModelEntry(id="databricks-claude-opus-5", family="claude"),
+        ),
+        note="LLM serving endpoints on the Databricks workspace gateway (profile 'oss')",
+    )
+
+
+def test_databricks_servlet_overlay_replaces_openai_family_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Servlet slugs replace the openai rows; other families keep the SDK rows.
+
+    The serving-endpoints enumeration buckets by name token, admitting
+    chat-only models (``gpt-oss``) in a spelling codex has no metadata for;
+    the servlet catalog is the Responses-dialect-filtered truth for the
+    openai family, and only that family.
+    """
+    monkeypatch.setattr(
+        "omnigent.gateway.client.fetch_servlet_codex_slugs",
+        lambda profile: ["gpt-5.6-sol", "gpt-5.5", "glm-5-2"],
+    )
+    monkeypatch.setattr(
+        model_catalog, "_fetch_databricks_listing", lambda provider, transport: _sdk_listing()
+    )
+
+    listing = model_catalog._databricks_listing_with_servlet(
+        _stub_databricks_provider(), transport=None
+    )
+
+    assert [m.id for m in listing.models] == [
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "glm-5-2",
+        "databricks-claude-opus-5",
+    ]
+    assert listing.verified is True
+    assert "openai family served by the host gateway servlet" in (listing.note or "")
+
+
+def test_databricks_servlet_overlay_absent_keeps_sdk_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No servlet ⇒ the listing is byte-identical to today's enumeration."""
+    monkeypatch.setattr("omnigent.gateway.client.fetch_servlet_codex_slugs", lambda profile: None)
+    sdk = _sdk_listing()
+    monkeypatch.setattr(
+        model_catalog, "_fetch_databricks_listing", lambda provider, transport: sdk
+    )
+
+    listing = model_catalog._databricks_listing_with_servlet(
+        _stub_databricks_provider(), transport=None
+    )
+
+    assert listing is sdk
+
+
+def test_databricks_servlet_overlay_serves_when_sdk_enumeration_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK enumeration failure (the common field case) still yields the
+    servlet rows instead of an empty catalog; with no servlet the failure
+    propagates exactly as before."""
+    monkeypatch.setattr(
+        "omnigent.gateway.client.fetch_servlet_codex_slugs",
+        lambda profile: ["gpt-5.6-sol"],
+    )
+
+    def _boom(provider: object, transport: object) -> model_catalog.ModelListing:
+        raise OSError("databricks-sdk is not importable")
+
+    monkeypatch.setattr(model_catalog, "_fetch_databricks_listing", _boom)
+
+    listing = model_catalog._databricks_listing_with_servlet(
+        _stub_databricks_provider(), transport=None
+    )
+    assert [m.id for m in listing.models] == ["gpt-5.6-sol"]
+    assert listing.verified is True
+    assert "serving-endpoints enumeration unavailable" in (listing.note or "")
+
+    monkeypatch.setattr("omnigent.gateway.client.fetch_servlet_codex_slugs", lambda profile: None)
+    with pytest.raises(OSError):
+        model_catalog._databricks_listing_with_servlet(_stub_databricks_provider(), transport=None)

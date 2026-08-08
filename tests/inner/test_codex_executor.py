@@ -3446,3 +3446,27 @@ def test_run_turn_cli_config_passes_no_model_to_thread_create():
         assert fake_session.calls[0]["model"] is None
 
     _run(_t())
+
+
+class TestCodexArmConfigOverrides(unittest.TestCase):
+    def test_translated_arm_model_disables_code_mode(self):
+        """Arm-pinned launches force Code Mode off.
+
+        Translated arms cannot speak Code Mode's trained-in GPT grammar;
+        with it engaged codex sends no JSON tools at all.
+        """
+        overrides = _databricks_codex_config_overrides(
+            model="glm-5-2",
+            base_url="https://example.cloud.databricks.com/ai-gateway/codex/v1",
+            auth_command="printf %s tok",
+        )
+        self.assertIn("features.code_mode=false", overrides)
+        self.assertIn("features.code_mode_only=false", overrides)
+
+    def test_mainline_model_keeps_code_mode_untouched(self):
+        overrides = _databricks_codex_config_overrides(
+            model="gpt-5.6-sol",
+            base_url="https://example.cloud.databricks.com/ai-gateway/codex/v1",
+            auth_command="printf %s tok",
+        )
+        self.assertFalse(any("code_mode" in item for item in overrides))

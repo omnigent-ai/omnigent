@@ -1386,7 +1386,7 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 )
 
             await page.route(
-                f"**/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
+                f"**/v1/hosts/{_HOST_ID}/model-options?harness=claude-native",
                 handle_model_options,
             )
 
@@ -1468,10 +1468,21 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
                             "models": [
                                 {
                                     "id": "gpt-live-default",
+                                    "model": "system.ai.gpt-live-default",
                                     "displayName": "GPT Live Default",
                                     "isDefault": True,
+                                    "description": (
+                                        "Databricks AI Gateway (system.ai.gpt-live-default)"
+                                    ),
                                 },
-                                {"id": "gpt-live-fast", "displayName": "GPT Live Fast"},
+                                {
+                                    "id": "gpt-live-fast",
+                                    "model": "system.ai.gpt-live-fast",
+                                    "displayName": "GPT Live Fast",
+                                    "description": (
+                                        "Databricks AI Gateway (system.ai.gpt-live-fast)"
+                                    ),
+                                },
                             ]
                         }
                     ),
@@ -1479,7 +1490,7 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
 
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
             await page.route(
-                f"**/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+                f"**/v1/hosts/{_HOST_ID}/model-options?harness=codex-native",
                 handle_model_options,
             )
             await page.add_init_script(
@@ -1496,7 +1507,14 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             await _open_entry_config(page, "ag_codex_e2e")
             model = page.get_by_test_id("new-chat-landing-config-model")
             await expect(model).to_contain_text("Default (gpt-live-default)")
-            await _pick_config_select(page, "new-chat-landing-config-model", "gpt-live-fast")
+            # The standard rows carry a routing-marker description the picker
+            # renders as a muted sub-line under each option.
+            await model.click()
+            fast_option = page.get_by_role("option", name=re.compile(r"gpt-live-fast"))
+            await expect(fast_option).to_contain_text(
+                "Databricks AI Gateway (system.ai.gpt-live-fast)"
+            )
+            await fast_option.click()
             await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")

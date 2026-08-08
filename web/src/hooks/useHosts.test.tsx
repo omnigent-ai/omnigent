@@ -384,9 +384,7 @@ describe("useHostModelOptions", () => {
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/hosts/host_1/harnesses/claude-native/model-options",
-    );
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host_1/model-options?harness=claude-native");
     expect(result.current.data?.map((model) => model.displayName)).toEqual(["Sonnet 4.6"]);
   });
 

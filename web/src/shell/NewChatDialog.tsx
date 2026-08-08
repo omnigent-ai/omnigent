@@ -1387,7 +1387,10 @@ function HarnessConfigModal({
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   claudeModelsLoading: boolean;
-  codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  codexModelOptions: readonly Pick<
+    NativeModelOption,
+    "id" | "displayName" | "isDefault" | "description"
+  >[];
   codexModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
@@ -1462,7 +1465,12 @@ function HarnessConfigModal({
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
+    () =>
+      codexModelOptions.map((m) => ({
+        id: m.id,
+        label: displayModelId(m),
+        description: m.description,
+      })),
     [codexModelOptions],
   );
   const onModelChange = (value: string) => {

@@ -82,6 +82,7 @@ import {
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
+import { useHostModelOptions } from "@/hooks/useHosts";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
@@ -186,6 +187,7 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  effortWithinLevels,
 } from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -1102,9 +1104,25 @@ export function ChatPage() {
     document.title = showsWorking ? `● ${base}` : base;
   }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId]);
 
-  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
+  const storeCodexModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
+  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
+  // A fresh codex session has no model_options until the runner pushes
+  // codex's live catalog, seconds after launch — which hid the Effort row
+  // and let the ladder fall back to the wrong (default) model's efforts.
+  // The host's pre-launch catalog serves the same NativeModelOption rows
+  // instantly (and is usually already cached from the new-chat picker), so
+  // seed the pickers from it until the session snapshot lands; the runner
+  // rows stay authoritative once present. Must run before the hydration
+  // gates below — they return early, and hooks may not be conditional.
+  const hostModelOptionsSeed = useHostModelOptions(
+    (activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"]) ===
+      "codex-native-ui" && storeCodexModelOptions.length === 0
+      ? (activeSession?.hostId ?? activeConv?.host_id ?? null)
+      : null,
+    "codex-native",
+  );
 
   // Loading + error gates for `/c/:id` hydration.
   if (urlConvId) {
@@ -1205,10 +1223,15 @@ export function ChatPage() {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  const codexModelOptions =
+    storeCodexModelOptions.length > 0 ? storeCodexModelOptions : (hostModelOptionsSeed.data ?? []);
   const effortLevels = effortLevelsForConv(
     capabilitySource,
     codexModelOptions,
-    selectedModel ?? llmModel,
+    // Session-applied model first: the sticky cross-session pick and the
+    // late-mirrored llmModel can both be stale/absent on a fresh session,
+    // and resolving against them borrowed the default row's ladder.
+    sessionModelOverride ?? selectedModel ?? llmModel,
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -5453,6 +5476,7 @@ export function Composer({
               <ComposerModelEffortLabel
                 showModels={showModels}
                 showEffort={showEffort}
+                effortLevels={effortLevels}
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
@@ -6091,7 +6115,15 @@ function SessionConfigModal({
                 // Routing picks the model (and its effort) per turn, so an
                 // explicit effort is meaningless: the row is frozen and reads as
                 // an em-dash placeholder (Radix shows it for the empty value).
-                value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
+                // An out-of-ladder sticky pick clamps to the Default sentinel
+                // (Radix renders an empty trigger for a value no item
+                // declares); the draft stays untouched so an unchanged save
+                // still writes nothing.
+                value={
+                  draftRoutingOn
+                    ? ""
+                    : (effortWithinLevels(draftEffort, effortLevels) ?? EFFORT_SELECT_NONE)
+                }
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 disabled={draftRoutingOn}
               >
@@ -6224,6 +6256,7 @@ function ComposerConfigGear({
     harnessLabel,
     showModels,
     showEffort,
+    effortLevels,
     modelPickerKind,
     codexModelOptions,
     costRoutingEligible,
@@ -6304,6 +6337,7 @@ function useSessionConfigSummary({
   harnessLabel,
   showModels,
   showEffort,
+  effortLevels,
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
@@ -6311,6 +6345,7 @@ function useSessionConfigSummary({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
+  effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
@@ -6331,7 +6366,10 @@ function useSessionConfigSummary({
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
-    const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
+    const effortValue = formatStatusEffortLabel(
+      effortWithinLevels(selectedEffort, effortLevels),
+      modelPickerKind === "codex",
+    );
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
   return rows;
@@ -6463,6 +6501,7 @@ function useResolvedComposerModel(
 function ComposerModelEffortLabel({
   showModels,
   showEffort,
+  effortLevels,
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
@@ -6470,6 +6509,7 @@ function ComposerModelEffortLabel({
 }: {
   showModels: boolean;
   showEffort: boolean;
+  effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
@@ -6491,9 +6531,12 @@ function ComposerModelEffortLabel({
       </span>
     );
   }
+  // Out-of-ladder sticky picks clamp away (the session effectively runs the
+  // model's default), so the label never names an effort this model can't run.
+  const clampedEffort = effortWithinLevels(selectedEffort, effortLevels);
   const effortLabel =
-    showEffort && selectedEffort
-      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
+    showEffort && clampedEffort
+      ? formatStatusEffortLabel(clampedEffort, modelPickerKind === "codex")
       : null;
   // SDK/bundle sessions (no native picker) still surface their resolved model
   // in the label even though the gear modal has no Model dropdown for them —

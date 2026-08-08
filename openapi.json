@@ -1757,6 +1757,57 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostModelOptionsLegacyResponse": {
+        "description": "Legacy host model-options envelope: rows in the host's own shape.",
+        "properties": {
+          "models": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "routable_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routable Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models",
+          "routable_models"
+        ],
+        "title": "HostModelOptionsLegacyResponse",
+        "type": "object"
+      },
+      "HostModelOptionsResponse": {
+        "description": "Standard host model-options envelope (`NativeModelOption` rows).",
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/NativeModelOption"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "routable_models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routable Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models",
+          "routable_models"
+        ],
+        "title": "HostModelOptionsResponse",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -7683,7 +7734,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/model-options": {
       "get": {
-        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.",
+        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.\nRows pass through in the host's own shape (legacy form); prefer the\n`/hosts/{host_id}/model-options?harness=` form, which normalizes\nrows through the standard picker contract.",
         "operationId": "get_host_model_options_v1_hosts__host_id__harnesses__harness__model_options_get",
         "parameters": [
           {
@@ -7710,15 +7761,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
-                    "type": "array"
-                  },
-                  "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HostModelOptionsLegacyResponse"
                 }
               }
             },
@@ -7736,6 +7779,60 @@
           }
         },
         "summary": "Get Host Model Options",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/model-options": {
+      "get": {
+        "description": "Pre-launch model choices for *harness*, in the standard row shape.\n\nThe query-parameter successor to\n`/hosts/{host_id}/harnesses/{harness}/model-options`: same\nhost-side resolution, but rows are normalized through the standard\npicker contract (`NativeModelOption`) and the envelope carries\n`routable_models` \u2014 every id the harness's endpoint serves,\nincluding generations no picker row names.",
+        "operationId": "get_host_model_options_by_harness_v1_hosts__host_id__model_options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Harness name, e.g. 'codex-native'.",
+            "in": "query",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "description": "Harness name, e.g. 'codex-native'.",
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostModelOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Model Options By Harness",
         "tags": [
           "hosts"
         ]

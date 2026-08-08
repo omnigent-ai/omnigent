@@ -1559,7 +1559,7 @@ def _normalize_subagent_model(
     # resolve_model_provider is total — undeterminable providers come
     # back as kind "none", which normalize passes through.
     provider = resolve_model_provider(sub_spec, harness)
-    normalized = normalize_model_for_provider(model, provider.kind)
+    normalized = normalize_model_for_provider(model, provider.kind, harness)
     if normalized != model:
         _logger.info(
             "sys_session_send: localized model %r -> %r for sub-agent %r "

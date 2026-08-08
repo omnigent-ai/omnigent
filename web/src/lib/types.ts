@@ -513,6 +513,8 @@ export interface NativeModelOption {
   model?: string;
   /** User-facing model label; provider rows may omit it — fall back to `id`. */
   displayName?: string;
+  /** One-line row description, e.g. the gateway routing marker. */
+  description?: string;
   /** Default reasoning effort for this model. */
   defaultReasoningEffort?: string;
   /** Reasoning efforts advertised for this model. */

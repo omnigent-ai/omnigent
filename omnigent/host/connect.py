@@ -2089,6 +2089,38 @@ class HostProcess:
                 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
                 launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+                # A running gateway servlet is the authority on what the
+                # session's workspace actually serves — answer the picker
+                # from its live catalog, falling back to the static paths
+                # below on any failure.
+                gateway = getattr(self, "_gateway_servlet", None)
+                if launch.profile is not None and gateway is not None:
+                    from omnigent.inner.databricks_executor import (
+                        _databricks_gateway_host,
+                    )
+
+                    servlet_options = None
+                    try:
+                        workspace = await asyncio.to_thread(
+                            _databricks_gateway_host, launch.profile
+                        )
+                        if workspace:
+                            servlet_options = await gateway.catalog_options(
+                                profile=launch.profile,
+                                workspace_host=workspace.rstrip("/"),
+                            )
+                    except Exception:
+                        _logger.exception(
+                            "gateway servlet catalog failed; using the static listing"
+                        )
+                    if servlet_options is not None:
+                        picker_models, routable = servlet_options
+                        return HostModelOptionsResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            models=picker_models,
+                            routable_models=routable,
+                        )
                 spec = AgentSpec(
                     spec_version=1,
                     name="codex-native-prelaunch",
@@ -2392,6 +2424,20 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Start the host-level gateway servlet: a loopback provider endpoint
+        # gateway-backed harness sessions route through (streamed passthrough
+        # plus an implemented /models). Best-effort — when it cannot start,
+        # session launches fall back to the direct gateway URL.
+        self._gateway_servlet = None
+        try:
+            from omnigent.gateway import start_gateway_servlet
+
+            self._gateway_servlet = await start_gateway_servlet(
+                native_catalog_provider=_native_codex_catalog
+            )
+            _logger.info("gateway servlet listening at %s", self._gateway_servlet.url)
+        except Exception:
+            _logger.exception("gateway servlet failed to start; sessions use the direct gateway")
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -2463,6 +2509,11 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            servlet = getattr(self, "_gateway_servlet", None)
+            if servlet is not None:
+                with contextlib.suppress(Exception):
+                    await servlet.stop()
+                self._gateway_servlet = None
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 self._reaper_task = None
@@ -2857,6 +2908,23 @@ class HostProcess:
             await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
+
+
+def _native_codex_catalog() -> dict | None:
+    """
+    Codex's own model catalog, for gateway-servlet metadata enrichment.
+
+    Blocking (shells out to ``codex debug models`` on first use); the servlet
+    calls it through a worker thread and caches the result.
+
+    :returns: The probed catalog, or ``None`` when no codex CLI is available.
+    """
+    from omnigent.inner.codex_executor import _find_codex_cli, read_codex_model_catalog
+
+    codex_path = _find_codex_cli()
+    if not codex_path:
+        return None
+    return read_codex_model_catalog(codex_path, Path.home() / ".codex")
 
 
 def run_host_process(

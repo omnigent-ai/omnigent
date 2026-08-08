@@ -188,6 +188,7 @@ async def fs_setup(
                                 status=reply.get("status", "ok"),
                                 models=reply.get("models", []),
                                 error=reply.get("error"),
+                                routable_models=reply.get("routable_models", []),
                             )
                         ),
                     }
@@ -267,7 +268,8 @@ async def test_host_model_options_returns_prelaunch_catalog(
                 "model": "system.ai.claude-sonnet-4-6[1m]",
                 "displayName": "Sonnet 4.6",
             }
-        ]
+        ],
+        "routable_models": [],
     }
 
 
@@ -680,3 +682,94 @@ async def test_list_filesystem_limit_above_max_rejected(
         )
     # FastAPI returns 422 for failed Query validation.
     assert resp.status_code == 422
+
+
+async def test_host_model_options_query_form_normalizes_standard_rows(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """``?harness=`` serves standard rows and carries ``routable_models``.
+
+    Rows are normalized through ``NativeModelOption``: malformed rows are
+    dropped, null-valued fields are stripped, and the servable-but-unlisted
+    ids survive the REST hop instead of being discarded there.
+    """
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "models": [
+            {
+                "id": "gpt-5.6-sol",
+                "model": "system.ai.gpt-5-6-sol",
+                "displayName": "GPT-5.6 Sol",
+                "isDefault": True,
+                "description": "Databricks AI Gateway (system.ai.gpt-5-6-sol)",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+                "upgrade": None,
+            },
+            {"displayName": "missing id -> dropped"},
+        ],
+        "routable_models": ["gpt-5.6-sol", "gpt-5.5"],
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/model-options",
+            params={"harness": "codex-native"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "models": [
+            {
+                "id": "gpt-5.6-sol",
+                "model": "system.ai.gpt-5-6-sol",
+                "displayName": "GPT-5.6 Sol",
+                "isDefault": True,
+                "description": "Databricks AI Gateway (system.ai.gpt-5-6-sol)",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+            }
+        ],
+        "routable_models": ["gpt-5.6-sol", "gpt-5.5"],
+    }
+
+
+async def test_host_model_options_query_form_passes_claude_rows_unchanged(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """Non-codex rows survive the query form's normalization byte-identically.
+
+    The standard-row normalization is shape-preserving for the host's claude
+    rows (no nulls, no malformed entries), so switching the web to the query
+    form changes nothing for non-codex harnesses.
+    """
+    app, _reg, _comm, replies, _drain = fs_setup
+    claude_rows = [
+        {
+            "id": "sonnet",
+            "model": "system.ai.claude-sonnet-4-6[1m]",
+            "displayName": "Sonnet 4.6",
+        }
+    ]
+    replies["model:claude-native"] = {"models": claude_rows}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/model-options",
+            params={"harness": "claude-native"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"models": claude_rows, "routable_models": []}

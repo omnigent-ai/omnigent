@@ -974,6 +974,44 @@ describe("Composer model/effort label", () => {
     // The real effort still renders — only the leaked model was suppressed.
     expect(label()).toHaveTextContent("High");
   });
+
+  it("hides an effort the current model's ladder doesn't offer", () => {
+    // The effort twin of the sticky-model leaks above: a glm session inherits
+    // the `xhigh` a GPT session left in the sticky, but glm's ladder is only
+    // low/medium/high. The label shows the model without naming an effort the
+    // session can't actually run (the gear modal reads Default for the same
+    // reason).
+    useChatStore.setState({
+      selectedEffort: "xhigh", // stale cross-session sticky — must not surface
+      llmModel: "glm-5-2",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "codex" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "codex",
+          showModels: true,
+          effortLevels: ["low", "medium", "high"] as const,
+          codexModelOptions: [
+            {
+              id: "glm-5-2",
+              model: "system.ai.glm-5-2",
+              displayName: "glm-5-2",
+              supportedReasoningEfforts: [
+                { reasoningEffort: "low" },
+                { reasoningEffort: "medium" },
+                { reasoningEffort: "high" },
+              ],
+              isDefault: true,
+            },
+          ],
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("glm-5-2");
+    expect(label()).not.toHaveTextContent("xhigh");
+  });
 });
 
 describe("Composer effort slash-command visibility", () => {

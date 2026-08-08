@@ -390,3 +390,29 @@ def test_family_tokens_survive_normalization_in_both_directions(harness: str, mo
     assert model_family_mismatch(harness, localized) is None
     # The strip direction round-trips to the original canonical id.
     assert normalize_model_for_provider(localized, "key") == model
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        # Codex gateway children speak bare catalog slugs — the servlet
+        # inventory spelling. A ``databricks-`` prefix produces a name the
+        # Responses passthrough rejects, so localization must not apply.
+        ("glm-5-2", "glm-5-2"),
+        ("gpt-5.6-sol", "gpt-5.6-sol"),
+        ("gpt-5-4", "gpt-5-4"),
+    ],
+)
+def test_normalize_skips_localization_for_codex_gateway_children(
+    model: str, expected: str
+) -> None:
+    assert normalize_model_for_provider(model, "databricks", "codex-native") == expected
+
+
+def test_normalize_still_localizes_for_claude_gateway_children() -> None:
+    """The harness guard is codex-scoped — claude children keep the prefix
+    rule that matches their real gateway endpoint names."""
+    assert (
+        normalize_model_for_provider("claude-opus-4-8", "databricks", "claude-native")
+        == "databricks-claude-opus-4-8"
+    )

@@ -1722,6 +1722,125 @@ def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
+def _gateway_servlet_session(profile: str) -> tuple[str, str] | None:
+    """
+    Register this session with the host gateway servlet, if one is running.
+
+    :param profile: Databricks profile from the provider entry; the servlet
+        resolves the workspace host itself from ``~/.databrickscfg``.
+    :returns: ``(base_url, auth_command)`` routing the session through the
+        servlet, or ``None`` to use the direct gateway URL (no servlet
+        running, registration failed, or anything else went wrong).
+    """
+    try:
+        from omnigent.gateway.state import read_servlet_state
+
+        state = read_servlet_state()
+        if state is None:
+            return None
+        import httpx
+
+        # The payload is a pointer into shared host config (the profile
+        # name); the servlet resolves the workspace host itself from the
+        # same ~/.databrickscfg the launcher read.
+        response = httpx.post(
+            f"{state.url}/admin/sessions",
+            json={"profile": profile},
+            headers={"authorization": f"Bearer {state.admin_token}"},
+            timeout=3.0,
+        )
+        if response.status_code != 200:
+            _logger.warning(
+                "gateway servlet registration returned %s; using the direct gateway",
+                response.status_code,
+            )
+            return None
+        token = response.json().get("token")
+        if not isinstance(token, str) or not token:
+            return None
+        _logger.info("native-codex routing via gateway servlet at %s", state.url)
+        return f"{state.url}/g/{token}/v1", f"printf %s {token}"
+    except Exception:  # noqa: BLE001 — any servlet failure falls open to the direct gateway
+        _logger.warning("gateway servlet unavailable; using the direct gateway", exc_info=True)
+        return None
+
+
+def _gateway_catalog_default(base_url: str) -> str | None:
+    """
+    Resolve the launch default from the servlet's live catalog.
+
+    Reads the session's own ``/models`` — the exact payload codex will poll —
+    and takes the first entry (the catalog's marked default), so the pinned
+    launch model and the picker's ``(default)`` row agree by construction.
+    Also warms the servlet's catalog cache for codex's first poll.
+
+    :param base_url: The session's servlet base, e.g.
+        ``"http://127.0.0.1:6768/g/<token>/v1"``.
+    :returns: The default slug, or ``None`` on any failure/timeout (callers
+        fall back to the bundled catalog; a cold daemon's first catalog
+        build can exceed the timeout, in which case codex's own poll
+        finishes the warm-up).
+    """
+    try:
+        import httpx
+
+        response = httpx.get(f"{base_url}/models", timeout=6.0)
+        if response.status_code != 200:
+            return None
+        models = response.json().get("models")
+        if not isinstance(models, list):
+            return None
+        for entry in models:
+            if isinstance(entry, dict):
+                slug = entry.get("slug")
+                if isinstance(slug, str) and slug:
+                    return slug
+        return None
+    except Exception:  # noqa: BLE001 — default resolution is best-effort by design
+        _logger.info("gateway catalog default unavailable; using the bundled catalog")
+        return None
+
+
+def _ucode_codex_default(profile: str) -> str | None:
+    """
+    Launch default from ucode's discovered state, as the slug codex knows.
+
+    The leg between the servlet catalog and the bundled catalog: ucode's
+    ``state.json`` holds the workspace's live-discovered inventory, so it is
+    strictly fresher than anything shipped in a release. Prefers ucode's own
+    pinned choice (``agents.codex.model`` — already "newest served" by its
+    rules), else the newest mainline GPT among ``codex_models``.
+
+    :param profile: Databricks profile from the provider entry.
+    :returns: A slug like ``"gpt-5.6-luna"``, or ``None`` when no usable
+        ucode state exists for the profile's workspace (fail open).
+    """
+    try:
+        from omnigent.gateway.auth import databrickscfg_host_for_profile
+        from omnigent.gateway.catalog import (
+            codex_slug,
+            newest_mainline_slug,
+            service_id_for_slug,
+        )
+        from omnigent.onboarding.ucode_state import read_ucode_state
+
+        workspace_url = databrickscfg_host_for_profile(profile)
+        if workspace_url is None:
+            return None
+        state = read_ucode_state(workspace_url)
+        if state is None:
+            return None
+        # ucode stores gateway-localized ids (``databricks-gpt-5-5``);
+        # service_id_for_slug canonicalizes any spelling before slugging.
+        agent_state = state.agent("codex")
+        if agent_state is not None and agent_state.model:
+            return codex_slug(service_id_for_slug(agent_state.model))
+        return newest_mainline_slug([service_id_for_slug(m) for m in state.codex_models])
+    except Exception:  # noqa: BLE001 — default resolution is best-effort by design
+        _logger.info("ucode codex default unavailable; trying the bundled catalog")
+        return None
+
+
 def build_codex_native_server(
     *,
     socket_path: Path,
@@ -1789,6 +1908,11 @@ def build_codex_native_server(
         )
     env = _clean_codex_env()
     config_overrides: list[str] = []
+    # Written into the session config copy by _pin_codex_config_model; the
+    # databricks branch upgrades it to the launch-resolved default (O1) so
+    # argv and the config file agree from t=0. Other provider kinds keep
+    # today's behavior: pin only an explicitly supplied model.
+    pinned_model_value = model
     if profile is not None:
         # Use the profile's own host so the gateway base URL matches the token
         # the profile-pinned auth command mints; a DATABRICKS_HOST override in
@@ -1801,14 +1925,51 @@ def build_codex_native_server(
                 "with a host visible to the runner process."
             )
         host = host.rstrip("/")
+        # Route through the host-level gateway servlet when one is running:
+        # it implements /models (live workspace catalog) and relays turns
+        # with a freshly minted bearer. Any registration failure falls back
+        # to the direct gateway URL.
+        servlet_session = _gateway_servlet_session(profile)
+        if servlet_session is not None:
+            gateway_base_url, gateway_auth_command = servlet_session
+        else:
+            gateway_base_url = _databricks_codex_base_url(host)
+            gateway_auth_command = _databricks_codex_auth_command(host, profile)
+        # Launch-default resolution: explicit model → the servlet catalog's
+        # own default (the live workspace inventory, in the slug spelling
+        # codex has native metadata for) → ucode's discovered state → the
+        # bundled/cached catalog, demoted to a true last resort (its
+        # per-user cache can shadow newer bundled data, so it must never
+        # outrank a live-discovered source).
+        resolved_model = model
+        if resolved_model is not None:
+            # Canonicalize whatever spelling the caller sent (bare slug,
+            # ``system.ai.*`` id, or a ``databricks-``-localized id from an
+            # older catalog surface) to the slug codex natively knows, so
+            # the pin, the composer, and the wire all agree.
+            from omnigent.gateway.catalog import codex_slug, service_id_for_slug
+
+            resolved_model = codex_slug(service_id_for_slug(resolved_model))
+        if resolved_model is None and servlet_session is not None:
+            resolved_model = _gateway_catalog_default(gateway_base_url)
+        if resolved_model is None:
+            resolved_model = _ucode_codex_default(profile)
+        if resolved_model is None:
+            resolved_model = model_catalog.resolve_catalog_model(
+                "databricks", family="openai"
+            ).model_id
         config_overrides.extend(
             _databricks_codex_config_overrides(
-                model=model
-                or model_catalog.resolve_catalog_model("databricks", family="openai").model_id,
-                base_url=_databricks_codex_base_url(host),
-                auth_command=_databricks_codex_auth_command(host, profile),
+                model=resolved_model,
+                base_url=gateway_base_url,
+                auth_command=gateway_auth_command,
             )
         )
+        # Pin the SAME resolved value into the session config copy: the
+        # forwarder mirrors that file into the session record, so an
+        # unpinned launch reports whatever stale `model =` line was copied
+        # from the user's shared config while the wire runs the override.
+        pinned_model_value = resolved_model
         env["DATABRICKS_HOST"] = host
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
@@ -1835,7 +1996,7 @@ def build_codex_native_server(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         python_executable=python_executable,
-        pinned_model=model,
+        pinned_model=pinned_model_value,
         trust_project=trust_project,
     )
 

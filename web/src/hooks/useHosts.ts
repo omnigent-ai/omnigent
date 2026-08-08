@@ -89,11 +89,18 @@ async function fetchHostModelOptions(
   hostId: string,
   harness: string,
 ): Promise<NativeModelOption[]> {
+  // The query-parameter form serves rows normalized through the standard
+  // picker contract (and carries `routable_models`, unused here so far);
+  // the legacy `/harnesses/{harness}/model-options` path form remains a
+  // passthrough alias.
   const res = await authenticatedFetch(
-    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+    `/v1/hosts/${encodeURIComponent(hostId)}/model-options?harness=${encodeURIComponent(harness)}`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { models?: NativeModelOption[] };
+  const body = (await res.json()) as {
+    models?: NativeModelOption[];
+    routable_models?: string[];
+  };
   return body.models ?? [];
 }
 

@@ -244,7 +244,9 @@ def canonical_model_spelling(model: str) -> str:
     return model
 
 
-def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
+def normalize_model_for_provider(
+    model: str, provider_kind: str | None, harness: str | None = None
+) -> str:
     """
     Mechanically localize *model* for the child's resolved provider.
 
@@ -271,9 +273,16 @@ def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
     :param provider_kind: The child's resolved provider kind from
         :func:`omnigent.model_catalog.resolve_model_provider`, e.g.
         ``"databricks"`` or ``"key"``; ``None`` when undeterminable.
+    :param harness: The child's declared harness, e.g. ``"codex-native"``;
+        ``None`` when unknown.
     :returns: The localized model id, or *model* unchanged.
     """
     if provider_kind == "databricks":
+        if harness is not None and canonicalize_harness(harness) in CODEX_CANONICAL_HARNESSES:
+            # The codex gateway path speaks bare catalog slugs (the servlet
+            # inventory spelling, e.g. ``glm-5-2``); a ``databricks-`` prefix
+            # produces a name the Responses passthrough rejects.
+            return model
         if _MECHANICAL_VENDOR_ID_RE.fullmatch(model):
             return _DATABRICKS_MODEL_PREFIX + model
         return model

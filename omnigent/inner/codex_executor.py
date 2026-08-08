@@ -1642,7 +1642,7 @@ def _databricks_codex_config_overrides(
     """
     provider_name = "omnigent_databricks"
     auth_command_json = json.dumps(auth_command)
-    return [
+    overrides = [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
         "model_supports_reasoning_summaries=true",
@@ -1658,6 +1658,14 @@ def _databricks_codex_config_overrides(
             'wire_api="responses"}'
         ),
     ]
+    if model in EXTENDED_CATALOG_MODELS:
+        # Translated arms (e.g. GLM) cannot speak Code Mode's trained-in GPT
+        # grammar; with Code Mode engaged codex sends no JSON tools at all,
+        # leaving the model unable to run shell or MCP tools. Forcing the
+        # features off makes codex fall back to the standard JSON tool set,
+        # which these models drive correctly through the gateway.
+        overrides += ["features.code_mode=false", "features.code_mode_only=false"]
+    return overrides
 
 
 def _provider_codex_config_overrides(

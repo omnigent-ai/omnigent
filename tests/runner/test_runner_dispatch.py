@@ -3643,9 +3643,10 @@ async def _dispatch_model_send(
             "databricks-claude-sonnet-4-6",
             id="canonical-claude-localized",
         ),
-        pytest.param(
-            "codex-native", "gpt-5-4", "databricks-gpt-5-4", id="canonical-gpt-localized"
-        ),
+        # Codex gateway children speak bare catalog slugs (the servlet
+        # inventory spelling) — localizing would produce a name the
+        # Responses passthrough rejects.
+        pytest.param("codex-native", "gpt-5-4", "gpt-5-4", id="codex-bare-slug-passthrough"),
         pytest.param(
             "claude-native",
             "databricks-claude-sonnet-4-6",

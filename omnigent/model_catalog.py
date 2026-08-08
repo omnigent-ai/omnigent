@@ -1006,7 +1006,7 @@ def _listing_for_provider(
         if provider.kind == SUBSCRIPTION_KIND:
             listing = _fetch_cursor_cli_listing(provider)
         elif provider.kind == DATABRICKS_KIND:
-            listing = _fetch_databricks_listing(provider, transport=transport)
+            listing = _databricks_listing_with_servlet(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
             listing = _fetch_anthropic_listing(provider, transport=transport)
         else:
@@ -1115,6 +1115,72 @@ def _is_llm_endpoint(name: str, task: str) -> bool:
         return any(token in task_lower for token in _LLM_TASK_TOKENS)
     name_lower = name.lower()
     return any(token in name_lower for token in _LLM_NAME_TOKENS)
+
+
+def _databricks_listing_with_servlet(
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> ModelListing:
+    """Databricks listing with the openai family served by the gateway servlet.
+
+    The serving-endpoints enumeration buckets by NAME token, so it admits
+    chat-only models the codex surface cannot run and spells everything in
+    the ``databricks-*`` form codex has no native metadata for. When the
+    host's gateway servlet is running, its catalog — Responses-dialect
+    filtered, slug-spelled, probe-validated arms included — replaces the
+    openai-family rows; every other family keeps the serving-endpoints
+    enumeration. No servlet ⇒ behavior unchanged. Servlet up but the SDK
+    enumeration failing (no databricks-sdk / no credentials — the common
+    field case) ⇒ the servlet rows still serve instead of an empty catalog.
+
+    :param provider: A ``kind="databricks"`` provider descriptor.
+    :param transport: Optional httpx transport override for tests.
+    :returns: The merged listing.
+    :raises Exception: Re-raises the enumeration failure only when the
+        servlet has nothing either.
+    """
+    from omnigent.gateway.client import fetch_servlet_codex_slugs
+
+    servlet_slugs = fetch_servlet_codex_slugs(provider.profile)
+    servlet_entries = tuple(
+        ModelEntry(id=slug, family=model_family_token(slug)) for slug in servlet_slugs or ()
+    )
+    try:
+        listing = _fetch_databricks_listing(provider, transport=transport)
+    except (
+        click.ClickException,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+    ):
+        if not servlet_entries:
+            raise
+        return ModelListing(
+            source="gateway",
+            verified=True,
+            models=servlet_entries,
+            note=(
+                "live workspace catalog via the host gateway servlet "
+                "(Responses-dialect filtered; serving-endpoints enumeration "
+                "unavailable)"
+            ),
+        )
+    if not servlet_entries:
+        return listing
+    merged = servlet_entries + tuple(
+        entry for entry in listing.models if entry.family != OPENAI_FAMILY
+    )
+    return ModelListing(
+        source=listing.source,
+        verified=listing.verified,
+        models=merged,
+        note=(
+            f"{listing.note}; openai family served by the host gateway "
+            "servlet's live workspace catalog (Responses-dialect filtered)"
+        ),
+    )
 
 
 def _fetch_databricks_listing(
