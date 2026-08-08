@@ -916,7 +916,12 @@ class ExecutorAdapter(HarnessApp):
             # client can't dedupe against the inline observed
             # event, and the REPL renders the call twice plus an
             # empty result panel for the orphan call.
-            if tool_use_id is not None:
+            # Self-executed tools (an ACP agent ran the tool inside its own
+            # loop) never round-trip _stable_tool_executor, so a queued id
+            # would never drain and would mis-pair the next real dispatch.
+            # Skip correlation; the observed function_call below still
+            # emits, so the call renders as a normal tool card.
+            if tool_use_id is not None and not (event.metadata or {}).get("self_executed"):
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             bare_name = _strip_mcp_tool_prefix(event.name)
@@ -981,6 +986,35 @@ class ExecutorAdapter(HarnessApp):
             #      real positional id, so their legitimate completions still emit.
             if not call_id or call_id in self._dispatched_call_ids:
                 return
+            # Self-executed completions: the observed function_call above went
+            # out with status "in_progress", which the item store does not
+            # persist -- only completed function_calls become stored items.
+            # Emit a completed function_call with the SAME call_id: live
+            # consumers dedupe it against the inline observed card by call_id,
+            # and the store gets a persistable pair so the card survives reload.
+            if (getattr(event, "metadata", None) or {}).get("self_executed"):
+                fc_args = (event.metadata or {}).get("arguments")
+                ctx.emit(
+                    OutputItemDoneEvent(
+                        type="response.output_item.done",
+                        item={
+                            "id": f"fc_{uuid.uuid4().hex[:12]}",
+                            "type": "function_call",
+                            "status": "completed",
+                            # Same normalization as the observed request emit,
+                            # so the reloaded card's name matches the live one.
+                            "name": _strip_mcp_tool_prefix(event.name),
+                            "arguments": _serialize_args(fc_args)
+                            if isinstance(fc_args, dict)
+                            else "{}",
+                            "call_id": call_id,
+                            # Durable card: carry the active model like the
+                            # scaffold dispatch path does. response_id is the
+                            # fallback for events translated outside a turn.
+                            "agent": self._current_agent or ctx.response_id,
+                        },
+                    )
+                )
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
                 "type": "function_call_output",
