@@ -521,12 +521,15 @@ class AcpExecutor(Executor):
         instead, which keeps every *other* provider's secret out.
 
         Kept as a named builder so the spawn-env canary can drive the real thing
-        rather than a hand-copied prefix list.
+        rather than a hand-copied prefix list. The canary constructs a bare
+        executor carrying only what the builder reads, so the agent config is
+        read defensively rather than assumed present.
         """
+        config = getattr(self, "_config", None)
         return clean_agent_env(
             allow_prefixes=(),
             extra_allowed=(
-                *self._config.env_passthrough,
+                *getattr(config, "env_passthrough", ()),
                 *declared_passthrough(self._os_env),
             ),
         )
