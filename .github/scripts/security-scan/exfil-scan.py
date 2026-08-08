@@ -32,9 +32,20 @@ import re
 import sys
 
 # Network / exfil sinks.
+#
+# ``httpx`` is matched on its request-performing attributes rather than the bare
+# module, mirroring ``requests`` above it. A bare ``httpx\.`` also matched
+# ``httpx.Response`` / ``httpx.Client`` in a type annotation, so any test file
+# that annotates a helper AND names a ``*_SECRET`` constant tripped the
+# co-occurrence rule below with no network call present at all. Every sending
+# path still matches: the module-level verbs, and the client constructors a
+# ``client.post(...)`` has to go through.
 _NETWORK = re.compile(
     r"requests\.(get|post|put|patch|request|Session)"
-    r"|urllib\.request|urlopen|httpx\.|aiohttp|http\.client"
+    r"|urllib\.request|urlopen"
+    r"|httpx\.(get|post|put|patch|delete|head|options|request|stream|send"
+    r"|Client|AsyncClient)"
+    r"|aiohttp|http\.client"
     r"|socket\.(socket|create_connection)|telnetlib|smtplib|ftplib"
     r"|\bcurl\b|\bwget\b|\bnc\b|fetch\(|XMLHttpRequest|axios",
     re.IGNORECASE,
