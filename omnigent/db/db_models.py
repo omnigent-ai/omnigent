@@ -455,6 +455,58 @@ class SqlAccountToken(OmnigentBase):
     )
 
 
+class SqlGithubConnection(OmnigentBase):
+    """
+    SQLAlchemy model for the ``github_connections`` table.
+
+    One row per ``(workspace_id, user_id)`` recording a user's
+    connected GitHub App account. Backs the web "Connect GitHub" flow
+    and the per-user sandbox authentication that injects the user's
+    ``gh``/git credentials and public SSH keys into managed sandboxes.
+
+    Token columns hold Fernet ciphertext (see
+    :class:`omnigent.server.secretbox.SecretBox`) — the plaintext user
+    access / refresh tokens never touch the database.
+
+    :param user_id: The omnigent user the connection belongs to —
+        email in header/OIDC modes, username in accounts mode.
+    :param github_login: Connected GitHub login, e.g. ``"octocat"``.
+    :param github_user_id: Connected GitHub numeric user id.
+    :param access_token_enc: Encrypted user access token (``ghu_…``).
+    :param refresh_token_enc: Encrypted refresh token (``ghr_…``), or
+        ``NULL`` when the App issues non-expiring user tokens.
+    :param token_expires_at: Unix epoch seconds the access token
+        expires at, or ``NULL`` for non-expiring tokens.
+    :param refresh_token_expires_at: Unix epoch seconds the refresh
+        token expires at, or ``NULL``.
+    :param scopes: Space-separated granted scopes (usually empty for
+        Apps — permissions live on the App).
+    :param created_at: Unix epoch seconds the connection was first made.
+    :param updated_at: Unix epoch seconds of the last refresh/reconnect.
+    """
+
+    __tablename__ = "github_connections"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    github_login: Mapped[str] = mapped_column(String(255), nullable=False)
+    github_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    access_token_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    refresh_token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scopes: Mapped[str] = mapped_column(String(512), nullable=False, server_default="")
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class SqlDeviceGrant(OmnigentBase):
     """
     SQLAlchemy model for the ``device_grants`` table.
