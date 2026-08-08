@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.inner import copilot_executor
 from omnigent.inner.copilot_executor import (
     COPILOT_HOST_ENV_VAR,
     CopilotExecutor,
@@ -372,7 +373,7 @@ def test_gh_cli_token_requested_for_configured_host(monkeypatch: pytest.MonkeyPa
     """A GHE user's gh token must be fetched for their host, not github.com."""
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv(COPILOT_HOST_ENV_VAR, "acme.ghe.com")
+    monkeypatch.setattr(copilot_executor, "_AMBIENT_HOST", "acme.ghe.com")
     seen: list[str | None] = []
 
     def _fake(host: str | None = None) -> str:
@@ -397,9 +398,24 @@ async def test_github_host_exported_for_bundled_cli(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
     ex = CopilotExecutor(github_host="acme.ghe.com")
     assert ex._github_host == "acme.ghe.com"
+    assert COPILOT_HOST_ENV_VAR not in os.environ, "set at session start, not construction"
     async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
         pass
     assert os.environ[COPILOT_HOST_ENV_VAR] == "acme.ghe.com"
+
+
+async def test_hostless_executor_clears_a_leftover_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hostless executor must not inherit a host another one left in the env."""
+    _install_fake_copilot(monkeypatch, [[]])
+    monkeypatch.setenv(COPILOT_HOST_ENV_VAR, "stale.ghe.com")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
+    monkeypatch.setattr(copilot_executor, "_AMBIENT_HOST", None)
+    monkeypatch.setattr(copilot_auth, "copilot_github_host", lambda config=None: None)
+    ex = CopilotExecutor()
+    assert ex._github_host is None
+    async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
+        pass
+    assert COPILOT_HOST_ENV_VAR not in os.environ
 
 
 def test_capabilities() -> None:

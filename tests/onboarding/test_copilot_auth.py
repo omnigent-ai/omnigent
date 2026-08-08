@@ -181,6 +181,22 @@ def test_host_settings_clears_field_when_none(tmp_path: Path) -> None:
     }
 
 
+def test_token_removal_keeps_configured_host(tmp_path: Path) -> None:
+    """Removing the token must not take a configured GHE host with it."""
+    _write_config(
+        tmp_path, {"copilot": {"github_token_ref": "keychain:copilot", "github_host": "a.ghe.com"}}
+    )
+    assert copilot_auth.copilot_token_removal_settings() == {
+        "copilot": {"github_host": "a.ghe.com"}
+    }
+
+
+def test_token_removal_none_when_no_host(tmp_path: Path) -> None:
+    """With no host to keep, the caller unsets the whole block."""
+    _write_config(tmp_path, {"copilot": {"github_token_ref": "keychain:copilot"}})
+    assert copilot_auth.copilot_token_removal_settings() is None
+
+
 def test_gh_cli_github_token_returns_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``gh auth login`` session is a usable Copilot credential."""
     calls: list[list[str]] = []

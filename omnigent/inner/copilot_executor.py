@@ -104,6 +104,9 @@ GITHUB_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # pins the two spellings equal.
 COPILOT_HOST_ENV_VAR = "COPILOT_GH_HOST"
 
+# The user's ambient host, captured before we ever write the var ourselves.
+_AMBIENT_HOST = os.environ.get(COPILOT_HOST_ENV_VAR) or None
+
 # Upper bound (seconds) on one ``send_and_wait``. The SDK default is 60s, far
 # too short for an agentic turn (sub-agent dispatches, long tool calls), so we
 # pass a generous finite bound: a wedged turn surfaces a timeout error instead
@@ -535,8 +538,12 @@ class CopilotExecutor(Executor):
         # no host parameter. Set it in our own environment rather than passing
         # ``env=`` — the SDK inherits ``os.environ`` only when ``env`` is None,
         # so handing it a dict would strip everything else from the subprocess.
+        # Assign both ways so a hostless executor can't inherit a host another
+        # one left behind.
         if self._github_host:
             os.environ[COPILOT_HOST_ENV_VAR] = self._github_host
+        else:
+            os.environ.pop(COPILOT_HOST_ENV_VAR, None)
         client = CopilotClient(
             github_token=self._github_token,
             working_directory=cwd,
@@ -886,10 +893,16 @@ def _ambient_github_token(host: str | None = None) -> str | None:
 
 
 def _configured_github_host() -> str | None:
-    """Return the configured GHE hostname: env var first, then the config block."""
+    """Return the configured GHE hostname: env var first, then the config block.
+
+    Reads the *ambient* env var captured at import, not the live one — the
+    executor writes ``COPILOT_HOST_ENV_VAR`` to hand the host to the bundled CLI,
+    and reading that back would let one executor's host leak into a later
+    hostless one.
+    """
     from omnigent.onboarding.copilot_auth import copilot_github_host
 
-    return os.environ.get(COPILOT_HOST_ENV_VAR) or copilot_github_host()
+    return _AMBIENT_HOST or copilot_github_host()
 
 
 def _coerce_args(raw: Any) -> dict[str, Any]:  # type: ignore[explicit-any]

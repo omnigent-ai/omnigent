@@ -257,6 +257,19 @@ def copilot_github_host_settings(host: str | None) -> dict[str, object]:
     return {COPILOT_CONFIG_KEY: block}
 
 
+def copilot_token_removal_settings() -> dict[str, object] | None:
+    """Return the ``copilot:`` block that must remain after removing the token.
+
+    Preserves ``github_host``: the saver replaces the whole block, so unsetting
+    it wholesale would silently discard a configured GHE host.
+
+    :returns: The block to persist, or ``None`` when nothing is left to keep and
+        the whole ``copilot:`` key can be unset.
+    """
+    host = copilot_github_host()
+    return {COPILOT_CONFIG_KEY: {_HOST_FIELD: host}} if host else None
+
+
 def copilot_github_token_settings(ref: str) -> dict[str, object]:
     """Build the ``{"copilot": {...}}`` settings dict that records *ref*.
 

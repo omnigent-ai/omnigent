@@ -2705,6 +2705,7 @@ def _manage_copilot_harness() -> None:
         copilot_github_token_configured,
         copilot_github_token_ref,
         copilot_sdk_installed,
+        copilot_token_removal_settings,
         gh_cli_github_token,
     )
     from omnigent.onboarding.interactive import select
@@ -2772,7 +2773,12 @@ def _manage_copilot_harness() -> None:
             # those cases just drop the config block and leave the secret.
             if ref == f"keychain:{COPILOT_SECRET_NAME}":
                 secret_store.delete_secret(COPILOT_SECRET_NAME)
-            _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            # Keep a configured GHE host: the saver replaces the whole block, so
+            # unsetting it wholesale would discard the host along with the token.
+            if (remaining := copilot_token_removal_settings()) is not None:
+                _save_global_config(remaining)
+            else:
+                _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
             status = "✓ Removed Copilot GitHub token"
 
 
