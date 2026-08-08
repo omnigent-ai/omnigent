@@ -202,21 +202,37 @@ def _find_git_root(path: Path) -> Path | None:
         current = parent
 
 
-def _git_common_dir(git_root: Path) -> Path:
-    """Return the Git directory shared by a repository and its worktrees."""
+def _git_dir(git_root: Path) -> Path | None:
+    """Return the Git directory owning *git_root*'s checkout.
+
+    For a linked worktree this is the private ``.git/worktrees/<name>``
+    directory, not the shared one — that's what holds the worktree's own
+    ``HEAD``.
+
+    :param git_root: Directory containing the ``.git`` entry.
+    :returns: The resolved Git directory, or ``None`` when the ``.git``
+        gitlink can't be read or doesn't name a git dir.
+    """
     git_entry = git_root / ".git"
     if git_entry.is_dir():
         return git_entry.resolve()
     try:
         marker = git_entry.read_text(encoding="utf-8").strip()
     except OSError:
-        return git_entry
+        return None
     if not marker.startswith("gitdir:"):
-        return git_entry
+        return None
     git_dir = Path(marker.removeprefix("gitdir:").strip())
     if not git_dir.is_absolute():
         git_dir = git_root / git_dir
-    git_dir = git_dir.resolve()
+    return git_dir.resolve()
+
+
+def _git_common_dir(git_root: Path) -> Path:
+    """Return the Git directory shared by a repository and its worktrees."""
+    git_dir = _git_dir(git_root)
+    if git_dir is None:
+        return git_root / ".git"
     try:
         common_marker = (git_dir / "commondir").read_text(encoding="utf-8").strip()
     except OSError:
@@ -225,6 +241,72 @@ def _git_common_dir(git_root: Path) -> Path:
     if not common_dir.is_absolute():
         common_dir = git_dir / common_dir
     return common_dir.resolve()
+
+
+@dataclasses.dataclass(frozen=True)
+class GitIdentity:
+    """Which repository and ref a workspace directory is checked out at."""
+
+    #: Repository name, e.g. ``"omnigent"``. Taken from the shared Git
+    #: directory's parent, so a linked worktree reports the repository it
+    #: belongs to rather than the worktree's own directory name.
+    repo: str
+    #: Branch name (``"feature/login"``), or the short commit for a detached
+    #: HEAD. ``None`` when ``HEAD`` can't be read.
+    ref: str | None
+    #: Whether :attr:`ref` is a commit rather than a branch.
+    detached: bool
+    #: Whether the workspace is a linked worktree of :attr:`repo`.
+    worktree: bool
+
+
+def _read_head_ref(git_dir: Path) -> tuple[str | None, bool]:
+    """Read ``HEAD`` from *git_dir* without spawning git.
+
+    :param git_dir: The checkout's own Git directory.
+    :returns: ``(ref, detached)`` — a branch name, or the 7-char short
+        commit with ``detached`` set. ``(None, False)`` when unreadable.
+    """
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, False
+    if head.startswith("ref:"):
+        ref = head.removeprefix("ref:").strip()
+        return (ref.removeprefix("refs/heads/") or None), False
+    if head:
+        return head[:7], True
+    return None, False
+
+
+def read_git_identity(path: Path) -> GitIdentity | None:
+    """Resolve the repository and ref a workspace directory sits in.
+
+    Reads ``.git`` metadata directly instead of spawning git: this backs a
+    header shown on every session, so it must stay cheap and must not block
+    on a busy repository.
+
+    :param path: Workspace directory, e.g. ``"/Users/alice/myrepo"``.
+    :returns: The identity, or ``None`` when *path* is not inside a git
+        repository.
+    """
+    git_root = _find_git_root(path)
+    if git_root is None:
+        return None
+    common_dir = _git_common_dir(git_root)
+    # A clone nests its common dir as ``myrepo/.git``; a submodule's lives at
+    # ``super/.git/modules/<name>``, where the dir name is the module name.
+    repo = common_dir.parent.name if common_dir.name == ".git" else common_dir.name
+    git_dir = _git_dir(git_root)
+    if git_dir is None:
+        return GitIdentity(repo=repo or git_root.name, ref=None, detached=False, worktree=False)
+    ref, detached = _read_head_ref(git_dir)
+    return GitIdentity(
+        repo=repo or git_root.name,
+        ref=ref,
+        detached=detached,
+        worktree=git_dir != common_dir,
+    )
 
 
 @contextlib.contextmanager

@@ -77,6 +77,7 @@ import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { TitleBarServerPicker } from "./TitleBarServerPicker";
+import { deriveWorkspaceIdentity } from "./workspaceIdentity";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -526,6 +527,25 @@ export function AppShell() {
   // it is enough to prove availability without paying for directory contents.
   const environmentQuery = useWorkspaceEnvironment(conversationId);
   const showFilesPanel = environmentQuery.data?.available !== false;
+  // Repo + branch for the header's title bar. The environment probe carries
+  // the workspace's real git state; the session snapshot backfills the path
+  // (and a server-created worktree's branch) while it loads or when the
+  // runner is unreachable.
+  const workspaceIdentity = useMemo(
+    () =>
+      deriveWorkspaceIdentity(
+        environmentQuery.data?.git,
+        environmentQuery.data?.root,
+        activeSession?.workspace,
+        activeSession?.gitBranch,
+      ),
+    [
+      environmentQuery.data?.git,
+      environmentQuery.data?.root,
+      activeSession?.workspace,
+      activeSession?.gitBranch,
+    ],
+  );
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -1451,6 +1471,7 @@ export function AppShell() {
                   isChildSession={isChildSession}
                   parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
+                  workspaceIdentity={workspaceIdentity}
                   boundAgent={boundAgent}
                   wrapperLabel={wrapperLabel}
                   canShare={canShare}

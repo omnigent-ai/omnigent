@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { ChatHeader } from "./ChatHeader";
+import type { WorkspaceIdentity } from "./workspaceIdentity";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -61,6 +62,7 @@ function renderHeader(props: {
           // toggle / mobile FAB all gate on conversationId and stay unmounted,
           // isolating the left-slot affordances under test.
           conversationId={undefined}
+          workspaceIdentity={null}
           boundAgent={props.boundAgent}
           wrapperLabel={props.wrapperLabel ?? null}
           canShare={props.canShare ?? false}
@@ -232,7 +234,10 @@ function makeTerminalFirstCtx(
  * mounts. QueryClientProvider covers AgentInfoButton's react-query hooks; it
  * self-hides here (no agent info), leaving the toggle as the asserted control.
  */
-function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
+function renderHeaderWithSession(
+  ctx: TerminalFirstContextValue | null,
+  workspaceIdentity: WorkspaceIdentity | null = null,
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/c/sess-1"]}>
@@ -246,6 +251,7 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 isChildSession={false}
                 parentSessionId={undefined}
                 conversationId="sess-1"
+                workspaceIdentity={workspaceIdentity}
                 boundAgent={undefined}
                 wrapperLabel={null}
                 canShare={false}
@@ -267,6 +273,7 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               isChildSession={false}
               parentSessionId={undefined}
               conversationId="sess-1"
+              workspaceIdentity={workspaceIdentity}
               boundAgent={undefined}
               wrapperLabel={null}
               canShare={false}
@@ -303,5 +310,59 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("omits the toggle when there is no TerminalFirst context", () => {
     renderHeaderWithSession(null);
     expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
+  });
+});
+
+describe("ChatHeader — workspace title bar", () => {
+  it("names the repository and the branch checked out in it", () => {
+    renderHeaderWithSession(null, {
+      name: "omnigent",
+      ref: "feat/session-title-bar",
+      detached: false,
+      worktree: false,
+      isRepo: true,
+    });
+
+    const identity = screen.getByRole("group", {
+      name: "Repository omnigent, checkout on branch feat/session-title-bar",
+    });
+    expect(identity).toHaveTextContent("omnigent");
+    expect(identity).toHaveTextContent("feat/session-title-bar");
+  });
+
+  it("flags a linked worktree so two sessions on one repo stay distinguishable", () => {
+    renderHeaderWithSession(null, {
+      name: "omnigent",
+      ref: "feat/login",
+      detached: false,
+      worktree: true,
+      isRepo: true,
+    });
+
+    expect(
+      screen.getByRole("group", {
+        name: "Repository omnigent, worktree on branch feat/login",
+      }),
+    ).toHaveTextContent("worktree");
+  });
+
+  it("shows a bare folder name when the workspace is not a repository", () => {
+    renderHeaderWithSession(null, {
+      name: "scratch",
+      ref: null,
+      detached: false,
+      worktree: false,
+      isRepo: false,
+    });
+
+    const identity = screen.getByRole("group", { name: "Folder scratch" });
+    expect(identity).toHaveTextContent("scratch");
+    // No ref to show — the branch chip must not render an empty slot.
+    expect(identity.querySelector(".lucide-git-branch")).toBeNull();
+  });
+
+  it("renders nothing when the session has no known workspace", () => {
+    renderHeaderWithSession(null, null);
+    expect(screen.queryByTestId("workspace-identity")).toBeNull();
   });
 });

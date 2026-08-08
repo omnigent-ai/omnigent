@@ -3,6 +3,9 @@ import {
   ChevronLeftIcon,
   EllipsisVerticalIcon,
   FileIcon,
+  FolderGitIcon,
+  FolderIcon,
+  GitBranchIcon,
   InfoIcon,
   ListIcon,
   ListTodoIcon,
@@ -29,6 +32,7 @@ import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
+import { describeWorkspaceIdentity, type WorkspaceIdentity } from "./workspaceIdentity";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -89,6 +93,60 @@ interface MobileSessionMenuProps {
 }
 
 /**
+ * Title-bar label naming where the session works: the repository (or plain
+ * folder) and the branch checked out in it, with a "worktree" suffix when the
+ * checkout is a linked worktree rather than the repo's own.
+ *
+ * Truncates from the repo end first so the branch — the part that
+ * distinguishes two sessions on the same repo — survives a narrow header.
+ */
+function WorkspaceIdentityLabel({ identity }: { identity: WorkspaceIdentity }) {
+  const description = describeWorkspaceIdentity(identity);
+  const RootIcon = identity.isRepo ? FolderGitIcon : FolderIcon;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div
+          role="group"
+          aria-label={description}
+          data-testid="workspace-identity"
+          className="flex min-w-0 items-center gap-1.5 text-sm"
+        >
+          <RootIcon className="size-4 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 max-w-[10rem] truncate font-medium text-foreground">
+            {identity.name}
+          </span>
+          {identity.ref !== null && (
+            <>
+              <span aria-hidden className="text-muted-foreground/50">
+                /
+              </span>
+              <span className="flex min-w-0 items-center gap-1 text-muted-foreground">
+                <GitBranchIcon className="size-3.5 shrink-0" />
+                <span className="truncate">{identity.ref}</span>
+              </span>
+              {identity.worktree && (
+                // Desktop-only: on a phone the branch itself is the signal
+                // worth the pixels, and the tooltip still says "worktree".
+                <span
+                  className={cn(
+                    TAB_BADGE_BASE,
+                    "hidden bg-muted text-muted-foreground md:inline-flex",
+                  )}
+                >
+                  worktree
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{description}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
  * Props for {@link ChatHeader}. All state lives in AppShell; action
  * callbacks wrap the shell's dialog/panel setters so state ownership
  * stays in one place.
@@ -104,6 +162,11 @@ interface ChatHeaderProps {
   parentSessionId: string | null | undefined;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /**
+   * Repo + branch the session works in, or null when nothing is known yet
+   * (landing composer, or a session with no bound workspace).
+   */
+  workspaceIdentity: WorkspaceIdentity | null;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
   /**
@@ -168,6 +231,7 @@ export function ChatHeader({
   isChildSession,
   parentSessionId,
   conversationId,
+  workspaceIdentity,
   boundAgent,
   wrapperLabel,
   canShare,
@@ -275,6 +339,20 @@ export function ChatHeader({
               )}
             </div>
           </>
+        )}
+        {/* Where this session works. Sits left so it reads as the pane's
+            title; on a sub-agent it follows the agent identity, and drops
+            below md there because both can't fit a phone's header. */}
+        {conversationId && workspaceIdentity && (
+          <div
+            className={cn("flex min-w-0 items-center gap-1", isChildSession && "hidden md:flex")}
+          >
+            {/* Divider only when something precedes it in the slot. */}
+            {(!sidebarOpen || isChildSession) && (
+              <span aria-hidden className="mx-1 h-5 w-px bg-border" />
+            )}
+            <WorkspaceIdentityLabel identity={workspaceIdentity} />
+          </div>
         )}
       </div>
 

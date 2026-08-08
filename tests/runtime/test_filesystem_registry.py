@@ -28,6 +28,7 @@ from omnigent.runtime.filesystem_registry import (
     _parse_git_porcelain_line,
     _unquote_git_path,
     create_filesystem_registry,
+    read_git_identity,
 )
 
 
@@ -1387,3 +1388,95 @@ def test_git_line_counts_numstat_failure_degrades_but_status_intact(
     assert rec["status"] == "modified"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
+
+
+def test_read_git_identity_reports_repo_and_branch(tmp_path: Path) -> None:
+    """A plain clone reports its directory name and the checked-out branch."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    _init_git_with_commit(repo, "f.py", "x\n")
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/login"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=_git_env(),
+    )
+
+    identity = read_git_identity(repo)
+
+    assert identity is not None
+    assert identity.repo == "myrepo"
+    assert identity.ref == "feature/login"
+    assert identity.detached is False
+    assert identity.worktree is False
+
+
+def test_read_git_identity_from_subdirectory_finds_repo_root(tmp_path: Path) -> None:
+    """A nested working directory still resolves to the enclosing repo."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    _init_git_with_commit(repo, "f.py", "x\n")
+    nested = repo / "src" / "deep"
+    nested.mkdir(parents=True)
+
+    identity = read_git_identity(nested)
+
+    assert identity is not None
+    assert identity.repo == "myrepo"
+    assert identity.worktree is False
+
+
+def test_read_git_identity_worktree_reports_parent_repo(tmp_path: Path) -> None:
+    """A linked worktree names the repo it belongs to, not its own directory."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    env = _init_git_with_commit(repo, "f.py", "x\n")
+    worktree = tmp_path / "myrepo-worktrees" / "feature-login"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/login", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    identity = read_git_identity(worktree)
+
+    assert identity is not None
+    assert identity.repo == "myrepo"
+    assert identity.ref == "feature/login"
+    assert identity.worktree is True
+
+
+def test_read_git_identity_detached_head_reports_short_commit(tmp_path: Path) -> None:
+    """A detached HEAD reports the short commit and flags itself detached."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    env = _init_git_with_commit(repo, "f.py", "x\n")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "--detach", head],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    identity = read_git_identity(repo)
+
+    assert identity is not None
+    assert identity.detached is True
+    assert identity.ref == head[:7]
+
+
+def test_read_git_identity_returns_none_outside_a_repo(tmp_path: Path) -> None:
+    """A directory with no enclosing repository has no identity to report."""
+    assert read_git_identity(tmp_path) is None

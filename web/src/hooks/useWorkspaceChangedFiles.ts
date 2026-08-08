@@ -611,6 +611,25 @@ export function useWorkspaceFileExists(
 
 // ── Default environment (working folder root) ─────────────────────────────────
 
+/**
+ * The repository and ref a session's workspace is checked out at, as
+ * reported by the runner's environment metadata. Absent when the workspace
+ * is not inside a git repository.
+ */
+export interface WorkspaceGitIdentity {
+  /** Repository name, e.g. ``"omnigent"`` — the repo a worktree belongs to. */
+  repo: string;
+  /**
+   * Branch name (``"feature/login"``), or the short commit when
+   * {@link detached}. ``null`` when the runner couldn't read ``HEAD``.
+   */
+  ref: string | null;
+  /** Whether {@link ref} is a commit rather than a branch. */
+  detached: boolean;
+  /** Whether the workspace is a linked worktree of {@link repo}. */
+  worktree: boolean;
+}
+
 export interface WorkspaceEnvironment {
   /** Whether the default filesystem environment exists for this session. */
   available: boolean;
@@ -622,21 +641,43 @@ export interface WorkspaceEnvironment {
    * paths before resolving them against {@link root}.
    */
   home: string | null;
+  /** Repo/ref the workspace sits in, or null outside a git repository. */
+  git: WorkspaceGitIdentity | null;
+}
+
+/** Wire shape of ``metadata.git``; every field is validated before use. */
+interface WireGitIdentity {
+  repo?: unknown;
+  ref?: unknown;
+  detached?: unknown;
+  worktree?: unknown;
+}
+
+function parseGitIdentity(wire: WireGitIdentity | undefined): WorkspaceGitIdentity | null {
+  if (!wire || typeof wire.repo !== "string" || wire.repo === "") return null;
+  return {
+    repo: wire.repo,
+    ref: typeof wire.ref === "string" && wire.ref !== "" ? wire.ref : null,
+    detached: wire.detached === true,
+    worktree: wire.worktree === true,
+  };
 }
 
 async function fetchWorkspaceEnvironment(conversationId: string): Promise<WorkspaceEnvironment> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}`,
   );
-  if (res.status === 404) return { available: false, root: null, home: null };
+  if (res.status === 404) return { available: false, root: null, home: null, git: null };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as { metadata?: { root?: string; home?: string } };
+  const json = (await res.json()) as {
+    metadata?: { root?: string; home?: string; git?: WireGitIdentity };
+  };
   const root = json.metadata?.root ?? null;
   const home = json.metadata?.home ?? null;
-  return { available: root !== null, root, home };
+  return { available: root !== null, root, home, git: parseGitIdentity(json.metadata?.git) };
 }
 
 /**

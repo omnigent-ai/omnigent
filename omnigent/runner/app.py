@@ -6594,6 +6594,8 @@ def create_runner_app(
             )
         content = session_resource_view_to_dict(resource)
         if environment_id == DEFAULT_ENVIRONMENT_ID:
+            from omnigent.runtime.filesystem_registry import read_git_identity
+
             root = resource_registry.compute_default_env_root(session_id, agent_spec)
             if root is not None:
                 raw_metadata = content.get("metadata")
@@ -6606,6 +6608,14 @@ def create_runner_app(
                 home = os.path.expanduser("~")
                 if os.path.isabs(home):
                     metadata["home"] = home
+                identity = read_git_identity(Path(root))
+                if identity is not None:
+                    metadata["git"] = {
+                        "repo": identity.repo,
+                        "ref": identity.ref,
+                        "detached": identity.detached,
+                        "worktree": identity.worktree,
+                    }
                 content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,

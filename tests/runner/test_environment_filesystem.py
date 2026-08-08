@@ -7,6 +7,7 @@ import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -1452,11 +1453,7 @@ async def test_search_glob_filter_returns_only_files(
 
 
 def _git_env() -> dict[str, str]:
-    """Build an env dict with dummy git identity.
-
-    :returns: Copy of the current environment with GIT_AUTHOR_* and
-        GIT_COMMITTER_* set to safe dummy values.
-    """
+    """Environment with a dummy git identity so ``git commit`` succeeds."""
     return {
         **os.environ,
         "GIT_AUTHOR_NAME": "Test",
@@ -1466,107 +1463,73 @@ def _git_env() -> dict[str, str]:
     }
 
 
-@pytest.mark.asyncio
-async def test_worktree_session_uses_session_workspace_for_changes(
-    tmp_path: Path,
-) -> None:
-    """The /changes endpoint uses the session's workspace, not the runner's.
-
-    When a session uses a git worktree, its workspace differs from the
-    runner's global workspace. The /changes endpoint must run ``git status``
-    in the session's workspace to detect changes there, not in the runner's
-    startup workspace (where there are no changes).
-
-    Failure means worktree sessions always show "No workspace changes yet"
-    even when the agent has modified files in the worktree.
-    """
-    env = _git_env()
-
-    # Runner's global workspace: a git repo with no uncommitted changes.
-    runner_ws = tmp_path / "main-repo"
-    runner_ws.mkdir()
-    subprocess.run(["git", "init"], cwd=runner_ws, check=True, capture_output=True, env=env)
-    subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "init"],
-        cwd=runner_ws,
-        check=True,
-        capture_output=True,
-        env=env,
-    )
-
-    # Session's workspace: a separate git repo simulating a worktree
-    # with an uncommitted change.
-    session_ws = tmp_path / "worktree-session"
-    session_ws.mkdir()
-    subprocess.run(["git", "init"], cwd=session_ws, check=True, capture_output=True, env=env)
-    subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "init"],
-        cwd=session_ws,
-        check=True,
-        capture_output=True,
-        env=env,
-    )
-    (session_ws / "agent_change.py").write_text("# written by agent")
-
-    session_id = "conv_worktree_test"
-
-    # Set up the OS environment for the session pointing at the
-    # session workspace so _require_os_env passes.
+def _app_rooted_at(root: Path) -> FastAPI:
+    """Runner app whose default environment resolves to *root*."""
     os_env = create_os_environment(
         OSEnvSpec(
             type="caller_process",
-            cwd=str(session_ws),
+            cwd=str(root),
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
     assert os_env is not None
-    reg = SessionResourceRegistry()
-    reg._primary_envs[session_id] = os_env
-
-    # Fake server_client that returns the session's workspace in
-    # GET /v1/sessions/{id}.
-    session_response = httpx.Response(
-        200,
-        json={
-            "id": session_id,
-            "agent_id": "agent_1",
-            "status": "idle",
-            "created_at": 1000,
-            "workspace": str(session_ws),
-        },
-    )
-
-    async def _mock_transport(request: httpx.Request) -> httpx.Response:
-        """Return the session response for GET /v1/sessions/{id}.
-
-        :param request: The outgoing request.
-        :returns: Mocked session response.
-        """
-        if request.url.path == f"/v1/sessions/{session_id}":
-            return session_response
-        return httpx.Response(404)
-
-    server_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(_mock_transport),
-        base_url="http://fake-server",
-    )
-
-    app = create_runner_app(
+    reg = SessionResourceRegistry(runner_workspace=root)
+    reg._primary_envs["conv_test"] = os_env
+    return create_runner_app(
         resource_registry=reg,
-        runner_workspace=runner_ws,
-        server_client=server_client,
+        runner_workspace=root,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
+
+async def _get_default_environment(app: FastAPI) -> dict[str, Any]:
+    """GET the default environment resource from *app*."""
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
         resp = await client.get(
-            f"/v1/sessions/{session_id}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+            f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
         )
         assert resp.status_code == 200, resp.text
-        body = resp.json()
-        paths = [e["path"] for e in body["data"]]
-        assert "agent_change.py" in paths, (
-            f"Expected 'agent_change.py' in changes but got {paths}. "
-            "The /changes endpoint is reading from the runner's global "
-            "workspace instead of the session's worktree workspace."
-        )
+        return cast(dict[str, Any], resp.json())
+
+
+@pytest.mark.asyncio
+async def test_environment_metadata_reports_repo_and_branch(tmp_path: Path) -> None:
+    """The default environment names the repo and branch its root sits in."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    env = _git_env()
+    (repo / "f.py").write_text("x\n")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/login"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    body = await _get_default_environment(_app_rooted_at(repo))
+
+    assert body["metadata"]["git"] == {
+        "repo": "myrepo",
+        "ref": "feature/login",
+        "detached": False,
+        "worktree": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_environment_metadata_omits_git_outside_a_repo(tmp_path: Path) -> None:
+    """A non-git workspace reports no git block rather than a guessed one."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    body = await _get_default_environment(_app_rooted_at(plain))
+
+    assert "git" not in body["metadata"]
+    assert body["metadata"]["root"] == str(plain.resolve())

@@ -28,6 +28,7 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  type WorkspaceEnvironment,
 } from "./useWorkspaceChangedFiles";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
@@ -108,7 +109,7 @@ function EnvironmentDataProbe({
   onData,
 }: {
   id: string | undefined;
-  onData: (data: { available: boolean; root: string | null; home: string | null }) => void;
+  onData: (data: WorkspaceEnvironment) => void;
 }) {
   const query = useWorkspaceEnvironment(id);
   useEffect(() => {
@@ -440,7 +441,7 @@ describe("useWorkspaceEnvironment gating", () => {
   it("marks the environment unavailable when the server omits metadata.root", async () => {
     onlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValue(jsonResponse({ metadata: {} }));
-    const results: { available: boolean; root: string | null; home: string | null }[] = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -448,7 +449,7 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: false, root: null, home: null }),
+      expect(results.at(-1)).toEqual({ available: false, root: null, home: null, git: null }),
     );
   });
 
@@ -459,7 +460,7 @@ describe("useWorkspaceEnvironment gating", () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ metadata: { root: "/home/u/ws", home: "/home/u" } }),
     );
-    const results: { available: boolean; root: string | null; home: string | null }[] = [];
+    const results: WorkspaceEnvironment[] = [];
 
     render(
       <Wrap>
@@ -467,8 +468,58 @@ describe("useWorkspaceEnvironment gating", () => {
       </Wrap>,
     );
     await waitFor(() =>
-      expect(results.at(-1)).toEqual({ available: true, root: "/home/u/ws", home: "/home/u" }),
+      expect(results.at(-1)).toEqual({
+        available: true,
+        root: "/home/u/ws",
+        home: "/home/u",
+        git: null,
+      }),
     );
+  });
+
+  it("surfaces the repo and ref the workspace is checked out at", async () => {
+    // The header's title bar reads this block; it must round-trip verbatim.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        metadata: {
+          root: "/home/u/ws",
+          git: { repo: "omnigent", ref: "feat/login", detached: false, worktree: true },
+        },
+      }),
+    );
+    const results: WorkspaceEnvironment[] = [];
+
+    render(
+      <Wrap>
+        <EnvironmentDataProbe id="conv_live" onData={(data) => results.push(data)} />
+      </Wrap>,
+    );
+    await waitFor(() =>
+      expect(results.at(-1)?.git).toEqual({
+        repo: "omnigent",
+        ref: "feat/login",
+        detached: false,
+        worktree: true,
+      }),
+    );
+  });
+
+  it("drops a git block that names no repository", async () => {
+    // An older runner (or a partial payload) must degrade to "no git info"
+    // rather than render an empty repo name in the header.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({ metadata: { root: "/home/u/ws", git: { ref: "main" } } }),
+    );
+    const results: WorkspaceEnvironment[] = [];
+
+    render(
+      <Wrap>
+        <EnvironmentDataProbe id="conv_live" onData={(data) => results.push(data)} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(results.at(-1)?.git).toBeNull());
   });
 
   it("does not fetch when disabled by the caller", async () => {
