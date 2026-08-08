@@ -42,6 +42,7 @@ import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   CheckIcon,
+  DownloadIcon,
   KeyRoundIcon,
   LaptopMinimalIcon,
   LogOutIcon,
@@ -53,6 +54,7 @@ import {
   PlusIcon,
   SunIcon,
   Trash2Icon,
+  UploadIcon,
   UserCogIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
@@ -163,6 +165,12 @@ import {
   writeCustomTheme,
 } from "@/lib/customTheme";
 import { useIsEmbedded } from "@/lib/embedded";
+import {
+  applyImportedSettings,
+  collectSettings,
+  downloadSettings,
+  readSettingsFile,
+} from "@/lib/settingsPortability";
 import {
   type CliStatus,
   getCliStatus,
@@ -832,6 +840,9 @@ function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
+  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetAppearance = () => {
     // Reset every appearance preference back to the product default.
@@ -888,6 +899,32 @@ function AppearanceSection() {
     setIsResetDialogOpen(false);
   };
 
+  const exportSettings = () => {
+    const exported = collectSettings();
+    if (exported) downloadSettings(exported);
+  };
+
+  const handleImportFile = async (file: File) => {
+    setImportError(null);
+    try {
+      const imported = await readSettingsFile(file);
+      applyImportedSettings(imported);
+
+      // Apply DOM side-effects so imported settings take effect immediately.
+      const themeMode = imported.settings["theme"];
+      if (themeMode) setTheme(themeMode);
+      applyUiFontScale(readUiFontSizePx());
+      applyUiFontFamily(readUiFontFamily());
+      applyThemePalette(readThemePalette());
+      applyCustomTheme(readCustomTheme());
+
+      setIsImportDialogOpen(false);
+      setResetKey((k) => k + 1);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "Import failed.");
+    }
+  };
+
   return (
     <Section
       title="Appearance"
@@ -927,7 +964,28 @@ function AppearanceSection() {
         <UiCodeFontFamilyControl />
       </div>
 
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-end gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="export-settings-button"
+          onClick={exportSettings}
+        >
+          <DownloadIcon className="size-4" />
+          Export
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="import-settings-button"
+          onClick={() => {
+            setImportError(null);
+            setIsImportDialogOpen(true);
+          }}
+        >
+          <UploadIcon className="size-4" />
+          Import
+        </Button>
         <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
           <DialogTrigger asChild>
             <Button variant="outline" size="sm" data-testid="reset-appearance-button">
@@ -959,6 +1017,53 @@ function AppearanceSection() {
           </DialogContent>
         </Dialog>
       </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json"
+        className="hidden"
+        data-testid="import-settings-file-input"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void handleImportFile(file);
+          e.target.value = "";
+        }}
+      />
+      <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Import settings</DialogTitle>
+            <DialogDescription>
+              Choose an exported Omnigent settings file to apply. This will overwrite your current
+              appearance and preference settings.
+            </DialogDescription>
+          </DialogHeader>
+          {importError && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            >
+              {importError}
+            </div>
+          )}
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" size="sm">
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="default"
+              size="sm"
+              data-testid="import-settings-choose-file"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Choose file
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Section>
   );
 }
