@@ -112,12 +112,7 @@ def _validate_spec_version(spec: AgentSpec, result: ValidationResult) -> None:
 # omnigent/spec/_omnigent_compat.py. Placed after the module's
 # internal helpers (rather than with the top-of-file imports) so the
 # integration's footprint is reviewable as one contiguous block.
-from omnigent.spec._omnigent_compat import (  # noqa: E402
-    OMNIGENT_EXECUTOR_TYPE,
-    validate_omnigent_executor,
-)
-
-_VALID_EXECUTOR_TYPES = {
+No change to this validation module. The fix belongs in the kiro-native bridge, which should be patched to always use kiro-cli chat --no-interactive with the user prompt, avoiding the broken interactive TUI in 2.13.0.LID_EXECUTOR_TYPES = {
     "claude_sdk",
     "agents_sdk",
     OMNIGENT_EXECUTOR_TYPE,
