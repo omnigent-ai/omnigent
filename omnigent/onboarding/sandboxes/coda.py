@@ -1,0 +1,236 @@
+"""Managed-host launcher for a pre-provisioned CoDA Databricks App."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import Callable, Mapping
+from typing import ClassVar
+from urllib import error, request
+
+import click
+
+from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+
+CODA_WORKSPACE_PATH = "/app/python/source_code"
+_SENSITIVE_ERROR_KEYS = (
+    "token",
+    "secret",
+    "authorization",
+    "credential",
+    "password",
+    "api_key",
+    "access_key",
+)
+
+
+def _safe_control_error_detail(raw: str) -> str:
+    """Return a bounded CoDA error detail with credential fields redacted."""
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return "upstream control request failed"
+
+    def _redact(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                str(key): (
+                    "<redacted>"
+                    if any(part in str(key).lower() for part in _SENSITIVE_ERROR_KEYS)
+                    else _redact(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact(item) for item in value]
+        if isinstance(value, str) and any(
+            marker in value.lower() for marker in _SENSITIVE_ERROR_KEYS
+        ):
+            return "<redacted>"
+        return value
+
+    return json.dumps(_redact(payload), separators=(",", ":"))[:1024]
+
+
+def _parse_sandbox_id(sandbox_id: str) -> tuple[str, str]:
+    """Return the fenced app and lease identifiers from a CoDA sandbox id."""
+    if not sandbox_id.startswith("coda:") or "#" not in sandbox_id:
+        raise click.ClickException(f"invalid CoDA sandbox id: {sandbox_id!r}")
+    app_name, lease_id = sandbox_id[5:].rsplit("#", 1)
+    if not app_name or not lease_id:
+        raise click.ClickException(f"invalid CoDA sandbox id: {sandbox_id!r}")
+    return app_name, lease_id
+
+
+class CodaProvider(SandboxHostLauncher):
+    """Lease and control one already-running CoDA Databricks App over HTTP."""
+
+    provider: ClassVar[str] = "coda"
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=False,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+        )
+
+    def __init__(
+        self,
+        *,
+        app_name: str,
+        app_url: str,
+        workspace_path: str = CODA_WORKSPACE_PATH,
+        request_fn: Callable[[str, str, Mapping[str, object] | None], Mapping[str, object]]
+        | None = None,
+        app_getter: Callable[[str], object] | None = None,
+    ) -> None:
+        self._app_name = app_name
+        self._app_url = app_url.rstrip("/")
+        self._workspace_path = workspace_path
+        self._request_fn = request_fn or self._request
+        self._app_getter = app_getter or self._get_app
+        self._lease_owner: str | None = None
+
+    def set_lease_owner(self, owner: str) -> None:
+        """Set the user principal used by CoDA's authoritative lease CAS."""
+        self._lease_owner = owner
+
+    @staticmethod
+    def _get_app(app_name: str) -> object:
+        from databricks.sdk import WorkspaceClient
+
+        return WorkspaceClient().apps.get(app_name)
+
+    def _request(
+        self, method: str, path: str, body: Mapping[str, object] | None
+    ) -> Mapping[str, object]:
+        from databricks.sdk.core import Config
+
+        headers = dict(Config().authenticate())
+        data = json.dumps(body).encode() if body is not None else None
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = request.Request(f"{self._app_url}{path}", data=data, headers=headers, method=method)
+        try:
+            with request.urlopen(req, timeout=30) as response:
+                payload = response.read()
+        except error.HTTPError as exc:
+            detail = _safe_control_error_detail(exc.read().decode(errors="replace"))
+            if exc.code == 409:
+                raise click.ClickException("CoDA app has no available lease capacity") from exc
+            raise click.ClickException(
+                f"CoDA control request failed ({exc.code}): {detail}"
+            ) from exc
+        except error.URLError as exc:
+            raise click.ClickException(f"CoDA control request failed: {exc.reason}") from exc
+        decoded = json.loads(payload or b"{}")
+        if not isinstance(decoded, dict):
+            raise click.ClickException("CoDA control response must be a JSON object")
+        return decoded
+
+    def prepare(self) -> None:
+        """Validate app readiness and control-plane authentication without mutation."""
+        app = self._app_getter(self._app_name)
+        compute = getattr(getattr(app, "compute_status", None), "state", None)
+        if str(compute).upper().split(".")[-1] != "ACTIVE":
+            raise click.ClickException(f"CoDA app {self._app_name!r} compute is not ACTIVE")
+        status = self._request_fn("GET", "/api/omnigent-host/status", None)
+        if status.get("ready") is False:
+            raise click.ClickException(f"CoDA app {self._app_name!r} is not ready")
+
+    def provision(self, name: str) -> str:
+        """Acquire a fenced CoDA lease without creating infrastructure."""
+        lease_id = uuid.uuid4().hex
+        result = self._request_fn(
+            "POST",
+            "/api/omnigent-host/lease",
+            {
+                "action": "acquire",
+                "app_name": self._app_name,
+                "host_name": name,
+                "lease_id": lease_id,
+                "owner": self._lease_owner,
+            },
+        )
+        acquired_id = result.get("lease_id", lease_id)
+        if not isinstance(acquired_id, str) or not acquired_id:
+            raise click.ClickException("CoDA lease response omitted lease_id")
+        return f"coda:{self._app_name}#{acquired_id}"
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
+        agent_name: str | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """Ask CoDA to start its managed host and return its reported workspace."""
+        app_name, lease_id = _parse_sandbox_id(sandbox_id)
+        if app_name != self._app_name:
+            raise click.ClickException("CoDA sandbox id targets a different app")
+        if on_stage is not None:
+            on_stage("cloning")
+            on_stage("starting")
+        result = self._request_fn(
+            "POST",
+            "/api/omnigent-host/connect",
+            {
+                "server_url": server_url,
+                "host_token": token,
+                "host_id": host_id,
+                "host_name": host_name,
+                "host_config": host_config,
+                "repo_url": repo_url,
+                "repo_branch": repo_branch,
+                "repo_name": repo_name,
+                "lease_id": lease_id,
+                "agent_name": agent_name,
+            },
+        )
+        workspace = result.get("workspace") or self._workspace_path
+        if not isinstance(workspace, str) or not workspace.startswith("/"):
+            raise click.ClickException(
+                "CoDA connect response did not contain an absolute workspace"
+            )
+        return workspace
+
+    def allocate_workspace(self, sandbox_id: str, session_id: str) -> str:
+        """Create and return a session-specific directory on the active lease."""
+        app_name, lease_id = _parse_sandbox_id(sandbox_id)
+        if app_name != self._app_name:
+            raise click.ClickException("CoDA sandbox id targets a different app")
+        result = self._request_fn(
+            "POST",
+            "/api/omnigent-host/workspaces",
+            {"lease_id": lease_id, "session_id": session_id},
+        )
+        workspace = result.get("workspace")
+        if not isinstance(workspace, str) or not workspace.startswith("/"):
+            raise click.ClickException("CoDA did not return an absolute session workspace")
+        return workspace
+
+    def terminate(self, sandbox_id: str) -> None:
+        """Release and scrub the fenced lease; never mutate the Databricks App."""
+        app_name, lease_id = _parse_sandbox_id(sandbox_id)
+        if app_name != self._app_name:
+            return
+        try:
+            self._request_fn(
+                "POST",
+                "/api/omnigent-host/disconnect",
+                {"lease_id": lease_id, "scrub": True},
+            )
+        except click.ClickException:
+            return

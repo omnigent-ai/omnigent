@@ -553,6 +553,21 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--coda-app-name",
+        default="",
+        help="Managed CoDA Databricks App name. Set with the other CoDA URL flags.",
+    )
+    parser.add_argument(
+        "--coda-app-url",
+        default="",
+        help="Managed CoDA Databricks App URL. Set with --coda-app-name.",
+    )
+    parser.add_argument(
+        "--omnigent-public-server-url",
+        default="",
+        help="Public Omnigent App URL supplied to managed CoDA hosts.",
+    )
+    parser.add_argument(
         "--compute-size",
         default="LARGE",
         choices=["SMALL", "MEDIUM", "LARGE"],
@@ -634,7 +649,14 @@ def _parse_args() -> argparse.Namespace:
             "known commit on main."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    coda_values = (args.coda_app_name, args.coda_app_url, args.omnigent_public_server_url)
+    if any(coda_values) and not all(coda_values):
+        parser.error(
+            "--coda-app-name, --coda-app-url, and --omnigent-public-server-url "
+            "must be set together"
+        )
+    return args
 
 
 def _clear_env_vars() -> None:
@@ -746,6 +768,12 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
+        "--var",
+        f"coda_app_name={args.coda_app_name}",
+        "--var",
+        f"coda_app_url={args.coda_app_url}",
+        "--var",
+        f"omnigent_public_server_url={args.omnigent_public_server_url}",
     ]
 
 

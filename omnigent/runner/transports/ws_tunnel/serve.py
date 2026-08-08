@@ -352,6 +352,12 @@ async def serve_tunnel(
             # connection to drain): nothing to flush, just stop looping.
             return
         auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
+        ingress_bearer = (
+            getattr(auth_token_factory, "ingress_bearer", None)
+            if auth_token_factory is not None
+            else None
+        )
+        owner_token = auth_token if ingress_bearer else None
         if ever_connected and on_reconnect is not None:
             try:
                 await on_reconnect()
@@ -367,7 +373,8 @@ async def serve_tunnel(
                 server_url=server_url,
                 runner_id=runner_id,
                 runner_version=runner_version,
-                auth_token=auth_token,
+                auth_token=ingress_bearer or auth_token,
+                owner_token=owner_token,
                 tunnel_token=tunnel_token,
                 shutdown_event=shutdown_event,
                 on_graceful_shutdown=on_graceful_shutdown,
@@ -623,6 +630,7 @@ async def _serve_tunnel_once(
     runner_id: str,
     runner_version: str,
     auth_token: str | None = None,
+    owner_token: str | None = None,
     tunnel_token: str | None = None,
     on_activity: Callable[[], None] | None = None,
     shutdown_event: asyncio.Event | None = None,
@@ -672,6 +680,10 @@ async def _serve_tunnel_once(
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
+    if owner_token:
+        from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+        headers[RUNNER_OWNER_TOKEN_HEADER] = owner_token
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
     # Verifying SSL context from a real CA bundle for wss:// — a bare default

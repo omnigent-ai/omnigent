@@ -34,6 +34,7 @@ from omnigent.runner._entry import (
     _run_inactivity_monitor,
     _run_parent_death_killer,
     _runner_parent_pid_from_env,
+    _runner_request_headers,
     _runner_threadpool_max_workers,
     _runner_tunnel_binding_token_from_env,
     _runner_workspace_from_env,
@@ -43,6 +44,7 @@ from omnigent.runner._entry import (
 )
 from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_OWNER_TOKEN_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
@@ -315,14 +317,13 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     assert mint_calls == []
 
 
-def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
+def test_initial_host_token_immediately_mints_managed_owner_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After the host bearer is rejected, a managed runner falls back to managed mint.
+    """A managed runner keeps ingress and owner credentials separate.
 
-    When no SDK/OIDC credential is available (managed sandbox with no user
-    credential), the fallback must reach the managed-mint path rather than
-    returning None and bricking all HTTP callbacks.
+    Application requests use the host bearer to cross the Apps ingress and
+    carry the owner-bound minted token in the internal owner-token header.
     """
     mint_calls: list[int] = []
 
@@ -347,21 +348,19 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
 
     factory = _make_auth_token_factory()
 
-    assert isinstance(factory, _InitialAuthTokenFactory)
-    assert factory() == "host-bootstrap-token"
-    assert mint_calls == []
+    assert factory is not None
+    assert not isinstance(factory, _InitialAuthTokenFactory)
+    assert factory() == "managed-minted-token"
+    assert len(mint_calls) >= 1
 
     request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
-    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
-    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
-
-    # After the initial bearer is rejected, the fallback must mint via the
-    # managed-mint path rather than returning None and bricking callbacks.
-    assert captured == [
-        "Bearer host-bootstrap-token",
-        "Bearer managed-minted-token",
-    ]
-    assert len(mint_calls) >= 1
+    captured = _drive_auth_flow(
+        _RunnerDatabricksAuth(factory),
+        request,
+        httpx.Response(200),
+    )
+    assert captured == ["Bearer host-bootstrap-token"]
+    assert request.headers[RUNNER_OWNER_TOKEN_HEADER] == "managed-minted-token"
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
@@ -791,7 +790,7 @@ def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
     assert captured["binding_token"] == "the-binding-token"
 
 
-def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
+def test_managed_mint_factory_keeps_ingress_bearer_separate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After the first mint, the factory uses the minted JWT as proxy bearer on re-mints."""
@@ -820,8 +819,43 @@ def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
     factory._cached_expires_at = 0.0  # expire
     factory()
 
-    assert mint_call_bearers[0] == "Bearer seed-bearer"
-    assert mint_call_bearers[1] == "Bearer minted-jwt"
+    assert mint_call_bearers == ["Bearer seed-bearer", "Bearer seed-bearer"]
+    assert factory.ingress_bearer == "seed-bearer"
+
+
+def test_runner_databricks_auth_sends_apps_and_owner_headers() -> None:
+    """Managed requests separate ingress OAuth from application identity."""
+    from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+    class _Factory:
+        ingress_bearer = "apps-sp-token"
+
+        def __call__(self) -> str:
+            return "owner-jwt"
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/v1/session")
+    captured = _drive_auth_flow(
+        _RunnerDatabricksAuth(_Factory()),
+        request,
+        httpx.Response(200),
+    )
+    assert captured == ["Bearer apps-sp-token"]
+    assert request.headers[RUNNER_OWNER_TOKEN_HEADER] == "owner-jwt"
+
+
+def test_runner_request_headers_sends_apps_and_owner_headers() -> None:
+    """Out-of-process clients get the same managed dual-header contract."""
+
+    class _Factory:
+        ingress_bearer = "apps-sp-token"
+
+        def __call__(self) -> str:
+            return "owner-jwt"
+
+    headers = _runner_request_headers(_Factory(), "https://app.databricksapps.com")
+
+    assert headers["Authorization"] == "Bearer apps-sp-token"
+    assert headers[RUNNER_OWNER_TOKEN_HEADER] == "owner-jwt"
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:

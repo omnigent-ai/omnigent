@@ -6,6 +6,7 @@ database and UC Volumes as the artifact store.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -215,7 +216,33 @@ try:
     if _exposure:
         logger.warning("%s", _exposure)
 
+    app_client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
+    if app_client_secret:
+        runner_secret = hashlib.sha256(f"omnigent-runner:{app_client_secret}".encode()).hexdigest()
+        os.environ.setdefault("OMNIGENT_RUNNER_TOKEN_SECRET", runner_secret)
     auth_provider = create_auth_provider()
+    sandbox_config = None
+    coda_app_name = os.environ.get("CODA_APP_NAME", "").strip()
+    coda_app_url = os.environ.get("CODA_APP_URL", "").strip()
+    public_server_url = os.environ.get("OMNIGENT_PUBLIC_SERVER_URL", "").strip()
+    coda_values = {
+        "CODA_APP_NAME": coda_app_name,
+        "CODA_APP_URL": coda_app_url,
+        "OMNIGENT_PUBLIC_SERVER_URL": public_server_url,
+    }
+    if any(coda_values.values()) and not all(coda_values.values()):
+        missing = ", ".join(name for name, value in coda_values.items() if not value)
+        raise RuntimeError(f"partial managed CoDA configuration; missing: {missing}")
+    if all(coda_values.values()):
+        from omnigent.server.managed_hosts import parse_sandbox_config
+
+        sandbox_config = parse_sandbox_config(
+            {
+                "provider": "coda",
+                "server_url": public_server_url,
+                "coda": {"app_name": coda_app_name, "app_url": coda_app_url},
+            }
+        )
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -229,6 +256,7 @@ try:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
+        sandbox_config=sandbox_config,
     )
 
     if __name__ == "__main__":

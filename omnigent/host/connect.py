@@ -456,6 +456,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # host→runner intrinsically, so the setter need not also list it in
         # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
+        # CoDA's loopback SP broker lets native harness token helpers mint a
+        # fresh workspace bearer without exposing the client secret.
+        "CODA_SP_TOKEN_BROKER_URL",
+        "CODA_VENV_PYTHON",
         # The operator's env-forwarding control var itself. Without it here, the
         # var is stripped before it reaches the daemon in --server mode (the
         # remote daemon prefixes are DATABRICKS_ + LC_/MLFLOW_/OTEL_/OMNIGENT_OTEL_,
@@ -1235,6 +1239,7 @@ class HostProcess:
         initial_auth_token = await asyncio.to_thread(
             self._current_auth_token,
             initialize=False,
+            allow_managed=True,
         )
         env = _build_runner_env(
             os.environ,
@@ -2555,7 +2560,9 @@ class HostProcess:
         Server-managed sandbox hosts authenticate with the launch token
         the server injected at spawn (:data:`HOST_TOKEN_ENV_VAR`); when
         present it is sent on its dedicated header and the user-token
-        path is skipped entirely (a sandbox has no user credentials).
+        path is skipped (a sandbox has no user credentials). A managed
+        host may additionally carry an ingress bearer — see
+        :meth:`_databricks_ingress_token`.
 
         Otherwise mints a fresh Databricks bearer token via the runner's
         auth factory (refreshed every reconnect so long-lived hosts
@@ -2563,8 +2570,8 @@ class HostProcess:
         the upgrade proceeds unauthenticated and the server/proxy
         decides.
 
-        :returns: Header mapping for the WS upgrade; carries either the
-            managed-host token header or — only when a token could be
+        :returns: Header mapping for the WS upgrade; carries the
+            managed-host token header and/or — only when a token could be
             minted — ``{"Authorization": "Bearer <token>"}``.
         """
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
@@ -2585,13 +2592,53 @@ class HostProcess:
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
+            ingress_token = self._databricks_ingress_token()
+            if ingress_token:
+                headers["Authorization"] = f"Bearer {ingress_token}"
             return headers
         token = self._current_auth_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
-    def _current_auth_token(self, *, initialize: bool = True) -> str | None:
+    def _databricks_ingress_token(self) -> str | None:
+        """Bearer for a Databricks ingress in front of a managed host's server.
+
+        A managed host running inside a Databricks App reaches the Omnigent
+        server through the Apps ingress, which rejects the launch-token header
+        on its own and redirects an unauthenticated upgrade to OIDC. The server
+        still authenticates the host by :data:`MANAGED_HOST_TOKEN_HEADER`; this
+        bearer only gets the request past the proxy.
+
+        Gated on the server URL being Databricks-owned *and* a Databricks
+        credential source being present, because an unconditional bearer would
+        ship a workspace credential to a Modal / E2B / Kubernetes server URL.
+        Resolved per upgrade attempt so multi-hour reconnects pick up a
+        refreshed service-principal token.
+
+        :returns: A bearer token, or ``None`` when the server is not
+            Databricks-owned, no Databricks credential is configured, or the
+            token could not be minted.
+        """
+        from omnigent.databricks_ai_gateway import is_databricks_owned_url
+
+        if not is_databricks_owned_url(self._server_url):
+            return None
+        if not any(
+            os.environ.get(var)
+            for var in (
+                "DATABRICKS_HOST",
+                "DATABRICKS_TOKEN",
+                "DATABRICKS_CLIENT_ID",
+                "DATABRICKS_CONFIG_PROFILE",
+            )
+        ):
+            return None
+        return self._current_auth_token(allow_managed=True)
+
+    def _current_auth_token(
+        self, *, initialize: bool = True, allow_managed: bool = False
+    ) -> str | None:
         """Return a bearer from the host's retained refreshable auth context.
 
         The first call builds the same factory the host tunnel already used.
@@ -2601,12 +2648,15 @@ class HostProcess:
         :param initialize: Build the factory when it has not been used yet.
             Runner launch passes ``False`` because it must only reuse the
             already-warm host context, never add auth work to the launch path.
+        :param allow_managed: Resolve a token even on a managed host. Only
+            :meth:`_databricks_ingress_token` passes ``True``; every other
+            caller must keep the managed short-circuit.
         :returns: Current bearer token, or ``None`` when credentials are not
             available or this is a managed host authenticated by launch token.
         """
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
-        if os.environ.get(HOST_TOKEN_ENV_VAR):
+        if not allow_managed and os.environ.get(HOST_TOKEN_ENV_VAR):
             return None
         try:
             if not self._auth_token_factory_resolved:

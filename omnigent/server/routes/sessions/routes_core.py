@@ -399,32 +399,96 @@ def register_core_routes(
                     resp.id,
                     {MANAGED_REPO_LABEL_KEY: body.workspace},
                 )
-            managed_launches.begin(resp.id)
-            # Seed the launch-progress indicator before the background
-            # task starts, so the first GET snapshot (the Web UI
-            # navigates to the session page immediately after this
-            # 201) already carries the "provisioning" stage.
-            _publish_sandbox_status(resp.id, "provisioning")
-            launch_task = asyncio.create_task(
-                _run_managed_launch(
-                    session_id=resp.id,
-                    # On auth-disabled servers user_id is None; the
-                    # sandbox host registers under the reserved local
-                    # owner, same as a directly-connected host would.
-                    owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                    sandbox_config=sandbox_config,
-                    repo=repo,
-                    tracker=managed_launches,
-                    conversation_store=conversation_store,
-                    host_store=host_store_for_managed,
-                    host_registry=getattr(request.app.state, "host_registry", None),
-                    tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                    agent_store=agent_store,
-                    agent_id=conv.agent_id if conv is not None else None,
+            owner = user_id if user_id is not None else RESERVED_USER_LOCAL
+            adopted = None
+            if sandbox_config.provider == "coda":
+                from omnigent.onboarding.sandboxes.coda import CodaProvider
+                from omnigent.stores.host_store import host_is_live
+
+                # Capacity check + workspace allocation + DB bind are one
+                # critical section. Without it, concurrent creates can both
+                # observe the last free slot on a shared lease.
+                adoption_lock = getattr(request.app.state, "coda_adoption_lock", None)
+                if adoption_lock is None:
+                    adoption_lock = asyncio.Lock()
+                    request.app.state.coda_adoption_lock = adoption_lock
+                async with adoption_lock:
+                    hosts = await asyncio.to_thread(host_store_for_managed.list_hosts, owner)
+                    candidates = [
+                        host
+                        for host in hosts
+                        if host.sandbox_provider == "coda"
+                        and host.sandbox_id is not None
+                        and host_is_live(host)
+                    ]
+                    if candidates:
+                        sessions = await asyncio.to_thread(
+                            conversation_store.list_conversations,
+                            limit=1000,
+                            kind=None,
+                        )
+                        cap = sandbox_config.max_sessions_per_lease or 10
+                        adopted = next(
+                            (
+                                host
+                                for host in candidates
+                                if sum(
+                                    session.host_id == host.host_id for session in sessions.data
+                                )
+                                < cap
+                            ),
+                            None,
+                        )
+                    if adopted is not None:
+                        launcher = sandbox_config.launcher_factory()
+                        if not isinstance(launcher, CodaProvider):
+                            raise OmnigentError(
+                                "coda sandbox config did not produce a CodaProvider",
+                                code=ErrorCode.INTERNAL_ERROR,
+                            )
+                        try:
+                            workspace = await asyncio.to_thread(
+                                launcher.allocate_workspace,
+                                adopted.sandbox_id,
+                                resp.id,
+                            )
+                            await asyncio.to_thread(
+                                conversation_store.set_host_id,
+                                resp.id,
+                                adopted.host_id,
+                                workspace,
+                            )
+                        except Exception:
+                            # Session creation is atomic from the caller's
+                            # perspective: a failed CoDA allocation must not
+                            # leave an unbound durable conversation behind.
+                            await conversation_store.delete_conversation(resp.id)
+                            raise
+                        resp.host_id = adopted.host_id
+                        resp.workspace = workspace
+                        launch_host_id = adopted.host_id
+            if adopted is None:
+                managed_launches.begin(resp.id)
+                # Seed the launch-progress indicator before the background
+                # task starts, so the first GET snapshot already carries it.
+                _publish_sandbox_status(resp.id, "provisioning")
+                launch_task = asyncio.create_task(
+                    _run_managed_launch(
+                        session_id=resp.id,
+                        owner=owner,
+                        sandbox_config=sandbox_config,
+                        repo=repo,
+                        tracker=managed_launches,
+                        conversation_store=conversation_store,
+                        host_store=host_store_for_managed,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                        agent_store=agent_store,
+                        agent_id=conv.agent_id if conv is not None else None,
+                    )
                 )
-            )
-            _managed_launch_tasks.add(launch_task)
-            launch_task.add_done_callback(_managed_launch_tasks.discard)
+                _managed_launch_tasks.add(launch_task)
+                launch_task.add_done_callback(_managed_launch_tasks.discard)
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must

@@ -251,6 +251,29 @@ async def _run_inactivity_monitor(
         await asyncio.sleep(min(poll_interval_s, idle_timeout_s - elapsed_s))
 
 
+def _runner_request_headers(
+    factory: Callable[[], str | None] | None,
+    server_url: str,
+) -> dict[str, str]:
+    """Build routing and dual-auth headers for runner-owned HTTP clients.
+
+    A managed runner's owner JWT authenticates inside Omnigent, while the
+    host-provided service-principal bearer is still required to cross a
+    Databricks Apps ingress. Callers outside :class:`_RunnerDatabricksAuth`
+    (notably the native-Pi extension) must preserve the same separation.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+
+    token = factory() if factory is not None else None
+    ingress_bearer = getattr(factory, "ingress_bearer", None)
+    headers = databricks_request_headers(server_url, bearer_token=ingress_bearer or token)
+    if ingress_bearer and token:
+        from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+        headers[RUNNER_OWNER_TOKEN_HEADER] = token
+    return headers
+
+
 class _RunnerDatabricksAuth(httpx.Auth):
     """httpx Auth that mints a fresh Databricks OAuth token per request.
 
@@ -327,7 +350,14 @@ class _RunnerDatabricksAuth(httpx.Auth):
                     yield request
                     return
                 raise httpx.RequestError("Databricks token refresh returned no token")
-            request.headers["Authorization"] = f"Bearer {token}"
+            ingress_bearer = getattr(self._factory, "ingress_bearer", None)
+            if ingress_bearer:
+                from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+                request.headers["Authorization"] = f"Bearer {ingress_bearer}"
+                request.headers[RUNNER_OWNER_TOKEN_HEADER] = token
+            else:
+                request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
             return
@@ -335,7 +365,14 @@ class _RunnerDatabricksAuth(httpx.Auth):
             _invalidate_auth_token_factory(self._factory)
             token = self._factory()
             if token:
-                request.headers["Authorization"] = f"Bearer {token}"
+                ingress_bearer = getattr(self._factory, "ingress_bearer", None)
+                if ingress_bearer:
+                    from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+                    request.headers["Authorization"] = f"Bearer {ingress_bearer}"
+                    request.headers[RUNNER_OWNER_TOKEN_HEADER] = token
+                else:
+                    request.headers["Authorization"] = f"Bearer {token}"
                 yield request
 
 
@@ -523,6 +560,25 @@ def _make_auth_token_factory(
         if _allow_initial_token
         else ""
     )
+    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
+    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+    if (
+        initial_token
+        and _allow_delegated_mint
+        and delegated_auth
+        and resolved_server_url
+        and binding_token
+    ):
+        # The host's SP bearer is only an Apps-ingress credential. Exchange
+        # the binding token immediately so application requests carry the
+        # session owner's token rather than the CoDA service principal.
+        delegated_factory = _make_managed_mint_factory(
+            resolved_server_url,
+            binding_token,
+            proxy_bearer=initial_token,
+        )
+        if delegated_factory is not None:
+            return delegated_factory
     if initial_token and resolved_server_url:
         _logger.info("using host-provided bearer for runner bootstrap")
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
@@ -535,8 +591,6 @@ def _make_auth_token_factory(
 
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
-    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
-    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
         delegated_factory = _make_managed_mint_factory(
             resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
@@ -726,10 +780,8 @@ class _ManagedMintTokenFactory:
         :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
         :param server_url: Omnigent server base URL.
         :param binding_token: The runner's tunnel binding token.
-        :param proxy_bearer: Optional bearer for the Apps proxy. Seeded with
-            the host's initial bearer; replaced by the minted JWT after the
-            first successful mint so the proxy sees a valid credential on
-            every subsequent refresh.
+        :param proxy_bearer: Optional OAuth bearer for the Apps proxy. It stays
+            separate from the minted owner JWT, which the proxy does not accept.
         """
         self._mint_url = mint_url
         self._server_url = server_url
@@ -794,10 +846,12 @@ class _ManagedMintTokenFactory:
             return self._still_valid_cached_token(now)
         self._cached_token = token
         self._cached_expires_at = expires_at
-        # Promote the minted JWT to proxy bearer so subsequent refreshes
-        # through the Apps proxy are authenticated with a valid credential.
-        self._proxy_bearer = token
         return token
+
+    @property
+    def ingress_bearer(self) -> str | None:
+        """Return the OAuth bearer reserved for a Databricks Apps ingress."""
+        return self._proxy_bearer
 
     def _still_valid_cached_token(self, now: float) -> str | None:
         """Return the cached token if it hasn't expired outright.

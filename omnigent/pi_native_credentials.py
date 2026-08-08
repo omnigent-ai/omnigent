@@ -194,6 +194,9 @@ class PiProviderConfig:
         request time, used for short-lived gateway tokens).
     :param auth_header: When ``True``, Pi sends ``Authorization: Bearer
         <apiKey>`` (gateways) instead of a provider-native key header.
+    :param compat: Optional Pi wire-compatibility flags for the primary
+        provider. Databricks' MLflow gateway rejects OpenAI-only fields such as
+        ``store`` and ``stream_options`` even when their values are false.
     :param credential_warning: A user-facing notice set when the provider was
         rendered but its credentials could not be resolved (e.g. an expired
         Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
@@ -211,6 +214,7 @@ class PiProviderConfig:
     model: str
     api_key: str
     auth_header: bool
+    compat: _PiProviderCompat | None = None
     credential_warning: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
@@ -321,6 +325,8 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
+        if self.compat is not None:
+            provider["compat"] = self.compat
         providers = {self.provider_id: provider}
         providers.update(additional)
         return {"providers": providers}
@@ -352,6 +358,13 @@ class PiProviderConfig:
             self.model,
             surface.value,
         )
+
+
+def _model_service_id(model: str) -> str:
+    """Normalize a legacy Databricks alias for AI Gateway v2 model routing."""
+    if model.startswith("databricks-"):
+        return f"system.ai.{model.removeprefix('databricks-')}"
+    return model
 
 
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
@@ -418,16 +431,42 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
             api_key, f"{host}/ai-gateway/mlflow/v1", gemini_models, api_type="openai-completions"
         )
+    selected_model = (
+        model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    )
+    # The live v2 catalog uses system.ai.* ids, while older profile defaults and
+    # explicit endpoint aliases may still use databricks-*. Normalize only when
+    # the authoritative catalog confirms the normalized id. If discovery
+    # failed, preserving the original alias lets family fallback route it to
+    # the legacy serving-endpoints surface instead of guessing incorrectly.
+    normalized_model = _model_service_id(selected_model)
+    catalog_ids = {
+        str(item.get("id"))
+        for item in (*claude_models, *gpt_models, *completions_models, *gemini_models)
+    }
+    rendered_model = (
+        normalized_model
+        if normalized_model in catalog_ids
+        or (credential_warning is not None and selected_model.startswith("databricks-claude-"))
+        else selected_model
+    )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
-        base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
-        api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        base_url=f"{host}/ai-gateway/mlflow/v1",
+        api="openai-completions",
+        model=rendered_model,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is re-read per request (the auth command attempts a
         # refresh), matching codex-native's refresh semantics.
         api_key=api_key,
         auth_header=True,
+        compat={
+            "supportsDeveloperRole": False,
+            "supportsStore": False,
+            "supportsStrictMode": False,
+            "supportsReasoningEffort": False,
+            "supportsUsageInStreaming": False,
+        },
         extra_models=claude_models,
         additional_providers=additional,
         credential_warning=credential_warning,

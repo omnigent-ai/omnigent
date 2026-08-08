@@ -32,6 +32,10 @@ if [[ "${SKIP_WEB_UI:-}" != "1" ]]; then
     pnpm --filter web run build
 else
     echo "==> SKIP_WEB_UI=1: skipping web build"
+    # The omnigent wheel's setup.py build hook rebuilds the SPA on its own and
+    # reads a different variable, so skipping only the step above still ships
+    # the web UI in the wheel.
+    export OMNIGENT_SKIP_WEB_UI=true
 fi
 
 echo "==> Building omnigent-client wheel"

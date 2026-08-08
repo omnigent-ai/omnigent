@@ -26,6 +26,9 @@ RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
 # owner-scoped server bearer instead of resolving the host user's credentials.
 RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
+# Owner JWT carried separately when Authorization is reserved for an Apps
+# ingress OAuth bearer.
+RUNNER_OWNER_TOKEN_HEADER = "X-Omnigent-Runner-Owner-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
 # terminal-attach) set on their handshakes so the server's CSWSH origin
