@@ -1184,75 +1184,85 @@ class GooseExecutor(Executor):
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
 
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for goose response", retryable=True)
-                return
-
-            # Complete only once the future is resolved AND the queue is drained,
-            # so trailing chunks aren't truncated.
-            if fut.done() and self._queue.empty():
-                try:
-                    response = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    self._session_id = None
-                    self._system_prompt_sent = False
-                    yield ExecutorError(message=f"goose process error: {exc}", retryable=True)
+        # The stdout reader pops ``req_id`` only when it matches a RESPONSE.
+        # On timeout, or when the reader resolves ``fut`` with an exception
+        # (EOF / reader error) without a match, nothing removes it, so
+        # ``self._pending`` would grow one stale entry per silent/failed turn
+        # on a long-lived session. Drop it on every exit (mirrors ``_rpc``).
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    yield ExecutorError(
+                        message="Timeout waiting for goose response", retryable=True
+                    )
                     return
-                if "error" in response:
-                    error_msg = response["error"].get("message", "Unknown ACP error")
-                    if "Session not found" in error_msg:
+
+                # Complete only once the future is resolved AND the queue is drained,
+                # so trailing chunks aren't truncated.
+                if fut.done() and self._queue.empty():
+                    try:
+                        response = fut.result()
+                    except Exception as exc:  # noqa: BLE001
                         self._session_id = None
                         self._system_prompt_sent = False
-                    yield ExecutorError(message=error_msg, retryable=True)
+                        yield ExecutorError(message=f"goose process error: {exc}", retryable=True)
+                        return
+                    if "error" in response:
+                        error_msg = response["error"].get("message", "Unknown ACP error")
+                        if "Session not found" in error_msg:
+                            self._session_id = None
+                            self._system_prompt_sent = False
+                        yield ExecutorError(message=error_msg, retryable=True)
+                        return
+                    result = response.get("result", {}) if isinstance(response, dict) else {}
+                    usage = self._usage_from_result(result) if isinstance(result, dict) else None
+                    yield TurnComplete(response="".join(accumulated_text), usage=usage)
                     return
-                result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_from_result(result) if isinstance(result, dict) else None
-                yield TurnComplete(response="".join(accumulated_text), usage=usage)
-                return
 
-            try:
-                notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
-                )
-            except asyncio.TimeoutError:
-                continue
+                try:
+                    notification = await asyncio.wait_for(
+                        self._queue.get(), timeout=min(remaining, 2.0)
+                    )
+                except asyncio.TimeoutError:
+                    continue
 
-            method = notification.get("method", "")
-            params = notification.get("params", {})
+                method = notification.get("method", "")
+                params = notification.get("params", {})
 
-            if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                update = params.get("update", {})
-                update_type = update.get("sessionUpdate", "")
+                if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                    update = params.get("update", {})
+                    update_type = update.get("sessionUpdate", "")
 
-                if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
-                    content = update.get("content", {})
-                    text = content.get("text", "") if isinstance(content, dict) else ""
-                    if text:
-                        accumulated_text.append(text)
-                        yield TextChunk(text=text)
-                elif update_type == _UPDATE_USAGE:
-                    size = update.get("size")
-                    if isinstance(size, int) and size > 0:
-                        self._context_window = size
-                elif update_type == _UPDATE_TOOL_CALL:
-                    logger.debug("goose tool_call: %s", update.get("title", "tool_call"))
-                elif update_type == _UPDATE_TOOL_CALL_UPDATE:
-                    pass
+                    if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
+                        content = update.get("content", {})
+                        text = content.get("text", "") if isinstance(content, dict) else ""
+                        if text:
+                            accumulated_text.append(text)
+                            yield TextChunk(text=text)
+                    elif update_type == _UPDATE_USAGE:
+                        size = update.get("size")
+                        if isinstance(size, int) and size > 0:
+                            self._context_window = size
+                    elif update_type == _UPDATE_TOOL_CALL:
+                        logger.debug("goose tool_call: %s", update.get("title", "tool_call"))
+                    elif update_type == _UPDATE_TOOL_CALL_UPDATE:
+                        pass
 
-            elif notification.get("id") is not None and notification.get("method"):
-                # Server-initiated request (session/request_permission): routes
-                # through policy + elicitation. Blocks while the human decides.
-                await self._respond_to_agent_request(notification)
-                # Surface any fs ToolCall events the handler buffered so the
-                # I/O shows in history.
-                while self._fs_events:
-                    yield self._fs_events.pop(0)
+                elif notification.get("id") is not None and notification.get("method"):
+                    # Server-initiated request (session/request_permission): routes
+                    # through policy + elicitation. Blocks while the human decides.
+                    await self._respond_to_agent_request(notification)
+                    # Surface any fs ToolCall events the handler buffered so the
+                    # I/O shows in history.
+                    while self._fs_events:
+                        yield self._fs_events.pop(0)
 
-            # Inbound message = progress; reset the idle deadline (after the
-            # approval block so a slow approval doesn't time out).
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+                # Inbound message = progress; reset the idle deadline (after the
+                # approval block so a slow approval doesn't time out).
+                deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        finally:
+            self._pending.pop(req_id, None)
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""

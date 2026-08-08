@@ -1340,97 +1340,107 @@ class QwenExecutor(Executor):
         # (see _accumulate_usage). Stays empty when qwen reports none.
         turn_usage: dict[str, int] = {}
 
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for qwen response", retryable=True)
-                return
-
-            # Complete only once the future is resolved AND the queue is drained.
-            # The reader resolves the future directly but enqueues chunks, and
-            # the response trails the chunk stream — a bare fut.done() check
-            # could return with chunks still buffered, truncating the response.
-            if fut.done() and self._queue.empty():
-                try:
-                    response = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    # The stdout reader sets an exception on the future when the
-                    # subprocess dies. Surface it as a clean retryable error
-                    # rather than letting it raise out of the generator.
-                    self._session_id = None
-                    self._system_prompt_sent = False
-                    yield ExecutorError(message=f"qwen process error: {exc}", retryable=True)
+        # The stdout reader pops ``req_id`` only when it matches a RESPONSE.
+        # On timeout, or when the reader resolves ``fut`` with an exception
+        # (EOF / reader error) without a match, nothing removes it, so
+        # ``self._pending`` would grow one stale entry per silent/failed turn
+        # on a long-lived session. Drop it on every exit (mirrors ``_rpc``).
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    yield ExecutorError(
+                        message="Timeout waiting for qwen response", retryable=True
+                    )
                     return
-                if "error" in response:
-                    error_msg = response["error"].get("message", "Unknown ACP error")
-                    # If the session was lost, reset so next turn creates a new
-                    # one — and re-send the system prompt into that fresh session.
-                    if "Session not found" in error_msg:
+
+                # Complete only once the future is resolved AND the queue is drained.
+                # The reader resolves the future directly but enqueues chunks, and
+                # the response trails the chunk stream — a bare fut.done() check
+                # could return with chunks still buffered, truncating the response.
+                if fut.done() and self._queue.empty():
+                    try:
+                        response = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        # The stdout reader sets an exception on the future when the
+                        # subprocess dies. Surface it as a clean retryable error
+                        # rather than letting it raise out of the generator.
                         self._session_id = None
                         self._system_prompt_sent = False
-                    yield ExecutorError(message=error_msg, retryable=True)
+                        yield ExecutorError(message=f"qwen process error: {exc}", retryable=True)
+                        return
+                    if "error" in response:
+                        error_msg = response["error"].get("message", "Unknown ACP error")
+                        # If the session was lost, reset so next turn creates a new
+                        # one — and re-send the system prompt into that fresh session.
+                        if "Session not found" in error_msg:
+                            self._session_id = None
+                            self._system_prompt_sent = False
+                        yield ExecutorError(message=error_msg, retryable=True)
+                        return
+                    # Successful completion. Attach the per-turn token usage qwen
+                    # reported over the stream (None when it reported none) and feed
+                    # the cost observer, mirroring the codex executor.
+                    usage = turn_usage or None
+                    if usage is not None:
+                        _notify_usage_from_dict(model=self._model, usage=usage)
+                    final_text = "".join(accumulated_text)
+                    yield TurnComplete(response=final_text if final_text else "", usage=usage)
                     return
-                # Successful completion. Attach the per-turn token usage qwen
-                # reported over the stream (None when it reported none) and feed
-                # the cost observer, mirroring the codex executor.
-                usage = turn_usage or None
-                if usage is not None:
-                    _notify_usage_from_dict(model=self._model, usage=usage)
-                final_text = "".join(accumulated_text)
-                yield TurnComplete(response=final_text if final_text else "", usage=usage)
-                return
 
-            # Otherwise consume queued notifications.
-            try:
-                notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
-                )
-            except asyncio.TimeoutError:
-                continue
+                # Otherwise consume queued notifications.
+                try:
+                    notification = await asyncio.wait_for(
+                        self._queue.get(), timeout=min(remaining, 2.0)
+                    )
+                except asyncio.TimeoutError:
+                    continue
 
-            method = notification.get("method", "")
-            params = notification.get("params", {})
+                method = notification.get("method", "")
+                params = notification.get("params", {})
 
-            if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                update = params.get("update", {})
-                update_type = update.get("sessionUpdate", "")
+                if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                    update = params.get("update", {})
+                    update_type = update.get("sessionUpdate", "")
 
-                if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
-                    # qwen rides per-call token usage on an agent_message_chunk
-                    # with empty text + a populated _meta.usage, so fold usage
-                    # before the text check (the usage-bearing chunk has none).
-                    self._accumulate_usage(turn_usage, update)
-                    content = update.get("content", {})
-                    if isinstance(content, dict):
-                        text = content.get("text", "")
-                    else:
-                        text = ""
-                    if text:
-                        accumulated_text.append(text)
-                        yield TextChunk(text=text)
+                    if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
+                        # qwen rides per-call token usage on an agent_message_chunk
+                        # with empty text + a populated _meta.usage, so fold usage
+                        # before the text check (the usage-bearing chunk has none).
+                        self._accumulate_usage(turn_usage, update)
+                        content = update.get("content", {})
+                        if isinstance(content, dict):
+                            text = content.get("text", "")
+                        else:
+                            text = ""
+                        if text:
+                            accumulated_text.append(text)
+                            yield TextChunk(text=text)
 
-                elif update_type == _UPDATE_TOOL_CALL:
-                    # Qwen is executing a built-in tool — surface it as info.
-                    tool_title = update.get("title", "tool_call")
-                    logger.debug("qwen tool_call: %s", tool_title)
+                    elif update_type == _UPDATE_TOOL_CALL:
+                        # Qwen is executing a built-in tool — surface it as info.
+                        tool_title = update.get("title", "tool_call")
+                        logger.debug("qwen tool_call: %s", tool_title)
 
-                elif update_type == _UPDATE_TOOL_CALL_UPDATE:
-                    # Status update on an in-progress tool call — skip.
-                    pass
+                    elif update_type == _UPDATE_TOOL_CALL_UPDATE:
+                        # Status update on an in-progress tool call — skip.
+                        pass
 
-            elif notification.get("id") is not None and notification.get("method"):
-                # Server-initiated request (e.g. session/request_permission):
-                # permission goes through policy + elicitation; anything else
-                # gets method-not-found. Blocks while the human decides.
-                await self._respond_to_agent_request(notification)
-                # Surface any fs ToolCall events the handler buffered so the
-                # I/O shows in history.
-                while self._fs_events:
-                    yield self._fs_events.pop(0)
+                elif notification.get("id") is not None and notification.get("method"):
+                    # Server-initiated request (e.g. session/request_permission):
+                    # permission goes through policy + elicitation; anything else
+                    # gets method-not-found. Blocks while the human decides.
+                    await self._respond_to_agent_request(notification)
+                    # Surface any fs ToolCall events the handler buffered so the
+                    # I/O shows in history.
+                    while self._fs_events:
+                        yield self._fs_events.pop(0)
 
-            # Inbound message = progress; reset the idle deadline. Runs after the
-            # human-approval block above so a slow approval doesn't time out.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+                # Inbound message = progress; reset the idle deadline. Runs after the
+                # human-approval block above so a slow approval doesn't time out.
+                deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        finally:
+            self._pending.pop(req_id, None)
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""

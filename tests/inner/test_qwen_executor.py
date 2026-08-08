@@ -2130,3 +2130,39 @@ async def test_ensure_initialized_image_capability_defaults_false() -> None:
     await executor._ensure_initialized()
     assert executor._initialized is True
     assert executor._image_supported is False
+
+
+@pytest.mark.asyncio
+async def test_run_turn_timeout_does_not_leak_pending_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that times out must not leave its request future in ``_pending``.
+
+    The stdout reader pops ``req_id`` only on a matched response; the timeout /
+    EOF paths did not, leaking one stale future per silent turn on a long-lived
+    qwen session. Drive a turn whose response never arrives and assert cleanup.
+    """
+    from types import SimpleNamespace
+
+    import omnigent.inner.qwen_executor as qwen_mod
+
+    monkeypatch.setattr(qwen_mod, "_PROMPT_TIMEOUT_SECONDS", 0.05)
+    ex = QwenExecutor(qwen_path="qwen")
+
+    async def _noop(*_a: object, **_k: object) -> None:
+        return None
+
+    async def _sess() -> str:
+        return "sess-1"
+
+    monkeypatch.setattr(ex, "_start_process", _noop)
+    monkeypatch.setattr(ex, "_ensure_initialized", _noop)
+    monkeypatch.setattr(ex, "_ensure_session", _sess)
+    monkeypatch.setattr(ex, "_send", _noop)
+    ex._proc = SimpleNamespace(returncode=None)  # type: ignore[assignment]
+
+    events = [
+        event async for event in ex.run_turn([{"role": "user", "content": "hi"}], [], "sys")
+    ]
+    assert any(isinstance(e, ExecutorError) for e in events)
+    assert ex._pending == {}, "run_turn must drop its prompt future from _pending on timeout"
