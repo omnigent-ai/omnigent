@@ -1874,3 +1874,38 @@ def test_stream_ended_without_finish_reason_with_content_completes() -> None:
         assert turn_events[0].response == "partial"
 
     _run(_t())
+
+
+def test_read_databrickscfg_fallback_tolerates_duplicate_default_section(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """
+    A ``~/.databrickscfg`` with a duplicate ``[DEFAULT]`` section (as written by
+    the Databricks VS Code extension) must not crash the file readers.
+
+    Regression test for #3284: ``configparser.ConfigParser`` defaults to
+    ``strict=True`` and raised ``DuplicateOptionError`` on such files. The
+    readers now parse in non-strict mode, where the last value wins.
+    """
+    contents = textwrap.dedent(
+        """
+        [DEFAULT]
+        host = https://first.cloud.databricks.com
+        token = dapi-first
+
+        [DEFAULT]
+        host = https://second.cloud.databricks.com
+        token = dapi-second
+        """
+    ).lstrip()
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    creds = _read_databrickscfg_file_fallback()
+    assert creds is not None
+    assert creds.host == "https://second.cloud.databricks.com"
+    assert creds.token == "dapi-second"
+
+    # The host-only reader must survive the same file too.
+    assert _read_databrickscfg_host() == "https://second.cloud.databricks.com"
