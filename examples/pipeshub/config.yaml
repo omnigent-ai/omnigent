@@ -1,0 +1,41 @@
+# PipesHub — chat over your organization's connected knowledge sources
+# (Slack, Drive, Confluence, and whatever else your org has wired into
+# PipesHub) through PipesHub's MCP server.
+#
+# Prerequisites:
+#   - A PipesHub deployment with a Personal Access Token: workspace →
+#     Developer settings → Personal Access Tokens → New token.
+#   - PIPESHUB_MCP_URL and PIPESHUB_MCP_TOKEN set in the environment (the
+#     token panel gives you a ready-to-paste block with both).
+#
+# Usage:
+#   PIPESHUB_MCP_URL=... PIPESHUB_MCP_TOKEN=... omnigent run examples/pipeshub/
+
+spec_version: 1
+name: pipeshub
+description: >-
+  An agent that searches, cites, and answers questions over your
+  organization's PipesHub-connected knowledge sources via the PipesHub MCP
+  server.
+
+# "Brain": Claude Agent SDK, pinned deliberately — this example is written
+# against claude-sdk's MCP failure/runner path (see AGENTS.md and the
+# `session.mcp_startup` band in the web UI for how a bad/expired token
+# surfaces). Don't switch this to a native harness without re-checking that
+# story; native harnesses run their own MCP startup pipeline and will look
+# healthier than they are for a stale token.
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+interaction:
+  conversational: true
+  modalities:
+    input: [text]
+    output: [text]
+
+# No `tools:` block — the PipesHub MCP server under tools/mcp/pipeshub.yaml
+# is auto-discovered and its tools exposed to the agent. Agent instructions
+# live in AGENTS.md (auto-discovered; takes precedence over any `prompt:`
+# key here, so don't add one — it would be silently ignored).
