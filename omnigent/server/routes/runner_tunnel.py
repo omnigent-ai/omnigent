@@ -47,6 +47,33 @@ PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
+# WebSocket close codes that mark a *planned* runner recycle (vs. an
+# abnormal drop). A runner closes the tunnel with one of these on the
+# graceful path — a server-issued host.stop_runner / managed runner-token
+# TTL recycle / orderly shutdown:
+#   1000  normal closure (RFC 6455 §7.4.1)
+#   1001  "going away"     — sent on an orderly runner shutdown
+#   1012  "service restart"
+# 1001/1012 mirror serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES`` — the same
+# taxonomy the runner uses to recognise a routine ingress recycle from the
+# other side of the tunnel. Treating all three as planned means an in-flight
+# relayed request aborted by the ensuing deregister surfaces as a retryable
+# 503 rather than an opaque 500. Gating on 1000 alone would miss the common
+# orderly-shutdown path, which closes with 1001.
+_PLANNED_RECYCLE_CLOSE_CODES = frozenset({1000, 1001, 1012})
+
+
+def _is_planned_recycle_close(code: object) -> bool:
+    """Whether a WebSocket close ``code`` marks a planned runner recycle.
+
+    :param code: The close code from the tunnel's disconnect, or ``None``
+        when the helper task ended without one.
+    :returns: True for a clean normal-closure / going-away / service-restart
+        (a planned recycle whose in-flight requests should abort retryably),
+        False for any abnormal or unknown close.
+    """
+    return code in _PLANNED_RECYCLE_CLOSE_CODES
+
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -515,6 +542,10 @@ def create_runner_tunnel_router(
                         runner_id,
                     )
 
+            # Whether the tunnel closed on the graceful path (clean
+            # normal-closure) vs. an abnormal drop — decides whether
+            # in-flight requests are aborted retryably (planned recycle).
+            planned_close = False
             try:
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},
@@ -546,6 +577,11 @@ def create_runner_tunnel_router(
                             getattr(task_error, "code", None),
                             getattr(task_error, "reason", None),
                         )
+                        # A clean normal-closure / going-away / service-
+                        # restart is the graceful recycle path; mark it so the
+                        # deregister below aborts in-flight requests retryably
+                        # (503 runner_recycling), not 500.
+                        planned_close = _is_planned_recycle_close(getattr(exc, "code", None))
                     else:
                         _logger.warning(
                             "Tunnel helper task failed for runner %s: %s",
@@ -567,7 +603,7 @@ def create_runner_tunnel_router(
                     receive_task,
                     return_exceptions=True,
                 )
-                registry.deregister(runner_id, session)
+                registry.deregister(runner_id, session, recycling=planned_close)
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id)

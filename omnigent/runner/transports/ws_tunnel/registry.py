@@ -53,6 +53,40 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 _logger = logging.getLogger(__name__)
 
 
+# Default Retry-After hint (seconds) for a client whose in-flight request
+# was aborted by a *planned* runner recycle. The replacement runner
+# generation is typically already registering, so a short backoff suffices.
+RUNNER_RECYCLING_RETRY_AFTER_S = 2
+
+
+class TunnelRecyclingError(ConnectionError):
+    """In-flight tunnel request aborted by a *planned* runner recycle.
+
+    Subclasses :class:`ConnectionError` so every existing
+    ``except ConnectionError`` call site keeps catching it unchanged, but
+    carries a machine-readable retry hint so the HTTP boundary can surface
+    a retryable ``503 runner_recycling`` (plus ``Retry-After``) instead of
+    an opaque ``500 internal_error``.
+
+    Raised ONLY on the graceful path — a clean WebSocket closure that maps
+    to a server-issued ``host.stop_runner`` / managed runner-token TTL
+    recycle / orderly shutdown — never on an abnormal tunnel drop (which
+    keeps the plain :class:`ConnectionError`, unchanged 500 behaviour).
+
+    :param message: Human-readable detail.
+    :param retry_after_s: Suggested client backoff before retrying.
+    """
+
+    def __init__(
+        self,
+        message: str = "tunnel closed for a planned runner recycle",
+        *,
+        retry_after_s: float = RUNNER_RECYCLING_RETRY_AFTER_S,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
 class WebSocketLike(Protocol):
     """Minimal WebSocket protocol used by the registry + transport.
 
@@ -301,13 +335,15 @@ class TunnelRegistry:
         self,
         runner_id: str,
         session: RunnerSession | None = None,
+        *,
+        recycling: bool = False,
     ) -> RunnerSession | None:
         """Remove a session and abort all its in-flight requests.
 
         Called by the WS route handler when the tunnel closes for
         any reason (clean shutdown, network error, etc.). The abort
         ensures awaiters of in-flight requests don't hang — they
-        get a ConnectionError and propagate it up.
+        get an error and propagate it up.
 
         :param runner_id: Runner id to remove, e.g.
             ``"runner_0123456789abcdef"``.
@@ -315,6 +351,14 @@ class TunnelRegistry:
             deregistration only removes the registry entry if the
             current entry is this exact session object. This prevents
             stale route handlers from deleting a newer tunnel.
+        :param recycling: True when the tunnel closed as part of a
+            *planned* runner recycle (clean WebSocket closure —
+            server-issued ``host.stop_runner`` / managed runner-token
+            TTL expiry / graceful shutdown). In-flight requests are
+            then aborted with a retryable :class:`TunnelRecyclingError`
+            instead of a bare ``ConnectionError``, so the HTTP boundary
+            can return ``503 runner_recycling`` rather than ``500``.
+            Defaults to False (abnormal drop — unchanged behaviour).
         :returns: The removed session, or ``None`` when the runner is
             already offline or the guard did not match.
         """
@@ -326,16 +370,19 @@ class TunnelRegistry:
             in_flight_count = len(removed.in_flight)
             if in_flight_count:
                 _logger.warning(
-                    "Deregistering runner %s; aborting %d in-flight request(s)",
+                    "Deregistering runner %s (%s); aborting %d in-flight request(s)",
                     runner_id,
+                    "planned recycle" if recycling else "tunnel closed",
                     in_flight_count,
                 )
             else:
                 _logger.info("Deregistering runner %s; no in-flight requests", runner_id)
-            self._abort_session_inflight(
-                removed,
-                ConnectionError("tunnel closed before request completed"),
+            abort_error: BaseException = (
+                TunnelRecyclingError()
+                if recycling
+                else ConnectionError("tunnel closed before request completed")
             )
+            self._abort_session_inflight(removed, abort_error)
         _retire_session_writer(removed, code=4003, reason="tunnel closed")
         return removed
 

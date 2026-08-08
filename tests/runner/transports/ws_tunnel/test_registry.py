@@ -389,3 +389,43 @@ async def test_online_runner_ids_returns_insertion_order() -> None:
     assert reg.online_runner_ids() == ["r1", "r2", "r3"]
     reg.deregister("r2")
     assert reg.online_runner_ids() == ["r1", "r3"]
+
+
+@pytest.mark.asyncio
+async def test_deregister_recycling_aborts_inflight_with_retryable_error() -> None:
+    """Planned recycle (recycling=True) -> in-flight requests fail with a
+    retryable TunnelRecyclingError carrying a Retry-After hint, so the HTTP
+    boundary can return 503 runner_recycling instead of an opaque 500."""
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRecyclingError
+
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    state = reg.open_request("r1", "req1")
+
+    reg.deregister("r1", recycling=True)
+
+    assert state.head_future.done()
+    with pytest.raises(TunnelRecyclingError) as excinfo:
+        state.head_future.result()
+    assert excinfo.value.retry_after_s >= 1
+    # Subclass of ConnectionError so existing `except ConnectionError`
+    # call sites keep catching it unchanged.
+    assert isinstance(excinfo.value, ConnectionError)
+
+
+@pytest.mark.asyncio
+async def test_deregister_default_uses_plain_connection_error() -> None:
+    """An abnormal drop (default recycling=False) stays a plain
+    ConnectionError -> unchanged 500 behaviour; NOT the retryable subclass."""
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRecyclingError
+
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    state = reg.open_request("r1", "req1")
+
+    reg.deregister("r1")
+
+    assert state.head_future.done()
+    with pytest.raises(ConnectionError) as excinfo:
+        state.head_future.result()
+    assert not isinstance(excinfo.value, TunnelRecyclingError)
