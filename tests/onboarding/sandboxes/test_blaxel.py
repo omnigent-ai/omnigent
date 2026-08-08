@@ -23,7 +23,7 @@ from omnigent.onboarding.sandboxes.blaxel import (
     _LineSink,
     _OutputLimitExceeded,
 )
-from tests.e2e.integrations.deploy.blaxel.smoke_test import _production_workspace_name
+from tests.e2e.integrations.deploy.blaxel.blaxel_smoke_test import _production_workspace_name
 
 
 class _SandboxAPIError(Exception):
