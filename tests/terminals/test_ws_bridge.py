@@ -1501,3 +1501,78 @@ async def test_check_pane_dead_definitive_tri_state(
     # By calling with non-existent socket/target, tmux probe fails and returns None
     result = await _check_pane_dead_definitive("/nonexistent/socket", "nonexistent")
     assert result is None, "inconclusive probe should return None"
+
+
+# ── Output-queue backpressure ────────────────────────────
+
+
+def test_bounded_output_queue_drops_oldest_past_byte_cap() -> None:
+    """A saturated bounded output queue sheds the OLDEST chunks.
+
+    Terminal bytes are lossy-safe (the next repaint restores the screen),
+    so when the browser send is wedged and the backlog passes the byte cap,
+    the freshest output must win and total queued bytes must stay bounded.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=10)
+    queue.put_nowait(b"aaaa")
+    queue.put_nowait(b"bbbb")
+    queue.put_nowait(b"cccc")  # 12 bytes queued -> oldest drops
+
+    assert queue.queued_bytes <= 10
+    remaining = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert remaining == [b"bbbb", b"cccc"]
+    assert queue.queued_bytes == 0  # _get accounting drains with the items
+
+
+def test_bounded_output_queue_never_drops_eof_sentinel() -> None:
+    """The None EOF sentinel survives saturation (re-queued, not dropped).
+
+    Losing the sentinel would leave the forwarder blocked on get() forever
+    after the reader exits.
+    """
+    from omnigent.terminals.ws_bridge import _ByteBoundedOutputQueue
+
+    queue = _ByteBoundedOutputQueue(max_bytes=4)
+    queue.put_nowait(None)  # sentinel at the front of an over-cap backlog
+    queue.put_nowait(b"xxxxxxxx")
+
+    remaining = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert None in remaining
+    assert b"xxxxxxxx" in remaining
+
+
+@pytest.mark.asyncio
+async def test_pump_pty_chunks_caps_reads_per_wakeup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One add_reader wakeup drains at most the per-wakeup read cap.
+
+    add_reader is level-triggered, so leaving data buffered just re-fires the
+    callback next loop pass — but an uncapped drain of a flooding PTY would
+    starve every other callback (tunnel heartbeats included) until EAGAIN.
+    """
+    from omnigent.terminals.ws_bridge import _pump_pty_chunks
+
+    monkeypatch.setattr(ws_bridge, "_PTY_READS_PER_WAKEUP", 4)
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(read_fd, False)
+        os.set_blocking(write_fd, False)
+        # More data than 4 reads can drain (reads are ≤ _PTY_READ_CHUNK each).
+        written = 0
+        with contextlib.suppress(BlockingIOError):
+            while written < 8 * ws_bridge._PTY_READ_CHUNK:
+                written += os.write(write_fd, b"z" * ws_bridge._PTY_READ_CHUNK)
+        assert written > 5 * ws_bridge._PTY_READ_CHUNK, "pipe buffer too small for test"
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        _pump_pty_chunks(loop, read_fd, queue)
+
+        assert queue.qsize() <= 4, "single wakeup drained past the read cap"
+        assert os.read(read_fd, 1), "cap hit but pipe was fully drained"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)

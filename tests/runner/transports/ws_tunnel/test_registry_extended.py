@@ -381,3 +381,48 @@ async def test_wait_for_runner_zero_timeout_just_checks() -> None:
     assert await reg.wait_for_runner("r1", timeout_s=0) is None
     session = reg.register("r1", _NoopWS(), _hello())
     assert await reg.wait_for_runner("r1", timeout_s=-1) is session
+
+
+# ── Outbound queue backpressure ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_text_fails_loud_when_outbound_queue_saturated() -> None:
+    """A saturated outbound queue fails the send instead of dropping the frame.
+
+    Protocol frames must never be dropped silently — a lost frame strands its
+    RPC — so when the sender task stops draining the socket and the bounded
+    queue fills, send_text surfaces a ConnectionError to the caller.
+    """
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        session.outbound_queue.put_nowait("frame")
+
+    with pytest.raises(ConnectionError, match="queue is full"):
+        await reg.send_text(session, "one-too-many")
+
+
+@pytest.mark.asyncio
+async def test_retire_delivers_stop_sentinel_through_full_queue() -> None:
+    """Retiring a session with a full outbound queue still stops its sender.
+
+    The stop sentinel makes room by evicting one dead frame (the session's
+    in-flight requests are already aborted) instead of overflowing — so the
+    queue stays at its bound and the sender task still sees None and exits.
+    """
+    from omnigent.runner.transports.ws_tunnel.registry import _OUTBOUND_QUEUE_MAX_FRAMES
+
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    for _ in range(_OUTBOUND_QUEUE_MAX_FRAMES):
+        old.outbound_queue.put_nowait("frame")
+
+    reg.register("r1", _NoopWS(), _hello())  # newest-wins triggers retire of old
+    await asyncio.sleep(0)  # let the retire callback run on this loop
+
+    assert old.outbound_queue.qsize() == _OUTBOUND_QUEUE_MAX_FRAMES
+    drained = [old.outbound_queue.get_nowait() for _ in range(old.outbound_queue.qsize())]
+    assert drained[-1] is None

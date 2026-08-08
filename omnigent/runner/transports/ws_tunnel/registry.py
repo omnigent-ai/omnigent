@@ -52,6 +52,12 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 
 _logger = logging.getLogger(__name__)
 
+# Cap on frames queued for a runner's sender task. Protocol frames are never
+# dropped or coalesced — a lost frame strands its RPC silently — so past the
+# cap ``send_text`` fails loudly with ConnectionError instead: a backlog this
+# deep means the tunnel socket has stopped draining.
+_OUTBOUND_QUEUE_MAX_FRAMES = 1024
+
 
 class WebSocketLike(Protocol):
     """Minimal WebSocket protocol used by the registry + transport.
@@ -272,7 +278,7 @@ class TunnelRegistry:
             ws=ws,
             hello=hello,
             loop=loop,
-            outbound_queue=asyncio.Queue(),
+            outbound_queue=asyncio.Queue(maxsize=_OUTBOUND_QUEUE_MAX_FRAMES),
             connected_at=now,
             last_frame_at=now,
             owner=owner,
@@ -696,7 +702,20 @@ class TunnelRegistry:
                 if self._sessions.get(session.runner_id) is not session:
                     error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
                 else:
-                    session.outbound_queue.put_nowait(data)
+                    try:
+                        session.outbound_queue.put_nowait(data)
+                    except asyncio.QueueFull:
+                        # The sender task has stopped draining the socket.
+                        # Frames must not be dropped silently (a lost frame
+                        # strands its RPC), so fail the send loudly.
+                        _logger.warning(
+                            "runner %s outbound queue saturated at %d frames; failing send",
+                            session.runner_id,
+                            session.outbound_queue.maxsize,
+                        )
+                        error = ConnectionError(
+                            f"runner {session.runner_id!r} outbound tunnel queue is full"
+                        )
             if error is not None:
                 if not ack.done():
                     ack.set_exception(error)
@@ -778,7 +797,13 @@ def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) ->
 
     def _retire() -> None:
         """Run on the WebSocket owner loop."""
-        session.outbound_queue.put_nowait(None)
+        try:
+            session.outbound_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            # A retired session's pending frames are already dead (in-flight
+            # requests were aborted) — make room so the stop sentinel lands.
+            session.outbound_queue.get_nowait()
+            session.outbound_queue.put_nowait(None)
         close = getattr(session.ws, "close", None)
         if close is not None:
             with contextlib.suppress(Exception):

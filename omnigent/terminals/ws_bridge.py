@@ -63,6 +63,16 @@ _logger = logging.getLogger(__name__)
 # measurable interactivity gains.
 _PTY_READ_CHUNK: Final[int] = 4096
 
+# Per-``add_reader`` wakeup read cap. The callback is level-triggered, so it
+# re-fires while the fd stays readable; capping the drain keeps the event
+# loop live (heartbeats, other bridges) under a sustained TUI output flood.
+_PTY_READS_PER_WAKEUP: Final[int] = 16
+
+# Byte cap on queued-but-unsent terminal output. Generous so normal bursts
+# (multi-MB build logs behind a slow browser send) still deliver in full;
+# only a pathological flood against a stuck consumer trips the drop path.
+_OUTPUT_QUEUE_MAX_BYTES: Final[int] = 16 * 1024 * 1024
+
 # Default per-frame cap: merge queued PTY chunks into bounded sends so
 # huge bursts stream.
 _WS_COALESCE_MAX_BYTES: Final[int] = 64 * 1024
@@ -405,6 +415,77 @@ async def _write_all_nonblocking(
             return
 
 
+class _ByteBoundedOutputQueue(asyncio.Queue["bytes | None"]):
+    """Terminal-output queue whose ``put_nowait`` sheds backlog past a byte cap.
+
+    Drop policy: terminal bytes are lossy-safe — the pane's next repaint
+    restores the screen — so when the browser send is wedged and the backlog
+    exceeds the cap, the OLDEST chunks go (the freshest output wins). The
+    ``None`` EOF sentinel is never dropped. Item count stays unbounded, so
+    ``put_nowait`` never raises; ``_put``/``_get`` are asyncio.Queue's
+    subclass hooks (the same ones ``PriorityQueue`` overrides).
+    """
+
+    def __init__(self, max_bytes: int = _OUTPUT_QUEUE_MAX_BYTES) -> None:
+        super().__init__()
+        self.max_bytes = max_bytes
+        self.queued_bytes = 0
+
+    def _put(self, item: bytes | None) -> None:
+        super()._put(item)
+        if item is not None:
+            self.queued_bytes += len(item)
+
+    def _get(self) -> bytes | None:
+        item = super()._get()
+        if item is not None:
+            self.queued_bytes -= len(item)
+        return item
+
+    def put_nowait(self, item: bytes | None) -> None:
+        super().put_nowait(item)
+        while self.queued_bytes > self.max_bytes and self.qsize() > 1:
+            dropped = self.get_nowait()
+            if dropped is None:
+                # EOF sentinel must survive; re-queue it behind the remaining
+                # data (the consumer stops at None wherever it sits).
+                super().put_nowait(None)
+                return
+            _logger.debug(
+                "terminal output queue saturated (%d queued bytes); dropped %d-byte chunk",
+                self.queued_bytes,
+                len(dropped),
+            )
+
+
+def _pump_pty_chunks(
+    loop: asyncio.AbstractEventLoop,
+    fd: int,
+    queue: asyncio.Queue[bytes | None],
+) -> None:
+    """``add_reader`` callback: read a bounded batch of PTY output into *queue*.
+
+    The read cap matters under a flood: ``add_reader`` is level-triggered, so
+    returning with data still buffered just re-fires the callback on the next
+    loop pass — after other ready callbacks (tunnel heartbeats, other bridges)
+    get their turn. Enqueues the ``None`` EOF sentinel on PTY EOF/error.
+    """
+    try:
+        for _ in range(_PTY_READS_PER_WAKEUP):
+            chunk = os.read(fd, _PTY_READ_CHUNK)
+            if not chunk:
+                loop.remove_reader(fd)
+                queue.put_nowait(None)
+                return
+            queue.put_nowait(chunk)
+    except BlockingIOError:
+        return
+    except OSError:
+        with contextlib.suppress(ValueError):
+            loop.remove_reader(fd)
+        queue.put_nowait(None)
+
+
 async def _forward_pty_to_ws(
     websocket: WebSocket,
     pty_chunks: asyncio.Queue[bytes | None],
@@ -590,7 +671,7 @@ async def bridge_tmux_pty_to_websocket(
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
     loop = asyncio.get_running_loop()
-    pty_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    pty_chunks: asyncio.Queue[bytes | None] = _ByteBoundedOutputQueue()
     last_client_input_at: float | None = None
     last_pane_check_at: float | None = None
 
@@ -602,23 +683,7 @@ async def bridge_tmux_pty_to_websocket(
         """
         return _coalesce_limit_after_input(last_client_input_at)
 
-    def _on_pty_readable() -> None:
-        try:
-            while True:
-                chunk = os.read(master_fd, _PTY_READ_CHUNK)
-                if not chunk:
-                    loop.remove_reader(master_fd)
-                    pty_chunks.put_nowait(None)
-                    return
-                pty_chunks.put_nowait(chunk)
-        except BlockingIOError:
-            return
-        except OSError:
-            with contextlib.suppress(ValueError):
-                loop.remove_reader(master_fd)
-            pty_chunks.put_nowait(None)
-
-    loop.add_reader(master_fd, _on_pty_readable)
+    loop.add_reader(master_fd, _pump_pty_chunks, loop, master_fd, pty_chunks)
 
     async def _ws_to_pty() -> None:
         nonlocal last_client_input_at, last_pane_check_at
