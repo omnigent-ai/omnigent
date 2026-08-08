@@ -271,6 +271,15 @@ class AgentObject(BaseModel):
         a user-registered template is superseded by a newer
         same-named upload. Always ``False`` for session-scoped
         agents.
+    :param default_workspace: The agent's default working
+        directory, from ``spec.os_env.cwd`` — the directory the
+        agent is configured to run in and (under
+        ``working_directory_scope``) may require. The Web UI's
+        new-session picker defaults the workspace field to this
+        when the agent is selected, without clobbering a
+        user-edited value, so a user need not already know the
+        agent's required path. ``None`` when the spec declares
+        no ``os_env.cwd`` or when the bundle cannot be loaded.
     """
 
     id: str
@@ -287,6 +296,7 @@ class AgentObject(BaseModel):
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
     builtin: bool = False
+    default_workspace: str | None = None
 
 
 # ── Session Policies ───────────────────────────────────────────
