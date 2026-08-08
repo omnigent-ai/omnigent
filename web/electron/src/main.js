@@ -37,7 +37,12 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const { registerLightJsonDocumentTheme } = require("./json-document-theme");
+const {
+  normalizeUrl,
+  canonicalizeDesktopServerUrl,
+  expandDatabricksWorkspaceUrl,
+} = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
@@ -564,7 +569,7 @@ function pinWindow(win, origin) {
 /**
  * Record (or clear) the full server URL a window is connected to. The pinned
  * `origin` drops any path, but the host/server CLI commands need the exact URL
- * the user connected with (e.g. a Databricks ``…/ml/omnigents`` mount), so the
+ * the user connected with (e.g. a Databricks ``…/omnigent`` mount), so the
  * window keeps both.
  *
  * @param {BrowserWindow} win
@@ -669,7 +674,22 @@ function settingsPath() {
 
 function loadSettings() {
   try {
-    return JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    // The workspace API mount is a server address, not a browser destination.
+    // Canonicalize it for saved defaults, recents, and server switching.
+    if (typeof settings.server_url === "string") {
+      settings.server_url = canonicalizeDesktopServerUrl(settings.server_url);
+    }
+    if (Array.isArray(settings.recent_servers)) {
+      settings.recent_servers = [
+        ...new Set(
+          settings.recent_servers
+            .filter((url) => typeof url === "string")
+            .map(canonicalizeDesktopServerUrl),
+        ),
+      ];
+    }
+    return settings;
   } catch {
     // Missing/corrupt file → empty settings (first launch).
     return {};
@@ -931,10 +951,10 @@ function hardenOauthPopup(child) {
 
 /**
  * Join a basename-less SPA path (e.g. ``/c/conv_abc``) onto a server URL that
- * may carry a workspace mount (e.g. ``https://host/ml/omnigents/``). The path
+ * may carry a workspace mount (e.g. ``https://host/omnigent/``). The path
  * is an ABSOLUTE in-app route, but it lives UNDER the server's mount —
  * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
- * ``/ml/omnigents`` — so we string-concatenate: strip the server URL's trailing
+ * ``/omnigent`` — so we string-concatenate: strip the server URL's trailing
  * slash, append the path. The SPA's react-router basename then matches
  * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
  * (re-pointing an existing window) so the mount-aware join is in one place.
@@ -1024,6 +1044,7 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  registerLightJsonDocumentTheme(win.webContents);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   const saved = loadSettings().server_url;
@@ -1033,10 +1054,11 @@ function createWindow(targetUrl, opts = {}) {
   // override (deep link); else the explicit target (New Window cloning a
   // sibling — preserves prior behavior); else the saved default for normal
   // windows; else null (ephemeral windows start on the setup page).
-  const serverUrl =
+  const requestedServerUrl =
     (typeof opts.serverUrl === "string" && opts.serverUrl.length > 0 ? opts.serverUrl : null) ??
     explicit ??
     (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+  const serverUrl = requestedServerUrl ? canonicalizeDesktopServerUrl(requestedServerUrl) : null;
   // loadUrl: what the webContents actually loads. A deep-link path resolves
   // under the server URL (mount-aware — see resolveServerPath); an explicit
   // target (New Window) loads that exact URL; otherwise load the server URL.
@@ -1044,7 +1066,7 @@ function createWindow(targetUrl, opts = {}) {
     (typeof opts.path === "string" && opts.path.length > 0 && serverUrl
       ? resolveServerPath(serverUrl, opts.path)
       : null) ??
-    explicit ??
+    (explicit ? canonicalizeDesktopServerUrl(explicit) : null) ??
     serverUrl;
   // A serverUrl that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
@@ -2684,7 +2706,7 @@ function drainPendingDeepLinks() {
  * (expandDatabricksWorkspaceUrl) runs ONLY after the user consents to an
  * UNKNOWN server — so clicking (or the OS dispatching) a link to an
  * attacker-chosen host makes no HTTP request until the user has agreed. The
- * probe is safe post-consent because it can only append a path (`/ml/omnigents`)
+ * probe is safe post-consent because it can only append a path (`/omnigent`)
  * under the SAME origin — it never changes the origin the user approved.
  *
  * @param {string} raw The raw `omnigent://...` URL.
@@ -2699,7 +2721,7 @@ async function handleDeepLink(raw) {
   // same origin, so approving the origin is approving the server.
   const targetOrigin = parsed.origin;
   // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
-  // `https://host/ml/omnigents`) so we SKIP the probe entirely. null for an
+  // `https://host/omnigent`) so we SKIP the probe entirely. null for an
   // unknown server — the mount is discovered AFTER consent (see consent-unknown).
   const known = findKnownServerUrl(targetOrigin);
 
