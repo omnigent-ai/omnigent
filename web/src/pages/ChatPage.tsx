@@ -843,7 +843,16 @@ export function ChatPage() {
     // Both keep the prompt on top across the pending → approved flip.
     const committed = stripGatedSubagentRoutingChips(
       reorderCommittedRequestElicitations(
-        buildBubbles(blocks, activeResponse, bubbleCacheRef.current, interruptedResponseIds),
+        buildBubbles(
+          blocks,
+          activeResponse,
+          bubbleCacheRef.current,
+          interruptedResponseIds,
+          // Spin the newest turn's in-flight tools while the session runs —
+          // for claude-native, whose running/idle lives in `sessionStatus`
+          // and never opens a streaming `activeResponse`.
+          computeIsWorking(sessionStatus),
+        ),
       ),
       subagentRoutingOverride,
     );
@@ -863,6 +872,7 @@ export function ChatPage() {
     interruptedResponseIds,
     pendingUserMessages,
     subagentRoutingOverride,
+    sessionStatus,
   ]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
