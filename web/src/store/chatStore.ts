@@ -115,6 +115,15 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /**
+   * The caller retries this send itself on failure (the initial-prompt
+   * delivery loop). Suppresses the user-visible failure block so a
+   * transient "runner still booting" 503 doesn't paint an error the
+   * retry is about to resolve; the caller surfaces the error on its
+   * final attempt instead. Status still settles and the optimistic
+   * bubble still rolls back.
+   */
+  retryPending?: boolean;
 }
 
 /**
@@ -554,7 +563,12 @@ export interface ChatState {
   historyGeneration: number;
 
   // Actions.
-  send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  /**
+   * Post a user message. Resolves ``true`` once the POST settled on the
+   * server (accepted, or terminally refused by policy) and ``false`` when
+   * it failed — the signal the initial-prompt delivery loop retries on.
+   */
+  send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<boolean>;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
@@ -614,13 +628,15 @@ export interface ChatState {
    *
    * :param name: Skill name without the leading ``/``, e.g. ``"grill-me"``.
    * :param args: Raw argument text typed after the command, ``""`` if none.
+   * :returns: ``true`` once the POST settled on the server, ``false`` when
+   *     it failed — same retry signal as ``send``.
    */
   sendSlashCommand: (
     name: string,
     args: string,
     agentId: string,
     opts?: SendOptions,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   stop: () => void;
   switchTo: (conversationId: string | null) => Promise<void>;
   submitApproval: (
@@ -1017,21 +1033,36 @@ export function setPendingInitialPrompt(
 }
 
 /**
- * Read and remove the pending first message for a conversation. Read-once
- * (get + delete): the delete is what prevents a refresh/back from
- * replaying the prompt, replacing the old `navigate(..., { state: null })`
- * clear.
+ * Read the pending first message for a conversation WITHOUT removing it.
  *
- * @param conversationId The conversation id to consume for, e.g.
+ * Non-destructive on purpose: the entry is the only copy of the user's
+ * typed text, so it must survive everything between arriving on
+ * `/c/:id` and the message actually reaching the server — a ChatPage
+ * remount, a StrictMode double-invoke, a failed session bind, a
+ * supporting request 500ing while the runner boots, or a navigate-away
+ * and back. Only `clearPendingInitialPrompt` (called once delivery
+ * succeeds or is finally given up on) drops it, which is also what
+ * keeps a refresh/back from replaying an already-sent prompt.
+ *
+ * @param conversationId The conversation id to read for, e.g.
  *   `"conv_abc123"`.
- * @returns The stashed prompt, or `null` when none was set (or it was
- *   already consumed).
+ * @returns The stashed prompt, or `null` when none is pending.
  */
-export function consumePendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
-  const prompt = pendingInitialPrompts.get(conversationId);
-  if (prompt === undefined) return null;
+export function peekPendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
+  return pendingInitialPrompts.get(conversationId) ?? null;
+}
+
+/**
+ * Drop the pending first message for a conversation.
+ *
+ * Called once the message has settled on the server, or once delivery
+ * has been given up on and the failure surfaced to the user — never
+ * merely because it was read.
+ *
+ * @param conversationId The conversation id to clear, e.g. `"conv_abc123"`.
+ */
+export function clearPendingInitialPrompt(conversationId: string): void {
   pendingInitialPrompts.delete(conversationId);
-  return prompt;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -1366,6 +1397,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    // Whether the POST settled on the server (accepted or policy-denied).
+    // Returned to the caller so a retrying caller can tell "the server has
+    // it" from "nothing landed".
+    let settled = false;
 
     try {
       await waitForPrior();
@@ -1402,6 +1437,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           content: serverContent,
         },
       });
+      settled = true;
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -1483,16 +1519,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
           pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
         }));
         if (!alreadyStreaming) {
-          if (get().activeResponse !== null) {
-            // A response bubble already exists (the turn started, then failed)
-            // — mark it failed so the error rides on that bubble.
-            finalizeActive(set, "failed", message, null);
-          } else {
-            // No response bubble to carry the failure — the turn never started
-            // (e.g. the runner never came online, so POST /events 503'd). Append
-            // a standalone error block so the user sees WHY nothing happened
-            // instead of being left on a silent, empty composer.
-            set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+          // A caller that retries owns the error surface: painting one per
+          // attempt would stack failures the next attempt resolves.
+          if (opts?.retryPending !== true) {
+            if (get().activeResponse !== null) {
+              // A response bubble already exists (the turn started, then failed)
+              // — mark it failed so the error rides on that bubble.
+              finalizeActive(set, "failed", message, null);
+            } else {
+              // No response bubble to carry the failure — the turn never started
+              // (e.g. the runner never came online, so POST /events 503'd). Append
+              // a standalone error block so the user sees WHY nothing happened
+              // instead of being left on a silent, empty composer.
+              set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+            }
           }
           set({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0, blockedOn: null });
         } else {
@@ -1510,6 +1550,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // failed POST can't stall the chain forever.
       releaseSend();
     }
+    return settled;
   },
 
   sendSlashCommand: async (name, args, agentId, opts) => {
@@ -1554,6 +1595,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // The session this command actually posts to, once resolved.
     let postedSessionId: string | null = null;
+    // Whether the POST settled on the server — see `send`.
+    let settled = false;
 
     try {
       await waitForPrior();
@@ -1566,6 +1609,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         type: "slash_command",
         data: { kind: "skill", name, arguments: args },
       });
+      settled = true;
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status
@@ -1630,7 +1674,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }));
       }
       if (stillActive && !alreadyStreaming) {
-        finalizeActive(set, "failed", message, null);
+        // A retrying caller owns the error surface — see `send`.
+        if (opts?.retryPending !== true) finalizeActive(set, "failed", message, null);
         set({ status: "idle" });
       } else if (stillActive) {
         // Same reasoning as `send`: surface the failure without settling a turn
@@ -1641,6 +1686,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } finally {
       releaseSend();
     }
+    return settled;
   },
 
   stop: () => {
