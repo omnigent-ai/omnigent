@@ -1014,7 +1014,31 @@ class HarnessApp:
             # heterogeneous return type.
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/model-options",
+            self._get_model_options,
+            methods=["GET"],
+        )
         return router
+
+    def model_options(self) -> dict[str, Any]:
+        """Model-picker payload: ``{"models": [...], "current": <id|None>}``.
+
+        Empty by default; :class:`ExecutorAdapter` overrides it to surface the
+        inner executor's advertised models. Used by the runner to populate the
+        web model picker for harnesses (e.g. ACP) whose agent owns the model
+        list. Empty until a session exists (the first turn), like the codex
+        model-options path.
+        """
+        return {"models": [], "current": None}
+
+    async def _get_model_options(self, conversation_id: str, request: Request) -> Response:
+        """Handle ``GET /v1/sessions/{conversation_id}/model-options``."""
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        return JSONResponse(self.model_options())
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
         """

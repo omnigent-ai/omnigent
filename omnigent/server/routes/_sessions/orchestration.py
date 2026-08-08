@@ -137,6 +137,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ACP_WRAPPER_LABEL_VALUE,
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -7276,6 +7277,53 @@ async def _resolve_native_smart_routing(
     return native_agent.agent_name, model, verdict, None
 
 
+def _is_acp_harness_override(harness: str | None) -> bool:
+    """Whether *harness* drives its agent over ACP.
+
+    Reads the declared capability record rather than matching names, so the
+    builtin ACP harnesses (``acp``, ``goose``, ``qwen``) and any community ACP
+    plugin are covered without editing a list here. Both spellings the override
+    can be stored as are accepted: the concrete ``acp:<slug>`` a picker sends,
+    and the bare ``acp`` it canonicalizes to when the slug is folded away —
+    matching only the former made this dead code wherever the slug did not
+    survive validation.
+
+    :param harness: A harness name, ``acp:<slug>``, or ``None``.
+    :returns: ``True`` for an ACP-backed harness.
+    """
+    if not harness:
+        return False
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_capabilities import IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
+
+    key = harness.split(":", 1)[0]
+    caps = harness_capabilities().get(canonicalize_harness(key) or key)
+    return caps is not None and caps.integration_mode is IntegrationMode.ACP_SUBPROCESS
+
+
+async def _agent_declared_harness(conv: Conversation, agent_store: AgentStore) -> str | None:
+    """Return the harness the session's agent declares, best-effort.
+
+    Used only to decide a presentation label, so a spec that cannot be loaded
+    (no runtime, missing bundle, unparsable spec) yields ``None`` rather than
+    failing the create — the session still works, it just renders without the
+    ACP model picker.
+
+    :param conv: The freshly created conversation.
+    :param agent_store: Store the agent's bundle is loaded from.
+    :returns: The declared harness, or ``None``.
+    """
+    try:
+        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    except Exception:  # noqa: BLE001 — labelling must never fail session create
+        return None
+    config = getattr(getattr(spec, "executor", None), "config", None)
+    if not isinstance(config, dict):
+        return None
+    return str(config.get("harness") or "") or None
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -7786,6 +7834,38 @@ async def _create_session_from_existing_agent(
         if updated_conv is None:
             raise OmnigentError(
                 f"Session {conv.id!r} disappeared while setting sub-agent labels",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        conv = updated_conv
+    elif _is_acp_harness_override(
+        conv.harness_override or await _agent_declared_harness(conv, agent_store)
+    ):
+        # ACP-backed session, either picked as an override (``acp:<slug>``) or
+        # declared by the agent itself (``harness: droid``): tag it so the web
+        # model picker and the model-options fetch recognize it — ACP agents own
+        # their model list (SessionModelState) but have no native-agent
+        # registration to carry the wrapper label.
+        #
+        # Ordered BEFORE the REPL-terminal arm below because ACP is a non-native
+        # harness: that arm matches every host-bound top-level ACP session, and
+        # in an elif chain it would short-circuit this one, leaving the picker
+        # untagged for exactly the sessions it exists for. Its label is folded in
+        # here instead (different key), so an ACP session keeps the terminal view.
+        _acp_labels = dict(body.labels) if body.labels else {}
+        _acp_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _ACP_WRAPPER_LABEL_VALUE
+        if body.sub_agent_name is None and body.host_id is not None:
+            _acp_labels.update(
+                _repl_terminal_ui_labels(
+                    agent=agent,
+                    agent_cache=agent_cache,
+                    harness_override=harness_override,
+                )
+            )
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _acp_labels)
+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if updated_conv is None:
+            raise OmnigentError(
+                f"Session {conv.id!r} disappeared while setting the ACP wrapper label",
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv

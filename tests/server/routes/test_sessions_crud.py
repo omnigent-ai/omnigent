@@ -581,3 +581,44 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+def test_acp_harness_override_matches_bare_and_slugged_spellings() -> None:
+    """
+    The ACP session marker must accept both spellings of the override.
+
+    ``_validated_harness_override`` canonicalizes ``acp:<slug>`` down to a
+    bare ``acp`` unless the slug is explicitly preserved, so the stored
+    value is whichever spelling survived validation. Matching only
+    ``acp:<slug>`` made the ACP labelling dead code — a session created
+    with ``harness_override="acp:droid"`` persisted as ``"acp"`` and never
+    got tagged, so the web model picker never recognized it.
+    """
+    from omnigent.server.routes._sessions.orchestration import _is_acp_harness_override
+
+    assert _is_acp_harness_override("acp")
+    assert _is_acp_harness_override("acp:droid")
+    # Non-ACP harnesses must not be tagged, including a name merely
+    # prefixed with the same letters.
+    assert not _is_acp_harness_override("claude-native")
+    assert not _is_acp_harness_override("acplike")
+    assert not _is_acp_harness_override(None)
+
+
+def test_acp_marker_covers_every_declared_acp_harness() -> None:
+    """
+    The marker is derived from capabilities, not a hardcoded harness list.
+
+    ``goose`` and ``qwen`` are ACP-backed but were never named by the old
+    string match, so an agent declaring one got no wrapper label and no model
+    picker. Deriving from ``IntegrationMode.ACP_SUBPROCESS`` also covers
+    community ACP plugins, which cannot be enumerated here at all. A failure
+    means the marker regressed to matching names.
+    """
+    from omnigent.harness_capabilities import IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
+    from omnigent.server.routes._sessions.orchestration import _is_acp_harness_override
+
+    for harness, caps in harness_capabilities().items():
+        expected = caps.integration_mode is IntegrationMode.ACP_SUBPROCESS
+        assert _is_acp_harness_override(harness) is expected, harness

@@ -827,6 +827,19 @@ class ExecutorAdapter(HarnessApp):
             self._executor = self._executor_factory()
         return self._executor
 
+    def model_options(self) -> dict[str, Any]:
+        """Surface the inner executor's advertised models for the web picker.
+
+        Empty until the executor has run a turn (and thus created its agent
+        session); the picker then populates from the agent's own model list.
+        """
+        if self._executor is None:
+            return {"models": [], "current": None}
+        return {
+            "models": self._executor.available_models(),
+            "current": self._executor.current_model_id(),
+        }
+
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """
         Translate one inner :class:`ExecutorEvent` into Omnigent SSE

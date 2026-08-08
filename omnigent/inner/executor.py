@@ -559,6 +559,19 @@ class Executor:
     def max_context_tokens(self) -> int | None:
         return None
 
+    def available_models(self) -> list[dict[str, Any]]:
+        """Models this executor's agent offers for a live model picker.
+
+        Empty by default; executors whose agent advertises a model list (e.g.
+        ACP ``SessionModelState``) override this. Populated only after a session
+        exists, so it may be empty until the first turn.
+        """
+        return []
+
+    def current_model_id(self) -> str | None:
+        """The session's current model id, or ``None`` if the agent has no picker."""
+        return None
+
     async def close_session(self, session_key: str) -> None:  # noqa: ARG002 — default no-op; subclasses with per-session state override
         """
         Release resources associated with one Omnigent session.

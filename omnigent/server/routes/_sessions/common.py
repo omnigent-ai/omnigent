@@ -238,6 +238,12 @@ _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 
 
+# Generic-ACP sessions aren't a NativeCodingAgent, but they own a model list
+# (ACP SessionModelState) — this wrapper label lets the model-options fetch and
+# the web picker recognize them without a native-agent registration.
+_ACP_WRAPPER_LABEL_VALUE = "acp-native-ui"
+
+
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 
 
@@ -657,6 +663,12 @@ _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    # ACP sessions reuse the codex route: it is the runner's generic
+    # model-options endpoint, and it answers ACP-backed sessions from the
+    # running subprocess's SessionModelState (see ``_harness_is_acp_backed``
+    # in ``runner/app.py``). Without an entry here the fetch never runs and
+    # the picker stays empty no matter what the agent advertises.
+    _ACP_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
     # not fetched from a runner route, so the picker works in every auth path
@@ -723,6 +735,7 @@ def get_server_host_registry() -> HostRegistry | None:
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
+    "_ACP_WRAPPER_LABEL_VALUE",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_APPROVAL_TYPE",

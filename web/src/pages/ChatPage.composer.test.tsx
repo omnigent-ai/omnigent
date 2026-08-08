@@ -896,6 +896,63 @@ describe("Composer model/effort label", () => {
     expect(within(label()).getByText("Composer 2.5")).toHaveClass("text-foreground");
   });
 
+  it("never labels an ACP session with the cross-session sticky model", () => {
+    // Droid repro: a fresh ACP session has no override, and the agent owns its
+    // own model, so Omnigent has no model to show. Before this, `acp` fell
+    // through to `selectedModel` and the composer confidently labelled the
+    // session with an Opus pick left over from an unrelated session while droid
+    // was actually answering on its own configured Sonnet.
+    useChatStore.setState({
+      nativeVendorOwnsModel: false,
+      selectedModel: "claude-opus-4-8", // stale cross-session sticky — must not surface
+      sessionModelOverride: null,
+      selectedEffort: null,
+      llmModel: null, // ACP bundles declare no llm block
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "droid" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "acp",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: [{ id: "claude-opus-4-8", displayName: "Opus" }],
+        })}
+      />,
+    );
+    expect(screen.queryByTestId("composer-model-effort-label")).toBeNull();
+  });
+
+  it("labels an ACP session once a model is actually applied to it", () => {
+    // The picker persists the pick as the session override and the executor
+    // applies it via session/set_model, so THAT is a real model to surface.
+    useChatStore.setState({
+      nativeVendorOwnsModel: false,
+      selectedModel: "claude-opus-4-8", // stale sticky still must not win
+      sessionModelOverride: "grok-4.5",
+      selectedEffort: null,
+      llmModel: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "droid" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "acp",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: [
+            { id: "grok-4.5", displayName: "Grok 4.5" },
+            { id: "claude-opus-4-8", displayName: "Opus" },
+          ],
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Grok 4.5");
+    expect(label()).not.toHaveTextContent("Opus");
+  });
+
   it("surfaces an SDK/bundle session's model from the override, not the cross-session sticky", () => {
     // Polly/Debby (claude-sdk) repro: a model picked in some other (Codex)
     // session lingers in the global sticky `selectedModel`. SDK/bundle sessions

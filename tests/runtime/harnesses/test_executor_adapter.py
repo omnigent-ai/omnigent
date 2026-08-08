@@ -2001,3 +2001,49 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
         verdict = await adapter._stable_policy_evaluator(advisory_phase, {})
         assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
         assert verdict.reason is None, advisory_phase
+
+
+def test_model_options_empty_before_first_turn() -> None:
+    """
+    The picker gets an empty list until the executor exists.
+
+    ``ExecutorAdapter`` builds its inner executor lazily on the first turn, so
+    a model fetch that arrives before then has nothing to report. A failure
+    here means the picker would raise (or invent a model) on a session the
+    user has not sent a message to yet.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    assert adapter.model_options() == {"models": [], "current": None}
+
+
+def test_model_options_reflects_executor_model_list() -> None:
+    """
+    Once an executor exists, the picker mirrors what it advertises.
+
+    ``Executor`` ships ``available_models()``/``current_model_id()`` defaults of
+    ``[]``/``None``, so an executor whose agent has no picker stays empty; one
+    that overrides them (e.g. an ACP agent reporting ``SessionModelState``) is
+    surfaced verbatim. A failure means the adapter dropped or reshaped the
+    agent's own model list on the way to the web picker.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    class _ModelExecutor(_StubExecutor):
+        def available_models(self) -> list[dict[str, object]]:
+            return [{"modelId": "auto"}, {"modelId": "fast"}]
+
+        def current_model_id(self) -> str | None:
+            return "auto"
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    # Default executor advertises no picker -> stays empty, not None-crashing.
+    adapter._executor = _StubExecutor()
+    assert adapter.model_options() == {"models": [], "current": None}
+
+    adapter._executor = _ModelExecutor()
+    assert adapter.model_options() == {
+        "models": [{"modelId": "auto"}, {"modelId": "fast"}],
+        "current": "auto",
+    }

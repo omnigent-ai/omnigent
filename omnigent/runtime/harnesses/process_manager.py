@@ -911,6 +911,30 @@ class HarnessProcessManager:
         """
         return conversation_id in self._entries
 
+    def existing_client(self, conversation_id: str) -> httpx.AsyncClient | None:
+        """Return the running harness client for *conversation_id*, without spawning.
+
+        Unlike :meth:`get_client`, never starts a subprocess — returns ``None``
+        when no live harness is bound. Used to query a harness (e.g. for its
+        model list) only when it is already running.
+        """
+        entry = self._entries.get(conversation_id)
+        if entry is None or entry.process.returncode is not None:
+            return None
+        return entry.client
+
+    def running_harness(self, conversation_id: str) -> str | None:
+        """Return the harness name of the live subprocess, or ``None`` if none.
+
+        The *running* harness, not the session's cached spec — for a session
+        started with a harness override the spec still names the bundle agent's
+        harness, but the subprocess serves the picked one.
+        """
+        entry = self._entries.get(conversation_id)
+        if entry is None or entry.process.returncode is not None:
+            return None
+        return entry.harness
+
     def has_active_turn(self, conversation_id: str) -> bool:
         """
         Check whether the given conversation has an in-flight

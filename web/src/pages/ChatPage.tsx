@@ -5697,7 +5697,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "acp";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -5777,6 +5777,11 @@ export function modelPickerKindForConv(
       // ``/model`` picks back to ``model_override`` via the extension's
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
+    case "acp-native-ui":
+      // Generic-ACP agents (droid, grok, …) advertise a live model list in
+      // their session/new SessionModelState; a pick rides as model_override
+      // and the ACP executor applies it live via session/set_model.
+      return "acp";
     default:
       return null;
   }
@@ -6364,7 +6369,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
-    modelPickerKind === "opencode";
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "acp";
   const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
@@ -6405,7 +6411,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "opencode" ||
-    modelPickerKind === "pi"
+    modelPickerKind === "pi" ||
+    modelPickerKind === "acp"
       ? sessionModelOverride
       : (sessionModelOverride ?? sessionStickyModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
@@ -6414,9 +6421,12 @@ function useResolvedComposerModel(
   // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
   // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
   // there it IS the applied model — but only once this session's catalog vouches
-  // for it (see `sessionStickyModel`).
+  // for it (see `sessionStickyModel`). ACP joins the no-sticky group for the same
+  // reason: the agent owns its model, so a session with no override has no
+  // Omnigent-visible model and the sticky would label it with a pick carried over
+  // from an unrelated session.
   const nonNativeModel =
-    modelPickerKind === null
+    modelPickerKind === null || modelPickerKind === "acp"
       ? (sessionModelOverride ?? llmModel)
       : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
