@@ -37,6 +37,33 @@ import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 
+internal fun systemSafeAreaInsets(insets: WindowInsetsCompat): Insets =
+    insets.getInsets(
+        WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+    )
+
+internal fun androidSafeAreaScript(
+    insets: Insets,
+    density: Float,
+): String =
+    """
+    (() => {
+      const s = document.documentElement.style;
+      const top = '${insets.top / density}px';
+      const bottom = '${insets.bottom / density}px';
+      const left = '${insets.left / density}px';
+      const right = '${insets.right / density}px';
+      s.setProperty('--omnigent-safe-top', top);
+      s.setProperty('--omnigent-safe-bottom', bottom);
+      s.setProperty('--omnigent-safe-left', left);
+      s.setProperty('--omnigent-safe-right', right);
+      s.setProperty('--omnigent-android-safe-area-top', top);
+      s.setProperty('--omnigent-android-safe-area-bottom', bottom);
+      s.setProperty('--omnigent-android-safe-area-left', left);
+      s.setProperty('--omnigent-android-safe-area-right', right);
+    })();
+    """.trimIndent()
+
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
  * loads the server-served SPA, installs the `window.omnigentNative` bridge, and
@@ -194,7 +221,7 @@ class MainActivity : AppCompatActivity() {
         // alone (unreliable < API 30 and across OEM builds). Cached so the first
         // post-load emit (in onPageReady) isn't lost to the pre-load race.
         ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val bars = systemSafeAreaInsets(insets)
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             // Edge-to-edge (setDecorFitsSystemWindows=false, above) neutralizes the
             // manifest's adjustResize: the window no longer shrinks when the IME
@@ -644,7 +671,7 @@ class MainActivity : AppCompatActivity() {
         // pins to a user-supplied server whose web build may PRE-DATE the Android
         // shell's CSS — it can't be assumed to carry the `[data-android-native]`
         // fold:
-        //   1. `--omnigent-safe-top/bottom` — the app's OWN base inset vars. Every
+        //   1. `--omnigent-safe-*` — the app's OWN base inset vars. Every
         //      build already derives `--omnigent-inset-*` and its layout from
         //      these, defaulting them to `env(safe-area-inset-*)`, which Android
         //      WebView reports as 0. Setting them inline (highest priority)
@@ -658,21 +685,7 @@ class MainActivity : AppCompatActivity() {
         // the safe area there would mis-assign it to a bar-footprint variable.
         val bars = lastInsets ?: return
         val d = resources.displayMetrics.density
-        val js =
-            """
-            (() => {
-              const s = document.documentElement.style;
-              const top = '${bars.top / d}px';
-              const bottom = '${bars.bottom / d}px';
-              s.setProperty('--omnigent-safe-top', top);
-              s.setProperty('--omnigent-safe-bottom', bottom);
-              s.setProperty('--omnigent-android-safe-area-top', top);
-              s.setProperty('--omnigent-android-safe-area-bottom', bottom);
-              s.setProperty('--omnigent-android-safe-area-left', '${bars.left / d}px');
-              s.setProperty('--omnigent-android-safe-area-right', '${bars.right / d}px');
-            })();
-            """.trimIndent()
-        webView.evaluateJavascript(js, null)
+        webView.evaluateJavascript(androidSafeAreaScript(bars, d), null)
     }
 
     private fun hasPermission(permission: String): Boolean =

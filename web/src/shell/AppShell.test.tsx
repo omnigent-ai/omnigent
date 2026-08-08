@@ -1900,7 +1900,7 @@ describe("Right workspace card visibility", () => {
     const headerGroup = panel.parentElement;
     expect(headerGroup?.querySelector("header")).not.toBeNull();
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
-      `${panelWidth + 16}px`,
+      `${panelWidth}px`,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
