@@ -103,6 +103,18 @@
             "title": "Mcp Servers Editable",
             "type": "boolean"
           },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The agent's configured default LLM model identifier (provider-prefixed, e.g. `\"databricks-gpt-5-5\"`), resolved from the spec's `llm.model` (the parser syncs `executor.model` into it). `None` when the bundle cannot be loaded or no model is declared. Lets the Web UI show / override the agent's model when adding it as a child session (flowed as `model_override` on session create).",
+            "title": "Model"
+          },
           "name": {
             "description": "Human-readable agent name, e.g. `\"research-agent\"`.",
             "title": "Name",

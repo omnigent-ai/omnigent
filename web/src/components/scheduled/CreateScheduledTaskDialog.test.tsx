@@ -82,6 +82,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
             display_name: "Claude Code",
             description: null,
             harness: "claude-native",
+            model: null,
             skills: [],
           })
         }
@@ -98,6 +99,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
             display_name: "Polly",
             description: null,
             harness: "claude-sdk",
+            model: null,
             skills: [],
           })
         }
@@ -133,6 +135,7 @@ const AGENTS: AvailableAgent[] = [
     display_name: "Polly",
     description: null,
     harness: "claude-sdk",
+    model: null,
     skills: [],
   },
   {
@@ -141,6 +144,7 @@ const AGENTS: AvailableAgent[] = [
     display_name: "Claude Code",
     description: null,
     harness: "claude-native",
+    model: null,
     skills: [],
   },
 ];

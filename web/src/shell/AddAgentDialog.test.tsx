@@ -6,7 +6,11 @@ import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { AddAgentDialog } from "./AddAgentDialog";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { createSession } from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
@@ -21,6 +25,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn() }));
 
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
+const prefetchMock = vi.mocked(prefetchAvailableAgentDetails);
 const createSessionMock = vi.mocked(createSession);
 
 const AGENTS: AvailableAgent[] = [
@@ -30,6 +35,7 @@ const AGENTS: AvailableAgent[] = [
     display_name: "Claude Code",
     description: "Claude Code agent",
     harness: "claude-native",
+    model: null,
     skills: [],
   },
   {
@@ -38,6 +44,7 @@ const AGENTS: AvailableAgent[] = [
     display_name: "codex",
     description: null,
     harness: "codex",
+    model: null,
     skills: [],
   },
 ];
@@ -63,6 +70,8 @@ function renderDialog(parentSessionId = "conv_parent") {
 
 beforeEach(() => {
   useAvailableAgentsMock.mockReset();
+  prefetchMock.mockReset();
+  prefetchMock.mockResolvedValue(undefined);
   createSessionMock.mockReset();
   navigateMock.mockReset();
   mockAgents(AGENTS);
@@ -99,6 +108,7 @@ describe("AddAgentDialog", () => {
       parentSessionId: "conv_parent",
       subAgentName: null,
       title: "ui:claude-native-ui:jimmy",
+      modelOverride: null,
     });
     // Rail refreshed for the parent, then navigated into the new child.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_child"));
@@ -129,6 +139,7 @@ describe("AddAgentDialog", () => {
       parentSessionId: "conv_parent",
       subAgentName: null,
       title: "ui:codex:reviewer",
+      modelOverride: null,
     });
   });
 
@@ -162,6 +173,149 @@ describe("AddAgentDialog", () => {
     const initialItems = createSessionMock.mock.calls[0][1];
     expect(initialItems).not.toEqual([]);
     expect(JSON.stringify(initialItems)).toContain("designs/feature-x.md");
+  });
+
+  it("pre-fills the agent's declared model and forwards it as model_override", async () => {
+    // Agent with a declared llm.model — the dialog must pre-fill the
+    // model input with it and forward the (possibly edited) value as
+    // model_override on session create, so a custom agent launches on
+    // its own model by default instead of the harness default.
+    mockAgents([
+      {
+        id: "ag_custom",
+        name: "databricks-coding-agent",
+        display_name: "Databricks Coding Agent",
+        description: "Custom coding agent",
+        harness: "openai-agents",
+        model: "databricks-gpt-5-5",
+        skills: [],
+      },
+    ]);
+    createSessionMock.mockResolvedValue({
+      id: "conv_child",
+    } as unknown as Awaited<ReturnType<typeof createSession>>);
+
+    renderDialog("conv_parent");
+
+    fireEvent.click(screen.getByTestId("agent-card-ag_custom"));
+    // Pre-filled from the agent's declared default — not empty.
+    const modelInput = screen.getByTestId("add-agent-model-input");
+    expect(modelInput).toHaveValue("databricks-gpt-5-5");
+    fireEvent.change(screen.getByTestId("add-agent-name-input"), {
+      target: { value: "reviewer" },
+    });
+    // The user edits the pre-filled model.
+    fireEvent.change(modelInput, { target: { value: "databricks-gpt-5-4" } });
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
+
+    await waitFor(() => expect(createSessionMock).toHaveBeenCalledTimes(1));
+    // The edited model flows through as model_override (not null).
+    expect(createSessionMock).toHaveBeenCalledWith("ag_custom", [], {
+      parentSessionId: "conv_parent",
+      subAgentName: null,
+      title: "ui:databricks-coding-agent:reviewer",
+      modelOverride: "databricks-gpt-5-4",
+    });
+  });
+
+  it("sends a null model_override when the pre-filled model is cleared", async () => {
+    // Clearing the model input → harness default (model_override: null),
+    // not an empty-string override.
+    mockAgents([
+      {
+        id: "ag_custom",
+        name: "databricks-coding-agent",
+        display_name: "Databricks Coding Agent",
+        description: "Custom coding agent",
+        harness: "openai-agents",
+        model: "databricks-gpt-5-5",
+        skills: [],
+      },
+    ]);
+    createSessionMock.mockResolvedValue({
+      id: "conv_child",
+    } as unknown as Awaited<ReturnType<typeof createSession>>);
+
+    renderDialog("conv_parent");
+
+    fireEvent.click(screen.getByTestId("agent-card-ag_custom"));
+    fireEvent.change(screen.getByTestId("add-agent-name-input"), {
+      target: { value: "reviewer" },
+    });
+    fireEvent.change(screen.getByTestId("add-agent-model-input"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
+
+    await waitFor(() => expect(createSessionMock).toHaveBeenCalledTimes(1));
+    expect(createSessionMock).toHaveBeenCalledWith("ag_custom", [], {
+      parentSessionId: "conv_parent",
+      subAgentName: null,
+      title: "ui:databricks-coding-agent:reviewer",
+      modelOverride: null,
+    });
+  });
+
+  // A session-discovered row: the sessions scan supplies only id/name, so
+  // its declared model (and description / harness) is null until enriched.
+  const SCANNED_AGENT: AvailableAgent = {
+    id: "ag_scanned",
+    name: "hello_world",
+    display_name: "Hello world",
+    description: null,
+    harness: null,
+    model: null,
+    skills: [],
+    sessionId: "conv_seed",
+  };
+
+  it("enriches only the row focus lands on when the dialog opens", () => {
+    // Enrichment is one GET /v1/sessions/{id}/agent per row, so fetching the
+    // whole list on open bursts on servers with many discovered agents.
+    // Radix moves focus into the dialog, which lands on the first card — that
+    // row enriches, and nothing else does.
+    mockAgents([SCANNED_AGENT, ...AGENTS]);
+    renderDialog();
+    expect(prefetchMock).toHaveBeenCalledTimes(1);
+    expect(prefetchMock.mock.calls[0][0]).toEqual(SCANNED_AGENT);
+  });
+
+  it("enriches a single row on hover and on keyboard focus", () => {
+    mockAgents([SCANNED_AGENT, ...AGENTS]);
+    renderDialog();
+    // Drop the open-time enrichment of the auto-focused row.
+    prefetchMock.mockClear();
+
+    fireEvent.mouseOver(screen.getByTestId("agent-card-ag_codex"));
+    expect(prefetchMock).toHaveBeenCalledTimes(1);
+    expect(prefetchMock.mock.calls[0][0]).toEqual(AGENTS[1]);
+
+    // Tabbing onto a row enriches it too, so keyboard users get the same
+    // pre-fill without a pointer ever touching the card.
+    fireEvent.focusIn(screen.getByTestId("agent-card-ag_claude"));
+    expect(prefetchMock).toHaveBeenCalledTimes(2);
+    expect(prefetchMock.mock.calls[1][0]).toEqual(AGENTS[0]);
+  });
+
+  it("enriches the picked row so a discovered agent's model still pre-fills", () => {
+    // Selection is what the model pre-fill hangs on: the Model input only
+    // appears after a pick, and a session-discovered row carries no model
+    // until this fetch patches the catalog.
+    mockAgents([SCANNED_AGENT]);
+    renderDialog();
+    prefetchMock.mockClear();
+    prefetchMock.mockImplementation((agent) => {
+      mockAgents([
+        { ...(agent as AvailableAgent), harness: "openai-agents", model: "gpt-4o-mini" },
+      ]);
+      return Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByTestId("agent-card-ag_scanned"));
+
+    expect(prefetchMock).toHaveBeenCalledTimes(1);
+    expect(prefetchMock.mock.calls[0][0]).toEqual(SCANNED_AGENT);
+    expect(screen.getByTestId("add-agent-model-input")).toHaveValue("gpt-4o-mini");
   });
 
   it("shows an empty-state and a disabled submit when no agents are available", () => {
