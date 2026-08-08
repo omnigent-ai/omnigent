@@ -505,6 +505,51 @@ def parse_provider_name(model: str) -> tuple[str, str]:
     return "", model
 
 
+def record_llm_retry(
+    *,
+    attempt: int,
+    max_attempts: int,
+    error_type: str,
+    error_message: str,
+    backoff_seconds: float | None = None,
+) -> None:
+    """
+    Record a retry attempt as a ``gen_ai.retry`` event on the
+    currently-active OTel span.
+
+    Called from the LLM retry loop after a failed attempt and before
+    the backoff sleep. Reads ``otel_trace.get_current_span()`` so the
+    event lands on whatever span wraps the LLM call.
+
+    No-ops silently when no span is active via
+    ``get_current_span()`` returning a non-recording span.
+
+    :param attempt: 1-based attempt number that just failed.
+    :param max_attempts: Total attempts allowed by the retry policy.
+    :param error_type: Exception class name, e.g. ``"TimeoutException"``.
+    :param error_message: Short error message from the failed attempt.
+    :param backoff_seconds: Sleep duration before the next attempt,
+        or ``None`` when no backoff applies.
+    """
+    from opentelemetry import trace as otel_trace
+
+    span = otel_trace.get_current_span()
+    if not span.is_recording():
+        return
+
+    attrs: dict[str, Any] = {
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "error.type": error_type,
+    }
+    # Gate error.message behind the content-capture flag.
+    if should_capture_content():
+        attrs["error.message"] = error_message
+    if backoff_seconds is not None:
+        attrs["backoff_seconds"] = backoff_seconds
+    span.add_event(name="gen_ai.retry", attributes=attrs)
+
+
 def trace_id_from_response_id(response_id: str) -> str:
     """
     Extract the 32-char hex trace ID from an omnigent response ID.
