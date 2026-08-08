@@ -20,15 +20,24 @@ export interface FilesPanelPreferences {
   changedOnly: boolean;
   /** Sort order for the changed-files flat list. */
   sort: ChangedSort;
+  /**
+   * Layout of the "Changed" scope: false = flat list (default), true = the
+   * changed files grouped into a collapsible folder tree. Independent of the
+   * scope switch — the "All" scope is always a tree — so a user can prefer the
+   * flat changed list while still folding changes by directory when they like.
+   */
+  changedTreeView: boolean;
 }
 
 const STORAGE_KEY = "omnigent:files-panel-preferences";
 
 // Default to the full folder tree ("All") — the panel opens on every file in
-// the working folder, not just the changed subset.
+// the working folder, not just the changed subset. The Changed scope defaults
+// to its flat list (changedTreeView false) to preserve the prior behaviour.
 export const DEFAULT_FILES_PANEL_PREFERENCES: FilesPanelPreferences = {
   changedOnly: false,
   sort: "recent",
+  changedTreeView: false,
 };
 
 /**
@@ -55,6 +64,10 @@ export function readFilesPanelPreferences(): FilesPanelPreferences {
         typeof p.sort === "string" && isValidSort(p.sort)
           ? p.sort
           : DEFAULT_FILES_PANEL_PREFERENCES.sort,
+      changedTreeView:
+        typeof p.changedTreeView === "boolean"
+          ? p.changedTreeView
+          : DEFAULT_FILES_PANEL_PREFERENCES.changedTreeView,
     };
   } catch {
     return DEFAULT_FILES_PANEL_PREFERENCES;

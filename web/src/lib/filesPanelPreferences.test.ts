@@ -19,12 +19,25 @@ describe("filesPanelPreferences", () => {
     expect(DEFAULT_FILES_PANEL_PREFERENCES.changedOnly).toBe(false);
   });
 
+  it("defaults the Changed scope to its flat list (changedTreeView false)", () => {
+    // The Changed scope opens as a flat list; the tree layout is opt-in.
+    expect(DEFAULT_FILES_PANEL_PREFERENCES.changedTreeView).toBe(false);
+  });
+
   it("round-trips a written preference", () => {
-    writeFilesPanelPreferences({ changedOnly: true, sort: "alpha" });
+    writeFilesPanelPreferences({ changedOnly: true, sort: "alpha", changedTreeView: true });
     expect(readFilesPanelPreferences()).toEqual({
       changedOnly: true,
       sort: "alpha",
+      changedTreeView: true,
     });
+  });
+
+  it("defaults changedTreeView when the stored field has the wrong type", () => {
+    // A record present but with a non-boolean changedTreeView must default the
+    // field rather than pass a garbage value through to the panel.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ changedTreeView: "yes" }));
+    expect(readFilesPanelPreferences().changedTreeView).toBe(false);
   });
 
   it("falls back to defaults on malformed JSON", () => {
@@ -47,6 +60,7 @@ describe("filesPanelPreferences", () => {
     expect(readFilesPanelPreferences()).toEqual({
       changedOnly: false,
       sort: "recent",
+      changedTreeView: false,
     });
   });
 
@@ -55,6 +69,7 @@ describe("filesPanelPreferences", () => {
     expect(readFilesPanelPreferences()).toEqual({
       changedOnly: true,
       sort: "recent",
+      changedTreeView: false,
     });
   });
 });

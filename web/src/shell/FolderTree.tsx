@@ -19,10 +19,10 @@ import { useCursorTooltip } from "./useCursorTooltip";
 const INDENT_STEP = 16;
 const BASE_PAD = 8;
 const GUIDE_OFFSET = 7;
-const indentFor = (depth: number) => depth * INDENT_STEP + BASE_PAD;
+export const indentFor = (depth: number) => depth * INDENT_STEP + BASE_PAD;
 
 // One vertical guide line per ancestor level; the row must be `relative`.
-function IndentGuides({ depth }: { depth: number }) {
+export function IndentGuides({ depth }: { depth: number }) {
   if (depth <= 0) return null;
   return (
     <>
@@ -423,7 +423,7 @@ export function FolderTree({
  * with depth-based indentation).  Keeping the DOM structure in one place
  * prevents the two views from drifting apart over time.
  */
-function FileRowItem({
+export function FileRowItem({
   path,
   displayLabel,
   labelIsPath = false,

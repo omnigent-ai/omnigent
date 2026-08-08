@@ -586,6 +586,10 @@ interface WorkspacePanelProps {
   filesPanelFlatView: boolean;
   /** Toggle the Files view scope (persisted by AppShell). */
   onFlatViewChange: (flat: boolean) => void;
+  /** Changed-scope layout: false = flat list, true = folder tree. */
+  filesPanelChangedTreeView: boolean;
+  /** Toggle the Changed-scope layout (persisted by AppShell). */
+  onChangedTreeViewChange: (treeView: boolean) => void;
   /** Whether the Files panel shows dotfiles/hidden entries. */
   filesPanelShowHidden: boolean;
   /** Toggle hidden-file visibility in the Files panel. */
@@ -646,6 +650,8 @@ export function WorkspacePanel({
   onSortChange,
   filesPanelFlatView,
   onFlatViewChange,
+  filesPanelChangedTreeView,
+  onChangedTreeViewChange,
   filesPanelShowHidden,
   onShowHiddenChange,
   liveness,
@@ -925,6 +931,8 @@ export function WorkspacePanel({
               onFileSelect={openFileViewer}
               flatView={filesPanelFlatView}
               onFlatViewChange={onFlatViewChange}
+              changedTreeView={filesPanelChangedTreeView}
+              onChangedTreeViewChange={onChangedTreeViewChange}
               showHidden={filesPanelShowHidden}
               onShowHiddenChange={onShowHiddenChange}
               sort={filesPanelSort}
