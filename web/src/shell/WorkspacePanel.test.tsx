@@ -87,6 +87,7 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    changedCount?: number;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -105,7 +106,7 @@ function renderWorkspace(
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
         showBrowserTab={overrides.showBrowserTab ?? false}
-        changedCount={0}
+        changedCount={overrides.changedCount ?? 0}
         showShellsTab={overrides.showShellsTab ?? false}
         terminalsLength={0}
         subagentsWorking={0}
@@ -537,15 +538,21 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
 describe("WorkspacePanel maximize", () => {
   it("shows a full-screen toggle pinned to the right and fires onToggleMaximized", () => {
-    const { onToggleMaximized } = renderWorkspace();
+    const { onToggleMaximized } = renderWorkspace({ changedCount: 1 });
 
     fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
 
     expect(onToggleMaximized).toHaveBeenCalledTimes(1);
   });
 
+  it("hides the full-screen button when workspace has no changes and no open tabs", () => {
+    renderWorkspace({ changedCount: 0, openFiles: [] });
+
+    expect(screen.queryByRole("button", { name: "Full screen" })).toBeNull();
+  });
+
   it("swaps to the exit-full-screen affordance and covers the content region when maximized", () => {
-    renderWorkspace({ maximized: true });
+    renderWorkspace({ maximized: true, changedCount: 1 });
 
     // Label + pressed state flip so the icon reads as a minimize/exit control.
     const toggle = screen.getByRole("button", { name: "Exit full screen" });
@@ -572,7 +579,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     // Two ml-auto siblings split the free space and strand the nav group
     // mid-strip. With no open tabs the single ml-auto lives on the maximize
     // button; the nav group must NOT also carry one.
-    renderWorkspace({ openFiles: [], showBrowserTab: true });
+    renderWorkspace({ openFiles: [], showBrowserTab: true, changedCount: 1 });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
     // It's the maximize button's wrapper (pins the button right).
@@ -586,7 +593,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     // The nav tabs stay anchored on the LEFT with open tabs — the open-tabs
     // region renders to their right and the maximize button keeps the row's
     // single ml-auto. Two ml-auto siblings would split the free space.
-    renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
+    renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true, changedCount: 1 });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
     // The nav tablist stays left — no ml-auto of its own.
@@ -620,7 +627,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
   it("gives the full-screen button no left padding", () => {
     // The maximize button must not carry a pl-* gap — it sits flush against the
     // preceding nav icon like the rest of the strip.
-    renderWorkspace({ openFiles: [] });
+    renderWorkspace({ openFiles: [], changedCount: 1 });
     const fullScreen = screen.getByRole("button", { name: "Full screen" });
     expect(fullScreen.parentElement).not.toHaveClass("pl-0.5");
   });
