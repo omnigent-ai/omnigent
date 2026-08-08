@@ -39,10 +39,12 @@ from omnigent.entities import DeviceGrant
 def hash_secret(secret: str, key: bytes) -> str:
     """Return the HMAC-SHA256 hex digest of a secret.
 
-    Used to hash the ``device_code`` and refresh tokens before they
-    touch the database. Keyed with the server's cookie secret so a
-    leaked DB alone (without the key) cannot be used to precompute a
-    reverse lookup.
+    The server's one stored-secret form. Hashes the ``device_code`` and
+    refresh tokens before they touch the database, and the machine
+    client's configured secret in
+    :mod:`omnigent.server.routes.client_credentials`. Keyed with the
+    server's cookie secret so a leaked store or config alone (without
+    the key) cannot be used to precompute a reverse lookup.
 
     :param secret: The raw secret string.
     :param key: HMAC key — the server's ``cookie_secret``.

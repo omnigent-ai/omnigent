@@ -48,11 +48,21 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
-# Path prefixes a delegated (device-grant) access token may reach.
-# Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
-# any path not covered here, so it can never touch admin / user-management
-# endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
-# its underlying identity is an admin. Delegated clients only need these.
+# Path prefixes a delegated (device-grant or machine client-credential)
+# access token may reach. Fail-closed allowlist: a token carrying a ``scope``
+# claim is rejected on any path not covered here, so it can never touch
+# admin / user-management endpoints (``/auth/users``, ``/auth/invite``,
+# ``/auth/setup`` …) even if its underlying identity is an admin. Delegated
+# clients only need these.
+#
+# The allowlist confines the PATH, not the privilege LEVEL within an
+# allowlisted path: the ``is_admin`` → ``LEVEL_OWNER`` override inside
+# /v1/sessions keys off the token's identity, so an admin subject reaches every
+# tenant's sessions there. For the device grant that is the delegation model
+# working as intended, since the subject is the human who approved the consent
+# screen and may legitimately be an admin. The machine client-credential grant
+# delegates no existing human, so it additionally requires its configured
+# subject to be a non-admin principal; see create_client_credentials_router.
 _DELEGATED_ALLOWED_PREFIXES = (
     "/health",
     "/v1/agents",
@@ -601,17 +611,26 @@ class UnifiedAuthProvider(AuthProvider):
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
 
-        # Delegated (device-grant) tokens carry a ``grant_id`` claim.
-        # They get two extra, request-scoped checks — a fail-closed path
-        # allowlist and a live revocation lookup — so they are never
-        # served from the plain user-id cache (which would skip both).
+        # A ``scope`` or ``grant_id`` claim marks a delegated token: it is
+        # confined to the fail-closed path allowlist and never cached, because
+        # the cache is token-keyed and a cached entry replayed on a
+        # non-allowlisted path would skip that allowlist. Minting always sets
+        # ``scope``, so the ``grant_id`` leg only catches a token that lost it
+        # — which must fail closed rather than reach the cache.
         grant_id = payload.get("grant_id")
-        if grant_id is not None:
-            if not isinstance(grant_id, str):
+        if payload.get("scope") is not None or grant_id is not None:
+            if grant_id is not None and not isinstance(grant_id, str):
                 return None
             if not delegated_path_allowed(request.url.path):
                 return None
-            if self._grant_revoked is not None and self._grant_revoked(grant_id):
+            # A ``grant_id`` (device grant only) is checked live against the
+            # revocation denylist. Client-credential tokens omit it (revocation
+            # is by rotation/expiry), so the lookup is skipped for them.
+            if (
+                grant_id is not None
+                and self._grant_revoked is not None
+                and self._grant_revoked(grant_id)
+            ):
                 return None
             return user_id
 
