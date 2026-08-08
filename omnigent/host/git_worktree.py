@@ -245,6 +245,75 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
     return worktrees
 
 
+@dataclass
+class BranchInfo:
+    """One branch available as a worktree base.
+
+    :param name: Short ref name, e.g. ``"main"`` for a local branch or
+        ``"origin/release-1.2"`` for a remote-tracking one.
+    :param is_current: ``True`` for the branch checked out in the
+        repository's main work tree.
+    :param is_remote: ``True`` for a remote-tracking branch. Those are
+        still valid bases — ``create_worktree`` fetches a base that
+        isn't locally resolvable.
+    """
+
+    name: str
+    is_current: bool
+    is_remote: bool
+
+
+def list_branches(*, repo_path: str) -> list[BranchInfo]:
+    """List the branches of the repository containing ``repo_path``.
+
+    Local branches first, then remote-tracking ones, each ordered by most
+    recent commit so the branches a user actually works on sort to the top
+    of a picker. A remote-tracking branch whose short name duplicates a
+    local branch is dropped (``origin/main`` adds nothing next to ``main``),
+    as is the symbolic ``origin/HEAD``.
+
+    :param repo_path: Absolute path inside a git repository — the
+        directory the user picked, e.g. ``"/Users/alice/myrepo"``.
+    :returns: One :class:`BranchInfo` per branch, most recent first.
+    :raises WorktreeError: If ``repo_path`` is not a directory or not
+        inside a git work tree, or if ``git for-each-ref`` fails.
+    """
+    repo_root = _main_work_tree(repo_path)
+    result = _run_git(
+        [
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)\t%(HEAD)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+        cwd=repo_root,
+    )
+    if result.returncode != 0:
+        raise _git_error("git for-each-ref failed", result)
+
+    local: list[BranchInfo] = []
+    remote: list[BranchInfo] = []
+    seen_local: set[str] = set()
+    for line in result.stdout.splitlines():
+        refname, _, head = line.partition("\t")
+        refname = refname.strip()
+        if refname.startswith("refs/heads/"):
+            name = refname[len("refs/heads/") :]
+            seen_local.add(name)
+            local.append(BranchInfo(name=name, is_current=head.strip() == "*", is_remote=False))
+        elif refname.startswith("refs/remotes/"):
+            name = refname[len("refs/remotes/") :]
+            # ``origin/HEAD`` is a symbolic alias, not a branch a user picks.
+            if name.endswith("/HEAD"):
+                continue
+            remote.append(BranchInfo(name=name, is_current=False, is_remote=True))
+    # Drop a remote whose branch name already exists locally (``origin/main``
+    # next to ``main``); compare on the segment after the remote name.
+    deduped = [b for b in remote if b.name.split("/", 1)[-1] not in seen_local]
+    return local + deduped
+
+
 def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     """Return whether a local branch already exists in the repo.
 

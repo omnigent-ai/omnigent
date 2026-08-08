@@ -35,6 +35,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
+    HostListBranchesResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostModelOptionsResultFrame,
@@ -602,6 +603,18 @@ async def _receive_loop(
                 remove_wt_future.set_result(
                     {
                         "status": frame.status,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostListBranchesResultFrame):
+            list_br_future = conn.pending_list_branches.pop(frame.request_id, None)
+            if list_br_future is not None and not list_br_future.done():
+                list_br_future.set_result(
+                    {
+                        "status": frame.status,
+                        "branches": frame.branches,
                         "error": frame.error,
                     }
                 )

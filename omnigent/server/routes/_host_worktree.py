@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
+    HostListBranchesFrame,
     HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     encode_host_frame,
@@ -229,6 +230,52 @@ async def remove_worktree_on_host(
         raise WorktreeProxyError(
             f"worktree removal failed: {result.get('error') or 'host reported no detail'}"
         )
+
+
+async def list_branches_on_host(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    repo_path: str,
+) -> list[dict[str, object]]:
+    """
+    Send a ``host.list_branches`` frame and await the result.
+
+    :param host_registry: Server-side registry; used to enqueue the
+        outbound frame on the host's send queue.
+    :param host_conn: Live host connection to list branches on.
+    :param repo_path: Absolute path inside the source repo on the
+        host — the canonical picked directory, e.g.
+        ``"/Users/alice/myrepo"``.
+    :returns: One dict per branch with keys ``name``, ``is_current``,
+        ``is_remote`` (most recently committed first).
+    :raises WorktreeHostUnavailableError: If the host connection drops
+        or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
+    :raises WorktreeProxyError: If the host reports a listing failure.
+    """
+    request_id = secrets.token_hex(8)
+    frame = encode_host_frame(
+        HostListBranchesFrame(
+            request_id=request_id,
+            repo_path=repo_path,
+        )
+    )
+    result = await _await_host_worktree_result(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        pending=host_conn.pending_list_branches,
+        request_id=request_id,
+        frame=frame,
+        op="branch listing",
+    )
+    if result.get("status") != "ok":
+        raise WorktreeProxyError(
+            f"branch listing failed: {result.get('error') or 'host reported no detail'}"
+        )
+    branches = result.get("branches")
+    if not isinstance(branches, list):
+        raise WorktreeProxyError("host returned an incomplete branch list")
+    return branches
 
 
 async def list_worktrees_on_host(

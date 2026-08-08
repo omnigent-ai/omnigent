@@ -84,6 +84,9 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 // Mocked so it doesn't hit authenticatedFetch (which would pollute the
 // call list the create-flow assertions index into positionally).
 vi.mock("@/hooks/useHostWorktrees", () => ({ useHostWorktrees: vi.fn() }));
+vi.mock("@/hooks/useHostBranches", () => ({
+  useHostBranches: () => ({ data: undefined }),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: vi.fn(),
 }));

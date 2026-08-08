@@ -47,6 +47,8 @@ from omnigent.host.frames import (
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
+    HostListBranchesFrame,
+    HostListBranchesResultFrame,
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
@@ -71,6 +73,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
+    list_branches,
     list_worktrees,
     remove_worktree,
 )
@@ -2333,6 +2336,46 @@ class HostProcess:
             status="ok",
         )
 
+    async def _handle_list_branches(
+        self,
+        frame: HostListBranchesFrame,
+    ) -> HostListBranchesResultFrame:
+        """Handle a ``host.list_branches`` request from the server.
+
+        Runs the blocking git work in a worker thread so the tunnel
+        loop keeps servicing pings.
+
+        :param frame: The list-branches request frame.
+        :returns: Result frame with the branches on success, or
+            ``status: "failed"`` with an error message.
+        """
+        try:
+            # Pause the orphan reaper while git runs — see
+            # _handle_create_worktree above and _reap_orphans_once.
+            with self._host_subprocess_op():
+                branches = await asyncio.to_thread(
+                    list_branches,
+                    repo_path=frame.repo_path,
+                )
+        except WorktreeError as exc:
+            return HostListBranchesResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        return HostListBranchesResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            branches=[
+                {
+                    "name": br.name,
+                    "is_current": br.is_current,
+                    "is_remote": br.is_remote,
+                }
+                for br in branches
+            ],
+        )
+
     async def _handle_list_worktrees(
         self,
         frame: HostListWorktreesFrame,
@@ -2850,6 +2893,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostListBranchesFrame):
+            await ws.send(encode_host_frame(await self._handle_list_branches(frame)))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.

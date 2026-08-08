@@ -160,6 +160,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useHostBranches } from "@/hooks/useHostBranches";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -2960,6 +2961,14 @@ export function NewChatLandingScreen() {
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
+  // Branches of the same repo, offered as the base a new worktree is cut
+  // from. Same enable conditions as the worktree list; a non-git path
+  // resolves to [] and the field stays free text.
+  const { data: hostBranches } = useHostBranches(
+    worktreesEnabled ? selectedHostId : null,
+    worktreesEnabled ? workspaceTrimmed : null,
+  );
+
   // Linked worktrees (exclude the main work tree — "starting in the main
   // repo" is just picking that directory, not selecting a worktree).
   const linkedWorktrees = useMemo(
@@ -4665,15 +4674,28 @@ export function NewChatLandingScreen() {
                         — hidden once the workspace points at an existing one
                         (no worktree is created, so there's nothing to base). */}
                       {branchName.trim() !== "" && !startInExistingWorktree && (
-                        <input
-                          type="text"
-                          value={baseBranch}
-                          onChange={(e) => setBaseBranch(e.target.value)}
-                          placeholder="Base branch (defaults to current)"
-                          aria-label="Base branch"
-                          className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                          data-testid="new-chat-landing-base-branch-input"
-                        />
+                        <>
+                          <input
+                            type="text"
+                            value={baseBranch}
+                            onChange={(e) => setBaseBranch(e.target.value)}
+                            placeholder="Base branch (defaults to current)"
+                            aria-label="Base branch"
+                            list="new-chat-landing-base-branch-options"
+                            className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                            data-testid="new-chat-landing-base-branch-input"
+                          />
+                          {/* Suggestions only — the field stays free text so a
+                            ref the host can fetch but hasn't listed still works. */}
+                          <datalist
+                            id="new-chat-landing-base-branch-options"
+                            data-testid="new-chat-landing-base-branch-options"
+                          >
+                            {(hostBranches ?? []).map((b) => (
+                              <option key={b.name} value={b.name} />
+                            ))}
+                          </datalist>
+                        </>
                       )}
                       {startInExistingWorktree && (
                         <p

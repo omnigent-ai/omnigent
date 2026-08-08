@@ -101,6 +101,9 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 vi.mock("@/hooks/useHostWorktrees", () => ({
   useHostWorktrees: () => ({ data: undefined }),
 }));
+vi.mock("@/hooks/useHostBranches", () => ({
+  useHostBranches: () => ({ data: undefined }),
+}));
 // No other sessions in scope — keep the conflict hooks inert so they don't
 // issue their own /health fetch or surface a warning. The warning is covered
 // in NewChatDialog.test.tsx.

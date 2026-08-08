@@ -61,6 +61,8 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    LIST_BRANCHES = "host.list_branches"
+    LIST_BRANCHES_RESULT = "host.list_branches_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
@@ -559,6 +561,44 @@ class HostListWorktreesResultFrame:
     request_id: str
     status: str
     worktrees: list[_JsonObject] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostListBranchesFrame:
+    """Server → host: list the branches of a repository.
+
+    Backs ``GET /v1/hosts/{id}/branches``, used by the Web UI's
+    new-session composer to offer the base branch a worktree is cut
+    from instead of asking the user to type a ref from memory.
+    Read-only; the host derives the main work tree from ``repo_path``.
+
+    :param request_id: Correlates the result, e.g. ``"req_br_ls_1"``.
+    :param repo_path: Absolute path inside the repo (the picked dir or
+        a subdir), e.g. ``"/Users/alice/myrepo"``.
+    """
+
+    request_id: str
+    repo_path: str
+
+
+@dataclass
+class HostListBranchesResultFrame:
+    """Host → server: outcome of a list-branches request.
+
+    :param request_id: Correlates to the
+        :class:`HostListBranchesFrame`, e.g. ``"req_br_ls_1"``.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param branches: One dict per branch with keys ``name`` (str),
+        ``is_current`` (bool) and ``is_remote`` (bool), most recently
+        committed first. ``None`` on failure.
+    :param error: Error message when ``status`` is ``"failed"``, e.g.
+        ``"not a git repository"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    branches: list[_JsonObject] | None = None
     error: str | None = None
 
 
@@ -1114,6 +1154,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostListBranchesFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LIST_BRANCHES.value,
+                "request_id": frame.request_id,
+                "repo_path": frame.repo_path,
+            }
+        )
+    if isinstance(frame, HostListBranchesResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LIST_BRANCHES_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "branches": frame.branches,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostCreateDirFrame):
         return _encode_payload(
             {
@@ -1331,6 +1389,10 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.LIST_BRANCHES:
+            return _decode_list_branches(msg)
+        case HostFrameKind.LIST_BRANCHES_RESULT:
+            return _decode_list_branches_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
@@ -1645,6 +1707,41 @@ def _decode_remove_worktree_result(
     return HostRemoveWorktreeResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_list_branches(msg: _JsonObject) -> HostListBranchesFrame:
+    """Decode a host.list_branches request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.list_branches frame.
+    """
+    return HostListBranchesFrame(
+        request_id=_required_str(msg, "request_id"),
+        repo_path=_required_str(msg, "repo_path"),
+    )
+
+
+def _decode_list_branches_result(
+    msg: _JsonObject,
+) -> HostListBranchesResultFrame:
+    """Decode a host.list_branches_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.list_branches_result frame.
+    """
+    raw = msg.get("branches")
+    if raw is not None:
+        if not isinstance(raw, list):
+            raise ValueError("frame field must be a list or null: 'branches'")
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ValueError("each entry in 'branches' must be a JSON object")
+    return HostListBranchesResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        branches=raw,
         error=_optional_nullable_str(msg, "error"),
     )
 

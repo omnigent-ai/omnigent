@@ -18,6 +18,7 @@ from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
     create_worktree,
+    list_branches,
     list_worktrees,
     remove_worktree,
     validate_branch_name,
@@ -396,3 +397,41 @@ def test_validate_branch_name_rejects_bad(bad: str) -> None:
 def test_validate_branch_name_accepts_good(good: str) -> None:
     """Well-formed branch names pass validation."""
     validate_branch_name(good)  # must not raise
+
+
+def test_list_branches_marks_the_checked_out_branch(git_repo: Path) -> None:
+    """The main work tree's branch is returned and flagged current."""
+    result = list_branches(repo_path=str(git_repo))
+    names = [b.name for b in result]
+    assert "main" in names
+    current = [b for b in result if b.is_current]
+    assert [b.name for b in current] == ["main"]
+    assert all(b.is_remote is False for b in result)
+
+
+def test_list_branches_orders_most_recent_first(git_repo: Path) -> None:
+    """Recency ordering puts the branch a user just touched at the top."""
+    _git(git_repo, "branch", "older")
+    _git(git_repo, "checkout", "-b", "newer")
+    (git_repo / "f.txt").write_text("x")
+    _git(git_repo, "add", "f.txt")
+    _git(git_repo, "commit", "-m", "newer commit")
+    _git(git_repo, "checkout", "main")
+
+    names = [b.name for b in list_branches(repo_path=str(git_repo))]
+    assert names.index("newer") < names.index("older")
+
+
+def test_list_branches_from_a_linked_worktree_sees_the_same_repo(git_repo: Path) -> None:
+    """A linked worktree resolves the main work tree, so the list matches."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/login")
+    from_main = {b.name for b in list_branches(repo_path=str(git_repo))}
+    from_linked = {b.name for b in list_branches(repo_path=created.worktree_path)}
+    assert from_main == from_linked
+    assert "feature/login" in from_main
+
+
+def test_list_branches_rejects_a_non_repo(tmp_path: Path) -> None:
+    """A directory outside any git work tree fails loudly."""
+    with pytest.raises(WorktreeError):
+        list_branches(repo_path=str(tmp_path))

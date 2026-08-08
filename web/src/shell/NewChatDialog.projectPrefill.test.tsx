@@ -54,6 +54,9 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 vi.mock("@/hooks/useHostWorktrees", () => ({
   useHostWorktrees: vi.fn(),
 }));
+vi.mock("@/hooks/useHostBranches", () => ({
+  useHostBranches: () => ({ data: undefined }),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: () => ({ data: [] }),
 }));
