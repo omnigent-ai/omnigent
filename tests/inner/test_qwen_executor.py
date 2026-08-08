@@ -979,6 +979,71 @@ async def test_close_session_is_noop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# interrupt_session cancels the active ACP turn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_sends_session_cancel() -> None:
+    """An established ACP session is cancelled without terminating the process."""
+    executor = QwenExecutor()
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    executor._proc = mock_proc
+    executor._session_id = "qwen-session"
+    executor._send = AsyncMock()
+
+    assert await executor.interrupt_session("some-key") is True
+    executor._send.assert_awaited_once_with(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": "qwen-session"},
+        }
+    )
+    mock_proc.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_terminates_before_session_exists() -> None:
+    """A live process without an ACP session falls back to SIGTERM."""
+    executor = QwenExecutor()
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    executor._proc = mock_proc
+
+    assert await executor.interrupt_session("some-key") is True
+    mock_proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_terminates_when_cancel_fails() -> None:
+    """A failed ACP cancellation falls back to SIGTERM."""
+    executor = QwenExecutor()
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    executor._proc = mock_proc
+    executor._session_id = "qwen-session"
+    executor._send = AsyncMock(side_effect=OSError("closed"))
+
+    assert await executor.interrupt_session("some-key") is True
+    mock_proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_returns_false_when_finished_or_absent() -> None:
+    """No process, or an already-exited one, yields False with no terminate."""
+    executor = QwenExecutor()
+    assert await executor.interrupt_session("some-key") is False
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    executor._proc = mock_proc
+    assert await executor.interrupt_session("some-key") is False
+    mock_proc.terminate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # system_prompt folded into the first turn (ACP has no system field)
 # ---------------------------------------------------------------------------
 

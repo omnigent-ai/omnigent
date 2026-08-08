@@ -39,6 +39,7 @@ Env vars read at construction:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -268,6 +269,9 @@ class HermesExecutor(Executor):
         self._session_map: dict[str, str] = {}
         # Per-session HERMES_HOME with policy hook config.
         self._hermes_home: Path | None = None
+        # Active per-turn subprocess; promoted from a local so the Stop
+        # button can interrupt it. None outside a running turn.
+        self._proc: asyncio.subprocess.Process | None = None
         self._setup_hermes_home()
 
     def _setup_hermes_home(self) -> None:
@@ -387,6 +391,7 @@ class HermesExecutor(Executor):
                 cwd=self._cwd,
                 env=proc_env,
             )
+            self._proc = proc
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(),
@@ -415,6 +420,8 @@ class HermesExecutor(Executor):
                 retryable=True,
             )
             return
+        finally:
+            self._proc = None
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
@@ -500,6 +507,16 @@ class HermesExecutor(Executor):
         """
         self._session_map.pop(session_key, None)
         await super().close_session(session_key)
+
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
+        """Terminate the active hermes subprocess to cancel the running turn."""
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+            return True
+        return False
 
     async def close(self) -> None:
         """Release executor-wide resources."""
