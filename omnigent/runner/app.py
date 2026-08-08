@@ -5236,9 +5236,20 @@ def create_runner_app(
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
             )
+            from omnigent.runtime.context_providers import (
+                input_from_turn,
+                run_context_providers,
+            )
             from omnigent.runtime.prompt import build_instructions
 
-            instructions = build_instructions(cached_spec, None, [])
+            # Per-turn context providers (e.g. memory recall) append to the
+            # system instructions via the existing per_request_instructions
+            # slot. Returns None when the spec declares none — identical to the
+            # prior behavior, so this is a no-op unless an agent opts in.
+            provider_text = await run_context_providers(
+                cached_spec, input_from_turn(conv, msg_body)
+            )
+            instructions = build_instructions(cached_spec, provider_text, [])
 
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,

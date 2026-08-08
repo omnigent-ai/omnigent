@@ -1504,6 +1504,15 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``non-public`` (grant named users only), or ``public`` (also
         allow ``__public__`` anonymous read). **Defaults to
         ``SharePolicy.NONE``.**
+    :param context_providers: Per-turn context providers — dotted-path
+        callables (same ``FunctionRef`` shape as function policies)
+        resolved and invoked on every turn, so a factory here is rebuilt
+        per turn. Each returns text that is **appended** to the system
+        instructions (additive; it never replaces the agent prompt).
+        ``None`` means no ``context_providers:`` block was declared.
+        Uploaded bundles may only name providers in the handler registry
+        (see ``omnigent.server.bundles``). See
+        ``runtime/prompt.py::build_instructions``.
     """
 
     spec_version: int
@@ -1550,3 +1559,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    context_providers: list[FunctionRef] | None = None

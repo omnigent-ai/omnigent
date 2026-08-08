@@ -94,6 +94,8 @@ _ALT_COVERED: frozenset[str] = frozenset(
         "agent_with_tools",
         # Covered by test_yaml_policies.py.
         "agent_with_policies",
+        # Covered by test_yaml_context_providers.py.
+        "agent_with_context_provider",
         # Covered by tests/e2e/test_coder_subagent.py +
         # tests/e2e/test_chat_e2e.py.
         "coder",

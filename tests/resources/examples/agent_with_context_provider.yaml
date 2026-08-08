@@ -1,0 +1,18 @@
+# E2E fixture: an agent with a per-turn context provider.
+#
+# The provider injects a "REMEMBER:" line containing a sentinel passphrase into
+# the system instructions on every turn. The prompt tells the agent to obey it,
+# so the sentinel appearing in the reply proves the context_providers hook
+# augmented the system prompt (and did not replace the agent's own prompt).
+#
+# Run (harness/model supplied by flags):
+#   omnigent run tests/resources/examples/agent_with_context_provider.yaml \
+#     --harness claude-sdk -p "What is the passphrase?"
+
+name: agent_with_context_provider
+prompt: |
+  You are a terse assistant. If your instructions contain a "REMEMBER:" line,
+  obey it. When asked for the passphrase, reply with it exactly and nothing else.
+
+context_providers:
+  - tests.resources.examples._shared.context_provider_probe.remember_passphrase
