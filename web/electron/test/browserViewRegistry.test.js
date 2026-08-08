@@ -332,3 +332,105 @@ describe("browserViewRegistry — child window.open is denied (S3)", () => {
     assert.deepEqual(windowOpen("https://example.com/ok"), { action: "deny" });
   });
 });
+
+describe("browserViewRegistry — overlay suppression (modal above the native view)", () => {
+  // The native WebContentsView paints above ALL renderer DOM, so an open
+  // modal (e.g. the share dialog) must hide the view for its lifetime. These
+  // tests drive setOverlaySuppressed with setVisible-recording stub views.
+  function makeVisibilityRegistry() {
+    const attached = [];
+    const makeStubView = () => {
+      const view = {
+        visibleCalls: [],
+        setVisible(v) {
+          view.visibleCalls.push(v);
+        },
+        setBounds() {},
+        webContents: {
+          loadURL() {},
+          close() {},
+          removeListener() {},
+          on() {},
+          setWindowOpenHandler() {},
+        },
+      };
+      return view;
+    };
+    const registry = createBrowserViewRegistry({
+      WebContentsViewCtor: () => makeStubView(),
+      createBoundsController: createBrowserViewBoundsController,
+      attachToHost: (view) => attached.push(view),
+      detachFromHost: () => {},
+      sendToRenderer: () => {},
+      getHostZoomFactor: () => 1,
+    });
+    return { registry, attached };
+  }
+
+  it("hides the active view when suppressed and restores it when cleared", () => {
+    const { registry, attached } = makeVisibilityRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.setActive("conv_1");
+    const view = attached[0];
+    view.visibleCalls.length = 0;
+
+    assert.deepEqual(registry.setOverlaySuppressed(true), { ok: true });
+    assert.equal(registry.overlaySuppressed(), true);
+    assert.deepEqual(view.visibleCalls, [false], "overlay open → view hidden");
+
+    assert.deepEqual(registry.setOverlaySuppressed(false), { ok: true });
+    assert.equal(registry.overlaySuppressed(), false);
+    assert.deepEqual(view.visibleCalls, [false, true], "overlay closed → view restored");
+  });
+
+  it("attaches a view HIDDEN when it becomes active while suppressed", () => {
+    const { registry, attached } = makeVisibilityRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.setOverlaySuppressed(true);
+    registry.setActive("conv_1");
+    const view = attached[0];
+    assert.equal(
+      view.visibleCalls.at(-1),
+      false,
+      "a view activated under an open overlay must not paint over it",
+    );
+  });
+
+  it("keeps the replacement view hidden when the active view swaps while suppressed", () => {
+    const { registry, attached } = makeVisibilityRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.openOrNavigate("conv_2", "https://example.org");
+    registry.setActive("conv_1");
+    registry.setOverlaySuppressed(true);
+    registry.setActive("conv_2");
+    const second = attached[1];
+    assert.equal(second.visibleCalls.at(-1), false, "swapped-in view stays hidden");
+  });
+
+  it("re-shows on attach after suppression cleared while detached (setVisible(false) persists)", () => {
+    const { registry, attached } = makeVisibilityRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.setActive("conv_1");
+    registry.setOverlaySuppressed(true); // hidden
+    registry.setActive(null); // detached while hidden
+    registry.setOverlaySuppressed(false); // overlay closed with nothing active
+    registry.setActive("conv_1"); // re-attach must undo the stale hidden state
+    const view = attached[0];
+    assert.equal(view.visibleCalls.at(-1), true, "re-attach restores visibility");
+  });
+
+  it("suppression with no active view is a safe no-op", () => {
+    const { registry } = makeVisibilityRegistry();
+    assert.deepEqual(registry.setOverlaySuppressed(true), { ok: true });
+    assert.deepEqual(registry.setOverlaySuppressed(false), { ok: true });
+  });
+
+  it("tolerates stub views without setVisible (older Electron)", () => {
+    // The shared makeRegistry views have no setVisible — must not throw.
+    const ctx = makeRegistry();
+    ctx.registry.openOrNavigate("conv_1", "https://example.com");
+    ctx.registry.setActive("conv_1");
+    assert.deepEqual(ctx.registry.setOverlaySuppressed(true), { ok: true });
+    assert.deepEqual(ctx.registry.setOverlaySuppressed(false), { ok: true });
+  });
+});

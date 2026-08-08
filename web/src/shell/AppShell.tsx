@@ -44,6 +44,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import {
   AGENT_TERMINAL_IDS,
   inventoryTerminals,
@@ -284,6 +285,10 @@ export function AppShell() {
       : false,
   );
   const [shareOpen, setShareOpen] = useState(false);
+  // While the share dialog is open, hide the embedded browser's native view —
+  // it paints above all DOM, so the dialog would otherwise sit underneath the
+  // page when the Browser tab is active.
+  useSuppressBrowserView(shareOpen);
   const [forkOpen, setForkOpen] = useState(false);
   // Truncation point for a "fork from here" opened from a message's
   // actions (ChatPage, via ForkDialogContext). `null` = full clone —

@@ -77,11 +77,11 @@ _ensure-electron:
 
 [group('electron')]
 electron-dev: _ensure-web _ensure-electron
-    pnpm --filter web/electron run dev
+    pnpm --filter ./web/electron run dev
 
 [group('electron')]
 electron-build: _ensure-web _ensure-electron
-    pnpm --filter web/electron run build
+    pnpm --filter ./web/electron run build
 
 # --- Lint ---
 
