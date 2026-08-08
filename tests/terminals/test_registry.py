@@ -846,3 +846,55 @@ def test_multiple_terminals_per_conversation(tmp_path: Path) -> None:
 
     for (name, key), inst in instances.items():
         assert reg.get("conv_a", name, key) is inst
+
+
+async def test_shutdown_closes_instances_concurrently(tmp_path: Path) -> None:
+    """shutdown closes all terminals concurrently (asyncio.gather), so total
+    time is ~one close, not the serial sum -- otherwise a multi-terminal
+    shutdown blows the parent-death drain window and leaks (B7)."""
+    reg = TerminalRegistry()
+
+    overlap = {"max_in_flight": 0, "in_flight": 0}
+    barrier = asyncio.Event()
+
+    def _make_instance(name: str) -> TerminalInstance:
+        inst = TerminalInstance(
+            name=name,
+            session_key="s1",
+            socket_path=tmp_path / f"{name}.sock",
+            private_dir=tmp_path / name,
+            running=True,
+        )
+
+        async def _close() -> None:
+            overlap["in_flight"] += 1
+            overlap["max_in_flight"] = max(overlap["max_in_flight"], overlap["in_flight"])
+            # Yield so a serial implementation would never see in_flight > 1.
+            await barrier.wait()
+            overlap["in_flight"] -= 1
+
+        inst.close = _close  # type: ignore[method-assign]
+        return inst
+
+    reg._by_conversation["conv_a"] = {
+        ("t1", "s1"): _make_instance("t1"),
+        ("t2", "s1"): _make_instance("t2"),
+    }
+    reg._by_conversation["conv_b"] = {("t3", "s1"): _make_instance("t3")}
+
+    async def _release_soon() -> None:
+        # Let all three close() coroutines reach the barrier, then release.
+        for _ in range(50):
+            if overlap["max_in_flight"] >= 3:
+                break
+            await asyncio.sleep(0.01)
+        barrier.set()
+
+    releaser = asyncio.create_task(_release_soon())
+    await reg.shutdown()
+    await releaser
+
+    assert overlap["max_in_flight"] >= 2, (
+        "shutdown closed terminals serially; expected concurrent closes (B7)"
+    )
+    assert reg.active_conversation_ids() == []
