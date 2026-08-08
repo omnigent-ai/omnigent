@@ -1,13 +1,13 @@
 """Unit tests for native-worker YOLO ``terminal_launch_args`` derivation.
 
 Nessie's native sub-agent workers (claude-native / codex-native /
-cursor-native) launch in a headless pane where no human can answer an
-approval prompt. The server translates a worker's bypass stance into the
-per-session ``terminal_launch_args`` the runner appends to the native
-CLI argv: claude-native opts in via ``permission_mode``, while
-codex-native and cursor-native default to full bypass (issue #171 /
-cursor ``--yolo``) because the headless seam has no safe non-bypass
-default, with ``yolo: false`` as the opt-out.
+cursor-native / antigravity-native) launch in a headless pane where no
+human can answer an approval prompt. The server translates a worker's
+bypass stance into the per-session ``terminal_launch_args`` the runner
+appends to the native CLI argv: claude-native and antigravity-native opt
+in via ``permission_mode``, while codex-native and cursor-native default
+to full bypass (cursor's ``--yolo``) because the headless seam has no
+safe non-bypass default, with ``yolo: false`` as the opt-out.
 
 These tests exercise the pure translation helper
 ``_derive_terminal_launch_args_from_spec`` directly with real
@@ -195,4 +195,36 @@ def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
     spec = _spec_with_config(
         {"harness": harness, "permission_mode": "bypassPermissions", "yolo": "True"}
     )
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_antigravity_native_bypass_permission_mode_translates_to_flag() -> None:
+    """antigravity-native + ``bypassPermissions`` -> ``["--dangerously-skip-permissions"]``."""
+    spec = _spec_with_config(
+        {"harness": "antigravity-native", "permission_mode": "bypassPermissions"}
+    )
+    assert _derive_terminal_launch_args_from_spec(spec) == [
+        "--dangerously-skip-permissions",
+    ]
+
+
+def test_antigravity_native_padded_bypass_mode_still_translates() -> None:
+    """The mode is stripped before matching, so a padded ``bypassPermissions`` still maps."""
+    spec = _spec_with_config(
+        {"harness": "antigravity-native", "permission_mode": " bypassPermissions "}
+    )
+    assert _derive_terminal_launch_args_from_spec(spec) == [
+        "--dangerously-skip-permissions",
+    ]
+
+
+def test_antigravity_native_without_permission_mode_returns_none() -> None:
+    """antigravity-native bypass is opt-IN: absent mode leaves args unset."""
+    spec = _spec_with_config({"harness": "antigravity-native"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_antigravity_native_non_bypass_mode_returns_none() -> None:
+    """A non-bypass mode has no agy analogue and must leave args unset."""
+    spec = _spec_with_config({"harness": "antigravity-native", "permission_mode": "acceptEdits"})
     assert _derive_terminal_launch_args_from_spec(spec) is None
