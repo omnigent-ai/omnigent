@@ -6,8 +6,10 @@ relative to the same home — there is no project-level merge for the ``hooks``
 array. To gate a session's tools without mutating the user's global config, the
 runner points the launched ``kimi`` process at a session-scoped home that:
 
-- symlinks every entry of the user's global home (oauth, credentials,
-  sessions, …) so login / providers / history keep working, and
+- symlinks the user's global home entries (oauth, credentials, …) so login /
+  providers keep working — EXCEPT the ``sessions/`` store and its index, which
+  stay session-private so the transcript forwarder's wire-log discovery can
+  never adopt a parallel session's log — and
 - carries a ``config.toml`` that is the user's config text with two Omnigent
   ``[[hooks]]`` appended — a ``PreToolUse`` deny-gate and a ``PermissionRequest``
   read-only surface, both dispatched to :mod:`omnigent.kimi_native_hook`.
@@ -28,6 +30,10 @@ from pathlib import Path
 #: Env var Kimi Code reads to locate its data dir (config.toml + oauth + …).
 KIMI_CODE_HOME_ENV_VAR = "KIMI_CODE_HOME"
 _CONFIG_FILE = "config.toml"
+#: Global-home entries kept session-private instead of symlinked: config.toml
+#: is rebuilt with the Omnigent hooks, and the sessions store + its index stay
+#: per-session so parallel kimi sessions cannot adopt each other's wire logs.
+_PRIVATE_ENTRIES = frozenset({_CONFIG_FILE, "sessions", "session_index.jsonl"})
 
 
 def resolve_user_kimi_home() -> Path:
@@ -101,10 +107,13 @@ def build_kimi_session_home(
 ) -> dict[str, str]:
     """Materialize a session-scoped ``KIMI_CODE_HOME`` with Omnigent hooks.
 
-    Symlinks every entry of the user's global kimi home (except
-    ``config.toml``) into *session_home*, then writes a ``config.toml`` that is
-    the user's config plus the Omnigent hooks. Best-effort and idempotent:
-    re-running rewrites ``config.toml`` and leaves existing symlinks in place.
+    Symlinks every entry of the user's global kimi home into *session_home*
+    except ``config.toml`` (rebuilt below with the Omnigent hooks) and the
+    ``sessions`` store + ``session_index.jsonl`` (kept session-private so
+    parallel kimi sessions cannot adopt each other's wire logs), then writes a
+    ``config.toml`` that is the user's config plus the Omnigent hooks.
+    Best-effort and idempotent: re-running rewrites ``config.toml`` and leaves
+    existing symlinks in place.
 
     :param session_home: Directory to use as the session's ``KIMI_CODE_HOME``.
     :param bridge_dir: The kimi-native bridge dir the hook commands read.
@@ -121,8 +130,7 @@ def build_kimi_session_home(
     base_config = ""
     if user_home.is_dir():
         for entry in user_home.iterdir():
-            if entry.name == _CONFIG_FILE:
-                # config.toml is materialized fresh below (user content + hooks).
+            if entry.name in _PRIVATE_ENTRIES:
                 continue
             link = session_home / entry.name
             if link.exists() or link.is_symlink():
@@ -131,6 +139,16 @@ def build_kimi_session_home(
                 link.symlink_to(entry)
         with contextlib.suppress(OSError):
             base_config = (user_home / _CONFIG_FILE).read_text(encoding="utf-8")
+
+    # Drop stale global-store symlinks from a session home built before the
+    # sessions store went private, then ensure the private store exists.
+    for name in ("sessions", "session_index.jsonl"):
+        link = session_home / name
+        if link.is_symlink():
+            with contextlib.suppress(OSError):
+                link.unlink()
+    with contextlib.suppress(OSError):
+        (session_home / "sessions").mkdir(exist_ok=True)
 
     hooks = render_kimi_hooks_toml(bridge_dir=bridge_dir, python_executable=python_executable)
     # Ensure a clean separation if the user's config has no trailing newline.

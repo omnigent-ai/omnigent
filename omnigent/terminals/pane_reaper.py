@@ -48,6 +48,10 @@ _logger = logging.getLogger(__name__)
 # cheap name pre-filter; the wiring additionally confirms the registry resource
 # ROLE is a native harness (so a user terminal that merely shares the name is not
 # reaped — see ``create_runner_app``).
+#
+# "kimi" is deliberately absent: kimi records no resumable chat id, so a reaped
+# pane cannot be re-created with its context — the next turn would silently
+# start a fresh TUI. Keep kimi panes alive until the session is torn down.
 NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
     {
         "claude",
@@ -57,7 +61,6 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
         "hermes",
         "kiro",
         "qwen",
-        "kimi",
         "pi",
         "antigravity",
         "opencode",

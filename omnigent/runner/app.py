@@ -6878,8 +6878,11 @@ def create_runner_app(
         into a dead tmux target and lose the message. This re-ensures the pane
         first. Idempotent: a no-op when the harness is not a native CLI harness or
         the pane is already live. Reuses ``create_session_terminal``'s
-        ``ensure_native_terminal`` path, so the pane resumes via the vendor CLI's
-        own ``--resume`` (no fresh-start, no lost history).
+        ``ensure_native_terminal`` path, so where the vendor CLI records a
+        resumable chat id the pane resumes via its own ``--resume``. A harness
+        without one (kimi — exempt from the reaper, so this only fires for a
+        crashed pane) restarts a fresh TUI: the prior turns survive only in the
+        server transcript, not in the CLI's context.
 
         Detection has two layers: (1) the reaper POPPING the registry entry
         when it reaps (``registry.close()`` -> ``get()`` returns ``None``),

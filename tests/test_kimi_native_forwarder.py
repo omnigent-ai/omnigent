@@ -1,24 +1,35 @@
 """Unit tests for the kimi-native transcript forwarder.
 
 Covers the pure parsing/discovery helpers against kimi's real ``wire.jsonl``
-event schema (turn.prompt + content.part), the line-offset state round-trip,
-and workspace/recency-based session discovery. The live POST loop is exercised
-by the e2e gate, not here.
+event schema (turn.prompt + content.part), the byte-offset state round-trip,
+workspace/recency-based session discovery, and the forward loop's lifecycle
+edges (failed finish reasons, pane death, quiescence, poison-line drops) with
+the POST helpers stubbed out.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 
+import httpx
+import pytest
+
+import omnigent._native_forwarder_health as forwarder_health
+import omnigent.kimi_native_forwarder as fwd
 from omnigent.kimi_native_forwarder import (
     _discover_wire,
     _ForwardState,
+    _offset_for_line,
     _read_state,
     _row_to_item,
     _write_state,
     clear_kimi_bridge_state,
+    forward_kimi_wire_to_session,
     read_kimi_wire_items,
+    read_new_kimi_wire_items,
 )
 
 
@@ -106,6 +117,28 @@ class TestRowToItem:
         }
         assert _row_to_item(12, row) is None
 
+    def test_step_end_with_failure_reason_is_turn_failed(self) -> None:
+        """error/abort steps end the turn abnormally → a failed edge, not a strand."""
+        for reason in ("error", "abort", "aborted"):
+            row = {
+                "type": "context.append_loop_event",
+                "event": {"type": "step.end", "turnId": "0", "step": 2, "finishReason": reason},
+            }
+            item = _row_to_item(30, row)
+            assert item is not None, reason
+            assert item.kind == "turn_failed"
+            assert item.response_id == "kimi:turn_failed:30"
+
+    def test_step_end_with_length_is_turn_end(self) -> None:
+        """A length-stopped step delivered (truncated) output — an idle edge."""
+        row = {
+            "type": "context.append_loop_event",
+            "event": {"type": "step.end", "turnId": "0", "step": 2, "finishReason": "length"},
+        }
+        item = _row_to_item(31, row)
+        assert item is not None
+        assert item.kind == "turn_end"
+
     def test_non_user_turn_prompt_skipped(self) -> None:
         row = {
             "type": "turn.prompt",
@@ -159,13 +192,79 @@ class TestReadNewItems:
 class TestState:
     def test_round_trip_and_clear(self, tmp_path: Path) -> None:
         assert _read_state(tmp_path) is None
-        _write_state(tmp_path, _ForwardState(wire_path="/x/wire.jsonl", last_line=7))
+        _write_state(tmp_path, _ForwardState(wire_path="/x/wire.jsonl", last_line=7, offset=345))
         loaded = _read_state(tmp_path)
         assert loaded is not None
         assert loaded.wire_path == "/x/wire.jsonl"
         assert loaded.last_line == 7
+        assert loaded.offset == 345
         clear_kimi_bridge_state(tmp_path)
         assert _read_state(tmp_path) is None
+
+    def test_legacy_state_without_offset_marks_unknown(self, tmp_path: Path) -> None:
+        # State written by a line-only build: offset -1 → re-derived on first poll.
+        (tmp_path / "kimi_forwarder.json").write_text(
+            json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 3}), encoding="utf-8"
+        )
+        loaded = _read_state(tmp_path)
+        assert loaded is not None
+        assert loaded.offset == -1
+
+
+class TestReadNewIncremental:
+    def _write_rows(self, path: Path, rows: list[dict[str, object]], *, partial: str = "") -> None:
+        text = "".join(json.dumps(r) + "\n" for r in rows) + partial
+        path.write_text(text, encoding="utf-8")
+
+    def _prompt(self, text: str) -> dict[str, object]:
+        return {
+            "type": "turn.prompt",
+            "input": [{"type": "text", "text": text}],
+            "origin": {"kind": "user"},
+        }
+
+    def test_reads_only_past_offset_and_resumes(self, tmp_path: Path) -> None:
+        wire = tmp_path / "wire.jsonl"
+        self._write_rows(wire, [{"type": "metadata"}, self._prompt("hi")])
+        items, offset, line = read_new_kimi_wire_items(wire, 0, 0)
+        assert [(i.role, i.text) for i in items] == [("user", "hi")]
+        assert offset == wire.stat().st_size
+        assert line == 2
+        assert items[0].offset_after == offset
+        # Append one more row; the next read starts at the persisted cursor.
+        with wire.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(self._prompt("again")) + "\n")
+        items, offset2, line2 = read_new_kimi_wire_items(wire, offset, line)
+        assert [(i.text, i.line_no) for i in items] == [("again", 2)]
+        assert offset2 == wire.stat().st_size
+        assert line2 == 3
+
+    def test_partial_trailing_line_left_for_next_poll(self, tmp_path: Path) -> None:
+        wire = tmp_path / "wire.jsonl"
+        self._write_rows(wire, [self._prompt("hi")], partial='{"type": "turn.pro')
+        items, offset, line = read_new_kimi_wire_items(wire, 0, 0)
+        assert len(items) == 1
+        assert offset < wire.stat().st_size
+        assert line == 1
+
+    def test_truncated_file_restarts_tail(self, tmp_path: Path) -> None:
+        wire = tmp_path / "wire.jsonl"
+        self._write_rows(wire, [self._prompt("fresh")])
+        items, offset, line = read_new_kimi_wire_items(wire, 10_000, 42)
+        assert [(i.text, i.line_no) for i in items] == [("fresh", 0)]
+        assert offset == wire.stat().st_size
+        assert line == 1
+
+    def test_missing_file_is_noop(self, tmp_path: Path) -> None:
+        assert read_new_kimi_wire_items(tmp_path / "nope.jsonl", 5, 1) == ([], 5, 1)
+
+    def test_offset_for_line_matches_line_starts(self, tmp_path: Path) -> None:
+        wire = tmp_path / "wire.jsonl"
+        wire.write_text('{"a":1}\n{"b":2}\n{"c":3}\n', encoding="utf-8")
+        assert _offset_for_line(wire, 0) == 0
+        assert _offset_for_line(wire, 1) == 8
+        assert _offset_for_line(wire, 3) == 24
+        assert _offset_for_line(wire, 99) == 24
 
 
 class TestDiscoverWire:
@@ -205,3 +304,167 @@ class TestDiscoverWire:
         self._make_session(home, "session_stale", "/ws", mtime=1000.0)
         # launch far in the future (ms) → the 1000s-mtime session is below the floor.
         assert _discover_wire(home, "/ws", launch_epoch_ms=9_000_000_000_000) is None
+
+
+def _wire_home(tmp_path: Path, rows: list[dict[str, object]]) -> tuple[Path, Path]:
+    """Build a kimi home holding one discoverable session wire with *rows*."""
+    home = tmp_path / "kimi-code-home"
+    wire = home / "sessions" / "wd_x" / "session_a" / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return home, wire
+
+
+def _prompt_row(text: str = "go") -> dict[str, object]:
+    return {
+        "type": "turn.prompt",
+        "input": [{"type": "text", "text": text}],
+        "origin": {"kind": "user"},
+    }
+
+
+def _assistant_row(uuid: str, text: str) -> dict[str, object]:
+    return {
+        "type": "context.append_loop_event",
+        "event": {"type": "content.part", "uuid": uuid, "part": {"type": "text", "text": text}},
+    }
+
+
+def _step_end_row(reason: str) -> dict[str, object]:
+    return {
+        "type": "context.append_loop_event",
+        "event": {"type": "step.end", "turnId": "0", "step": 1, "finishReason": reason},
+    }
+
+
+async def _drive_loop_until(
+    tmp_path: Path,
+    rows: list[dict[str, object]],
+    done: Callable[[], bool],
+    *,
+    pane_alive: Callable[[], bool] | None = None,
+    quiescence_s: float = 60.0,
+) -> None:
+    """Run the forward loop against a canned wire until *done* (then cancel)."""
+    bridge = tmp_path / "bridge"
+    bridge.mkdir(exist_ok=True)
+    home, _wire = _wire_home(tmp_path, rows)
+    task = asyncio.create_task(
+        forward_kimi_wire_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_k",
+            bridge_dir=bridge,
+            kimi_home=home,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            pane_alive=pane_alive,
+            quiescence_s=quiescence_s,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        for _ in range(300):
+            if done():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("forward loop never reached the expected state")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+class TestForwardLoopEdges:
+    """Lifecycle edges of the forward loop, with the POST helpers stubbed."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_posts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.items: list[str] = []
+        self.statuses: list[tuple[str, str]] = []
+        forwarder_health.clear()
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            self.items.append(kwargs["item"].response_id)  # type: ignore[union-attr]
+
+        async def _fake_status(_client: object, **kwargs: object) -> None:
+            self.statuses.append((str(kwargs["status"]), str(kwargs["output"])))
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+        monkeypatch.setattr(fwd, "_post_reasoning_item", _fake_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    async def test_error_finish_reason_posts_failed_edge(self, tmp_path: Path) -> None:
+        rows = [_prompt_row(), _assistant_row("u1", "partial"), _step_end_row("error")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
+        assert self.statuses == [("failed", "partial")]
+
+    async def test_end_turn_posts_idle_edge_with_output(self, tmp_path: Path) -> None:
+        rows = [_prompt_row(), _assistant_row("u1", "done!"), _step_end_row("end_turn")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
+        assert self.statuses == [("idle", "done!")]
+
+    async def test_pane_death_mid_turn_posts_failed_edge(self, tmp_path: Path) -> None:
+        # A prompt with no terminal edge and a dead pane: fail instead of strand.
+        rows = [_prompt_row(), _assistant_row("u1", "so far")]
+        await _drive_loop_until(
+            tmp_path, rows, lambda: bool(self.statuses), pane_alive=lambda: False
+        )
+        assert self.statuses == [("failed", "so far")]
+
+    async def test_quiescence_closes_turn_without_edge_as_idle(self, tmp_path: Path) -> None:
+        # An interrupted turn writes no wire edge; the quiet-wire fallback closes it.
+        rows = [_prompt_row(), _assistant_row("u1", "so far")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses), quiescence_s=0.05)
+        assert self.statuses == [("idle", "so far")]
+
+
+class TestForwardLoopPostFailures:
+    async def test_poison_item_dropped_after_bounded_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 4xx-rejected item is skipped after bounded retries; the tail moves on."""
+        posted: list[str] = []
+        statuses: list[str] = []
+        rejections = 0
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            response_id = kwargs["item"].response_id  # type: ignore[union-attr]
+            if response_id == "kimi:turn:0":
+                nonlocal rejections
+                rejections += 1
+                request = httpx.Request("POST", "http://test")
+                raise httpx.HTTPStatusError(
+                    "422", request=request, response=httpx.Response(422, request=request)
+                )
+            posted.append(str(response_id))
+
+        async def _fake_status(_client: object, **kwargs: object) -> None:
+            statuses.append(str(kwargs["status"]))
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+        rows = [_prompt_row("poison"), _assistant_row("u1", "ok"), _step_end_row("end_turn")]
+        await _drive_loop_until(tmp_path, rows, lambda: bool(statuses))
+        assert rejections == 3
+        assert posted == ["kimi:u1"]
+        assert statuses == ["idle"]
+
+    async def test_transport_failure_is_recorded_and_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A connect failure attributes itself to forwarder health and holds the cursor."""
+        forwarder_health.clear()
+        attempts = 0
+
+        async def _fake_item(_client: object, **kwargs: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ConnectError("no route to host")
+
+        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+
+        await _drive_loop_until(tmp_path, [_prompt_row()], lambda: attempts >= 3)
+        assert forwarder_health.recent_post_failure(60.0) is not None
+        forwarder_health.clear()
