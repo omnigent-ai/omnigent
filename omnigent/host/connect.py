@@ -54,6 +54,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPackageWorkspaceAgentFrame,
+    HostPackageWorkspaceAgentResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -65,6 +67,8 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceHarnessesFrame,
+    HostWorkspaceHarnessesResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -2208,6 +2212,90 @@ class HostProcess:
             routable_models=list(config.routable_models) if config is not None else [],
         )
 
+    async def _handle_workspace_harnesses(
+        self,
+        frame: HostWorkspaceHarnessesFrame,
+    ) -> HostWorkspaceHarnessesResultFrame:
+        """Discover repo-declared ACP agents in a workspace's ``.omnigent/``.
+
+        Reads only the project-level config, so every returned row is
+        attributable to the repo. ``command_found`` is a soft PATH hint for
+        the picker, never a gate — the agent owns its own install.
+        """
+        try:
+            from omnigent.onboarding.acp_auth import (
+                command_binary_on_path,
+                workspace_acp_agents,
+            )
+            from omnigent.spec.workspace_agents import scan_workspace_agent_configs
+
+            entries = await asyncio.to_thread(workspace_acp_agents, Path(frame.path))
+            agents: list[dict[str, object]] = [
+                {
+                    "slug": entry.slug,
+                    "name": entry.name,
+                    "command": entry.command,
+                    "model": entry.model,
+                    "session_id_mode": entry.session_id_mode,
+                    "send_model": entry.send_model,
+                    "omnigent_mcp": entry.omnigent_mcp,
+                    "command_found": command_binary_on_path(entry.command),
+                }
+                for entry in entries
+            ]
+            configs = await asyncio.to_thread(
+                scan_workspace_agent_configs,
+                Path(frame.path),
+            )
+            agent_configs = [config.as_dict() for config in configs]
+        except Exception:
+            _logger.exception("Failed to discover workspace harnesses")
+            return HostWorkspaceHarnessesResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="failed to discover workspace harnesses",
+            )
+        return HostWorkspaceHarnessesResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            agents=agents,
+            agent_configs=agent_configs,
+        )
+
+    async def _handle_package_workspace_agent(
+        self,
+        frame: HostPackageWorkspaceAgentFrame,
+    ) -> HostPackageWorkspaceAgentResultFrame:
+        """Package a repo-declared agent config into bundle bytes.
+
+        Deterministic tar (see ``omnigent.spec.workspace_agents``): the
+        client hashes and uploads exactly these bytes, so the digest the
+        user consents to is the digest of what runs. Containment and the
+        size ceiling are enforced by the packager.
+        """
+        import base64
+
+        try:
+            from omnigent.spec.workspace_agents import package_workspace_agent
+
+            bundle = await asyncio.to_thread(
+                package_workspace_agent,
+                Path(frame.path),
+                frame.config_path,
+            )
+        except Exception as exc:
+            _logger.exception("Failed to package workspace agent")
+            return HostPackageWorkspaceAgentResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"failed to package workspace agent: {exc}",
+            )
+        return HostPackageWorkspaceAgentResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            bundle_b64=base64.b64encode(bundle).decode("ascii"),
+        )
+
     @staticmethod
     def _dispatch_fs_op(
         reader: object,
@@ -2857,6 +2945,10 @@ class HostProcess:
             await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
+        elif isinstance(frame, HostWorkspaceHarnessesFrame):
+            await ws.send(encode_host_frame(await self._handle_workspace_harnesses(frame)))
+        elif isinstance(frame, HostPackageWorkspaceAgentFrame):
+            await ws.send(encode_host_frame(await self._handle_package_workspace_agent(frame)))
 
 
 def run_host_process(

@@ -6040,7 +6040,8 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
     :param tmp_path: Pytest temp dir used as the runner workspace, so the
         local-config scan reads a real directory.
     """
-    from omnigent.runner.tool_dispatch import _AGENT_CONFIG_SUBDIR, execute_tool
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.workspace_agents import AGENT_CONFIG_SUBDIR as _AGENT_CONFIG_SUBDIR
 
     # Author a local config on disk so the scan has something to find.
     configs_dir = tmp_path / _AGENT_CONFIG_SUBDIR

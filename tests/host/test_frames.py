@@ -29,6 +29,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPackageWorkspaceAgentFrame,
+    HostPackageWorkspaceAgentResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -40,6 +42,8 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceHarnessesFrame,
+    HostWorkspaceHarnessesResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -97,6 +101,128 @@ def test_model_options_frames_round_trip() -> None:
         "system.ai.claude-opus-5",
         "system.ai.claude-opus-4-8",
     ]
+
+
+def test_workspace_harnesses_frames_round_trip() -> None:
+    """Repo-declared harness discovery survives both directions of the tunnel."""
+    request = decode_host_frame(
+        encode_host_frame(
+            HostWorkspaceHarnessesFrame(request_id="req_ws", path="/Users/corey/universe"),
+        )
+    )
+    assert request == HostWorkspaceHarnessesFrame(
+        request_id="req_ws",
+        path="/Users/corey/universe",
+    )
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostWorkspaceHarnessesResultFrame(
+                request_id="req_ws",
+                status="ok",
+                agents=[
+                    {
+                        "slug": "repo-echo",
+                        "name": "Repo Echo",
+                        "command": "echo-agent --acp",
+                        "model": None,
+                        "session_id_mode": "server",
+                        "send_model": False,
+                        "command_found": True,
+                    }
+                ],
+            )
+        )
+    )
+    assert isinstance(result, HostWorkspaceHarnessesResultFrame)
+    assert result.agents[0]["slug"] == "repo-echo"
+    assert result.agents[0]["command_found"] is True
+
+    failure = decode_host_frame(
+        encode_host_frame(
+            HostWorkspaceHarnessesResultFrame(
+                request_id="req_ws",
+                status="failed",
+                error="boom",
+            )
+        )
+    )
+    assert failure == HostWorkspaceHarnessesResultFrame(
+        request_id="req_ws",
+        status="failed",
+        agents=[],
+        error="boom",
+    )
+
+
+def test_workspace_harnesses_result_carries_agent_configs() -> None:
+    """Agent-config summaries ride the discovery result; absent decodes empty."""
+    result = decode_host_frame(
+        encode_host_frame(
+            HostWorkspaceHarnessesResultFrame(
+                request_id="req_ws",
+                status="ok",
+                agent_configs=[{"slug": "reviewer", "kind": "bundle"}],
+            )
+        )
+    )
+    assert isinstance(result, HostWorkspaceHarnessesResultFrame)
+    assert result.agent_configs == [{"slug": "reviewer", "kind": "bundle"}]
+
+    # An older host's result (no agent_configs key) decodes to [].
+    legacy = json.loads(
+        encode_host_frame(
+            HostWorkspaceHarnessesResultFrame(request_id="req_ws", status="ok"),
+        )
+    )
+    del legacy["agent_configs"]
+    decoded = decode_host_frame(json.dumps(legacy))
+    assert isinstance(decoded, HostWorkspaceHarnessesResultFrame)
+    assert decoded.agent_configs == []
+
+
+def test_package_workspace_agent_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(
+            HostPackageWorkspaceAgentFrame(
+                request_id="req_pkg",
+                path="/Users/corey/universe",
+                config_path=".omnigent/agent-configs/reviewer",
+            ),
+        )
+    )
+    assert request == HostPackageWorkspaceAgentFrame(
+        request_id="req_pkg",
+        path="/Users/corey/universe",
+        config_path=".omnigent/agent-configs/reviewer",
+    )
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostPackageWorkspaceAgentResultFrame(
+                request_id="req_pkg",
+                status="ok",
+                bundle_b64="aGk=",
+            )
+        )
+    )
+    assert result == HostPackageWorkspaceAgentResultFrame(
+        request_id="req_pkg",
+        status="ok",
+        bundle_b64="aGk=",
+    )
+
+
+def test_workspace_harnesses_result_rejects_non_object_agents() -> None:
+    """Malformed ``agents`` payloads fail decode instead of leaking through."""
+    frame = json.loads(
+        encode_host_frame(
+            HostWorkspaceHarnessesResultFrame(request_id="req_ws", status="ok"),
+        )
+    )
+    frame["agents"] = ["not-an-object"]
+    with pytest.raises(ValueError, match="agents"):
+        decode_host_frame(json.dumps(frame))
 
 
 def test_encode_injects_traceparent_under_active_span() -> None:

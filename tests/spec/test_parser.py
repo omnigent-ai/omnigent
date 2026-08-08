@@ -3220,6 +3220,50 @@ def test_executor_profile_field_lifted_for_non_omnigent(tmp_path: Path) -> None:
     assert "profile" not in spec.executor.config
 
 
+def test_executor_acp_agent_mirrored_into_config(tmp_path: Path) -> None:
+    """
+    Top-level ``executor.acp_agent`` mirrors into ``config["acp_agent"]``
+    as a structured mapping (not string-coerced), like ``profile`` above —
+    the runtime adapter reads it from the raw executor mapping, but
+    server-side consumers (e.g. the launch gate) only see the parsed spec.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "agent",
+        "executor": {
+            "type": "omnigent",
+            "acp_agent": {"name": "Repo Echo", "command": "echo-agent --acp"},
+            "config": {"harness": "acp:repo-echo"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.config.get("acp_agent") == {
+        "name": "Repo Echo",
+        "command": "echo-agent --acp",
+    }
+
+
+def test_executor_acp_agent_in_config_not_stringified(tmp_path: Path) -> None:
+    """A config-level ``acp_agent`` mapping keeps its nested YAML shape."""
+    config = {
+        "spec_version": 1,
+        "name": "agent",
+        "executor": {
+            "type": "omnigent",
+            "config": {
+                "harness": "acp:repo-echo",
+                "acp_agent": {"name": "Repo Echo", "command": "echo-agent --acp"},
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    acp_agent = spec.executor.config.get("acp_agent")
+    assert isinstance(acp_agent, dict)
+    assert acp_agent["command"] == "echo-agent --acp"
+
+
 def test_omnigent_and_default_executor_minimal_configs_still_parse(tmp_path: Path) -> None:
     """Both legacy ``omnigent`` and default minimal YAMLs continue to parse cleanly."""
     omni_config = {

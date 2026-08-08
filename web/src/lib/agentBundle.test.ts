@@ -197,4 +197,60 @@ describe("buildAgentBundle", () => {
     expect(yaml).toContain("harness: openai-agents");
     expect(yaml).toContain("model: gpt-4o");
   });
+
+  it("omits the model line when no model is given", async () => {
+    const input: AgentBundleInput = {
+      name: "acp-agent",
+      harness: "acp:repo-echo",
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).not.toContain("model:");
+    expect(yaml).toContain("harness: acp:repo-echo");
+  });
+
+  it("embeds acp_agent under executor, before config", async () => {
+    const input: AgentBundleInput = {
+      name: "repo-agent",
+      harness: "acp:repo-echo",
+      acpAgent: {
+        name: "Repo Echo",
+        command: "echo-agent --acp --flag",
+        model: "gpt-5.3",
+        sessionIdMode: "client",
+        sendModel: true,
+      },
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).toContain("executor:\n  type: omnigent\n  acp_agent:");
+    expect(yaml).toContain("    name: Repo Echo");
+    expect(yaml).toContain("    command: echo-agent --acp --flag");
+    expect(yaml).toContain("    model: gpt-5.3");
+    expect(yaml).toContain("    session_id_mode: client");
+    expect(yaml).toContain("    send_model: true");
+    expect(yaml).toContain("harness: acp:repo-echo");
+  });
+
+  it("omits default acp_agent knobs", async () => {
+    const input: AgentBundleInput = {
+      name: "repo-agent",
+      harness: "acp:repo-echo",
+      acpAgent: { name: "Repo Echo", command: "echo-agent --acp" },
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).toContain("  acp_agent:");
+    expect(yaml).not.toContain("session_id_mode");
+    expect(yaml).not.toContain("send_model");
+    expect(yaml).not.toContain("model:");
+    expect(yaml).not.toContain("omnigent_mcp");
+  });
+
+  it("emits omnigent_mcp only when disabled", async () => {
+    const input: AgentBundleInput = {
+      name: "repo-agent",
+      harness: "acp:repo-echo",
+      acpAgent: { name: "Repo Echo", command: "echo-agent --acp", omnigentMcp: false },
+    };
+    const yaml = await extractConfigYaml(await buildAgentBundle(input));
+    expect(yaml).toContain("    omnigent_mcp: false");
+  });
 });
