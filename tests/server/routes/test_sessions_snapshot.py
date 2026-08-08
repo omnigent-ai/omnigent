@@ -2339,3 +2339,57 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
         captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
         == "runner_error"
     )
+
+
+# ── _runner_reject_detail ────────────────────────────────────────────────────
+
+
+def test_runner_reject_detail_combines_error_code_and_detail() -> None:
+    """The runner's own ``{error, detail}`` shape reads as ``code: detail``."""
+    import httpx
+
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    resp = httpx.Response(
+        503,
+        request=httpx.Request("POST", "http://runner/v1/sessions/conv_x/events"),
+        json={"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+    )
+    assert _runner_reject_detail(resp) == "harness_spawn_failed: harness spawn failed (see log)"
+
+
+def test_runner_reject_detail_falls_back_through_code_body_and_status() -> None:
+    """Each degraded body shape still yields a non-empty reason.
+
+    The reason becomes the user-visible ``last_task_error``, so an
+    error-code-only body, a non-JSON body, and an empty body must each
+    produce something better than a bare "failed".
+    """
+    import httpx
+
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    req = httpx.Request("POST", "http://runner/v1/sessions/conv_x/events")
+
+    code_only = httpx.Response(501, request=req, json={"error": "not_implemented"})
+    assert _runner_reject_detail(code_only) == "not_implemented"
+
+    non_json = httpx.Response(400, request=req, text="bad request body")
+    assert _runner_reject_detail(non_json) == "bad request body"
+
+    empty = httpx.Response(503, request=req)
+    assert _runner_reject_detail(empty) == "runner returned status 503"
+
+
+def test_runner_reject_detail_tolerates_status_only_response_fake() -> None:
+    """A fake exposing only ``status_code`` degrades to the status line.
+
+    Runner-client stubs across the server tests return lightweight fakes
+    without ``json()``; the helper must not raise on them.
+    """
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    class _Fake:
+        status_code = 503
+
+    assert _runner_reject_detail(_Fake()) == "runner returned status 503"  # type: ignore[arg-type]

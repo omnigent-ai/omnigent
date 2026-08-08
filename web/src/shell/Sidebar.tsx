@@ -154,6 +154,11 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import {
+  type SessionFilter,
+  readSessionFilter,
+  writeSessionFilter,
+} from "@/lib/sessionFilterPreferences";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
@@ -220,9 +225,10 @@ function SidebarRowDataProvider({
 /**
  * Which slice of sessions the sidebar shows. ``"mine"``/``"shared"`` split by
  * ownership (see :func:`isOwnedByViewer`); ``"archived"`` is the only slice
- * that includes archived sessions.
+ * that includes archived sessions. The vocabulary lives with the persistence
+ * helpers, which validate a stored value against it.
  */
-type SidebarTab = "all" | "mine" | "shared" | "archived";
+type SidebarTab = SessionFilter;
 
 const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
   { value: "all", label: "All sessions" },
@@ -452,11 +458,13 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // (from the Sessions header or the Projects header kebab, respectively).
   const [selectionScope, setSelectionScope] = useState<SelectionScope>("sessions");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  // Active filter from the Sessions heading's menu.
-  const [activeTab, setActiveTab] = useState<SidebarTab>("all");
   // A loopback-only server has one user, so "Shared" is meaningless there —
   // the filter menu drops that option. Mirrors AppShell's `shareDisabled`.
+  // Read before the filter state, which validates a stored "shared" against it.
   const multiUser = !isCurrentServerLocal();
+  // Active filter from the Sessions heading's menu, seeded from the persisted
+  // preference so a reload keeps the slice the viewer was last on.
+  const [activeTab, setActiveTab] = useState<SidebarTab>(() => readSessionFilter(multiUser));
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
@@ -507,11 +515,13 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // switch keeps the bulk-action count honest with the visible tab (the viewer
   // re-enters per tab) instead of carrying stale rows across. Every path that
   // changes the tab must go through here — not a bare setActiveTab — or the
-  // selection cleanup is skipped (e.g. the "New session" snap-back below).
+  // selection cleanup and the persisted preference are skipped (e.g. the
+  // "New session" snap-back below).
   const switchTab = useCallback(
     (tab: SidebarTab) => {
       if (selectionMode) exitSelectionMode();
       setActiveTab(tab);
+      writeSessionFilter(tab);
     },
     [selectionMode, exitSelectionMode],
   );
@@ -878,7 +888,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                         ? "1 inbox item waiting"
                         : `${inboxCount} inbox items waiting`
                     }
-                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-accent/15 px-1 text-10 font-medium text-brand-accent tabular-nums"
                   >
                     {inboxCount}
                   </span>
@@ -3307,7 +3317,12 @@ function ConversationRow({
             : sessionState !== null
               ? "pr-28 md:pr-8"
               : "pr-28 md:pr-2"),
-        !selectionMode && "md:group-hover:pr-14 md:group-focus-within:pr-14",
+        // The narrowed reserve must track exactly when the trailing controls
+        // appear and the state marker fades — both keyed on `:focus-visible`.
+        // `focus-within` also fires for a plain click, which shrank the reserve
+        // on the selected row while the marker stayed put, sliding the title
+        // under it.
+        !selectionMode && "md:group-hover:pr-14 md:group-has-[:focus-visible]:pr-14",
         !selectionMode && menuOpen && "md:pr-14",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,

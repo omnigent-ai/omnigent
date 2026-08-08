@@ -1318,6 +1318,25 @@ export function AppShell() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" stays a pill view.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+
+  // A runner stop/disconnect empties the terminal list; if that lands while the
+  // terminal view is open, flip back to chat rather than stranding the user on
+  // "No terminals available" (and chat is where the composer resumes it).
+  // Edge-triggered + startingUp-guarded so a cold boot / relaunch isn't yanked.
+  const hadTerminalRef = useRef(false);
+  useEffect(() => {
+    if (
+      terminalFirst &&
+      panelOpen &&
+      hadTerminalRef.current &&
+      !terminalsAvailable &&
+      !terminalStartingUp
+    ) {
+      setPanelInitialKey(null);
+    }
+    hadTerminalRef.current = terminalsAvailable;
+  }, [terminalFirst, panelOpen, terminalsAvailable, terminalStartingUp, setPanelInitialKey]);
+
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,

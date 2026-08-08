@@ -1879,10 +1879,12 @@ export function NewChatLandingScreen() {
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
-  const dictation = useDictationInsert(setMessage);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Declared after textareaRef so dictation can place the caret after the
+  // text it inserts (and insert at the caret rather than the draft's end).
+  const dictation = useDictationInsert(message, setMessage, textareaRef);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
@@ -3866,6 +3868,11 @@ export function NewChatLandingScreen() {
                       )
                     : null,
                 );
+              }}
+              onFocus={() => {
+                // From here the textarea's caret is one the user placed, so
+                // dictation inserts there instead of at the end of the draft.
+                dictation.noteFocus();
               }}
               onBlur={() => {
                 // Dismiss the mention menu when focus leaves the textarea; menu

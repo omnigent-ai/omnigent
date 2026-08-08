@@ -2341,6 +2341,10 @@ def create_runner_app(
     async def _session_workspace_value(session_id: str) -> str | None:
         if session_id not in _session_workspace_cache:
             snapshot = await _session_snapshot(session_id)
+            # A failed fetch carries no workspace. Memoizing its ``None``
+            # would pin the session to the global workspace for its lifetime.
+            if not snapshot.ok:
+                return None
             _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
@@ -7566,7 +7570,10 @@ def create_runner_app(
             return
         snapshot = await _session_snapshot(session_id)
         _session_start_cache[session_id] = snapshot.created_at
-        _session_workspace_cache[session_id] = snapshot.workspace
+        # Only memoize a workspace the server actually returned; a failed
+        # fetch is re-resolved lazily by _session_workspace_value.
+        if snapshot.ok:
+            _session_workspace_cache[session_id] = snapshot.workspace
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:

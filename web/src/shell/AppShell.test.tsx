@@ -731,6 +731,110 @@ describe("TerminalFirstContext", () => {
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
   });
 
+  it("falls back to chat when an open terminal view loses its terminal", () => {
+    // A runner stop / disconnect empties the terminal list (useTerminals clears
+    // it on the runner-offline edge). Landing while the terminal view is open,
+    // that would strand the user on "No terminals available"; the view must
+    // fall back to chat, where the composer can resume the session.
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    // Stable QueryClient + fresh element per render so the rerender reads the
+    // updated mock (React bails on an identical element reference).
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_native"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    // Open the terminal view (a terminal is present).
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+
+    // The runner stops: the terminal list empties out from under the open view.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    // Fell back to chat rather than stranding on "No terminals available".
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+  });
+
+  it("stays in terminal view while the terminal is relaunching", () => {
+    // A relaunch (terminalPending) also empties the list briefly, but the
+    // terminal is coming right back — the startingUp guard must hold the
+    // terminal view so a wake doesn't flip chat/terminal back and forth.
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    // terminalPending + a non-failed status makes terminalStartingUp true once
+    // the list empties (see the startup-spinner tests above).
+    useChatStore.setState({ terminalPending: true, sessionStatus: "running" });
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_native"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+
+    // Terminal drops but is relaunching (startingUp) — must NOT fall back.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    const probe = screen.getByTestId("view-probe");
+    expect(probe).toHaveAttribute("data-terminal-starting-up", "true");
+    expect(probe).toHaveAttribute("data-view", "terminal");
+  });
+
   it("restores the terminal view when re-entering a native session within the same tab", () => {
     // Bug: switching to another chat and back used to drop the user
     // out of terminal view because the conversation-switch effect reset

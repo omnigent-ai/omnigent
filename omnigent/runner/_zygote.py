@@ -165,6 +165,10 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
         zygote, exported so the runner can request harness forks.
     """
     _apply_child_env(request)
+    workspace = request.get("cwd")
+    if not isinstance(workspace, str):
+        raise ValueError("runner fork request requires a cwd")
+    os.chdir(workspace)
     # Tell the runner its harness-fork channel fd (set after the env replace so
     # it survives the clear).
     os.environ[ZYGOTE_HARNESS_FD_ENV_VAR] = str(harness_fd)
@@ -201,6 +205,7 @@ def _maybe_run_test_seam() -> None:
     if test_exit is not None:
         sys.stdout.write(f"marker={os.environ.get('OMNIGENT_ZYGOTE_MARKER', '')}\n")
         sys.stdout.write(f"tty_fd={os.environ.get(LOG_TTY_FD_ENV_VAR, '')}\n")
+        sys.stdout.write(f"cwd={os.getcwd()}\n")
         sys.stdout.flush()
         if env_truthy(os.environ.get(_ZYGOTE_TEST_CHILD_RAISE_ENV_VAR)):
             raise SystemExit(int(test_exit))

@@ -2403,6 +2403,46 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
   });
 
+  it("surfaces a failed send without settling the live turn", async () => {
+    // A send that fails while a turn is streaming used to roll its optimistic
+    // bubble back and stop there — no error block, no status change. That
+    // silence is why a message that never reaches the agent looks like it was
+    // never typed. The error must show; the live turn must not be touched.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_in_flight", state: "streaming", error: null },
+      blocks: [],
+      pendingUserMessages: [],
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_abc/events" && init?.method === "POST") {
+        return Promise.reject(new Error("network down"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("does this vanish?", "agent_xyz");
+
+    const state = useChatStore.getState();
+    const errorBlocks = state.blocks.filter((b) => b.type === "error");
+    expect(errorBlocks).toHaveLength(1);
+    expect(errorBlocks[0]).toMatchObject({ type: "error", message: "network down" });
+    // The optimistic bubble rolls back — no server record will reconcile it.
+    expect(state.pendingUserMessages).toHaveLength(0);
+    // The in-flight turn keeps its lifecycle: not failed, not settled.
+    expect(state.activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "streaming",
+      error: null,
+    });
+    expect(state.status).toBe("streaming");
+  });
+
   it("revive is a no-op for failed and absent responses", () => {
     useChatStore.setState({
       conversationId: "conv_abc",
@@ -9049,6 +9089,97 @@ describe("chatStore — client-side message queue", () => {
     expect(sendSpy).toHaveBeenCalledTimes(1);
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["stranded?", "agent_xyz"]);
   });
+
+  /**
+   * Drive a send whose POST never settles, leaving `status` latched to
+   * "streaming", then queue a message behind it.
+   *
+   * @param rowStatus - the session's status in the sidebar cache, i.e. the
+   *   server's own view of whether a turn is running.
+   * @returns the texts delivered to /events, appended to as the test advances.
+   */
+  async function wedgeOnHungSend(rowStatus: Conversation["status"]): Promise<string[]> {
+    seedConversationsCache([conv("conv_abc", rowStatus)]);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [],
+    });
+
+    const delivered: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_abc/events" && init?.method === "POST") {
+        const text = JSON.parse(init.body as string).data.content[0].text;
+        delivered.push(text);
+        if (text === "hung") return new Promise<Response>(() => {});
+        return mockResponse({ queued: true, item_id: "ci_ok" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    void useChatStore.getState().send("hung", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(delivered).toEqual(["hung"]);
+    expect(useChatStore.getState().status).toBe("streaming");
+
+    // enqueueMessage flushes eagerly; the latch must hold it back.
+    useChatStore.getState().enqueueMessage("queued", undefined);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(delivered).toEqual(["hung"]);
+    return delivered;
+  }
+
+  it("drains the queue once a stranded send latch outlives any plausible POST", async () => {
+    // The wedge: postEvent has no timeout, so a POST whose connection dies
+    // mid-flight never settles. `status` stays "streaming" forever and that
+    // same flag gates the queue — every later message queues with no error and
+    // no recovery short of a page reload.
+    vi.useFakeTimers();
+    try {
+      const delivered = await wedgeOnHungSend("idle");
+
+      // Still within the window a real POST could take: the latch is honored.
+      await vi.advanceTimersByTimeAsync(120_000);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+
+      // Past it, with the session's own row reading idle, the latch is
+      // stranded: it clears and the queue drains.
+      await vi.advanceTimersByTimeAsync(60_000);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung", "queued"]);
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      // The stale latch was cleared — the drain's own send owns this one, and
+      // its clock restarts, so it can't inherit the stranded send's staleness.
+      expect(useChatStore.getState().status).toBe("streaming");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the queue parked when the session is genuinely running", async () => {
+    // Same elapsed time, different server truth. Overriding the latch here
+    // would double-send into a live turn, so only the server's own idle row
+    // may override it.
+    vi.useFakeTimers();
+    try {
+      const delivered = await wedgeOnHungSend("running");
+
+      await vi.advanceTimersByTimeAsync(300_000);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+      expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["queued"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("chatStore — background cross-session flush", () => {
@@ -9340,59 +9471,151 @@ describe("chatStore — background cross-session flush", () => {
     });
   });
 
-  it("serializes a background flush behind an in-flight foreground send (FIFO across paths)", async () => {
-    // The navigate-away race: a foreground send() for the active conversation is
-    // still in flight (its /events POST held open) when the background flush
-    // fires for another conversation. Both POSTs must go through the one send
-    // chain, so the background POST cannot overtake the foreground one — it
-    // waits until the foreground POST resolves.
-    seedConversationsCache([conv("conv_active", "idle"), conv("conv_bg", "idle")]);
+  it("serializes a background flush behind an in-flight foreground send to the same conversation", async () => {
+    // The navigate-away race: a foreground send() for conv_a is still in flight
+    // (its /events POST held open) when the user switches away, so conv_a's
+    // queue now drains via the background path. Both take a slot on conv_a's
+    // chain, so the background POST cannot overtake the foreground one.
+    seedConversationsCache([conv("conv_a", "idle"), conv("conv_other", "idle")]);
     useChatStore.setState({
-      conversationId: "conv_active",
+      conversationId: "conv_a",
       boundAgentId: "agent_xyz",
       abortController: new AbortController(),
       status: "idle",
       sessionStatus: "idle",
-      queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_bg" }],
+      queuedMessages: [],
     });
 
-    // Hold conv_active's foreground POST open; conv_bg's background POST resolves
-    // immediately. Records delivery order across both endpoints.
+    // Both POSTs hit the same endpoint, so order is recorded by message text.
     const delivered: string[] = [];
     let releaseForeground: () => void = () => {};
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_active/events" && init?.method === "POST") {
-        delivered.push("foreground");
-        return new Promise<Response>((resolve) => {
-          releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
-        });
-      }
-      if (url === "/v1/sessions/conv_bg/events" && init?.method === "POST") {
-        delivered.push("background");
+      if (url === "/v1/sessions/conv_a/events" && init?.method === "POST") {
+        const text = JSON.parse(init.body as string).data.content[0].text;
+        delivered.push(text);
+        if (text === "fg-msg") {
+          return new Promise<Response>((resolve) => {
+            releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
+          });
+        }
         return mockResponse({ queued: true, item_id: "ci_bg" });
       }
       return defaultFetchHandler(input, init);
     });
 
-    // Foreground send() takes the first chain slot and its POST is held open.
+    // Foreground send() takes conv_a's first chain slot; its POST is held open.
     const fg = useChatStore.getState().send("fg-msg", "agent_xyz");
     await tick();
-    expect(delivered).toEqual(["foreground"]);
+    expect(delivered).toEqual(["fg-msg"]);
 
-    // Background flush fires while the foreground POST is still in flight. It
-    // must NOT deliver yet — it's queued behind the foreground POST on the chain.
+    // User navigates away, handing conv_a's queue to the background path.
+    useChatStore.setState({
+      conversationId: "conv_other",
+      queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_a" }],
+    });
     useChatStore.getState().flushBackgroundQueues();
     await tick();
     await tick();
-    expect(delivered).toEqual(["foreground"]);
+    expect(delivered).toEqual(["fg-msg"]);
 
     // Release the foreground POST → the background POST is now free to deliver.
     releaseForeground();
     await fg;
     await tick();
     await tick();
-    expect(delivered).toEqual(["foreground", "background"]);
+    expect(delivered).toEqual(["fg-msg", "bg-msg"]);
+  });
+
+  it("does not serialize sends across different conversations", async () => {
+    // Ordering only means anything WITHIN a conversation. A single global chain
+    // let one stalled POST wedge every session in the tab, so a POST held open
+    // for conv_a must not delay a send to conv_b.
+    seedConversationsCache([conv("conv_a", "idle"), conv("conv_b", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_a",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [],
+    });
+
+    const delivered: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_a/events" && init?.method === "POST") {
+        delivered.push("conv_a");
+        // Never settles — conv_a's chain stays occupied for the whole test.
+        return new Promise<Response>(() => {});
+      }
+      if (url === "/v1/sessions/conv_b/events" && init?.method === "POST") {
+        delivered.push("conv_b");
+        return mockResponse({ queued: true, item_id: "ci_b" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    void useChatStore.getState().send("a-msg", "agent_xyz");
+    await tick();
+    expect(delivered).toEqual(["conv_a"]);
+
+    useChatStore.setState({ conversationId: "conv_b" });
+    void useChatStore.getState().send("b-msg", "agent_xyz");
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["conv_a", "conv_b"]);
+  });
+
+  it("releases the chain when a prior send's POST never settles", async () => {
+    // postEvent issues its fetch with no timeout, so a connection that dies
+    // mid-flight never settles and that send's `finally` never runs. The wait on
+    // the prior send is bounded so the next send to the SAME conversation still
+    // goes out — otherwise the composer queues forever with no error and no
+    // recovery short of a page reload.
+    vi.useFakeTimers();
+    try {
+      seedConversationsCache([conv("conv_a", "idle")]);
+      useChatStore.setState({
+        conversationId: "conv_a",
+        boundAgentId: "agent_xyz",
+        abortController: new AbortController(),
+        status: "idle",
+        sessionStatus: "idle",
+        queuedMessages: [],
+      });
+
+      const delivered: string[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/v1/sessions/conv_a/events" && init?.method === "POST") {
+          const text = JSON.parse(init.body as string).data.content[0].text;
+          delivered.push(text);
+          if (text === "hung") return new Promise<Response>(() => {});
+          return mockResponse({ queued: true, item_id: "ci_ok" });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      void useChatStore.getState().send("hung", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+
+      // Second send parks behind the hung one until the bounded wait expires.
+      void useChatStore.getState().send("after", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+
+      // A legitimately slow POST (runner session-init, sandbox-host wake) must
+      // still keep its ordering — the bound sits above those, not under them.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(delivered).toEqual(["hung"]);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(delivered).toEqual(["hung", "after"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

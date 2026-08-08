@@ -641,6 +641,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation as _resolve_elicitation,
     _run_managed_launch as _run_managed_launch,
     _run_managed_wake as _run_managed_wake,
+    _runner_reject_detail as _runner_reject_detail,
     _schedule_deferred_elicitation_clear as _schedule_deferred_elicitation_clear,
     _spawn_native_approval_popup_forward as _spawn_native_approval_popup_forward,
     _spawn_native_blocked_notice_forward as _spawn_native_blocked_notice_forward,
