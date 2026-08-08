@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from omnigent.policies.builtins.prompt import prompt_policy
+from omnigent.policies.builtins.prompt import _CLASSIFIER_SCHEMA, prompt_policy
 
 
 def _make_event(
@@ -70,6 +70,22 @@ async def test_fixed_reason_overrides_llm() -> None:
     event = _make_event(llm_response={"action": "deny", "reason": "LLM reason"})
     result = await evaluate(event)
     assert result == {"result": "DENY", "reason": "Fixed reason."}
+
+
+@pytest.mark.asyncio
+async def test_structured_output_schema_forwarded() -> None:
+    """
+    The classifier call passes ``text=_CLASSIFIER_SCHEMA`` so the LLM
+    is constrained to bare JSON.
+
+    What breaks if this fails: a chatty model prefixes prose,
+    ``json.loads`` raises, and the fail-closed branch DENYs an
+    otherwise-fine turn with an opaque reason.
+    """
+    evaluate = prompt_policy(prompt="Deny Canada.")
+    event = _make_event(llm_response={"action": "allow", "reason": ""})
+    await evaluate(event)
+    assert event["llm_client"].create.call_args.kwargs["text"] is _CLASSIFIER_SCHEMA
 
 
 @pytest.mark.asyncio
