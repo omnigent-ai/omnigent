@@ -201,6 +201,12 @@ _REAP_KILL_TIMEOUT_S = 10.0
 # status segments and window formats; it is not an application sentinel.
 _TMUX_EMPTY_OPTION_VALUE = ""
 
+# ``set-option -g allow-passthrough`` was added in tmux 3.3. Stock
+# Ubuntu 22.04 still ships 3.2a; sending the option there rejects the
+# entire ``new-session`` command sequence (issue #4442). Mirror the
+# parse-and-compare style of :func:`omnigent.repl._tmux_pane._tmux_version_ok`.
+_MIN_TMUX_ALLOW_PASSTHROUGH_VERSION = (3, 3)
+
 
 def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
     """
@@ -223,6 +229,57 @@ def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
     return sequence
 
 
+def _parse_tmux_version(version_text: str) -> tuple[int, ...] | None:
+    """
+    Parse ``tmux -V`` stdout into a ``(major, minor)`` tuple.
+
+    Suffix letters (``"a"`` in ``"3.2a"``) are ignored so a stable
+    3.2.x release counts as 3.2 — same convention as
+    :func:`omnigent.repl._tmux_pane._tmux_version_ok`.
+
+    :param version_text: Raw ``tmux -V`` output, e.g. ``"tmux 3.2a"``.
+    :returns: Leading two integers, or ``None`` when the text is
+        unparseable.
+    """
+    parts = version_text.strip().split()
+    if len(parts) != 2:
+        return None
+    nums: list[int] = []
+    for piece in parts[1].replace("-", ".").split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if digits:
+            nums.append(int(digits))
+        if len(nums) >= 2:
+            break
+    if len(nums) < 2:
+        return None
+    return tuple(nums[:2])
+
+
+def _tmux_supports_allow_passthrough() -> bool:
+    """
+    Return whether the installed tmux accepts ``allow-passthrough``.
+
+    Parses ``tmux -V`` and compares against
+    :data:`_MIN_TMUX_ALLOW_PASSTHROUGH_VERSION`. Returns ``False`` when
+    tmux is missing, unparseable, or older than 3.3 so callers can
+    omit the option instead of failing the whole launch.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "-V"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return False
+    parsed = _parse_tmux_version(out)
+    if parsed is None:
+        return False
+    return parsed >= _MIN_TMUX_ALLOW_PASSTHROUGH_VERSION
+
+
 def _tmux_managed_option_commands(
     scrollback: int,
     *,
@@ -235,6 +292,8 @@ def _tmux_managed_option_commands(
     :param scrollback: Tmux history limit, e.g. ``10000``.
     :param allow_passthrough: Whether to allow pane programs to send
         passthrough escape sequences to the real attached terminal.
+        Ignored when the installed tmux is older than 3.3 (the option
+        did not exist yet); the launch proceeds without it.
     :param keep_alive_after_exit: When ``True``, keep the private tmux server
         alive after the pane's process exits (see
         :func:`_tmux_session_persistence_commands`). Opt-in because it changes
@@ -250,7 +309,13 @@ def _tmux_managed_option_commands(
     if keep_alive_after_exit:
         commands.extend(_tmux_session_persistence_commands())
     if allow_passthrough:
-        commands.append(["set-option", "-g", "allow-passthrough", "on"])
+        if _tmux_supports_allow_passthrough():
+            commands.append(["set-option", "-g", "allow-passthrough", "on"])
+        else:
+            logger.warning(
+                "tmux >= %s required for allow-passthrough; omitting option",
+                ".".join(str(n) for n in _MIN_TMUX_ALLOW_PASSTHROUGH_VERSION),
+            )
     return commands
 
 

@@ -22,6 +22,8 @@ from omnigent.inner.terminal import (
     _apply_utf8_locale_default,
     _has_utf8_locale,
     _is_utf8_locale_value,
+    _parse_tmux_version,
+    _tmux_managed_option_commands,
     create_terminal_instance,
     resolve_terminal_transport,
 )
@@ -536,6 +538,85 @@ async def test_launch_omits_keep_alive_options_by_default(
     cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
     assert not contains_subsequence(cmd, ["set-option", "-gq", "remain-on-exit", "on"])
     assert not contains_subsequence(cmd, ["set-option", "-sq", "exit-empty", "off"])
+
+
+@pytest.mark.parametrize(
+    ("version_text", "expected"),
+    [
+        ("tmux 3.3", (3, 3)),
+        ("tmux 3.2a", (3, 2)),
+        ("tmux 3.4", (3, 4)),
+        ("tmux next-3.5", (3, 5)),
+        ("not-a-version", None),
+    ],
+)
+def test_parse_tmux_version(version_text: str, expected: tuple[int, int] | None) -> None:
+    """
+    ``_parse_tmux_version`` extracts ``(major, minor)`` and ignores letter suffixes.
+
+    :param version_text: Fake ``tmux -V`` stdout.
+    :param expected: Parsed tuple, or ``None`` when unparseable.
+    """
+    assert _parse_tmux_version(version_text) == expected
+
+
+def test_tmux_managed_option_commands_includes_allow_passthrough_on_tmux_3_3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    tmux >= 3.3 still receives ``allow-passthrough on`` when requested (issue #4442).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        assert cmd[:2] == ["tmux", "-V"]
+        return subprocess.CompletedProcess(cmd, 0, stdout="tmux 3.3\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    commands = _tmux_managed_option_commands(10000, allow_passthrough=True)
+    assert ["set-option", "-g", "allow-passthrough", "on"] in commands
+
+
+def test_tmux_managed_option_commands_skips_allow_passthrough_on_old_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    tmux < 3.3 must omit ``allow-passthrough`` so launch does not fail (issue #4442).
+
+    Stock Ubuntu 22.04 ships tmux 3.2a; sending the option rejects the entire
+    ``new-session`` sequence with ``invalid option: allow-passthrough``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        assert cmd[:2] == ["tmux", "-V"]
+        return subprocess.CompletedProcess(cmd, 0, stdout="tmux 3.2a\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    commands = _tmux_managed_option_commands(10000, allow_passthrough=True)
+    assert ["set-option", "-g", "allow-passthrough", "on"] not in commands
+    # Other managed options must still be present — we degrade only the
+    # unsupported option, not the whole option sequence.
+    assert any(cmd[:2] == ["set-option", "-g"] for cmd in commands)
+
+
+def test_tmux_managed_option_commands_omits_allow_passthrough_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``allow_passthrough=False`` never probes or sets the option.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+
+    def fail_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("tmux -V must not run when allow_passthrough is False")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+    commands = _tmux_managed_option_commands(10000, allow_passthrough=False)
+    assert ["set-option", "-g", "allow-passthrough", "on"] not in commands
 
 
 @pytest.mark.asyncio
