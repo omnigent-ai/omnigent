@@ -198,7 +198,7 @@ side effects.
 - **Orchestration skills:** `examples/polly/skills/{investigate,fanout,cross-review}/SKILL.md`
 - **Guardrail policies:** `omnigent/inner/nessie/policies.py`
 - **Runner-side gate:** `omnigent/runner/policy.py`; server-side tool-call
-  enforcement: `omnigent/server/routes/sessions.py`
+  enforcement: `omnigent/server/routes/sessions/`
 - **Mock LLM server:** `tests/server/integration/mock_llm_server.py`
 
 ```bash
