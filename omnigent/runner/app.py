@@ -5235,6 +5235,8 @@ def create_runner_app(
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
+                # Raw override still carries the acp:<slug> for agent selection.
+                acp_override=cast(str | None, msg_body.get("harness_override")),
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -8812,6 +8814,8 @@ async def _resolve_harness_config(
                 workdir=workdir,
                 model_override=model_override,
                 session_id=session_id,
+                # Raw (pre-canonicalize) override still carries the acp:<slug>.
+                acp_override=harness_override,
             )
             return harness, spawn_env
 
@@ -8914,6 +8918,7 @@ def _build_spawn_env_from_spec(
     workdir: Path | None = None,
     model_override: str | None = None,
     session_id: str | None = None,
+    acp_override: str | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -8931,11 +8936,17 @@ def _build_spawn_env_from_spec(
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
         env var here.)
+    :param acp_override: The raw, pre-canonicalize harness override, e.g.
+        ``"acp:droid"``. Only the generic-ACP builder reads it — canonicalizing
+        folds ``acp:<slug>`` to ``acp``, so the slug that names the agent to
+        launch survives only on this parameter. ``None`` when no override.
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
-    # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    # the concrete agent's slug comes from ``acp_override`` when a per-session
+    # override picked one, else from the spec, and is read by
+    # ``_build_acp_spawn_env``.
     harness = canonicalize_harness(harness) or harness
     effective_spec = spec
     if model_override is not None:
@@ -8983,7 +8994,9 @@ def _build_spawn_env_from_spec(
         elif harness == "goose":
             env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
-            env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env = _build_acp_spawn_env(
+                effective_spec, cwd=cwd, workdir=workdir, override_harness=acp_override
+            )
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness in ACP_CLI_HARNESSES:

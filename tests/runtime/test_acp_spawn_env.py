@@ -109,6 +109,22 @@ def test_spec_model_overrides_agent_model(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_MODEL"] == "claude-sonnet-4-6"
 
 
+def test_override_harness_selects_specific_agent(_isolate_config: Path) -> None:
+    """A per-session ``acp:<slug>`` override wins over the bundle spec's harness.
+
+    The overridden bundle agent's own harness (e.g. ``claude-sdk``) carries no
+    acp slug, so without the override the launch collapses to the first
+    configured agent. The override must select the picked one.
+    """
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="claude-sdk"), override_harness="acp:goose")
+    assert env["HARNESS_ACP_COMMAND"] == "goose acp"
+    assert env["HARNESS_ACP_NAME"] == "Goose"
+    # A non-acp override is ignored — fall back to the spec's pinned slug.
+    env2 = _build_acp_spawn_env(_make_spec(harness="acp:gemini-cli"), override_harness="pi")
+    assert env2["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
+
+
 def test_databricks_model_dropped_agent_model_used(_isolate_config: Path) -> None:
     """A ``databricks-*`` gateway id isn't a valid third-party model — drop it,
     fall back to the agent's own configured model."""
