@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import threading
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal
 
@@ -94,9 +95,22 @@ def _import_conversation_id(source: ImportSource, external_session_id: str) -> s
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
-async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[None]:
-    """Serialize concurrent imports for one source identity in this server."""
-    key = (body.source, body.external_session_id)
+@asynccontextmanager
+async def _source_import_lock(
+    source: ImportSource,
+    external_session_id: str,
+) -> AsyncIterator[None]:
+    """Serialize concurrent imports for one source identity in this server.
+
+    The sole owner of :data:`_IMPORT_LOCKS`; both the CLI's
+    ``POST /v1/imports`` and the Web UI's
+    ``POST /v1/imports/local-sessions`` contend on the same map.
+
+    :param source: Harness that owns the source session.
+    :param external_session_id: Harness-native session id.
+    :returns: Async context manager held for the duration of one import.
+    """
+    key = (source, external_session_id)
     with _IMPORT_LOCKS_GUARD:
         entry = _IMPORT_LOCKS.setdefault(key, _ImportLockEntry(lock=asyncio.Lock()))
         entry.users += 1
@@ -108,6 +122,126 @@ async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[
             entry.users -= 1
             if entry.users == 0:
                 _IMPORT_LOCKS.pop(key, None)
+
+
+async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[None]:
+    """Serialize concurrent imports for one source identity in this server."""
+    async with _source_import_lock(body.source, body.external_session_id):
+        yield
+
+
+async def _create_imported_session(
+    *,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    permission_store: PermissionStore | None,
+    user_id: str | None,
+    source: ImportSource,
+    external_session_id: str,
+    workspace: str | None,
+    items: list[NewConversationItem],
+    force: bool = False,
+) -> ImportSessionResponse:
+    """Create one imported session, rejecting an already-imported source.
+
+    Shared by the CLI's ``POST /v1/imports`` and the Web UI's
+    ``POST /v1/imports/local-sessions`` so both produce identical
+    provenance labels, duplicate handling, and ownership grants.
+
+    :param conversation_store: Store the session is created in.
+    :param agent_store: Store used to confirm the built-in agent exists.
+    :param permission_store: Store granting the caller ownership, or
+        ``None`` when permissions are disabled.
+    :param user_id: Authenticated caller, or ``None`` when auth is off.
+    :param source: Harness that owns the source session.
+    :param external_session_id: Harness-native session id.
+    :param workspace: Working directory recorded in the transcript.
+    :param items: Normalized items to append.
+    :param force: Replace a prior import of the same source session
+        instead of rejecting it.
+    :returns: The import result.
+    :raises OmnigentError: ``CONFLICT`` when already imported,
+        ``INVALID_INPUT`` for an unsupported source, ``INTERNAL_ERROR``
+        when the built-in agent is missing.
+    """
+    existing = await asyncio.to_thread(
+        conversation_store.find_imported_conversation,
+        source,
+        external_session_id,
+    )
+    if existing is not None:
+        await require_access(
+            user_id,
+            existing.id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+        if not force:
+            raise OmnigentError(
+                f"This {source} session has already been imported as {existing.id}",
+                code=ErrorCode.CONFLICT,
+            )
+
+    native_agent = native_coding_agent_for_harness(f"{source}-native")
+    if native_agent is None:
+        raise OmnigentError(
+            f"Unsupported import source: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    agent_id = builtin_agent_id(native_agent.agent_name)
+    if await asyncio.to_thread(agent_store.get, agent_id) is None:
+        raise OmnigentError(
+            f"The {native_agent.display_name} built-in agent is unavailable",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+
+    if existing is not None:
+        await conversation_store.delete_conversation(existing.id)
+
+    try:
+        conversation = await asyncio.to_thread(
+            conversation_store.create_conversation,
+            title=title_from_items(items),
+            agent_id=agent_id,
+            workspace=workspace,
+            conversation_id=_import_conversation_id(source, external_session_id),
+        )
+    except ConversationAlreadyExistsError as exc:
+        raise OmnigentError(
+            "This source session has already been imported",
+            code=ErrorCode.CONFLICT,
+        ) from exc
+    try:
+        await asyncio.to_thread(
+            conversation_store.set_external_session_id,
+            conversation.id,
+            external_session_id,
+        )
+        await asyncio.to_thread(conversation_store.append, conversation.id, items)
+        labels = {
+            **native_agent.presentation_labels,
+            IMPORT_SOURCE_LABEL_KEY: source,
+            IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
+        }
+        await asyncio.to_thread(conversation_store.set_labels, conversation.id, labels)
+        if permission_store is not None and user_id is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+            await asyncio.to_thread(
+                permission_store.grant,
+                user_id,
+                conversation.id,
+                LEVEL_OWNER,
+            )
+    except Exception:
+        await conversation_store.delete_conversation(conversation.id)
+        raise
+
+    return ImportSessionResponse(
+        session_id=conversation.id,
+        status="imported",
+        item_count=len(items),
+    )
 
 
 def create_imports_router(
@@ -136,84 +270,18 @@ def create_imports_router(
         """Import one normalized transcript, optionally replacing its prior import."""
         user_id = require_user(request, auth_provider)
         items = [item.to_item() for item in body.items]
-        existing = await asyncio.to_thread(
-            conversation_store.find_imported_conversation,
-            body.source,
-            body.external_session_id,
+        result = await _create_imported_session(
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+            permission_store=permission_store,
+            user_id=user_id,
+            source=body.source,
+            external_session_id=body.external_session_id,
+            workspace=body.workspace,
+            items=items,
+            force=body.force,
         )
-        if existing is not None:
-            await require_access(
-                user_id,
-                existing.id,
-                LEVEL_OWNER,
-                permission_store,
-                conversation_store,
-            )
-            if not body.force:
-                raise OmnigentError(
-                    f"This {body.source} session has already been imported as {existing.id}",
-                    code=ErrorCode.CONFLICT,
-                )
-
-        native_agent = native_coding_agent_for_harness(f"{body.source}-native")
-        if native_agent is None:
-            raise OmnigentError(
-                f"Unsupported import source: {body.source}",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        agent_id = builtin_agent_id(native_agent.agent_name)
-        if await asyncio.to_thread(agent_store.get, agent_id) is None:
-            raise OmnigentError(
-                f"The {native_agent.display_name} built-in agent is unavailable",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-
-        if existing is not None:
-            await conversation_store.delete_conversation(existing.id)
-
-        try:
-            conversation = await asyncio.to_thread(
-                conversation_store.create_conversation,
-                title=title_from_items(items),
-                agent_id=agent_id,
-                workspace=body.workspace,
-                conversation_id=_import_conversation_id(body.source, body.external_session_id),
-            )
-        except ConversationAlreadyExistsError as exc:
-            raise OmnigentError(
-                "This source session has already been imported",
-                code=ErrorCode.CONFLICT,
-            ) from exc
-        try:
-            await asyncio.to_thread(
-                conversation_store.set_external_session_id,
-                conversation.id,
-                body.external_session_id,
-            )
-            await asyncio.to_thread(conversation_store.append, conversation.id, items)
-            labels = {
-                **native_agent.presentation_labels,
-                IMPORT_SOURCE_LABEL_KEY: body.source,
-                IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: body.external_session_id,
-            }
-            await asyncio.to_thread(conversation_store.set_labels, conversation.id, labels)
-            if permission_store is not None and user_id is not None:
-                await asyncio.to_thread(permission_store.ensure_user, user_id)
-                await asyncio.to_thread(
-                    permission_store.grant,
-                    user_id,
-                    conversation.id,
-                    LEVEL_OWNER,
-                )
-        except Exception:
-            await conversation_store.delete_conversation(conversation.id)
-            raise
-
         response.status_code = 201
-        return ImportSessionResponse(
-            session_id=conversation.id,
-            status="imported",
-            item_count=len(items),
-        )
+        return result
 
     return router
