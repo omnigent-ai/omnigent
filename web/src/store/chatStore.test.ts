@@ -52,6 +52,7 @@ import {
   handleSessionEvent,
   initChatStore,
   pumpStreamEvents,
+  removePersistedToolDuplicates,
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
@@ -6296,6 +6297,71 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     expect(withId[0]!.type).toBe("text_done");
 
     controller.abort();
+  });
+
+  it("drops item-id-less live tool copies when persisted call ids arrive", () => {
+    const persisted = itemsToBlocks([
+      {
+        id: "fc_persisted",
+        response_id: "resp_tools",
+        type: "function_call",
+        status: "completed",
+        model: "watchdog",
+        call_id: "call_shell",
+        name: "sys_os_shell",
+        arguments: '{"command":"git status"}',
+      },
+      {
+        id: "fco_persisted",
+        response_id: "resp_tools",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_shell",
+        output: '{"stdout":"","stderr":"","exit_code":0}',
+      },
+    ] satisfies ConversationItem[]);
+    const live: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: {
+          agent: "watchdog",
+          depth: 0,
+          turn: 0,
+          timestamp: 1,
+          responseId: "resp_tools",
+          itemId: null,
+        },
+        executions: [
+          {
+            name: "sys_os_shell",
+            arguments: { command: "git status" },
+            argsSummary: "git status",
+            callId: "call_shell",
+            agentName: "watchdog",
+            executedBy: "server",
+            output: null,
+          },
+        ],
+        iteration: 0,
+      },
+      {
+        type: "tool_result",
+        ctx: {
+          agent: "watchdog",
+          depth: 0,
+          turn: 0,
+          timestamp: 2,
+          responseId: "resp_tools",
+          itemId: null,
+        },
+        name: "sys_os_shell",
+        callId: "call_shell",
+        agentName: "watchdog",
+        output: '{"stdout":"","stderr":"","exit_code":0}',
+      },
+    ];
+
+    expect(removePersistedToolDuplicates(live, persisted)).toEqual([]);
   });
 
   it("stamps a persisted message's id onto the streamed text in the buffer instead of duplicating it", async () => {

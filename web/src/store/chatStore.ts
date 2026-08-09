@@ -1890,8 +1890,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
         );
         const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+        const retained = removePersistedToolDuplicates(state.blocks, unique);
         return {
-          blocks: [...unique, ...state.blocks],
+          blocks: [...unique, ...retained],
           hasMoreHistory: hasMore,
           oldestItemId: items[0]?.id ?? state.oldestItemId,
           loadingMoreHistory: false,
@@ -2437,20 +2438,26 @@ async function bindStream(
         state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
+      const retainedStateBlocks = removePersistedToolDuplicates(state.blocks, unique);
       let transcriptBlocks: AnyBlock[];
       if (cachedItemIds === null) {
-        transcriptBlocks = [...unique, ...state.blocks];
+        transcriptBlocks = [...unique, ...retainedStateBlocks];
       } else if (!replaceCachedWindow) {
+        const retainedState =
+          retainedStateBlocks === state.blocks ? state : { ...state, blocks: retainedStateBlocks };
         transcriptBlocks =
-          unique.length > 0 ? spliceUnseenAheadOfInFlight(state, unique) : state.blocks;
+          unique.length > 0
+            ? spliceUnseenAheadOfInFlight(retainedState, unique)
+            : retainedStateBlocks;
       } else {
         const rid =
           state.activeResponse?.state === "streaming" ? state.activeResponse.responseId : null;
-        const liveTail = state.blocks.filter((b) => {
+        let liveTail = state.blocks.filter((b) => {
           if (b.ctx.itemId) return !cachedItemIds.has(b.ctx.itemId);
           if (b.type === "elicitation" || b.type === "error") return true;
           return rid !== null && b.ctx.responseId === rid;
         });
+        liveTail = removePersistedToolDuplicates(liveTail, snapshotBlocks);
         const liveTailIds = new Set(
           liveTail.map((b) => b.ctx.itemId).filter((itemId): itemId is string => Boolean(itemId)),
         );
@@ -2936,12 +2943,13 @@ async function rehydrateWindowOnReconnect(
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    const tail = s.blocks.filter((b) => {
+    let tail = s.blocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
       // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
       if (b.type === "elicitation" || b.type === "error") return true;
       return rid !== null && b.ctx.responseId === rid;
     });
+    tail = removePersistedToolDuplicates(tail, freshBlocks);
     const tailIds = new Set(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
@@ -2995,6 +3003,66 @@ async function backfillItemsUntilCovered(
   /* oxlint-enable no-await-in-loop */
   if (!covered) return "uncovered";
   return { items, hasMore };
+}
+
+function toolBlockKey(responseId: string, kind: "call" | "result", callId: string): string {
+  return `${kind}:${responseId}:${callId}`;
+}
+
+function persistedToolKeys(blocks: AnyBlock[]): Set<string> {
+  const keys = new Set<string>();
+  for (const block of blocks) {
+    if (!block.ctx.itemId) continue;
+    if (block.type === "tool_group") {
+      for (const execution of block.executions) {
+        keys.add(toolBlockKey(block.ctx.responseId, "call", execution.callId));
+      }
+    } else if (block.type === "tool_result") {
+      keys.add(toolBlockKey(block.ctx.responseId, "result", block.callId));
+    }
+  }
+  return keys;
+}
+
+/**
+ * Prefer persisted tool blocks over item-id-less live copies of the same call.
+ *
+ * A tool can reach the web twice during stream-then-snapshot binding: first as
+ * a live event without its store id, then through the items API with that id.
+ * Item-id dedupe cannot correlate those copies, but response id + call id can.
+ */
+export function removePersistedToolDuplicates(
+  liveBlocks: AnyBlock[],
+  persistedBlocks: AnyBlock[],
+): AnyBlock[] {
+  const persisted = persistedToolKeys(persistedBlocks);
+  if (persisted.size === 0) return liveBlocks;
+  let changed = false;
+  const retained: AnyBlock[] = [];
+  for (const block of liveBlocks) {
+    if (block.type === "tool_group") {
+      const executions = block.executions.filter(
+        (execution) => !persisted.has(toolBlockKey(block.ctx.responseId, "call", execution.callId)),
+      );
+      if (executions.length === 0) {
+        changed = true;
+        continue;
+      }
+      if (executions.length !== block.executions.length) {
+        changed = true;
+        retained.push({ ...block, executions });
+        continue;
+      }
+    } else if (
+      block.type === "tool_result" &&
+      persisted.has(toolBlockKey(block.ctx.responseId, "result", block.callId))
+    ) {
+      changed = true;
+      continue;
+    }
+    retained.push(block);
+  }
+  return changed ? retained : liveBlocks;
 }
 
 /** Insert committed gap items before the active turn's itemId-less replay tail. */
@@ -3097,7 +3165,10 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s);
-    let nextBlocks = unseen.length > 0 ? spliceUnseenAheadOfInFlight(s, unseen) : s.blocks;
+    const retainedBlocks = removePersistedToolDuplicates(s.blocks, unseen);
+    const retainedState = retainedBlocks === s.blocks ? s : { ...s, blocks: retainedBlocks };
+    let nextBlocks =
+      unseen.length > 0 ? spliceUnseenAheadOfInFlight(retainedState, unseen) : retainedBlocks;
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -3627,6 +3698,7 @@ export async function pumpStreamEvents(
         );
         fresh = batch.filter((b) => !b.ctx.itemId || !committed.has(b.ctx.itemId));
       }
+      fresh = removePersistedToolDuplicates(fresh, s.blocks);
       // Same commit-time recheck for elicitations, keyed by
       // elicitationId: the reconnect reconcile can append the
       // snapshot's copy of a prompt while the live block sits in this

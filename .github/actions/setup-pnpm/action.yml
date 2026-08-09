@@ -10,12 +10,14 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-      with:
-        standalone: true
-
     - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
       with:
         node-version: ${{ inputs.node-version }}
-        cache: pnpm
-        cache-dependency-path: pnpm-lock.yaml
+
+    - name: Activate pinned pnpm
+      shell: bash
+      run: |
+        version="$(node -p "require('./package.json').packageManager.split('@')[1]")"
+        corepack enable
+        corepack prepare "pnpm@$version" --activate
+        test "$(pnpm --version)" = "$version"
