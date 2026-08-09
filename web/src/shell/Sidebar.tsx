@@ -4443,10 +4443,13 @@ function BulkActionBar({
                 <TooltipContent side="bottom">Unarchive</TooltipContent>
               </Tooltip>
             )}
-            <DropdownMenu open={moveMenuOpen} onOpenChange={(open) => {
-              setMoveMenuOpen(open);
-              if (!open) setMoveSearch("");
-            }}>
+            <DropdownMenu
+              open={moveMenuOpen}
+              onOpenChange={(open) => {
+                setMoveMenuOpen(open);
+                if (!open) setMoveSearch("");
+              }}
+            >
               <Tooltip>
                 <TooltipTrigger asChild>
                   <DropdownMenuTrigger asChild>
@@ -4482,10 +4485,16 @@ function BulkActionBar({
                 </div>
                 <div className="max-h-48 overflow-y-auto">
                   {(moveSearch
-                    ? projects.filter((p) => p.name.toLowerCase().includes(moveSearch.toLowerCase()))
+                    ? projects.filter((p) =>
+                        p.name.toLowerCase().includes(moveSearch.toLowerCase()),
+                      )
                     : projects
                   ).map((p) => (
-                    <DropdownMenuItem key={p.name} className="px-2 py-1" onSelect={() => handleMoveToProject(p.name)}>
+                    <DropdownMenuItem
+                      key={p.name}
+                      className="px-2 py-1"
+                      onSelect={() => handleMoveToProject(p.name)}
+                    >
                       <span className="flex-1 truncate text-left">{p.name}</span>
                     </DropdownMenuItem>
                   ))}
