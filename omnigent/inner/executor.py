@@ -142,9 +142,12 @@ class LLMCallStarted(ExecutorEvent):
 
     :param model: Provider model identifier for this call, or ``None`` when the
         executor cannot resolve it.
+    :param input: New user or tool-result messages that triggered this call.
+        Executors may omit it when the provider does not expose call boundaries.
     """
 
     model: str | None = None
+    input: list[Message] | None = None
 
 
 @dataclass

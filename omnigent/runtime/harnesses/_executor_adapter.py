@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import secrets
 import uuid
 from collections import deque
@@ -110,6 +111,11 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
+
+
+def _llm_trace_unit() -> str:
+    unit = os.environ.get("OMNIGENT_LLM_UNIT", "").strip().lower()
+    return unit if unit in {"gpu", "npu"} else "llm"
 
 
 # Bounds on the detached, abnormal-exit executor cleanup scheduled from
@@ -430,15 +436,27 @@ class ExecutorAdapter(HarnessApp):
         _active_tool_parent = None
 
         user_message = _extract_last_user_message(request.input)
+        llm_fallback_input: Any = (
+            [{"role": "user", "content": user_message}] if user_message else None
+        )
 
-        def _start_llm_trace(model: str | None = None) -> None:
-            nonlocal llm_parent, llm_span, llm_span_count
+        def _start_llm_trace(
+            model: str | None = None,
+            input_value: Any = None,
+        ) -> None:
+            nonlocal llm_fallback_input, llm_parent, llm_span, llm_span_count
             if tctx is None or llm_span is not None:
                 return
+            resolved_model = model or request.model_override or request.model
+            agent_name = request.model or "unknown"
+            traced_input = input_value if input_value is not None else llm_fallback_input
             llm_parent = tctx._current_span
             llm_span = tctx.start_llm_span(
-                model=model or request.model_override or request.model,
+                model=resolved_model,
+                name=(f"{_llm_trace_unit()}:{agent_name}/{resolved_model or 'unknown'}"),
+                input_value=traced_input,
             )
+            llm_fallback_input = None
             llm_reasoning_parts.clear()
             llm_response_parts.clear()
             llm_span_count += 1
@@ -563,7 +581,7 @@ class ExecutorAdapter(HarnessApp):
                     if tctx is not None:
                         if isinstance(event, LLMCallStarted):
                             _end_llm_trace()
-                            _start_llm_trace(event.model)
+                            _start_llm_trace(event.model, event.input)
                         elif isinstance(event, ReasoningChunk):
                             _start_llm_trace()
                             if event.delta:
@@ -601,6 +619,14 @@ class ExecutorAdapter(HarnessApp):
                                 error=event.error,
                                 duration_ms=event.duration_ms,
                             )
+                            llm_fallback_input = [
+                                {
+                                    "role": "tool",
+                                    "name": _strip_mcp_tool_prefix(event.name),
+                                    "content": event.result,
+                                    "error": event.error or None,
+                                }
+                            ]
                         elif isinstance(event, TurnComplete):
                             response_text = event.response
                             if llm_span is not None:

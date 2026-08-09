@@ -4281,6 +4281,74 @@ def test_pi_ignores_non_assistant_message_boundaries() -> None:
     _run(_test())
 
 
+def test_pi_model_calls_include_new_user_and_tool_result_inputs() -> None:
+    """Each Pi model boundary carries the new messages that triggered it."""
+
+    async def _test() -> None:
+        user = {"role": "user", "content": "inspect"}
+        first = _pi_assistant_message_with_usage(text="")
+        first["content"] = [{"type": "thinking", "thinking": "Use the tool."}]
+        tool_result = {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [{"type": "text", "text": "contents"}],
+            "isError": False,
+        }
+        second = _pi_assistant_message_with_usage(text="Done.")
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "message_start", "message": user}),
+                json.dumps({"type": "message_end", "message": user}),
+                json.dumps({"type": "message_start", "message": first}),
+                json.dumps({"type": "message_end", "message": first}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "read",
+                        "args": {"path": "README.md"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "read",
+                        "isError": False,
+                        "result": "contents",
+                    }
+                ),
+                json.dumps({"type": "message_start", "message": tool_result}),
+                json.dumps({"type": "message_end", "message": tool_result}),
+                json.dumps({"type": "message_start", "message": second}),
+                json.dumps({"type": "message_end", "message": second}),
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [first, tool_result, second],
+                    }
+                ),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "inspect"}],
+                [],
+                "system",
+            )
+        ]
+
+        starts = [event for event in events if isinstance(event, LLMCallStarted)]
+        assert [event.input for event in starts] == [
+            [{"role": "user", "content": "inspect"}],
+            [tool_result],
+        ]
+
+    _run(_test())
+
+
 def test_pi_usage_fallback_from_agent_end() -> None:
     """
     When no ``message_end`` carried usage, the ``agent_end`` handler falls

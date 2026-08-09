@@ -1629,6 +1629,20 @@ def _pi_message_model(message: object, fallback_model: str | None) -> str | None
     return raw_model if isinstance(raw_model, str) and raw_model else fallback_model
 
 
+def _pi_trace_input_message(message: object) -> Message | None:
+    """Keep the new non-assistant message that triggered a Pi model call."""
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if not isinstance(role, str) or role == "assistant":
+        return None
+    traced: Message = {"role": role}
+    for key in ("content", "toolCallId", "toolName", "isError"):
+        if key in message:
+            traced[key] = message[key]
+    return traced
+
+
 def _extract_pi_message_output(message: object) -> tuple[str | None, str | None]:
     """Extract assistant text and reasoning from a completed Pi message."""
     if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -2437,6 +2451,7 @@ class PiExecutor(Executor):
         # ``agent_end`` so the terminal event is consumed off the RPC stream.
         pending_error: str | None = None
         saw_message_end = False
+        pending_llm_input: list[Message] = []
 
         while True:
             # After an errored message the only thing left to drain is the
@@ -2491,8 +2506,11 @@ class PiExecutor(Executor):
                     and message_started.get("role") == "assistant"
                 ):
                     saw_message_end = False
+                    call_input = list(pending_llm_input) or None
+                    pending_llm_input.clear()
                     yield LLMCallStarted(
                         model=_pi_message_model(message_started, model),
+                        input=call_input,
                     )
                 continue
 
@@ -2720,6 +2738,9 @@ class PiExecutor(Executor):
             if event_type == "message_end":
                 msg = event.get("message", {})
                 if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    traced_input = _pi_trace_input_message(msg)
+                    if traced_input is not None:
+                        pending_llm_input.append(traced_input)
                     continue
                 saw_message_end = True
                 captured = _extract_pi_turn_usage(msg, model)

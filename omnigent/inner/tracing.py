@@ -26,9 +26,9 @@ Or per-session::
 Span hierarchy for a typical turn::
 
     agent:<name>  (openinference.span.kind=AGENT)
-    ├── llm_call  (openinference.span.kind=LLM)
+    ├── gpu:<agent>/<model>  (openinference.span.kind=LLM)
     ├── tool:<tool_name>  (openinference.span.kind=TOOL)
-    ├── llm_call
+    ├── gpu:<agent>/<model>
     └── policy:<policy_name>  (openinference.span.kind=GUARDRAIL)
 """
 
@@ -249,7 +249,13 @@ class TracingContext:
         elif span is self._current_span:
             self._current_span = self._inherited_parent
 
-    def start_llm_span(self, model: str | None = None) -> Span:
+    def start_llm_span(
+        self,
+        model: str | None = None,
+        *,
+        name: str = "llm_call",
+        input_value: TraceValue = None,
+    ) -> Span:
         """Begin one LLM generation span under the active agent span."""
         from opentelemetry import trace
 
@@ -275,10 +281,12 @@ class TracingContext:
                 attrs[_LANGFUSE_OBSERVATION_MODEL] = model_name
 
         span = _tracer().start_span(
-            name="llm_call",
+            name=name,
             context=ctx_carrier,
             attributes=attrs,
         )
+        if input_value is not None and should_capture_content():
+            span.set_attribute(_INPUT_VALUE, _safe_serialize_str(input_value))
         self._current_span = span
         return span
 

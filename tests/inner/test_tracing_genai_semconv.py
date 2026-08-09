@@ -244,7 +244,11 @@ def test_llm_span_is_a_langfuse_generation_with_exact_usage(
 
     ctx = TracingContext()
     agent = ctx.start_agent_span(agent_name="watchdog", user_message="inspect")
-    llm = ctx.start_llm_span(model="openai/gpt-5.4-mini")
+    llm = ctx.start_llm_span(
+        model="openai/gpt-5.4-mini",
+        name="gpu:watchdog/openai/gpt-5.4-mini",
+        input_value=[{"role": "user", "content": "inspect"}],
+    )
     ctx.end_llm_span(
         llm,
         reasoning="I should inspect the repository.",
@@ -260,7 +264,7 @@ def test_llm_span_is_a_langfuse_generation_with_exact_usage(
     )
     ctx.end_agent_span(agent, response="done")
 
-    llm_spans = _spans_by_name(exporter, "llm_call")
+    llm_spans = _spans_by_name(exporter, "gpu:watchdog/")
     assert len(llm_spans) == 1
     attrs = dict(llm_spans[0].attributes or {})
     assert attrs["openinference.span.kind"] == "LLM"
@@ -272,6 +276,7 @@ def test_llm_span_is_a_langfuse_generation_with_exact_usage(
     assert attrs["gen_ai.usage.input_tokens"] == 120
     assert attrs["gen_ai.usage.output_tokens"] == 30
     assert attrs["gen_ai.usage.total_tokens"] == 175
+    assert json.loads(attrs["input.value"]) == [{"role": "user", "content": "inspect"}]
     assert json.loads(attrs["langfuse.observation.usage_details"]) == {
         "cache_creation_input_tokens": 5,
         "cache_read_input_tokens": 20,

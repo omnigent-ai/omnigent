@@ -1644,7 +1644,10 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
             config: ExecutorConfig | None = None,
         ) -> AsyncIterator[ExecutorEvent]:
             del messages, tools, system_prompt, config
-            yield LLMCallStarted(model="openai/gpt-5.4-mini")
+            yield LLMCallStarted(
+                model="openai/gpt-5.4-mini",
+                input=[{"role": "user", "content": "inspect"}],
+            )
             yield ReasoningChunk(delta="Inspect the file.", event_type="reasoning_text")
             yield LLMCallComplete(
                 model="openai/gpt-5.4-mini",
@@ -1662,7 +1665,16 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
                 result="contents",
                 metadata={"call_id": "call_trace_1"},
             )
-            yield LLMCallStarted(model="openai/gpt-5.4-mini")
+            yield LLMCallStarted(
+                model="openai/gpt-5.4-mini",
+                input=[
+                    {
+                        "role": "tool",
+                        "name": "sys_os_read",
+                        "content": "contents",
+                    }
+                ],
+            )
             yield ReasoningChunk(delta="Use the result.", event_type="reasoning_text")
             yield TextChunk(text="Done.")
             yield LLMCallComplete(
@@ -1684,6 +1696,7 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
     otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
     otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+    monkeypatch.setenv("OMNIGENT_LLM_UNIT", "gpu")
     enable_tracing()
     try:
         adapter = ExecutorAdapter(
@@ -1707,9 +1720,9 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
             key=lambda span: span.start_time or 0,
         )
         assert [span.name for span in children] == [
-            "llm_call",
+            "gpu:watchdog/openai/gpt-5.4-mini",
             "tool:sys_os_read",
-            "llm_call",
+            "gpu:watchdog/openai/gpt-5.4-mini",
         ]
         assert all(
             span.parent is not None and span.parent.span_id == agent.context.span_id
@@ -1727,8 +1740,18 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
         second_usage = json.loads(
             (children[2].attributes or {})["langfuse.observation.usage_details"]
         )
+        first_input = json.loads((children[0].attributes or {})["input.value"])
+        second_input = json.loads((children[2].attributes or {})["input.value"])
         assert first_usage == {"input": 100, "output": 20, "total": 120}
         assert second_usage == {"input": 130, "output": 25, "total": 155}
+        assert first_input == [{"role": "user", "content": "inspect"}]
+        assert second_input == [
+            {
+                "role": "tool",
+                "name": "sys_os_read",
+                "content": "contents",
+            }
+        ]
     finally:
         disable_tracing()
         exporter.clear()
