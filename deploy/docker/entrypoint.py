@@ -304,6 +304,22 @@ def _build_routing(
     return _build_local_llm_routing_client(server_llm), settings
 
 
+def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
+    """Resolve the max wall-clock seconds per agent execution.
+
+    Mirrors the CLI's ``execution_timeout`` resolution (``omnigent server
+    --execution-timeout``) minus the flag layer, since a Docker deploy has no
+    CLI invocation to read one from: config file, else ``RuntimeCaps``'s own
+    default (7200s = 2 hours).
+
+    :param cfg: The parsed server config mapping.
+    :returns: The effective timeout in seconds.
+    """
+    from omnigent.runtime.caps import RuntimeCaps
+
+    return int(cfg.get("execution_timeout") or RuntimeCaps.execution_timeout)
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -377,6 +393,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     routing_client, routing_settings = _build_routing(cfg, server_llm)
 
     caps = RuntimeCaps(
+        execution_timeout=_resolve_execution_timeout(cfg),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,

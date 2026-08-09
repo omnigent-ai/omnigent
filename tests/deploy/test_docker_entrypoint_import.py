@@ -185,3 +185,23 @@ def test_build_routing_defaults_without_a_routing_block() -> None:
     client, settings = _build_routing({}, None)
     assert client is None
     assert settings == RoutingSettings()
+
+
+# ── execution timeout ───────────────────────────────────────────────────────
+# The CLI's `omnigent server --execution-timeout` has no equivalent flag for a
+# Docker deploy, so `execution_timeout:` in the server config YAML is the only
+# way to raise it there — this must actually reach RuntimeCaps, not silently
+# stay pinned to the 7200s (2h) dataclass default.
+
+
+def test_resolve_execution_timeout_reads_the_config_value() -> None:
+    from deploy.docker.entrypoint import _resolve_execution_timeout
+
+    assert _resolve_execution_timeout({"execution_timeout": 86400}) == 86400
+
+
+def test_resolve_execution_timeout_defaults_without_config() -> None:
+    from deploy.docker.entrypoint import _resolve_execution_timeout
+    from omnigent.runtime.caps import RuntimeCaps
+
+    assert _resolve_execution_timeout({}) == RuntimeCaps.execution_timeout
