@@ -76,6 +76,7 @@ from typing import Any
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
+    is_unresolved_invocation,
     real_invocation_tokens,
     split_command_segments,
     unwrap_shell_command,
@@ -672,6 +673,11 @@ class _ShellOp:
         ``"git push"`` or ``"gh pr create"``.
     :param destructive: Whether the operation is an irreversible delete, gated
         separately by ``allow_destructive``.
+    :param tag_push: Whether this ``git push`` includes tags (``--tags``,
+        ``--follow-tags``, or ``refs/tags/`` refspecs).
+    :param force_push: Whether this ``git push`` uses a force flag
+        (``--force``, ``-f``, ``--force-with-lease``, ``--force-if-includes``)
+        or a ``+refspec`` force prefix.
     """
 
     kind: str
@@ -680,6 +686,8 @@ class _ShellOp:
     branch_targeted: bool
     detail: str
     destructive: bool = False
+    tag_push: bool = False
+    force_push: bool = False
 
 
 def _repo_from_tokens(tokens: list[str]) -> str | None:
@@ -744,8 +752,13 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         positionals = [t for t in args if not t.startswith("-")]
         repo = _repo_from_tokens(args)
         branches: set[str] = set()
+        tag_push = any(t in ("--tags", "--follow-tags") for t in args)
         for refspec in positionals[1:]:
             dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
+            dest = dest.lstrip("+")
+            if dest.startswith("refs/tags/"):
+                tag_push = True
+                continue
             branch = _normalize_branch(dest)
             if branch:
                 branches.add(branch)
@@ -754,6 +767,15 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         is_destructive = any(t in ("--delete", "-d") for t in args) or any(
             refspec.startswith(":") for refspec in positionals[1:]
         )
+        # Detect force-push: long flags, ``=``-value forms, bundled short
+        # flags containing ``f`` (e.g. ``-uf``), and ``+refspec`` prefix.
+        _FORCE_LONG = {"--force", "-f", "--force-with-lease", "--force-if-includes"}
+        is_force = any(
+            t in _FORCE_LONG
+            or t.startswith(("--force-with-lease=", "--force-if-includes="))
+            or (t.startswith("-") and not t.startswith("--") and "f" in t)
+            for t in args
+        ) or any(rs.startswith("+") for rs in positionals[1:])
         return _ShellOp(
             kind="write",
             repo=repo,
@@ -761,6 +783,8 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
             branch_targeted=True,
             detail="git push",
             destructive=is_destructive,
+            tag_push=tag_push,
+            force_push=is_force,
         )
     return None
 
@@ -859,18 +883,29 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         leave it 0.
     :returns: One :class:`_ShellOp` per git/gh remote invocation found. Local
         git commands and non-git/gh segments produce no op. A segment that
-        starts with git/gh but cannot be tokenized yields an ``"unparseable"``
-        op so the caller can ASK rather than silently allow.
+        mentions git/gh but whose real command cannot be resolved — it does not
+        tokenize, or a wrapper's own flags left an option as the head — yields
+        an ``"unparseable"`` op so the caller can ASK rather than silently allow.
     """
     if _depth > MAX_SHELL_NESTING:
         return []
     ops: list[_ShellOp] = []
     for segment in split_command_segments(command):
+        unreadable = False
         try:
             tokens = shlex.split(segment)
         except ValueError:
             # Unbalanced quotes etc. If it looks like a git/gh command we can't
             # read, surface it for approval instead of guessing.
+            unreadable = True
+            tokens = []
+        else:
+            tokens = real_invocation_tokens(tokens)
+            # A leading option means some wrapper's own flags were not modelled,
+            # so the real command was never reached. Same fail-safe as an
+            # un-tokenizable segment rather than a silent abstain.
+            unreadable = is_unresolved_invocation(tokens)
+        if unreadable:
             if re.search(r"\b(git|gh)\b", segment):
                 ops.append(
                     _ShellOp(
@@ -882,7 +917,6 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
                     )
                 )
             continue
-        tokens = real_invocation_tokens(tokens)
         if not tokens:
             continue
         # Unwrap shell-interpreter (``bash -c "<cmd>"``) and ``eval`` wrappers so
@@ -912,6 +946,8 @@ def github_policy(
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
     allow_destructive: bool = False,
+    deny_tag_push: bool = True,
+    deny_force_push: bool = True,
     mcp_tool_prefixes: list[str] | None = None,
     shell_tools: list[str] | None = None,
     deny_reason: str = "GitHub operation blocked by policy.",
@@ -932,6 +968,17 @@ def github_policy(
     :param allow_destructive: When ``False`` (default), irreversible destructive
         operations (deletes) are denied even on allowed repos. Set to ``True``
         to let destructive operations through normal write gating.
+    :param deny_tag_push: When ``True`` (default), pushing tags to remotes via
+        ``git push --tags``, ``git push --follow-tags``, or explicit
+        ``refs/tags/`` refspecs is denied. Tags are immutable references that
+        downstream CI/CD and release tooling depend on; an agent pushing a tag
+        can trigger releases, deployments, or break semver expectations.
+    :param deny_force_push: When ``True`` (default), ``git push`` with force
+        flags (``--force``, ``-f``, ``--force-with-lease``,
+        ``--force-if-includes``), bundled short flags containing ``f``
+        (e.g. ``-uf``), and ``+refspec`` force prefixes are denied regardless
+        of repo/branch allowlists. Set to ``False`` to allow force pushes
+        through normal repo/branch gating.
     :param mcp_tool_prefixes: GitHub MCP server name-prefixes to strip when
         canonicalizing MCP tool names. ``None`` uses the standard
         ``mcp__github__`` / ``github__``.
@@ -1117,11 +1164,21 @@ def github_policy(
                     f"of `{op.detail}` could not be determined. Approve?"
                 ),
             )
+        if op.kind == "write" and op.force_push and deny_force_push:
+            return _deny(
+                "Force push is blocked by policy. Remove the force flag "
+                "(--force / -f / --force-with-lease / --force-if-includes / "
+                "+refspec) or set deny_force_push=False."
+            )
         if op.kind == "write":
             if op.destructive and not allow_destructive:
                 return _deny(
                     f"{deny_reason} Destructive operation `{op.detail}` is blocked by "
                     f"default. Set allow_destructive=true to permit deletes."
+                )
+            if deny_tag_push and op.tag_push:
+                return _deny(
+                    f"{deny_reason} Pushing tags is blocked by policy (deny_tag_push is enabled)."
                 )
             return _gate_write(
                 {op.repo} if op.repo else set(),
@@ -1230,6 +1287,20 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "description": "Allow irreversible destructive operations (deletes). "
                     "When false (default), deletes are denied even on allowed repos.",
                     "default": False,
+                },
+                "deny_tag_push": {
+                    "type": "boolean",
+                    "description": "Block pushing tags to remotes (--tags, --follow-tags, "
+                    "refs/tags/ refspecs). Tags are immutable references that downstream "
+                    "CI/CD depends on.",
+                    "default": True,
+                },
+                "deny_force_push": {
+                    "type": "boolean",
+                    "description": "Deny git push with force flags (--force, -f, "
+                    "--force-with-lease, --force-if-includes), bundled short flags "
+                    "(-uf), and +refspec force prefixes. Default true.",
+                    "default": True,
                 },
                 "mcp_tool_prefixes": {
                     "type": "array",

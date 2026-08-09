@@ -108,13 +108,7 @@ export function InboxPage() {
   const sources: InboxSource[] = [];
   rows.forEach((row, i) => {
     const snapshot = snapshotQueries[i]?.data;
-    if (snapshot) {
-      sources.push({
-        row,
-        pendingElicitations: snapshot.pendingElicitations ?? [],
-        canApprove: snapshot.canApprove ?? true,
-      });
-    }
+    if (snapshot) sources.push({ row, pendingElicitations: snapshot.pendingElicitations ?? [] });
   });
   const items = collectInboxItems(sources);
 
@@ -125,7 +119,6 @@ export function InboxPage() {
   // any snapshot query delivers fresh data (dataUpdatedAt advances),
   // sweep verdicts whose id is still pending on the server — those
   // approvals were consumed and the server re-parked the prompt.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const snapshotVersionKey = snapshotQueries.map((q) => q.dataUpdatedAt ?? 0).join(",");
   const isFirstRender = useRef(true);
   useEffect(() => {
@@ -192,7 +185,7 @@ export function InboxPage() {
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Inbox</h1>
         {(items.length > 0 || commentInbox.items.length > 0) && (
-          <span className="text-sm text-muted-foreground">
+          <span className="text-ui text-muted-foreground">
             {[
               items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
               commentInbox.items.length > 0 &&
@@ -210,7 +203,7 @@ export function InboxPage() {
       {failedSessionCount > 0 && (
         <div
           data-testid="inbox-load-error"
-          className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm"
+          className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui"
         >
           <AlertTriangleIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">
@@ -231,7 +224,7 @@ export function InboxPage() {
       )}
 
       {assembling && items.length === 0 && commentInbox.items.length === 0 && (
-        <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">
+        <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading inbox…
         </div>
@@ -243,8 +236,8 @@ export function InboxPage() {
         commentInbox.items.length === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-sm font-medium">Nothing waiting on you</p>
-            <p className="text-xs text-muted-foreground">
+            <p className="text-ui font-medium">Nothing waiting on you</p>
+            <p className="text-sm text-muted-foreground">
               When an agent needs your input or someone comments on a file, it will show up here.
             </p>
           </div>
@@ -287,26 +280,26 @@ export function InboxPage() {
                       !expanded && "-rotate-90",
                     )}
                   />
-                  <span className="min-w-0 shrink-0 truncate text-sm font-medium">
+                  <span className="min-w-0 shrink-0 truncate text-ui font-medium">
                     {title}
                     {agentLabel !== title && (
-                      <span className="ml-2 text-xs font-normal text-muted-foreground">
+                      <span className="ml-2 text-sm font-normal text-muted-foreground">
                         {agentLabel}
                       </span>
                     )}
                   </span>
                   {!expanded && (
-                    <span className="min-w-0 truncate text-xs text-muted-foreground">
+                    <span className="min-w-0 truncate text-sm text-muted-foreground">
                       {item.elicitation.message}
                     </span>
                   )}
                 </button>
                 <span className="flex shrink-0 items-center gap-2">
-                  <span className="text-xs text-muted-foreground">
+                  <span className="text-sm text-muted-foreground">
                     {/* Server timestamps are epoch seconds; relativeTime takes ms. */}
                     {relativeTime(item.row.updated_at * 1000)}
                   </span>
-                  <Button asChild variant="ghost" size="sm" className="text-xs">
+                  <Button asChild variant="ghost" size="sm" className="text-sm">
                     <Link to={`/c/${item.row.id}`}>
                       Open session
                       <ArrowRightIcon className="ml-1 size-3.5" />
@@ -330,7 +323,6 @@ export function InboxPage() {
                   codexCommand={item.elicitation.codexCommand}
                   allowAllEdits={item.elicitation.allowAllEdits}
                   rememberScope={item.elicitation.rememberScope}
-                  canApprove={item.canApprove}
                   onSubmit={makeSubmit(item)}
                 />
               )}
@@ -361,17 +353,17 @@ export function InboxPage() {
               </Avatar>
               <div className="flex min-w-0 flex-1 flex-col gap-1">
                 <div className="flex items-center gap-2">
-                  <span className="min-w-0 truncate text-sm">
+                  <span className="min-w-0 truncate text-ui">
                     <span className="font-medium">{author}</span>
                     <span className="text-muted-foreground"> commented on </span>
-                    <span className="font-mono text-xs">{comment.path}</span>
+                    <span className="font-mono text-sm">{comment.path}</span>
                   </span>
                   <span className="ml-auto flex shrink-0 items-center gap-2">
-                    <span className="text-xs text-muted-foreground">
+                    <span className="text-sm text-muted-foreground">
                       {/* created_at is epoch seconds; relativeTime takes ms. */}
                       {relativeTime(comment.created_at * 1000)}
                     </span>
-                    <Button asChild variant="ghost" size="sm" className="text-xs">
+                    <Button asChild variant="ghost" size="sm" className="text-sm">
                       {/* Deep-link into the file browser with this comment
                           selected — opening it there marks it seen, which
                           is what clears this inbox item. */}
@@ -385,20 +377,20 @@ export function InboxPage() {
                   </span>
                 </div>
                 {comment.anchor_content && (
-                  <p className="truncate font-mono text-[11px] text-muted-foreground">
+                  <p className="truncate font-mono text-sm text-muted-foreground">
                     {comment.anchor_content.trim()}
                   </p>
                 )}
-                <p className="line-clamp-3 text-sm break-words whitespace-pre-wrap">
+                <p className="line-clamp-3 text-ui break-words whitespace-pre-wrap">
                   {comment.body}
                 </p>
-                <span className="text-xs text-muted-foreground">{sessionTitle}</span>
+                <span className="text-sm text-muted-foreground">{sessionTitle}</span>
               </div>
             </div>
           );
         })}
         {assembling && (items.length > 0 || commentInbox.items.length > 0) && (
-          <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
+          <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" />
             Checking remaining sessions…
           </div>

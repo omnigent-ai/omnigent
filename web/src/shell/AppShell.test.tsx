@@ -336,6 +336,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -730,6 +731,110 @@ describe("TerminalFirstContext", () => {
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
   });
 
+  it("falls back to chat when an open terminal view loses its terminal", () => {
+    // A runner stop / disconnect empties the terminal list (useTerminals clears
+    // it on the runner-offline edge). Landing while the terminal view is open,
+    // that would strand the user on "No terminals available"; the view must
+    // fall back to chat, where the composer can resume the session.
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    // Stable QueryClient + fresh element per render so the rerender reads the
+    // updated mock (React bails on an identical element reference).
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_native"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    // Open the terminal view (a terminal is present).
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+
+    // The runner stops: the terminal list empties out from under the open view.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    // Fell back to chat rather than stranding on "No terminals available".
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+  });
+
+  it("stays in terminal view while the terminal is relaunching", () => {
+    // A relaunch (terminalPending) also empties the list briefly, but the
+    // terminal is coming right back — the startingUp guard must hold the
+    // terminal view so a wake doesn't flip chat/terminal back and forth.
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    // terminalPending + a non-failed status makes terminalStartingUp true once
+    // the list empties (see the startup-spinner tests above).
+    useChatStore.setState({ terminalPending: true, sessionStatus: "running" });
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_native"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+
+    // Terminal drops but is relaunching (startingUp) — must NOT fall back.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    const probe = screen.getByTestId("view-probe");
+    expect(probe).toHaveAttribute("data-terminal-starting-up", "true");
+    expect(probe).toHaveAttribute("data-view", "terminal");
+  });
+
   it("restores the terminal view when re-entering a native session within the same tab", () => {
     // Bug: switching to another chat and back used to drop the user
     // out of terminal view because the conversation-switch effect reset
@@ -1073,8 +1178,8 @@ describe("Workspace rail maximize", () => {
     fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
     expect(rail().className).toContain("md:absolute");
     expect(rail().className).toContain("md:inset-0");
-    // Still keeps the docked card inset/rounding — only the width changes.
-    expect(rail().className).toContain("md:m-2");
+    // Still keeps the docked flush/bordered styling — only the width changes.
+    expect(rail().className).toContain("md:border-l");
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     // Minimize → back to the docked flex child, and the sidebar is restored to
@@ -1958,6 +2063,120 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTitle("a.ts")).toBeInTheDocument();
     expect(screen.getByTitle("b.ts")).toBeInTheDocument();
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  });
+
+  it("restores the open shell tabs per session (switch away and back keeps them)", () => {
+    // Regression: shell tabs used to live only in transient component state and
+    // were cleared on every conversation switch, so navigating away and back
+    // lost them. They now persist per session like file tabs. Seed a session
+    // with one open + selected shell tab whose terminal is live, and assert the
+    // tab strip restores it and mounts its xterm.
+    writeSessionWorkspaceState("conv_shellmem", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_bash_s1", name: "bash", session: "s1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    mockConversations([{ id: "conv_shellmem", permission_level: null }]);
+
+    renderShell("/c/conv_shellmem");
+
+    // The remembered tab renders in the strip (title = "name · session"), and
+    // the persisted active key drives the rail's xterm (stub echoes the id).
+    expect(screen.getByTitle("bash · s1")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
+  });
+
+  it("keeps restored shell tabs while the terminal list is still loading, then prunes dead ones", () => {
+    // The prune effect drops tabs whose terminal is gone — but the incoming
+    // session's list is momentarily empty *while loading*, indistinguishable
+    // from "all closed". Pruning then would wipe the just-restored tabs. The
+    // effect is gated on isLoading: it must skip the load window, then prune
+    // once the real (still-empty) list confirms the terminal is truly gone.
+    writeSessionWorkspaceState("conv_shellload", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    // Loading: list empty but not yet resolved.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: true, error: null });
+    mockConversations([{ id: "conv_shellload", permission_level: null }]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_shellload"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    // While loading the restored tab survives the transient empty list.
+    expect(screen.getByTitle("terminal_bash_s1")).toBeInTheDocument();
+
+    // The list resolves to genuinely empty (the terminal is really gone) —
+    // now the prune runs and drops the dead tab.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    expect(screen.queryByTitle("terminal_bash_s1")).toBeNull();
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+  });
+
+  it("keeps restored shell tabs when the terminals fetch errors (non-authoritative empty list)", () => {
+    // An errored terminals fetch also yields terminals: [], but that empty list
+    // is not authoritative — we couldn't reach the PTYs, not "they're gone".
+    // Pruning against it would wipe the restored tab, so the prune effect is
+    // gated on error too. The tab must survive an errored read.
+    writeSessionWorkspaceState("conv_shellerr", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [],
+      isLoading: false,
+      error: new Error("terminals fetch failed: 503"),
+    });
+    mockConversations([{ id: "conv_shellerr", permission_level: null }]);
+
+    renderShell("/c/conv_shellerr");
+
+    // The restored tab survives the errored (non-authoritative) empty list —
+    // the strip keeps the tab (title falls back to the raw id until the
+    // terminal loads) instead of pruning it as if the PTY were gone.
+    expect(screen.getByTitle("terminal_bash_s1")).toBeInTheDocument();
   });
 });
 

@@ -57,6 +57,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
 def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -64,6 +65,9 @@ def _make_hello(
     :param configured_harnesses: Per-harness readiness map to report,
         e.g. ``{"claude-sdk": True}``; ``None`` mimics an older host
         that doesn't report it.
+    :param gateway_inference: Per-harness AI-Gateway-backed inference map to
+        report, e.g. ``{"claude-native": True}``; ``None`` mimics a host that
+        doesn't report it.
     :returns: JSON-encoded hello frame.
     """
     return encode_host_frame(
@@ -72,6 +76,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             configured_harnesses=configured_harnesses,
+            gateway_inference=gateway_inference,
         )
     )
 
@@ -81,6 +86,21 @@ def host_api_app(
     db_uri: str,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """FastAPI app with host tunnel + REST routes and stores.
+
+    :param db_uri: SQLite URI from the shared fixture.
+    :returns: Tuple of (app, registry, host_store, conv_store).
+    """
+    return _build_host_api_app(db_uri)
+
+
+def _build_host_api_app(
+    db_uri: str,
+) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
+    """Build one replica's app over *db_uri*.
+
+    Separate from the fixture so a test can stand up a SECOND replica on the
+    same database — a server restart, which keeps every host row but starts with
+    an empty registry.
 
     :param db_uri: SQLite URI from the shared fixture.
     :returns: Tuple of (app, registry, host_store, conv_store).
@@ -106,6 +126,7 @@ async def _connect_host(
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -115,6 +136,8 @@ async def _connect_host(
     :param name: Host name for the hello frame.
     :param configured_harnesses: Readiness map for the hello frame,
         e.g. ``{"codex": False}``; ``None`` mimics an older host.
+    :param gateway_inference: Gateway-inference map for the hello frame,
+        e.g. ``{"codex": True}``; ``None`` mimics a host that doesn't report it.
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
@@ -124,7 +147,10 @@ async def _connect_host(
     assert accepted["type"] == "websocket.accept"
 
     await comm.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, configured_harnesses)},
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(name, configured_harnesses, gateway_inference),
+        },
     )
     while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
@@ -296,6 +322,123 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+
+
+async def test_hosts_api_surfaces_gateway_inference(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the gateway-inference map a host reports in its hello is held in
+    memory and surfaced by both GET /v1/hosts and GET /v1/hosts/{id}.
+
+    This is the signal the web UI gates Smart Routing on. If it is dropped
+    anywhere along hello → host registry → hosts route, the UI would offer
+    Smart Routing on a host whose apply layer cannot work.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"claude-native": True, "codex": True},
+        gateway_inference={"claude-native": True, "codex": False},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] == {
+        "claude-native": True,
+        "codex": False,
+    }
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] == {"claude-native": True, "codex": False}
+
+
+async def test_hosts_api_gateway_inference_null_for_older_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify a host that never reported gateway inference lists with
+    ``gateway_inference`` null — unknown, never ``{}``.
+
+    ``{}`` would gate Smart Routing away from every old host; ``null`` is the
+    contract the web helper keys on to leave it enabled.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] is None
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] is None
+
+
+async def test_gateway_inference_reconverges_after_a_server_restart(
+    db_uri: str,
+) -> None:
+    """
+    Verify a restarted server re-learns gateway backing from the reconnect, with
+    no database state behind it, and that router selection follows.
+
+    The restart→unknown window is the cost of holding the map in memory, so it
+    has to be bounded by the handshake: while the fresh replica has no report,
+    the unknown-is-backed rule keeps the external router in play; the moment the
+    host reconnects and re-reports "claude is off-gateway", selection drops back
+    to the built-in judge — permanently, with nothing to migrate or backfill.
+    """
+    from omnigent.server.routes._sessions.common import set_server_host_registry
+    from omnigent.server.routing_backend import RoutingBackends, gateway_backs_all, select_router
+
+    external = object()
+    local = object()
+    backends = RoutingBackends(external=external, local=local)  # type: ignore[arg-type]
+
+    def _source(host: object) -> str | None:
+        choice = select_router(
+            backends, gateway_backed=gateway_backs_all(host, ("claude-native",))
+        )
+        return choice.source if choice is not None else None
+
+    app, registry, host_store, _cs = _build_host_api_app(db_uri)
+    set_server_host_registry(registry)
+    try:
+        comm = await _connect_host(app, registry, gateway_inference={"claude-native": False})
+        host = host_store.get_host(_HOST_ID)
+        assert host is not None
+        assert _source(host) == "oss-llm"
+
+        # Restart: the hosts row survives, every in-memory report is gone.
+        with contextlib.suppress(Exception):
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        restarted_app, restarted_registry, restarted_store, _cs2 = _build_host_api_app(db_uri)
+        set_server_host_registry(restarted_registry)
+        restarted_host = restarted_store.get_host(_HOST_ID)
+        assert restarted_host is not None
+        assert restarted_registry.gateway_inference(_HOST_ID) is None
+        assert _source(restarted_host) == "databricks-aigw"
+
+        # The host reconnects and re-reports; the replica converges.
+        _recomm = await _connect_host(
+            restarted_app,
+            restarted_registry,
+            gateway_inference={"claude-native": False},
+        )
+        assert restarted_registry.gateway_inference(_HOST_ID) == {"claude-native": False}
+        assert _source(restarted_host) == "oss-llm"
+
+        async with AsyncClient(
+            transport=ASGITransport(app=restarted_app), base_url="http://test"
+        ) as client:
+            single = await client.get(f"/v1/hosts/{_HOST_ID}")
+        assert single.json()["gateway_inference"] == {"claude-native": False}
+    finally:
+        set_server_host_registry(None)
 
 
 async def test_get_host_404(

@@ -46,7 +46,7 @@ export function TodoPanel({ frameless = false }: TodoPanelProps) {
             // eslint-disable-next-line react/no-array-index-key
             key={i}
             className={cn(
-              "flex items-center gap-2 rounded px-1.5 py-1 text-xs",
+              "flex items-center gap-2 rounded px-1.5 py-1 text-sm",
               todo.status === "completed" && "opacity-50",
             )}
           >

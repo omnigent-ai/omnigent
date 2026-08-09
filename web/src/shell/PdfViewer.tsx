@@ -68,8 +68,8 @@ function centered(message: string, tone: "muted" | "error" = "muted") {
     <div
       className={
         tone === "error"
-          ? "flex items-center justify-center p-8 text-destructive text-sm"
-          : "flex items-center justify-center p-8 text-muted-foreground text-sm"
+          ? "flex items-center justify-center p-8 text-destructive text-ui"
+          : "flex items-center justify-center p-8 text-muted-foreground text-ui"
       }
     >
       {message}
@@ -295,7 +295,7 @@ export function PdfViewer({
     <div className="flex h-full flex-col">
       {/* Toolbar: page count + zoom controls. */}
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-1.5">
-        <span className="text-xs text-muted-foreground tabular-nums">
+        <span className="text-sm text-muted-foreground tabular-nums">
           {numPages > 0 ? `${numPages} page${numPages === 1 ? "" : "s"}` : ""}
         </span>
         <div className="flex items-center gap-1">
@@ -374,7 +374,7 @@ export function PdfViewer({
           <button
             data-add-comment-btn
             type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
             style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {

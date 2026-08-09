@@ -187,7 +187,7 @@ def _fetch_remote_config() -> TelemetryConfig | None:
             return None
         cfg: dict[object, object] = raw_config
 
-        if cfg.get("omnigent_version") != VERSION:
+        if cfg.get("omnigent_version") not in (VERSION, "default"):
             _logger.debug("Telemetry config version mismatch; disabling telemetry")
             return None
         if cfg.get("disable_telemetry") is True:

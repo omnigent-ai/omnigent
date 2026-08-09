@@ -223,14 +223,14 @@ function HandleMenu({
   return createPortal(
     <div
       data-table-handle-menu
-      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-md border border-border bg-popover py-1 shadow-md"
+      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu"
       style={{ top: anchorTop, left: anchorLeft }}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
     >
       {items.map((item) =>
         "separator" in item ? (
-          <div key={item.id} className="mx-2 my-1 h-px bg-border" />
+          <div key={item.id} className="-mx-1 my-1 h-px bg-border" />
         ) : (
           <button
             key={item.id}
@@ -241,7 +241,7 @@ function HandleMenu({
               onClose();
             }}
             className={cn(
-              "flex w-full items-center gap-2.5 px-3 py-1.5 text-xs transition-colors",
+              "flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-ui transition-colors",
               item.destructive
                 ? "text-destructive hover:bg-destructive/10"
                 : "text-foreground hover:bg-muted",

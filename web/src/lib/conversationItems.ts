@@ -19,6 +19,9 @@ export interface BaseItem {
   type: string;
   response_id: string;
   status: string;
+  /** Server-side creation time (unix epoch seconds). Drives the
+   *  completed-turn "Worked for" duration for reloaded history. */
+  created_at?: number;
 }
 
 export interface MessageItem extends BaseItem {

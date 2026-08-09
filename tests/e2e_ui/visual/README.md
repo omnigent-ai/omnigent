@@ -14,11 +14,15 @@ stubs.
 Pages covered:
 
 - **Empty landing (`/`)** — the open left sidebar plus the `NewChatLandingScreen`
-  ("What should we do?") hero and composer.
+  ("What should we build?") hero and composer.
   [`test_landing_snapshot.py`](test_landing_snapshot.py)
 - **Chat conversation (`/c/{id}`)** — a fully-mocked one-turn transcript (user
   question + assistant markdown reply) rendered as message bubbles, with the
   composer below. [`test_chat_snapshot.py`](test_chat_snapshot.py)
+- **Multi-turn chat with TurnRail (`/c/{id}`)** — a fully-mocked several-turn
+  transcript that mounts the left-edge tick minimap (the rail only renders for
+  two or more turns), guarding the spacing between the transcript column and the
+  rail. [`test_chat_turn_rail_snapshot.py`](test_chat_turn_rail_snapshot.py)
 
 Baselines are committed under `snapshots/<test_module>/<test_name>/<name>[chromium][linux].png`.
 

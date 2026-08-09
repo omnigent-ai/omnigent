@@ -316,6 +316,96 @@ def test_env_prefix_stripped_before_classifying() -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo -u root cd /etc",
+        "sudo -n cd /etc",
+        "sudo -- cd /etc",
+        "env -i cd /etc",
+        "env -u GIT_DIR cd /etc",
+        "env --unset=GIT_DIR cd /etc",
+        "command -p cd /etc",
+        "time -p cd /etc",
+        "exec -a disguise cd /etc",
+        # Bundled short options: ``-u root`` still consumes its value token.
+        "sudo -nu root cd /etc",
+        "env -iu FOO cd /etc",
+        # BSD sudo: -a/--auth-type and -c/--login-class take a value.
+        "sudo -a foo cd /etc",
+        "sudo --auth-type foo cd /etc",
+        "sudo -c bar cd /etc",
+        "sudo --login-class bar cd /etc",
+        # ``git -C`` behind the same wrappers.
+        "sudo -u root git -C /other status",
+        "env -i git -C /other status",
+        "sudo -nu root git worktree add /tmp/wt",
+        # ``env -S`` runs the string it splits, so the cd is INSIDE the flag's
+        # value — consuming it as an ordinary value left no tokens to classify.
+        "env -S 'cd /etc'",
+        "env --split-string='cd /etc'",
+        "env --split-string 'cd /etc'",
+        "env -iS 'cd /etc'",
+        "env -u FOO -S 'cd /etc'",
+        "env -S 'git worktree add /tmp/wt'",
+        "sudo -u root env -S 'cd /etc'",
+        # An absolute path names the same wrapper.
+        "/usr/bin/sudo -u root cd /etc",
+        "/usr/bin/env -S 'cd /etc'",
+    ],
+)
+def test_option_taking_wrapper_does_not_hide_the_dir_op(command: str) -> None:
+    """A wrapper's OWN flags don't hide the gated command (GHSA-7mqg-cx4g-x2rf class).
+
+    ``sudo``, ``env``, ``command``, ``time`` and ``exec`` all take option flags.
+    Skipping only the wrapper word left the flag as the apparent command, so
+    ``_classify_segment`` saw no dir op and the policy abstained — a one-token
+    bypass. Each form must reach the same DENY as the bare command.
+    """
+    policy = block_working_dir_changes()
+    result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo -u root ls -la",
+        "sudo -nu root npm test",
+        "env -i make build",
+        "env -iu FOO make build",
+        "command -p ls",
+        "time -p pytest",
+        "timeout 60 npm test",
+        "env -S 'npm test'",
+        "env -S 'git status'",
+    ],
+)
+def test_option_taking_wrapper_around_benign_command_abstains(command: str) -> None:
+    """Widening the wrapper parser must not gate benign wrapped commands.
+
+    Composability matters: a wrapper in front of a non-dir-op command has to keep
+    abstaining so the policy composes with others.
+    """
+    policy = block_working_dir_changes()
+    assert policy(_sh(command)) is None
+
+
+def test_unresolvable_wrapper_head_is_gated_not_abstained() -> None:
+    """An option left as the apparent command takes the configured action.
+
+    The wrapper tables are an enumeration, so a form they do not model can still
+    leave a flag as the head (``nohup -- cd /etc``). Abstaining there is what made
+    the whole wrapper-flag class a silent bypass, so such a segment is treated
+    like one ``shlex`` cannot tokenize.
+    """
+    policy = block_working_dir_changes()
+    result = policy(_sh("nohup -- cd /etc"))
+    assert result is not None and result["result"] == "DENY"
+    # Still no over-block: an unresolvable head with no dir-op keyword abstains.
+    assert policy(_sh("nohup -- ls -la")) is None
+
+
 def test_subshell_paren_prefix_still_gated() -> None:
     """A leading subshell ``(`` doesn't disguise the cd.
 

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import stat
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from omnigent.inner.codex_executor import (
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _prompt_for_turn,
+    _provider_codex_config_overrides,
     _to_codex_input_items,
 )
 from omnigent.inner.executor import (
@@ -236,15 +238,19 @@ class TestCodexExecutor(unittest.TestCase):
             any("--host" in override for override in executor._codex_config_overrides)
         )
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # must be applied via a `--help` capability probe ($force), never
-        # passed unconditionally — an older CLI rejects the unknown flag and
-        # yields an empty token → silent 401.
+        # stays behind a `--help` capability probe — an older CLI rejects the
+        # unknown flag and yields an empty token → silent 401.
         auth_override = next(
             o for o in executor._codex_config_overrides if "databricks auth token" in o
         )
         self.assertIn("databricks auth token --help", auth_override)
-        self.assertIn("force=--force-refresh", auth_override)
-        self.assertNotIn('--profile "test-profile" --force-refresh', auth_override)
+        # And even where it exists it is only ATTEMPTED: it fails outright on a
+        # stale refresh token, so an empty result must fall back to the cached
+        # token rather than turning a usable credential into an auth failure.
+        self.assertIn("--force-refresh", auth_override)
+        # (the TOML fragment escapes the shell's quotes, so match on the test)
+        self.assertIn("if [ -z ", auth_override)
+        self.assertIn("$token", auth_override)
 
     def test_constructor_databricks_flag_with_host_override_skips_profile_lookup(self):
         with (
@@ -2354,6 +2360,76 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
     assert not (codex_home / "skills").exists()
 
 
+@pytest.mark.parametrize(
+    "auth_command",
+    [
+        "printf %s sk-sentinel-do-not-use",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ],
+)
+async def test_embedded_codex_materializes_provider_auth_outside_argv(
+    tmp_path: Path,
+    auth_command: str,
+) -> None:
+    """Embedded Codex keeps provider credentials only in private config."""
+    import tomllib
+
+    captured_argv: list[str] = []
+    captured_env: dict[str, str] = {}
+    process = _FakeProcess()
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _FakeProcess:
+        captured_argv.extend(args)
+        captured_env.update(kwargs["env"])
+        return process
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    overrides = _provider_codex_config_overrides(
+        model="test-model",
+        base_url="https://provider.invalid/v1",
+        auth_command=auth_command,
+        wire_api="responses",
+    )
+    session = _CodexAppServerSession(
+        codex_path="/test/codex",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        codex_config_overrides=overrides,
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    with (
+        patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=_fake_create_subprocess_exec,
+        ),
+        patch(
+            "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+            return_value=source_home,
+        ),
+    ):
+        await session.start()
+        codex_home = Path(captured_env["CODEX_HOME"])
+        config_path = codex_home / "config.toml"
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+        assert all("sk-sentinel-do-not-use" not in arg for arg in captured_argv)
+        assert 'model_provider="omnigent_provider"' in captured_argv
+        assert 'model="test-model"' in captured_argv
+        assert config["model_providers"]["omnigent_provider"]["auth"]["args"] == [
+            "-c",
+            auth_command,
+        ]
+        assert config["model_providers"]["omnigent_provider"]["wire_api"] == "responses"
+        assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        await session.close()
+
+    assert not codex_home.exists()
+
+
 # ---------------------------------------------------------------------------
 # _populate_codex_home_config tests
 # ---------------------------------------------------------------------------
@@ -3346,3 +3422,27 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
             expected = str(Path(writable_dir) / ".codex-tmp")
             self.assertEqual(dir_used, expected)
+
+
+def test_run_turn_cli_config_passes_no_model_to_thread_create():
+    """On the cli-config path (model_provider_override set), model=None is passed
+    to thread/create so the codex binary uses its own configured model rather than
+    forwarding an unresolvable alias (e.g. gpt-5.6) to the Databricks UC API."""
+
+    async def _t():
+        fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.6",
+            model_provider_override="Databricks",
+            app_session_factory=lambda **kwargs: fake_session,
+        )
+        async for _ in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}],
+            [],
+            "",
+        ):
+            pass
+        assert fake_session.calls[0]["model"] is None
+
+    _run(_t())

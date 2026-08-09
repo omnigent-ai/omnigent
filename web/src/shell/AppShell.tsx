@@ -57,13 +57,17 @@ import {
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
-import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper as isNativeWrapperLabel,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
+import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
@@ -89,6 +93,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
+import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -129,6 +134,10 @@ import type { RightRailTab } from "./railTabs";
  * more than one agent (the root has at least one child).
  */
 export function AppShell() {
+  // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
+  // here so it works on every chat route, regardless of where focus sits.
+  useApproveHotkey();
+
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
@@ -148,10 +157,17 @@ export function AppShell() {
   // width. The panel can be dragged wider, but this floor keeps it usable at
   // its default; widening past it is the user's choice via the inline handle.
   const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // Reads the same module-level store Sidebar drives, so the rail's ceiling
+  // tracks the live sidebar width (including a drag) rather than a guess.
+  const { width: sidebarWidth } = useResizableSidebar();
+  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
+    useResizableInlinePanel(
+      conversationId ?? null,
+      inlinePanelMinWidth,
+      sidebarOpen ? sidebarWidth : 0,
+    );
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -198,11 +214,16 @@ export function AppShell() {
   // Ordered list of open shell tabs (``terminalTabKey`` values) shown in the
   // right rail's tab strip beside the file tabs. ``selectedTerminalKey`` is the
   // active one (mutually exclusive with ``selectedFilePath`` — the rail's
-  // content slot shows one thing). Not persisted: terminal keys are
-  // session-scoped and the PTYs don't survive a reload, so a fresh visit starts
-  // with no shell tabs; a prune effect drops keys whose terminal has gone away.
-  const [openTerminals, setOpenTerminals] = useState<string[]>([]);
-  const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(null);
+  // content slot shows one thing). Persisted per-session (like file tabs) so a
+  // session switch or reload restores the tab strip; the PTYs live on the
+  // server and are re-fetched by ``useTerminals``, and a prune effect drops any
+  // keys whose terminal has actually gone away once the list loads.
+  const [openTerminals, setOpenTerminals] = useState<string[]>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).openTerminals ?? []) : [],
+  );
+  const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).selectedTerminalKey ?? null) : null,
+  );
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.
   const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
@@ -286,7 +307,11 @@ export function AppShell() {
   // terminal. The hook is react-query-backed and dedup'd with the rail.
   // reconcileWhilePending: self-heals if the live resource.created SSE was
   // missed (see UseTerminalsOptions for the why).
-  const { terminals } = useTerminals(conversationId ?? null, {
+  const {
+    terminals,
+    isLoading: terminalsLoading,
+    error: terminalsError,
+  } = useTerminals(conversationId ?? null, {
     reconcileWhilePending: terminalPending,
   });
 
@@ -343,10 +368,6 @@ export function AppShell() {
     conversationId,
     conversationsData !== undefined,
   );
-  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
-  // Cmd/Ctrl+Enter accepts the pending prompt only when this viewer has
-  // owner or delegated approval authority.
-  useApproveHotkey(canApprove);
   // Labels can come from the sidebar row (``activeConv``) for top-level
   // sessions OR the per-session snapshot (``activeSession``) for ALL
   // sessions including children. The sidebar list omits child (sub-agent)
@@ -419,11 +440,13 @@ export function AppShell() {
   const hasAgentInfo = !!conversationId && agentHasInfo(boundAgent, conversationId);
   // Whether the mobile three-dot menu has any entry to offer.
   const hasHeaderMenu = canShare || hasAgentInfo;
+  // The live snapshot is authoritative; the sidebar row is only a fallback
+  // (it is absent entirely for sub-agent children, which the list omits).
+  const wrapperLabel =
+    activeSession?.labels?.[WRAPPER_LABEL_KEY] ?? activeConv?.labels?.[WRAPPER_LABEL_KEY] ?? null;
   // Claude-native sub-agents have no terminal of their own — the parent
   // owns the tmux pane.
-  const isClaudeNativeSubagent =
-    activeSession?.labels?.["omnigent.wrapper"] === "claude-code-native-ui-subagent" ||
-    activeConv?.labels?.["omnigent.wrapper"] === "claude-code-native-ui-subagent";
+  const isClaudeNativeSubagent = wrapperLabel === "claude-code-native-ui-subagent";
   // Hide the rail Shells tab only for claude-native sub-agents — they
   // have no terminals of their own (the parent owns the tmux pane).
   // Native top-level sessions get the same Shells rail as SDK ones;
@@ -709,6 +732,8 @@ export function AppShell() {
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
+      setOpenTerminals([]);
+      setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
       stateConvRef.current = null;
       return;
@@ -753,11 +778,12 @@ export function AppShell() {
     const nextSelected = urlFile ?? persisted.selectedFilePath ?? null;
     setOpenFiles(nextOpenFiles);
     setSelectedFilePath(nextSelected);
-    // Shell tabs are session-scoped and not persisted — a switch starts the
-    // incoming session with no open shell tabs (the prune effect would drop
-    // stale keys anyway once its terminals load).
-    setOpenTerminals([]);
-    setSelectedTerminalKey(null);
+    // Restore the open shell tabs from the per-session store. The prune effect
+    // drops any key whose terminal no longer exists once this session's
+    // terminal list loads, so a dead PTY can't leave a phantom tab. A restored
+    // shell selection must not coexist with a file selection (one content slot).
+    setOpenTerminals(persisted.openTerminals ?? []);
+    setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
     // A maximized rail is transient too — the incoming session starts docked.
     // If we were maximized, restore the sidebar we collapsed on entry (the
     // toggle handler won't run on a session switch).
@@ -802,8 +828,14 @@ export function AppShell() {
     }
     const id = stateConvRef.current;
     if (!id) return;
-    writeSessionWorkspaceState(id, { rightRailTab, openFiles, selectedFilePath });
-  }, [rightRailTab, openFiles, selectedFilePath]);
+    writeSessionWorkspaceState(id, {
+      rightRailTab,
+      openFiles,
+      selectedFilePath,
+      openTerminals,
+      selectedTerminalKey,
+    });
+  }, [rightRailTab, openFiles, selectedFilePath, openTerminals, selectedTerminalKey]);
 
   // Sync the Files-panel scope into the URL. The tree is the default, so we
   // only write the param for "Changed only" — and only while the rail is open,
@@ -896,7 +928,7 @@ export function AppShell() {
       );
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
-  ); // eslint-disable-line react-hooks/exhaustive-deps
+  );
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
@@ -1131,15 +1163,19 @@ export function AppShell() {
   // Prune shell tabs whose terminal has gone away (closed by the agent, or the
   // runner went offline and emptied the list). Keeps the strip from pointing at
   // dead PTYs; the active selection falls back to the Shells list when its tab
-  // is dropped.
+  // is dropped. Skip while the list is still loading OR the fetch errored so
+  // restored (persisted) tabs aren't wiped by a non-authoritative empty list —
+  // an errored read is `[]` too, and pruning against it would discard tabs
+  // whose PTYs we simply couldn't reach.
   useEffect(() => {
+    if (terminalsLoading || terminalsError !== null) return;
     const valid = new Set(terminals.map((t) => terminalTabKey(t)));
     setOpenTerminals((prev) => {
       const next = prev.filter((k) => valid.has(k));
       return next.length === prev.length ? prev : next;
     });
     setSelectedTerminalKey((active) => (active !== null && !valid.has(active) ? null : active));
-  }, [terminals]);
+  }, [terminals, terminalsLoading, terminalsError]);
 
   function openExecutionLogsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1282,6 +1318,25 @@ export function AppShell() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" stays a pill view.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+
+  // A runner stop/disconnect empties the terminal list; if that lands while the
+  // terminal view is open, flip back to chat rather than stranding the user on
+  // "No terminals available" (and chat is where the composer resumes it).
+  // Edge-triggered + startingUp-guarded so a cold boot / relaunch isn't yanked.
+  const hadTerminalRef = useRef(false);
+  useEffect(() => {
+    if (
+      terminalFirst &&
+      panelOpen &&
+      hadTerminalRef.current &&
+      !terminalsAvailable &&
+      !terminalStartingUp
+    ) {
+      setPanelInitialKey(null);
+    }
+    hadTerminalRef.current = terminalsAvailable;
+  }, [terminalFirst, panelOpen, terminalsAvailable, terminalStartingUp, setPanelInitialKey]);
+
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,
@@ -1397,6 +1452,7 @@ export function AppShell() {
                   parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
                   boundAgent={boundAgent}
+                  wrapperLabel={wrapperLabel}
                   canShare={canShare}
                   shareDisabled={shareDisabled}
                   shareDisabledReason={shareDisabledReason}
@@ -1442,6 +1498,20 @@ export function AppShell() {
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
                 </main>
+
+                {/* Debug-mode execution-logs rail — desktop only, hidden when a
+              push panel is open (the panel itself becomes the focus). Only
+              rendered in debug mode so the column doesn't occupy space in
+              normal use. */}
+                {conversationId && debugMode && !panelOpen && !executionLogsOpen && (
+                  <div className="hidden md:flex md:flex-col md:w-56 md:shrink-0 md:border-l md:border-border md:overflow-y-auto md:px-2 md:pb-2 md:pt-12 md:gap-2">
+                    <SessionRail
+                      conversationId={conversationId}
+                      onExpandExecutionLogs={openExecutionLogsPanel}
+                      suppressed={false}
+                    />
+                  </div>
+                )}
 
                 {/* Right workspace card — gated on conversationId (panels have
               no workspace to read without a session), default-open,
@@ -1595,7 +1665,6 @@ export function AppShell() {
               sessionId={conversationId}
               open={shareOpen}
               onOpenChange={setShareOpen}
-              canDelegateApprovals={isOwnerLevel(permissionLevel)}
             />
           )}
           {conversationId && (

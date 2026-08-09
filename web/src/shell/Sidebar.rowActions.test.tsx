@@ -44,7 +44,9 @@ const mocks = vi.hoisted(() => {
     },
   };
   return {
-    rename: { mutate: vi.fn() },
+    // `isSuccess`/`isError` drive the row's hold-the-committed-name logic:
+    // it keeps showing the new title until the PATCH settles.
+    rename: { mutate: vi.fn(), isSuccess: false, isError: false },
     isMobile: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
@@ -187,6 +189,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -232,6 +235,8 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  mocks.rename.isSuccess = false;
+  mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
   mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
@@ -294,10 +299,14 @@ describe("quick pin/unpin hover button", () => {
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
-    expect(screen.getByTestId("project-actions")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-actions")).not.toHaveClass("size-7");
-    expect(screen.getByTestId("project-new-session")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-new-session")).not.toHaveClass("size-7");
+    const projectActions = screen.getByTestId("project-actions");
+    const projectNewSession = screen.getByTestId("project-new-session");
+    for (const button of [projectActions, projectNewSession]) {
+      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+      expect(button).not.toHaveClass("size-7");
+      expect(button.querySelector("svg")).toHaveClass("size-3.5");
+      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
+    }
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
@@ -310,10 +319,13 @@ describe("quick pin/unpin hover button", () => {
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
-    expect(screen.getByTestId("new-project")).toHaveClass("size-6");
-    expect(screen.getByTestId("new-project")).not.toHaveClass("size-7");
-    expect(screen.getByTestId("project-list-actions")).toHaveClass("size-6");
-    expect(screen.getByTestId("project-list-actions")).not.toHaveClass("size-7");
+    for (const button of [
+      screen.getByTestId("new-project"),
+      screen.getByTestId("project-list-actions"),
+    ]) {
+      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+      expect(button).not.toHaveClass("size-7");
+    }
   });
 
   it("hides the Projects list-actions kebab when there are no projects", () => {
@@ -334,6 +346,13 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.queryByText("Pinned")).toBeNull();
     const pinButton = screen.getByTestId("quick-pin-conversation");
     expect(pinButton).toHaveAttribute("aria-label", "Pin conversation");
+    expect(pinButton).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(pinButton.querySelector("svg")).toHaveClass("size-3.5");
+    expect(pinButton.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
+    const actionsButton = screen.getByTestId("conversation-actions");
+    expect(actionsButton).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(actionsButton.querySelector("svg")).toHaveClass("size-3.5");
+    expect(actionsButton.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
 
     fireEvent.click(pinButton);
 
@@ -439,6 +458,43 @@ describe("double-click to rename", () => {
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed Session" });
   });
 
+  it("shows the committed title the moment the editor closes, before the list updates", () => {
+    // The rename mutation writes the new name into the list cache, but that
+    // reaches the row as a prop from the list above it, which re-renders a
+    // tick after the row's own state change. The row must not fall back to
+    // the pre-rename prop in between — that gap painted the old name for one
+    // frame as the input disappeared. The mocked mutation never updates the
+    // list, so the prop still says "My Session" throughout.
+    renderSidebar();
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByRole("link", { name: /Renamed Session/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /My Session/ })).toBeNull();
+  });
+
+  it("drops the committed title once a failed rename rolls the cache back", () => {
+    // The hook reverts the optimistic overlay when the PATCH fails, so the row
+    // has to stop showing the name the server rejected.
+    const { rerenderSidebar } = renderSidebar();
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("link", { name: /Renamed Session/ })).toBeTruthy();
+
+    mocks.rename.isError = true;
+    rerenderSidebar();
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Renamed Session/ })).toBeNull();
+  });
+
   it("does not commit the rename when Enter confirms an active IME composition", () => {
     renderSidebar();
 
@@ -532,7 +588,12 @@ describe("double-click to rename", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
 
@@ -568,11 +629,10 @@ describe("pinned row project flyout", () => {
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     const flyoutTitle = within(flyout).getByText("My Session");
     expect(flyoutTitle).toBeInTheDocument();
-    // The flyout title is sized to match the sidebar row name
-    // (`sidebar-compact-text`, 13px at the default), not the larger `text-sm`.
-    // Both scale with the UI font-size setting via the rem-based root.
+    // The flyout title matches sidebar row names through the shared compact
+    // class, which resolves to the same text-ui step as Appearance content.
     expect(flyoutTitle).toHaveClass("sidebar-compact-text");
-    expect(flyoutTitle).not.toHaveClass("text-sm");
+    expect(flyoutTitle).not.toHaveClass("text-ui");
     expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );

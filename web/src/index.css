@@ -25,11 +25,6 @@
     ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol",
     "Noto Color Emoji";
   --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, monospace;
-  /* 13px/20px text step between text-xs (12px) and text-sm (14px) —
-     * generates the `text-13` utility. Used for compact UI chrome like
-     * the composer footer selectors and slash-command menu rows. */
-  --text-13: 13px;
-  --text-13--line-height: 20px;
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
   --text-3xl: 32px;
@@ -50,6 +45,8 @@
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
+  /* Weaker panel border for low-contrast dividers. */
+  --color-border-weak: var(--border-weak);
   /* Stronger border for higher-contrast dividers/outlines. */
   --color-border-strong: var(--border-strong);
   /* Neutral border specifically for buttons (lighter than --border-strong). */
@@ -65,6 +62,8 @@
   --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
+  /* Pink tag surface (translucent) — generates `bg-tag-pink`. */
+  --color-tag-pink: var(--tag-pink);
   /* Named status hues — success/warning/info are repointed to the
      * green/yellow/blue of this set below, so the two stay in lockstep. */
   --color-status-blue: var(--status-blue);
@@ -75,6 +74,8 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
+  /* Tertiary text for lighter/disabled labels. */
+  --color-foreground-tertiary: var(--foreground-tertiary);
   --color-muted: var(--muted);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-secondary: var(--secondary);
@@ -92,13 +93,46 @@
   --color-tray: var(--tray);
   --color-foreground: var(--foreground);
   --color-background: var(--background);
-  --radius-sm: calc(var(--radius) * 0.6);
-  --radius-md: calc(var(--radius) * 0.8);
-  --radius-lg: var(--radius);
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
   --radius-xl: calc(var(--radius) * 1.4);
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+  --shadow-composer: 0 0 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-composer-focus: 0 0 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-xs: 0 2px 8px rgb(var(--ui-shadow-neutral-rgb) / 0.04);
+  --shadow-sm: 0 4px 10px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.09);
+  --shadow-md: 0 6px 12px -6px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-lg: 0 6px 20px -4px rgb(var(--ui-shadow-neutral-rgb) / 0.12);
+  --shadow-menu: 0 8px 28px rgb(var(--ui-shadow-warm-rgb) / 0.12);
+  --shadow-xl: 0 12px 44px rgb(var(--ui-shadow-warm-rgb) / 0.16);
+  --shadow-card:
+    0 4px 16px -2px rgb(var(--ui-shadow-warm-rgb) / 0.1),
+    0 1px 0 rgb(var(--ui-shadow-neutral-rgb) / 0.02);
+  --shadow-tooltip: 0 3px 6px rgb(var(--ui-shadow-neutral-rgb) / 0.05);
+  --shadow-dialog: 0 16px 48px rgb(var(--ui-shadow-neutral-rgb) / 0.2);
+}
+
+/* The two body text steps. Keep these non-inline: `@theme inline` bakes the
+ * literal value into each utility, which would make the runtime typography
+ * mapping below a no-op. Line heights are unitless so both tiers keep their
+ * 1.6 rhythm at every size the Appearance setting allows. */
+@theme {
+  /* App-default interface/body text — every control, label, and menu item. */
+  --text-ui: 1rem;
+  --text-ui--line-height: 1.6;
+  /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
+   * body step, mapped below so it tracks the Appearance setting. */
+  --text-sm: 0.9rem;
+  --text-sm--line-height: 1.6;
+  /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
+   * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
+   * ignores the Appearance setting — the same trap the ramp test guards. Keeps
+   * vendor markup (streamdown's image-fallback) on the caption tier too. */
+  --text-xs: var(--text-sm);
+  --text-xs--line-height: var(--text-sm--line-height);
 }
 
 /* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
@@ -107,16 +141,16 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
-  /* User-controlled UI font size, as a unitless multiplier on the root
-   * font-size (see Appearance settings / lib/uiFontPreferences.ts). 1 = the
-   * browser default; the root `html` rules multiply it into their font-size so
-   * the whole rem-based UI scales. Overridden at runtime on documentElement. */
-  --ui-font-scale: 1;
-  /* Compact sidebar text size. In `rem` so it rides the root font-size (which
-   * folds in --ui-font-scale and the mobile bump) — 0.8125rem = 13px at the
-   * 16px default, matching the design while still scaling with the Appearance
-   * font-size setting. */
-  --sidebar-font-size: 0.8125rem;
+  /* User-controlled UI font size (see Appearance settings /
+   * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
+   * runtime on documentElement. It feeds typography tokens only. */
+  --desktop-ui-font-size: 13px;
+  --icon-size-default: 14px;
+  --icon-container-default: 16px;
+  --ui-shadow-neutral-rgb: 0 0 0;
+  --ui-shadow-warm-rgb: 60 40 10;
+  --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
+  --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -184,11 +218,13 @@
      * The auth pages (outside the gradient shell) use this as their
      * full-page canvas. */
   --background: #fff;
-  --foreground: #11171c;
+  --foreground: #27272a;
+  /* Tertiary gray for lighter/disabled/placeholder text. */
+  --foreground-tertiary: #a1a1aa;
   --card: #fff;
   /* Light --card is already opaque; the solid form only diverges in dark. */
   --card-solid: #fff;
-  --card-foreground: #11171c;
+  --card-foreground: #27272a;
   /* Tray surface (composer footer tray): white, applied translucently
      * via opacity modifiers so the page gradient shows through. */
   --tray: #fff;
@@ -201,9 +237,9 @@
   /* Light grey fill so secondary badges/headers read as surfaces (a
      * fully-transparent value left them as bare floating text). */
   --secondary: #eceef1;
-  --secondary-foreground: #11171c;
+  --secondary-foreground: #27272a;
   --muted: #0000000f;
-  --muted-foreground: #6f6f6f;
+  --muted-foreground: #71717a;
   /* Dedicated chip background for inline code — a hair darker than the
      * white card so the chip reads as a tile. Kept separate from --muted
      * (now a translucent black wash reused for hover/quote surfaces). */
@@ -221,16 +257,20 @@
      * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
      * with strong contrast on the white card surface. */
   --session-active: #2f7fd4;
-  --border: #e8ecf0;
+  --border: #e4e4e7;
+  /* Weaker panel border for low-contrast dividers. */
+  --border-weak: #ececee;
   /* Stronger divider/outline + a dedicated neutral button border. */
-  --border-strong: #a3b1bf;
+  --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
-  --button-icon-hover-color: #11171c;
-  --input: #e8ecf0;
+  --button-icon-hover-color: #27272a;
+  --input: #e4e4e7;
   /* Focus ring matches --primary. */
   --ring: #11171c;
   /* Brand pink — reserved for brand moments, not status. */
   --brand-accent: #df3c85;
+  /* Pink tag surface — a translucent wash, so it tints whatever it sits on. */
+  --tag-pink: rgba(240, 1, 150, 0.06);
   /* Named status hues. success/warning/info above mirror green/yellow/blue. */
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
@@ -255,34 +295,35 @@
      * message copy button) blend into the canvas rather than painting
      * a lavender band. */
   --sidebar: #fdfafa;
-  --sidebar-foreground: #11171c;
+  --sidebar-foreground: #27272a;
   --sidebar-primary: #2272b4;
   --sidebar-primary-foreground: #fff;
   --sidebar-accent: #d7edfe;
   --sidebar-accent-foreground: #04355d;
-  --sidebar-border: #e8ecf0;
+  --sidebar-border: #e4e4e7;
   --sidebar-ring: #2272b4;
-  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 3%, transparent);
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
 }
 
 .dark {
   /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
-  --background: #0d1218;
+  --ui-shadow-neutral-rgb: 0 0 0;
+  --ui-shadow-warm-rgb: 0 0 0;
+  --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 80%);
+  --composer-shadow-focus: 0 0 14px -8px rgb(0 0 0 / 90%);
+  --background: #0e1013;
   --foreground: oklch(0.965 0.003 240);
-  --card: rgba(40, 34, 58, 0.6);
+  --card: rgba(31, 39, 45, 0.6);
   /* Opaque stand-in for the glass --card. The composer card uses this
      * instead of --card: its trays tuck their square corners behind the
      * card (negative-margin overlap), and a translucent card lets the
-     * tucked strip ghost through its edges. Not --card's raw RGB
-     * (#28223a) — full-alpha that read lighter than the neighboring
-     * glass surfaces; this approximates the glass card's perceived
-     * color: 60% of #28223a composited over the dark canvas gradient. */
-  --card-solid: #201c30;
+     * tucked strip ghost through its edges. Approximates the glass card's
+     * perceived color on the dark canvas. */
+  --card-solid: #181f25;
   --card-foreground: oklch(0.965 0.003 240);
   /* Dark counterpart of the tray surface — semi-transparent for glass effect */
-  --tray: rgba(40, 34, 58, 0.6);
+  --tray: rgba(31, 39, 45, 0.6);
   --popover: rgba(26, 33, 41, 0.8);
   --popover-foreground: oklch(0.965 0.003 240);
   --primary: #e8ecf0;
@@ -290,11 +331,10 @@
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
   /* Active/selected states, hover backgrounds, subtle containers. */
-  /* Opaque base (#28223a is var(--card)'s solid form — the dark-mode --card
-       itself is translucent). bg-muted backs ~160 solid utility surfaces (code
-       blocks, badges, hover rows) that must not let the canvas gradient bleed
-       through; the frosted look is reserved for the .dark .bg-card rule. */
-  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #28223a);
+  /* Opaque slate base: bg-muted backs ~160 solid utility surfaces (code
+       blocks, badges, hover rows) that must stay opaque; the frosted look is
+       reserved for the .dark .bg-card rule. */
+  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #262f36);
   --muted-foreground: #92a4b3;
   --code-bg: oklch(0.38 0.005 240);
   --accent: #04355d;
@@ -314,6 +354,9 @@
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
   --brand-accent: #df3c85;
+  /* Pink tag surface — a heavier wash than light, since 6% all but vanishes
+     * against the dark canvas. */
+  --tag-pink: rgba(240, 1, 150, 0.15);
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
   --status-yellow: #d4972a;
@@ -328,11 +371,8 @@
   --chart-3: oklch(0.68 0.15 145);
   --chart-4: oklch(0.75 0.16 70);
   --chart-5: oklch(0.65 0.008 240);
-  /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
-     * diagonal sweeping green (rgb 17,24,28) → purple (rgb 19,13,33);
-     * --sidebar sits in the green-dominant region and stays translucent
-     * so it tracks the canvas underneath (a flat color can't match a
-     * diagonal everywhere). Mirrors the light-mode treatment. */
+  /* Translucent so the sidebar's own layers (see .dark .conversations-sidebar)
+     * and the canvas read through it. */
   --sidebar: rgba(17, 23, 28, 0.75);
   --sidebar-foreground: oklch(0.965 0.003 240);
   --sidebar-primary: oklch(0.64 0.22 254);
@@ -344,43 +384,112 @@
   --tooltip-bg: #2a2440;
 }
 
-.sidebar-compact-text {
-  font-size: var(--sidebar-font-size);
+/* Omnigent-only active sidebar treatment. Other palettes retain their neutral
+ * inherited sidebar-active tokens. */
+:root:not(.dark):not([data-theme]) {
+  --sidebar-active: rgba(240, 1, 150, 0.1);
+  --sidebar-active-foreground: #651249;
 }
 
-/* App-shell canvas gradient. Copied verbatim from the brand mock
- * (agentic-ux-2026, "modern-1" layout): a near-white 45° gradient with the
- * faintest warm/pink drift, painted over the lavender --background. The
- * lavender base is effectively never seen (the opaque gradient covers it),
- * exactly as on the mock — it remains the fallback. The white sidebar /
- * workspace cards float on this near-white canvas, delineated by their
- * border + shadow rather than background contrast. --sidebar is set to the
- * gradient's near-white so bg-sidebar chrome stays invisible against this
- * canvas. */
+.dark:not([data-theme]) {
+  --sidebar-active: rgba(240, 1, 150, 0.15);
+  --sidebar-active-foreground: #f472b6;
+}
+
+/* Main-sidebar item labels use the same text-ui semantic step as Appearance
+ * content. Both read the desktop typography tokens derived from the size
+ * selected in Settings. */
+.sidebar-compact-text {
+  font-size: var(--text-ui);
+  line-height: var(--text-ui--line-height);
+}
+
+/* Home-sidebar rows use a fixed 20px line box so their shared 4px block padding
+ * produces a natural 28px row without scaling layout geometry. */
+.sidebar-row {
+  line-height: 20px;
+}
+
+/* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
+.ui-icon {
+  box-sizing: border-box;
+  width: var(--icon-container-default);
+  height: var(--icon-container-default);
+  padding: 1px;
+  flex-shrink: 0;
+}
+
+/* Shared buttons standardize every unescaped SVG to the same fixed icon
+ * geometry. Set data-icon-size on a deliberately exceptional icon. */
+.button-standard-icons svg:not([data-icon-size]) {
+  box-sizing: border-box;
+  width: var(--icon-container-default);
+  height: var(--icon-container-default);
+  padding: 1px;
+}
+
+/* Compact icon-only buttons use the full 16px glyph inside that box. */
+.button-standard-icons[data-size="icon-xs"] svg:not([data-icon-size]) {
+  padding: 0;
+}
+
+/* App-shell canvas — the transparent <main> shows it through. Light: flat
+ * white. Dark: purple-tinted near-black, two faint radial blooms over a 145°
+ * gradient (from the agentic-ux-2026 mock). The rails paint their own layers
+ * (below) and are excluded from the .dark glass rule, so they read as canvas,
+ * not frosted cards. */
 .app-shell {
-  background: linear-gradient(
-    45deg,
-    rgb(253, 250, 250),
-    rgb(253, 249, 251) 8%,
-    rgb(253, 249, 251) 17%,
-    rgb(253, 249, 252) 25%,
-    rgb(254, 248, 253) 33%,
-    rgb(254, 248, 252) 42%,
-    rgb(254, 251, 252) 50%,
-    rgb(254, 251, 251) 58%,
-    rgb(254, 251, 251) 67%,
-    rgb(254, 251, 251) 75%,
-    rgb(254, 251, 251) 83%,
-    rgb(254, 251, 251) 92%,
-    rgb(254, 253, 253)
-  );
+  background: var(--background);
 }
 .dark .app-shell {
   background:
-    radial-gradient(ellipse at 20% 50%, rgba(100, 40, 180, 0.15) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(80, 30, 140, 0.1) 0%, transparent 45%),
-    radial-gradient(ellipse at 60% 80%, rgba(140, 30, 100, 0.08) 0%, transparent 40%),
-    linear-gradient(145deg, #1e1035 0%, #11171c 50%, #161020 100%);
+    radial-gradient(rgba(100, 40, 180, 0.12), transparent 50%),
+    radial-gradient(at 80% 20%, rgba(80, 30, 140, 0.08), transparent 45%),
+    linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b);
+}
+
+/* Omnigent's sidebar canvas. The default palette carries no data-theme
+ * attribute, so these brand gradients cannot leak into alternate palettes. */
+:root:not(.dark):not([data-theme]) .conversations-sidebar {
+  background: #fffefe;
+  background: -webkit-linear-gradient(to right, #fffefe, #fcf6fa);
+  background: linear-gradient(to right, #fffefe, #fcf6fa);
+}
+.dark:not([data-theme]) .conversations-sidebar {
+  background:
+    linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%);
+}
+
+/* Alternate palettes own their sidebar color through the palette token. */
+:root:not(.dark)[data-theme] .conversations-sidebar,
+.dark[data-theme] .conversations-sidebar {
+  background: var(--sidebar);
+}
+
+/* Edge treatment is mode-specific but palette-independent. */
+html:not(.dark) .conversations-sidebar {
+  border-right: none;
+  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+}
+.dark .conversations-sidebar {
+  border-right: 1px solid rgb(255 255 255 / 2%);
+  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+}
+
+/* Below md the sidebar is a full-screen overlay ON TOP of the chat, so it has
+ * to be opaque — the rules above set `background` as a shorthand, which resets
+ * background-color and would otherwise let the conversation show through the
+ * translucent layers. Restores what Sidebar.tsx's max-md:bg-card-solid does on
+ * desktop. Above md the sidebar pushes content aside instead of covering it,
+ * so it keeps its translucent canvas there. */
+@media (width < 48rem) {
+  :root:not(.dark):not([data-theme]) .conversations-sidebar,
+  :root:not(.dark)[data-theme] .conversations-sidebar,
+  .dark:not([data-theme]) .conversations-sidebar,
+  .dark[data-theme] .conversations-sidebar {
+    background-color: var(--card-solid);
+  }
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
@@ -399,6 +508,14 @@
 .chat-scroll-fade {
   mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
   -webkit-mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
+}
+
+/* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
+ * Must land BELOW the fade above: the mask is fully opaque only from 80px,
+ * so a smaller margin parks the row in the transparent band — scrolled
+ * "to the top" yet invisible. Kept next to the fade so they can't desync. */
+.turn-fold-row {
+  scroll-margin-top: 88px;
 }
 
 /* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
@@ -423,9 +540,7 @@
 }
 
 /* Elevated surfaces — frosted glass effect with backdrop blur.
- * Targets top-level cards only, including responsive card surfaces like
- * the workspace panel's md:bg-card (so its chrome matches the sidebar's
- * glass border in dark mode). A bg-card nested inside another bg-card
+ * Targets top-level cards only. A bg-card nested inside another bg-card
  * (e.g. FilesPanel inside the workspace panel, toolbars inside the
  * composer) is an interior fill, and re-decorating it with its own
  * border/shadow visually carves the parent card into pieces.
@@ -436,11 +551,13 @@
  * aria-hidden: Radix's modal a11y hiding sets aria-hidden="true" on open
  * panels while a menu/dialog is up, and dropping this rule's 1px border
  * then reflowed every sidebar row 2px wider. Not [inert] either: this
- * React version drops the boolean inert attribute from the DOM.) */
+ * React version drops the boolean inert attribute from the DOM.)
+ * Both rails (Workspace, Conversations) are excluded — they paint their own
+ * canvas layers above, not a glass card. */
 .dark
   :is(.bg-card, [class*="md:bg-card"]):not(
     :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])
-  ):not([data-collapsed]) {
+  ):not([data-collapsed]):not([aria-label="Workspace"]):not([aria-label="Conversations"]) {
   /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
    * build) collapses the pair and keeps only the last declaration. */
   -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
@@ -465,6 +582,17 @@
   border-right: none !important;
   border-top: none !important;
   border-bottom: none !important;
+}
+
+/* Right rail (workspace panel) in dark: blends into the canvas, keeping only
+ * its left divider. Excluded from the glass rule above, so this just clears
+ * the rail's md:bg-card fill and the bg-card fills its panel contents paint
+ * (FilesPanel/TerminalsPanel/SubagentsPanel + the graph surface). */
+.dark aside[aria-label="Workspace"],
+.dark
+  aside[aria-label="Workspace"]
+  :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+  background: transparent !important;
 }
 
 /* Popovers/menus — same glass treatment */
@@ -610,6 +738,10 @@
     );
   }
 
+  [data-ios-native] .turn-fold-row {
+    scroll-margin-top: calc(88px + var(--omnigent-inset-top));
+  }
+
   /* Android: the floating server-switcher pill sits at the top. Start the
      fade at the pill bottom (safe-top + margin + height) so content scrolls
      smoothly into view below it. */
@@ -730,10 +862,9 @@
      * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
      * with the system stack as the fallback when it's unset. */
     font-family: var(--ui-font-family, var(--font-sans));
-    /* Root size for the whole rem-based UI. `1em` resolves against the
-     * browser default so a customized default is preserved; --ui-font-scale
-     * layers the user's Appearance choice on top. */
-    font-size: calc(1em * var(--ui-font-scale));
+    /* Keep the desktop rem grid fixed so font preferences cannot resize icons,
+     * controls, spacing, or radii. Typography is mapped separately below. */
+    font-size: 16px;
   }
   /* Code surfaces stay on the mono stack, immune to the UI --ui-font-family
    * override above. The Appearance font-family setting is UI chrome only; the
@@ -744,34 +875,63 @@
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection tracks the palette's brand accent so it stays cohesive
-   * across themes (pink on Omni, blue on GitHub, coral on Claude, …). Light:
-   * gentle accent wash + accent-colored text. Dark: solid accent + white. */
+  /* Text selection mirrors the sidebar's active-item treatment in every
+   * palette and color mode. */
   ::selection {
-    background: color-mix(in srgb, var(--brand-accent) 22%, transparent);
-    color: var(--brand-accent);
-  }
-  .dark ::selection {
-    background: var(--brand-accent);
-    color: #ffffff;
+    background: var(--sidebar-active);
+    color: var(--sidebar-active-foreground);
   }
 }
 
-/* Mobile typography bump.
- *
- * Push the root font-size from the browser default (16px) to 18px below
- * Tailwind's `md` breakpoint. Tailwind v4 sizes typography AND spacing in
- * `rem`, so the whole UI scales up ~12.5% uniformly — easier to read at
- * arm's length and slightly more forgiving touch targets. Desktop is
- * untouched. `--ui-font-scale` (the user's Appearance choice) multiplies in
- * here too, so the bump composes with the setting instead of being lost.
- *
- * Note that `rem` in `@media` queries always refers to the user-agent's
- * default (16px) per the CSS spec — so `48rem` here is the same 768px
- * Tailwind uses for `md:*` utilities, regardless of our root override. */
+/* Desktop-only typography mapping. Tailwind text utilities read these tokens,
+ * while the fixed 16px root keeps every spacing/size utility geometrically
+ * stable. Typed multiplication preserves each Tailwind text step relative to
+ * the discrete Appearance value without affecting mobile. */
+@media (width >= 48rem) {
+  :root {
+    /* The step factors below are Tailwind's rem ratios against a 16px base, so
+     * they need the preference on that scale. Multiplying the raw 13px shrinks
+     * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
+    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
+    /* Body and caption tiers come off the raw preference, not the anchor: the
+     * anchor is the 16px-equivalent grid the title ratios need, and running the
+     * caption factor through it put text-sm at 14.4px against a 13px body —
+     * a caption step larger than the text it captions. */
+    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+    --text-ui: var(--desktop-ui-font-size);
+    --text-base: var(--desktop-ui-font-size);
+    /* Title steps keep the anchor so each stays on its Tailwind ratio. */
+    --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
+    --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
+    --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
+  }
+
+  body {
+    font-size: var(--desktop-ui-font-size);
+  }
+}
+
+/* Mobile-specific sidebar geometry. The root remains at the global 16px so
+ * rem-based typography and controls keep the same scale across viewports. */
 @media (width < 48rem) {
-  html {
-    font-size: calc(1.125em * var(--ui-font-scale));
+  /* Mobile uses its own base size while preserving the desktop hierarchy. */
+  :root {
+    --mobile-ui-font-size: 14px;
+    --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
+    --text-ui: var(--mobile-ui-font-size);
+  }
+
+  /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
+  .conversations-sidebar {
+    --sidebar-icon-size-mobile: 16px;
+  }
+
+  .conversations-sidebar svg,
+  .conversations-sidebar .ui-icon,
+  .conversations-sidebar .button-standard-icons svg {
+    width: var(--sidebar-icon-size-mobile);
+    height: var(--sidebar-icon-size-mobile);
+    padding: 0;
   }
 }
 
@@ -791,6 +951,37 @@
 }
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
+}
+
+/* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
+ * hide the native one so both don't show. */
+.transcript-hide-native-scrollbar {
+  scrollbar-width: none;
+}
+.transcript-hide-native-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Streamdown hard-codes `content-visibility: auto` with a flat 200px intrinsic
+ * size on every code block, so offscreen blocks lay out at 200px and snap to
+ * their real height (100–1700px) as they scroll in — shifting the transcript
+ * under the reader and resizing the scrollbar on every snap. Blocks under
+ * content-visibility are also skipped when the browser picks a scroll anchor,
+ * so this has to go for anchoring to hold across a history prepend. Scoped to
+ * the transcript so the file viewer keeps skipping offscreen blocks in big
+ * files. Overrides an inline style, hence !important. */
+[role="log"] [data-streamdown="code-block"] {
+  content-visibility: visible !important;
+}
+
+/* Streamdown pins `text-sm` on table cells and h6. That tier is the caption
+ * step, so inside chat prose those read as a shrink rather than body text —
+ * pin them back to the surrounding size. sub/sup keep the caption step, where
+ * a smaller face is correct. */
+[data-streamdown="table-cell"],
+[data-streamdown="table-header-cell"],
+[data-streamdown="heading-6"] {
+  font-size: 1em;
 }
 
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
@@ -1981,4 +2172,79 @@
     radial-gradient(ellipse at 20% 30%, rgba(136, 192, 208, 0.12) 0%, transparent 55%),
     radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%),
     linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%);
+}
+
+/* Turn "Worked for …" process fold (BlockRenderer TurnWorkedFold).
+   The trace collapses with a height animation instead of disappearing in
+   one frame — an instant swap of a tall block read as a page reload. The
+   from/to heights need Radix's measured custom property, so this can't be
+   expressed as a Tailwind utility. */
+@keyframes turn-fold-expand {
+  from {
+    height: 0;
+    opacity: 0;
+  }
+  to {
+    height: var(--radix-collapsible-content-height);
+    opacity: 1;
+  }
+}
+@keyframes turn-fold-collapse {
+  from {
+    height: var(--radix-collapsible-content-height);
+    opacity: 1;
+  }
+  to {
+    height: 0;
+    opacity: 0;
+  }
+}
+.turn-fold-content {
+  overflow: hidden;
+}
+.turn-fold-content[data-state="open"] {
+  animation: turn-fold-expand 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* User-click expands open at full height in one frame: the animation
+   starts at height 0, so the snap-to-top that accompanies a user expand
+   would clamp against a scroller that has no room yet, then lose the
+   200ms growth to the stick-to-bottom pin / scroll anchoring. */
+.turn-fold-content-instant[data-state="open"] {
+  animation: none;
+}
+.turn-fold-content[data-state="closed"] {
+  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-fold-content[data-state="open"],
+  .turn-fold-content[data-state="closed"] {
+    animation: none;
+  }
+}
+/* The summary row grows in over the same beat as the trace shrinks.
+   Inserting it at full height first jolted the bubble ~40px TALLER
+   before the collapse began, which read as two separate motions; row
+   expanding + trace shrinking nets one monotonic shrink. */
+@keyframes turn-fold-row-in {
+  from {
+    grid-template-rows: 0fr;
+  }
+  to {
+    grid-template-rows: 1fr;
+  }
+}
+.turn-fold-row-enter {
+  display: grid;
+  grid-template-rows: 0fr;
+  animation: turn-fold-row-in 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+.turn-fold-row-enter > * {
+  min-height: 0;
+  overflow: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-fold-row-enter {
+    grid-template-rows: 1fr;
+    animation: none;
+  }
 }

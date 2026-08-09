@@ -29,7 +29,11 @@ def test_external_builds_client() -> None:
     assert client._url == "https://host/ai-gateway/routing/v1/routes:select"
     assert client._router_name == "task_v0"
     assert client._auth is None  # no profile -> unauthenticated
-    assert client._model_prefixes == []  # no prefix -> catalog ids sent verbatim
+    # No prefix configured -> the module's shared catalog-prefix list, so the
+    # client and the server-side seam can't disagree about a catalog id.
+    from omnigent.server.smart_routing import MODEL_ID_PREFIXES
+
+    assert client._model_prefixes == list(MODEL_ID_PREFIXES)
 
 
 def test_external_threads_model_prefix_scalar() -> None:
@@ -79,6 +83,46 @@ def test_external_defers_profile_auth_to_per_call() -> None:
     resolve.assert_not_called()  # deferred to per-call, not resolved at build
     assert isinstance(client, ExternalRoutingClient)
     assert client._auth is None  # static auth unused; token minted per call
+    assert client._databricks_profile == "staging"
+
+
+def test_external_falls_back_to_the_deployments_databricks_provider_profile() -> None:
+    """
+    A ``routing:`` block that names no profile still authenticates as the config's.
+
+    Otherwise the client falls through to the ambient SDK chain, which resolves
+    by host or ``[DEFAULT]``: on a workspace with two profiles on one host, the
+    router then authenticates as a different identity than the panes it routes,
+    and re-authing one leaves the other's token expired.
+    """
+    cfg = {
+        "providers": {
+            "ws": {"kind": "databricks", "profile": "eng-ml-agent-platform", "default": True},
+        },
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/v1",
+            "router_name": "task_v0",
+        },
+    }
+    client = _build_external_routing_client(cfg["routing"], None, cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._databricks_profile == "eng-ml-agent-platform"
+
+
+def test_externals_own_profile_still_wins_over_the_provider_block() -> None:
+    """An explicitly routed profile is the deployment saying which identity to use."""
+    cfg = {
+        "providers": {"ws": {"kind": "databricks", "profile": "agent"}},
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/v1",
+            "router_name": "task_v0",
+            "profile": "staging",
+        },
+    }
+    client = _build_external_routing_client(cfg["routing"], None, cfg)
+    assert isinstance(client, ExternalRoutingClient)
     assert client._databricks_profile == "staging"
 
 

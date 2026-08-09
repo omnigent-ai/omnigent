@@ -87,6 +87,10 @@ _REPLAY_POST_TIMEOUT_SECONDS = 5.0
 _REPLAY_DEADLINE_SECONDS = 30.0
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
+# A worker cancelled at loop teardown can no longer resolve its queued markers, so an
+# unbounded wait parks the caller for good. Under the runner's 10s auto-forwarder cancel
+# budget so this resolves first.
+_DELTA_MARKER_TIMEOUT_SECONDS = 5.0
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
 # Context-compaction progress edge. Publishes the same
 # ``response.compaction.in_progress`` / ``response.compaction.completed`` SSE
@@ -126,13 +130,14 @@ _CODEX_MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"
 # SYNTHESIZED: at forwarder start the config-declared servers are
 # recorded as ``starting`` (true — codex boots them all at thread start)
 # in the bridge dir and posted to Omnigent as ``external_mcp_startup``; the
-# round is settled (unresolved entries dropped) when the thread goes
-# idle after a turn — codex defers turn execution until startup ends, so
-# an idle edge proves the round is over — or when the config-derived
-# startup window elapses. ``cancelled`` states are recorded locally by
-# the Stop path. The notification handler is kept as a zero-cost path
-# for any delivery codex broadens later (it fully supersedes synthesis
-# when edges do arrive).
+# round is settled (unresolved entries dropped) when the first
+# model-produced item arrives or the thread goes idle after a turn —
+# codex defers turn EXECUTION until startup ends, so model output (and
+# the later idle edge) proves the round is over — or when the
+# config-derived startup window elapses. ``cancelled`` states are
+# recorded locally by the Stop path. The notification handler is kept as
+# a zero-cost path for any delivery codex broadens later (it fully
+# supersedes synthesis when edges do arrive).
 _CODEX_MCP_STARTUP_STATUS_METHOD = "mcpServer/startupStatus/updated"
 _CODEX_THREAD_STATUS_CHANGED_METHOD = "thread/status/changed"
 _EXTERNAL_MCP_STARTUP_TYPE = "external_mcp_startup"
@@ -382,6 +387,12 @@ class _CodexForwarderState:
 
     model: str | None = None
     posted_model: str | None = None
+    # The running thread's authoritative model, from a live
+    # ``thread/settings/updated``; beats a stale config.toml re-read.
+    settings_model: str | None = None
+    # The config.toml model as of the last _refresh_model_from_config read,
+    # so the refresh can tell an unchanged file from a rewritten one.
+    last_config_model: str | None = None
     effort: str | None = None
     posted_effort: str | None = None
     posted_effort_known: bool = False
@@ -419,6 +430,11 @@ class _CodexForwarderState:
     # the block finalizes when the turn's assistant message arrives.
     reasoning_stream_item_id: str | None = None
     turn_diff_by_turn: dict[str, str] = field(default_factory=dict)
+    # Whether model output has already settled the synthesized MCP startup
+    # round. The round is seeded once per forwarder connection (never on
+    # thread rotation), so a settled round stays settled and later items
+    # can skip re-reading the bridge file for the life of the session.
+    mcp_startup_settled: bool = False
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -457,6 +473,13 @@ class _CodexForwarderState:
             self._note_effort_fields(settings)
             self._note_collaboration_mode_fields(settings)
             self._note_approval_mode_fields(settings)
+            # Live thread settings are the running process's truth: remember
+            # the model so a stale config.toml re-read at the next
+            # turn/started cannot roll the mirror back (see
+            # _refresh_model_from_config).
+            model = settings.get("model")
+            if isinstance(model, str) and model:
+                self.settings_model = model
 
     def record_completed_plan(self, params: _JsonObject) -> None:
         """
@@ -1028,6 +1051,21 @@ class _DeltaChunk:
     tool_call_id: str | None = None
 
 
+def _resolve_marker(done: asyncio.Future[None]) -> None:
+    """
+    Complete a queue marker's future unless a cancelled caller already settled it.
+
+    An unguarded ``set_result`` on an already-cancelled future raises
+    ``InvalidStateError``, which kills the worker; ``_ensure_worker`` only replaces a
+    ``None`` task, so the dead one is never restarted and every later flush hangs.
+
+    :param done: Future the caller is waiting on.
+    :returns: None.
+    """
+    if not done.done():
+        done.set_result(None)
+
+
 @dataclass(frozen=True)
 class _DeltaFlushBarrier:
     """
@@ -1130,12 +1168,12 @@ class _OutputTextDeltaCoalescer:
 
         :returns: None after all earlier deltas have been posted.
         """
-        if self._worker_task is None:
+        if self._worker_task is None or self._worker_task.done():
             return
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushBarrier(done=done))
-        await done
+        await self._await_marker(done, "flush barrier")
 
     async def close(self) -> None:
         """
@@ -1145,12 +1183,51 @@ class _OutputTextDeltaCoalescer:
         """
         if self._worker_task is None:
             return
+        # A worker that already stopped will never read the marker, so skip
+        # straight to reaping it rather than waiting out the bound.
+        if self._worker_task.done():
+            self._worker_task = None
+            return
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushStop(done=done))
-        await done
-        await self._worker_task
+        await self._await_marker(done, "stop marker")
+        # Only reap a worker that has actually finished; awaiting a wedged one
+        # would reintroduce the unbounded wait this method exists to remove.
+        if self._worker_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
         self._worker_task = None
+
+    async def _await_marker(self, done: asyncio.Future[None], marker: str) -> None:
+        """
+        Wait for the worker to resolve a queue marker.
+
+        Races the marker against the worker itself: a worker that stops will never
+        resolve it, and at loop teardown the cancellation order between the worker
+        and the caller is arbitrary, so waiting on the marker alone stalls for the
+        full bound on an ordinary shutdown.
+
+        :param done: Future the worker resolves for this marker.
+        :param marker: Marker name used in the timeout log.
+        :returns: None once resolved, once the worker stops, or once the bound elapses.
+        """
+        worker = self._worker_task
+        waiters: set[asyncio.Future[None] | asyncio.Task[None]] = {done}
+        if worker is not None:
+            waiters.add(worker)
+        await asyncio.wait(
+            waiters,
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=_DELTA_MARKER_TIMEOUT_SECONDS,
+        )
+        if not done.done() and (worker is None or not worker.done()):
+            _logger.warning(
+                "codex delta coalescer %s timed out after %.1fs (session=%s)",
+                marker,
+                _DELTA_MARKER_TIMEOUT_SECONDS,
+                self._session_id,
+            )
 
     def _ensure_worker(self) -> None:
         """
@@ -1220,10 +1297,10 @@ class _OutputTextDeltaCoalescer:
                 buffer_chunk = None
                 buffered_chars = 0
                 flush_deadline = None
-                item.done.set_result(None)
+                _resolve_marker(item.done)
                 continue
             await self._flush_buffer(buffer, chunk=buffer_chunk)
-            item.done.set_result(None)
+            _resolve_marker(item.done)
             return
 
     async def _flush_buffer(
@@ -2450,6 +2527,21 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    # First model-produced item settles the synthesized MCP startup round
+    # mid-turn — codex defers turn execution until the round ends, so
+    # assistant-side output proves startup is over before the idle edge.
+    # Guarded by the state flag so only that first item pays the
+    # bridge-file read; every later item in the session short-circuits.
+    if (
+        not is_child
+        and (forwarder_state is None or not forwarder_state.mcp_startup_settled)
+        and _is_model_output_item_event(method, params)
+    ):
+        await _settle_mcp_startup(
+            client, session_id=session_id, bridge_dir=bridge_dir, reason="model output observed"
+        )
+        if forwarder_state is not None:
+            forwarder_state.mcp_startup_settled = True
     # item/started: register collab-agent children early (before item/completed)
     # so live child events can be routed to the child session immediately.
     # Only meaningful for the parent thread; children don't spawn grandchildren here.
@@ -2706,26 +2798,39 @@ async def _maybe_handle_codex_request(
 
 def _refresh_model_from_config(bridge_dir: Path, forwarder_state: _CodexForwarderState) -> None:
     """
-    Update the forwarder's known model from this session's ``config.toml``.
+    Update the forwarder's known model from config.toml and thread settings.
 
-    Reads the source-of-truth model via the shared
-    :func:`~omnigent.codex_native_bridge.read_codex_config_model` (the
-    ``model`` key an in-TUI ``/model`` writes — see that function for why
-    config.toml is the source of truth and its caveats) and stores it on
-    ``forwarder_state.model`` so a following ``_sync_model_change`` mirrors
-    it to Omnigent as ``model_override``. This mirror is a fallback to the codex
-    hook, which stamps the live model onto the evaluation request at gate
-    time; the gate prefers the hook's value. No-op when the model can't be
-    determined, leaving the prior value.
+    Reads the ``model`` key an in-TUI ``/model`` writes via the shared
+    :func:`~omnigent.codex_native_bridge.read_codex_config_model` and stores
+    the freshest value on ``forwarder_state.model`` so a following
+    ``_sync_model_change`` mirrors it to Omnigent as ``model_override``. This
+    mirror is a fallback to the codex hook, which stamps the live model onto
+    the evaluation request at gate time; the gate prefers the hook's value.
+
+    Precedence: a config.toml value that CHANGED since the last read wins
+    (an in-TUI ``/model`` or the executor's mirror write — the freshest
+    signal). An unchanged config defers to the last live
+    ``thread/settings/updated`` model when one was seen: an
+    Omnigent-initiated ``thread/settings/update`` switches the running
+    thread without touching config.toml, so re-adopting the stale file
+    would revert a routed model one turn after it applied. No-op when
+    nothing is known, leaving the prior value.
 
     :param bridge_dir: The session's native-Codex bridge directory.
     :param forwarder_state: Mutable forwarder state whose ``model`` is
         updated in place.
     :returns: None.
     """
-    model = read_codex_config_model(bridge_dir)
-    if model:
-        forwarder_state.model = model
+    config_model = read_codex_config_model(bridge_dir)
+    config_changed = bool(config_model) and config_model != forwarder_state.last_config_model
+    if config_model:
+        forwarder_state.last_config_model = config_model
+    if config_changed:
+        forwarder_state.model = config_model
+    elif forwarder_state.settings_model:
+        forwarder_state.model = forwarder_state.settings_model
+    elif config_model:
+        forwarder_state.model = config_model
 
 
 async def _sync_model_change(
@@ -3448,6 +3553,32 @@ def _is_thread_idle_status_event(method: str, params: _JsonObject) -> bool:
         return False
     status = params.get("status")
     return isinstance(status, dict) and status.get("type") == "idle"
+
+
+def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
+    """
+    Return whether an event carries a model-produced turn item.
+
+    The mid-turn settle signal for the synthesized MCP startup round:
+    codex defers turn execution until the round ends, so an
+    assistant-side item proves the round is over while the turn is still
+    running — the idle edge only fires after it. The turn's
+    ``userMessage`` item is excluded: like the thread-active edge, it
+    materializes when a turn is merely ACCEPTED, which happens
+    mid-startup.
+
+    :param method: Codex method value, e.g. ``"item/started"``.
+    :param params: Codex notification params.
+    :returns: ``True`` for an ``item/started`` / ``item/completed``
+        carrying a non-``userMessage`` item.
+    """
+    if method not in {"item/started", "item/completed"}:
+        return False
+    item = params.get("item")
+    if not isinstance(item, dict):
+        return False
+    item_type = item.get("type")
+    return isinstance(item_type, str) and item_type != "userMessage"
 
 
 async def _post_mcp_startup(

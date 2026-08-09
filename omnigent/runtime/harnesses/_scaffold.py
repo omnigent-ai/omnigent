@@ -104,8 +104,14 @@ _POLICY_EVAL_TIMEOUT_S = 86400.0
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).
 # Every non-heartbeat ``ctx.emit`` resets the deadline (see
 # ``_guarded_run_turn``), so a long-but-active turn is never killed.
+# The window must clear the longest single progress-free ``await`` a
+# healthy turn can make — notably context compaction, whose summarizing
+# LLM call runs as one long ``await`` emitting no non-heartbeat events
+# (see ``runtime/compaction.py``). On a near-full context that call can
+# exceed the old 240s cap, tripping the watchdog and wedging the session
+# in a "Prompt is too long" → compaction → 240s-timeout loop.
 # Env var name kept for the ops knob; ``<= 0`` disables.
-_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "240"))
+_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 
 # Absolute per-turn ceiling: a hard cap on TOTAL turn duration, backstop
 # to the idle watchdog above. The idle watchdog never trips a turn that

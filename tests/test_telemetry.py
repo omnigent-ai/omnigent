@@ -298,6 +298,23 @@ def test_fetch_remote_config_respects_rollout_percentage_boundaries(
     assert (result is not None) is included
 
 
+def test_fetch_remote_config_accepts_default_version() -> None:
+    """A config with omnigent_version='default' is accepted for any client version."""
+    import omnigent.telemetry.client as _mod
+
+    config = {
+        "omnigent_version": "default",
+        "ingestion_url": "https://telemetry.example.test",
+        "rollout_percentage": 100,
+    }
+    with patch("urllib.request.urlopen") as urlopen:
+        response = urlopen.return_value.__enter__.return_value
+        response.read.return_value = json.dumps(config).encode("utf-8")
+        result = _mod._fetch_remote_config()
+
+    assert result is not None
+
+
 # ── get_installation_id ──────────────────────────────────────────────────────
 
 

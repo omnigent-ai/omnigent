@@ -180,7 +180,7 @@ export function ReconnectSessionDialog({
           </TabsList>
           <TabsContent value="reconnect" className="flex flex-col gap-4">
             <p
-              className="text-sm text-muted-foreground"
+              className="text-ui text-muted-foreground"
               data-testid="reconnect-session-description"
             >
               {description}

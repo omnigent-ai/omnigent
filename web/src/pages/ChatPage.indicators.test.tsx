@@ -158,7 +158,9 @@ describe("RunnerStartingIndicator", () => {
 
 describe("BubbleView dispatch", () => {
   beforeEach(() => {
-    useChatStore.setState({ conversationId: "conv_test" });
+    // Explicitly settled: the fold-only cases below turn on `possiblyLive`
+    // being false, so they must not ride on the store's default status.
+    useChatStore.setState({ conversationId: "conv_test", sessionStatus: "idle" });
   });
 
   type AssistantBubble = Extract<Bubble, { kind: "assistant" }>;
@@ -188,6 +190,7 @@ describe("BubbleView dispatch", () => {
     );
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "user");
+    expect(bubble).toHaveClass("max-w-[640px]");
     expect(bubble).toHaveTextContent("hello there");
   });
 
@@ -197,8 +200,9 @@ describe("BubbleView dispatch", () => {
     render(<BubbleView bubble={assistantText("the answer is 42")} />);
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveAttribute("data-role", "assistant");
+    expect(bubble).toHaveClass("gap-2");
     expect(bubble).toHaveTextContent("the answer is 42");
-    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
   });
 
   it("uses full-width layout for assistant display math", () => {
@@ -221,6 +225,92 @@ describe("BubbleView dispatch", () => {
     // itself instead of vanishing.
     render(<BubbleView bubble={{ ...assistantText("", "failed"), error: "rate limited" }} />);
     expect(screen.getByText(/Error: rate limited/)).toBeInTheDocument();
+  });
+
+  const toolItem = (callId: string): AssistantBubble["items"][number] => ({
+    kind: "tool",
+    itemId: callId,
+    execution: {
+      name: "Bash",
+      arguments: { command: "ls" },
+      argsSummary: "ls",
+      callId,
+      agentName: "coder",
+      executedBy: "server",
+      output: "ok",
+    },
+    output: "ok",
+    state: "output-available",
+    startedAt: 0,
+    duration: 1,
+  });
+
+  /** A turn that yielded mid-task: its whole trace folds, its answer lands later. */
+  const foldOnlyBubble = (items: AssistantBubble["items"]): AssistantBubble => ({
+    kind: "assistant",
+    responseId: "resp_fold",
+    stableId: "resp_fold",
+    lifecycle: "completed",
+    error: null,
+    items,
+    workedForS: 147,
+    continued: true,
+  });
+
+  it("gives fold-only turns the same chrome whether or not the hidden trace narrated", () => {
+    // WHY: the copy/fork row keys off ALL the bubble's text, including text
+    // sealed inside the fold — so an otherwise identical collapsed row grew a
+    // row of hover-only chrome purely because its hidden trace happened to
+    // narrate, and consecutive "Worked for" rows sat at two different gaps.
+    render(
+      <BubbleView
+        bubble={foldOnlyBubble([
+          { kind: "text", itemId: "t1", text: "Let me look at the code.", final: false },
+          toolItem("c1"),
+        ])}
+      />,
+    );
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+    // Nothing below the fold: the collapsed row is the bubble's whole height.
+    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+    cleanup();
+
+    render(<BubbleView bubble={foldOnlyBubble([toolItem("c2"), toolItem("c3")])} />);
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+  });
+
+  it("spans the column for a fold-only turn so the row's hairline draws", () => {
+    // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
+    // (a flex-1 span) collapses to zero width and the click target stops
+    // short of the column. The max-w-3xl cap keeps it aligned with the rule
+    // under an answered turn.
+    render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-3xl");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+  });
+
+  it("keeps the copy action on a folded turn that answers for itself", () => {
+    // WHY: the suppression must stop at bubbles with a visible answer —
+    // that trailing prose is exactly what copy/fork act on.
+    render(
+      <BubbleView
+        bubble={{
+          ...foldOnlyBubble([
+            toolItem("c5"),
+            { kind: "text", itemId: "t2", text: "Done — here's the fix.", final: true },
+          ]),
+          continued: false,
+        }}
+      />,
+    );
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.getByText("Done — here's the fix.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 
   it("renders the compacting shimmer for a compaction_loading bubble", () => {

@@ -29,14 +29,14 @@ Two templates:
 | Template | Auto-labels | Required | Optional hints |
 |---|---|---|---|
 | Bug Report | `bug`, `needs-triage` | Description only | Component, repro steps, version, OS |
-| Feature Request | `enhancement`, `needs-triage` | Problem/use case only | Proposed solution, alternatives |
+| Feature Request | `Feature`, `needs-triage` | Problem/use case only | Proposed solution, alternatives |
 
 Questions redirect to GitHub Discussions (via `config.yml` contact link) - they aren't actionable work and would clog the issue tracker. Blank issues enabled for anything that doesn't fit a template.
 
 
 ### Stage 2 - AI Triage
 
-Triggered on every new issue. The bot classifies, deduplicates, resolves what it can, and escalates the rest - **labels only, no comments** (see [why not comments](#decision-labels-only-no-bot-comments)).
+Triggered on every new issue. The bot classifies, deduplicates, resolves what it can, and escalates the rest. It posts one concise duplicate-check comment so the author always knows why the issue was closed or left open.
 
 **What the bot does:**
 
@@ -45,11 +45,11 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 3. **Assigns priority** - one of `P0-critical`, `P1-high`, `P2-medium`, `P3-low`
 4. **Routes to contributors** - adds `good-first-issue` for well-scoped, self-contained issues; `help-wanted` for issues needing community help with more context
 5. **Flags incomplete issues** - adds `needs-info` if repro steps are missing or description is too vague (replaces priority label)
-6. **Detects duplicates** - adds `duplicate` label and posts ONE comment: "Potential duplicate of #NNN. React 👎 to contest." This is the only case the bot comments.
+6. **Detects duplicates** - unions several short title searches with explicitly referenced issues, ranks the candidates, and comments with exact, similar, or no-match results; adds `duplicate` when a validated candidate reaches at least 0.92 confidence and passes an independent deterministic lexical near-copy gate, then closes with GitHub's native duplicate link only when the rollout flag is enabled
 
 **What the bot does NOT do:**
-- Post explanations, suggestions, or verbose responses
-- Close issues (the lifecycle bot handles that)
+- Post suggestions or verbose responses beyond the duplicate-check result
+- Close issues unless they are validated high-confidence duplicates
 - Re-triage after initial classification (maintainers can override freely)
 
 **Tool:** `omnigent run .github/triage/` via GitHub Actions workflow, triggered `on: issues: [opened]`. The triage agent is a tool-less Claude SDK harness that outputs structured JSON; all GitHub mutations (labeling, assignment, comments) happen in trusted workflow steps that validate against allowlists. LLM credentials route through the Databricks gateway (`LLM_API_KEY` + `GATEWAY_BASE_URL`). Permissions: `issues: write` only.
@@ -58,7 +58,8 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 
 | Issue state | What happens | Human needed? |
 |---|---|---|
-| **Duplicate** | 3-day grace period → auto-close (unless reporter reacts 👎) | No |
+| **Duplicate** | Comment and label with the canonical issue; leave open by default, or close when the rollout flag is enabled | No |
+| **Similar issue** | Comment with up to three related issues → leave open | No |
 | **`needs-info`**, reporter responds | Bot removes `needs-info`, re-adds `needs-triage`, bot re-triages | No |
 | **`needs-info`**, no response 14d | Marked `stale` → closed after 7 more days | No |
 | **`good-first-issue`** | Contributor claims via comment, starts working | No (until PR review) |
@@ -73,8 +74,8 @@ A maintainer only sees issues that the bot could not fully resolve. The escalati
 
 - **`P0-critical` / `P1-high`** - always escalated; exempt from stale bot
 - **`needs-triage` still present** - bot wasn't confident enough to classify
-- **Duplicate contested** - reporter reacted 👎 on the duplicate comment
-- **Complex feature requests** - labeled `enhancement` + `P2-medium` or higher
+- **Duplicate contested** - reporter comments that the reports are materially different
+- **Complex feature requests** - labeled `Feature` + `P2-medium` or higher
 
 Maintainers work from a filtered view: `is:issue is:open label:P0-critical,P1-high,needs-triage -label:stale`. Everything else is either being handled by the bot/lifecycle or picked up by contributors.
 
@@ -97,11 +98,11 @@ Maintainers can always reassign. The bot doesn't re-assign after initial routing
 
 ## Key Decisions
 
-### Decision: Labels-only, no bot comments
+### Decision: One concise duplicate-check comment
 
-The bot applies labels but does NOT post comments (except for duplicate flagging).
+The bot posts exactly one duplicate-check comment on every new issue. The comment identifies an exact duplicate, links potentially related issues, or says no confident match was found. It does not suggest fixes or attempt an ongoing conversation.
 
-**Why:** LangChain's Dosu bot received significant community backlash ([discussion #25153](https://github.com/langchain-ai/langchain/discussions/25153)) for "polluting reported issues" with verbose, often unhelpful AI-generated responses. Claude Code's labels-only approach handles 2K+ issues/week without this problem. Labels are machine-readable, filterable, and silent - comments are noisy and set expectations of a conversation the bot can't sustain.
+**Why:** Authors need to understand automated closure decisions and benefit from discovering related work even when the match is uncertain. Keeping the response short, templated, and limited to duplicate detection avoids the verbose, speculative behavior that caused backlash against bots such as Dosu ([discussion #25153](https://github.com/langchain-ai/langchain/discussions/25153)).
 
 ### Decision: Omnigent triage agent over `claude-code-action`
 
@@ -119,11 +120,13 @@ Use `omnigent run .github/triage/` as the triage engine — a tool-less Claude S
 | Pullfrog AI | Model-agnostic BYOK (by Zod author, May 2026). Strong fallback, but newer and less proven at scale |
 | Manual-only | Doesn't scale beyond current volume |
 
-### Decision: Duplicate closure with veto
+### Decision: High-confidence duplicate closure
 
-Duplicates get a 3-day grace period. Reporter can react 👎 to prevent closure. Non-bot comments also block auto-closure.
+Duplicates become eligible for immediate closure only when the classifier selects a prefetched candidate, reports at least 0.92 confidence, and a deterministic lexical check finds strong title and document overlap. The lexical gate is intentionally conservative but is not a prompt-injection boundary: issue text remains attacker-controlled. Model confidence alone cannot authorize a destructive action, and any match that fails the gate is linked as similar and left open. Public reasons are fixed templates rather than model-authored prose. A prior bot comment vetoes reruns so a maintainer reopening an issue is durable.
 
-**Why:** Claude Code's dedupe bot drives 49-71% of all closures - highest-ROI automation. But false positives erode trust, so the veto mechanism is essential. Conservative duplicate detection (only flag clear matches) plus human override keeps the error rate low.
+Automatic closure is additionally controlled by the repository variable `ISSUE_TRIAGE_CLOSE_DUPLICATES`. It defaults to `false`, so validated duplicates are labeled, linked, and left open while maintainers measure precision and blast radius. Set the variable to the exact string `true` to enable native duplicate closure without another code change. Classification and comments are identical in both modes except that the disposition sentence says whether the issue was left open or closed.
+
+**Why:** Duplicate detection is high-ROI automation, but false positives erode trust. Candidate allowlisting, a conservative confidence threshold, an independent lexical near-copy gate, downgrade-to-similar behavior, strict single-object JSON parsing, clean-exit gating, templated public reasons, and a durable human-override veto keep auto-closure narrow and reviewable even when issue content is adversarial.
 
 ### Decision: Stale lifecycle with exemptions
 
@@ -137,7 +140,7 @@ Duplicates get a 3-day grace period. Reporter can react 👎 to prevent closure.
 
 | Category | Labels | Purpose |
 |---|---|---|
-| **Type** | `bug`, `enhancement`, `documentation` | What kind of issue |
+| **Type** | `bug`, `Feature`, `Docs` | What kind of issue |
 | **Triage** | `needs-triage`, `triaged`, `needs-info`, `duplicate`, `wontfix` | Triage state |
 | **Priority** | `P0-critical`, `P1-high`, `P2-medium`, `P3-low` | Severity |
 | **Component** | `comp:server`, `comp:runner`, `comp:repr`, `comp:web-ui`, `comp:policies`, `comp:harnesses`, ... | Which subsystem (mirrors CODEOWNERS) |
@@ -172,7 +175,7 @@ Use `actions/first-interaction` to post a short welcome message on a contributor
 - **LLM credentials route through the gateway** - `LLM_API_KEY` + `GATEWAY_BASE_URL` via Databricks, not a direct Anthropic API key. The `GH_TOKEN` is only available in trusted steps, never in the LLM step.
 - **Workflow has `issues: write` only** - no code access, no `contents: write`
 - **No bot-driven code changes** - all code changes go through the existing PR + maintainer approval + security scan pipeline
-- **Duplicate closure has a veto** - reporter reacts 👎 to block
+- **Duplicate closure is conservative and reversible** - only allowlisted matches at ≥0.92 close; authors can comment and maintainers can reopen
 - **Stale closure is reversible** - anyone can reopen
 - **`pull_request_target` in welcome bot** is safe - static comment only, no fork code checkout
 - **Bot-opened issues are skipped** - the workflow checks `!endsWith(github.event.issue.user.login, '[bot]')` to prevent feedback loops
@@ -221,7 +224,7 @@ Scale: ~6K open issues, ~2K-2.5K new/week.
 
 ### Common takeaways
 
-1. AI triage works best as **labeling, not commenting**
+1. AI triage comments should be **concise, templated, and decision-specific**
 2. **Duplicate detection** is the highest-ROI automation (drives majority of closures in Claude Code)
 3. **"AI slop" is emerging** - HF and vLLM both created explicit labels for it
 4. **Structured templates** are table stakes for any project at scale

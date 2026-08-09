@@ -563,8 +563,6 @@ class SqlSessionPermission(OmnigentBase):
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage. Each level subsumes the
         ones below it (comparison is ``>=``).
-    :param can_approve: Owner-controlled authority to resolve privileged
-        action approvals for this session.
     """
 
     __tablename__ = "session_permissions"
@@ -586,12 +584,6 @@ class SqlSessionPermission(OmnigentBase):
         primary_key=True,
     )
     level: Mapped[int] = mapped_column(Integer, nullable=False)
-    can_approve: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        server_default=false(),
-        default=False,
-    )
 
     __table_args__ = (
         CheckConstraint("level IN (1, 2, 3, 4)", name="ck_session_permissions_level"),
@@ -681,15 +673,15 @@ class SqlProject(OmnigentBase):
     membership lives on ``omnigent_conversation_metadata.project_id``, not
     here; there is no DB foreign key (Rule R032).
 
-    Ownership is stamped on the row via ``owner_user_id`` (like
-    ``scheduled_tasks``), not derived from a permission table the way session
-    ownership is — projects have no ACL of their own and are never shared.
+    Ownership is stamped on the row via ``user_id`` (like ``scheduled_tasks``),
+    not derived from a permission table the way session ownership is — projects
+    have no ACL of their own and are never shared.
 
     :param id: Uuid16 primary key (bare 32-char hex in Python).
-    :param name: Human-readable project name; unique per owner (enforced in
-        the store, since ``owner_user_id`` is NULL in single-user mode and a DB
-        unique index treats NULLs as distinct).
-    :param owner_user_id: Owning user, or ``None`` in single-user mode.
+    :param name: Human-readable project name; unique per owner, enforced in the
+        store (``_name_taken``) rather than by a DB constraint — see
+        ``__table_args__``.
+    :param user_id: Owning user, or ``None`` in single-user mode.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
     """
@@ -706,7 +698,9 @@ class SqlProject(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
-    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Owning user identity. String(128) matches session_permissions.user_id and
+    # every other user-identity column in this schema.
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Default session settings as a compact JSON object (host/workspace/harness/
@@ -714,32 +708,36 @@ class SqlProject(OmnigentBase):
     # keys are an opaque, client-owned vocabulary: the value is read and written
     # whole with the row and never filtered in SQL, so new keys need no schema
     # change. Stored values are hints the new-chat dialog pre-fills and the user
-    # can always override.
-    config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # can always override. Opaque and never SQL-filtered — stored compressed
+    # (CompressedText).
+    config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
     __table_args__ = (
-        # "list my projects" — prefix scan on (workspace_id, owner_user_id) with
+        # "list my projects" — prefix scan on (workspace_id, user_id) with
         # created_at in the key so the ORDER BY created_at, id is served by the
         # index (no filesort). Server returns a stable order; reorder, if ever
         # added, is a client-only concern, so there is no ``position`` column.
+        #
+        # Also covers the two name lookups via its (workspace_id, user_id)
+        # prefix: the store's ``_name_taken`` probe and the ``?project=<name>``
+        # member join. Both then filter ``name`` over the owner's handful of
+        # rows, so neither needs a name-leading index of its own.
+        #
+        # There is deliberately NO unique index on (workspace_id, user_id, name).
+        # Per-owner name uniqueness is a store-level check (``_name_taken``), not
+        # a DB constraint: it never held for single-user mode anyway (``user_id``
+        # is NULL there and SQL treats NULLs as distinct), and ``name`` is
+        # mutable, so a unique key over it is maintained on every rename. The
+        # cost is that two concurrent creates/renames to the same name can both
+        # land; the member join already tolerates duplicate names by
+        # construction, since it unions first-class members with label-projects
+        # matched on the same string.
         Index(
-            "ix_projects_owner_user_id",
+            "ix_projects_user_id",
             "workspace_id",
-            "owner_user_id",
+            "user_id",
             "created_at",
             "id",
-        ),
-        # Enforces per-owner name uniqueness at the DB layer for NON-NULL owners
-        # (closing the store's check-then-insert race under concurrency). SQL
-        # treats NULLs as distinct, so single-user rows (owner_user_id IS NULL)
-        # can still collide on name — the store's _name_taken check covers that
-        # case. Also backs the get-by-name lookup.
-        Index(
-            "ix_projects_name",
-            "workspace_id",
-            "owner_user_id",
-            "name",
-            unique=True,
         ),
     )
 

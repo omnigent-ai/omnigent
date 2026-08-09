@@ -1248,12 +1248,14 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
 ) -> None:
     """Spec resolver failures are surfaced as structured 503 errors.
 
     :param caplog: Pytest log capture, used to confirm the raw cause is
         logged server-side (the other half of the log-and-genericize
         contract).
+    :param pinned_runner_log: The log path the detail must name.
     :returns: None.
     """
 
@@ -1289,11 +1291,13 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
 
     assert response.status_code == 503
     body = response.json()
-    # The structured error slug is preserved for the caller; the detail is a
-    # fixed client-safe string. The raw resolver exception text must not leak
-    # into the HTTP body (it is logged on the runner instead).
+    # The structured error slug is preserved for the caller; the detail names
+    # the runner log holding the cause. The raw resolver exception text must
+    # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
-    assert body["detail"] == "Request failed on the runner; see runner logs for details."
+    assert body["detail"] == (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
     assert "spec resolver unavailable" not in body["detail"]
     # The other half of the contract: the raw cause IS logged for operators.
     # If this fails, log-and-genericize logged nothing and the detail is the
@@ -3366,7 +3370,7 @@ async def test_sys_session_send_model_rejected_for_unplumbed_harness(
         pytest.param(
             "codex-native",
             "databricks-claude-sonnet-4-6",
-            "only runs GPT models",
+            "only runs codex-compatible models",
             id="claude-on-codex",
         ),
         pytest.param(
@@ -6411,6 +6415,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         requested_paths.append(request.url.path)
         if request.url.path == "/v1/sessions/conv_caller":
+            assert request.url.params["include_items"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6419,6 +6424,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
                     "agent_name": "main",
                     "status": "idle",
                     "created_at": 1,
+                    "updated_at": 42,
                     "runner_id": None,
                     "pending_elicitations": [],
                 },
@@ -6442,6 +6448,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     # never queried (a stray /v1/runners call would mean the None-runner
     # short-circuit regressed).
     assert info["runner_online"] is None
+    assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
@@ -6816,6 +6823,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            assert request.url.params["include_items"] == "false"
+            assert request.url.params["include_liveness"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6824,6 +6833,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_name": "researcher",
                     "status": "running",
                     "created_at": 1,
+                    "updated_at": 84,
                     "title": "auth flow",
                     "runner_id": "runner_1",
                     "host_id": None,
@@ -6855,6 +6865,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
     assert info["agent_name"] == "researcher"

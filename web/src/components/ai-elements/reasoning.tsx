@@ -151,7 +151,7 @@ export const ReasoningTrigger = memo(
       return (
         <div
           className={cn(
-            "flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs",
+            "flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm",
             className,
           )}
         >
@@ -163,7 +163,7 @@ export const ReasoningTrigger = memo(
     return (
       <CollapsibleTrigger
         className={cn(
-          "flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground",
+          "flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground",
           className,
         )}
         {...props}
@@ -189,7 +189,7 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
   return (
     <CollapsibleContent
       className={cn(
-        "mt-1 ml-2 border-l pl-3 py-1 text-xs",
+        "mt-1 ml-2 border-l pl-3 py-1 text-sm",
         "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
         className,
       )}

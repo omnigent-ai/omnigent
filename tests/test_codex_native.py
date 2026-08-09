@@ -14,6 +14,7 @@ from typing import Any
 import click
 import httpx
 import pytest
+import tomllib
 import yaml
 
 from omnigent import codex_native, codex_native_app_server, codex_native_forwarder
@@ -80,7 +81,7 @@ def _point_codex_auth_check_at(
         # on the auth-path decision.
         monkeypatch.setattr(
             "omnigent.onboarding.harness_install.harness_cli_installed",
-            lambda _key: True,
+            lambda _key, **_kw: True,
         )
 
 
@@ -1097,6 +1098,43 @@ def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
         remote_url="ws://127.0.0.1:9876",
     )
     assert "--dangerously-bypass-hook-trust" not in args
+
+
+def test_trust_codex_project_updates_private_config_only(tmp_path: Path) -> None:
+    """Headless startup trusts the workspace without changing shared config."""
+    source_config = tmp_path / "shared-config.toml"
+    source_text = '[projects."/existing"]\ntrust_level = "untrusted"\n'
+    source_config.write_text(source_text, encoding="utf-8")
+    codex_home = tmp_path / "private-home"
+    codex_home.mkdir()
+    private_config = codex_home / "config.toml"
+    private_config.write_text(source_text, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    codex_native_app_server._trust_codex_project(codex_home, workspace)
+
+    parsed = tomllib.loads(private_config.read_text(encoding="utf-8"))
+    assert parsed["projects"][str(workspace.resolve())]["trust_level"] == "trusted"
+    assert parsed["projects"]["/existing"]["trust_level"] == "untrusted"
+    assert source_config.read_text(encoding="utf-8") == source_text
+
+
+def test_build_codex_native_server_does_not_trust_project_by_default(
+    tmp_path: Path,
+) -> None:
+    """Interactive Codex launches retain the normal project trust prompt."""
+    app_server = codex_native_app_server.build_codex_native_server(
+        socket_path=tmp_path / "app.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path / "workspace",
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+    )
+
+    assert app_server.trust_project is False
 
 
 def test_codex_app_server_client_uses_codex_remote_handshake(
@@ -6658,6 +6696,113 @@ def test_local_run_prints_resume_hint_after_attach(
     assert resume_hint in captured.err
     assert captured.err.index(web_ui) < captured.err.index(resume_hint)
     assert opened == [("http://127.0.0.1:23456", "conv_codex_fresh", True)]
+
+
+def test_local_run_resume_hint_follows_native_new_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The resume hint names the session a native ``/new`` rotated into.
+
+    Codex ``/new`` starts a fresh thread and the forwarder rotates
+    Omnigent ownership to a new conversation, recording it in bridge
+    state. A regression that echoes the launch-time ``prepared`` id
+    instead hands the user a command that resumes the session they
+    already cleared away from.
+    """
+    spec_path = tmp_path / "codex.yaml"
+    spec_path.write_text("name: codex-native-ui\nprompt: hi\n", encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+
+    class _Proc:
+        """Stub for the local server subprocess."""
+
+        def poll(self) -> None:
+            """
+            Pretend the fake local server is alive.
+
+            :returns: None.
+            """
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        """
+        Return a minimal server handle without starting a process.
+
+        :param args: Positional startup arguments.
+        :param kwargs: Keyword startup arguments.
+        :returns: Fake local server handle.
+        """
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def fake_prepare(**kwargs: object) -> codex_native.PreparedCodexTerminal:
+        """
+        Return prepared Codex terminal details without launching Codex.
+
+        :param kwargs: Terminal preparation keyword arguments.
+        :returns: Prepared fake terminal.
+        """
+        del kwargs
+        return codex_native.PreparedCodexTerminal(
+            session_id="conv_codex_first",
+            terminal_id=codex_native.codex_terminal_resource_id(),
+            tmux_socket=None,
+            tmux_target=None,
+            bridge_dir=bridge_dir,
+            thread_id="thread_first",
+            app_server_url="ws://127.0.0.1:9876",
+            app_server=None,
+            event_client=None,
+            reattached=False,
+        )
+
+    async def fake_attach_with_forwarder(**kwargs: object) -> None:
+        """
+        Simulate a session where the user ran a native ``/new``.
+
+        :param kwargs: Attach keyword arguments.
+        :returns: None.
+        """
+        del kwargs
+        write_bridge_state(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id="conv_codex_rotated",
+                socket_path="ws://127.0.0.1:9876",
+                thread_id="thread_rotated",
+                codex_home=str(bridge_dir / "codex-home"),
+            ),
+        )
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 23456)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(codex_native, "_prepare_codex_terminal", fake_prepare)
+    monkeypatch.setattr(codex_native, "_attach_with_forwarder", fake_attach_with_forwarder)
+    monkeypatch.setattr(
+        codex_native,
+        "open_conversation_link_if_enabled",
+        lambda **kwargs: None,
+    )
+
+    codex_native._run_with_local_server(
+        spec_path,
+        session_id=None,
+        resume_picker=False,
+        codex_args=(),
+        command="codex",
+        model=None,
+        prompt=None,
+        auto_open_conversation=False,
+    )
+
+    captured = capsys.readouterr()
+    assert "Resume with: omnigent codex --resume conv_codex_rotated" in captured.err
+    assert "--resume conv_codex_first" not in captured.err
 
 
 def test_local_resume_does_not_print_redundant_resume_hint(

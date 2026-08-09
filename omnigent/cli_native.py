@@ -74,6 +74,9 @@ def register_native_commands(cli: click.Group) -> None:
     )
     _resolve_harness_startup_args = _late_bound(lambda: _cli._resolve_harness_startup_args)
     _split_resume_value = _late_bound(lambda: _cli._split_resume_value)
+    _reject_smart_routing_prompt = _late_bound(lambda: _cli._reject_smart_routing_prompt)
+    _reject_smart_routing_resume = _late_bound(lambda: _cli._reject_smart_routing_resume)
+    _smart_routing_decision = _late_bound(lambda: _cli._smart_routing_decision)
 
     @cli.command(
         context_settings={
@@ -155,6 +158,22 @@ def register_native_commands(cli: click.Group) -> None:
             "flag will be removed in a future release."
         ),
     )
+    @click.option(
+        "-p",
+        "--prompt",
+        default=None,
+        help="Open the Claude Code TUI with this as its initial prompt.",
+    )
+    @click.option(
+        "--smart-routing",
+        "smart_routing",
+        is_flag=True,
+        default=False,
+        help=(
+            "Let the server pick the model for this session. The first message "
+            "you type in the TUI is what gets routed, so this takes no -p."
+        ),
+    )
     @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
     def claude(
         server: str | None,
@@ -164,6 +183,8 @@ def register_native_commands(cli: click.Group) -> None:
         use_claude_config: bool,
         profile_startup: bool,
         claude_command: str | None,
+        prompt: str | None,
+        smart_routing: bool,
         claude_args: tuple[str, ...],
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
@@ -173,6 +194,9 @@ def register_native_commands(cli: click.Group) -> None:
         # :param use_claude_config: When True, skip ucode/Databricks auth and use
         #     existing Claude config.
         # :param profile_startup: When True, print startup timing marks.
+        # :param prompt: Optional initial TUI prompt.
+        # :param smart_routing: When True, arm Smart Routing for the session so
+        #     the first typed message picks the model.
         # :param claude_args: Pass-through args for ``claude``.
         """Launch Claude Code with Omnigent.
 
@@ -182,8 +206,13 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent claude --resume conv_abc123
           omnigent claude --resume                  # interactive picker
           omnigent claude --server https://<app>.databricksapps.com
+          omnigent claude --smart-routing           # first message picks the model
         """
         _reject_native_on_windows("claude")
+        if smart_routing:
+            # Validate before any side effects (daemon spawn, server discovery)
+            # so an unroutable invocation fails instantly.
+            _reject_smart_routing_prompt(prompt)
         startup_profiler = StartupProfiler.from_env(
             name="omnigent claude",
             env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -210,6 +239,12 @@ def register_native_commands(cli: click.Group) -> None:
             raise click.UsageError(
                 "--session and --resume are mutually exclusive; "
                 "prefer --resume (--session is deprecated).",
+            )
+        if smart_routing:
+            _reject_smart_routing_resume(
+                resuming=choice.picker
+                or choice.conversation_id is not None
+                or session_id is not None
             )
         startup_profiler.mark("arguments validated")
 
@@ -243,11 +278,19 @@ def register_native_commands(cli: click.Group) -> None:
             explicit=claude_command,
             cfg=cfg,
         )
+        extra_args = _resolve_harness_startup_args(cfg, "claude-native", claude_args)
+        if smart_routing:
+            # Arming creates the session (that is where Smart Routing is turned
+            # on and the decision card lands), so attach to it instead of
+            # letting the wrapper bundle a fresh one.
+            armed = _smart_routing_decision(server=server, harness="claude-native")
+            resolved_session_id = armed.session_id or resolved_session_id
         run_claude_native(
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            extra_args=_resolve_harness_startup_args(cfg, "claude-native", claude_args),
+            extra_args=extra_args,
+            prompt=prompt,
             use_claude_config=use_claude_config,
             auto_open_conversation=auto_open_conversation,
             startup_profiler=startup_profiler,
@@ -298,6 +341,16 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help="Send this as the first message after the Codex TUI starts.",
     )
+    @click.option(
+        "--smart-routing",
+        "smart_routing",
+        is_flag=True,
+        default=False,
+        help=(
+            "Let the server pick the model for this session. The first message "
+            "you type in the TUI is what gets routed, so this takes no -p."
+        ),
+    )
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
     def codex(
         server: str | None,
@@ -305,6 +358,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         model: str | None,
         prompt: str | None,
+        smart_routing: bool,
         codex_args: tuple[str, ...],
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
@@ -313,6 +367,8 @@ def register_native_commands(cli: click.Group) -> None:
         # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
         # :param model: Codex model id.
         # :param prompt: Optional first prompt.
+        # :param smart_routing: When True, arm Smart Routing for the session so
+        #     the first typed message picks the model.
         # :param codex_args: Pass-through args for ``codex`` before ``resume``.
         """Launch Codex with Omnigent.
 
@@ -322,13 +378,24 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent codex --resume conv_abc123
           omnigent codex --resume                  # interactive picker
           omnigent codex --server https://<app>.databricksapps.com
+          omnigent codex --smart-routing           # first message picks the model
         """
         _reject_native_on_windows("codex")
+        if smart_routing:
+            # Validate before any side effects (daemon spawn, server discovery)
+            # so an unroutable invocation fails instantly.
+            _reject_smart_routing_prompt(prompt)
         choice = _split_resume_value(resume)
         if session_id is not None and (choice.picker or choice.conversation_id is not None):
             raise click.UsageError(
                 "--session and --resume are mutually exclusive; "
                 "prefer --resume (--session is deprecated).",
+            )
+        if smart_routing:
+            _reject_smart_routing_resume(
+                resuming=choice.picker
+                or choice.conversation_id is not None
+                or session_id is not None
             )
 
         from omnigent.codex_native import run_codex_native
@@ -357,6 +424,12 @@ def register_native_commands(cli: click.Group) -> None:
             explicit=None,
             cfg=cfg,
         )
+        if smart_routing:
+            # Attach to the armed session — arming created it. Nothing is picked
+            # yet, so ``model`` keeps whatever the user or config asked for
+            # until the first typed message routes.
+            armed = _smart_routing_decision(server=server, harness="codex-native")
+            resolved_session_id = armed.session_id or resolved_session_id
         run_codex_native(
             server=server,
             session_id=resolved_session_id,

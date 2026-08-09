@@ -66,6 +66,21 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
+def _select_view_mode(page: Page, option: str) -> None:
+    """Click the header Chat/Terminal switcher's *option* segment.
+
+    Both destinations are always on screen (a segmented control, not a menu),
+    so this is a single click with no menu to open first.
+
+    :param page: The Playwright page, on the session's chat surface.
+    :param option: The segment to activate, ``"Chat"`` or ``"Terminal"``.
+    """
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=30_000)
+    segment = page.get_by_test_id(f"view-mode-{option.lower()}")
+    expect(segment).to_be_enabled(timeout=30_000)
+    segment.click()
+
+
 def _ensure_chat_view(page: Page) -> None:
     """Switch a terminal-first (native) session to its chat bubble view.
 
@@ -76,13 +91,9 @@ def _ensure_chat_view(page: Page) -> None:
 
     :param page: The Playwright page, on the session's chat surface.
     """
-    view_mode = page.get_by_test_id("view-mode-toggle")
-    if view_mode.count() == 0:
+    if page.get_by_test_id("view-mode-toggle").count() == 0:
         return
-    view_mode.click()
-    chat_item = page.get_by_role("menuitemradio", name="Chat")
-    expect(chat_item).to_be_visible(timeout=30_000)
-    chat_item.click()
+    _select_view_mode(page, "Chat")
 
 
 def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:
@@ -334,27 +345,38 @@ def test_tool_run_fold_semantic_label(
     page: Page,
     tool_fold_session: tuple[str, str],
 ) -> None:
-    """A completed tool run folds into a semantic action summary, like the TUI.
+    """A settled turn folds its process trace, with semantic tool labels inside.
 
     The ``tool_fold_probe`` agent deterministically runs
     ``sys_os_shell("ls")`` then ``sys_os_read("README.md")`` before
-    replying. Once the turn settles, the chat view must collapse that run
-    into a single summary row labeled with the actions taken — "Listed 1
-    directory, read 1 file" (``formatToolRunLabel`` in
-    ``web/src/lib/toolTitle.ts``) — matching the native CLIs' step
-    one-liners, not a generic "See N steps" count. Expanding the row must
-    reveal the individual tool cards.
+    replying. Once the turn settles, the chat view collapses the whole
+    process trace behind the "Worked" row (``TurnWorkedFold`` in
+    ``BlockRenderer.tsx``), leaving the final answer visible. Expanding
+    that row must reveal the tool run collapsed into its semantic action
+    summary — "Listed 1 directory, read 1 file" (``formatToolRunLabel``
+    in ``web/src/lib/toolTitle.ts``), matching the native CLIs' step
+    one-liners, not a generic "See N steps" count — and expanding the
+    summary must reveal the individual tool cards.
     """
     base_url, session_id = tool_fold_session
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
     _send(page, "Inspect the workspace.")
 
-    # The fold only forms once the wrap-up text lands (a live run keeps its
-    # streaming tail visible), so waiting for the label covers the turn.
-    fold = page.get_by_text("Listed 1 directory, read 1 file", exact=True)
-    expect(fold).to_be_visible(timeout=_CUSTOM_TURN_TIMEOUT_MS)
+    # The Worked row only forms once the wrap-up text lands and the turn
+    # settles (a live turn keeps its trace expanded), so waiting for it
+    # covers the turn.
+    worked = page.get_by_test_id("turn-worked-fold")
+    expect(worked).to_be_visible(timeout=_CUSTOM_TURN_TIMEOUT_MS)
     expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
+    # The final answer stays visible outside the fold.
+    expect(page.get_by_text("Workspace inspected.")).to_be_visible()
+
+    # Expanding the Worked row replays the trace, where the tool run is
+    # one semantic summary line.
+    worked.locator('[data-slot="collapsible-trigger"]').first.click()
+    fold = page.get_by_text("Listed 1 directory, read 1 file", exact=True)
+    expect(fold).to_be_visible()
 
     # Expanding reveals the individual per-tool rows (toolTitle.ts titles:
     # the raw command for shell, "Read <path>" for reads).

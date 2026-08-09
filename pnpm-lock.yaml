@@ -520,7 +520,7 @@ packages:
 
   '@anthropic-ai/claude-code@2.1.212':
     resolution: {integrity: sha512-MEasj1oaoARRKEWU7eHJ6DWC2TC8ogml9QUDihbmxYI2Ij5Ol1leW90DIj8/a0xX3lfHZOwT3gJr0JxVKa8Sxw==}
-    engines: {node: '>=18.0.0'}
+    engines: {node: '>=22.0.0'}
     hasBin: true
 
   '@anthropic-ai/sdk@0.91.1':

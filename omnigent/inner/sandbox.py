@@ -1013,8 +1013,8 @@ def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
     Spec-self-containment is preserved: a YAML that explicitly
     declares ``sandbox.type: linux_bwrap`` still routes to the bwrap
     backend and errors loudly on macOS (the author asked for it). The
-    default only fires when ``sandbox:`` is omitted or when the YAML's
-    ``sandbox:`` block declares fields but not ``type:``.
+    default fires when ``sandbox:`` is omitted, when its ``type:`` is
+    omitted, or when ``type: auto`` is selected explicitly.
 
     :returns: :class:`OSEnvSandboxSpec` with the OS-appropriate
         ``type``.
@@ -1032,6 +1032,15 @@ def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
         f"No sandbox backend is available on platform {sys.platform!r}. "
         "Set os_env.sandbox.type='none' explicitly to run without a sandbox."
     )
+
+
+def _resolve_sandbox_type(raw_type: str | None) -> str:
+    """Resolve ``auto`` to the platform default and null to disabled."""
+    if raw_type is None:
+        return "none"
+    if raw_type == "auto":
+        return _default_sandbox_for_platform().type
+    return raw_type
 
 
 def _project_root() -> Path:

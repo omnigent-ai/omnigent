@@ -54,7 +54,7 @@ interface GoalSummaryProps {
 function GoalSummary({ loading, goal }: GoalSummaryProps) {
   if (loading) {
     return (
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+      <div className="flex items-center gap-2 text-ui text-muted-foreground">
         <Loader2Icon className="size-4 animate-spin" />
         <span>Loading goal</span>
       </div>
@@ -62,7 +62,7 @@ function GoalSummary({ loading, goal }: GoalSummaryProps) {
   }
   if (!goal) {
     return (
-      <p data-testid="goal-empty" className="text-sm text-muted-foreground">
+      <p data-testid="goal-empty" className="text-ui text-muted-foreground">
         No goal set.
       </p>
     );
@@ -72,11 +72,11 @@ function GoalSummary({ loading, goal }: GoalSummaryProps) {
       data-testid="goal-current"
       className="space-y-1 rounded-lg border border-border bg-muted/30 p-3"
     >
-      <div className="flex items-center justify-between gap-3 text-xs">
+      <div className="flex items-center justify-between gap-3 text-sm">
         <span className="font-medium text-foreground">{formatGoalStatus(goal.status)}</span>
         <span className="shrink-0 text-muted-foreground">{formatGoalUsage(goal)}</span>
       </div>
-      <p className="text-sm leading-5 whitespace-pre-wrap">{goal.objective}</p>
+      <p className="text-ui leading-5 whitespace-pre-wrap">{goal.objective}</p>
     </div>
   );
 }
@@ -125,7 +125,7 @@ function GoalEditor({
   const showKeepCurrentMode = goal != null && !isGoalUserMode(goal.status);
   const modeButtonClass = (selected: boolean) =>
     cn(
-      "inline-flex min-h-9 flex-1 items-center justify-center gap-2 rounded-md px-3 text-sm font-medium transition-colors",
+      "inline-flex min-h-9 flex-1 items-center justify-center gap-2 rounded-md px-3 text-ui font-medium transition-colors",
       "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
       selected
         ? "bg-background text-foreground shadow-sm"
@@ -135,7 +135,7 @@ function GoalEditor({
   return (
     <>
       <div className="space-y-1.5">
-        <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-objective">
+        <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-objective">
           Objective
         </label>
         <Textarea
@@ -150,7 +150,7 @@ function GoalEditor({
       </div>
 
       <div className="space-y-1.5">
-        <label className="text-xs font-medium text-muted-foreground">Mode</label>
+        <label className="text-sm font-medium text-muted-foreground">Mode</label>
         <div
           role="radiogroup"
           aria-label="Goal mode"
@@ -199,7 +199,7 @@ function GoalEditor({
       </div>
 
       <div className="space-y-1.5">
-        <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-token-budget">
+        <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-token-budget">
           Token budget
         </label>
         <Input
@@ -216,7 +216,7 @@ function GoalEditor({
         />
       </div>
 
-      {error && <p className="text-sm text-destructive">{error}</p>}
+      {error && <p className="text-ui text-destructive">{error}</p>}
     </>
   );
 }

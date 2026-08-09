@@ -43,6 +43,16 @@ function renderToggle(ctx: TerminalFirstContextValue | null) {
   );
 }
 
+/** The Chat segment — icon-only, so it's addressed by its accessible name. */
+function chatSegment() {
+  return screen.getByRole("button", { name: /^chat view$/i });
+}
+
+/** The Terminal segment. Its name doubles as the starting-up explanation. */
+function terminalSegment() {
+  return screen.getByRole("button", { name: /^terminal (view|is starting up…)$/i });
+}
+
 beforeEach(() => {
   isIOSShellMock.mockReturnValue(false);
 });
@@ -53,44 +63,16 @@ afterEach(() => {
 });
 
 describe("ViewModeToggle", () => {
-  it("renders the MessagesSquare trigger for terminal-first sessions", () => {
+  it("renders both segments for terminal-first sessions", () => {
     renderToggle(makeCtx());
-    expect(
-      screen.getByRole("button", { name: /switch between chat and terminal/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: /switch between chat and terminal/i })).toBeVisible();
+    expect(chatSegment()).toBeVisible();
+    expect(terminalSegment()).toBeVisible();
   });
 
   it("renders nothing for a non-terminal-first session", () => {
     const { container } = renderToggle(makeCtx({ isTerminalFirst: false }));
     expect(container).toBeEmptyDOMElement();
-  });
-
-  it("labels the trigger 'Terminal view' on hover in the terminal view", async () => {
-    renderToggle(makeCtx({ view: "terminal" }));
-    const trigger = screen.getByRole("button", { name: /switch between chat and terminal/i });
-    fireEvent.pointerEnter(trigger);
-    // The tooltip content mirrors the active view (portalled, so it appears
-    // in addition to the menu item's own label).
-    await screen.findByRole("tooltip", { name: /^terminal view$/i });
-  });
-
-  it("labels the trigger 'Chat view' on hover in the chat view", async () => {
-    renderToggle(makeCtx({ view: "chat" }));
-    const trigger = screen.getByRole("button", { name: /switch between chat and terminal/i });
-    fireEvent.pointerEnter(trigger);
-    await screen.findByRole("tooltip", { name: /^chat view$/i });
-  });
-
-  it("suppresses the tooltip while the menu is open", async () => {
-    renderToggle(makeCtx({ view: "chat" }));
-    const trigger = screen.getByRole("button", { name: /switch between chat and terminal/i });
-    // Hover shows the tooltip…
-    fireEvent.pointerEnter(trigger);
-    await screen.findByRole("tooltip", { name: /^chat view$/i });
-    // …but opening the menu must hide it so it doesn't overlap the dropdown.
-    fireEvent.pointerDown(trigger, { button: 0 });
-    await screen.findByRole("menuitemradio", { name: /^chat$/i });
-    expect(screen.queryByRole("tooltip", { name: /^chat view$/i })).toBeNull();
   });
 
   it("renders nothing outside a provider", () => {
@@ -109,52 +91,60 @@ describe("ViewModeToggle", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("marks the current view as checked in the menu", async () => {
-    renderToggle(makeCtx({ view: "terminal" }));
-    // Radix menus open on pointerdown, not click.
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: /switch between chat and terminal/i }),
-      { button: 0 },
-    );
-    const terminalItem = await screen.findByRole("menuitemradio", { name: /^terminal$/i });
-    expect(terminalItem).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByRole("menuitemradio", { name: /^chat$/i })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
+  it("presses only the active segment in the chat view", () => {
+    renderToggle(makeCtx({ view: "chat" }));
+    expect(chatSegment()).toHaveAttribute("aria-pressed", "true");
+    expect(terminalSegment()).toHaveAttribute("aria-pressed", "false");
   });
 
-  it("invokes setView when a menu option is selected", async () => {
+  it("presses only the active segment in the terminal view", () => {
+    renderToggle(makeCtx({ view: "terminal" }));
+    expect(terminalSegment()).toHaveAttribute("aria-pressed", "true");
+    expect(chatSegment()).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("switches to the terminal view in one click — no menu to open", () => {
     const setView = vi.fn();
-    renderToggle(makeCtx({ setView }));
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: /switch between chat and terminal/i }),
-      { button: 0 },
-    );
-    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^terminal$/i }));
+    renderToggle(makeCtx({ setView, view: "chat" }));
+    fireEvent.click(terminalSegment());
     expect(setView).toHaveBeenCalledWith("terminal");
   });
 
-  it("disables the Terminal option and shows a spinner while the terminal is coming up", async () => {
-    renderToggle(makeCtx({ terminalsAvailable: false, terminalStartingUp: true }));
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: /switch between chat and terminal/i }),
-      { button: 0 },
-    );
-    const terminalItem = await screen.findByRole("menuitemradio", { name: /^terminal$/i });
-    expect(terminalItem).toHaveAttribute("aria-disabled", "true");
-    expect(terminalItem.querySelector(".animate-spin")).not.toBeNull();
-    expect(terminalItem).toHaveAttribute("title", expect.stringMatching(/starting up/i));
+  it("switches back to the chat view in one click", () => {
+    const setView = vi.fn();
+    renderToggle(makeCtx({ setView, view: "terminal" }));
+    fireEvent.click(chatSegment());
+    expect(setView).toHaveBeenCalledWith("chat");
   });
 
-  it("disables the Terminal option WITHOUT a spinner when no terminal exists and none is coming up", async () => {
+  it("names each segment on hover so the icon-only control is legible", async () => {
+    renderToggle(makeCtx({ view: "chat" }));
+    // Radix opens on a real pointer move over the trigger (the wrapper span),
+    // so a bare pointerEnter on the button wouldn't surface the tooltip.
+    fireEvent.pointerMove(chatSegment().parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Chat view");
+  });
+
+  it("disables the Terminal segment and shows a spinner while the terminal is coming up", () => {
+    renderToggle(makeCtx({ terminalsAvailable: false, terminalStartingUp: true }));
+    const terminal = terminalSegment();
+    expect(terminal).toBeDisabled();
+    // The name carries the reason, so the disabled state explains itself.
+    expect(terminal).toHaveAccessibleName(/starting up/i);
+    expect(terminal.querySelector(".animate-spin")).not.toBeNull();
+  });
+
+  it("disables the Terminal segment WITHOUT a spinner when no terminal exists and none is coming up", () => {
     renderToggle(makeCtx({ terminalsAvailable: false, terminalStartingUp: false }));
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: /switch between chat and terminal/i }),
-      { button: 0 },
-    );
-    const terminalItem = await screen.findByRole("menuitemradio", { name: /^terminal$/i });
-    expect(terminalItem).toHaveAttribute("aria-disabled", "true");
-    expect(terminalItem.querySelector(".animate-spin")).toBeNull();
+    const terminal = terminalSegment();
+    expect(terminal).toBeDisabled();
+    expect(terminal.querySelector(".animate-spin")).toBeNull();
+  });
+
+  it("leaves the Chat segment usable while the terminal is unavailable", () => {
+    const setView = vi.fn();
+    renderToggle(makeCtx({ setView, terminalsAvailable: false, view: "terminal" }));
+    fireEvent.click(chatSegment());
+    expect(setView).toHaveBeenCalledWith("chat");
   });
 });

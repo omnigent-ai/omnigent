@@ -503,6 +503,30 @@
             "title": "Pending Elicitations Count",
             "type": "integer"
           },
+          "routed_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model this sub-agent runs on when one was pinned for it, e.g. `\"databricks-claude-opus-4-8\"`. Read from the child's `model_override` \u2014 the field intelligent routing writes when it picks a model for a spawned child. `None` when the child inherits the parent/spec model.",
+            "title": "Routed Model"
+          },
+          "routing_decision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identifier of the routing decision that produced `routed_model`, mirroring `RoutingDecisionData.decision_id`. Read from the child's `omnigent.routing.decision_id` label, stamped when routing pins the model. `None` when the child was not routed.",
+            "title": "Routing Decision Id"
+          },
           "session_name": {
             "anyOf": [
               {
@@ -1646,18 +1670,6 @@
       "GrantPermissionRequest": {
         "description": "Request body for `PUT /v1/sessions/{id}/permissions`.",
         "properties": {
-          "can_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Whether the owner delegates privileged-action approval authority to this user.",
-            "title": "Can Approve"
-          },
           "level": {
             "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
             "maximum": 3.0,
@@ -2532,12 +2544,6 @@
       "PermissionObject": {
         "description": "API representation of a session permission grant.",
         "properties": {
-          "can_approve": {
-            "default": false,
-            "description": "Whether this grantee may approve privileged actions.",
-            "title": "Can Approve",
-            "type": "boolean"
-          },
           "conversation_id": {
             "description": "The session, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",
@@ -3215,6 +3221,42 @@
             "title": "Applied",
             "type": "boolean"
           },
+          "attempted_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model the spawning agent asked for and the router overrode, e.g. `\"databricks-gpt-5-5\"` \u2014 an LLM-supplied `args.model` on a child session, or a native spawn's own `requested_model`. `None` when nothing was asked for, or when the router's pick names the same arm as the ask.",
+            "title": "Attempted Override"
+          },
+          "decision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Router decision identifier, e.g. `\"3f1c\u2026\"`. Correlates the transcript item with the routing telemetry event and the child-sessions API row. `None` for decisions made before decision ids existed.",
+            "title": "Decision Id"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Harness the decision applies to, e.g. `\"claude-native\"` or `\"codex\"`. `None` when the decision picked a model only (no harness dimension).",
+            "title": "Harness"
+          },
           "model": {
             "description": "The concrete brain model the router chose, e.g. `\"databricks-claude-opus-4-8\"`.",
             "title": "Model",
@@ -3223,6 +3265,42 @@
           "rationale": {
             "description": "The router's one-line explanation, shown as muted secondary text, e.g. `\"Multi-file refactor needs deep reasoning.\"`.",
             "title": "Rationale",
+            "type": "string"
+          },
+          "raw_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The router-vocabulary pick before resolution to a servable catalog id, e.g. `\"gpt-5-6-sol\"`. `None` when the pick needed no resolution.",
+            "title": "Raw Model"
+          },
+          "router_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which router produced the decision \u2014 `\"databricks-aigw\"` for the external AI-Gateway `task_v1` service, `\"oss-llm\"` for the built-in judge. Deliberately a plain `str` rather than a `Literal`: a source added later must still round-trip through stored rows and the wire instead of failing validation. `None` on rows written before the field existed.",
+            "title": "Router Source"
+          },
+          "scope": {
+            "default": "turn",
+            "description": "What the decision governs \u2014 `\"session\"` (auto-harness session routing), `\"turn\"` (per-turn routing), `\"child_session\"` (an Omnigent-spawned sub-agent) or `\"native_subagent\"` (a Task / `spawn_agent` spawn routed inside the harness). Defaults to `\"turn\"` so rows persisted before this field deserialize.",
+            "enum": [
+              "session",
+              "turn",
+              "child_session",
+              "native_subagent"
+            ],
+            "title": "Scope",
             "type": "string"
           }
         },
@@ -4117,18 +4195,6 @@
             "title": "Archived",
             "type": "boolean"
           },
-          "can_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Whether the requesting user may accept privileged actions for this session. `None` when permissions are disabled.",
-            "title": "Can Approve"
-          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -4858,18 +4924,6 @@
             "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
             "title": "Background Task Count"
           },
-          "can_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Whether the requesting user may accept privileged actions for this session. `None` when permissions are disabled.",
-            "title": "Can Approve"
-          },
           "context_window": {
             "anyOf": [
               {
@@ -5207,6 +5261,18 @@
             "description": "For sub-agent sessions, the sub-agent type name within the parent's spec tree, e.g. `\"summarizer\"`. `None` for top-level sessions.",
             "title": "Sub Agent Name"
           },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session subagent-routing switch, two-state: `\"on\"` routes subagent spawns, and `\"off\"` or `None` (unset) both leave them unrouted \u2014 the in-session \"Subagent routing\" row renders either as \"Default\". `None` on a row created before this became explicit inherits nothing. Stamped `\"on\"` at create for Smart Routing sessions; also set via `PATCH /v1/sessions/{id}`.",
+            "title": "Subagent Routing Override"
+          },
           "terminal_launch_args": {
             "anyOf": [
               {
@@ -5260,6 +5326,18 @@
             ],
             "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
             "title": "Total Cost Usd"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch timestamp of the last persisted session activity. Advances when conversation items are appended and on session metadata edits (rename, agent switch, archive); a mid-stall rename therefore resets the clock, so an orchestrator treating this as a pure item-append heartbeat should account for that. Can be compared across snapshots independently of lifecycle status.",
+            "title": "Updated At"
           },
           "usage_by_model": {
             "anyOf": [
@@ -5408,6 +5486,19 @@
             "default": null,
             "title": "Background Task Count"
           },
+          "blocked_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Short human phrase naming what a still-`running` session is parked on, e.g. `\"permission prompt\"` or `\"dialog open\"`. Set by terminal-backed integrations whose agent can block on a dialog the web UI does not mirror, so the client can say *why* nothing is moving instead of showing a bare spinner. `None` whenever the session is not parked. Unrelated to the `waiting` status above, which means the turn has ended and only background work remains. Category: **transient** (SSE-only). Status is rederived on reconnect from the cached last-relayed turn lifecycle event or by re-querying the runner; not persisted by the runtime.",
+            "title": "Blocked On"
+          },
           "conversation_id": {
             "description": "The conversation/session identifier whose status changed, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",
@@ -5423,7 +5514,7 @@
               }
             ],
             "default": null,
-            "description": "Machine-readable failure detail, present only when `status == \"failed\"`. Carries the message the runner attached when a turn died \u2014 most importantly a SETUP-phase failure (spec resolution, spawn-env build) that ends the turn before any `response.failed` event is emitted. `None` for every non-failed transition. Clients render `error.message` as the terminal error line; without it a setup failure shows as a silent end. Category: **transient** (SSE-only). Status is rederived on reconnect from the cached last-relayed turn lifecycle event or by re-querying the runner; not persisted by the runtime."
+            "description": "Machine-readable failure detail, present only when `status == \"failed\"`. Carries the message the runner attached when a turn died \u2014 most importantly a SETUP-phase failure (spec resolution, spawn-env build) that ends the turn before any `response.failed` event is emitted. `None` for every non-failed transition. Clients render `error.message` as the terminal error line; without it a setup failure shows as a silent end."
           },
           "response_id": {
             "anyOf": [
@@ -6556,6 +6647,18 @@
             "title": "Silent",
             "type": "boolean"
           },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session subagent-routing switch: `\"on\"` routes subagent spawns, `\"off\"` leaves them unrouted. Explicit JSON `null` clears the override, which lands the session on Default (the same behavior as `\"off\"` \u2014 nothing is inherited); omitting the field leaves it unchanged (same presence-is-the-clear-signal rule as `cost_control_mode_override`). Effective on the next spawn, so it can be changed at any point in a session.",
+            "title": "Subagent Routing Override"
+          },
           "terminal_launch_args": {
             "anyOf": [
               {
@@ -7084,7 +7187,7 @@
     },
     "/v1/hosts": {
       "get": {
-        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
+        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details \u2014 `host_id`, `name`, `owner`, `status`, `sandbox_provider`, `configured_harnesses`, and `gateway_inference` (`None` when no connected host has reported it to this replica).",
         "operationId": "list_hosts_v1_hosts_get",
         "responses": {
           "200": {
@@ -7114,7 +7217,7 @@
     },
     "/v1/hosts/{host_id}": {
       "get": {
-        "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
+        "description": "Get details for a single host.\n\n**Returns:** Host details dict \u2014 the `list_hosts` fields (including `gateway_inference`, `None` when unreported) plus `runners`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
         "parameters": [
           {
@@ -7458,7 +7561,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/credential": {
       "post": {
-        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline, 502 on host-side failure, 504 on timeout.",
+        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline, 502 on host-side failure, 504 on timeout.",
         "operationId": "store_host_harness_credential_v1_hosts__host_id__harnesses__harness__credential_post",
         "parameters": [
           {
@@ -7524,7 +7627,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/install": {
       "post": {
-        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` (default off): when disabled it\nreturns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline, 502 on a host-side install failure, 504 on host timeout.",
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` (default off): when disabled it\nreturns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline, 502 on a host-side install failure, 504 on host timeout.",
         "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
         "parameters": [
           {
@@ -7814,6 +7917,12 @@
                           "type": "string"
                         },
                         "type": "array"
+                      },
+                      {
+                        "additionalProperties": {
+                          "type": "boolean"
+                        },
+                        "type": "object"
                       },
                       {
                         "type": "null"

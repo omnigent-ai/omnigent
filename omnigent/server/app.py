@@ -1159,6 +1159,7 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
@@ -1337,7 +1338,7 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=True)
+            _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
@@ -1375,7 +1376,7 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=True)
+        _logger.error("Database error: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1400,7 +1401,7 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=True)
+        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1691,7 +1692,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | None]:
+    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1777,19 +1778,26 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is configured (a server llm: block, or a
-        # routing.provider=external block) or the managed deployment registered
-        # a policy_llm_connection_factory (which means it has LLM capability
-        # and will supply its own RoutingClient).
+        # smart_routing_enabled: true when the server can route from ANY source
+        # — a configured RoutingClient (a server llm: block, routing.provider=
+        # external, or an explicit routing_backends pair) or a managed
+        # deployment's policy_llm_connection_factory.
+        # smart_routing_sources names WHICH router can answer: "external" is the
+        # workspace AI-Gateway task_v1 client, "oss" the built-in judge. A
+        # harness whose inference is not gateway-backed can only be served by
+        # the built-in one, so the SPA and the CLI read this to pick a source
+        # instead of hiding the surface.
+        # Both come from one helper, so the flag can never claim routing is off
+        # for a deployment whose sources say a router would answer.
         try:
             from omnigent.runtime._globals import _caps
+            from omnigent.server.routing_backend import routing_available, routing_sources
 
-            smart_routing_enabled = _caps is not None and (
-                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
-            )
+            smart_routing_enabled = routing_available(_caps)
+            smart_routing_sources = routing_sources(_caps)
         except ImportError:
             smart_routing_enabled = False
+            smart_routing_sources = {"external": False, "oss": False}
         # harness_install_enabled gates the web UI's "Install" action for a
         # missing, npm-installable harness on a connected host. Off by default
         # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
@@ -1830,6 +1838,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "smart_routing_sources": smart_routing_sources,
             "harness_install_enabled": harness_install_enabled,
             "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,
@@ -2058,22 +2067,22 @@ def create_app(
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark sessions pinned to *this* runner as offline.
+        """Mark the turns *this* runner interrupted as offline.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
         disconnect on one runner does not flip every cached session
         (e.g. sessions owned by other runners on the same server, or
         sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``. The cache is updated
-        in lockstep with the publish so the list endpoint stays
-        coherent.
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.schemas import ErrorDetail
 
         # Newest-wins guard: a superseded tunnel's teardown fires this
         # hook after a fresh tunnel for the same ``runner_id`` already
@@ -2105,20 +2114,22 @@ def create_app(
         # Archived sessions are included by construction — an archived
         # session can still be runner-bound, and skipping it here would
         # leave it stuck "running" forever.
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s disconnected; marking %d session(s) offline",
+            "Runner %s disconnected; reconciling %d bound session(s)",
             runner_id,
             len(affected),
         )
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed")
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            ),
+            conversation_store,
+        )
 
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
@@ -2129,34 +2140,33 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout.
+        instead of spinning on "starting" until a timeout. An idle
+        top-level session is included for exactly that reason; an idle
+        sub-agent is not, since its work finished on a runner that was
+        already live.
 
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s reported crashed; marking %d session(s) failed: %s",
+            "Runner %s reported crashed; reconciling %d bound session(s): %s",
             runner_id,
             len(affected),
             error,
         )
-        detail = ErrorDetail(code="runner_failed_to_start", message=error)
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed", error=detail)
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(code="runner_failed_to_start", message=error),
+            conversation_store,
+            fail_idle_top_level=True,
+        )
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -2172,6 +2182,7 @@ def create_app(
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            prefetch_session_routing_catalogs,
         )
 
         # Stamp liveness immediately so other replicas see the runner
@@ -2238,6 +2249,12 @@ def create_app(
                 routed.client,
                 conversation_store,
             )
+            # The session's terminal exists as of the handshake above, so its
+            # model catalogs are answerable now. Warming them here is what
+            # keeps the first routed message off the runner round trip. The
+            # helper self-gates on routing state, so the plain sessions in this
+            # loop (and any archived row) cost nothing.
+            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
             # Reconcile the persisted pending-elicitation count with this
             # pod's live index. A runner that crashed with prompts parked
             # leaves a stale row (no decrement is ever written on a crash),
@@ -2524,7 +2541,15 @@ class _SPAStaticFiles(StaticFiles):
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+            # StaticFiles only serves GET/HEAD, so it answers every other
+            # method with 405, which reads as "this endpoint exists, wrong
+            # method" and sends a client pointed at the wrong base URL
+            # hunting a server bug instead. Nothing reaching this catch-all
+            # exists, and a non-GET is never an SPA navigation, so answer
+            # 404 whatever the path looks like.
+            if exc.status_code == 405 or (
+                exc.status_code == 404 and _is_web_ui_api_fallback_path(path)
+            ):
                 return JSONResponse(
                     status_code=404,
                     content={

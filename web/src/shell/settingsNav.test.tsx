@@ -1,7 +1,7 @@
 // Tests for the Settings nav model + sidebar body (settingsNav).
 //
 // Covers the mobile-specific behavior: keyboard shortcuts is hidden on mobile
-// (max-md:hidden), and "Back to Omnigent" does NOT close the sidebar overlay
+// (max-md:hidden), and "Back" does NOT close the sidebar overlay
 // on a plain tap (no onNavClick) so mobile lands back on the conversation list
 // instead of the homepage. Section links still close it.
 
@@ -44,17 +44,16 @@ import {
   useTrackSettingsReturn,
 } from "./settingsNav";
 
-function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}) {
+function renderBody(opts: { onNavClick?: () => void } = {}) {
   const onNavClick = opts.onNavClick ?? vi.fn();
-  const onClose = opts.onClose ?? vi.fn();
   render(
     <TooltipProvider>
       <MemoryRouter initialEntries={["/settings/appearance"]}>
-        <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
+        <SettingsSidebarBody onNavClick={onNavClick} />
       </MemoryRouter>
     </TooltipProvider>,
   );
-  return { onNavClick, onClose };
+  return { onNavClick };
 }
 
 beforeEach(() => {
@@ -131,6 +130,65 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it("renders Back as a standard sidebar row without a collapse button", () => {
+    renderBody();
+    const backLink = screen.getByRole("link", { name: "Back" });
+    expect(backLink.querySelector("svg")).toHaveClass("ui-icon");
+    expect(backLink).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "gap-2",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+      "rounded-[var(--radius-otto-button)]",
+      "w-fit",
+      "justify-start",
+      "border-0",
+      "font-normal",
+    );
+    expect(screen.queryByRole("button", { name: "Close sidebar" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("settings-nav-appearance").querySelector("svg")).toHaveClass(
+      "ui-icon",
+    );
+  });
+
+  it("uses the shared row geometry with normal-weight labels", () => {
+    renderBody();
+    const selected = screen.getByTestId("settings-nav-appearance");
+    const unselected = screen.getByTestId("settings-nav-git");
+    expect(selected).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
+      "gap-2",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+      "rounded-[var(--radius-otto-button)]",
+      "font-normal",
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+      "dark:hover:bg-[var(--sidebar-active)]",
+      "dark:hover:text-[var(--sidebar-active-foreground)]",
+    );
+    expect(selected).not.toHaveClass("bg-muted", "font-semibold");
+    expect(unselected).toHaveClass("sidebar-row", "font-normal");
+    expect(selected.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
+    expect(selected.querySelector("svg")).not.toHaveClass("text-muted-foreground");
+    expect(unselected.querySelector("svg")).toHaveClass("text-muted-foreground");
+  });
+
+  it("renders group subtitles in sentence case at the text-sm tier", () => {
+    renderBody();
+    const heading = screen.getByRole("heading", { name: "General" });
+    expect(heading).toHaveClass("text-sm", "font-normal");
+    expect(heading).not.toHaveClass("font-medium", "uppercase");
+    expect(heading.parentElement).toHaveClass("gap-0");
+    expect(heading.parentElement).not.toHaveClass("gap-0.5");
+  });
+
   it("marks the Keyboard shortcuts nav item hidden on mobile via max-md:hidden", () => {
     renderBody();
     expect(screen.getByTestId("settings-nav-shortcuts").className).toContain("max-md:hidden");
@@ -139,16 +197,16 @@ describe("SettingsSidebarBody", () => {
     expect(screen.getByTestId("settings-nav-archived").className).not.toContain("max-md:hidden");
   });
 
-  it("does NOT close the sidebar when 'Back to Omnigent' is tapped", () => {
+  it("does NOT close the sidebar when Back is tapped", () => {
     // No onNavClick on the back link: on mobile the overlay stays open so the
     // sidebar swaps back to the conversation list rather than closing onto the
     // homepage behind it.
     const { onNavClick } = renderBody();
-    fireEvent.click(screen.getByRole("link", { name: /Back to Omnigent/ }));
+    fireEvent.click(screen.getByRole("link", { name: "Back" }));
     expect(onNavClick).not.toHaveBeenCalled();
   });
 
-  it("'Back to Omnigent' returns to the conversation the user came from", () => {
+  it("Back returns to the conversation the user came from", () => {
     // Simulate the real flow: the sidebar (which stays mounted) tracks the
     // pre-settings location, then the user enters /settings. Back must point at
     // the conversation, not the home page.
@@ -161,7 +219,7 @@ describe("SettingsSidebarBody", () => {
           <button type="button" onClick={() => navigate("/settings")}>
             go-settings
           </button>
-          {inSettings && <SettingsSidebarBody onNavClick={vi.fn()} onClose={vi.fn()} />}
+          {inSettings && <SettingsSidebarBody onNavClick={vi.fn()} />}
         </>
       );
     }
@@ -173,7 +231,7 @@ describe("SettingsSidebarBody", () => {
       </TooltipProvider>,
     );
     fireEvent.click(screen.getByText("go-settings"));
-    expect(screen.getByRole("link", { name: /Back to Omnigent/ })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Back" })).toHaveAttribute(
       "href",
       "/c/conv_123?file=foo.ts",
     );

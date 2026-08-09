@@ -46,7 +46,6 @@ export function PreviewSearchBar({
     }
     setRanges(findTextRanges(container, query.trim()));
     // contentVersion forces a rebuild after the preview re-renders.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [containerRef, open, query, contentVersion]);
 
   const matchCount = ranges.length;
@@ -91,10 +90,9 @@ export function PreviewSearchBar({
 
   // Focus the input when the bar opens.
   useEffect(() => {
-    if (open) {
-      const id = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => clearTimeout(id);
-    }
+    if (!open) return undefined;
+    const id = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => clearTimeout(id);
   }, [open, inputRef]);
 
   const goNext = useCallback(() => {
@@ -130,9 +128,9 @@ export function PreviewSearchBar({
           }
         }}
         placeholder="Find…"
-        className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+        className="min-w-0 flex-1 bg-transparent text-sm outline-none"
       />
-      <span className="shrink-0 text-xs text-muted-foreground">
+      <span className="shrink-0 text-sm text-muted-foreground">
         {query.trim() ? (matchCount > 0 ? `${safeIndex + 1} / ${matchCount}` : "No results") : ""}
       </span>
       <button
