@@ -2453,6 +2453,42 @@ class PiExecutor(Executor):
         saw_message_end = False
         pending_llm_input: list[Message] = []
 
+        async def _continue_tool_turn(
+            *,
+            recover_failure: bool,
+        ) -> ExecutorError | None:
+            nonlocal completion_text_ready
+            nonlocal failure_recovery_requested
+            nonlocal tool_turn_continuations
+
+            if tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS:
+                return ExecutorError(
+                    message=(
+                        "Pi ended a tool-driven turn without a final "
+                        "assistant response after "
+                        f"{_TOOL_TURN_MAX_CONTINUATIONS} continuations."
+                    ),
+                    retryable=True,
+                )
+            tool_turn_continuations += 1
+            completion_text_ready = False
+            if recover_failure:
+                failure_recovery_requested = True
+            try:
+                await rpc.send_command(
+                    {
+                        "type": "prompt",
+                        "message": PI_TOOL_TURN_CONTINUATION,
+                        "id": f"{cmd_id}_continue_{tool_turn_continuations}",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                return ExecutorError(
+                    message=f"Failed to continue incomplete Pi tool turn: {exc}",
+                    retryable=True,
+                )
+            return None
+
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
@@ -2464,10 +2500,13 @@ class PiExecutor(Executor):
                     not completion_text_ready
                     or (last_tool_failed and not failure_recovery_requested)
                 ):
-                    yield ExecutorError(
-                        message="Pi stopped before completing its tool-driven turn.",
-                        retryable=True,
+                    continuation_error = await _continue_tool_turn(
+                        recover_failure=(last_tool_failed and not failure_recovery_requested),
                     )
+                    if continuation_error is not None:
+                        yield continuation_error
+                        return
+                    continue
                 elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
@@ -2681,37 +2720,17 @@ class PiExecutor(Executor):
                 needs_completion_text = saw_tool_activity and not completion_text_ready
                 needs_failure_recovery = last_tool_failed and not failure_recovery_requested
                 if needs_completion_text or needs_failure_recovery:
-                    if tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS:
-                        if completion_text_ready:
-                            needs_failure_recovery = False
-                        else:
-                            yield ExecutorError(
-                                message=(
-                                    "Pi ended a tool-driven turn without a final "
-                                    "assistant response after "
-                                    f"{_TOOL_TURN_MAX_CONTINUATIONS} continuations."
-                                ),
-                                retryable=True,
-                            )
-                            return
+                    if (
+                        tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS
+                        and completion_text_ready
+                    ):
+                        needs_failure_recovery = False
                     if needs_completion_text or needs_failure_recovery:
-                        tool_turn_continuations += 1
-                        completion_text_ready = False
-                        if needs_failure_recovery:
-                            failure_recovery_requested = True
-                        try:
-                            await rpc.send_command(
-                                {
-                                    "type": "prompt",
-                                    "message": PI_TOOL_TURN_CONTINUATION,
-                                    "id": f"{cmd_id}_continue_{tool_turn_continuations}",
-                                }
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            yield ExecutorError(
-                                message=f"Failed to continue incomplete Pi tool turn: {exc}",
-                                retryable=True,
-                            )
+                        continuation_error = await _continue_tool_turn(
+                            recover_failure=needs_failure_recovery,
+                        )
+                        if continuation_error is not None:
+                            yield continuation_error
                             return
                         continue
                 # Fallback usage capture: if no ``message_end`` carried

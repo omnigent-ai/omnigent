@@ -4577,8 +4577,71 @@ def test_pi_retries_empty_completion_after_tool_activity() -> None:
         assert completed[0].response == "The evidence identifies the failure."
         assert len([event for event in events if isinstance(event, ToolCallComplete)]) == 1
         written = b"".join(rpc.process.stdin.data).decode()
-        assert written.count('"type": "prompt"') == 2
+        commands = [json.loads(line) for line in written.splitlines()]
+        assert len([item for item in commands if item.get("type") == "prompt"]) == 2
         assert "try a different permitted tool" in written
+
+    _run(_test())
+
+
+def test_pi_retries_idle_timeout_after_tool_activity() -> None:
+    """A silent post-tool Pi loop gets the same bounded continuation."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc([])
+        lines: list[str | None] = [
+            json.dumps({"type": "response", "success": True}),
+            json.dumps(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "oracle__fetch",
+                    "args": {"ref": "oracle://trace/h1"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "oracle__fetch",
+                    "isError": False,
+                    "result": {"content": "evidence"},
+                }
+            ),
+            None,
+            json.dumps({"type": "response", "success": True}),
+            json.dumps(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "delta": "The PR is repaired.",
+                    },
+                }
+            ),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ]
+
+        async def read_line(timeout=120.0):
+            del timeout
+            return lines.pop(0) if lines else None
+
+        rpc.read_line = read_line
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "repair the PR"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "The PR is repaired."
+        commands = [
+            json.loads(line) for line in b"".join(rpc.process.stdin.data).decode().splitlines()
+        ]
+        assert len([item for item in commands if item.get("type") == "prompt"]) == 2
 
     _run(_test())
 
