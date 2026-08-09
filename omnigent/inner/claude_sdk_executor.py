@@ -58,6 +58,7 @@ from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -279,9 +280,13 @@ class _UserMessageObj(Protocol):
 class _ResultMessageObj(Protocol):
     """Structural view of ``claude_agent_sdk.ResultMessage``."""
 
+    session_id: str
     result: str | None
     is_error: bool | None
     usage: dict[str, Any] | None  # type: ignore[explicit-any]
+    errors: list[str] | None
+    api_error_status: int | None
+    stop_reason: str | None
 
 
 class _SystemMessageObj(Protocol):
@@ -349,6 +354,21 @@ _QUERY_START_TIMEOUT_SECONDS = 30.0
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
 _STREAM_IDLE_WARN_SECONDS = 600.0
+
+
+def _is_context_window_overflow(result: _ResultMessageObj) -> bool:
+    """Return whether an SDK error is specifically a provider context overflow."""
+    if getattr(result, "stop_reason", None) == "model_context_window_exceeded":
+        return True
+    if getattr(result, "api_error_status", None) != 400:
+        return False
+    errors = getattr(result, "errors", None) or []
+    text = " ".join([result.result or "", *errors]).lower()
+    normalized = " ".join(text.split())
+    return (
+        "context window" in normalized and ("exceed" in normalized or "too long" in normalized)
+    ) or "prompt is too long" in normalized
+
 
 # ── Multimodal content block conversion ──────────────────────
 
@@ -1505,6 +1525,8 @@ class ClaudeSDKExecutor(Executor):
         # Force-close tasks for clients evicted on turn cancellation, kept
         # referenced so they are not GC'd mid-close.
         self._cancel_close_tasks: set[asyncio.Task[None]] = set()
+        # One native compact-and-retry attempt per user turn.
+        self._overflow_recovery_sessions: set[str] = set()
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1762,6 +1784,67 @@ class ClaudeSDKExecutor(Executor):
         task = asyncio.create_task(self._force_close_client(state.client))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    async def _compact_live_client(
+        self,
+        sdk: _ClaudeSDK,
+        *,
+        client: _ClaudeClient,
+        session_key: str,
+        fallback_session_id: str | None,
+        model: str | None,
+    ) -> CompactionComplete | None:
+        """Force Claude Code's native compaction and export its replacement history."""
+        await client.query("/compact", session_id=session_key)
+        stream = client.receive_response()
+        saw_precompact = False
+        compact_session_id = fallback_session_id
+        compact_usage: dict[str, Any] | None = None  # type: ignore[explicit-any]
+        try:
+            async for message in stream:
+                if isinstance(message, sdk.SystemMessage):
+                    saw_precompact = saw_precompact or (
+                        getattr(message, "hook_event_name", None) == "PreCompact"
+                    )
+                elif isinstance(message, sdk.ResultMessage):
+                    result = cast(_ResultMessageObj, message)
+                    compact_session_id = result.session_id or compact_session_id
+                    if result.is_error:
+                        return None
+                    compact_usage = result.usage
+        finally:
+            aclose = getattr(stream, _ACLOSE_ATTR, None)
+            if aclose is not None:
+                await aclose()
+        if not saw_precompact or not compact_session_id:
+            return None
+
+        from claude_agent_sdk import get_session_messages
+
+        session_messages = get_session_messages(compact_session_id, directory=self._cwd)
+        compacted_messages = [
+            {"type": "message", "role": item.type, "content": item.message.get("content", [])}
+            for item in session_messages
+            if isinstance(item.message, dict)
+        ]
+        if not compacted_messages:
+            return None
+        context_tokens = 0
+        if compact_usage:
+            context_tokens = sum(
+                int(compact_usage.get(key) or 0)
+                for key in (
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                )
+            )
+        return CompactionComplete(
+            summary="[Claude Code compaction — context recovered after overflow]",
+            token_count=context_tokens,
+            model=model,
+            compacted_messages=compacted_messages,
+        )
 
     async def close(self) -> None:
         session_keys = list(self._clients)
@@ -2437,6 +2520,7 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        context_overflow = False
         compaction_occurred: bool = False
         claude_session_id: str | None = None
 
@@ -2732,6 +2816,7 @@ class ClaudeSDKExecutor(Executor):
                             # Harness-level failure (e.g. expired login). Surface
                             # as an executor error rather than assistant content.
                             failure_text = result_msg.result or "claude-sdk harness error"
+                            context_overflow = _is_context_window_overflow(result_msg)
                             logger.error(
                                 "claude-sdk ResultMessage is_error=True for agent %r: %s",
                                 self._agent_name,
@@ -2884,6 +2969,44 @@ class ClaudeSDKExecutor(Executor):
             )
             return
         if terminal_error:
+            if context_overflow:
+                if session_key in self._overflow_recovery_sessions:
+                    # The one allowed retry also overflowed. Drop the dead
+                    # transcript; the persisted boundary makes the next turn
+                    # cold-start safely.
+                    await self._close_live_client(session_key)
+                else:
+                    self._overflow_recovery_sessions.add(session_key)
+                    try:
+                        compaction = await self._compact_live_client(
+                            sdk,
+                            client=client,
+                            session_key=session_key,
+                            fallback_session_id=claude_session_id,
+                            model=observed_model or model,
+                        )
+                        if compaction is not None:
+                            yield compaction
+                            async for event in self.run_turn(
+                                messages,
+                                tools,
+                                system_prompt,
+                                config,
+                            ):
+                                yield event
+                            return
+                    except asyncio.CancelledError:
+                        self._evict_client_on_cancel(session_key)
+                        raise
+                    except Exception:  # noqa: BLE001 — recovery failure preserves original error
+                        logger.warning(
+                            "Claude SDK native compaction recovery failed for session %s",
+                            session_key,
+                            exc_info=True,
+                        )
+                    finally:
+                        self._overflow_recovery_sessions.discard(session_key)
+                    await self._close_live_client(session_key)
             yield ExecutorError(message=terminal_error)
             return
 
@@ -2931,8 +3054,6 @@ class ClaudeSDKExecutor(Executor):
         _notify_usage_from_dict(model=model, usage=turn_usage)
 
         if compaction_occurred and claude_session_id:
-            from omnigent.inner.executor import CompactionComplete
-
             _compaction_tokens = 0
             if turn_usage is not None:
                 _compaction_tokens = turn_usage.get("context_tokens", 0) or 0

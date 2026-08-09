@@ -4531,3 +4531,187 @@ async def test_enqueue_session_message_returns_false_without_queuing() -> None:
 
     assert result is False
     assert not query_called, "query() must not be called during enqueue"
+
+
+class _OverflowTestResult:
+    def __init__(
+        self,
+        result: str,
+        *,
+        is_error: bool,
+        api_error_status: int | None = None,
+    ) -> None:
+        self.session_id = "claude-overflow-session"
+        self.result = result
+        self.is_error = is_error
+        self.api_error_status = api_error_status
+        self.errors = None
+        self.stop_reason = None
+        self.usage = None
+
+
+class _OverflowTestSystem:
+    hook_event_name = "PreCompact"
+
+
+class _OverflowTestSentinel:
+    pass
+
+
+def _overflow_test_sdk(responses):
+    created = []
+
+    class _FakeSDK:
+        AssistantMessage = _OverflowTestSentinel
+        UserMessage = _OverflowTestSentinel
+        SystemMessage = _OverflowTestSystem
+        ResultMessage = _OverflowTestResult
+        StreamEvent = _OverflowTestSentinel
+        TextBlock = _OverflowTestSentinel
+        ThinkingBlock = _OverflowTestSentinel
+        ToolUseBlock = _OverflowTestSentinel
+        ToolResultBlock = _OverflowTestSentinel
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        @staticmethod
+        def create_sdk_mcp_server(**kwargs):
+            return kwargs
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+                self.queries = []
+                self.current = []
+                self.disconnects = 0
+                created.append(self)
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                self.queries.append(prompt)
+                self.current = responses[len(self.queries) - 1]
+
+            async def receive_response(self):
+                for message in self.current:
+                    yield message
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+    return _FakeSDK, created
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_compacts_persistent_client_and_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, TurnComplete
+
+    overflow = _OverflowTestResult(
+        "API Error: 400 Your input exceeds the context window of this model",
+        is_error=True,
+        api_error_status=400,
+    )
+    compacted = _OverflowTestResult("Compacted", is_error=False)
+    recovered = _OverflowTestResult("recovered", is_error=False)
+    sdk, created = _overflow_test_sdk(
+        [[overflow], [_OverflowTestSystem(), compacted], [recovered]]
+    )
+    monkeypatch.setattr(
+        "claude_agent_sdk.get_session_messages",
+        lambda *args, **kwargs: [
+            SimpleNamespace(
+                type="user", message={"content": [{"type": "text", "text": "summary"}]}
+            )
+        ],
+    )
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert len(created) == 1
+    assert created[0].queries == ["hello", "/compact", "hello"]
+    boundary = next(event for event in events if isinstance(event, CompactionComplete))
+    assert boundary.compacted_messages == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "text", "text": "summary"}],
+        }
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "recovered"
+    assert executor._overflow_recovery_sessions == set()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_second_failure_does_not_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    overflow = _OverflowTestResult(
+        "API Error: 400 input exceeds context window",
+        is_error=True,
+        api_error_status=400,
+    )
+    compacted = _OverflowTestResult("Compacted", is_error=False)
+    sdk, created = _overflow_test_sdk([[overflow], [_OverflowTestSystem(), compacted], [overflow]])
+    monkeypatch.setattr(
+        "claude_agent_sdk.get_session_messages",
+        lambda *args, **kwargs: [
+            SimpleNamespace(
+                type="assistant", message={"content": [{"type": "text", "text": "summary"}]}
+            )
+        ],
+    )
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert len(created) == 1
+    assert created[0].queries == ["hello", "/compact", "hello"]
+    assert isinstance(events[-1], ExecutorError)
+    assert executor._clients == {}
+    assert executor._overflow_recovery_sessions == set()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_provider_400_does_not_trigger_context_recovery() -> None:
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    bad_request = _OverflowTestResult(
+        "API Error: 400 invalid temperature",
+        is_error=True,
+        api_error_status=400,
+    )
+    sdk, created = _overflow_test_sdk([[bad_request]])
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert len(created) == 1
+    assert created[0].queries == ["hello"]
+    assert isinstance(events[-1], ExecutorError)
