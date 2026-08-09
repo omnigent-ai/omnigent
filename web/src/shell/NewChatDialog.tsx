@@ -2053,8 +2053,14 @@ export function NewChatLandingScreen() {
     setGithubRepoPicker({ status: "loading" });
     void listGithubRepos().then((result) => {
       if (!result.ok) {
+        // Only the "you haven't connected yet" case gets the "Connect
+        // GitHub in Settings" hint — a deployment with credentials
+        // disabled entirely (or any other failure) has no actionable
+        // next step there, so it falls into the silent error state.
         setGithubRepoPicker(
-          result.status === 409 ? { status: "not_connected" } : { status: "error" },
+          result.status === 409 && result.code === "github_not_connected"
+            ? { status: "not_connected" }
+            : { status: "error" },
         );
         return;
       }
@@ -4506,6 +4512,15 @@ export function NewChatLandingScreen() {
                           role="combobox"
                           aria-expanded={repoInputFocused && filteredGithubRepos.length > 0}
                           aria-autocomplete="list"
+                          // Suppress the browser's native autofill dropdown so it
+                          // doesn't overlay our repo combobox. `off` alone is
+                          // ignored by some browsers, so also disable spellcheck /
+                          // autocorrect and give it an unrecognized name.
+                          autoComplete="off"
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          spellCheck={false}
+                          name="omnigent-sandbox-repo-url"
                           className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-repo-input"
                         />

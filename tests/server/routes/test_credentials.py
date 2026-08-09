@@ -168,6 +168,30 @@ async def test_callback_happy_path_then_list_and_disconnect(
 async def test_repos_requires_connected_github(client: httpx.AsyncClient) -> None:
     resp = await client.get("/v1/credentials/github/repos")
     assert resp.status_code == 409
+    # OmnigentError.code is the generic HTTP-status category ("conflict")
+    # for both this and the disabled-deployment case below; the specific,
+    # machine-readable reason is carried in .message.
+    assert resp.json()["error"]["message"] == "github_not_connected"
+
+
+async def test_repos_disabled_without_client_id(client: httpx.AsyncClient, monkeypatch) -> None:
+    monkeypatch.delenv("OMNIGENT_GITHUB_CREDENTIAL_CLIENT_ID", raising=False)
+    resp = await client.get("/v1/credentials/github/repos")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["message"] == "credentials_disabled"
+
+
+async def test_repos_disabled_takes_priority_over_connected_credential(
+    client: httpx.AsyncClient, credential_store: CredentialStore, monkeypatch
+) -> None:
+    # The feature gate is checked before the credential lookup, so a
+    # not-configured deployment reports `credentials_disabled` even for a
+    # user who has a stored (now-orphaned) credential.
+    credential_store.upsert(_USER, "github", token="gho_live", login="alice-gh", scopes="repo")
+    monkeypatch.delenv("OMNIGENT_GITHUB_CREDENTIAL_CLIENT_ID", raising=False)
+    resp = await client.get("/v1/credentials/github/repos")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["message"] == "credentials_disabled"
 
 
 async def test_repos_returns_mapped_list(

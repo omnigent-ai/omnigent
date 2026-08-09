@@ -686,6 +686,7 @@ function setupLandingMocks() {
     ok: false,
     error: "github_not_connected",
     status: 409,
+    code: "github_not_connected",
   });
   useHostsMock.mockReset();
   useHostModelOptionsMock.mockReset();
@@ -2496,6 +2497,28 @@ describe("NewChatLandingScreen", () => {
     fireEvent.focus(screen.getByTestId("new-chat-landing-repo-input"));
     await waitFor(() => expect(credentialsMocks.listGithubRepos).toHaveBeenCalledTimes(1));
     expect(await screen.findByText("Connect GitHub in Settings to browse your repos")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-repo-option")).toBeNull();
+  });
+
+  it("does not show the connect-GitHub hint when credentials are disabled on the deployment", async () => {
+    // A deployment with no GitHub OAuth App / encryption key configured
+    // gets the same 409 as "not connected yet", but a different code —
+    // Settings' Connect button is disabled there too, so the hint would
+    // be a dead end.
+    credentialsMocks.listGithubRepos.mockResolvedValue({
+      ok: false,
+      error: "credentials_disabled",
+      status: 409,
+      code: "credentials_disabled",
+    });
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull());
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-repo-input"));
+    await waitFor(() => expect(credentialsMocks.listGithubRepos).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("Connect GitHub in Settings to browse your repos")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-repo-option")).toBeNull();
   });
 

@@ -3,9 +3,10 @@ Per-user external-service credential routes (Settings → Credentials).
 
 ``GET /v1/credentials`` lists the caller's connected credentials (masked —
 never the token). ``GET /v1/credentials/github/repos`` lists the caller's
-GitHub repos (requires a stored, decrypted token). ``POST /v1/credentials/github/connect``
-starts the GitHub OAuth authorize flow; ``GET /auth/github/credential-callback`` finishes it
-(code → token exchange, identity fetch, encrypted upsert);
+GitHub repos (requires a stored, decrypted token).
+``POST /v1/credentials/github/connect`` starts the GitHub OAuth authorize
+flow; ``GET /auth/github/credential-callback`` finishes it (code → token
+exchange, identity fetch, encrypted upsert);
 ``DELETE /v1/credentials/github`` disconnects.
 
 The GitHub OAuth App is configured via
@@ -173,6 +174,8 @@ def create_credentials_router(
     @router.get("/v1/credentials/github/repos")
     async def list_github_repos(request: Request) -> dict[str, Any]:
         """The caller's GitHub repos — owner, collaborator, and org member."""
+        if not _feature_enabled():
+            raise OmnigentError("credentials_disabled", code=ErrorCode.CONFLICT)
         user_id = _user(request)
         cred = credential_store.get(user_id, "github")
         if cred is None:

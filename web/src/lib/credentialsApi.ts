@@ -31,6 +31,15 @@ export interface CredentialsFailure {
   ok: false;
   error: string;
   status: number;
+  /**
+   * The specific, machine-readable reason (e.g. `"github_not_connected"`,
+   * `"credentials_disabled"`). The server's `OmnigentError.code` is only
+   * the generic HTTP-status category (e.g. `"conflict"`) shared by
+   * multiple reasons, so this reads the same slug that's shown in
+   * `error` — callers that need to branch on the specific reason (rather
+   * than just display it) should check `code` instead of `error`.
+   */
+  code?: string;
 }
 
 export type CredentialsListResult = CredentialsList | CredentialsFailure;
@@ -45,17 +54,24 @@ const NETWORK_FAILURE: CredentialsFailure = {
 
 async function failureFrom(res: Response, fallback: string): Promise<CredentialsFailure> {
   let message = fallback;
+  let code: string | undefined;
   if (res.status >= 500) {
     message = "Server error. Try again in a moment.";
   } else {
     try {
-      const data = (await res.json()) as { error?: string };
-      if (data.error) message = data.error;
+      const data = (await res.json()) as { error?: { code?: string; message?: string } };
+      // credentials.py's OmnigentError.message carries the specific reason
+      // (e.g. "github_not_connected"); error.code is only the generic
+      // HTTP-status category ("conflict") and can't distinguish reasons.
+      if (data.error?.message) {
+        message = data.error.message;
+        code = data.error.message;
+      }
     } catch {
       // keep fallback
     }
   }
-  return { ok: false, error: message, status: res.status };
+  return { ok: false, error: message, status: res.status, code };
 }
 
 /** GET /v1/credentials — the caller's connected credentials. */
