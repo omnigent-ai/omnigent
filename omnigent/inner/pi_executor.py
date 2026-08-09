@@ -2598,6 +2598,7 @@ class PiExecutor(Executor):
                 completion_text_ready = False
                 last_tool_failed = status in (ToolCallStatus.BLOCKED, ToolCallStatus.ERROR)
                 failure_recovery_requested = False
+                tool_turn_continuations = 0
 
                 yield ToolCallComplete(
                     name=tool_name,
@@ -2717,35 +2718,36 @@ class PiExecutor(Executor):
             # ``usage`` object holds that LLM call's token counts — collect
             # each for the turn-level sum before handling error stop reasons.
             if event_type == "message_end":
-                saw_message_end = True
                 msg = event.get("message", {})
-                if isinstance(msg, dict):
-                    captured = _extract_pi_turn_usage(msg, model)
-                    if captured is not None:
-                        message_usages.append(captured)
-                    raw_stop = msg.get("stopReason")
-                    stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    call_error = None
-                    if stop in {"aborted", "error"}:
-                        call_error = str(msg.get("errorMessage", stop))
-                    call_response, call_reasoning = _extract_pi_message_output(msg)
-                    yield LLMCallComplete(
-                        model=_pi_message_model(msg, model),
-                        usage=dict(captured) if captured is not None else None,
-                        response=call_response,
-                        reasoning=call_reasoning,
-                        error=call_error,
-                    )
-                    if stop == "aborted":
-                        yield ExecutorError(message=call_error or stop)
-                        return
-                    if stop == "error":
-                        # Pi emits the turn-terminal ``agent_end`` after an
-                        # errored LLM call; returning here would leave it
-                        # queued, so the next turn on this RPC session reads
-                        # the stale event as its own end. Record the error
-                        # and keep draining until ``agent_end``.
-                        pending_error = call_error or stop
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                saw_message_end = True
+                captured = _extract_pi_turn_usage(msg, model)
+                if captured is not None:
+                    message_usages.append(captured)
+                raw_stop = msg.get("stopReason")
+                stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                call_error = None
+                if stop in {"aborted", "error"}:
+                    call_error = str(msg.get("errorMessage", stop))
+                call_response, call_reasoning = _extract_pi_message_output(msg)
+                yield LLMCallComplete(
+                    model=_pi_message_model(msg, model),
+                    usage=dict(captured) if captured is not None else None,
+                    response=call_response,
+                    reasoning=call_reasoning,
+                    error=call_error,
+                )
+                if stop == "aborted":
+                    yield ExecutorError(message=call_error or stop)
+                    return
+                if stop == "error":
+                    # Pi emits the turn-terminal ``agent_end`` after an
+                    # errored LLM call; returning here would leave it
+                    # queued, so the next turn on this RPC session reads
+                    # the stale event as its own end. Record the error
+                    # and keep draining until ``agent_end``.
+                    pending_error = call_error or stop
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

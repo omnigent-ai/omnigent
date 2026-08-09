@@ -4237,20 +4237,26 @@ def test_pi_emits_model_call_boundaries_with_per_call_usage() -> None:
     _run(_test())
 
 
-def test_pi_ignores_non_assistant_message_start() -> None:
+def test_pi_ignores_non_assistant_message_boundaries() -> None:
     """User and tool-result messages do not create empty model-call spans."""
 
     async def _test() -> None:
         assistant = _pi_assistant_message_with_usage(text="Done.")
+        user = {"role": "user", "content": "inspect"}
+        tool_result = {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [{"type": "text", "text": "contents"}],
+            "isError": False,
+        }
         executor = _executor_with_scripted_rpc(
             [
                 json.dumps({"type": "response", "success": True}),
-                json.dumps(
-                    {
-                        "type": "message_start",
-                        "message": {"role": "user", "content": "inspect"},
-                    }
-                ),
+                json.dumps({"type": "message_start", "message": user}),
+                json.dumps({"type": "message_end", "message": user}),
+                json.dumps({"type": "message_start", "message": tool_result}),
+                json.dumps({"type": "message_end", "message": tool_result}),
                 json.dumps({"type": "message_start", "message": assistant}),
                 json.dumps({"type": "message_end", "message": assistant}),
                 json.dumps({"type": "agent_end", "messages": [assistant]}),
@@ -4267,7 +4273,9 @@ def test_pi_ignores_non_assistant_message_start() -> None:
         ]
 
         starts = [event for event in events if isinstance(event, LLMCallStarted)]
+        completions = [event for event in events if isinstance(event, LLMCallComplete)]
         assert len(starts) == 1
+        assert len(completions) == 1
         assert starts[0].model == "claude-sonnet-4-6"
 
     _run(_test())
@@ -4740,6 +4748,76 @@ def test_pi_fails_loud_after_bounded_empty_post_tool_continuations() -> None:
         assert errors[0].retryable is True
         assert "after 2 continuations" in errors[0].message
         assert not any(isinstance(event, TurnComplete) for event in events)
+
+    _run(_test())
+
+
+def test_pi_resets_empty_completion_budget_after_tool_progress() -> None:
+    """A completed tool call resets the consecutive continuation limit."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "initial evidence"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "read",
+                        "args": {"path": "README.md"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "read",
+                        "isError": False,
+                        "result": {"content": "more evidence"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Resolved.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "Resolved."
+        written = b"".join(rpc.process.stdin.data).decode().splitlines()
+        commands = [json.loads(line) for line in written]
+        prompts = [command for command in commands if command.get("type") == "prompt"]
+        assert len(prompts) == 4
 
     _run(_test())
 
