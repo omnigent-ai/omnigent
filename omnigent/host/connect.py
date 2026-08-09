@@ -50,8 +50,12 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListLocalSessionsFrame,
+    HostListLocalSessionsResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostLoadLocalSessionFrame,
+    HostLoadLocalSessionResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
@@ -712,6 +716,11 @@ class _RunnerHandle:
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
+
+
+# Only the first-party harnesses the web import picker offers; the
+# CLI still imports the rest by session id.
+_IMPORTABLE_SOURCES = ("claude", "codex")
 
 
 class HostProcess:
@@ -2374,6 +2383,114 @@ class HostProcess:
             ],
         )
 
+    async def _handle_list_local_sessions(
+        self,
+        frame: HostListLocalSessionsFrame,
+    ) -> HostListLocalSessionsResultFrame:
+        """Handle a ``host.list_local_sessions`` request from the server.
+
+        Parsing transcripts blocks, so the scan runs in a worker thread
+        and the tunnel loop keeps servicing pings.
+
+        :param frame: The browse request frame.
+        :returns: Result frame with session summaries, or
+            ``status: "failed"`` with an error message.
+        """
+        from omnigent.session_import.local import list_recent_local_sessions
+
+        if frame.source not in _IMPORTABLE_SOURCES:
+            return HostListLocalSessionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"unsupported import source: {frame.source}",
+            )
+        try:
+            summaries = await asyncio.to_thread(
+                list_recent_local_sessions,
+                frame.source,
+                limit=frame.limit,
+            )
+        except Exception as exc:
+            _logger.exception("host list_local_sessions for %r failed", frame.source)
+            return HostListLocalSessionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=str(exc),
+            )
+        return HostListLocalSessionsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            sessions=[
+                {
+                    "source": summary.source,
+                    "external_session_id": summary.external_session_id,
+                    "workspace": summary.workspace,
+                    "title": summary.title,
+                    "item_count": summary.item_count,
+                    "preview": [
+                        {"role": entry.role, "text": entry.text} for entry in summary.preview
+                    ],
+                }
+                for summary in summaries
+            ],
+        )
+
+    async def _handle_load_local_session(
+        self,
+        frame: HostLoadLocalSessionFrame,
+    ) -> HostLoadLocalSessionResultFrame:
+        """Handle a ``host.load_local_session`` request from the server.
+
+        :param frame: The load request frame.
+        :returns: Result frame with the normalized transcript, or a
+            ``"not_found"`` / ``"failed"`` status with an error message.
+        """
+        from omnigent.session_import import SessionImportNotFoundError
+        from omnigent.session_import.local import load_local_session
+
+        if frame.source not in _IMPORTABLE_SOURCES:
+            return HostLoadLocalSessionResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"unsupported import source: {frame.source}",
+            )
+        try:
+            loaded = await asyncio.to_thread(
+                load_local_session,
+                frame.source,
+                frame.external_session_id,
+            )
+        except SessionImportNotFoundError as exc:
+            return HostLoadLocalSessionResultFrame(
+                request_id=frame.request_id,
+                status="not_found",
+                error=str(exc),
+            )
+        except Exception as exc:
+            _logger.exception("host load_local_session %r failed", frame.external_session_id)
+            return HostLoadLocalSessionResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=str(exc),
+            )
+        return HostLoadLocalSessionResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            session={
+                "source": loaded.source,
+                "external_session_id": loaded.external_session_id,
+                "workspace": loaded.workspace,
+                "items": [
+                    {
+                        "type": item.type,
+                        "response_id": item.response_id,
+                        "data": item.data.model_dump(mode="json", exclude_none=True),
+                    }
+                    for item in loaded.items
+                ],
+            },
+        )
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -2857,6 +2974,10 @@ class HostProcess:
             await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
+        elif isinstance(frame, HostListLocalSessionsFrame):
+            await ws.send(encode_host_frame(await self._handle_list_local_sessions(frame)))
+        elif isinstance(frame, HostLoadLocalSessionFrame):
+            await ws.send(encode_host_frame(await self._handle_load_local_session(frame)))
 
 
 def run_host_process(

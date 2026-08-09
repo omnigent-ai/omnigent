@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import subprocess
 import threading
@@ -3784,3 +3785,116 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     while time.monotonic() < deadline and spawned[0].poll() is None:
         await asyncio.sleep(0.05)
     assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"
+
+
+async def test_handle_list_local_sessions_returns_summaries(monkeypatch) -> None:
+    """The host answers a browse request with picker-ready summaries."""
+    from omnigent.host.frames import HostListLocalSessionsFrame
+    from omnigent.session_import.models import (
+        LocalSessionPreviewMessage,
+        LocalSessionSummary,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_local_sessions",
+        lambda source, *, limit: (
+            LocalSessionSummary(
+                source="claude",
+                external_session_id="abc",
+                workspace="/repo",
+                title="inspect TODO.md",
+                item_count=4,
+                preview=(LocalSessionPreviewMessage(role="user", text="inspect TODO.md"),),
+            ),
+        ),
+    )
+
+    host = _make_host_process()
+    result = await host._handle_list_local_sessions(
+        HostListLocalSessionsFrame(request_id="r1", source="claude", limit=10)
+    )
+
+    assert result.status == "ok"
+    assert result.sessions == [
+        {
+            "source": "claude",
+            "external_session_id": "abc",
+            "workspace": "/repo",
+            "title": "inspect TODO.md",
+            "item_count": 4,
+            "preview": [{"role": "user", "text": "inspect TODO.md"}],
+        }
+    ]
+
+
+async def test_handle_list_local_sessions_rejects_unsupported_source() -> None:
+    """Only Claude and Codex can be browsed from the web picker."""
+    from omnigent.host.frames import HostListLocalSessionsFrame
+
+    host = _make_host_process()
+    result = await host._handle_list_local_sessions(
+        HostListLocalSessionsFrame(request_id="r1", source="qwen", limit=10)
+    )
+
+    assert result.status == "failed"
+    assert result.sessions is None
+    assert "qwen" in (result.error or "")
+
+
+async def test_handle_load_local_session_returns_serializable_items(monkeypatch) -> None:
+    """A loaded transcript comes back as JSON-ready item dicts."""
+    from omnigent.entities import NewConversationItem, parse_item_data
+    from omnigent.host.frames import HostLoadLocalSessionFrame
+    from omnigent.session_import.models import LocalSessionImport
+
+    loaded = LocalSessionImport(
+        source="claude",
+        external_session_id="abc",
+        workspace="/repo",
+        items=(
+            NewConversationItem(
+                type="message",
+                response_id="claude:1",
+                data=parse_item_data(
+                    "message",
+                    {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.session_import.local.load_local_session", lambda source, sid: loaded
+    )
+
+    host = _make_host_process()
+    result = await host._handle_load_local_session(
+        HostLoadLocalSessionFrame(request_id="r2", source="claude", external_session_id="abc")
+    )
+
+    assert result.status == "ok"
+    assert result.session is not None
+    assert result.session["external_session_id"] == "abc"
+    assert result.session["workspace"] == "/repo"
+    assert result.session["items"][0]["type"] == "message"
+    assert result.session["items"][0]["response_id"] == "claude:1"
+    assert json.dumps(result.session)  # must be JSON-serializable
+
+
+async def test_handle_load_local_session_reports_missing_session(monkeypatch) -> None:
+    """A missing transcript is a not_found status, not an exception."""
+    from omnigent.host.frames import HostLoadLocalSessionFrame
+    from omnigent.session_import import SessionImportNotFoundError
+
+    def _missing(source, session_id):
+        raise SessionImportNotFoundError("Claude Code session 'gone' was not found")
+
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _missing)
+
+    host = _make_host_process()
+    result = await host._handle_load_local_session(
+        HostLoadLocalSessionFrame(request_id="r2", source="claude", external_session_id="gone")
+    )
+
+    assert result.status == "not_found"
+    assert result.session is None
+    assert "gone" in (result.error or "")
