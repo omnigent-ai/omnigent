@@ -11,6 +11,7 @@ executor adapter uses, then asserts on the exported span attributes.
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import Iterator
 
 import pytest
@@ -234,23 +235,51 @@ def test_content_capture_on_includes_error_message(
     assert attrs["error.message"] == "boom"
 
 
-# ---
-# Dead-helper deletion: start_llm_span / end_llm_span removed
-# ---
+def test_llm_span_is_a_langfuse_generation_with_exact_usage(
+    exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """LLM spans carry model, content, and exclusive usage buckets."""
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
 
-
-def test_dead_llm_helpers_removed():
-    """
-    start_llm_span / end_llm_span had zero production callers (LLM
-    spans come from inside the spawned executor subprocess via the
-    SDK's own tracing). They were deleted as part of this PR. Lock
-    that with a test so a future drive-by add gets caught.
-    """
     ctx = TracingContext()
-    assert not hasattr(ctx, "start_llm_span"), (
-        "start_llm_span was deleted as dead-for-production. If you need "
-        "LLM-level instrumentation, wire it from where LLM calls actually "
-        "happen. inside the spawned subprocess via the SDK, or from "
-        "record_llm_usage in TurnComplete."
+    agent = ctx.start_agent_span(agent_name="watchdog", user_message="inspect")
+    llm = ctx.start_llm_span(model="openai/gpt-5.4-mini")
+    ctx.end_llm_span(
+        llm,
+        reasoning="I should inspect the repository.",
+        response="I found the file.",
+        usage={
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "total_tokens": 175,
+            "cache_read_input_tokens": 20,
+            "cache_creation_input_tokens": 5,
+        },
+        parent_span=agent,
     )
-    assert not hasattr(ctx, "end_llm_span")
+    ctx.end_agent_span(agent, response="done")
+
+    llm_spans = _spans_by_name(exporter, "llm_call")
+    assert len(llm_spans) == 1
+    attrs = dict(llm_spans[0].attributes or {})
+    assert attrs["openinference.span.kind"] == "LLM"
+    assert attrs["gen_ai.operation.name"] == "chat"
+    assert attrs["gen_ai.provider.name"] == "openai"
+    assert attrs["gen_ai.request.model"] == "gpt-5.4-mini"
+    assert attrs["langfuse.observation.type"] == "generation"
+    assert attrs["langfuse.observation.model.name"] == "gpt-5.4-mini"
+    assert attrs["gen_ai.usage.input_tokens"] == 120
+    assert attrs["gen_ai.usage.output_tokens"] == 30
+    assert attrs["gen_ai.usage.total_tokens"] == 175
+    assert json.loads(attrs["langfuse.observation.usage_details"]) == {
+        "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 20,
+        "input": 120,
+        "output": 30,
+        "total": 175,
+    }
+    assert json.loads(attrs["output.value"]) == {
+        "reasoning": "I should inspect the repository.",
+        "response": "I found the file.",
+    }

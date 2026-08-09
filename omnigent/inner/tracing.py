@@ -1,8 +1,9 @@
 """OpenTelemetry tracing integration for Omnigent.
 
-Emits structured traces for every agent turn, tool call, sub-agent
-invocation, and policy evaluation so the full execution tree is visible
-in any OTel-compatible backend (Jaeger, Tempo, Grafana, MLflow Traces, etc.).
+Emits structured traces for every agent turn, model call, tool call,
+sub-agent invocation, and policy evaluation so the full execution tree is
+visible in any OTel-compatible backend (Jaeger, Tempo, Grafana, MLflow
+Traces, Langfuse, etc.).
 
 Usage::
 
@@ -25,14 +26,10 @@ Or per-session::
 Span hierarchy for a typical turn::
 
     agent:<name>  (openinference.span.kind=AGENT)
+    ├── llm_call  (openinference.span.kind=LLM)
     ├── tool:<tool_name>  (openinference.span.kind=TOOL)
-    │   └── agent:<sub_agent>  (openinference.span.kind=AGENT)
-    │       └── tool:<sub_tool>
+    ├── llm_call
     └── policy:<policy_name>  (openinference.span.kind=GUARDRAIL)
-
-LLM-level spans are not emitted from this module. Real ``llm_call``
-spans originate inside the spawned executor subprocess via the SDK's
-own tracing.
 """
 
 from __future__ import annotations
@@ -57,6 +54,7 @@ TraceValue: TypeAlias = Any  # type: ignore[explicit-any]
 # OpenInference semantic conventions for span kinds.
 _SPAN_KIND_ATTR = "openinference.span.kind"
 _SPAN_KIND_AGENT = "AGENT"
+_SPAN_KIND_LLM = "LLM"
 _SPAN_KIND_TOOL = "TOOL"
 _SPAN_KIND_GUARDRAIL = "GUARDRAIL"
 
@@ -73,6 +71,8 @@ _GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
 _GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
 _GEN_AI_TOOL_NAME = "gen_ai.tool.name"
 _TOOL_NAME = "tool.name"
+_LANGFUSE_OBSERVATION_TYPE = "langfuse.observation.type"
+_LANGFUSE_OBSERVATION_MODEL = "langfuse.observation.model.name"
 
 # Error text can echo user input or tool payloads, so it is gated behind
 # content capture just like input.value / output.value.
@@ -248,6 +248,80 @@ class TracingContext:
             self._current_span = self._inherited_parent
         elif span is self._current_span:
             self._current_span = self._inherited_parent
+
+    def start_llm_span(self, model: str | None = None) -> Span:
+        """Begin one LLM generation span under the active agent span."""
+        from opentelemetry import trace
+
+        ctx_carrier = (
+            trace.set_span_in_context(self._current_span)
+            if self._current_span is not None
+            else None
+        )
+        attrs: dict[str, str] = {
+            _SPAN_KIND_ATTR: _SPAN_KIND_LLM,
+            _GEN_AI_OP_NAME: "chat",
+            _LANGFUSE_OBSERVATION_TYPE: "generation",
+        }
+        if self.session_id:
+            attrs["session.id"] = self.session_id
+        if model:
+            attrs[_LLM_MODEL_NAME] = model
+            provider, model_name = parse_provider_name(model)
+            if provider:
+                attrs[_GEN_AI_PROVIDER_NAME] = provider
+            if model_name:
+                attrs[_GEN_AI_REQUEST_MODEL] = model_name
+                attrs[_LANGFUSE_OBSERVATION_MODEL] = model_name
+
+        span = _tracer().start_span(
+            name="llm_call",
+            context=ctx_carrier,
+            attributes=attrs,
+        )
+        self._current_span = span
+        return span
+
+    def end_llm_span(
+        self,
+        span: Span | None,
+        *,
+        reasoning: str | None = None,
+        response: str | None = None,
+        usage: dict[str, TraceValue] | None = None,
+        error: str | None = None,
+        parent_span: Span | None = None,
+    ) -> None:
+        """End one LLM generation span with content and token usage."""
+        if span is None:
+            return
+        from opentelemetry.trace import StatusCode
+
+        if should_capture_content():
+            output: TraceValue = None
+            if reasoning and response:
+                output = {"reasoning": reasoning, "response": response}
+            elif reasoning:
+                output = reasoning
+            elif response:
+                output = response
+            if output is not None:
+                span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(output))
+        if usage is not None:
+            from omnigent.runtime.telemetry import record_llm_usage
+
+            record_llm_usage(span, usage)
+        if error:
+            if should_capture_content():
+                span.set_attribute(_ERROR_MESSAGE, error)
+                span.set_status(StatusCode.ERROR, error)
+            else:
+                span.set_status(StatusCode.ERROR)
+        else:
+            span.set_status(StatusCode.OK)
+        span.end()
+        if span is self._current_span:
+            self._current_span = parent_span
 
     def start_tool_span(
         self,

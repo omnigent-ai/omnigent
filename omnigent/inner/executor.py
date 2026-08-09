@@ -133,6 +133,40 @@ class ReasoningChunk(ExecutorEvent):
 
 
 @dataclass
+class LLMCallStarted(ExecutorEvent):
+    """An executor started one provider model call.
+
+    Executors that run their own tool loop may make several model calls during
+    one Omnigent turn. Emitting this boundary lets tracing keep each call
+    separate from the tools between them.
+
+    :param model: Provider model identifier for this call, or ``None`` when the
+        executor cannot resolve it.
+    """
+
+    model: str | None = None
+
+
+@dataclass
+class LLMCallComplete(ExecutorEvent):
+    """One provider model call finished.
+
+    :param model: Provider model identifier for this call.
+    :param usage: Provider-reported usage for this call, using the same
+        exclusive token buckets as :class:`TurnComplete`.
+    :param response: Assistant text produced by this call, when available.
+    :param reasoning: Reasoning text produced by this call, when available.
+    :param error: Provider error for this call, or ``None`` on success.
+    """
+
+    model: str | None = None
+    usage: ExecutorUsage | None = None
+    response: str | None = None
+    reasoning: str | None = None
+    error: str | None = None
+
+
+@dataclass
 class ToolCallRequest(ExecutorEvent):
     """The LLM wants to call a tool.
 

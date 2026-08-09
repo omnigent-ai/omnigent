@@ -1566,6 +1566,141 @@ async def test_executor_adapter_forwards_model_override_to_config() -> None:
     assert captured["model"] == "openai/gpt-5.4-mini"
 
 
+@pytest.mark.asyncio
+async def test_executor_adapter_traces_model_tool_model_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model calls and tools are sibling spans in execution order."""
+    import asyncio
+
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        ExecutorEvent,
+        LLMCallComplete,
+        LLMCallStarted,
+        Message,
+        ReasoningChunk,
+        TextChunk,
+        ToolCallComplete,
+        ToolCallRequest,
+        ToolCallStatus,
+        ToolSpec,
+        TurnComplete,
+    )
+    from omnigent.inner.tracing import disable_tracing, enable_tracing
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _TraceSequenceExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ) -> AsyncIterator[ExecutorEvent]:
+            del messages, tools, system_prompt, config
+            yield LLMCallStarted(model="openai/gpt-5.4-mini")
+            yield ReasoningChunk(delta="Inspect the file.", event_type="reasoning_text")
+            yield LLMCallComplete(
+                model="openai/gpt-5.4-mini",
+                reasoning="Inspect the file.",
+                usage={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+            )
+            yield ToolCallRequest(
+                name="sys_os_read",
+                args={"path": "README.md"},
+                metadata={"call_id": "call_trace_1"},
+            )
+            yield ToolCallComplete(
+                name="sys_os_read",
+                status=ToolCallStatus.SUCCESS,
+                result="contents",
+                metadata={"call_id": "call_trace_1"},
+            )
+            yield LLMCallStarted(model="openai/gpt-5.4-mini")
+            yield ReasoningChunk(delta="Use the result.", event_type="reasoning_text")
+            yield TextChunk(text="Done.")
+            yield LLMCallComplete(
+                model="openai/gpt-5.4-mini",
+                reasoning="Use the result.",
+                response="Done.",
+                usage={"input_tokens": 130, "output_tokens": 25, "total_tokens": 155},
+            )
+            yield TurnComplete(
+                response="Done.",
+                usage={"input_tokens": 230, "output_tokens": 45, "total_tokens": 275},
+            )
+
+    previous = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    previous_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+    enable_tracing()
+    try:
+        adapter = ExecutorAdapter(
+            executor_factory=lambda: _TraceSequenceExecutor(),
+            session_key="conv_trace",
+        )
+        ctx = TurnContext(
+            response_id="resp_0123456789abcdef0123456789abcdef",
+            event_queue=asyncio.Queue(),
+            cancelled=asyncio.Event(),
+        )
+        await adapter.run_turn(
+            CreateResponseRequest(model="watchdog", input="inspect"),
+            ctx,
+        )
+
+        spans = list(exporter.get_finished_spans())
+        agent = next(span for span in spans if span.name == "agent:watchdog")
+        children = sorted(
+            (span for span in spans if span is not agent),
+            key=lambda span: span.start_time or 0,
+        )
+        assert [span.name for span in children] == [
+            "llm_call",
+            "tool:sys_os_read",
+            "llm_call",
+        ]
+        assert all(
+            span.parent is not None and span.parent.span_id == agent.context.span_id
+            for span in children
+        )
+        assert children[0].end_time is not None
+        assert children[1].start_time is not None
+        assert children[1].end_time is not None
+        assert children[2].start_time is not None
+        assert children[0].end_time <= children[1].start_time
+        assert children[1].end_time <= children[2].start_time
+        first_usage = json.loads(
+            (children[0].attributes or {})["langfuse.observation.usage_details"]
+        )
+        second_usage = json.loads(
+            (children[2].attributes or {})["langfuse.observation.usage_details"]
+        )
+        assert first_usage == {"input": 100, "output": 20, "total": 120}
+        assert second_usage == {"input": 130, "output": 25, "total": 155}
+    finally:
+        disable_tracing()
+        exporter.clear()
+        with contextlib.suppress(Exception):
+            provider.shutdown()
+        otel_trace._TRACER_PROVIDER = previous  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = previous_done  # type: ignore[attr-defined]
+
+
 class _AcceptingInjectionExecutor:
     """Inner executor stub whose enqueue_session_message always accepts."""
 

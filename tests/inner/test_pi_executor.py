@@ -20,6 +20,8 @@ from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
+    LLMCallComplete,
+    LLMCallStarted,
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
@@ -2221,9 +2223,11 @@ class TestRunTurn(unittest.TestCase):
                 )
             ]
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], ExecutorError)
-            self.assertIn("Rate limited", events[0].message)
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], LLMCallComplete)
+            self.assertEqual(events[0].error, "Rate limited")
+            self.assertIsInstance(events[1], ExecutorError)
+            self.assertIn("Rate limited", events[1].message)
 
         _run(_test())
 
@@ -2275,9 +2279,11 @@ class TestRunTurn(unittest.TestCase):
                 )
             ]
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], ExecutorError)
-            self.assertEqual(events[0].message, "boom")
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], LLMCallComplete)
+            self.assertEqual(events[0].error, "boom")
+            self.assertIsInstance(events[1], ExecutorError)
+            self.assertEqual(events[1].message, "boom")
 
         _run(_test())
 
@@ -4144,6 +4150,89 @@ def test_pi_usage_captured_from_message_end() -> None:
         assert usage["model"] == "claude-sonnet-4-6"
         # The text still streams through unaffected by usage capture.
         assert turn_complete[0].response == "Done."
+
+    _run(_test())
+
+
+def test_pi_emits_model_call_boundaries_with_per_call_usage() -> None:
+    """Each Pi assistant message becomes one traced model call."""
+
+    async def _test() -> None:
+        first = _pi_assistant_message_with_usage(
+            text="",
+            input_tokens=100,
+            output_tokens=20,
+            cache_read=10,
+            cache_write=2,
+            total_tokens=132,
+        )
+        first["content"] = [{"type": "thinking", "thinking": "Use the tool."}]
+        second = _pi_assistant_message_with_usage(
+            text="Done.",
+            input_tokens=140,
+            output_tokens=25,
+            cache_read=12,
+            cache_write=3,
+            total_tokens=180,
+        )
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "message_start", "message": first}),
+                json.dumps({"type": "message_end", "message": first}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "sys_os_read",
+                        "args": {"path": "README.md"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "sys_os_read",
+                        "isError": False,
+                        "result": "contents",
+                    }
+                ),
+                json.dumps({"type": "message_start", "message": second}),
+                json.dumps({"type": "message_end", "message": second}),
+                json.dumps({"type": "agent_end", "messages": [first, second]}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "inspect"}],
+                [],
+                "system",
+            )
+        ]
+
+        boundaries = [
+            event
+            for event in events
+            if isinstance(
+                event,
+                (LLMCallStarted, LLMCallComplete, ToolCallRequest, ToolCallComplete),
+            )
+        ]
+        assert [type(event) for event in boundaries] == [
+            LLMCallStarted,
+            LLMCallComplete,
+            ToolCallRequest,
+            ToolCallComplete,
+            LLMCallStarted,
+            LLMCallComplete,
+        ]
+        completions = [event for event in boundaries if isinstance(event, LLMCallComplete)]
+        assert completions[0].reasoning == "Use the tool."
+        assert completions[0].usage is not None
+        assert completions[0].usage["input_tokens"] == 100
+        assert completions[1].response == "Done."
+        assert completions[1].usage is not None
+        assert completions[1].usage["input_tokens"] == 140
 
     _run(_test())
 

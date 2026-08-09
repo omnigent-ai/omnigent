@@ -51,6 +51,8 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    LLMCallComplete,
+    LLMCallStarted,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -416,11 +418,73 @@ class ExecutorAdapter(HarnessApp):
             self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
         agent_span = None
+        llm_span = None
+        llm_parent = None
+        llm_reasoning_parts: list[str] = []
+        llm_response_parts: list[str] = []
+        llm_span_count = 0
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
         _active_tool_span = None
         _active_tool_parent = None
 
         user_message = _extract_last_user_message(request.input)
+
+        def _start_llm_trace(model: str | None = None) -> None:
+            nonlocal llm_parent, llm_span, llm_span_count
+            if tctx is None or llm_span is not None:
+                return
+            llm_parent = tctx._current_span
+            llm_span = tctx.start_llm_span(
+                model=model or request.model_override or request.model,
+            )
+            llm_reasoning_parts.clear()
+            llm_response_parts.clear()
+            llm_span_count += 1
+
+        def _end_llm_trace(
+            *,
+            usage: dict[str, Any] | None = None,
+            response: str | None = None,
+            reasoning: str | None = None,
+            error: str | None = None,
+        ) -> None:
+            nonlocal llm_parent, llm_span
+            if tctx is None or llm_span is None:
+                return
+            traced_reasoning = "".join(llm_reasoning_parts) or reasoning
+            traced_response = "".join(llm_response_parts) or response
+            tctx.end_llm_span(
+                llm_span,
+                reasoning=traced_reasoning,
+                response=traced_response,
+                usage=usage,
+                error=error,
+                parent_span=llm_parent,
+            )
+            llm_span = None
+            llm_parent = None
+            llm_reasoning_parts.clear()
+            llm_response_parts.clear()
+
+        def _end_tool_trace(
+            *,
+            result: Any = None,
+            error: str | None = None,
+            duration_ms: float = 0.0,
+        ) -> None:
+            nonlocal _active_tool_parent, _active_tool_span
+            if tctx is None or _active_tool_span is None:
+                return
+            tctx.end_tool_span(
+                _active_tool_span,
+                result=result,
+                error=error,
+                duration_ms=duration_ms,
+                parent_span=_active_tool_parent,
+            )
+            _active_tool_span = None
+            _active_tool_parent = None
+
         # --- End tracing setup --------------------------------------------
 
         # Watcher for mid-turn steering injections. The scaffold
@@ -474,6 +538,12 @@ class ExecutorAdapter(HarnessApp):
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
 
+                            if llm_span is not None:
+                                record_cancellation(llm_span)
+                                _end_llm_trace()
+                            if _active_tool_span is not None:
+                                record_cancellation(_active_tool_span)
+                                _end_tool_trace()
                             record_cancellation(agent_span)
                             tctx.end_agent_span(agent_span, response=None)
                             agent_span = None
@@ -489,35 +559,55 @@ class ExecutorAdapter(HarnessApp):
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
-                        if isinstance(event, ToolCallRequest):
+                        if isinstance(event, LLMCallStarted):
+                            _end_llm_trace()
+                            _start_llm_trace(event.model)
+                        elif isinstance(event, ReasoningChunk):
+                            _start_llm_trace()
+                            if event.delta:
+                                llm_reasoning_parts.append(event.delta)
+                        elif isinstance(event, TextChunk):
+                            _start_llm_trace()
+                            llm_response_parts.append(event.text)
+                        elif isinstance(event, LLMCallComplete):
+                            _start_llm_trace(event.model)
+                            _end_llm_trace(
+                                usage=event.usage,
+                                response=event.response,
+                                reasoning=event.reasoning,
+                                error=event.error,
+                            )
+                        elif isinstance(event, ToolCallRequest):
+                            _end_llm_trace()
                             _active_tool_parent = tctx._current_span
                             _active_tool_span = tctx.start_tool_span(
                                 _strip_mcp_tool_prefix(event.name),
                                 event.args or {},
                             )
                         elif isinstance(event, ToolCallComplete):
-                            if _active_tool_span is not None:
-                                tctx.end_tool_span(
-                                    _active_tool_span,
-                                    result=event.result,
-                                    error=event.error,
-                                    duration_ms=event.duration_ms,
-                                    parent_span=_active_tool_parent,
-                                )
-                                _active_tool_span = None
-                                _active_tool_parent = None
+                            _end_tool_trace(
+                                result=event.result,
+                                error=event.error,
+                                duration_ms=event.duration_ms,
+                            )
                         elif isinstance(event, TurnComplete):
                             response_text = event.response
-                            if event.usage is not None and agent_span is not None:
-                                from omnigent.runtime.telemetry import record_llm_usage
-
-                                # Record usage on the agent span for
-                                # aggregate visibility.
-                                record_llm_usage(agent_span, event.usage)
+                            if llm_span is not None:
+                                _end_llm_trace(
+                                    usage=event.usage,
+                                    response=event.response,
+                                )
+                            elif llm_span_count == 0 and event.usage is not None:
+                                _start_llm_trace()
+                                _end_llm_trace(
+                                    usage=event.usage,
+                                    response=event.response,
+                                )
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):
                         if tctx is not None and agent_span is not None:
+                            _end_tool_trace(error="tool call did not complete before turn end")
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None
                         # The inner generation reached its natural end — no
@@ -529,18 +619,27 @@ class ExecutorAdapter(HarnessApp):
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
 
+                            if llm_span is not None:
+                                record_cancellation(llm_span)
+                                _end_llm_trace()
+                            if _active_tool_span is not None:
+                                record_cancellation(_active_tool_span)
+                                _end_tool_trace()
                             record_cancellation(agent_span)
                             # #1026: mark the cancelled turn's agent span ERROR.
                             # Upstream refactored end_agent_span (dropped the
                             # ``status=`` kwarg); ERROR status is now driven by a
                             # truthy ``error=``, so route the cancellation through it.
                             tctx.end_agent_span(agent_span, response=None, error="cancelled")
+                            agent_span = None
                         # The inner executor reported its own cancellation; the
                         # generation is already wound down, so treat as clean.
                         clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
                         if tctx is not None and agent_span is not None:
+                            _end_llm_trace(error=event.message)
+                            _end_tool_trace(error=event.message)
                             tctx.end_agent_span(
                                 agent_span,
                                 response=None,
@@ -562,8 +661,15 @@ class ExecutorAdapter(HarnessApp):
             if tctx is not None and agent_span is not None:
                 from omnigent.runtime.telemetry import record_cancellation
 
+                if llm_span is not None:
+                    record_cancellation(llm_span)
+                    _end_llm_trace()
+                if _active_tool_span is not None:
+                    record_cancellation(_active_tool_span)
+                    _end_tool_trace()
                 record_cancellation(agent_span)
                 tctx.end_agent_span(agent_span, response=None)
+                agent_span = None
             ctx.cancelled.set()
             # Interrupt the inner executor session so the in-flight
             # generation stops immediately, same as the normal
@@ -574,6 +680,8 @@ class ExecutorAdapter(HarnessApp):
             # End agent span on unhandled exceptions so it's not
             # left open (which would leak on the OTel provider).
             if tctx is not None and agent_span is not None:
+                _end_llm_trace(error="unhandled exception")
+                _end_tool_trace(error="unhandled exception")
                 tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
                 agent_span = None
             raise

@@ -78,6 +78,8 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    LLMCallComplete,
+    LLMCallStarted,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -1619,6 +1621,53 @@ def _extract_pi_turn_usage(
     }
 
 
+def _pi_message_model(message: object, fallback_model: str | None) -> str | None:
+    """Return the resolved model recorded on a Pi assistant message."""
+    if not isinstance(message, dict):
+        return fallback_model
+    raw_model = message.get("model")
+    return raw_model if isinstance(raw_model, str) and raw_model else fallback_model
+
+
+def _extract_pi_message_output(message: object) -> tuple[str | None, str | None]:
+    """Extract assistant text and reasoning from a completed Pi message."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None, None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content or None, None
+    if not isinstance(content, list):
+        return None, None
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "text":
+            value = part.get("text")
+            if isinstance(value, str) and value:
+                text_parts.append(value)
+        elif part_type in {"thinking", "reasoning"}:
+            value = part.get("thinking")
+            if not isinstance(value, str):
+                value = part.get("text")
+            if isinstance(value, str) and value:
+                reasoning_parts.append(value)
+    return "".join(text_parts) or None, "".join(reasoning_parts) or None
+
+
+def _pi_message_has_tool_call(message: object) -> bool:
+    """Return whether a completed Pi assistant message requested a tool."""
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "toolCall" for part in content
+    )
+
+
 def _aggregate_pi_turn_usage(
     message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
@@ -2387,6 +2436,7 @@ class PiExecutor(Executor):
         # Error reported by a ``message_end`` (stopReason=error); surfaced at
         # ``agent_end`` so the terminal event is consumed off the RPC stream.
         pending_error: str | None = None
+        saw_message_end = False
 
         while True:
             # After an errored message the only thing left to drain is the
@@ -2432,6 +2482,13 @@ class PiExecutor(Executor):
                 if not event.get("success", True):
                     yield ExecutorError(message=event.get("error", "Pi command failed"))
                     return
+                continue
+
+            if event_type == "message_start":
+                saw_message_end = False
+                yield LLMCallStarted(
+                    model=_pi_message_model(event.get("message"), model),
+                )
                 continue
 
             # Streaming text and thinking deltas.
@@ -2552,10 +2609,12 @@ class PiExecutor(Executor):
                     return
                 end_messages = event.get("messages", [])
                 end_response_text = ""
+                last_assistant: object = None
                 if isinstance(end_messages, list):
                     for m in reversed(end_messages):
                         if not isinstance(m, dict) or m.get("role") != "assistant":
                             continue
+                        last_assistant = m
                         content = m.get("content", [])
                         if isinstance(content, str):
                             end_response_text = content
@@ -2567,24 +2626,36 @@ class PiExecutor(Executor):
                                 break
                             text_parts: list[str] = []
                             for part in content:
-                                if not (
-                                    isinstance(part, dict) and part.get("type") == "text"
-                                ):
+                                if not (isinstance(part, dict) and part.get("type") == "text"):
                                     continue
                                 part_text = part.get("text")
                                 if isinstance(part_text, str):
                                     text_parts.append(part_text)
                             end_response_text = "".join(text_parts)
                         break
+                fallback_usage = None
+                if (
+                    not saw_message_end
+                    and last_assistant is not None
+                    and not _pi_message_has_tool_call(last_assistant)
+                ):
+                    fallback_usage = _extract_pi_turn_usage(last_assistant, model)
+                    if fallback_usage is not None:
+                        message_usages.append(fallback_usage)
+                    call_response, call_reasoning = _extract_pi_message_output(last_assistant)
+                    yield LLMCallComplete(
+                        model=_pi_message_model(last_assistant, model),
+                        usage=dict(fallback_usage) if fallback_usage is not None else None,
+                        response=call_response,
+                        reasoning=call_reasoning,
+                    )
                 if end_response_text.strip():
                     completion_text_ready = True
                     if not response_text:
                         response_text = end_response_text
 
                 needs_completion_text = saw_tool_activity and not completion_text_ready
-                needs_failure_recovery = (
-                    last_tool_failed and not failure_recovery_requested
-                )
+                needs_failure_recovery = last_tool_failed and not failure_recovery_requested
                 if needs_completion_text or needs_failure_recovery:
                     if tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS:
                         if completion_text_ready:
@@ -2641,6 +2712,7 @@ class PiExecutor(Executor):
             # ``usage`` object holds that LLM call's token counts — collect
             # each for the turn-level sum before handling error stop reasons.
             if event_type == "message_end":
+                saw_message_end = True
                 msg = event.get("message", {})
                 if isinstance(msg, dict):
                     captured = _extract_pi_turn_usage(msg, model)
@@ -2648,9 +2720,19 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                    call_error = None
+                    if stop in {"aborted", "error"}:
+                        call_error = str(msg.get("errorMessage", stop))
+                    call_response, call_reasoning = _extract_pi_message_output(msg)
+                    yield LLMCallComplete(
+                        model=_pi_message_model(msg, model),
+                        usage=dict(captured) if captured is not None else None,
+                        response=call_response,
+                        reasoning=call_reasoning,
+                        error=call_error,
+                    )
                     if stop == "aborted":
-                        err = msg.get("errorMessage", stop)
-                        yield ExecutorError(message=str(err))
+                        yield ExecutorError(message=call_error or stop)
                         return
                     if stop == "error":
                         # Pi emits the turn-terminal ``agent_end`` after an
@@ -2658,7 +2740,7 @@ class PiExecutor(Executor):
                         # queued, so the next turn on this RPC session reads
                         # the stale event as its own end. Record the error
                         # and keep draining until ``agent_end``.
-                        pending_error = str(msg.get("errorMessage", stop))
+                        pending_error = call_error or stop
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

@@ -638,6 +638,7 @@ _GEN_AI_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 _GEN_AI_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
 _GEN_AI_CACHE_READ_TOKENS = "gen_ai.usage.cache_read_input_tokens"
 _GEN_AI_CACHE_CREATION_TOKENS = "gen_ai.usage.cache_creation_input_tokens"
+_LANGFUSE_USAGE_DETAILS = "langfuse.observation.usage_details"
 
 
 def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
@@ -666,12 +667,29 @@ def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
     span.set_attribute(_GEN_AI_INPUT_TOKENS, input_tokens)
     span.set_attribute(_GEN_AI_OUTPUT_TOKENS, output_tokens)
     span.set_attribute(_GEN_AI_TOTAL_TOKENS, int(total))
+    usage_details = {
+        "input": input_tokens,
+        "output": output_tokens,
+        "total": int(total),
+    }
     if "cache_read_input_tokens" in usage:
-        span.set_attribute(_GEN_AI_CACHE_READ_TOKENS, int(usage["cache_read_input_tokens"]))
+        cache_read = int(usage["cache_read_input_tokens"])
+        span.set_attribute(_GEN_AI_CACHE_READ_TOKENS, cache_read)
+        usage_details["cache_read_input_tokens"] = cache_read
     if "cache_creation_input_tokens" in usage:
+        cache_creation = int(usage["cache_creation_input_tokens"])
         span.set_attribute(
-            _GEN_AI_CACHE_CREATION_TOKENS, int(usage["cache_creation_input_tokens"])
+            _GEN_AI_CACHE_CREATION_TOKENS,
+            cache_creation,
         )
+        usage_details["cache_creation_input_tokens"] = cache_creation
+    # Omnigent usage buckets are already mutually exclusive. Langfuse's explicit
+    # JSON attribute preserves those values instead of re-normalizing gen_ai.*
+    # fields as provider-inclusive counts.
+    span.set_attribute(
+        _LANGFUSE_USAGE_DETAILS,
+        json.dumps(usage_details, separators=(",", ":"), sort_keys=True),
+    )
 
 
 def record_error(span: Span, exc: BaseException) -> None:
