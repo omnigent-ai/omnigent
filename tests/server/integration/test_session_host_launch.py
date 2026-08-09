@@ -1977,7 +1977,7 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     worktree was pruned), the host returns ``workspace_missing`` and the
     runner will never appear. The server must:
     - NOT wait out the full connect timeout (which would hang every message);
-    - Persist the user message together with a ``runner_failed_to_start``
+    - Persist the user message together with a ``workspace_missing``
       error item carrying the host's actionable "workspace does not exist"
       message instead of the generic fallback.
 
@@ -2043,7 +2043,7 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     assert len(error_items) == 1, (
         f"expected exactly one error item for the workspace-missing refusal, got {error_items!r}"
     )
-    assert error_items[0]["code"] == "workspace_missing"
+    assert error_items[0]["code"] == WORKSPACE_MISSING_ERROR_CODE
     assert "does not exist" in error_items[0]["message"], (
         f"error message should mention workspace does not exist, got {error_items[0]['message']!r}"
     )
