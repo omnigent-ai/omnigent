@@ -808,6 +808,38 @@ export function useBulkStopSessions() {
   });
 }
 
+/**
+ * Move multiple sessions to a project (or remove from all projects when
+ * `project=""`). Each session is moved independently; partial failures don't
+ * block the rest.
+ */
+export function useBulkMoveToProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ids, project }: { ids: string[]; project: string }) => {
+      const results = await Promise.allSettled(
+        ids.map((id) => moveConversationToProject(id, project)),
+      );
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "rejected") failed.push(ids[i]);
+      }
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("move", { failed, total: ids.length });
+      }
+      return results
+        .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
+        .map((r) => r.value);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+    },
+  });
+}
+
 // ── Pinned hooks ──────────────────────────────────────────────────────────────
 
 // The reserved `conversation_labels` pinned key lives in the leaf cache module

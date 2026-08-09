@@ -109,6 +109,7 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
+  useBulkMoveToProject,
   useProjects,
   useProjectSessions,
   useConversations,
@@ -1847,6 +1848,7 @@ function ConversationList({
                         allConversations={projectSessionPool}
                         onDeselectAll={onDeselectAll}
                         onExit={onExitSelectionMode}
+                        onProjectAssigned={expandProject}
                       />
                     ) : undefined
                   }
@@ -1930,6 +1932,7 @@ function ConversationList({
                             allConversations={sections.sessions}
                             onDeselectAll={onDeselectAll}
                             onExit={onExitSelectionMode}
+                            onProjectAssigned={expandProject}
                           />
                         ) : undefined
                       }
@@ -4250,16 +4253,20 @@ function BulkActionBar({
   allConversations,
   onDeselectAll,
   onExit,
+  onProjectAssigned,
 }: {
   selectedIds: Set<string>;
   allConversations: Conversation[];
   onDeselectAll: () => void;
   onExit: () => void;
+  onProjectAssigned?: (projectName: string) => void;
 }) {
   const navigate = useNavigate();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
+  const bulkMove = useBulkMoveToProject();
+  const { data: projects = [] } = useProjects();
   const viewerId = useViewerId();
 
   const selectedConversations = useMemo(
@@ -4286,7 +4293,7 @@ function BulkActionBar({
     ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
-  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending || bulkMove.isPending;
 
   // Delete acts only on owned rows, so surface that count on the control when it
   // differs from "N selected" — otherwise a mixed-ownership selection (reachable
@@ -4301,6 +4308,24 @@ function BulkActionBar({
       : "Delete";
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
+  const [moveSearch, setMoveSearch] = useState("");
+
+  function handleMoveToProject(project: string) {
+    const ids = ownedSelected.map((c) => c.id);
+    if (ids.length === 0) return;
+    setMoveMenuOpen(false);
+    setMoveSearch("");
+    bulkMove.mutate(
+      { ids, project },
+      {
+        onSuccess: () => {
+          if (project) onProjectAssigned?.(project);
+          onExit();
+        },
+      },
+    );
+  }
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
@@ -4418,6 +4443,58 @@ function BulkActionBar({
                 <TooltipContent side="bottom">Unarchive</TooltipContent>
               </Tooltip>
             )}
+            <DropdownMenu open={moveMenuOpen} onOpenChange={(open) => {
+              setMoveMenuOpen(open);
+              if (!open) setMoveSearch("");
+            }}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="shrink-0"
+                      disabled={isBusy || ownedSelected.length === 0}
+                      aria-label="Move to project"
+                      data-testid="bulk-move-to-project"
+                    >
+                      {bulkMove.isPending ? (
+                        <Loader2Icon className="size-3.5 animate-spin" />
+                      ) : (
+                        <FolderInputIcon className="size-3.5" />
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Move to project</TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="end" className="w-52">
+                <div className="flex items-center gap-2 border-b px-2 py-1.5">
+                  <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  <input
+                    className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                    placeholder="Search projects"
+                    value={moveSearch}
+                    onChange={(e) => setMoveSearch(e.target.value)}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                </div>
+                <div className="max-h-48 overflow-y-auto">
+                  {(moveSearch
+                    ? projects.filter((p) => p.name.toLowerCase().includes(moveSearch.toLowerCase()))
+                    : projects
+                  ).map((p) => (
+                    <DropdownMenuItem key={p.name} className="px-2 py-1" onSelect={() => handleMoveToProject(p.name)}>
+                      <span className="flex-1 truncate text-left">{p.name}</span>
+                    </DropdownMenuItem>
+                  ))}
+                  {projects.length === 0 && (
+                    <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
+                  )}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -4442,7 +4519,7 @@ function BulkActionBar({
           </div>
         </div>
 
-        {(bulkArchive.isError || bulkDelete.isError) && (
+        {(bulkArchive.isError || bulkDelete.isError || bulkMove.isError) && (
           <p className="text-sm text-destructive" role="alert">
             Some actions failed. Retry or dismiss.
           </p>
