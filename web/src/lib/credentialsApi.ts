@@ -99,3 +99,28 @@ export async function disconnectGithub(): Promise<DisconnectResult> {
   if (res.ok) return { ok: true };
   return failureFrom(res, "Could not disconnect GitHub.");
 }
+
+/** One repo the caller's connected GitHub credential can access. */
+export interface GithubRepoInfo {
+  full_name: string;
+  clone_url: string;
+  default_branch: string;
+  private: boolean;
+}
+
+export type GithubReposResult = { ok: true; repos: GithubRepoInfo[] } | CredentialsFailure;
+
+/** GET /v1/credentials/github/repos — the caller's accessible GitHub repos. */
+export async function listGithubRepos(): Promise<GithubReposResult> {
+  let res: Response;
+  try {
+    res = await authenticatedFetch("/v1/credentials/github/repos");
+  } catch {
+    return NETWORK_FAILURE;
+  }
+  if (res.ok) {
+    const data = (await res.json()) as { repos: GithubRepoInfo[] };
+    return { ok: true, repos: data.repos };
+  }
+  return failureFrom(res, "Could not load your GitHub repos.");
+}
