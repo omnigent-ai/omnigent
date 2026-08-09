@@ -380,6 +380,17 @@ def _is_context_window_overflow(result: _ResultMessageObj) -> bool:
     ) or "prompt is too long" in normalized
 
 
+def _read_compacted_messages(session_id: str, *, directory: str | None) -> list[_JsonObject]:
+    """Export the CLI's post-compaction transcript for durable resume."""
+    from claude_agent_sdk import get_session_messages
+
+    return [
+        {"type": "message", "role": item.type, "content": item.message.get("content", [])}
+        for item in get_session_messages(session_id, directory=directory)
+        if isinstance(item.message, dict)
+    ]
+
+
 # ── Multimodal content block conversion ──────────────────────
 
 
@@ -1829,14 +1840,7 @@ class ClaudeSDKExecutor(Executor):
         if not saw_precompact or not compact_session_id:
             return None
 
-        from claude_agent_sdk import get_session_messages
-
-        session_messages = get_session_messages(compact_session_id, directory=self._cwd)
-        compacted_messages = [
-            {"type": "message", "role": item.type, "content": item.message.get("content", [])}
-            for item in session_messages
-            if isinstance(item.message, dict)
-        ]
+        compacted_messages = _read_compacted_messages(compact_session_id, directory=self._cwd)
         if not compacted_messages:
             return None
         context_tokens = 0
@@ -2359,11 +2363,13 @@ class ClaudeSDKExecutor(Executor):
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
-        settings_payload = (
-            json.dumps({"apiKeyHelper": api_key_helper}, separators=(",", ":"))
-            if api_key_helper
-            else None
-        )
+        # Claude CLI JSONL transcripts contain conversation and tool inputs/outputs.
+        # They are local working data for compaction export, retained for seven days;
+        # Omnigent's conversation store remains authoritative.
+        settings: _JsonObject = {"cleanupPeriodDays": 7}
+        if api_key_helper:
+            settings["apiKeyHelper"] = api_key_helper
+        settings_payload = json.dumps(settings, separators=(",", ":"))
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -2396,9 +2402,9 @@ class ClaudeSDKExecutor(Executor):
         # NOT passed: bare mode skips CLAUDE.md auto-discovery,
         # plugin sync, and auto-memory — exactly the host config
         # users expect to leak through to a ``claude-sdk`` harness
-        # they explicitly opted into. ``no-session-persistence``
-        # stays because omnigent owns conversation persistence
-        # via its own conversation store.
+        # they explicitly opted into. CLI transcript persistence stays
+        # enabled as the local compaction/export source; Omnigent's
+        # conversation store remains authoritative.
         # OS-environment tools are provided via Omnigent ``sys_os_*``
         # MCP tools (declared via ``os_env`` in the spec), not the
         # SDK's native Bash/Read/Edit/Write.  Only the Skill tool
@@ -2435,7 +2441,6 @@ class ClaudeSDKExecutor(Executor):
             "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
-            "extra_args": {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
         # Only forward ``setting_sources`` when explicitly set.
@@ -2998,23 +3003,24 @@ class ClaudeSDKExecutor(Executor):
                             ),
                             timeout=_COMPACT_TIMEOUT_SECONDS,
                         )
-                        if compaction is not None:
+                        if compaction is not None and session_key in self._clients:
                             yield compaction
-                            retry_messages: list[Message] = [
-                                {
-                                    "role": "user",
-                                    "content": _OVERFLOW_RETRY_PROMPT,
-                                    "session_id": session_key,
-                                }
-                            ]
-                            async for event in self.run_turn(
-                                retry_messages,
-                                tools,
-                                system_prompt,
-                                config,
-                            ):
-                                yield event
-                            return
+                            if session_key in self._clients:
+                                retry_messages: list[Message] = [
+                                    {
+                                        "role": "user",
+                                        "content": _OVERFLOW_RETRY_PROMPT,
+                                        "session_id": session_key,
+                                    }
+                                ]
+                                async for event in self.run_turn(
+                                    retry_messages,
+                                    tools,
+                                    system_prompt,
+                                    config,
+                                ):
+                                    yield event
+                                return
                     except asyncio.CancelledError:
                         self._evict_client_on_cancel(session_key)
                         raise
@@ -3082,14 +3088,7 @@ class ClaudeSDKExecutor(Executor):
             # environments where the CLI's own transcript is lost.
             _compacted: list[_JsonObject] | None = None
             try:
-                from claude_agent_sdk import get_session_messages
-
-                _msgs = get_session_messages(claude_session_id, directory=self._cwd)
-                _compacted = [
-                    {"type": "message", "role": m.type, "content": m.message.get("content", [])}
-                    for m in _msgs
-                    if isinstance(m.message, dict)
-                ]
+                _compacted = _read_compacted_messages(claude_session_id, directory=self._cwd)
                 if not _compacted:
                     logger.warning(
                         "Claude post-compaction read returned no messages "
