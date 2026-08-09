@@ -793,6 +793,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    default_session_readers: list[str] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -860,6 +861,8 @@ def create_sessions_router(
     :param background_title_coordinator: Optional app-owned coordinator for
         semantic title generation after first-turn forwarding. ``None`` disables
         background titles in focused router tests.
+    :param default_session_readers: Identities granted read-only access to each
+        new top-level session. Child sessions inherit access from their parent.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -892,6 +895,7 @@ def create_sessions_router(
         host_registry=host_registry,
         project_store=project_store,
         background_title_coordinator=background_title_coordinator,
+        default_session_readers=default_session_readers,
     )
 
     register_hooks_routes(

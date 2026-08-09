@@ -122,6 +122,54 @@ async def auth_client(
 
 
 @pytest.fixture()
+def default_reader_auth_app(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> FastAPI:
+    """Auth-enabled app with a read-only watcher configured for new sessions."""
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        default_session_readers=["watcher"],
+    )
+
+
+@pytest_asyncio.fixture()
+async def default_reader_auth_client(
+    default_reader_auth_app: FastAPI,
+    mock_llm: ControllableMockClient,
+    tmp_path: Path,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """HTTP client for :func:`default_reader_auth_app`."""
+    from omnigent.runtime import set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+
+    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
+    await pm.start()
+    set_harness_process_manager(pm)
+
+    transport = httpx.ASGITransport(app=default_reader_auth_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await pm.shutdown()
+
+
+@pytest.fixture()
 def local_auth_app(
     runtime_init: None,
     db_uri: str,
@@ -537,6 +585,36 @@ async def test_full_permission_lifecycle(
 # ── Visibility: no grants -> no sessions ─────────────────────
 
 
+async def test_default_session_reader_lists_new_sessions_but_cannot_edit(
+    default_reader_auth_client: httpx.AsyncClient,
+) -> None:
+    """Configured watchers get read access on creation without write access."""
+    agent = await create_test_agent(default_reader_auth_client, user="creator")
+    session = await _create_session_as(
+        default_reader_auth_client,
+        agent["id"],
+        "creator",
+        title="watched",
+    )
+
+    sessions = await _list_sessions_as(default_reader_auth_client, "watcher")
+    assert session["id"] in {item["id"] for item in sessions}
+
+    snapshot = await default_reader_auth_client.get(
+        f"/v1/sessions/{session['id']}",
+        headers={"X-Forwarded-Email": "watcher"},
+    )
+    assert snapshot.status_code == 200
+    assert snapshot.json()["permission_level"] == LEVEL_READ
+
+    edit = await default_reader_auth_client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"title": "must-not-change"},
+        headers={"X-Forwarded-Email": "watcher"},
+    )
+    assert edit.status_code == 403
+
+
 async def test_user_without_grants_sees_no_sessions(
     auth_client: httpx.AsyncClient,
 ) -> None:
@@ -877,10 +955,10 @@ async def test_cost_control_override_patch_requires_edit_access(
 # ── Public access via __public__ sentinel ────────────────────
 
 
-async def test_public_grant_hides_from_list_but_allows_direct_access(
+async def test_public_grant_lists_and_allows_direct_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """A __public__ read grant does NOT list the session, but direct GET works."""
+    """A __public__ read grant lists the session and allows direct GET."""
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(
         auth_client,
@@ -900,13 +978,12 @@ async def test_public_grant_hides_from_list_but_allows_direct_access(
     )
     assert resp.status_code == 200
 
-    # user-b (no direct grant) should NOT see the session in the list —
-    # public-only sessions are excluded from the sidebar.
+    # user-b has no direct grant, but public access must make the list and
+    # direct-read paths agree.
     sessions = await _list_sessions_as(auth_client, "user-b")
     session_ids = {s["id"] for s in sessions}
-    assert session_id not in session_ids, (
-        "A __public__-only session should not appear in another user's "
-        "session list. Public sessions are accessible by direct URL only."
+    assert session_id in session_ids, (
+        "A __public__-only session should appear in another user's session list."
     )
 
     # user-b CAN still GET the session directly.
@@ -1501,11 +1578,11 @@ async def test_multi_session_list_mixed_access(
       - __public__: read on S5
       - rice: manage on S2
 
-    Expected visibility (public-only sessions are excluded from the list):
+    Expected visibility (public grants are included in the list):
       - bryan: all 5 (owner)
-      - corey: S1 + S3 (direct grants only) = 2
-      - rice: S2 (direct grant only) = 1
-      - nobody: nothing (no direct grants)
+      - corey: S1 + S3 + S5 (direct and public grants) = 3
+      - rice: S2 + S5 (direct and public grants) = 2
+      - nobody: S5 (public grant)
     """
     agent = await create_test_agent(auth_client, user="bryan")
 
@@ -1570,32 +1647,29 @@ async def test_multi_session_list_mixed_access(
         f"Bryan should see all 5 sessions, but is missing {all_ids - bryan_ids}."
     )
 
-    # Corey sees S1 (read), S3 (edit) = 2 of bryan's sessions.
-    # S5 is public-only (no direct grant for corey) so it's excluded.
+    # Corey sees S1 (read), S3 (edit), and S5 (public).
     corey_sessions = await _list_sessions_as(auth_client, "corey")
     corey_ids = {s["id"] for s in corey_sessions}
-    expected_corey = {s1["id"], s3["id"]}
+    expected_corey = {s1["id"], s3["id"], s5["id"]}
     assert expected_corey == corey_ids & all_ids, (
-        f"Corey should see exactly S1, S3 from bryan's sessions, "
+        f"Corey should see exactly S1, S3, S5 from bryan's sessions, "
         f"but sees {corey_ids & all_ids}. Expected {expected_corey}."
     )
 
-    # Rice sees S2 (manage) = 1 of bryan's sessions.
-    # S5 is public-only (no direct grant for rice) so it's excluded.
+    # Rice sees S2 (manage) and S5 (public).
     rice_sessions = await _list_sessions_as(auth_client, "rice")
     rice_ids = {s["id"] for s in rice_sessions}
-    expected_rice = {s2["id"]}
+    expected_rice = {s2["id"], s5["id"]}
     assert expected_rice == rice_ids & all_ids, (
-        f"Rice should see exactly S2 from bryan's sessions, "
+        f"Rice should see exactly S2, S5 from bryan's sessions, "
         f"but sees {rice_ids & all_ids}. Expected {expected_rice}."
     )
 
-    # Nobody (zero direct grants) sees nothing — public-only sessions
-    # are excluded from the list (accessible by direct URL only).
+    # Nobody has no direct grants but sees S5 through its public grant.
     nobody_sessions = await _list_sessions_as(auth_client, "nobody")
     nobody_ids = {s["id"] for s in nobody_sessions}
-    assert not (nobody_ids & all_ids), (
-        f"Nobody should see none of bryan's sessions, but sees {nobody_ids & all_ids}."
+    assert nobody_ids & all_ids == {s5["id"]}, (
+        f"Nobody should see only public S5, but sees {nobody_ids & all_ids}."
     )
 
 

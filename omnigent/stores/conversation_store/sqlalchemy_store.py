@@ -2090,7 +2090,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             surfacing as one of their own folders.
         :returns: List of project names ordered ascending.
         """
-        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 
         # ACL (accessible_by/owned_by) resolves against session_permissions on
         # the Omnigent DB, so it still needs a pre-fetch; archived now lives on
@@ -2105,7 +2105,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         meta_sess.execute(
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
-                                SqlSessionPermission.user_id == accessible_by,
+                                SqlSessionPermission.user_id.in_(
+                                    (accessible_by, RESERVED_USER_PUBLIC)
+                                ),
                             )
                         ).scalars()
                     )
@@ -2254,7 +2256,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
-        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
@@ -2290,7 +2292,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         meta_sess.execute(
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
-                                SqlSessionPermission.user_id == accessible_by,
+                                SqlSessionPermission.user_id.in_(
+                                    (accessible_by, RESERVED_USER_PUBLIC)
+                                ),
                             )
                         ).scalars()
                     )

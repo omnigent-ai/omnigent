@@ -3951,6 +3951,7 @@ def server(
         debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
+        default_session_readers=config_str_list(cfg.get("default_session_readers")),
         sandbox_config=sandbox_config,
         server_config=cfg,
     )

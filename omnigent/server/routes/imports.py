@@ -16,7 +16,7 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import native_coding_agent_for_harness
-from omnigent.server.auth import LEVEL_OWNER, AuthProvider
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.session_import import (
@@ -116,9 +116,11 @@ def create_imports_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    default_session_readers: list[str] | None = None,
 ) -> APIRouter:
     """Create the local-session import router."""
     router = APIRouter()
+    default_readers = tuple(dict.fromkeys(default_session_readers or ()))
 
     @router.post(
         "/imports",
@@ -205,6 +207,14 @@ def create_imports_router(
                     conversation.id,
                     LEVEL_OWNER,
                 )
+                for reader_id in default_readers:
+                    if reader_id != user_id:
+                        await asyncio.to_thread(
+                            permission_store.grant,
+                            reader_id,
+                            conversation.id,
+                            LEVEL_READ,
+                        )
         except Exception:
             await conversation_store.delete_conversation(conversation.id)
             raise

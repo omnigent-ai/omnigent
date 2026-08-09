@@ -66,6 +66,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_PUBLIC,
     AuthProvider,
 )
 from omnigent.server.background_session_titles import (
@@ -208,8 +209,33 @@ def register_core_routes(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    default_session_readers: list[str] | None = None,
 ) -> None:
     """Register the core session routes on router."""
+
+    default_readers = tuple(dict.fromkeys(default_session_readers or ()))
+    if RESERVED_USER_PUBLIC in default_readers:
+        raise ValueError("default_session_readers must not include '__public__'")
+
+    async def _grant_created_session_access(
+        user_id: str | None,
+        session_id: str,
+        *,
+        is_top_level: bool,
+    ) -> None:
+        """Grant the creator ownership and configured watchers read access."""
+        if permission_store is None:
+            return
+        if user_id is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+            await asyncio.to_thread(permission_store.grant, user_id, session_id, LEVEL_OWNER)
+        if not is_top_level:
+            return
+        for reader_id in default_readers:
+            # A creator must retain ownership when it is also configured as a
+            # watcher; child-session access delegates to this root grant.
+            if reader_id != user_id:
+                await asyncio.to_thread(permission_store.grant, reader_id, session_id, LEVEL_READ)
 
     @router.post(
         "/sessions",
@@ -252,12 +278,12 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            result = await _create_bundled_session_from_multipart(request, user_id)
-            if permission_store is not None and user_id is not None:
-                await asyncio.to_thread(permission_store.ensure_user, user_id)
-                await asyncio.to_thread(
-                    permission_store.grant, user_id, result.session_id, LEVEL_OWNER
-                )
+            result, is_top_level = await _create_bundled_session_from_multipart(request, user_id)
+            await _grant_created_session_access(
+                user_id,
+                result.session_id,
+                is_top_level=is_top_level,
+            )
             # Push the new session to this user's other open tabs so it
             # enters the sidebar without a list poll (WS /sessions/updates).
             _announce_session_added(user_id, result.session_id)
@@ -347,8 +373,11 @@ def register_core_routes(
         # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
         # sees the grant.
         if permission_store is not None and user_id is not None:
-            await asyncio.to_thread(permission_store.ensure_user, user_id)
-            await asyncio.to_thread(permission_store.grant, user_id, resp.id, LEVEL_OWNER)
+            await _grant_created_session_access(
+                user_id,
+                resp.id,
+                is_top_level=body.parent_session_id is None,
+            )
             resp.permission_level = await _get_permission_level(user_id, resp.id, permission_store)
         # Push the new session to this user's other open tabs (see the
         # multipart path above for the rationale).
@@ -529,7 +558,7 @@ def register_core_routes(
     async def _create_bundled_session_from_multipart(
         request: Request,
         user_id: str | None,
-    ) -> CreatedSessionResponse:
+    ) -> tuple[CreatedSessionResponse, bool]:
         """
         Handle multipart ``POST /v1/sessions`` with inline agent upload.
 
@@ -539,8 +568,8 @@ def register_core_routes(
             ``"alice@example.com"``. Used to authorize
             ``metadata.parent_session_id`` and enforce
             runner ownership on parent inheritance.
-        :returns: :class:`CreatedSessionResponse` with the new
-            session id.
+        :returns: The created-session response and whether it is a top-level
+            session (rather than a child inheriting its parent's grants).
         :raises HTTPException: 422 when a required multipart part is
             absent.
         :raises OmnigentError: If metadata or bundle validation
@@ -596,7 +625,7 @@ def register_core_routes(
                 result.agent_id,
                 runner_router,
             )
-        return result
+        return result, parsed_metadata.parent_session_id is None
 
     # ── GET /sessions/projects ────────────────────────────────────
     #
@@ -2165,9 +2194,7 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
-        if permission_store is not None and user_id is not None:
-            await asyncio.to_thread(permission_store.ensure_user, user_id)
-            await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
+        await _grant_created_session_access(user_id, new_conv.id, is_top_level=True)
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
 
