@@ -350,10 +350,20 @@ class _ClaudeSDK(Protocol):
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+_COMPACT_TIMEOUT_SECONDS = 60.0
+_OVERFLOW_RETRY_PROMPT = "Continue responding to the previous user message after compaction."
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
 _STREAM_IDLE_WARN_SECONDS = 600.0
+
+
+def _is_compaction_boundary(message: _SystemMessageObj) -> bool:
+    """Return whether a real SDK system message marks compaction."""
+    return (
+        message.subtype == "compact_boundary"
+        or message.data.get("hook_event_name") == "PreCompact"
+    )
 
 
 def _is_context_window_overflow(result: _ResultMessageObj) -> bool:
@@ -1803,8 +1813,8 @@ class ClaudeSDKExecutor(Executor):
         try:
             async for message in stream:
                 if isinstance(message, sdk.SystemMessage):
-                    saw_precompact = saw_precompact or (
-                        getattr(message, "hook_event_name", None) == "PreCompact"
+                    saw_precompact = saw_precompact or _is_compaction_boundary(
+                        cast(_SystemMessageObj, message)
                     )
                 elif isinstance(message, sdk.ResultMessage):
                     result = cast(_ResultMessageObj, message)
@@ -2925,9 +2935,9 @@ class ClaudeSDKExecutor(Executor):
                                     f"{endpoint_hint}"
                                 )
                                 break
-                        elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
+                        elif _is_compaction_boundary(system_msg):
                             compaction_occurred = True
-                            logger.info("Claude SDK compaction detected (PreCompact hook)")
+                            logger.info("Claude SDK compaction detected (compact boundary)")
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:
@@ -2978,17 +2988,27 @@ class ClaudeSDKExecutor(Executor):
                 else:
                     self._overflow_recovery_sessions.add(session_key)
                     try:
-                        compaction = await self._compact_live_client(
-                            sdk,
-                            client=client,
-                            session_key=session_key,
-                            fallback_session_id=claude_session_id,
-                            model=observed_model or model,
+                        compaction = await asyncio.wait_for(
+                            self._compact_live_client(
+                                sdk,
+                                client=client,
+                                session_key=session_key,
+                                fallback_session_id=claude_session_id,
+                                model=observed_model or model,
+                            ),
+                            timeout=_COMPACT_TIMEOUT_SECONDS,
                         )
                         if compaction is not None:
                             yield compaction
+                            retry_messages: list[Message] = [
+                                {
+                                    "role": "user",
+                                    "content": _OVERFLOW_RETRY_PROMPT,
+                                    "session_id": session_key,
+                                }
+                            ]
                             async for event in self.run_turn(
-                                messages,
+                                retry_messages,
                                 tools,
                                 system_prompt,
                                 config,

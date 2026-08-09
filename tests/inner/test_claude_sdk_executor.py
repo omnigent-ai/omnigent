@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from claude_agent_sdk.types import SystemMessage as SDKSystemMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -4290,6 +4291,23 @@ class TestToolCallPolicyGate(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def test_compaction_boundary_uses_real_sdk_system_message_shape() -> None:
+    from omnigent.inner.claude_sdk_executor import _is_compaction_boundary
+
+    real = SDKSystemMessage(
+        subtype="compact_boundary",
+        data={"hook_event_name": "PreCompact"},
+    )
+    fictional = SimpleNamespace(
+        subtype="hook_started",
+        data={"hook_event": "PreCompact"},
+        hook_event_name="PreCompact",
+    )
+
+    assert _is_compaction_boundary(real)
+    assert not _is_compaction_boundary(fictional)
+
+
 def test_precompact_hook_emits_compaction_complete_with_session_messages() -> None:
     """When PreCompact fires and a ResultMessage carries a session_id,
     CompactionComplete is emitted with compacted_messages read from
@@ -4312,15 +4330,6 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
                 },
             )()
 
-    class _SystemMessage:
-        def __init__(self, subtype, data, hook_event_name=None):
-            self.subtype = subtype
-            self.data = data
-            self.hook_event_name = hook_event_name
-
-    class _HookEventMessage(_SystemMessage):
-        pass
-
     class _FakeSessionMessage:
         def __init__(self, type, message):
             self.type = type
@@ -4329,7 +4338,7 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
     class _FakeSDK:
         AssistantMessage = type("AssistantMessage", (), {})
         UserMessage = type("UserMessage", (), {})
-        SystemMessage = _SystemMessage
+        SystemMessage = SDKSystemMessage
         ResultMessage = _ResultMessage
         StreamEvent = type("StreamEvent", (), {})
         ClaudeAgentOptions = type(
@@ -4348,10 +4357,9 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
 
             async def query(self, prompt, session_id="default"):
                 _FakeSDK.messages = [
-                    _HookEventMessage(
-                        subtype="hook_started",
-                        data={"hook_event": "PreCompact"},
-                        hook_event_name="PreCompact",
+                    SDKSystemMessage(
+                        subtype="compact_boundary",
+                        data={"hook_event_name": "PreCompact"},
                     ),
                     _ResultMessage("claude-uuid-123", "compacted result"),
                 ]
@@ -4550,8 +4558,8 @@ class _OverflowTestResult:
         self.usage = None
 
 
-class _OverflowTestSystem:
-    hook_event_name = "PreCompact"
+class _OverflowTestHang:
+    pass
 
 
 class _OverflowTestSentinel:
@@ -4564,7 +4572,7 @@ def _overflow_test_sdk(responses):
     class _FakeSDK:
         AssistantMessage = _OverflowTestSentinel
         UserMessage = _OverflowTestSentinel
-        SystemMessage = _OverflowTestSystem
+        SystemMessage = SDKSystemMessage
         ResultMessage = _OverflowTestResult
         StreamEvent = _OverflowTestSentinel
         TextBlock = _OverflowTestSentinel
@@ -4595,6 +4603,8 @@ def _overflow_test_sdk(responses):
             async def query(self, prompt, session_id="default"):
                 self.queries.append(prompt)
                 self.current = responses[len(self.queries) - 1]
+                if isinstance(self.current, _OverflowTestHang):
+                    await asyncio.Event().wait()
 
             async def receive_response(self):
                 for message in self.current:
@@ -4624,7 +4634,17 @@ async def test_context_overflow_compacts_persistent_client_and_retries_once(
     compacted = _OverflowTestResult("Compacted", is_error=False)
     recovered = _OverflowTestResult("recovered", is_error=False)
     sdk, created = _overflow_test_sdk(
-        [[overflow], [_OverflowTestSystem(), compacted], [recovered]]
+        [
+            [overflow],
+            [
+                SDKSystemMessage(
+                    subtype="compact_boundary",
+                    data={"hook_event_name": "PreCompact"},
+                ),
+                compacted,
+            ],
+            [recovered],
+        ]
     )
     monkeypatch.setattr(
         "claude_agent_sdk.get_session_messages",
@@ -4641,7 +4661,11 @@ async def test_context_overflow_compacts_persistent_client_and_retries_once(
         events = [event async for event in executor.run_turn(messages, [], "")]
 
     assert len(created) == 1
-    assert created[0].queries == ["hello", "/compact", "hello"]
+    assert created[0].queries == [
+        "hello",
+        "/compact",
+        "Continue responding to the previous user message after compaction.",
+    ]
     boundary = next(event for event in events if isinstance(event, CompactionComplete))
     assert boundary.compacted_messages == [
         {
@@ -4671,7 +4695,13 @@ async def test_context_overflow_second_failure_does_not_loop(
         api_error_status=400,
     )
     compacted = _OverflowTestResult("Compacted", is_error=False)
-    sdk, created = _overflow_test_sdk([[overflow], [_OverflowTestSystem(), compacted], [overflow]])
+    sdk, created = _overflow_test_sdk(
+        [
+            [overflow],
+            [SDKSystemMessage(subtype="compact_boundary", data={}), compacted],
+            [overflow],
+        ]
+    )
     monkeypatch.setattr(
         "claude_agent_sdk.get_session_messages",
         lambda *args, **kwargs: [
@@ -4687,10 +4717,46 @@ async def test_context_overflow_second_failure_does_not_loop(
         events = [event async for event in executor.run_turn(messages, [], "")]
 
     assert len(created) == 1
-    assert created[0].queries == ["hello", "/compact", "hello"]
+    assert created[0].queries == [
+        "hello",
+        "/compact",
+        "Continue responding to the previous user message after compaction.",
+    ]
     assert isinstance(events[-1], ExecutorError)
     assert executor._clients == {}
     assert executor._overflow_recovery_sessions == set()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_compaction_timeout_preserves_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    overflow_text = "API Error: 400 input exceeds context window"
+    overflow = _OverflowTestResult(
+        overflow_text,
+        is_error=True,
+        api_error_status=400,
+    )
+    sdk, created = _overflow_test_sdk([[overflow], _OverflowTestHang()])
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor._COMPACT_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert created[0].queries == ["hello", "/compact"]
+    assert isinstance(events[-1], ExecutorError)
+    assert events[-1].message == overflow_text
+    assert executor._clients == {}
 
 
 @pytest.mark.asyncio
