@@ -167,6 +167,29 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
 # image; contributes no layers of its own.
 FROM node:${NODE_VERSION}-slim AS node-runtime
 
+# ── Optional HomeLab Pi fork builder ─────────────────────
+# A normal Omnigent checkout contains only deploy/docker/pi-source/.gitkeep,
+# so public builds keep installing Pi from npm. HomeLab's signed build task
+# replaces that directory with one exact Pi commit before docker build.
+FROM node-runtime AS pi-builder
+ARG NPM_CONFIG_REGISTRY=
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+WORKDIR /pi-src
+COPY deploy/docker/pi-source/ ./
+RUN if [ -f package.json ]; then \
+      npm ci --ignore-scripts \
+      && node scripts/local-release.mjs \
+           --out /opt/pi-release \
+           --force \
+           --skip-check \
+           --skip-test \
+           --skip-binary \
+           --skip-bun-install \
+      && cp LICENSE /opt/pi-release/node/LICENSE; \
+    else \
+      mkdir -p /opt/pi-release/node; \
+    fi
+
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
 # git + tmux for harness runtime needs, procps + lsof so the antigravity-native
@@ -243,15 +266,21 @@ COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+COPY --from=pi-builder /opt/pi-release/node /opt/pi
 
 # The harness CLI set mirrors omnigent/onboarding/harness_install.py
 # (the binary/package map `omnigent setup` installs from) — keep the
-# two in sync. Unpinned on purpose: the official image is rebuilt by
-# CI, so it tracks the same "latest" a laptop install would get.
+# two in sync. A signed HomeLab build installs the packaged Pi fork from
+# /opt/pi. Other builds retain the upstream npm fallback.
 RUN npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
-      @earendil-works/pi-coding-agent \
+ && if [ -x /opt/pi/pi ]; then \
+      ln -sf /opt/pi/pi /usr/local/bin/pi; \
+    else \
+      npm install -g --no-audit --no-fund @earendil-works/pi-coding-agent; \
+    fi \
+ && pi --version \
  && npm cache clean --force
 
 # Kiro CLI is not published as an npm package, and its installer has NO version

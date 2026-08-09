@@ -52,3 +52,26 @@ def test_host_images_include_kiro_installer_dependency(dockerfile: Path) -> None
     """Kiro's installer needs ``unzip`` on Linux."""
     text = dockerfile.read_text()
     assert "unzip" in text
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        _ROOT / "deploy/docker/Dockerfile",
+        _ROOT / "deploy/docker/Dockerfile.ubi",
+    ],
+)
+def test_host_images_prefer_packaged_pi_fork_with_npm_fallback(
+    dockerfile: Path,
+) -> None:
+    """HomeLab builds use the staged Pi fork without breaking public builds."""
+    text = dockerfile.read_text()
+
+    assert "FROM node-runtime AS pi-builder" in text
+    assert "COPY deploy/docker/pi-source/ ./" in text
+    assert "--skip-binary" in text
+    assert "--skip-bun-install" in text
+    assert "COPY --from=pi-builder /opt/pi-release/node /opt/pi" in text
+    assert "if [ -x /opt/pi/pi ]" in text
+    assert "npm install -g --no-audit --no-fund @earendil-works/pi-coding-agent" in text
+    assert "pi --version" in text
