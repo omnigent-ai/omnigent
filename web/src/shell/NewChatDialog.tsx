@@ -16,6 +16,7 @@ import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  DownloadIcon,
   GitBranchIcon,
   ArrowUpIcon,
   Loader2Icon,
@@ -194,6 +195,7 @@ import type { CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
+import { ImportChatDialog } from "./ImportChatDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
@@ -2139,6 +2141,8 @@ export function NewChatLandingScreen() {
   } | null>(null);
   // Harness-config modal, opened from the composer's gear icon.
   const [configOpen, setConfigOpen] = useState(false);
+  // Import-chat dialog, opened from the composer's import icon.
+  const [importOpen, setImportOpen] = useState(false);
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -4159,6 +4163,27 @@ export function NewChatLandingScreen() {
                     </>
                   )}
                 </div>
+                {/* Import chat — independent of the selected agent, so unlike
+                  the gear it is never hidden behind the knobs check above. */}
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="size-9 text-muted-foreground md:size-8"
+                        disabled={creating}
+                        onClick={() => setImportOpen(true)}
+                        data-testid="new-chat-landing-import-chat"
+                        aria-label="Import chat"
+                      >
+                        <DownloadIcon className="size-4" data-icon-size="16" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">Import chat</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
                 {selectedAgent && selectedAgentHasKnobs && (
                   <HarnessConfigModal
                     open={configOpen}
@@ -4194,6 +4219,15 @@ export function NewChatLandingScreen() {
                     setCostControlMode={setCostControlMode}
                   />
                 )}
+                <ImportChatDialog
+                  open={importOpen}
+                  onOpenChange={setImportOpen}
+                  defaultHostId={selectedHostId}
+                  onImported={(sessionId) => {
+                    setImportOpen(false);
+                    navigate(`/c/${sessionId}`);
+                  }}
+                />
                 {/* Routing is not a standalone composer toggle — it folds into
                   the gear modal's Model dropdown as an "Smart Routing"
                   option (see HarnessConfigModal). */}

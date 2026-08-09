@@ -5,7 +5,7 @@ import type * as ChatStoreModule from "@/store/chatStore";
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useParams } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
@@ -41,6 +41,8 @@ import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFile
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
+import { useHostLocalSessions } from "@/hooks/useHostLocalSessions";
+import { importHostLocalSession, type LocalSessionSummary } from "@/lib/localSessionImportApi";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
@@ -90,6 +92,10 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
 }));
+// The composer's Import-chat dialog browses/imports via these — stubbed so
+// the two import-flow tests below can drive it without a real host/server.
+vi.mock("@/hooks/useHostLocalSessions", () => ({ useHostLocalSessions: vi.fn() }));
+vi.mock("@/lib/localSessionImportApi", () => ({ importHostLocalSession: vi.fn() }));
 // The composer's project chip lists projects via useProjects; stub it to an
 // empty list so it doesn't fire its own authenticatedFetch (which would skew
 // the create-POST call-count / call-order assertions below).
@@ -173,6 +179,8 @@ const useHostWorktreesMock = vi.mocked(useHostWorktrees);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const setPendingInitialPromptMock = vi.mocked(setPendingInitialPrompt);
+const useHostLocalSessionsMock = vi.mocked(useHostLocalSessions);
+const importHostLocalSessionMock = vi.mocked(importHostLocalSession);
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 // Per-harness remembered option knobs (see lib/modePreferences).
@@ -671,6 +679,20 @@ function mockAgents(agents: AvailableAgent[]) {
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
+/** A `useHostLocalSessions` result, for the Import-chat composer tests. */
+function localSessionsResult(
+  data: LocalSessionSummary[] | undefined,
+  extra: { isLoading?: boolean; error?: Error | null } = {},
+): ReturnType<typeof useHostLocalSessions> {
+  const error = extra.error ?? null;
+  return {
+    data,
+    isLoading: extra.isLoading ?? false,
+    isError: error !== null,
+    error,
+  } as unknown as ReturnType<typeof useHostLocalSessions>;
+}
+
 // Shared mock setup for the landing-screen tests: one online host (host_1,
 // auto-selected), two agents (Claude Code default + Codex), inert
 // directory-session / runner-health / filesystem stubs, and a persisted
@@ -684,6 +706,8 @@ function setupLandingMocks() {
   useHostWorktreesMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
+  useHostLocalSessionsMock.mockReset();
+  importHostLocalSessionMock.mockReset();
   // Reset the install hooks to their inert defaults: per-test overrides
   // (a pending install set, a callback-firing mutate) must not leak into the
   // next test — a stale pending set would disable the Install button and make
@@ -771,6 +795,55 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
             <NewChatLandingScreen />
+          </MemoryRouter>
+        </TooltipProvider>
+      </CapabilitiesProvider>
+    </QueryClientProvider>,
+  );
+}
+
+/** Renders the `conversationId` route param, so a post-import `navigate()` can
+ *  be observed by asserting this marker appeared with the imported session id. */
+function ImportNavTarget() {
+  const { conversationId } = useParams<{ conversationId: string }>();
+  return <div data-testid="import-nav-target">{conversationId}</div>;
+}
+
+/**
+ * Same as `renderLanding`, but with a `/c/:conversationId` route mounted
+ * alongside it (matching Sidebar.test.tsx's own MemoryRouter+Routes idiom),
+ * so a successful import's navigation can be asserted by the target rendering.
+ */
+function renderLandingWithImportNavTarget(): void {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
+  render(
+    <QueryClientProvider client={client}>
+      <CapabilitiesProvider info={info}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Routes>
+              <Route path="/" element={<NewChatLandingScreen />} />
+              <Route path="/c/:conversationId" element={<ImportNavTarget />} />
+            </Routes>
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>
@@ -2428,6 +2501,42 @@ describe("NewChatLandingScreen", () => {
       target: { value: "https://github.com/org/repo" },
     });
     expect(submit.disabled).toBe(false);
+  });
+
+  it("opens the import-chat dialog from the composer", async () => {
+    useHostLocalSessionsMock.mockReturnValue(localSessionsResult([]));
+    renderLanding();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-import-chat"));
+
+    expect(await screen.findByTestId("import-chat-dialog")).toBeInTheDocument();
+  });
+
+  it("navigates to the imported session after a successful import", async () => {
+    useHostLocalSessionsMock.mockReturnValue(
+      localSessionsResult([
+        {
+          source: "claude",
+          external_session_id: "abc",
+          workspace: "/Users/corey/repo",
+          title: "Fix the flaky parser",
+          item_count: 4,
+          preview: [],
+        },
+      ]),
+    );
+    importHostLocalSessionMock.mockResolvedValue({
+      session_id: "conv_new",
+      status: "imported",
+      item_count: 4,
+    });
+    renderLandingWithImportNavTarget();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-import-chat"));
+    fireEvent.click(await screen.findByTestId("import-chat-recent-row-abc"));
+    fireEvent.click(screen.getByTestId("import-chat-submit"));
+
+    expect(await screen.findByTestId("import-nav-target")).toHaveTextContent("conv_new");
   });
 });
 
