@@ -4228,6 +4228,13 @@ def is_known_event(name: str) -> bool:
 # these internal markers. See ``designs/RUNNER_MESSAGE_INGEST.md`` Part B.
 
 
+class TraceContextEvent(_SSEEventBase):
+    """Runner-internal marker carrying the active agent span context."""
+
+    type: Literal["trace_context.available"]
+    traceparent: str
+
+
 class PolicyEvaluationRequestEvent(_SSEEventBase):
     """
     Runner-internal marker: harness requests policy evaluation.
@@ -4259,7 +4266,9 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
     data: dict[str, Any]
 
 
-HarnessStreamEvent = ServerStreamEvent | InjectionConsumedEvent | PolicyEvaluationRequestEvent
+HarnessStreamEvent = (
+    ServerStreamEvent | InjectionConsumedEvent | TraceContextEvent | PolicyEvaluationRequestEvent
+)
 
 
 # ── Projects ──────────────────────────────────────────────────────

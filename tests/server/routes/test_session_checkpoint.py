@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 import httpx
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.server.routes.sessions import routes_checkpoint
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -153,46 +151,3 @@ async def test_checkpoint_write_preserves_concurrent_unrelated_session_state(
     assert conversation.session_state["policy.keep"] == {"mode": "enforce"}
     assert conversation.session_state["policy.concurrent"] == {"mode": "audit"}
     assert "_framework_checkpoint_v1" in conversation.session_state
-
-
-async def test_checkpoint_route_records_tool_observation_attributes(
-    client: httpx.AsyncClient,
-    checkpoint_session_id: str,
-    monkeypatch: Any,
-) -> None:
-    """Checkpoint writes redact captured tool-observation payloads."""
-    attributes: dict[str, Any] = {}
-
-    class _Span:
-        def set_attribute(self, key: str, value: Any) -> None:
-            attributes[key] = value
-
-        def is_recording(self) -> bool:
-            return True
-
-    @contextmanager
-    def _span(*args: Any, **kwargs: Any) -> Iterator[_Span]:
-        attributes.update(kwargs["attributes"])
-        yield _Span()
-
-    monkeypatch.setattr(routes_checkpoint.telemetry, "span", _span)
-    monkeypatch.setattr(routes_checkpoint.telemetry, "should_capture_content", lambda: True)
-
-    payload = _checkpoint(checkpoint_session_id)
-    payload["latest_user_directive"] = (
-        "Use https://trace-token@github.com/example/repository"
-    )
-    response = await client.put(
-        f"/v1/sessions/{checkpoint_session_id}/checkpoint",
-        json={"checkpoint": payload},
-    )
-
-    assert response.status_code == 200
-    assert attributes["openinference.span.kind"] == "TOOL"
-    assert attributes["openinference.tool.name"] == "session_checkpoint"
-    assert attributes["session.id"] == checkpoint_session_id
-    assert attributes["checkpoint.outcome"] == "success"
-    assert attributes["checkpoint.covered_item_count"] == 1
-    assert attributes["checkpoint.latency_ms"] >= 0
-    assert "trace-token" not in attributes["input.value"]
-    assert "[redacted]" in attributes["input.value"]

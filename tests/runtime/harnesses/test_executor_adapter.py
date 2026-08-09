@@ -1633,7 +1633,7 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
     from omnigent.inner.tracing import disable_tracing, enable_tracing
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
-    from omnigent.server.schemas import CreateResponseRequest
+    from omnigent.server.schemas import CreateResponseRequest, TraceContextEvent
 
     class _TraceSequenceExecutor(Executor):
         async def run_turn(
@@ -1701,12 +1701,13 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
     try:
         adapter = ExecutorAdapter(
             executor_factory=lambda: _TraceSequenceExecutor(),
-            session_key="conv_trace",
+            session_key="private_sdk_session",
         )
         ctx = TurnContext(
             response_id="resp_0123456789abcdef0123456789abcdef",
             event_queue=asyncio.Queue(),
             cancelled=asyncio.Event(),
+            conversation_id="conv_trace",
         )
         await adapter.run_turn(
             CreateResponseRequest(model="watchdog", input="inspect"),
@@ -1715,6 +1716,7 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
 
         spans = list(exporter.get_finished_spans())
         agent = next(span for span in spans if span.name == "agent:watchdog")
+        assert agent.attributes["session.id"] == "conv_trace"
         children = sorted(
             (span for span in spans if span is not agent),
             key=lambda span: span.start_time or 0,
@@ -1728,6 +1730,12 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
             span.parent is not None and span.parent.span_id == agent.context.span_id
             for span in children
         )
+        assert all(span.attributes["session.id"] == "conv_trace" for span in children)
+        emitted = []
+        while not ctx._event_queue.empty():
+            emitted.append(ctx._event_queue.get_nowait())
+        trace_context = next(event for event in emitted if isinstance(event, TraceContextEvent))
+        assert trace_context.traceparent.split("-")[2] == f"{agent.context.span_id:016x}"
         assert children[0].end_time is not None
         assert children[1].start_time is not None
         assert children[1].end_time is not None

@@ -125,10 +125,9 @@ def prune_covered_history(
     if count == 0 or len(history) < count:
         return [dict(item) for item in history]
     prefix = history[:count]
-    if (
-        [_item_digest(item) for item in prefix] != checkpoint.covered_items
-        or history_fingerprint(prefix) != checkpoint.history_fingerprint
-    ):
+    if [_item_digest(item) for item in prefix] != checkpoint.covered_items or history_fingerprint(
+        prefix
+    ) != checkpoint.history_fingerprint:
         return [dict(item) for item in history]
     return [dict(item) for item in history[count:]]
 
@@ -220,6 +219,7 @@ def _outcome(
         if (
             is_error is True
             or payload.get("success") is False
+            or payload.get("verified") is False
             or error not in (None, False, "", {}, [])
             or outcome in {"error", "failed", "failure", "cancelled"}
             or status in {"error", "failed", "failure", "cancelled"}
@@ -229,6 +229,7 @@ def _outcome(
         if (
             is_error is False
             or payload.get("success") is True
+            or payload.get("verified") is True
             or outcome in {"success", "succeeded", "completed", "ok"}
             or status in {"success", "succeeded", "completed", "ok"}
             or exit_code == 0
@@ -266,6 +267,8 @@ def _markers(name: str, arguments: Any, output: Any, exit_code: int | None) -> l
         markers.append(f"exit_code:{exit_code}")
     if _is_pull_request_tool(name):
         markers.append("pull_request_created")
+    if "gh_app_commit.py" in text:
+        markers.extend(("git_commit", "git_push"))
     if re.search(r"\bgit\s+push\b", text):
         markers.append("git_push")
     if re.search(r"\bgit\s+commit\b", text):
@@ -287,21 +290,40 @@ def _safe_facts(
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """Extract only tightly constrained repository facts from transient tool data."""
     text = f"{_raw_arguments(arguments)} {output if isinstance(output, str) else ''}"
+    payload = _decode_output(output)
     pr_match = re.search(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+", text)
     repo_match = re.search(r"github\.com[/:]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", text)
     branch_match = re.search(r"(?:branch|HEAD)\s+['\"]?([A-Za-z0-9._/-]+)", text, re.I)
     commit_match = re.search(r"\b[0-9a-f]{7,40}\b", text)
+    payload_branch = payload.get("branch")
+    payload_commit = payload.get("commit")
     return (
         repo_match.group(1) if repo_match else None,
-        branch_match.group(1) if branch_match else None,
-        commit_match.group(0) if commit_match else None,
+        (
+            payload_branch
+            if isinstance(payload_branch, str) and payload_branch
+            else branch_match.group(1)
+            if branch_match
+            else None
+        ),
+        (
+            payload_commit
+            if isinstance(payload_commit, str) and re.fullmatch(r"[0-9a-f]{7,40}", payload_commit)
+            else commit_match.group(0)
+            if commit_match
+            else None
+        ),
         pr_match.group(0) if pr_match else None,
     )
 
 
 def paired_tool_actions(
     history: Sequence[Mapping[str, Any]],
-) -> tuple[list[CheckpointAction], list[CheckpointAction], tuple[str | None, str | None, str | None, str | None]]:
+) -> tuple[
+    list[CheckpointAction],
+    list[CheckpointAction],
+    tuple[str | None, str | None, str | None, str | None],
+]:
     """Pair calls by id and retain only normalized success and failure facts."""
     calls: dict[str, tuple[str, Any]] = {}
     verified: list[CheckpointAction] = []
@@ -330,7 +352,12 @@ def paired_tool_actions(
             (verified if outcome == "success" else failed).append(action)
             if outcome == "success":
                 candidate = _safe_facts(arguments, output)
-                facts = tuple(new or old for new, old in zip(candidate, facts, strict=True))
+                facts = (
+                    candidate[0] or facts[0],
+                    candidate[1] or facts[1],
+                    candidate[2] or facts[2],
+                    candidate[3] or facts[3],
+                )
     workflow_markers = {
         "pull_request_created",
         "git_push",
@@ -353,12 +380,35 @@ def paired_tool_actions(
     return retained, failed[-MAX_CHECKPOINT_ACTIONS:], facts
 
 
-def _phase_for_actions(actions: Sequence[CheckpointAction]) -> CheckpointPhase:
+def _requests_branch_only(directive: str) -> bool:
+    normalized = " ".join(directive.lower().replace("’", "'").split())
+    return any(
+        phrase in normalized
+        for phrase in (
+            "do not create pr",
+            "don't create pr",
+            "do not create a pr",
+            "don't create a pr",
+            "without opening a pr",
+            "just commit and push",
+            "commit and push from shell",
+        )
+    )
+
+
+def _phase_for_actions(
+    actions: Sequence[CheckpointAction],
+    *,
+    pr_url: str | None,
+    directive: str,
+) -> CheckpointPhase:
     markers = {marker for action in actions for marker in action.markers}
     names = {action.name for action in actions}
     if "pull_request_created" in markers or any(_is_pull_request_tool(name) for name in names):
         return "complete"
     if "git_push" in markers:
+        if pr_url is not None or _requests_branch_only(directive):
+            return "complete"
         return "open_pr"
     if "git_commit" in markers:
         return "push"
@@ -384,7 +434,12 @@ def _pending_for_phase(phase: CheckpointPhase) -> str:
     }[phase]
 
 
-def _do_not_repeat(actions: Sequence[CheckpointAction]) -> list[str]:
+def _do_not_repeat(
+    actions: Sequence[CheckpointAction],
+    *,
+    pr_url: str | None,
+    directive: str,
+) -> list[str]:
     markers = {marker for action in actions for marker in action.markers}
     directives = []
     if "branch_created" in markers:
@@ -393,8 +448,10 @@ def _do_not_repeat(actions: Sequence[CheckpointAction]) -> list[str]:
         directives.append("Do not repeat the verified git commit.")
     if "git_push" in markers:
         directives.append("Do not repeat the verified git push.")
-    if "pull_request_created" in markers:
+    if "pull_request_created" in markers or (pr_url is not None and "git_push" in markers):
         directives.append("Do not create another pull request.")
+    elif _requests_branch_only(directive):
+        directives.append("Do not create a pull request.")
     return directives
 
 
@@ -406,12 +463,13 @@ def build_checkpoint(
 ) -> SessionCheckpoint:
     """Build a bounded checkpoint from user messages and completed tool pairs."""
     verified, failed, (repo, branch, commit, pr_url) = paired_tool_actions(history)
-    phase = _phase_for_actions(verified)
+    directive = latest_user_directive(history)
+    phase = _phase_for_actions(verified, pr_url=pr_url, directive=directive)
     covered_items, fingerprint = covered_history(history)
     return SessionCheckpoint(
         session_id=session_id,
         status="complete" if phase == "complete" and status == "idle" else status,
-        latest_user_directive=latest_user_directive(history),
+        latest_user_directive=directive,
         phase=phase,
         repo=repo,
         branch=branch,
@@ -419,7 +477,11 @@ def build_checkpoint(
         pr_url=pr_url,
         verified_actions=verified,
         failed_actions=failed,
-        do_not_repeat=_do_not_repeat(verified),
+        do_not_repeat=_do_not_repeat(
+            verified,
+            pr_url=pr_url,
+            directive=directive,
+        ),
         pending=_pending_for_phase(phase),
         covered_items=covered_items,
         history_fingerprint=fingerprint,

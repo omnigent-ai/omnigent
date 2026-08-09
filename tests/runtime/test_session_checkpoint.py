@@ -56,6 +56,92 @@ def test_checkpoint_pairs_normalized_tools_and_resumes_at_pull_request() -> None
     assert "Do not repeat the verified git push." in checkpoint.do_not_repeat
 
 
+def test_checkpoint_understands_verified_commit_helper_for_existing_pr() -> None:
+    history = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": "Fix https://github.com/example/repository/pull/42",
+        },
+        {
+            "type": "function_call",
+            "call_id": "inspect-pr",
+            "name": "oracle__ask",
+            "arguments": '{"question":"Review the pull request"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "inspect-pr",
+            "output": '{"url":"https://github.com/example/repository/pull/42"}',
+        },
+        {
+            "type": "function_call",
+            "call_id": "verified-commit",
+            "name": "sys_os_shell",
+            "arguments": (
+                '{"command":"python3 /agents/watchdog/skills/contribute/'
+                "gh_app_commit.py --repo /workspace/HomeLab-Forge/repository "
+                '--message \\"fix: repair config\\""}'
+            ),
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "verified-commit",
+            "output": ('{"branch":"add-config","commit":"0123456789abcdef","verified":true}'),
+        },
+    ]
+
+    checkpoint = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=history,
+        status="idle",
+    )
+
+    assert checkpoint.phase == "complete"
+    assert checkpoint.status == "complete"
+    assert checkpoint.pr_url == "https://github.com/example/repository/pull/42"
+    assert checkpoint.branch == "add-config"
+    assert checkpoint.commit == "0123456789abcdef"
+    assert "Do not repeat the verified git commit." in checkpoint.do_not_repeat
+    assert "Do not repeat the verified git push." in checkpoint.do_not_repeat
+    assert "Do not create another pull request." in checkpoint.do_not_repeat
+
+
+def test_checkpoint_respects_explicit_branch_only_directive() -> None:
+    history = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": "Just commit and push into the branch. Do not create a PR.",
+        },
+        {
+            "type": "function_call",
+            "call_id": "verified-commit",
+            "name": "sys_os_shell",
+            "arguments": (
+                '{"command":"python3 /agents/watchdog/skills/contribute/'
+                "gh_app_commit.py --repo /workspace/HomeLab-Forge/repository "
+                '--message \\"fix: repair config\\""}'
+            ),
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "verified-commit",
+            "output": ('{"branch":"repair-config","commit":"abcdef0123456789","verified":true}'),
+        },
+    ]
+
+    checkpoint = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=history,
+        status="idle",
+    )
+
+    assert checkpoint.phase == "complete"
+    assert checkpoint.pending == "Answer the user with the verified completed state."
+    assert "Do not create a pull request." in checkpoint.do_not_repeat
+
+
 def test_checkpoint_requires_explicit_structured_tool_success() -> None:
     unverified = build_checkpoint(
         session_id="conv_checkpoint",
@@ -375,8 +461,7 @@ def test_checkpoint_redacts_token_only_url_userinfo_in_directives_and_tools() ->
             "type": "function_call_output",
             "call_id": "push",
             "output": (
-                '{"exit_code":0,"remote":'
-                '"https://output-token@github.com/example/repository"}'
+                '{"exit_code":0,"remote":"https://output-token@github.com/example/repository"}'
             ),
         },
     ]

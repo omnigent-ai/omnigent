@@ -7,6 +7,7 @@ from typing import Any, Literal, cast
 import pytest
 
 from omnigent.runner import create_runner_app
+from omnigent.runtime import telemetry
 from omnigent.runtime.session_checkpoint import build_checkpoint
 
 
@@ -100,4 +101,64 @@ async def test_runner_persists_checkpoint_for_every_terminal_outcome(
     assert persisted["pending"] == "Create the pull request with github__create_pull_request."
     assert "Do not repeat the verified git commit." in persisted["do_not_repeat"]
     assert "Do not repeat the verified git push." in persisted["do_not_repeat"]
+    app.state.session_histories.pop(session_id, None)
+
+
+async def test_runner_records_checkpoint_load_and_save_as_agent_tool_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint I/O waits for the agent parent and records direct TOOL children."""
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    session_id = "conv_checkpoint_trace"
+    stored = build_checkpoint(
+        session_id=session_id,
+        history=_prior_history(),
+        status="idle",
+    )
+    server = _CheckpointServer(stored.model_dump(mode="json"))
+    recorded: list[dict[str, Any]] = []
+
+    def _record(tool_name: str, **kwargs: Any) -> None:
+        recorded.append({"tool_name": tool_name, **kwargs})
+
+    monkeypatch.setattr(telemetry, "record_completed_tool_call", _record)
+    app = create_runner_app(server_client=cast(Any, server))
+    history = [
+        *_prior_history(),
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Open the PR."}],
+        },
+    ]
+
+    checkpoint, _ = await app.state.checkpoint_for_turn(
+        session_id,
+        "openai-agents",
+        history,
+    )
+
+    assert checkpoint is not None
+    assert recorded == []
+
+    parent = "00-" + "1" * 32 + "-" + "2" * 16 + "-01"
+    app.state.bind_checkpoint_traceparent(session_id, parent)
+
+    assert [call["tool_name"] for call in recorded] == [
+        "session_checkpoint.load",
+        "session_checkpoint.save",
+    ]
+    assert all(call["parent_traceparent"] == parent for call in recorded)
+    assert all(call["attributes"]["session.id"] == session_id for call in recorded)
+
+    app.state.session_histories[session_id] = history
+    app.state.checkpoint_turn_status[session_id] = "idle"
+    await app.state.persist_session_checkpoint(session_id)
+
+    assert [call["tool_name"] for call in recorded] == [
+        "session_checkpoint.load",
+        "session_checkpoint.save",
+        "session_checkpoint.save",
+    ]
+    assert recorded[-1]["attributes"]["checkpoint.status"] in {"idle", "complete"}
     app.state.session_histories.pop(session_id, None)

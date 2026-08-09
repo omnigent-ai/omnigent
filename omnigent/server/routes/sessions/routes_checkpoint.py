@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any
 
 from fastapi import APIRouter, Request
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime import telemetry
 from omnigent.runtime.session_checkpoint import CHECKPOINT_KEY, SessionCheckpoint
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import (
@@ -24,45 +22,6 @@ from omnigent.server.schemas import (
 )
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
-
-
-def _checkpoint_attributes(
-    checkpoint: SessionCheckpoint | None,
-    *,
-    session_id: str,
-    outcome: str,
-    latency_ms: float,
-) -> dict[str, Any]:
-    """Build tool-observation attributes without exposing checkpoint content."""
-    return {
-        "openinference.span.kind": "TOOL",
-        "openinference.tool.name": "session_checkpoint",
-        "tool.name": "session_checkpoint",
-        "session.id": session_id,
-        "outcome": outcome,
-        "checkpoint.outcome": outcome,
-        "latency_ms": latency_ms,
-        "checkpoint.latency_ms": latency_ms,
-        "status": checkpoint.status if checkpoint is not None else "absent",
-        "checkpoint.status": checkpoint.status if checkpoint is not None else "absent",
-        "phase": checkpoint.phase if checkpoint is not None else "absent",
-        "checkpoint.phase": checkpoint.phase if checkpoint is not None else "absent",
-        "covered_item_count": len(checkpoint.covered_items) if checkpoint is not None else 0,
-        "checkpoint.covered_item_count": len(checkpoint.covered_items)
-        if checkpoint is not None
-        else 0,
-    }
-
-
-def _record_checkpoint_payload(
-    span: Any,
-    *,
-    key: str,
-    payload: dict[str, Any],
-) -> None:
-    """Attach a capped checkpoint payload only when content capture is enabled."""
-    if telemetry.should_capture_content() and getattr(span, "is_recording", lambda: False)():
-        span.set_attribute(key, telemetry.redact_and_cap_payload(payload))
 
 
 def register_checkpoint_routes(
@@ -124,48 +83,8 @@ def register_checkpoint_routes(
         request: Request,
         session_id: str,
     ) -> SessionCheckpointResponse:
-        started = time.perf_counter()
-        checkpoint: SessionCheckpoint | None = None
-        outcome = "error"
-        with telemetry.span(
-            "session_checkpoint.read",
-            attributes=_checkpoint_attributes(
-                None,
-                session_id=session_id,
-                outcome="started",
-                latency_ms=0,
-            ),
-        ) as span:
-            _record_checkpoint_payload(
-                span,
-                key="input.value",
-                payload={"session_id": session_id},
-            )
-            try:
-                checkpoint = await _load_authorized_checkpoint(request, session_id, LEVEL_READ)
-                outcome = "success" if checkpoint is not None else "absent"
-                _record_checkpoint_payload(
-                    span,
-                    key="output.value",
-                    payload={
-                        "session_id": session_id,
-                        "checkpoint": checkpoint.model_dump(mode="json")
-                        if checkpoint is not None
-                        else None,
-                    },
-                )
-                return SessionCheckpointResponse(session_id=session_id, checkpoint=checkpoint)
-            except Exception as exc:
-                telemetry.record_error(span, exc)
-                raise
-            finally:
-                for key, value in _checkpoint_attributes(
-                    checkpoint,
-                    session_id=session_id,
-                    outcome=outcome,
-                    latency_ms=(time.perf_counter() - started) * 1000,
-                ).items():
-                    span.set_attribute(key, value)
+        checkpoint = await _load_authorized_checkpoint(request, session_id, LEVEL_READ)
+        return SessionCheckpointResponse(session_id=session_id, checkpoint=checkpoint)
 
     @router.put(
         "/sessions/{session_id}/checkpoint",
@@ -181,54 +100,13 @@ def register_checkpoint_routes(
                 "checkpoint session_id must match the route session_id",
                 code=ErrorCode.INVALID_INPUT,
             )
-        started = time.perf_counter()
         checkpoint = body.checkpoint
-        outcome = "error"
-        with telemetry.span(
-            "session_checkpoint.write",
-            attributes=_checkpoint_attributes(
-                checkpoint,
-                session_id=session_id,
-                outcome="started",
-                latency_ms=0,
-            ),
-        ) as span:
-            _record_checkpoint_payload(
-                span,
-                key="input.value",
-                payload={
-                    "session_id": session_id,
-                    "checkpoint": checkpoint.model_dump(mode="json")
-                    if checkpoint is not None
-                    else None,
-                },
-            )
-            try:
-                await _authorized_session_state(request, session_id, LEVEL_EDIT)
-                stored_checkpoint = (
-                    checkpoint.model_dump(mode="json") if checkpoint is not None else None
-                )
-                await asyncio.to_thread(
-                    conversation_store.set_session_state_key,
-                    session_id,
-                    CHECKPOINT_KEY,
-                    stored_checkpoint,
-                )
-                outcome = "success"
-                _record_checkpoint_payload(
-                    span,
-                    key="output.value",
-                    payload={"session_id": session_id, "checkpoint": stored_checkpoint},
-                )
-                return SessionCheckpointResponse(session_id=session_id, checkpoint=checkpoint)
-            except Exception as exc:
-                telemetry.record_error(span, exc)
-                raise
-            finally:
-                for key, value in _checkpoint_attributes(
-                    checkpoint,
-                    session_id=session_id,
-                    outcome=outcome,
-                    latency_ms=(time.perf_counter() - started) * 1000,
-                ).items():
-                    span.set_attribute(key, value)
+        await _authorized_session_state(request, session_id, LEVEL_EDIT)
+        stored_checkpoint = checkpoint.model_dump(mode="json") if checkpoint is not None else None
+        await asyncio.to_thread(
+            conversation_store.set_session_state_key,
+            session_id,
+            CHECKPOINT_KEY,
+            stored_checkpoint,
+        )
+        return SessionCheckpointResponse(session_id=session_id, checkpoint=checkpoint)

@@ -381,6 +381,8 @@ class TurnContext:
         e.g. ``"resp_abc123"``. Surfaced on the SSE
         ``response.created`` envelope so Omnigent can correlate
         replays / heartbeat-event-seq tracking.
+    :param conversation_id: Omnigent conversation id from the
+        session route, e.g. ``"conv_abc123"``.
     :param event_queue: The :class:`asyncio.Queue` the SSE
         streaming response reads from. ``ctx.emit`` puts
         events onto this queue; the streaming response
@@ -396,8 +398,10 @@ class TurnContext:
         response_id: str,
         event_queue: asyncio.Queue[HarnessStreamEvent | None],
         cancelled: asyncio.Event,
+        conversation_id: str | None = None,
     ) -> None:
         self.response_id = response_id
+        self.conversation_id = conversation_id
         self._event_queue = event_queue
         self.cancelled = cancelled
         # Layer 3 per-tool-dispatch state: ``call_id`` →
@@ -1137,7 +1141,10 @@ class HarnessApp:
             return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
-            return await self._start_or_inject_turn(body.to_create_request())
+            return await self._start_or_inject_turn(
+                body.to_create_request(),
+                conversation_id=conversation_id,
+            )
         if isinstance(body, InterruptEvent):
             return await self._handle_interrupt_event()
         if isinstance(body, ToolResultEvent):
@@ -1226,7 +1233,10 @@ class HarnessApp:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
-        self, request: CreateResponseRequest
+        self,
+        request: CreateResponseRequest,
+        *,
+        conversation_id: str | None = None,
     ) -> StreamingResponse | Response:
         """
         Start a new turn or inject into the in-flight one.
@@ -1244,6 +1254,7 @@ class HarnessApp:
            that runs ``run_turn`` to completion.
 
         :param request: The decoded request body.
+        :param conversation_id: Omnigent conversation id from the route.
         :returns: Either a :class:`StreamingResponse` for the new
             turn or a 204 :class:`Response` for an in-band
             injection.
@@ -1292,6 +1303,7 @@ class HarnessApp:
                 response_id=response_id,
                 event_queue=event_queue,
                 cancelled=cancelled,
+                conversation_id=conversation_id,
             )
             self._in_flight[response_id] = ctx
             self._active_turn_ctx = ctx

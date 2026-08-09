@@ -75,6 +75,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    TraceContextEvent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -417,11 +418,10 @@ class ExecutorAdapter(HarnessApp):
         tracing = is_tracing_enabled()
         from omnigent.runtime.telemetry import current_session_id, session_scope
 
-        # Prefer the conversation id the request hook already bound
-        # (authoritative, from the /sessions/<conv>/events path); fall back to
-        # the adapter session key, which can be a random uuid for harnesses
-        # built without one.
-        turn_session_id = current_session_id() or self._session_key
+        # The route-owned conversation id is authoritative even when FastAPI
+        # auto-instrumentation is disabled. Older callers fall back to the
+        # ambient context and finally the adapter's private SDK session key.
+        turn_session_id = ctx.conversation_id or current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
             self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
@@ -546,6 +546,16 @@ class ExecutorAdapter(HarnessApp):
                         user_message=user_message,
                         model=request.model_override or request.model,
                     )
+                    from omnigent.runtime.telemetry import traceparent_for_span
+
+                    agent_traceparent = traceparent_for_span(agent_span)
+                    if agent_traceparent is not None:
+                        ctx.emit(
+                            TraceContextEvent(
+                                type="trace_context.available",
+                                traceparent=agent_traceparent,
+                            )
+                        )
 
                 response_text: str | None = None
                 async for event in executor.run_turn(

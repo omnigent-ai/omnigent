@@ -158,6 +158,42 @@ def test_trace_id_from_response_id_invalid_hex() -> None:
         telemetry.trace_id_from_response_id(bad_id)
 
 
+def test_completed_tool_call_uses_explicit_parent_and_stays_leaf(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred tool observation is a direct child of the supplied agent span."""
+    monkeypatch.setattr(telemetry, "_capture_content", True)
+    tracer = otel_trace.get_tracer("test")
+    with tracer.start_as_current_span("agent:watchdog") as parent:
+        traceparent = telemetry.traceparent_for_span(parent)
+    assert traceparent is not None
+
+    telemetry.record_completed_tool_call(
+        "session_checkpoint.load",
+        parent_traceparent=traceparent,
+        attributes={
+            "session.id": "conv_checkpoint",
+            "checkpoint.outcome": "success",
+        },
+        input_value={"session_id": "conv_checkpoint", "token": "secret"},
+        output_value={"checkpoint": {"status": "idle"}},
+    )
+
+    spans = list(in_memory_exporter.get_finished_spans())
+    assert [span.name for span in spans] == [
+        "agent:watchdog",
+        "tool:session_checkpoint.load",
+    ]
+    tool = spans[1]
+    assert tool.parent is not None
+    assert tool.parent.span_id == spans[0].context.span_id
+    assert tool.attributes["openinference.span.kind"] == "TOOL"
+    assert tool.attributes["gen_ai.operation.name"] == "execute_tool"
+    assert tool.attributes["session.id"] == "conv_checkpoint"
+    assert "[redacted]" in tool.attributes["input.value"]
+
+
 # ── _env_bool / should_capture_content ─────────────────
 
 

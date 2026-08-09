@@ -735,6 +735,60 @@ def record_error(span: Span, exc: BaseException) -> None:
     span.record_exception(exc)
 
 
+def record_completed_tool_call(
+    tool_name: str,
+    *,
+    parent_traceparent: str,
+    attributes: Mapping[str, Any] | None = None,
+    input_value: Any = None,
+    output_value: Any = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Record a completed TOOL leaf under an explicit remote parent span."""
+    if not telemetry_enabled():
+        return
+    normalized = normalize_traceparent(parent_traceparent)
+    if normalized is None:
+        return
+
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.trace import StatusCode
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    parent = TraceContextTextMapPropagator().extract({"traceparent": normalized})
+    span_attributes: dict[str, Any] = {
+        "openinference.span.kind": "TOOL",
+        "openinference.tool.name": tool_name,
+        "tool.name": tool_name,
+        "gen_ai.tool.name": tool_name,
+        "gen_ai.operation.name": "execute_tool",
+    }
+    span_attributes.update(attributes or {})
+    span = otel_trace.get_tracer("omnigent").start_span(
+        name=f"tool:{tool_name}",
+        context=parent,
+        attributes=span_attributes,
+    )
+    try:
+        if should_capture_content() and input_value is not None:
+            span.set_attribute("input.value", redact_and_cap_payload(input_value))
+        if should_capture_content() and output_value is not None:
+            span.set_attribute("output.value", redact_and_cap_payload(output_value))
+        if error_type is not None:
+            span.set_attribute("error.type", error_type)
+            if should_capture_content() and error_message:
+                safe_message = redact_and_cap_text(error_message)
+                span.set_attribute("error.message", safe_message)
+                span.set_status(StatusCode.ERROR, safe_message)
+            else:
+                span.set_status(StatusCode.ERROR)
+        else:
+            span.set_status(StatusCode.OK)
+    finally:
+        span.end()
+
+
 def record_cancellation(span: Span) -> None:
     """
     Mark a span as cancelled.
