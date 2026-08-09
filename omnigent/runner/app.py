@@ -1212,6 +1212,36 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+def list_undelivered_terminal_subagent_work(
+    parent_session_id: str,
+) -> list[_SubagentWorkEntry]:
+    """
+    List a parent's sub-agent dispatches that finished but never delivered.
+
+    A terminal work entry (``status`` in ``completed``/``failed``/
+    ``cancelled``) with ``delivered=False`` means
+    :func:`_deliver_subagent_completion` could not find a parent inbox on
+    this runner (``missing_parent_inbox``) and the forward was later
+    dropped after its bounded retries exhausted — the child's result is
+    parked in this registry, but nothing ever reached this parent's inbox
+    queue or wake path (SIL-925: the parent orchestrator strands silently,
+    discoverable only via a direct ``sys_session_get_info`` poll).
+
+    ``sys_read_inbox`` surfaces these explicitly as a structural signal so
+    the caller can detect a stranded child instead of relying on
+    remembering to poll every in-flight dispatch ad hoc.
+
+    :param parent_session_id: Parent session id, e.g.
+        ``"conv_parent123"``.
+    :returns: Terminal, undelivered work entries, oldest first.
+    """
+    return [
+        entry
+        for entry in list_subagent_work(parent_session_id)
+        if entry.status in _SUBAGENT_TERMINAL_STATUSES and not entry.delivered
+    ]
+
+
 def mark_subagent_work_terminal(
     child_session_id: str,
     *,

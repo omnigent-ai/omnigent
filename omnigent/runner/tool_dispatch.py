@@ -38,6 +38,7 @@ from omnigent.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.runner.app import _SubagentWorkEntry
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
@@ -6574,6 +6575,29 @@ def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
     )
 
 
+def _format_undelivered_subagent_notice(entries: list[_SubagentWorkEntry]) -> str:
+    """
+    Render a structural notice for sub-agents that finished but never delivered.
+
+    :param entries: Terminal, undelivered work entries from
+        :func:`omnigent.runner.app.list_undelivered_terminal_subagent_work`,
+        oldest first.
+    :returns: One ``[System: ...]`` block listing every stranded child.
+    """
+    lines = [
+        f"- {entry.agent} ({entry.title or entry.child_session_id}): "
+        f"status={entry.status} conversation_id={entry.child_session_id}"
+        for entry in entries
+    ]
+    return (
+        "[System: {count} sub-agent(s) finished but their completion could "
+        "not be delivered to this inbox (parent-inbox delivery failed and "
+        "exhausted its retries — SIL-925). They will NOT auto-wake you "
+        "again. Call sys_session_get_info on each conversation_id to read "
+        "their result directly:\n{lines}]"
+    ).format(count=len(entries), lines="\n".join(lines))
+
+
 async def _drain_inbox(
     inbox: asyncio.Queue[_JsonObject] | None,
     *,
@@ -6583,7 +6607,13 @@ async def _drain_inbox(
     """
     Non-blocking drain of the per-session inbox queue.
 
-    Returns formatted completion payloads or "Inbox is empty."
+    Returns formatted completion payloads or "Inbox is empty." Also
+    appends a structural notice (SIL-925) for any of this session's
+    dispatched sub-agents that reached a terminal status but whose
+    completion could never be delivered here (see
+    :func:`omnigent.runner.app.list_undelivered_terminal_subagent_work`) —
+    a caller relying solely on push-wake would otherwise never learn
+    those children finished.
 
     :param inbox: The session's asyncio.Queue, or ``None`` if
         no queue has been created yet.
@@ -6592,38 +6622,45 @@ async def _drain_inbox(
         ``"conv_parent123"``.
     :returns: Formatted string of completed tasks.
     """
-    if inbox is None or inbox.empty():
-        return "Inbox is empty — no completed tasks."
     items: list[str] = []
-    retry_payloads: list[_JsonObject] = []
-    while not inbox.empty():
-        try:
-            payload = inbox.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-        if payload.get("type") == "terminal_idle":
+    if inbox is not None and not inbox.empty():
+        retry_payloads: list[_JsonObject] = []
+        while not inbox.empty():
             try:
-                items.append(_format_terminal_idle_item(payload))
-            except ValueError as exc:
-                _logger.warning(
-                    "malformed terminal-idle inbox item ignored: %s",
-                    exc,
-                    exc_info=True,
-                )
-                items.append(f"[System: malformed terminal_idle inbox item ignored — {exc}]")
-            continue
-        evaluation = await _evaluate_subagent_inbox_output(
-            payload,
-            server_client=server_client,
-            conversation_id=conversation_id,
-        )
-        items.append(_format_async_task_item(evaluation.payload))
-        if evaluation.retry_original:
-            retry_payloads.append(payload)
-        else:
-            _cleanup_drained_subagent_work(evaluation.payload)
-    for payload in retry_payloads:
-        inbox.put_nowait(payload)
+                payload = inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if payload.get("type") == "terminal_idle":
+                try:
+                    items.append(_format_terminal_idle_item(payload))
+                except ValueError as exc:
+                    _logger.warning(
+                        "malformed terminal-idle inbox item ignored: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    items.append(f"[System: malformed terminal_idle inbox item ignored — {exc}]")
+                continue
+            evaluation = await _evaluate_subagent_inbox_output(
+                payload,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
+            items.append(_format_async_task_item(evaluation.payload))
+            if evaluation.retry_original:
+                retry_payloads.append(payload)
+            else:
+                _cleanup_drained_subagent_work(evaluation.payload)
+        for payload in retry_payloads:
+            inbox.put_nowait(payload)
+
+    if conversation_id is not None:
+        from omnigent.runner import app as _runner_app
+
+        stranded = _runner_app.list_undelivered_terminal_subagent_work(conversation_id)
+        if stranded:
+            items.append(_format_undelivered_subagent_notice(stranded))
+
     return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
 
 

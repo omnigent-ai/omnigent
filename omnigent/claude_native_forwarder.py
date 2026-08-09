@@ -3061,6 +3061,33 @@ async def _forward_available_status_events(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
+                # Dead-letter the dropped terminal status for recovery (#1120;
+                # replay #1579). Unlike the item/start dead-letter sites, a
+                # dropped ``idle``/``failed`` hook status is the ONLY signal
+                # that ends a sub-agent's turn and wakes its parent's inbox
+                # (SIL-925): with nothing durable recorded here, an exhausted
+                # ``subagent_delivery_not_confirmed`` 503 (the parent-inbox
+                # race in omnigent-ai/omnigent#3274) silently strands the
+                # orchestrator forever, discoverable only via a direct
+                # sys_session_get_info poll. The 503 and any permanent 4xx
+                # both arrive as ``httpx.HTTPStatusError`` — a real response
+                # was received, so this is never an ambiguous delivery (see
+                # ``post_may_have_been_delivered``) and is safe to replay.
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=session_id,
+                    event_type="external_session_status",
+                    payload={
+                        "status": effective_status,
+                        "response_id": response_id,
+                        "background_task_count": (
+                            None if status == "failed" else record.background_task_count
+                        ),
+                    },
+                    reason="permanent HTTP failure after retries",
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
+                )
                 if status != "failed":
                     await _post_forwarder_failed_status(
                         client,

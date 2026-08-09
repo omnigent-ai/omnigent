@@ -7859,6 +7859,77 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_forward_status_events_dead_letters_on_exhausted_subagent_delivery(
+    tmp_path: Path,
+) -> None:
+    """
+    An exhausted ``subagent_delivery_not_confirmed`` 503 dead-letters the drop (SIL-925).
+
+    A sub-agent's terminal Stop→idle edge is the ONLY signal that ends its
+    turn and wakes its parent's inbox. If the runner can never accept
+    delivery (``missing_parent_inbox`` — omnigent-ai/omnigent#3274, a
+    parent-inbox map populated only by ``create_session``) the forwarder
+    retries a bounded number of times (``_SUBAGENT_DELIVERY_NOT_CONFIRMED
+    _MAX_ATTEMPTS``, added in #1471 so a permanently orphaned parent does
+    not retry forever), then previously just logged a server-side ERROR and
+    dropped the edge outright — no inbox item, no wake, nothing durable.
+    That is the SIL-925 failure mode: the orchestrator strands silently and
+    the completion is only discoverable via a direct ``sys_session_get_info``
+    poll. Dead-lettering the drop instead makes it a durable, forensic
+    record eligible for a future replay pass.
+    """
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "Stop", "session_id": "claude-session"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={
+                "error": "subagent_delivery_not_confirmed",
+                "reason": "missing_parent_inbox",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_child"
+        )
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=_PostRetryTracker(base_delay_s=0.0, max_not_confirmed_attempts=1),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id=None,
+        )
+
+    dl_path = bridge_dir / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    # The idle edge exhausts and dead-letters; the synthesized ``failed``
+    # fallback (_post_forwarder_failed_status) then hits the same 503, but
+    # that path is a bare best-effort POST with no retry tracker and no
+    # dead-letter of its own — exactly one record results.
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_child"
+    assert record["event_type"] == "external_session_status"
+    assert record["payload"]["status"] == "idle"
+    assert record["payload"]["background_task_count"] == 0
+    assert record["reason"] == "permanent HTTP failure after retries"
+    assert record["delivered_ambiguous"] is False
+    assert record["http_status"] == 503
+
+
+@pytest.mark.asyncio
 async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Path) -> None:
     """
     The first assistant output of a turn publishes ``running`` + its response id.
