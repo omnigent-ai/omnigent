@@ -10,6 +10,8 @@
  * messages without try/catch at every call site.
  */
 
+import { authenticatedFetch } from "@/lib/identity";
+
 /** One connected credential, masked — the token never reaches the client. */
 export interface CredentialInfo {
   provider: string;
@@ -60,7 +62,7 @@ async function failureFrom(res: Response, fallback: string): Promise<Credentials
 export async function listCredentials(): Promise<CredentialsListResult> {
   let res: Response;
   try {
-    res = await fetch("/v1/credentials");
+    res = await authenticatedFetch("/v1/credentials");
   } catch {
     return NETWORK_FAILURE;
   }
@@ -75,7 +77,7 @@ export async function listCredentials(): Promise<CredentialsListResult> {
 export async function connectGithub(): Promise<ConnectResult> {
   let res: Response;
   try {
-    res = await fetch("/v1/credentials/github/connect", { method: "POST" });
+    res = await authenticatedFetch("/v1/credentials/github/connect", { method: "POST" });
   } catch {
     return NETWORK_FAILURE;
   }
@@ -90,7 +92,7 @@ export async function connectGithub(): Promise<ConnectResult> {
 export async function disconnectGithub(): Promise<DisconnectResult> {
   let res: Response;
   try {
-    res = await fetch("/v1/credentials/github", { method: "DELETE" });
+    res = await authenticatedFetch("/v1/credentials/github", { method: "DELETE" });
   } catch {
     return NETWORK_FAILURE;
   }

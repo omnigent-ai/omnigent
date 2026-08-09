@@ -354,7 +354,7 @@ export type GithubReposResult = { ok: true; repos: GithubRepoInfo[] } | Credenti
 export async function listGithubRepos(): Promise<GithubReposResult> {
   let res: Response;
   try {
-    res = await fetch("/v1/credentials/github/repos");
+    res = await authenticatedFetch("/v1/credentials/github/repos");
   } catch {
     return NETWORK_FAILURE;
   }
@@ -365,6 +365,12 @@ export async function listGithubRepos(): Promise<GithubReposResult> {
   return failureFrom(res, "Could not load your GitHub repos.");
 }
 ```
+
+Note: `credentialsApi.ts` already has `import { authenticatedFetch } from "@/lib/identity";` at
+the top (its other three functions were migrated from bare `fetch()` to
+`authenticatedFetch` in a prerequisite fix — the project's `no-restricted-globals`
+oxlint rule bans bare `fetch()` outside `src/lib/host.ts`). Use the existing
+import; do not add a second one.
 
 - [ ] **Step 4: Add state and the filtered-repos memo to `NewChatDialog.tsx`**
 
