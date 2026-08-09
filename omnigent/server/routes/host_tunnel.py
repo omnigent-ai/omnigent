@@ -27,6 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
+    HostChatImportResultFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
@@ -687,6 +688,14 @@ async def _receive_loop(
                         "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
+                )
+            continue
+
+        if isinstance(frame, HostChatImportResultFrame):
+            import_future = conn.pending_chat_imports.pop(frame.request_id, None)
+            if import_future is not None and not import_future.done():
+                import_future.set_result(
+                    {"status": frame.status, "payload": frame.payload, "error": frame.error}
                 )
             continue
 

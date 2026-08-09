@@ -10,6 +10,7 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.conversation import synthesize_conversation_title
 
 ImportSource = Literal["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"]
+SESSION_IMPORT_TITLE_LIMIT = 512
 
 IMPORT_SOURCE_LABEL_KEY = "omnigent.import.source"
 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY = "omnigent.import.external_session_id"
@@ -33,14 +34,19 @@ class LocalSessionImport:
     external_session_id: str
     workspace: str | None
     items: tuple[NewConversationItem, ...]
+    title_hint: str | None = None
 
     @property
     def title(self) -> str | None:
         """Return a sidebar title derived from the first user message."""
-        return title_from_items(self.items)
+        return self.title_hint or title_from_items(self.items, limit=SESSION_IMPORT_TITLE_LIMIT)
 
 
-def title_from_items(items: Sequence[NewConversationItem]) -> str | None:
+def title_from_items(
+    items: Sequence[NewConversationItem],
+    *,
+    limit: int = SESSION_IMPORT_TITLE_LIMIT,
+) -> str | None:
     """Return a sidebar title derived from the first user message."""
     for item in items:
         if (
@@ -48,5 +54,5 @@ def title_from_items(items: Sequence[NewConversationItem]) -> str | None:
             and item.data.role == "user"
             and not item.data.is_meta
         ):
-            return synthesize_conversation_title(item.data.content)
+            return synthesize_conversation_title(item.data.content, limit=limit)
     return None

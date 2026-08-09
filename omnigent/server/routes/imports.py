@@ -27,6 +27,7 @@ from omnigent.session_import import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -55,6 +56,8 @@ class ImportSessionRequest(BaseModel):
     source: ImportSource
     external_session_id: str = Field(min_length=1, max_length=128)
     workspace: str | None = Field(default=None, max_length=2048)
+    title: str | None = Field(default=None, max_length=512)
+    host_id: str | None = Field(default=None, max_length=128)
     force: bool = False
     items: list[ImportItemInput] = Field(min_length=1, max_length=100_000)
 
@@ -66,6 +69,14 @@ class ImportSessionRequest(BaseModel):
         if not value:
             raise ValueError("external_session_id must not be blank")
         return value
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value: str | None) -> str | None:
+        """Normalize an optional source-provided title."""
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 class ImportSessionResponse(BaseModel):
@@ -116,6 +127,7 @@ def create_imports_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    host_store: HostStore | None = None,
 ) -> APIRouter:
     """Create the local-session import router."""
     router = APIRouter()
@@ -135,6 +147,19 @@ def create_imports_router(
     ) -> ImportSessionResponse:
         """Import one normalized transcript, optionally replacing its prior import."""
         user_id = require_user(request, auth_provider)
+        if body.host_id is not None:
+            if body.workspace is None:
+                raise OmnigentError(
+                    "Imported chats need a workspace when a host is selected",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            host = (
+                None
+                if host_store is None
+                else await asyncio.to_thread(host_store.get_host, body.host_id)
+            )
+            if host is None or (user_id is not None and host.user_id != user_id):
+                raise OmnigentError("Host not found", code=ErrorCode.NOT_FOUND)
         items = [item.to_item() for item in body.items]
         existing = await asyncio.to_thread(
             conversation_store.find_imported_conversation,
@@ -174,9 +199,10 @@ def create_imports_router(
         try:
             conversation = await asyncio.to_thread(
                 conversation_store.create_conversation,
-                title=title_from_items(items),
+                title=body.title or title_from_items(items),
                 agent_id=agent_id,
                 workspace=body.workspace,
+                host_id=body.host_id,
                 conversation_id=_import_conversation_id(body.source, body.external_session_id),
             )
         except ConversationAlreadyExistsError as exc:
