@@ -4643,7 +4643,9 @@ def test_pi_retries_idle_timeout_after_tool_activity() -> None:
         commands = [
             json.loads(line) for line in b"".join(rpc.process.stdin.data).decode().splitlines()
         ]
-        assert len([item for item in commands if item.get("type") == "prompt"]) == 2
+        prompts = [item for item in commands if item.get("type") == "prompt"]
+        assert len(prompts) == 2
+        assert prompts[1]["streamingBehavior"] == "followUp"
 
     _run(_test())
 

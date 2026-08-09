@@ -2488,6 +2488,7 @@ class PiExecutor(Executor):
                         "type": "prompt",
                         "message": PI_TOOL_TURN_CONTINUATION,
                         "id": f"{cmd_id}_continue_{tool_turn_continuations}",
+                        "streamingBehavior": "followUp",
                     }
                 )
             except Exception as exc:  # noqa: BLE001

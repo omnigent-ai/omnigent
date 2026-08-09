@@ -58,6 +58,7 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.runner.skill_load_guard import skill_load_guard
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -4965,6 +4966,8 @@ async def execute_tool(
                 args,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                conversation_id=conversation_id,
+                task_id=task_id,
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
@@ -6857,6 +6860,8 @@ def _execute_skill_tool(
     *,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    conversation_id: str | None,
+    task_id: str | None,
 ) -> str:
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
@@ -6870,6 +6875,8 @@ def _execute_skill_tool(
     :param agent_spec: The session's AgentSpec.
     :param runner_workspace: The runner's workspace path for
         host-scope skill discovery.
+    :param conversation_id: Current conversation id.
+    :param task_id: Current response or task id.
     :returns: Tool output string.
     """
     from omnigent.tools.builtins.load_skill import LoadSkillTool
@@ -6882,6 +6889,15 @@ def _execute_skill_tool(
     # author valid agent configs via sys_os_write without requiring the
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
+
+    skill_name = args.get("name") if tool_name == "load_skill" else None
+    if isinstance(skill_name, str) and skill_load_guard.is_loaded(
+        conversation_id, task_id, skill_name
+    ):
+        return (
+            f"Skill {skill_name!r} is already loaded for this turn. "
+            "Follow its instructions now; do not call load_skill again."
+        )
 
     tool: Tool
     if tool_name == "load_skill":
@@ -6897,4 +6913,7 @@ def _execute_skill_tool(
     from omnigent.tools.base import ToolContext
 
     ctx = ToolContext(task_id="", conversation_id="", agent_id="")
-    return tool.invoke(arguments_json, ctx)
+    output = tool.invoke(arguments_json, ctx)
+    if isinstance(skill_name, str) and not output.startswith("Error:"):
+        skill_load_guard.record(conversation_id, task_id, skill_name)
+    return output
