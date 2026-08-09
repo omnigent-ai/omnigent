@@ -36,7 +36,9 @@ from omnigent.host.frames import (
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
+    HostListLocalSessionsResultFrame,
     HostListWorktreesResultFrame,
+    HostLoadLocalSessionResultFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -614,6 +616,30 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktrees": frame.worktrees,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostListLocalSessionsResultFrame):
+            list_ls_future = conn.pending_list_local_sessions.pop(frame.request_id, None)
+            if list_ls_future is not None and not list_ls_future.done():
+                list_ls_future.set_result(
+                    {
+                        "status": frame.status,
+                        "sessions": frame.sessions,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostLoadLocalSessionResultFrame):
+            load_ls_future = conn.pending_load_local_session.pop(frame.request_id, None)
+            if load_ls_future is not None and not load_ls_future.done():
+                load_ls_future.set_result(
+                    {
+                        "status": frame.status,
+                        "session": frame.session,
                         "error": frame.error,
                     }
                 )

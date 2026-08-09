@@ -259,6 +259,17 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param pending_list_local_sessions: Per-``request_id`` futures for
+        in-flight ``host.list_local_sessions`` requests (the import-chat
+        picker). Resolved when the host sends
+        ``host.list_local_sessions_result``. Values carry ``status``,
+        ``sessions``, and ``error``. Same ``Any`` typing rationale as
+        ``pending_stats``.
+    :param pending_load_local_session: Per-``request_id`` futures for
+        in-flight ``host.load_local_session`` requests. Resolved when
+        the host sends ``host.load_local_session_result``. Values
+        carry ``status``, ``session``, and ``error``. Same ``Any``
+        typing rationale as ``pending_stats``.
     """
 
     workspace_id: int
@@ -313,6 +324,12 @@ class HostConnection:
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_list_local_sessions: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_load_local_session: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 
