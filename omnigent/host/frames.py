@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.json_types import JsonObject as _JsonObject
@@ -73,6 +74,10 @@ class HostFrameKind(str, Enum):
     FS_RESULT = "host.fs_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    LIST_LOCAL_SESSIONS = "host.list_local_sessions"
+    LIST_LOCAL_SESSIONS_RESULT = "host.list_local_sessions_result"
+    LOAD_LOCAL_SESSION = "host.load_local_session"
+    LOAD_LOCAL_SESSION_RESULT = "host.load_local_session_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -849,6 +854,80 @@ class HostModelOptionsResultFrame:
     routable_models: list[str] = field(default_factory=list)
 
 
+@dataclass
+class HostListLocalSessionsFrame:
+    """Server → host: list recent local harness sessions to import.
+
+    Backs ``GET /v1/imports/local-sessions``, used by the Web UI's
+    import-chat picker. Read-only: the host parses transcripts under
+    the harness's own config directory and returns summaries.
+
+    :param request_id: Correlates the result, e.g. ``"req_ls_1"``.
+    :param source: Harness that owns the sessions — ``"claude"`` or
+        ``"codex"``.
+    :param limit: Maximum sessions to return, e.g. ``10``.
+    """
+
+    request_id: str
+    source: str
+    limit: int
+
+
+@dataclass
+class HostListLocalSessionsResultFrame:
+    """Host → server: outcome of a local-session listing.
+
+    :param request_id: Correlates to the
+        :class:`HostListLocalSessionsFrame`, e.g. ``"req_ls_1"``.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param sessions: One dict per session with keys ``source`` (str),
+        ``external_session_id`` (str), ``workspace`` (str | None),
+        ``title`` (str | None), ``item_count`` (int), and ``preview``
+        (list of ``{role, text}``), newest first. ``None`` on failure.
+    :param error: Error message when ``status`` is ``"failed"``.
+    """
+
+    request_id: str
+    status: str
+    sessions: list[dict[str, Any]] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostLoadLocalSessionFrame:
+    """Server → host: load one local transcript for import.
+
+    :param request_id: Correlates the result, e.g. ``"req_load_1"``.
+    :param source: Harness that owns the session — ``"claude"`` or
+        ``"codex"``.
+    :param external_session_id: Harness-native session id.
+    """
+
+    request_id: str
+    source: str
+    external_session_id: str
+
+
+@dataclass
+class HostLoadLocalSessionResultFrame:
+    """Host → server: outcome of a local transcript load.
+
+    :param request_id: Correlates to the
+        :class:`HostLoadLocalSessionFrame`, e.g. ``"req_load_1"``.
+    :param status: ``"ok"``, ``"not_found"``, or ``"failed"``.
+    :param session: The normalized transcript with keys ``source``,
+        ``external_session_id``, ``workspace`` (str | None), and
+        ``items`` (list of ``{type, response_id, data}``). ``None``
+        unless ``status`` is ``"ok"``.
+    :param error: Error message when ``status`` is not ``"ok"``.
+    """
+
+    request_id: str
+    status: str
+    session: dict[str, Any] | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostHarnessReadinessFrame
@@ -881,6 +960,10 @@ HostFrame = (
     | HostFsResultFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
+    | HostListLocalSessionsFrame
+    | HostListLocalSessionsResultFrame
+    | HostLoadLocalSessionFrame
+    | HostLoadLocalSessionResultFrame
 )
 
 
@@ -1233,6 +1316,44 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "routable_models": frame.routable_models,
             }
         )
+    if isinstance(frame, HostListLocalSessionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LIST_LOCAL_SESSIONS.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "limit": frame.limit,
+            }
+        )
+    if isinstance(frame, HostListLocalSessionsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LIST_LOCAL_SESSIONS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "sessions": frame.sessions,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostLoadLocalSessionFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LOAD_LOCAL_SESSION.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "external_session_id": frame.external_session_id,
+            }
+        )
+    if isinstance(frame, HostLoadLocalSessionResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LOAD_LOCAL_SESSION_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "session": frame.session,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -1355,6 +1476,14 @@ def _decode_known_host_frame(
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
+        case HostFrameKind.LIST_LOCAL_SESSIONS:
+            return _decode_list_local_sessions(msg)
+        case HostFrameKind.LIST_LOCAL_SESSIONS_RESULT:
+            return _decode_list_local_sessions_result(msg)
+        case HostFrameKind.LOAD_LOCAL_SESSION:
+            return _decode_load_local_session(msg)
+        case HostFrameKind.LOAD_LOCAL_SESSION_RESULT:
+            return _decode_load_local_session_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1870,6 +1999,76 @@ def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFram
         models=models,
         error=_optional_nullable_str(msg, "error"),
         routable_models=routable,
+    )
+
+
+def _decode_list_local_sessions(msg: _JsonObject) -> HostListLocalSessionsFrame:
+    """Decode a host.list_local_sessions request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.list_local_sessions frame.
+    """
+    return HostListLocalSessionsFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        limit=_required_int(msg, "limit"),
+    )
+
+
+def _decode_list_local_sessions_result(
+    msg: _JsonObject,
+) -> HostListLocalSessionsResultFrame:
+    """Decode a host.list_local_sessions_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.list_local_sessions_result frame.
+    :raises ValueError: When 'sessions' is not a list of objects.
+    """
+    raw = msg.get("sessions")
+    if raw is not None:
+        if not isinstance(raw, list):
+            raise ValueError("frame field must be a list or null: 'sessions'")
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ValueError("each entry in 'sessions' must be a JSON object")
+    return HostListLocalSessionsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        sessions=raw,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_load_local_session(msg: _JsonObject) -> HostLoadLocalSessionFrame:
+    """Decode a host.load_local_session request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.load_local_session frame.
+    """
+    return HostLoadLocalSessionFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        external_session_id=_required_str(msg, "external_session_id"),
+    )
+
+
+def _decode_load_local_session_result(
+    msg: _JsonObject,
+) -> HostLoadLocalSessionResultFrame:
+    """Decode a host.load_local_session_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.load_local_session_result frame.
+    :raises ValueError: When 'session' is present but not an object.
+    """
+    raw = msg.get("session")
+    if raw is not None and not isinstance(raw, dict):
+        raise ValueError("frame field must be a JSON object or null: 'session'")
+    return HostLoadLocalSessionResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        session=raw,
+        error=_optional_nullable_str(msg, "error"),
     )
 
 

@@ -25,8 +25,12 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListLocalSessionsFrame,
+    HostListLocalSessionsResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostLoadLocalSessionFrame,
+    HostLoadLocalSessionResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
@@ -1540,3 +1544,119 @@ def test_fs_result_null_payload_round_trip() -> None:
     assert isinstance(decoded, HostFsResultFrame)
     assert decoded.payload is None
     assert decoded.error_status == 500
+
+
+# ── host.list_local_sessions frames ─────────────────────
+
+
+def test_list_local_sessions_frame_round_trip() -> None:
+    """A browse request survives encode/decode."""
+    frame = HostListLocalSessionsFrame(request_id="req_ls_1", source="claude", limit=10)
+
+    decoded = decode_host_frame(encode_host_frame(frame))
+
+    assert decoded == frame
+
+
+def test_list_local_sessions_result_frame_round_trip() -> None:
+    """A successful browse result survives encode/decode."""
+    frame = HostListLocalSessionsResultFrame(
+        request_id="req_ls_1",
+        status="ok",
+        sessions=[
+            {
+                "source": "claude",
+                "external_session_id": "abc",
+                "workspace": "/repo",
+                "title": "inspect TODO.md",
+                "item_count": 4,
+                "preview": [{"role": "user", "text": "inspect TODO.md"}],
+            }
+        ],
+    )
+
+    decoded = decode_host_frame(encode_host_frame(frame))
+
+    assert decoded == frame
+
+
+def test_list_local_sessions_result_frame_failure_round_trip() -> None:
+    """A failed browse result carries the error and no sessions."""
+    frame = HostListLocalSessionsResultFrame(
+        request_id="req_ls_1", status="failed", error="no claude sessions"
+    )
+
+    decoded = decode_host_frame(encode_host_frame(frame))
+
+    assert decoded == frame
+    assert isinstance(decoded, HostListLocalSessionsResultFrame)
+    assert decoded.sessions is None
+
+
+def test_list_local_sessions_result_frame_rejects_non_list() -> None:
+    """A non-list 'sessions' field is rejected at decode time."""
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            '{"kind": "host.list_local_sessions_result", "request_id": "r", '
+            '"status": "ok", "sessions": {}}'
+        )
+
+
+# ── host.load_local_session frames ──────────────────────
+
+
+def test_load_local_session_frame_round_trip() -> None:
+    """A load request survives encode/decode."""
+    frame = HostLoadLocalSessionFrame(
+        request_id="req_load_1", source="codex", external_session_id="thread-1"
+    )
+
+    decoded = decode_host_frame(encode_host_frame(frame))
+
+    assert decoded == frame
+
+
+def test_load_local_session_result_frame_round_trip() -> None:
+    """A loaded transcript survives encode/decode."""
+    frame = HostLoadLocalSessionResultFrame(
+        request_id="req_load_1",
+        status="ok",
+        session={
+            "source": "codex",
+            "external_session_id": "thread-1",
+            "workspace": "/repo",
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "codex:1",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                }
+            ],
+        },
+    )
+
+    decoded = decode_host_frame(encode_host_frame(frame))
+
+    assert decoded == frame
+
+
+def test_load_local_session_result_frame_reports_not_found() -> None:
+    """A missing session round-trips as a not_found status."""
+    frame = HostLoadLocalSessionResultFrame(
+        request_id="req_load_1", status="not_found", error="session 'x' was not found"
+    )
+
+    decoded = decode_host_frame(encode_host_frame(frame))
+
+    assert decoded == frame
+    assert isinstance(decoded, HostLoadLocalSessionResultFrame)
+    assert decoded.session is None
+
+
+def test_load_local_session_result_frame_rejects_non_object_session() -> None:
+    """A non-object 'session' field is rejected at decode time."""
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            '{"kind": "host.load_local_session_result", "request_id": "r", '
+            '"status": "ok", "session": []}'
+        )
