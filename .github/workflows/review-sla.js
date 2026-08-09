@@ -11,14 +11,14 @@
 //     have elapsed AND they've posted no comment or review since, the SLA is
 //     breached: re-ping them in one comment and add ONE second reviewer (lowest
 //     open-review load among the area owners in .github/areas.json, mirrored as
-//     an assignee like auto-assign-reviewer.js does).
+//     an assignee for UI filtering).
 //   - Issues: the "assigned person" is any maintainer assignee; clock starts at
 //     their latest `assigned` event. Breach -> re-ping + add one second assignee
 //     from the owners of the area(s) whose comp:* label the issue carries.
 //
-// Ownership comes from .github/areas.json -- the single source of truth shared
-// with auto-assign-reviewer.js and issue-triage.yml (it replaced the old
-// .github/reviewers + .github/ISSUE_ASSIGNEES files). `owners_paused` is ignored.
+// Ownership comes from .github/areas.json, shared with issue-triage.yml. It
+// replaced the old .github/reviewers and .github/ISSUE_ASSIGNEES files.
+// `owners_paused` is ignored.
 //
 // "Working days" = weekdays (Mon-Fri) in UTC. Reply = ANY comment or review by the
 // assignee since the clock started.
@@ -117,7 +117,7 @@ function breachedTargets({ targets, clockStartByUser, openedAt, now, comments, r
   return out;
 }
 
-// Parse .github/areas.json (same shape auto-assign-reviewer.js reads) into:
+// Parse .github/areas.json into:
 //   rules       - [{ prefix, owners }] in document order (last match wins per file)
 //   pool        - Map lc->original of every owner (the full candidate set)
 //   labelOwners - Map "comp:x" -> Set of owners, for routing an issue by its label
@@ -140,8 +140,7 @@ function parseAreas(text) {
   return { rules, pool, labelOwners };
 }
 
-// Count currently-open review requests per (lc) login -- the stateless fairness
-// signal auto-assign-reviewer.js also uses.
+// Count currently-open review requests per lowercased login.
 function buildLoad(openPRs) {
   const load = new Map();
   for (const p of openPRs)
@@ -282,7 +281,7 @@ async function run({ github, context, core }) {
 
     await escalateOnce(pr.number, breached, "reviewer", async () => {
       await github.rest.pulls.requestReviewers({ owner, repo, pull_number: pr.number, reviewers: [second] });
-      // Mirror as assignee for UI filterability, matching auto-assign-reviewer.js.
+      // Mirror as assignee for UI filtering.
       await github.rest.issues.addAssignees({ owner, repo, issue_number: pr.number, assignees: [second] });
       bumpLoad(second);
       return true;

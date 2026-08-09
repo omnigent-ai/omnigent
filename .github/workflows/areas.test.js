@@ -1,6 +1,6 @@
-// Integrity checks for .github/areas.json -- the single source of truth for both
-// issue triage and PR reviewer assignment. Run offline: `node .github/workflows/areas.test.js`
-// (cwd = repo root). No network. Guards the invariants the two workflows rely on.
+// Integrity checks for .github/areas.json, shared by issue triage and reviewer
+// SLA escalation. Run from the repo root with
+// `node .github/workflows/areas.test.js`. No network.
 const fs = require("fs");
 const path = require("path");
 

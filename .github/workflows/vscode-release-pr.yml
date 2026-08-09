@@ -13,9 +13,8 @@
 #
 # This is a tools-less, one-shot "prompt in -> text out" call, so it hits the
 # Databricks gateway's OpenAI-compatible /chat/completions endpoint directly
-# with a stdlib urllib POST (same pattern as auto-assign-reviewer.yml) — no
-# Omnigent runtime, uv sync, or Claude Code CLI needed. The agent only ever
-# sees already-merged history.
+# with a stdlib urllib POST. It needs no Omnigent runtime, uv sync, or Claude
+# Code CLI. The agent only ever sees already-merged history.
 name: VS Code Extension Release PR
 
 on:
@@ -161,9 +160,9 @@ jobs:
 
       # --- LLM draft of the CHANGELOG bullets (degrades to the placeholder) ---
       # One-shot call to the gateway's OpenAI-compatible /chat/completions with a
-      # stdlib urllib POST (same pattern as auto-assign-reviewer.yml). Fail-open:
-      # any missing creds / API error / empty result leaves the placeholder, so
-      # the release PR is never blocked by the drafter.
+      # stdlib urllib POST. Fail-open: any missing creds, API error, or empty
+      # result leaves the placeholder, so the drafter never blocks the release
+      # PR.
       - name: Draft the CHANGELOG bullets
         if: steps.harvest.outputs.count != '0'
         working-directory: editors/vscode
