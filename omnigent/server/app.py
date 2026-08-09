@@ -1931,6 +1931,11 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            # Lets the web import picker browse and import the Claude /
+            # Codex transcripts that live on the user's own machine.
+            # Absent a host store the endpoints answer 503.
+            host_registry=host_registry,
+            host_store=host_store,
         ),
         prefix="/v1",
         tags=["imports"],

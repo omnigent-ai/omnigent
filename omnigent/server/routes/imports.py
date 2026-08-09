@@ -8,9 +8,9 @@ import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from omnigent.db.utils import builtin_agent_id
@@ -18,8 +18,16 @@ from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
+from omnigent.server.routes._host_session_import import (
+    LocalSessionHostUnavailableError,
+    LocalSessionNotFoundError,
+    LocalSessionProxyError,
+    list_local_sessions_on_host,
+    load_local_session_on_host,
+)
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -28,7 +36,16 @@ from omnigent.session_import import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
+
+# The web picker only browses the two harnesses whose transcripts the
+# host daemon can read; the CLI still imports the other sources by id.
+ImportBrowseSource = Literal["claude", "codex"]
+
+# The picker parses a full transcript per row, so a deep list is slow
+# for little benefit; the CLI still imports older chats by id.
+_MAX_RECENT_LOCAL_SESSIONS = 20
 
 
 class ImportItemInput(BaseModel):
@@ -75,6 +92,41 @@ class ImportSessionResponse(BaseModel):
     session_id: str
     status: Literal["imported"]
     item_count: int
+
+
+class LocalSessionPreviewOutput(BaseModel):
+    """One preview message shown when a picker row is expanded."""
+
+    role: str
+    text: str
+
+
+class LocalSessionSummaryOutput(BaseModel):
+    """One browsable local session, as returned to the import picker."""
+
+    source: ImportBrowseSource
+    external_session_id: str
+    workspace: str | None = None
+    title: str | None = None
+    item_count: int
+    preview: list[LocalSessionPreviewOutput] = Field(default_factory=list)
+
+
+class ImportLocalSessionRequest(BaseModel):
+    """Request body for importing one session read from a host."""
+
+    host_id: str = Field(min_length=1, max_length=128)
+    source: ImportBrowseSource
+    external_session_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("external_session_id")
+    @classmethod
+    def strip_external_session_id(cls, value: str) -> str:
+        """Reject a source session id that is only whitespace."""
+        value = value.strip()
+        if not value:
+            raise ValueError("external_session_id must not be blank")
+        return value
 
 
 @dataclass
@@ -250,8 +302,24 @@ def create_imports_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    host_registry: HostRegistry | None = None,
+    host_store: HostStore | None = None,
 ) -> APIRouter:
-    """Create the local-session import router."""
+    """Create the local-session import router.
+
+    :param conversation_store: Store imported sessions are created in.
+    :param agent_store: Store used to confirm the built-in agent exists.
+    :param auth_provider: Provider resolving the caller, or ``None``
+        when auth is disabled.
+    :param permission_store: Store granting the caller ownership, or
+        ``None`` when permissions are disabled.
+    :param host_registry: Per-replica live host connections; ``None``
+        on a server without host support, which makes the
+        browse/import-from-host endpoints answer 503.
+    :param host_store: Store of registered hosts; ``None`` on a server
+        without host support.
+    :returns: The router, to be mounted under ``/v1``.
+    """
     router = APIRouter()
 
     @router.post(
@@ -281,6 +349,149 @@ def create_imports_router(
             items=items,
             force=body.force,
         )
+        response.status_code = 201
+        return result
+
+    async def _resolve_online_host(
+        request: Request,
+        host_id: str,
+    ) -> tuple[str | None, HostRegistry, HostConnection]:
+        """Authorize the caller and return a live connection to their host.
+
+        Also returns the registry so callers get it already narrowed out
+        of the optional host-support configuration.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier from the caller.
+        :returns: ``(user_id, host_registry, host_connection)``.
+        :raises HTTPException: 503 when host support is unconfigured,
+            404 when the host is unknown, 403 when it is not the
+            caller's, 409 when it is offline.
+        """
+        if host_registry is None or host_store is None:
+            raise HTTPException(
+                status_code=503, detail="host support is not configured on this server"
+            )
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+        return user_id, host_registry, conn
+
+    @router.get("/imports/local-sessions")
+    async def list_local_sessions(
+        request: Request,
+        host_id: Annotated[str, Query()],
+        source: Annotated[ImportBrowseSource, Query()],
+        limit: Annotated[int, Query(ge=1, le=_MAX_RECENT_LOCAL_SESSIONS)] = 10,
+    ) -> dict[str, Any]:
+        """
+        List recent Claude Code or Codex sessions on a host.
+
+        Backs the New Session import picker, which shows each session's
+        title, workspace, item count, and expandable context. Titles use
+        the same synthesis the import itself applies, so a browsed row
+        and the session it creates read the same.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host to browse, e.g. ``"host_a1b2c3d4..."``.
+        :param source: ``"claude"`` or ``"codex"``.
+        :param limit: Maximum sessions to return (1-20).
+        :returns: ``{"object": "list", "data": [...]}`` newest first.
+        :raises HTTPException: 400 when the host reports a failure, 403
+            when the host is not the caller's, 404 when the host is
+            unknown, 409 when it is offline, 503 when the server has no
+            host support.
+        """
+        _user_id, registry, conn = await _resolve_online_host(request, host_id)
+        try:
+            sessions = await list_local_sessions_on_host(
+                host_registry=registry,
+                host_conn=conn,
+                source=source,
+                limit=limit,
+            )
+        # The unavailable subclass must precede its base or a dropped
+        # tunnel would read as bad user input.
+        except LocalSessionHostUnavailableError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except LocalSessionProxyError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        return {
+            "object": "list",
+            "data": [LocalSessionSummaryOutput(**entry).model_dump() for entry in sessions],
+        }
+
+    @router.post(
+        "/imports/local-sessions",
+        response_model=ImportSessionResponse,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def import_local_session(
+        body: ImportLocalSessionRequest,
+        request: Request,
+        response: Response,
+    ) -> ImportSessionResponse:
+        """
+        Import one Claude Code or Codex session read from a host.
+
+        The host loads and normalizes the transcript; the session is
+        then created through the same path the CLI's ``POST /v1/imports``
+        uses, so provenance labels and duplicate handling match.
+
+        :param body: Host, source, and harness-native session id.
+        :param request: FastAPI request (for auth).
+        :param response: Response, set to 201 on success.
+        :returns: The created session id and item count.
+        :raises HTTPException: 400 when the host reports a failure, 403
+            when the host is not the caller's, 404 when the host or the
+            session is unknown, 409 when the host is offline, 503 when
+            the server has no host support.
+        :raises OmnigentError: ``INVALID_INPUT`` when the host found no
+            importable history, plus whatever
+            :func:`_create_imported_session` raises.
+        """
+        user_id, registry, conn = await _resolve_online_host(request, body.host_id)
+        try:
+            payload = await load_local_session_on_host(
+                host_registry=registry,
+                host_conn=conn,
+                source=body.source,
+                external_session_id=body.external_session_id,
+            )
+        # Both specific errors subclass LocalSessionProxyError, so they
+        # must be caught before it or every 404/409 becomes a 400.
+        except LocalSessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=exc.message) from exc
+        except LocalSessionHostUnavailableError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except LocalSessionProxyError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise OmnigentError(
+                "The host returned no importable history for this session",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        items = [ImportItemInput(**entry).to_item() for entry in raw_items]
+        workspace = payload.get("workspace")
+        async with _source_import_lock(body.source, body.external_session_id):
+            result = await _create_imported_session(
+                conversation_store=conversation_store,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                user_id=user_id,
+                source=body.source,
+                external_session_id=body.external_session_id,
+                workspace=workspace if isinstance(workspace, str) else None,
+                items=items,
+            )
         response.status_code = 201
         return result
 

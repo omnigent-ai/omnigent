@@ -1784,6 +1784,38 @@
         "title": "ImportItemInput",
         "type": "object"
       },
+      "ImportLocalSessionRequest": {
+        "description": "Request body for importing one session read from a host.",
+        "properties": {
+          "external_session_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "External Session Id",
+            "type": "string"
+          },
+          "host_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Host Id",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id",
+          "source",
+          "external_session_id"
+        ],
+        "title": "ImportLocalSessionRequest",
+        "type": "object"
+      },
       "ImportSessionRequest": {
         "description": "Request body for importing one local harness session.",
         "properties": {
@@ -7890,6 +7922,119 @@
           }
         },
         "summary": "Import Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local-sessions": {
+      "get": {
+        "description": "List recent Claude Code or Codex sessions on a host.\n\nBacks the New Session import picker, which shows each session's\ntitle, workspace, item count, and expandable context. Titles use\nthe same synthesis the import itself applies, so a browsed row\nand the session it creates read the same.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}` newest first.\n\n**Raises**\n\n- `HTTPException` \u2014 400 when the host reports a failure, 403 when the host is not the caller's, 404 when the host is unknown, 409 when it is offline, 503 when the server has no host support.",
+        "operationId": "list_local_sessions_v1_imports_local_sessions_get",
+        "parameters": [
+          {
+            "description": "Host to browse, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "query",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "`\"claude\"` or `\"codex\"`.",
+            "in": "query",
+            "name": "source",
+            "required": true,
+            "schema": {
+              "enum": [
+                "claude",
+                "codex"
+              ],
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum sessions to return (1-20).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Local Sessions V1 Imports Local Sessions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Local Sessions",
+        "tags": [
+          "imports"
+        ]
+      },
+      "post": {
+        "description": "Import one Claude Code or Codex session read from a host.\n\nThe host loads and normalizes the transcript; the session is\nthen created through the same path the CLI's `POST /v1/imports`\nuses, so provenance labels and duplicate handling match.\n\n**Parameters**\n\n- `body` \u2014 Host, source, and harness-native session id.\n\n**Returns:** The created session id and item count.\n\n**Raises**\n\n- `HTTPException` \u2014 400 when the host reports a failure, 403 when the host is not the caller's, 404 when the host or the session is unknown, 409 when the host is offline, 503 when the server has no host support.\n- `OmnigentError` \u2014 `INVALID_INPUT` when the host found no importable history, plus whatever `_create_imported_session` raises.",
+        "operationId": "import_local_session_v1_imports_local_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportLocalSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportSessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Local Session",
         "tags": [
           "imports"
         ]
