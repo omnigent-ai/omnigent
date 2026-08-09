@@ -29,7 +29,9 @@ from omnigent.opencode_native_forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
+    LocalSessionSummary,
     SessionImportNotFoundError,
+    summarize_local_session,
 )
 
 _PI_IMPORT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
@@ -258,6 +260,37 @@ def list_recent_local_session_ids(
         return _recent_unique_session_ids(candidates, limit=limit)
 
     raise ValueError(f"Unsupported import source: {source}")
+
+
+def list_recent_local_sessions(
+    source: ImportSource,
+    *,
+    limit: int,
+    preview_limit: int = 6,
+) -> tuple[LocalSessionSummary, ...]:
+    """Summarize the most recent local sessions for one harness.
+
+    Each candidate is loaded through :func:`load_local_session` — the
+    same path the import itself takes — so the browsed title, workspace,
+    and item count match what importing would produce. A transcript that
+    fails to load is skipped rather than failing the whole listing.
+
+    :param source: Harness that owns the sessions, e.g. ``"claude"``.
+    :param limit: Maximum sessions to return.
+    :param preview_limit: Maximum preview messages per session.
+    :returns: Summaries ordered newest transcript first.
+    :raises SessionImportNotFoundError: When the harness's session
+        directory cannot be enumerated at all.
+    :raises ValueError: When ``source`` is not a supported harness.
+    """
+    summaries: list[LocalSessionSummary] = []
+    for session_id in list_recent_local_session_ids(source, limit=limit):
+        try:
+            imported = load_local_session(source, session_id)
+        except (SessionImportNotFoundError, OSError, TypeError, ValueError):
+            continue
+        summaries.append(summarize_local_session(imported, preview_limit=preview_limit))
+    return tuple(summaries)
 
 
 def _claude_workspace(transcript_path: Path) -> str | None:
@@ -1218,6 +1251,7 @@ def load_local_session(source: ImportSource, session_id: str) -> LocalSessionImp
 
 __all__ = [
     "list_recent_local_session_ids",
+    "list_recent_local_sessions",
     "load_claude_session",
     "load_codex_session",
     "load_kimi_session",

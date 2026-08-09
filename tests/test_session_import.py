@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.kimi_native_forwarder import KimiWireItem, read_kimi_wire_items
 from omnigent.kiro_native_session_forwarder import (
     KiroConversationMessage,
@@ -16,6 +17,7 @@ from omnigent.kiro_native_session_forwarder import (
 from omnigent.session_import import local as local_import
 from omnigent.session_import.local import (
     list_recent_local_session_ids,
+    list_recent_local_sessions,
     load_claude_session,
     load_codex_session,
     load_kimi_session,
@@ -1242,3 +1244,138 @@ def test_list_recent_kimi_sessions_uses_wire_recency(tmp_path: Path, monkeypatch
     recent = list_recent_local_session_ids("kimi", limit=10)
 
     assert recent == ("session_new", "session_old")
+
+
+def test_summarize_local_session_uses_shared_title_rules() -> None:
+    """A summary's title matches the import's own title synthesis."""
+    from omnigent.session_import.models import LocalSessionImport, summarize_local_session
+
+    imported = LocalSessionImport(
+        source="claude",
+        external_session_id="session-a",
+        workspace="/repo",
+        items=(
+            NewConversationItem(
+                type="message",
+                response_id="claude:1",
+                data=parse_item_data(
+                    "message",
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                    },
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="claude:1",
+                data=parse_item_data(
+                    "message",
+                    {
+                        "role": "assistant",
+                        "agent": "claude-native-ui",
+                        "content": [{"type": "output_text", "text": "Done."}],
+                    },
+                ),
+            ),
+        ),
+    )
+
+    summary = summarize_local_session(imported)
+
+    assert summary.title == imported.title
+    assert summary.source == "claude"
+    assert summary.external_session_id == "session-a"
+    assert summary.workspace == "/repo"
+    assert summary.item_count == 2
+    assert [(entry.role, entry.text) for entry in summary.preview] == [
+        ("user", "inspect TODO.md"),
+        ("assistant", "Done."),
+    ]
+
+
+def test_summarize_local_session_bounds_preview_length_and_count() -> None:
+    """Preview keeps the first N messages and truncates long text."""
+    from omnigent.session_import.models import LocalSessionImport, summarize_local_session
+
+    items = tuple(
+        NewConversationItem(
+            type="message",
+            response_id=f"claude:{index}",
+            data=parse_item_data(
+                "message",
+                {"role": "user", "content": [{"type": "input_text", "text": "x" * 500}]},
+            ),
+        )
+        for index in range(10)
+    )
+    imported = LocalSessionImport(
+        source="claude", external_session_id="s", workspace=None, items=items
+    )
+
+    summary = summarize_local_session(imported, preview_limit=3)
+
+    assert summary.item_count == 10
+    assert len(summary.preview) == 3
+    assert len(summary.preview[0].text) == 240
+    assert summary.preview[0].text.endswith("…")
+
+
+def test_list_recent_local_sessions_summarizes_newest_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recent Claude sessions come back newest first with real item counts."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    projects = tmp_path / "projects" / "repo"
+    projects.mkdir(parents=True)
+    for index, name in enumerate(("older", "newer")):
+        transcript = projects / f"{name}.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": f"{name}-1",
+                    "cwd": "/repo",
+                    "message": {"role": "user", "content": f"question {name}"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.utime(transcript, (1_000 + index, 1_000 + index))
+
+    summaries = list_recent_local_sessions("claude", limit=5)
+
+    assert [summary.external_session_id for summary in summaries] == ["newer", "older"]
+    assert summaries[0].title == "question newer"
+    assert summaries[0].workspace == "/repo"
+    assert summaries[0].item_count >= 1
+
+
+def test_list_recent_local_sessions_skips_unreadable_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One corrupt transcript does not break the whole listing."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    projects = tmp_path / "projects" / "repo"
+    projects.mkdir(parents=True)
+    good = projects / "good.jsonl"
+    good.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "good-1",
+                "cwd": "/repo",
+                "message": {"role": "user", "content": "hello"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (projects / "empty.jsonl").write_text("", encoding="utf-8")
+
+    summaries = list_recent_local_sessions("claude", limit=5)
+
+    assert [summary.external_session_id for summary in summaries] == ["good"]
