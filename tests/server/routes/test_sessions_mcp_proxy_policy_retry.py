@@ -21,6 +21,7 @@ import pytest
 from omnigent.entities.conversation import Conversation
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.server.routes import sessions as sessions_mod
+from omnigent.server.routes._sessions import orchestration as orchestration_mod
 from omnigent.server.routes.sessions import (
     _handle_mcp_tools_call,
     _pending_policy_ask_writes,
@@ -630,3 +631,61 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     assert captured[0].actor == {"run_as": "alice@example.com"}, (
         f"expected actor from runner body, got: {captured[0].actor!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_proxy_forwards_valid_traceparent_to_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AP proxy preserves the originating tool span context."""
+    engine = _CapturingPolicyEngine(captured=[])
+    traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    captured_posts: list[dict[str, Any]] = []
+
+    class _RunnerResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"result": {"output": "ok"}}
+
+    class _RunnerClient:
+        async def post(
+            self, path: str, *, json: dict[str, Any], timeout: float
+        ) -> _RunnerResponse:
+            del path, timeout
+            captured_posts.append(json)
+            return _RunnerResponse()
+
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        lambda spec, session_id, conversation_store: engine,
+    )
+
+    async def _runner_client(session_id: str, runner_router: object) -> _RunnerClient:
+        del session_id, runner_router
+        return _RunnerClient()
+
+    monkeypatch.setattr(orchestration_mod, "_get_runner_client", _runner_client)
+
+    response = await _handle_mcp_tools_call(
+        rpc_id=1,
+        session_id=_SESSION_ID,
+        params={
+            "name": "oracle__ask",
+            "arguments": {"question": "why"},
+            "_meta": {"traceparent": traceparent},
+        },
+        conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=object(),  # type: ignore[arg-type]
+    )
+
+    assert json.loads(bytes(response.body))["result"]["content"][0]["text"] == "ok"
+    assert captured_posts[0]["params"]["_meta"] == {"traceparent": traceparent}

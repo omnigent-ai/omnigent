@@ -350,6 +350,32 @@ async def test_call_tool_raises_without_connect() -> None:
         await conn.call_tool("test_tool", {"query": "hi"})
 
 
+@pytest.mark.asyncio()
+async def test_invoke_tool_forwards_request_metadata() -> None:
+    """MCP request metadata reaches the SDK's ``tools/call`` request."""
+    conn = McpServerConnection(config=_make_http_config())
+    session = AsyncMock()
+    session.call_tool.return_value = CallToolResult(
+        content=[TextContent(type="text", text="ok")],
+        isError=False,
+    )
+    conn._session = session
+    traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
+    result = await conn._invoke_tool(
+        "test_tool",
+        {"query": "hi"},
+        meta={"traceparent": traceparent},
+    )
+
+    assert result == "ok"
+    session.call_tool.assert_awaited_once_with(
+        name="test_tool",
+        arguments={"query": "hi"},
+        meta={"traceparent": traceparent},
+    )
+
+
 # ── McpServerConnection.close ────────────────────────────
 
 

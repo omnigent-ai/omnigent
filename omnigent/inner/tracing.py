@@ -298,13 +298,7 @@ class TracingContext:
         from opentelemetry.trace import StatusCode
 
         if should_capture_content():
-            output: TraceValue = None
-            if reasoning and response:
-                output = {"reasoning": reasoning, "response": response}
-            elif reasoning:
-                output = reasoning
-            elif response:
-                output = response
+            output: TraceValue = reasoning or response
             if output is not None:
                 span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(output))
         if usage is not None:

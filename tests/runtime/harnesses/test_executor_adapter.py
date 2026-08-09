@@ -1359,6 +1359,43 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stable_tool_executor_forwards_tool_traceparent() -> None:
+    """The action_required event inherits the active tool span context."""
+    from collections import deque
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    expected = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    adapter._pending_tool_traceparents["oracle__ask"] = deque([expected])
+    captured: list[str | None] = []
+
+    class _CapturingCtx:
+        response_id = "resp_capturing"
+
+        async def dispatch_tool(
+            self,
+            *,
+            call_id: str,
+            name: str,
+            arguments: str,
+            agent: str,
+            traceparent: str | None = None,
+        ) -> str:
+            del call_id, name, arguments, agent
+            captured.append(traceparent)
+            return "{}"
+
+    adapter._current_ctx = _CapturingCtx()  # type: ignore[assignment]
+    adapter._current_agent = "watchdog"
+
+    await adapter._stable_tool_executor("oracle__ask", {"question": "why"})
+
+    assert captured == [expected]
+    assert "oracle__ask" not in adapter._pending_tool_traceparents
+
+
+@pytest.mark.asyncio
 async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> None:
     """
     End-to-end round-trip: for an openai-agents-style ToolCallRequest

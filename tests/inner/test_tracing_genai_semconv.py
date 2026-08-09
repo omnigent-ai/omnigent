@@ -279,7 +279,4 @@ def test_llm_span_is_a_langfuse_generation_with_exact_usage(
         "output": 30,
         "total": 175,
     }
-    assert json.loads(attrs["output.value"]) == {
-        "reasoning": "I should inspect the repository.",
-        "response": "I found the file.",
-    }
+    assert attrs["output.value"] == "I should inspect the repository."

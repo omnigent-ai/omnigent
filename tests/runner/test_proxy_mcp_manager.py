@@ -364,6 +364,32 @@ async def test_call_tool_happy_path_returns_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_call_tool_forwards_traceparent_as_mcp_metadata() -> None:
+    """Tool span context crosses the runner-to-server MCP proxy."""
+    rpc_resp = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": "ok"}], "isError": False},
+        }
+    )
+    transport = _StubTransport([rpc_resp])
+    manager = _make_manager(transport)
+    traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
+    await manager.call_tool(
+        _make_spec("oracle"),
+        "oracle__ask",
+        {"question": "why"},
+        traceparent=traceparent,
+    )
+
+    assert transport.calls[0].body["params"]["_meta"] == {
+        "traceparent": traceparent,
+    }
+
+
+@pytest.mark.asyncio
 async def test_call_tool_is_error_returns_json_error_string() -> None:
     """``isError=True`` in result must be returned as a JSON error string, not raised.
 

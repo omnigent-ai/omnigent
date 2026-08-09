@@ -587,6 +587,23 @@ def test_tracing_context_stamps_session_id_on_agent_span(
     assert agent_spans[-1].attributes.get("session.id") == "d1f9214d74c38b9f9a9db17ed8352dc4"
 
 
+def test_traceparent_helpers_round_trip_span_context(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """A tool span serializes to one validated W3C traceparent."""
+    tracer = otel_trace.get_tracer("test")
+    span = tracer.start_span("tool")
+    try:
+        traceparent = telemetry.traceparent_for_span(span)
+        assert traceparent is not None
+        assert telemetry.normalize_traceparent(traceparent.upper()) == traceparent
+        assert traceparent.split("-")[1] == f"{span.get_span_context().trace_id:032x}"
+        assert traceparent.split("-")[2] == f"{span.get_span_context().span_id:016x}"
+        assert telemetry.normalize_traceparent("not-a-traceparent") is None
+    finally:
+        span.end()
+
+
 def test_set_session_id_stamps_current_span(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:

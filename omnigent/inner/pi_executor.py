@@ -2485,10 +2485,15 @@ class PiExecutor(Executor):
                 continue
 
             if event_type == "message_start":
-                saw_message_end = False
-                yield LLMCallStarted(
-                    model=_pi_message_model(event.get("message"), model),
-                )
+                message_started = event.get("message")
+                if (
+                    isinstance(message_started, dict)
+                    and message_started.get("role") == "assistant"
+                ):
+                    saw_message_end = False
+                    yield LLMCallStarted(
+                        model=_pi_message_model(message_started, model),
+                    )
                 continue
 
             # Streaming text and thinking deltas.

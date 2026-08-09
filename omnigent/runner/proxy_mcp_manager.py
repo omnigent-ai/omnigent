@@ -223,6 +223,8 @@ class ProxyMcpManager:
         spec: AgentSpec | None,
         tool_name: str,
         arguments: _JsonObject,
+        *,
+        traceparent: str | None = None,
     ) -> str:
         """Dispatch a tool call via the Omnigent server MCP proxy (``tools/call``).
 
@@ -241,6 +243,7 @@ class ProxyMcpManager:
         :param tool_name: Tool name as seen by the LLM, e.g.
             ``"github__search"`` or ``"sys_os_read"``.
         :param arguments: Decoded tool arguments dict.
+        :param traceparent: W3C context for the originating tool span.
         :returns: Tool output string.  On denial the Omnigent server returns an
             MCP error response which is converted here to a JSON error string
             so the harness can feed it to the LLM as a tool result.
@@ -248,11 +251,14 @@ class ProxyMcpManager:
         """
         del spec  # Omnigent server resolves spec from session context
 
+        params: _JsonObject = {"name": tool_name, "arguments": arguments}
+        if traceparent is not None:
+            params["_meta"] = {"traceparent": traceparent}
         payload: _JsonObject = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
+            "params": params,
         }
 
         # At most two iterations: initial call + one approval retry.

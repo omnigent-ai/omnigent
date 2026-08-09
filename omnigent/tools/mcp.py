@@ -487,6 +487,7 @@ class McpServerConnection:
         # own ClientSession.call_tool() signature.
         arguments: dict[str, Any],
         session_id: str | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> str:
         """
         Invoke a tool on this MCP server.
@@ -504,6 +505,7 @@ class McpServerConnection:
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Forwarded to ``_invoke_tool`` for inline elicitation
             context. ``None`` when no session is available.
+        :param meta: MCP request metadata forwarded as ``params._meta``.
         :returns: The tool result as a string. For multi-content
             results, text blocks are joined with newlines.
         :raises RuntimeError: If ``connect()`` has not been called.
@@ -524,6 +526,7 @@ class McpServerConnection:
                 arguments=arguments,
                 retry=retry,
                 session_id=session_id,
+                meta=meta,
             )
         except Exception:
             self._breaker.record_failure(self.config.name)
@@ -536,6 +539,7 @@ class McpServerConnection:
         name: str,
         arguments: dict[str, Any],  # JSON values — see call_tool
         session_id: str | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> str:
         """
         Send a single ``tools/call`` request to the MCP session.
@@ -556,6 +560,7 @@ class McpServerConnection:
         :param arguments: The tool arguments dict.
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Set on the connection for the inline elicitation handler.
+        :param meta: MCP request metadata forwarded as ``params._meta``.
         :returns: The formatted tool result string.
         :raises McpElicitationRequired: When the MCP server returns
             an ``InputRequiredResult`` requiring user input before
@@ -566,7 +571,17 @@ class McpServerConnection:
         async with self._call_lock:
             self._active_session_id = session_id
             try:
-                result = await self._session.call_tool(name=name, arguments=arguments)
+                if meta is None:
+                    result = await self._session.call_tool(
+                        name=name,
+                        arguments=arguments,
+                    )
+                else:
+                    result = await self._session.call_tool(
+                        name=name,
+                        arguments=arguments,
+                        meta=meta,
+                    )
             finally:
                 self._active_session_id = None
 
@@ -589,6 +604,7 @@ class McpServerConnection:
         input_responses: dict[str, Any] | None = None,
         request_state: str | None = None,
         session_id: str | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> str:
         """
         Retry a ``tools/call`` with MRTR ``inputResponses``.
@@ -606,6 +622,7 @@ class McpServerConnection:
             "content": {"decision": "allow"}}}``.
         :param request_state: The opaque ``requestState`` from the
             ``InputRequiredResult``. Echoed back verbatim.
+        :param meta: MCP request metadata forwarded as ``params._meta``.
         :returns: The formatted tool result string.
         :raises RuntimeError: If ``connect()`` has not been called.
         """
@@ -620,6 +637,8 @@ class McpServerConnection:
             retry_params["inputResponses"] = input_responses
         if request_state:
             retry_params["requestState"] = request_state
+        if meta is not None:
+            retry_params["_meta"] = meta
 
         async with self._call_lock:
             self._active_session_id = session_id
@@ -1275,6 +1294,7 @@ async def _call_tool_with_reconnect(
     arguments: dict[str, Any],  # JSON values — see call_tool
     retry: RetryPolicy,
     session_id: str | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> str:
     """
     Invoke a tool, reconnecting with backoff on connection errors.
@@ -1291,6 +1311,7 @@ async def _call_tool_with_reconnect(
         base, and backoff cap.
     :param session_id: Omnigent session id forwarded to
         ``_invoke_tool`` for inline elicitation context.
+    :param meta: MCP request metadata forwarded as ``params._meta``.
     :returns: The formatted tool result string.
     """
     last_exc: Exception | None = None
@@ -1298,7 +1319,12 @@ async def _call_tool_with_reconnect(
 
     for attempt in range(total_tries):
         try:
-            return await conn._invoke_tool(name, arguments, session_id=session_id)
+            return await conn._invoke_tool(
+                name,
+                arguments,
+                session_id=session_id,
+                meta=meta,
+            )
         except Exception as exc:
             if not _is_connection_error(exc):
                 raise

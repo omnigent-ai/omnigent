@@ -269,6 +269,7 @@ class ExecutorAdapter(HarnessApp):
         # suppress-observed mitigation that introduced the
         # end-of-turn ordering regression this queue resolves.
         self._pending_mcp_call_ids: deque[str] = deque()
+        self._pending_tool_traceparents: dict[str, deque[str]] = {}
         # Per-session tracing context. Created lazily on the first
         # turn when tracing is enabled; reused across turns so the
         # span parent chain stays rooted on the session's executor.
@@ -385,6 +386,7 @@ class ExecutorAdapter(HarnessApp):
         # previous turn. Clearing makes each turn's correlation
         # window self-contained.
         self._pending_mcp_call_ids.clear()
+        self._pending_tool_traceparents.clear()
         # A fresh turn binding clears the orphan-callback watchdog: whatever
         # stragglers fired before this turn started are now moot, and the
         # tier-1 reset condition is "N orphans with NO intervening clean
@@ -584,6 +586,15 @@ class ExecutorAdapter(HarnessApp):
                                 _strip_mcp_tool_prefix(event.name),
                                 event.args or {},
                             )
+                            from omnigent.runtime.telemetry import traceparent_for_span
+
+                            tool_traceparent = traceparent_for_span(_active_tool_span)
+                            if tool_traceparent is not None:
+                                bare_name = _strip_mcp_tool_prefix(event.name)
+                                self._pending_tool_traceparents.setdefault(
+                                    bare_name,
+                                    deque(),
+                                ).append(tool_traceparent)
                         elif isinstance(event, ToolCallComplete):
                             _end_tool_trace(
                                 result=event.result,
@@ -1095,12 +1106,18 @@ class ExecutorAdapter(HarnessApp):
         # completions (not in this set) through as the sole output source.
         dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
         self._dispatched_call_ids.add(dispatch_call_id)
+        trace_key = _strip_mcp_tool_prefix(tool_name)
+        traceparents = self._pending_tool_traceparents.get(trace_key)
+        traceparent = traceparents.popleft() if traceparents else None
+        if traceparents is not None and not traceparents:
+            self._pending_tool_traceparents.pop(trace_key, None)
         return await _bridge_one_dispatch(
             ctx,
             agent,
             tool_name,
             args,
             call_id=dispatch_call_id,
+            traceparent=traceparent,
         )
 
     async def _stable_elicitation_handler(
@@ -1854,6 +1871,7 @@ async def _bridge_one_dispatch(
     args: dict[str, Any],
     *,
     call_id: str | None = None,
+    traceparent: str | None = None,
 ) -> dict[str, Any]:
     """
     Round-trip one tool call through ``ctx.dispatch_tool``.
@@ -1878,6 +1896,7 @@ async def _bridge_one_dispatch(
         freshly-allocated uuid — the dispatch still works but the
         observed and action_required events render as separate
         ``⏵ tool_name`` lines.
+    :param traceparent: W3C context for the active tool span.
     :returns: A dict suitable as the MCP tool result.
     """
     import json
@@ -1885,12 +1904,21 @@ async def _bridge_one_dispatch(
     if call_id is None:
         call_id = f"call_{uuid.uuid4().hex[:12]}"
     try:
-        output = await ctx.dispatch_tool(
-            call_id=call_id,
-            name=tool_name,
-            arguments=json.dumps(args),
-            agent=agent,
-        )
+        if traceparent is None:
+            output = await ctx.dispatch_tool(
+                call_id=call_id,
+                name=tool_name,
+                arguments=json.dumps(args),
+                agent=agent,
+            )
+        else:
+            output = await ctx.dispatch_tool(
+                call_id=call_id,
+                name=tool_name,
+                arguments=json.dumps(args),
+                agent=agent,
+                traceparent=traceparent,
+            )
     except Exception as exc:
         _logger.exception("dispatch_tool failed for %s", tool_name)
         return {"error": str(exc)}

@@ -398,6 +398,7 @@ class RunnerMcpManager:
         tool_name: str,
         arguments: _JsonObject,
         session_id: str | None = None,
+        traceparent: str | None = None,
     ) -> str:
         """
         Dispatch *tool_name* against the pool's cached MCP session.
@@ -409,6 +410,7 @@ class RunnerMcpManager:
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Forwarded to the connection for inline elicitation
             context. ``None`` when no session is available.
+        :param traceparent: W3C context for the originating tool span.
         :returns: Tool result string.
         :raises McpElicitationRequired: When the MCP server returns
             an ``InputRequiredResult`` requiring user input before
@@ -467,6 +469,7 @@ class RunnerMcpManager:
                 bare_name,
                 arguments,
                 session_id=session_id,
+                meta={"traceparent": traceparent} if traceparent is not None else None,
             )
         finally:
             if server_to_release is not None:

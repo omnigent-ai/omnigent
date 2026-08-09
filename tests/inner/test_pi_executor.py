@@ -4237,6 +4237,42 @@ def test_pi_emits_model_call_boundaries_with_per_call_usage() -> None:
     _run(_test())
 
 
+def test_pi_ignores_non_assistant_message_start() -> None:
+    """User and tool-result messages do not create empty model-call spans."""
+
+    async def _test() -> None:
+        assistant = _pi_assistant_message_with_usage(text="Done.")
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_start",
+                        "message": {"role": "user", "content": "inspect"},
+                    }
+                ),
+                json.dumps({"type": "message_start", "message": assistant}),
+                json.dumps({"type": "message_end", "message": assistant}),
+                json.dumps({"type": "agent_end", "messages": [assistant]}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "inspect"}],
+                [],
+                "system",
+            )
+        ]
+
+        starts = [event for event in events if isinstance(event, LLMCallStarted)]
+        assert len(starts) == 1
+        assert starts[0].model == "claude-sonnet-4-6"
+
+    _run(_test())
+
+
 def test_pi_usage_fallback_from_agent_end() -> None:
     """
     When no ``message_end`` carried usage, the ``agent_end`` handler falls

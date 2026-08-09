@@ -50,6 +50,9 @@ _logger = logging.getLogger(__name__)
 
 _RESP_PREFIX = "resp_"
 _HEX_LEN = 32
+_TRACEPARENT_RE = re.compile(
+    r"^00-(?P<trace_id>[0-9a-f]{32})-(?P<span_id>[0-9a-f]{16})-(?P<flags>[0-9a-f]{2})$"
+)
 # Sentinel span ID used in trace_context_for_response. start_agent_span
 # detects this value and strips the parent so the agent span is exported
 # as a true root span (parent_span_id absent in OTLP proto).
@@ -59,6 +62,26 @@ _capture_content: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
 _logs_initialized: bool = False
+
+
+def normalize_traceparent(value: object) -> str | None:
+    """Return a canonical W3C traceparent, or ``None`` when invalid."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if _TRACEPARENT_RE.fullmatch(normalized) else None
+
+
+def traceparent_for_span(span: Span | None) -> str | None:
+    """Serialize a recording span's context as a W3C traceparent."""
+    if span is None:
+        return None
+    context = span.get_span_context()
+    if context is None or not context.is_valid:
+        return None
+    flags = int(context.trace_flags) & 0xFF
+    return f"00-{context.trace_id:032x}-{context.span_id:016x}-{flags:02x}"
+
 
 # Session (conversation) id for the current execution context. Set once at a
 # session boundary (request hook, executor turn, forwarder task); the

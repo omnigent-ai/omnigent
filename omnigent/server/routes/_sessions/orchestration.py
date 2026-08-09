@@ -6249,6 +6249,13 @@ async def _handle_mcp_tools_call(
     arguments: dict[str, Any] = params.get("arguments") or {}
     request_state_str: str | None = params.get("requestState")
     input_responses: dict[str, Any] = params.get("inputResponses") or {}
+    from omnigent.runtime.telemetry import normalize_traceparent
+
+    raw_meta = params.get("_meta")
+    traceparent = normalize_traceparent(
+        raw_meta.get("traceparent") if isinstance(raw_meta, dict) else None
+    )
+    request_meta = {"traceparent": traceparent} if traceparent is not None else None
     is_retry = request_state_str is not None
 
     _logger.debug(
@@ -6478,7 +6485,11 @@ async def _handle_mcp_tools_call(
             f"/v1/sessions/{session_id}/mcp/execute",
             json={
                 "method": "tools/call",
-                "params": {"name": namespaced_name, "arguments": arguments},
+                "params": {
+                    "name": namespaced_name,
+                    "arguments": arguments,
+                    **({"_meta": request_meta} if request_meta is not None else {}),
+                },
             },
             # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
@@ -6548,6 +6559,7 @@ async def _handle_mcp_tools_call(
                         "arguments": arguments,
                         "inputResponses": elicitation_responses,
                         "requestState": mcp_request_state,
+                        **({"_meta": request_meta} if request_meta is not None else {}),
                     },
                 },
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,

@@ -657,6 +657,13 @@ def get_arguments(event: _JsonObject) -> str:
     return arguments if isinstance(arguments, str) else "{}"
 
 
+def get_traceparent(event: _JsonObject) -> str | None:
+    """Extract a validated W3C traceparent from an action_required event."""
+    from omnigent.runtime.telemetry import normalize_traceparent
+
+    return normalize_traceparent(_event_item(event).get("traceparent"))
+
+
 def should_dispatch_locally(tool_name: str) -> bool:
     """Return True if this tool should be dispatched by the runner locally.
 
@@ -4762,6 +4769,7 @@ async def execute_tool(
     harness_client: httpx.AsyncClient | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    traceparent: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -4785,6 +4793,7 @@ async def execute_tool(
         so that ``sys_os_write`` and ``sys_os_edit`` calls record changed
         paths for the ``GET …/changes`` endpoint. ``sys_os_shell`` is
         not tracked — shell side-effects cannot be attributed to a session.
+    :param traceparent: W3C context for the originating tool span.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -4802,7 +4811,15 @@ async def execute_tool(
             # /mcp/execute. No runner-side policy gate needed.
             if agent_spec is None:
                 return "Error: agent_spec not available for MCP dispatch"
-            output = await mcp_manager.call_tool(agent_spec, tool_name, args)
+            if traceparent is None:
+                output = await mcp_manager.call_tool(agent_spec, tool_name, args)
+            else:
+                output = await mcp_manager.call_tool(
+                    agent_spec,
+                    tool_name,
+                    args,
+                    traceparent=traceparent,
+                )
         elif tool_name in _OS_ENV_TOOLS:
             output = await _execute_os_env_tool(
                 tool_name,
@@ -5081,6 +5098,7 @@ async def dispatch_tool_locally(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    traceparent: str | None = None,
 ) -> str:
     """Execute a tool locally and PATCH the result to the harness.
 
@@ -5102,6 +5120,7 @@ async def dispatch_tool_locally(
         for the ``GET …/changes`` endpoint.
     :param resource_registry: Optional session-resource registry used to
         observe tool-launched terminals.
+    :param traceparent: W3C context for the originating tool span.
     :returns: The tool output string.
     """
     output = await execute_tool(
@@ -5122,6 +5141,7 @@ async def dispatch_tool_locally(
         harness_client=harness_client,
         filesystem_registry=filesystem_registry,
         publish_event=publish_event,
+        traceparent=traceparent,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the

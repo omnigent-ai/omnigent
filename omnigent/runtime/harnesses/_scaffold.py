@@ -455,7 +455,14 @@ class TurnContext:
             self._reset_idle_watchdog()
         self._event_queue.put_nowait(event)
 
-    async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
+    async def dispatch_tool(
+        self,
+        call_id: str,
+        name: str,
+        arguments: str,
+        agent: str,
+        traceparent: str | None = None,
+    ) -> str:
         """
         Emit a server-dispatched tool call and park until the result.
 
@@ -477,6 +484,8 @@ class TurnContext:
         :param agent: Agent name that invoked the tool — required
             on the function_call item per
             :class:`omnigent.entities.conversation.FunctionCallData`.
+        :param traceparent: W3C context for the active tool span. The runner
+            forwards it through MCP request metadata.
         :returns: The tool's output string from
             :class:`omnigent.server.schemas.ToolResult`.
         :raises asyncio.CancelledError: If the turn is cancelled
@@ -498,6 +507,8 @@ class TurnContext:
             "call_id": call_id,
             "agent": agent,
         }
+        if traceparent is not None:
+            item["traceparent"] = traceparent
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
         try:
             result = await future

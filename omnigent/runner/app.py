@@ -25,7 +25,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
@@ -6103,6 +6103,7 @@ def create_runner_app(
                 get_arguments,
                 get_call_id,
                 get_tool_name,
+                get_traceparent,
                 is_action_required,
                 should_dispatch_locally,
             )
@@ -6371,6 +6372,7 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
+                                                    traceparent=get_traceparent(event),
                                                 )
                                             )
                                         )
@@ -8698,6 +8700,15 @@ def create_runner_app(
             arguments = cast(_JsonObject, params.get("arguments") or {})
             input_responses = cast(_JsonObject | None, params.get("inputResponses"))
             request_state = cast(str | None, params.get("requestState"))
+            from omnigent.runtime.telemetry import normalize_traceparent
+
+            raw_meta = params.get("_meta")
+            request_traceparent = normalize_traceparent(
+                raw_meta.get("traceparent") if isinstance(raw_meta, dict) else None
+            )
+            request_meta = (
+                {"traceparent": request_traceparent} if request_traceparent is not None else None
+            )
             if not tool_name:
                 return JSONResponse(
                     status_code=200,
@@ -8754,6 +8765,7 @@ def create_runner_app(
                             arguments,
                             input_responses=input_responses,
                             request_state=request_state,
+                            meta=request_meta,
                         )
                     else:
                         output = await mcp_manager.call_tool(
@@ -8761,6 +8773,7 @@ def create_runner_app(
                             tool_name,
                             arguments,
                             session_id=session_id,
+                            traceparent=request_traceparent,
                         )
                 except McpElicitationRequired as elicit:
                     return JSONResponse(
