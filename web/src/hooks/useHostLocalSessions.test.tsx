@@ -26,6 +26,15 @@ function wrapper({ children }: { children: ReactNode }) {
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
+/** Mirrors `main.tsx`'s real QueryClient, which sets no `retry` default (so
+ *  React Query's own default of 3 would apply if the hook didn't opt out). */
+function productionDefaultsWrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { staleTime: 30_000, refetchOnWindowFocus: false } },
+  });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
 beforeEach(() => {
   mockFetch.mockReset();
 });
@@ -81,5 +90,21 @@ describe("useHostLocalSessions", () => {
         preview: [{ role: "user", text: "inspect TODO.md" }],
       },
     ]);
+  });
+
+  it("does not retry a failed browse, even under React Query's default retry policy", async () => {
+    // The server-side browse RPC has a 60s timeout; letting the default
+    // retry: 3 apply would turn one failed request into ~4 sequential 60s
+    // waits before the picker ever shows an error. Uses a client with no
+    // `retry` override (like the app's real one) so this actually exercises
+    // the hook's own opt-out rather than the test wrapper's.
+    mockFetch.mockRejectedValue(new Error("host is offline"));
+
+    const { result } = renderHook(() => useHostLocalSessions("host_a", "claude", true), {
+      wrapper: productionDefaultsWrapper,
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });

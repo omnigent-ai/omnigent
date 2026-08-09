@@ -28,5 +28,10 @@ export function useHostLocalSessions(
     queryFn: () => fetchHostLocalSessions(hostId as string, source),
     enabled: hostId !== null && enabled,
     staleTime: 5_000,
+    // The server's browse RPC has a 60s timeout, and an older host that
+    // silently drops the frame (no reply at all) hits exactly that timeout —
+    // the default retry: 3 would turn one failure into ~4 minutes of
+    // "Loading recent chats…" before the picker shows anything.
+    retry: false,
   });
 }
