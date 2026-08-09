@@ -2538,6 +2538,44 @@ describe("NewChatLandingScreen", () => {
 
     expect(await screen.findByTestId("import-nav-target")).toHaveTextContent("conv_new");
   });
+
+  it("refreshes the sidebar's conversation list after a successful import", async () => {
+    // The imports router never announces `session_added`, so there is no WS
+    // push to backfill the sidebar the way a normal create's push (or its
+    // own refetch/invalidate below) does — this has to trigger it itself.
+    useHostLocalSessionsMock.mockReturnValue(
+      localSessionsResult([
+        {
+          source: "claude",
+          external_session_id: "abc",
+          workspace: "/Users/corey/repo",
+          title: "Fix the flaky parser",
+          item_count: 4,
+          preview: [],
+        },
+      ]),
+    );
+    importHostLocalSessionMock.mockResolvedValue({
+      session_id: "conv_new",
+      status: "imported",
+      item_count: 4,
+    });
+    const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    const refetchSpy = vi.spyOn(QueryClient.prototype, "refetchQueries");
+    renderLandingWithImportNavTarget();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-import-chat"));
+    fireEvent.click(await screen.findByTestId("import-chat-recent-row-abc"));
+    fireEvent.click(screen.getByTestId("import-chat-submit"));
+
+    await screen.findByTestId("import-nav-target");
+    expect(refetchSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ queryKey: ["conversations"] }),
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ queryKey: ["directory-sessions"] }),
+    );
+  });
 });
 
 // The landing composer's "/" skills menu: bundled skills of the chosen

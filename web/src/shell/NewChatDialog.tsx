@@ -4225,6 +4225,11 @@ export function NewChatLandingScreen() {
                   defaultHostId={selectedHostId}
                   onImported={(sessionId) => {
                     setImportOpen(false);
+                    // The imports router never announces `session_added`, so the
+                    // sidebar has no push to pick this session up on its own —
+                    // refresh it the same way a normal create does.
+                    void queryClient.refetchQueries({ queryKey: ["conversations"] });
+                    void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
                     navigate(`/c/${sessionId}`);
                   }}
                 />
