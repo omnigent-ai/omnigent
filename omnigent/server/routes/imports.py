@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import NewConversationItem, parse_item_data
@@ -38,6 +39,8 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
+
+_logger = logging.getLogger(__name__)
 
 # The web picker only browses the two harnesses whose transcripts the
 # host daemon can read; the CLI still imports the other sources by id.
@@ -110,6 +113,13 @@ class LocalSessionSummaryOutput(BaseModel):
     title: str | None = None
     item_count: int
     preview: list[LocalSessionPreviewOutput] = Field(default_factory=list)
+
+
+class LocalSessionListOutput(BaseModel):
+    """Envelope returned by the local-session browse endpoint."""
+
+    object: Literal["list"] = "list"
+    data: list[LocalSessionSummaryOutput] = Field(default_factory=list)
 
 
 class ImportLocalSessionRequest(BaseModel):
@@ -383,13 +393,13 @@ def create_imports_router(
             raise HTTPException(status_code=409, detail="host is offline")
         return user_id, host_registry, conn
 
-    @router.get("/imports/local-sessions")
+    @router.get("/imports/local-sessions", response_model=LocalSessionListOutput)
     async def list_local_sessions(
         request: Request,
         host_id: Annotated[str, Query()],
         source: Annotated[ImportBrowseSource, Query()],
         limit: Annotated[int, Query(ge=1, le=_MAX_RECENT_LOCAL_SESSIONS)] = 10,
-    ) -> dict[str, Any]:
+    ) -> LocalSessionListOutput:
         """
         List recent Claude Code or Codex sessions on a host.
 
@@ -397,6 +407,11 @@ def create_imports_router(
         title, workspace, item count, and expandable context. Titles use
         the same synthesis the import itself applies, so a browsed row
         and the session it creates read the same.
+
+        A row the server cannot parse — e.g. from a host running an
+        older protocol version — is skipped rather than failing the
+        whole listing, matching how the CLI's own local scan treats an
+        unreadable transcript.
 
         :param request: FastAPI request (for auth).
         :param host_id: Host to browse, e.g. ``"host_a1b2c3d4..."``.
@@ -422,10 +437,18 @@ def create_imports_router(
             raise HTTPException(status_code=409, detail=exc.message) from exc
         except LocalSessionProxyError as exc:
             raise HTTPException(status_code=400, detail=exc.message) from exc
-        return {
-            "object": "list",
-            "data": [LocalSessionSummaryOutput(**entry).model_dump() for entry in sessions],
-        }
+        summaries: list[LocalSessionSummaryOutput] = []
+        for entry in sessions:
+            try:
+                summaries.append(LocalSessionSummaryOutput(**entry))
+            except (TypeError, ValidationError):
+                # A host on a different version can send a row this server
+                # can't parse; skip it rather than failing the whole picker.
+                _logger.warning(
+                    "host '%s' returned a malformed local-session row, skipping it",
+                    conn.host_id,
+                )
+        return LocalSessionListOutput(data=summaries)
 
     @router.post(
         "/imports/local-sessions",
@@ -453,8 +476,8 @@ def create_imports_router(
             session is unknown, 409 when the host is offline, 503 when
             the server has no host support.
         :raises OmnigentError: ``INVALID_INPUT`` when the host found no
-            importable history, plus whatever
-            :func:`_create_imported_session` raises.
+            importable history or returned a malformed item, plus
+            whatever :func:`_create_imported_session` raises.
         """
         user_id, registry, conn = await _resolve_online_host(request, body.host_id)
         try:
@@ -479,7 +502,13 @@ def create_imports_router(
                 "The host returned no importable history for this session",
                 code=ErrorCode.INVALID_INPUT,
             )
-        items = [ImportItemInput(**entry).to_item() for entry in raw_items]
+        try:
+            items = [ImportItemInput(**entry).to_item() for entry in raw_items]
+        except (TypeError, ValidationError) as exc:
+            raise OmnigentError(
+                f"host '{conn.host_id}' returned an invalid session item",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
         workspace = payload.get("workspace")
         async with _source_import_lock(body.source, body.external_session_id):
             result = await _create_imported_session(

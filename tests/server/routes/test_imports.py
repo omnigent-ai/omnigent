@@ -318,6 +318,20 @@ async def test_list_local_sessions_returns_host_summaries(
     assert body["data"][0]["external_session_id"] == "abc"
     assert body["data"][0]["item_count"] == 4
     assert body["data"][0]["preview"] == [{"role": "user", "text": "inspect TODO.md"}]
+    # The picker reads this envelope directly, so lock its exact shape.
+    assert body == {
+        "object": "list",
+        "data": [
+            {
+                "source": "claude",
+                "external_session_id": "abc",
+                "workspace": "/repo",
+                "title": "inspect TODO.md",
+                "item_count": 4,
+                "preview": [{"role": "user", "text": "inspect TODO.md"}],
+            }
+        ],
+    }
 
 
 async def test_list_local_sessions_rejects_unsupported_source(host_env: _HostEnv) -> None:
@@ -410,6 +424,45 @@ async def test_list_local_sessions_maps_lost_connection_to_conflict(
     )
 
     assert response.status_code == 409
+
+
+async def test_list_local_sessions_skips_malformed_row(
+    host_env: _HostEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row this server can't parse is skipped, not a 500 for the whole picker."""
+    import omnigent.server.routes.imports as imports_module
+
+    async def _fake_list(
+        *, host_registry: object, host_conn: object, source: str, limit: int
+    ) -> list[object]:
+        """Return well-formed rows around the shapes a skewed host might send."""
+        return [
+            {
+                "source": "claude",
+                "external_session_id": "good",
+                "workspace": "/repo",
+                "title": "inspect TODO.md",
+                "item_count": 4,
+                "preview": [],
+            },
+            {"source": "claude", "external_session_id": "bad"},  # missing item_count
+            "not-even-a-mapping",
+            # Trailing good row: a loop that aborts on the first bad
+            # entry would drop this one.
+            {"source": "claude", "external_session_id": "also-good", "item_count": 2},
+        ]
+
+    monkeypatch.setattr(imports_module, "list_local_sessions_on_host", _fake_list)
+    _connect_host(host_env, _HOST_A)
+
+    response = await host_env.client.get(
+        "/v1/imports/local-sessions", params={"host_id": _HOST_A, "source": "claude"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["external_session_id"] for row in body["data"]] == ["good", "also-good"]
 
 
 async def test_local_session_endpoints_require_host_support(client: httpx.AsyncClient) -> None:
@@ -601,4 +654,48 @@ async def test_import_local_session_rejects_empty_history(
     assert response.status_code == 400
     assert (
         SqlAlchemyConversationStore(db_uri).find_imported_conversation("claude", "empty") is None
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_item",
+    [
+        pytest.param({"type": "message"}, id="missing-required-fields"),
+        pytest.param("not-even-a-mapping", id="not-a-mapping"),
+    ],
+)
+async def test_import_local_session_rejects_malformed_item(
+    host_env: _HostEnv,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_item: object,
+) -> None:
+    """A host-returned item the server can't parse is a 400, not a crash."""
+    import omnigent.server.routes.imports as imports_module
+
+    _seed_claude_agent(db_uri)
+
+    async def _fake_load(
+        *, host_registry: object, host_conn: object, source: str, external_session_id: str
+    ) -> dict[str, object]:
+        """Return a transcript whose one item this server cannot parse."""
+        return {
+            "source": "claude",
+            "external_session_id": external_session_id,
+            "workspace": "/repo",
+            "items": [bad_item],
+        }
+
+    monkeypatch.setattr(imports_module, "load_local_session_on_host", _fake_load)
+    _connect_host(host_env, _HOST_A)
+
+    response = await host_env.client.post(
+        "/v1/imports/local-sessions",
+        json={"host_id": _HOST_A, "source": "claude", "external_session_id": "malformed"},
+    )
+
+    assert response.status_code == 400
+    assert (
+        SqlAlchemyConversationStore(db_uri).find_imported_conversation("claude", "malformed")
+        is None
     )

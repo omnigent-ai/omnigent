@@ -2011,6 +2011,102 @@
         "title": "LaunchRunnerRequest",
         "type": "object"
       },
+      "LocalSessionListOutput": {
+        "description": "Envelope returned by the local-session browse endpoint.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/LocalSessionSummaryOutput"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "LocalSessionListOutput",
+        "type": "object"
+      },
+      "LocalSessionPreviewOutput": {
+        "description": "One preview message shown when a picker row is expanded.",
+        "properties": {
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "text"
+        ],
+        "title": "LocalSessionPreviewOutput",
+        "type": "object"
+      },
+      "LocalSessionSummaryOutput": {
+        "description": "One browsable local session, as returned to the import picker.",
+        "properties": {
+          "external_session_id": {
+            "title": "External Session Id",
+            "type": "string"
+          },
+          "item_count": {
+            "title": "Item Count",
+            "type": "integer"
+          },
+          "preview": {
+            "items": {
+              "$ref": "#/components/schemas/LocalSessionPreviewOutput"
+            },
+            "title": "Preview",
+            "type": "array"
+          },
+          "source": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "source",
+          "external_session_id",
+          "item_count"
+        ],
+        "title": "LocalSessionSummaryOutput",
+        "type": "object"
+      },
       "MCPServerSummary": {
         "description": "Safe subset of an MCP server's configuration for API exposure.\n\nHeader values are redacted (`\"[REDACTED]\"`) so callers can see\nwhich headers are configured without leaking the actual secrets.\n`env` is still fully excluded.",
         "properties": {
@@ -7929,7 +8025,7 @@
     },
     "/v1/imports/local-sessions": {
       "get": {
-        "description": "List recent Claude Code or Codex sessions on a host.\n\nBacks the New Session import picker, which shows each session's\ntitle, workspace, item count, and expandable context. Titles use\nthe same synthesis the import itself applies, so a browsed row\nand the session it creates read the same.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}` newest first.\n\n**Raises**\n\n- `HTTPException` \u2014 400 when the host reports a failure, 403 when the host is not the caller's, 404 when the host is unknown, 409 when it is offline, 503 when the server has no host support.",
+        "description": "List recent Claude Code or Codex sessions on a host.\n\nBacks the New Session import picker, which shows each session's\ntitle, workspace, item count, and expandable context. Titles use\nthe same synthesis the import itself applies, so a browsed row\nand the session it creates read the same.\n\nA row the server cannot parse \u2014 e.g. from a host running an\nolder protocol version \u2014 is skipped rather than failing the\nwhole listing, matching how the CLI's own local scan treats an\nunreadable transcript.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}` newest first.\n\n**Raises**\n\n- `HTTPException` \u2014 400 when the host reports a failure, 403 when the host is not the caller's, 404 when the host is unknown, 409 when it is offline, 503 when the server has no host support.",
         "operationId": "list_local_sessions_v1_imports_local_sessions_get",
         "parameters": [
           {
@@ -7975,9 +8071,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response List Local Sessions V1 Imports Local Sessions Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/LocalSessionListOutput"
                 }
               }
             },
@@ -8000,7 +8094,7 @@
         ]
       },
       "post": {
-        "description": "Import one Claude Code or Codex session read from a host.\n\nThe host loads and normalizes the transcript; the session is\nthen created through the same path the CLI's `POST /v1/imports`\nuses, so provenance labels and duplicate handling match.\n\n**Parameters**\n\n- `body` \u2014 Host, source, and harness-native session id.\n\n**Returns:** The created session id and item count.\n\n**Raises**\n\n- `HTTPException` \u2014 400 when the host reports a failure, 403 when the host is not the caller's, 404 when the host or the session is unknown, 409 when the host is offline, 503 when the server has no host support.\n- `OmnigentError` \u2014 `INVALID_INPUT` when the host found no importable history, plus whatever `_create_imported_session` raises.",
+        "description": "Import one Claude Code or Codex session read from a host.\n\nThe host loads and normalizes the transcript; the session is\nthen created through the same path the CLI's `POST /v1/imports`\nuses, so provenance labels and duplicate handling match.\n\n**Parameters**\n\n- `body` \u2014 Host, source, and harness-native session id.\n\n**Returns:** The created session id and item count.\n\n**Raises**\n\n- `HTTPException` \u2014 400 when the host reports a failure, 403 when the host is not the caller's, 404 when the host or the session is unknown, 409 when the host is offline, 503 when the server has no host support.\n- `OmnigentError` \u2014 `INVALID_INPUT` when the host found no importable history or returned a malformed item, plus whatever `_create_imported_session` raises.",
         "operationId": "import_local_session_v1_imports_local_sessions_post",
         "requestBody": {
           "content": {
