@@ -3388,10 +3388,13 @@ async def ensure_runner_connected(
             if _fatal_refusal and launch_attempt.error is not None:
                 _rer = getattr(app_state, "runner_exit_reports", None)
                 if _rer is not None:
+                    report_error = launch_attempt.error
+                    if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
+                        report_error = f"workspace path does not exist: {conv.workspace}"
                     _rer.record(
                         launch_attempt.runner_id,
-                        launch_attempt.error,
-                        owner=None,
+                        report_error,
+                        owner=host_conn.owner,
                     )
             if not _fatal_refusal:
                 relaunched_runner_id = launch_attempt.runner_id
