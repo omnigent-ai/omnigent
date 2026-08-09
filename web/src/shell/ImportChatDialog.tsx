@@ -121,13 +121,18 @@ function ImportChatForm({
 
   const { data: hosts } = useHosts();
   // Only a live, user-connected machine has transcripts to import: sandbox
-  // hosts are server-managed launch targets. A host from an older server omits
-  // `sandbox_provider` entirely, which must read as "not a sandbox".
+  // hosts are server-managed launch targets. `useHosts` already drops them,
+  // so the sandbox clause is defence-in-depth against a future
+  // `includeSandbox` caller; a host omitting the field is NOT a sandbox.
   const onlineHosts = useMemo(
     () => (hosts ?? []).filter((h) => h.status === "online" && !h.sandbox_provider),
     [hosts],
   );
-  const noOnlineHosts = onlineHosts.length === 0;
+  const hostsLoading = hosts === undefined;
+  // Only "no machines" once the list has actually arrived — a cold cache must
+  // not tell the user to connect a machine they already have.
+  const noOnlineHosts = !hostsLoading && onlineHosts.length === 0;
+  const hostsUnusable = hostsLoading || noOnlineHosts;
 
   // Default to the composer's host when it's online, else the first online
   // one. Only fills an empty slot, so an explicit pick is never overridden.
@@ -143,7 +148,8 @@ function ImportChatForm({
   // An import failure takes precedence: it's the action the user just took.
   const shownError = errorMessage ?? recent.error?.message ?? null;
 
-  function clearSelection(): void {
+  /** Back to a clean slate: no pick, empty id, and any stale error dropped. */
+  function resetSelection(): void {
     setSelected(null);
     setSessionId("");
     setExpandedId(null);
@@ -161,7 +167,7 @@ function ImportChatForm({
     setSource(next);
     // A pick from the other source isn't valid here, and its id would import
     // the wrong transcript.
-    clearSelection();
+    resetSelection();
   }
 
   async function handleImport(): Promise<void> {
@@ -205,7 +211,7 @@ function ImportChatForm({
                 size="sm"
                 variant={source === id ? "secondary" : "ghost"}
                 aria-pressed={source === id}
-                disabled={noOnlineHosts}
+                disabled={hostsUnusable}
                 data-testid={`import-chat-source-${id}`}
                 onClick={() => changeSource(id)}
               >
@@ -222,9 +228,9 @@ function ImportChatForm({
             onValueChange={(v) => {
               setHostId(v);
               // Chats are per-machine, so a pick from the old host is stale.
-              clearSelection();
+              resetSelection();
             }}
-            disabled={noOnlineHosts}
+            disabled={hostsUnusable}
           >
             <SelectTrigger
               aria-label="Machine"
@@ -245,9 +251,11 @@ function ImportChatForm({
               ))}
             </SelectContent>
           </Select>
-          {noOnlineHosts && (
+          {hostsLoading ? (
+            <p className="text-sm text-muted-foreground">Loading machines…</p>
+          ) : noOnlineHosts ? (
             <p className="text-sm text-muted-foreground">Connect a machine to import chats</p>
-          )}
+          ) : null}
         </div>
 
         <div className="flex flex-col gap-1.5">
@@ -318,7 +326,7 @@ function ImportChatForm({
               size="sm"
               className="self-start"
               data-testid="import-chat-clear-selection"
-              onClick={clearSelection}
+              onClick={resetSelection}
             >
               Clear selection
             </Button>

@@ -33,6 +33,11 @@ function setHosts(hosts: Host[]): void {
   useHostsMock.mockReturnValue({ data: hosts } as ReturnType<typeof useHosts>);
 }
 
+/** A cold `useHosts` cache: the list hasn't arrived yet. */
+function setHostsLoading(): void {
+  useHostsMock.mockReturnValue({ data: undefined } as ReturnType<typeof useHosts>);
+}
+
 // Two Claude rows: one fully populated, one with the nullable title/workspace
 // the server passes through when the host couldn't determine them.
 const CLAUDE_SESSIONS: LocalSessionSummary[] = [
@@ -278,5 +283,44 @@ describe("ImportChatDialog", () => {
     expect(useHostLocalSessionsMock).toHaveBeenLastCalledWith(null, "claude", true);
     // The manual session-id path the CLI supports stays open regardless.
     expect(screen.getByTestId("import-chat-session-id")).not.toBeDisabled();
+  });
+
+  it("waits for the host list before telling the user to connect a machine", () => {
+    // A cold hosts cache is not "no machines" — showing the connect hint here
+    // instructs the user to set up a machine they may already have connected.
+    setHostsLoading();
+    renderDialog();
+
+    expect(screen.queryByText("Connect a machine to import chats")).not.toBeInTheDocument();
+    expect(screen.getByText("Loading machines…")).toBeInTheDocument();
+    // Still nothing to act on until the list lands, so the controls stay locked.
+    expect(screen.getByTestId("import-chat-host-select")).toBeDisabled();
+    expect(screen.getByTestId("import-chat-source-claude")).toBeDisabled();
+    expect(screen.getByTestId("import-chat-submit")).toBeDisabled();
+  });
+
+  it("shows a loading state, not an empty one, while the recent chats load", () => {
+    setLocalSessionsBySource({ claude: queryResult(undefined, { isLoading: true }) });
+    renderDialog();
+
+    expect(screen.getByText("Loading recent chats…")).toBeInTheDocument();
+    // Flashing "no recent chats" mid-load would misreport the machine.
+    expect(screen.queryByTestId("import-chat-empty")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("import-chat-recent-list")).not.toBeInTheDocument();
+  });
+
+  it("surfaces the server's message when the recent chats can't be listed", () => {
+    setLocalSessionsBySource({
+      claude: queryResult(undefined, { error: new Error("host is offline") }),
+    });
+    renderDialog();
+
+    expect(screen.getByTestId("import-chat-error")).toHaveTextContent("host is offline");
+    expect(screen.queryByTestId("import-chat-recent-list")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("import-chat-empty")).not.toBeInTheDocument();
+
+    // A failed browse must not close off the manual path: a pasted id still imports.
+    fireEvent.change(screen.getByTestId("import-chat-session-id"), { target: { value: "abc" } });
+    expect(screen.getByTestId("import-chat-submit")).not.toBeDisabled();
   });
 });
