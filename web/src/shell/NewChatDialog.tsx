@@ -22,6 +22,7 @@ import {
   FileTextIcon,
   FolderIcon,
   ImageIcon,
+  ImportIcon,
   PaperclipIcon,
   PlusIcon,
   SettingsIcon,
@@ -73,6 +74,7 @@ import { attachmentKey } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
+import { ImportChatDialog } from "@/shell/ImportChatDialog";
 import {
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
@@ -83,7 +85,7 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import {
   isSlashCommandText,
   rankedSlashCommandNames,
@@ -1937,6 +1939,10 @@ export function NewChatLandingScreen() {
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
+  // Importing reads transcripts off the SERVER's disk, which is the user's own
+  // machine only on a single-user local runtime. Elsewhere the API refuses it,
+  // so don't offer it.
+  const importChatAvailable = isSingleUserMode(info);
   // Which router can answer a pick. The external AI-Gateway router only covers
   // a family the host runs through the gateway; the built-in judge covers any
   // family. Read once here and reused by every routing gate below. "loading"
@@ -2139,6 +2145,8 @@ export function NewChatLandingScreen() {
   } | null>(null);
   // Harness-config modal, opened from the composer's gear icon.
   const [configOpen, setConfigOpen] = useState(false);
+  // Import-a-local-chat modal, opened from the composer's import icon.
+  const [importOpen, setImportOpen] = useState(false);
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -4082,6 +4090,30 @@ export function NewChatLandingScreen() {
                 />
               </div>
               <div className="flex items-center gap-0.5 md:gap-2">
+                {/* Import — pulls an existing Claude Code / Codex chat off this
+                  machine into a normal session (the web form of
+                  `omnigent import`). */}
+                {importChatAvailable && (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="size-9 text-muted-foreground md:size-8"
+                          disabled={creating}
+                          onClick={() => setImportOpen(true)}
+                          data-testid="new-chat-landing-import"
+                        >
+                          <ImportIcon className="size-4" data-icon-size="16" />
+                          <span className="sr-only">Import chat</span>
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">Import chat</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
                 <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
                   {/* Agent / harness picker — selects the agent or harness only.
                     Its run-config knobs (model / effort / permission mode for
@@ -4193,6 +4225,9 @@ export function NewChatLandingScreen() {
                     setPickedHarness={handleSetPickedHarness}
                     setCostControlMode={setCostControlMode}
                   />
+                )}
+                {importChatAvailable && (
+                  <ImportChatDialog open={importOpen} onOpenChange={setImportOpen} />
                 )}
                 {/* Routing is not a standalone composer toggle — it folds into
                   the gear modal's Model dropdown as an "Smart Routing"

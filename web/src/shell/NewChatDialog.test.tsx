@@ -3035,6 +3035,28 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
   });
 });
 
+describe("NewChatLandingScreen import chat", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it("hides the import action on a multi-user server", () => {
+    // The transcripts sit on the SERVER's disk, which isn't the caller's
+    // machine here — the API refuses it, so the action must not be offered.
+    renderLanding();
+    expect(screen.queryByTestId("new-chat-landing-import")).toBeNull();
+  });
+
+  it("opens the import dialog from the composer on a single-user server", () => {
+    renderLanding({ single_user: true });
+    expect(screen.queryByTestId("import-chat-dialog")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-import"));
+    expect(screen.getByTestId("import-chat-dialog")).toBeTruthy();
+  });
+});
+
 describe("NewChatLandingScreen custom-agent sandbox gating", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {

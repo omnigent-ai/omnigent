@@ -6,6 +6,7 @@ from omnigent.session_import.models import (
     IMPORT_SOURCE_LABEL_KEY,
     ImportSource,
     LocalSessionImport,
+    LocalSessionSummary,
     SessionImportNotFoundError,
     title_from_items,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "IMPORT_SOURCE_LABEL_KEY",
     "ImportSource",
     "LocalSessionImport",
+    "LocalSessionSummary",
     "SessionImportNotFoundError",
     "title_from_items",
 ]

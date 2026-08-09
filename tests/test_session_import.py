@@ -416,6 +416,52 @@ def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     assert recent == ("new", "middle")
 
 
+def test_list_recent_local_sessions_describes_parents_and_skips_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery reports picker metadata and drops transcripts it cannot parse."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    project = tmp_path / "projects" / "-repo"
+    project.mkdir(parents=True)
+    readable = project / "readable.jsonl"
+    readable.write_text(
+        "".join(
+            f"{json.dumps(record)}\n"
+            for record in (
+                {
+                    "type": "user",
+                    "uuid": "user-1",
+                    "cwd": "/repo",
+                    "message": {"role": "user", "content": "inspect TODO.md"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Done."}],
+                    },
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    os.utime(readable, (1000, 1000))
+    # An empty transcript has no importable history: it must not hide the rest.
+    empty = project / "empty.jsonl"
+    empty.touch()
+    os.utime(empty, (2000, 2000))
+
+    sessions = local_import.list_recent_local_sessions("claude", limit=5)
+
+    assert [session.session_id for session in sessions] == ["readable"]
+    assert sessions[0].title == "inspect TODO.md"
+    assert sessions[0].workspace == "/repo"
+    assert sessions[0].item_count == 2
+    assert sessions[0].modified_at == 1000
+
+
 def test_load_codex_session_normalizes_response_items(tmp_path: Path) -> None:
     """Codex response items retain turn grouping and omit scaffolding."""
     session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -29,8 +30,11 @@ from omnigent.opencode_native_forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
+    LocalSessionSummary,
     SessionImportNotFoundError,
 )
+
+_logger = logging.getLogger(__name__)
 
 _PI_IMPORT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 _OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
@@ -59,12 +63,12 @@ def _find_transcript(root: Path, session_id: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
-def _recent_unique_session_ids(
+def _recent_unique_session_entries(
     candidates: list[tuple[Path, str]],
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """Return unique session ids ordered from newest transcript to oldest."""
+) -> tuple[tuple[str, float], ...]:
+    """Return unique session ids and mtimes, newest transcript first."""
     newest_by_id: dict[str, float] = {}
     for path, session_id in candidates:
         try:
@@ -77,7 +81,7 @@ def _recent_unique_session_ids(
         key=lambda session_id: (newest_by_id[session_id], session_id),
         reverse=True,
     )
-    return tuple(ordered[:limit])
+    return tuple((session_id, newest_by_id[session_id]) for session_id in ordered[:limit])
 
 
 def _pi_session_id_from_path(path: Path) -> str | None:
@@ -152,12 +156,12 @@ def _qwen_session_locator(path: Path) -> str:
     return f"{project_digest}:{sha256(session_id.encode()).hexdigest()}"
 
 
-def list_recent_local_session_ids(
+def _recent_local_session_entries(
     source: ImportSource,
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """List recent parent session ids for one local harness."""
+) -> tuple[tuple[str, float | None], ...]:
+    """List recent parent session ids and modification times for one harness."""
     if source == "claude":
         configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
@@ -167,14 +171,14 @@ def list_recent_local_session_ids(
             for path in root.rglob("*.jsonl")
             if "subagents" not in path.parts and path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_session_entries(candidates, limit=limit)
 
     if source == "qwen":
         configured_home = os.environ.get("QWEN_HOME")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".qwen"
         paths = [path for path in (home / "projects").glob("*/chats/*.jsonl") if path.is_file()]
         candidates = [(path, _qwen_session_locator(path)) for path in paths]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_session_entries(candidates, limit=limit)
 
     if source == "kiro":
         root = kiro_cli_sessions_dir()
@@ -183,7 +187,7 @@ def list_recent_local_session_ids(
             for path in root.glob("*.jsonl")
             if path.is_file() and path.with_suffix(".json").is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_session_entries(candidates, limit=limit)
 
     if source == "opencode":
         payload = _run_opencode_json(
@@ -212,7 +216,14 @@ def list_recent_local_session_ids(
             key=lambda session_id: (updated_by_id[session_id], session_id),
             reverse=True,
         )
-        return tuple(ordered[:limit])
+        # OpenCode reports JavaScript epoch milliseconds; every other source
+        # here carries a POSIX mtime, so normalize to seconds. An entry that
+        # arrived without a usable timestamp reports none.
+        entries: list[tuple[str, float | None]] = []
+        for ordered_id in ordered[:limit]:
+            updated_ms = updated_by_id[ordered_id]
+            entries.append((ordered_id, updated_ms / 1000 if updated_ms else None))
+        return tuple(entries)
 
     if source == "pi":
         configured_home = os.environ.get("PI_CODING_AGENT_DIR")
@@ -227,7 +238,7 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").rglob("*.jsonl")
             if path.is_file() and (session_id := _pi_session_id_from_path(path)) is not None
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_session_entries(candidates, limit=limit)
 
     if source == "kimi":
         home = resolve_user_kimi_home()
@@ -236,7 +247,7 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").glob("*/session_*/agents/main/wire.jsonl")
             if path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_session_entries(candidates, limit=limit)
 
     if source == "codex":
         configured_home = os.environ.get("CODEX_HOME")
@@ -255,9 +266,50 @@ def list_recent_local_session_ids(
             session_id = path.stem[-36:]
             if _CODEX_THREAD_ID_RE.fullmatch(session_id):
                 candidates.append((path, session_id))
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_session_entries(candidates, limit=limit)
 
     raise ValueError(f"Unsupported import source: {source}")
+
+
+def list_recent_local_session_ids(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """List recent parent session ids for one local harness."""
+    entries = _recent_local_session_entries(source, limit=limit)
+    return tuple(session_id for session_id, _ in entries)
+
+
+def list_recent_local_sessions(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> tuple[LocalSessionSummary, ...]:
+    """Describe recent parent sessions for one local harness, newest first.
+
+    Each candidate is parsed to read its title, workspace, and item count. A
+    candidate that cannot be parsed — a half-written transcript, a harness
+    format this build does not understand — is skipped so one bad file never
+    hides the rest of the list.
+    """
+    summaries: list[LocalSessionSummary] = []
+    for session_id, modified_at in _recent_local_session_entries(source, limit=limit):
+        try:
+            imported = load_local_session(source, session_id)
+        except (OSError, TypeError, ValueError) as exc:
+            _logger.debug("Skipping unreadable %s session %s: %s", source, session_id, exc)
+            continue
+        summaries.append(
+            LocalSessionSummary(
+                session_id=session_id,
+                title=imported.title,
+                workspace=imported.workspace,
+                item_count=len(imported.items),
+                modified_at=modified_at,
+            )
+        )
+    return tuple(summaries)
 
 
 def _claude_workspace(transcript_path: Path) -> str | None:
@@ -1218,6 +1270,7 @@ def load_local_session(source: ImportSource, session_id: str) -> LocalSessionImp
 
 __all__ = [
     "list_recent_local_session_ids",
+    "list_recent_local_sessions",
     "load_claude_session",
     "load_codex_session",
     "load_kimi_session",

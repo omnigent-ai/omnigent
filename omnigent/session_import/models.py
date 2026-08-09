@@ -40,6 +40,19 @@ class LocalSessionImport:
         return title_from_items(self.items)
 
 
+@dataclass(frozen=True)
+class LocalSessionSummary:
+    """One recent local transcript described for an import picker."""
+
+    session_id: str
+    title: str | None
+    workspace: str | None
+    item_count: int
+    # POSIX seconds, matching the API's other timestamps. ``None`` when the
+    # harness reported no usable modification time.
+    modified_at: float | None
+
+
 def title_from_items(items: Sequence[NewConversationItem]) -> str | None:
     """Return a sidebar title derived from the first user message."""
     for item in items:

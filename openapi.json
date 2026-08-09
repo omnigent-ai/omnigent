@@ -1784,6 +1784,41 @@
         "title": "ImportItemInput",
         "type": "object"
       },
+      "ImportLocalSessionRequest": {
+        "description": "Request body for importing one transcript from the server's own disk.",
+        "properties": {
+          "external_session_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "External Session Id",
+            "type": "string"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "source": {
+            "enum": [
+              "claude",
+              "codex",
+              "kimi",
+              "kiro",
+              "opencode",
+              "pi",
+              "qwen"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "external_session_id"
+        ],
+        "title": "ImportLocalSessionRequest",
+        "type": "object"
+      },
       "ImportSessionRequest": {
         "description": "Request body for importing one local harness session.",
         "properties": {
@@ -1977,6 +2012,78 @@
           "workspace"
         ],
         "title": "LaunchRunnerRequest",
+        "type": "object"
+      },
+      "LocalSessionListResponse": {
+        "description": "Recent local transcripts for one harness, newest first.",
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/LocalSessionSummaryResponse"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "title": "LocalSessionListResponse",
+        "type": "object"
+      },
+      "LocalSessionSummaryResponse": {
+        "description": "One local transcript offered to the import picker.",
+        "properties": {
+          "item_count": {
+            "title": "Item Count",
+            "type": "integer"
+          },
+          "modified_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "session_id",
+          "title",
+          "workspace",
+          "item_count",
+          "modified_at"
+        ],
+        "title": "LocalSessionSummaryResponse",
         "type": "object"
       },
       "MCPServerSummary": {
@@ -7890,6 +7997,112 @@
           }
         },
         "summary": "Import Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local": {
+      "post": {
+        "description": "Read one transcript off the server's disk and import it.",
+        "operationId": "import_local_session_v1_imports_local_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportLocalSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportSessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Local Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local/sessions": {
+      "get": {
+        "description": "List recent transcripts the given harness left on the server's disk.",
+        "operationId": "list_local_sessions_v1_imports_local_sessions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": true,
+            "schema": {
+              "enum": [
+                "claude",
+                "codex",
+                "kimi",
+                "kiro",
+                "opencode",
+                "pi",
+                "qwen"
+              ],
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalSessionListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Local Sessions",
         "tags": [
           "imports"
         ]
