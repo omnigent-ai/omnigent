@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 import pytest_asyncio
+import respx
 from cryptography.fernet import Fernet
 from starlette.requests import HTTPConnection
 
@@ -162,3 +163,87 @@ async def test_callback_happy_path_then_list_and_disconnect(
     resp = await client.delete("/v1/credentials/github")
     assert resp.json() == {"ok": True}
     assert credential_store.get(_USER, "github") is None
+
+
+async def test_repos_requires_connected_github(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/v1/credentials/github/repos")
+    assert resp.status_code == 409
+
+
+async def test_repos_returns_mapped_list(
+    client: httpx.AsyncClient, credential_store: CredentialStore, monkeypatch
+) -> None:
+    credential_store.upsert(_USER, "github", token="gho_live", login="alice-gh", scopes="repo")
+
+    async def fake_repos(token: str) -> list[dict]:
+        assert token == "gho_live"
+        return [
+            {
+                "full_name": "alice/proj",
+                "clone_url": "https://github.com/alice/proj.git",
+                "default_branch": "main",
+                "private": False,
+                "id": 1,  # extra GitHub fields the mapping must drop
+            },
+        ]
+
+    monkeypatch.setattr(credentials_routes, "_fetch_github_repos", fake_repos)
+    resp = await client.get("/v1/credentials/github/repos")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "repos": [
+            {
+                "full_name": "alice/proj",
+                "clone_url": "https://github.com/alice/proj.git",
+                "default_branch": "main",
+                "private": False,
+            }
+        ]
+    }
+
+
+async def test_repos_undecryptable_credential_treated_as_not_connected(
+    client: httpx.AsyncClient, credential_store: CredentialStore, monkeypatch
+) -> None:
+    credential_store.upsert(_USER, "github", token="gho_live", login="alice-gh", scopes="repo")
+    # Rotate the key after writing — the stored ciphertext no longer decrypts.
+    monkeypatch.setenv("OMNIGENT_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    resp = await client.get("/v1/credentials/github/repos")
+    assert resp.status_code == 409
+
+
+async def test_repos_github_api_failure_returns_500(
+    client: httpx.AsyncClient, credential_store: CredentialStore, monkeypatch
+) -> None:
+    credential_store.upsert(_USER, "github", token="gho_live", login="alice-gh", scopes="repo")
+
+    async def failing_repos(token: str) -> list[dict]:
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(credentials_routes, "_fetch_github_repos", failing_repos)
+    resp = await client.get("/v1/credentials/github/repos")
+    assert resp.status_code == 500
+
+
+@respx.mock
+async def test_fetch_github_repos_requests_all_affiliations_sorted_by_pushed() -> None:
+    route = respx.get("https://api.github.com/user/repos").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "full_name": "alice/proj",
+                    "clone_url": "https://github.com/alice/proj.git",
+                    "default_branch": "main",
+                    "private": False,
+                }
+            ],
+        )
+    )
+    repos = await credentials_routes._fetch_github_repos("gho_live")
+    assert repos[0]["full_name"] == "alice/proj"
+    request = route.calls.last.request
+    assert request.headers["authorization"] == "Bearer gho_live"
+    assert request.url.params["affiliation"] == "owner,collaborator,organization_member"
+    assert request.url.params["sort"] == "pushed"
+    assert request.url.params["per_page"] == "100"

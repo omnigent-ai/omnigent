@@ -2,8 +2,9 @@
 Per-user external-service credential routes (Settings → Credentials).
 
 ``GET /v1/credentials`` lists the caller's connected credentials (masked —
-never the token). ``POST /v1/credentials/github/connect`` starts the GitHub
-OAuth authorize flow; ``GET /auth/github/credential-callback`` finishes it
+never the token). ``GET /v1/credentials/github/repos`` lists the caller's
+GitHub repos (requires a stored, decrypted token). ``POST /v1/credentials/github/connect``
+starts the GitHub OAuth authorize flow; ``GET /auth/github/credential-callback`` finishes it
 (code → token exchange, identity fetch, encrypted upsert);
 ``DELETE /v1/credentials/github`` disconnects.
 
@@ -120,6 +121,27 @@ async def _fetch_github_user(token: str) -> dict[str, Any]:
         return resp.json()
 
 
+async def _fetch_github_repos(token: str) -> list[dict[str, Any]]:
+    """Fetch repos the token can access — owner, collaborator, and org member
+    affiliations, most-recently-pushed first, capped at GitHub's 100/page
+    maximum (raises on HTTP error)."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{_USER_URL}/repos",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            params={
+                "affiliation": "owner,collaborator,organization_member",
+                "sort": "pushed",
+                "per_page": 100,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 def create_credentials_router(
     credential_store: CredentialStore,
     auth_provider: AuthProvider | None = None,
@@ -147,6 +169,35 @@ def create_credentials_router(
                 }
             )
         return {"credentials": creds, "enabled": _feature_enabled()}
+
+    @router.get("/v1/credentials/github/repos")
+    async def list_github_repos(request: Request) -> dict[str, Any]:
+        """The caller's GitHub repos — owner, collaborator, and org member."""
+        user_id = _user(request)
+        cred = credential_store.get(user_id, "github")
+        if cred is None:
+            raise OmnigentError("github_not_connected", code=ErrorCode.CONFLICT)
+        token = credential_store.decrypt_token(cred)
+        if token is None:
+            raise OmnigentError("github_not_connected", code=ErrorCode.CONFLICT)
+        try:
+            repos = await _fetch_github_repos(token)
+        except httpx.HTTPError as exc:
+            logger.warning("github repo listing failed for %s", user_id, exc_info=True)
+            raise OmnigentError(
+                "github_repos_fetch_failed", code=ErrorCode.INTERNAL_ERROR
+            ) from exc
+        return {
+            "repos": [
+                {
+                    "full_name": r["full_name"],
+                    "clone_url": r["clone_url"],
+                    "default_branch": r["default_branch"],
+                    "private": r["private"],
+                }
+                for r in repos
+            ]
+        }
 
     @router.post("/v1/credentials/github/connect")
     async def connect_github(request: Request) -> dict[str, str]:
