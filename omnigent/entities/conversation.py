@@ -287,6 +287,25 @@ class MessageData(BaseModel):
         return self
 
 
+def strip_attachment_marker_lines(text: str) -> str:
+    """
+    Drop lines that are native attachment path markers.
+
+    Shared by title synthesis and any other view that collapses message
+    content blocks into plain text, so a temp-file path never leaks in
+    from either place.
+
+    :param text: Raw text from one content block, e.g.
+        ``"hello\\n[Attached: /tmp/abc/x.png]"``.
+    :returns: ``text`` with attachment-marker lines
+        (:data:`_ATTACHMENT_MARKER_RE`) removed.
+    """
+    kept_lines = [
+        line for line in text.splitlines() if not _ATTACHMENT_MARKER_RE.match(line.strip())
+    ]
+    return "\n".join(kept_lines)
+
+
 def synthesize_conversation_title(
     content: list[dict[str, Any]],
     *,
@@ -311,12 +330,7 @@ def synthesize_conversation_title(
         if block.get("type") == "input_text":
             text = block.get("text")
             if isinstance(text, str):
-                kept_lines = [
-                    line
-                    for line in text.splitlines()
-                    if not _ATTACHMENT_MARKER_RE.match(line.strip())
-                ]
-                parts.append("\n".join(kept_lines))
+                parts.append(strip_attachment_marker_lines(text))
     collapsed = " ".join(" ".join(parts).split())
     if not collapsed:
         return None

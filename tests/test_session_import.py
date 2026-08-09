@@ -1321,6 +1321,39 @@ def test_summarize_local_session_bounds_preview_length_and_count() -> None:
     assert summary.preview[0].text.endswith("…")
 
 
+def test_summarize_local_session_preview_strips_attachment_markers() -> None:
+    """A message that is purely an attachment marker leaves no temp-file path in preview."""
+    from omnigent.session_import.models import LocalSessionImport, summarize_local_session
+
+    imported = LocalSessionImport(
+        source="claude",
+        external_session_id="s",
+        workspace=None,
+        items=(
+            NewConversationItem(
+                type="message",
+                response_id="claude:1",
+                data=parse_item_data(
+                    "message",
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "[Attached: /tmp/abc123/screenshot.png]",
+                            }
+                        ],
+                    },
+                ),
+            ),
+        ),
+    )
+
+    summary = summarize_local_session(imported)
+
+    assert summary.preview == ()
+
+
 def test_list_recent_local_sessions_summarizes_newest_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

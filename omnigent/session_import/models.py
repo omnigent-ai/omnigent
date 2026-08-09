@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.entities.conversation import synthesize_conversation_title
+from omnigent.entities.conversation import (
+    strip_attachment_marker_lines,
+    synthesize_conversation_title,
+)
 
 ImportSource = Literal["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"]
 
@@ -79,13 +82,20 @@ class LocalSessionSummary:
     preview: tuple[LocalSessionPreviewMessage, ...]
 
 
-def _preview_text(content: list[dict[str, object]]) -> str | None:
-    """Collapse message content blocks into one truncated preview line."""
-    parts = [
-        text.strip()
-        for block in content
-        if isinstance(block, dict) and isinstance(text := block.get("text"), str)
-    ]
+def _preview_text(content: list[dict[str, Any]]) -> str | None:
+    """Collapse message content blocks into one truncated preview line.
+
+    Mirrors :func:`synthesize_conversation_title`: only text-bearing
+    blocks are read, and native attachment path markers are stripped
+    so a temp-file path never shows up in a picker preview.
+    """
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in ("input_text", "output_text"):
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(strip_attachment_marker_lines(text))
     collapsed = " ".join(" ".join(parts).split())
     if not collapsed:
         return None
