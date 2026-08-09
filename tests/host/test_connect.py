@@ -1312,6 +1312,63 @@ async def test_watch_runner_restarts_unexpected_exit_in_place(
     assert tunnel.sent == []
 
 
+async def test_watch_runner_cancelled_midrestart_does_not_leak_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a blocked restart tears down the unregistered process."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_RESTART_BASE_DELAY_S", 0.0)
+    host = _make_host_process()
+    host._zygote = None
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+    restart_spawned = threading.Event()
+    release_restart = threading.Event()
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        command = ["sh", "-c", "sleep 0.1; exit 3"] if not spawned else ["sleep", "60"]
+        proc = original_popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+        spawned.append(proc)
+        if len(spawned) == 2:
+            restart_spawned.set()
+            release_restart.wait(10.0)
+        return proc
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cancel_restart",
+        binding_token="tok_cancel_restart",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        watcher = next(iter(host._watcher_tasks))
+        assert await asyncio.to_thread(restart_spawned.wait, 5.0)
+        watcher.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await watcher
+        finally:
+            release_restart.set()
+
+    assert len(spawned) == 2
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and spawned[1].poll() is None:
+        await asyncio.sleep(0.05)
+    assert spawned[1].poll() is not None, "cancelled restart leaked an untracked runner"
+    host._cleanup_runners()
+
+
 async def test_watch_runner_reports_after_restart_budget_is_exhausted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1426,13 +1426,14 @@ class HostProcess:
             log_fh.close()
 
     def _discard_abandoned_spawn(self, spawn: asyncio.Future[Any]) -> None:
-        """Tear down a runner whose launch was cancelled before registration.
+        """Tear down a runner whose spawn was cancelled before registration.
 
-        ``_handle_launch`` shields the spawn, so a cancellation still lets the
-        fork land — but nothing registered it in ``self._runners``, so it would
-        never be watched, stopped, or reaped (and the zygote would hold its exit
-        status forever). Kill it off the loop, since for a zygote-forked runner
-        the terminate/wait round-trips are blocking control-socket exchanges.
+        Initial launches and supervised restarts shield the spawn, so a
+        cancellation still lets the fork land — but nothing registered it in
+        ``self._runners``, so it would never be watched, stopped, or reaped (and
+        the zygote would hold its exit status forever). Kill it off the loop,
+        since for a zygote-forked runner the terminate/wait round-trips are
+        blocking control-socket exchanges.
 
         :param spawn: The completed spawn future.
         """
@@ -1616,13 +1617,19 @@ class HostProcess:
             await asyncio.sleep(delay_s)
             if self._runners.get(runner_id) is not handle:
                 return
-            try:
-                proc, log_path = await asyncio.to_thread(
+            spawn = asyncio.ensure_future(
+                asyncio.to_thread(
                     self._spawn_runner_proc,
                     dict(launch_spec.env),
                     launch_spec.session_slug,
                     launch_spec.workspace,
                 )
+            )
+            try:
+                proc, log_path = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                spawn.add_done_callback(self._discard_abandoned_spawn)
+                raise
             except OSError as exc:
                 self._runners.pop(runner_id, None)
                 error += f"\nAutomatic restart failed: {exc}"
