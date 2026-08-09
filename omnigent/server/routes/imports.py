@@ -22,6 +22,7 @@ from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._host_session_import import (
     LocalSessionHostUnavailableError,
     LocalSessionNotFoundError,
@@ -369,7 +370,12 @@ def create_imports_router(
         """Authorize the caller and return a live connection to their host.
 
         Also returns the registry so callers get it already narrowed out
-        of the optional host-support configuration.
+        of the optional host-support configuration. Ownership is checked
+        via :func:`resolve_host_owner`, the same helper the host-launch
+        routes use, so the 404/403 semantics can't drift between them —
+        these endpoints read a user's private local transcripts off
+        their host, so a cross-tenant leak here is just as serious as a
+        cross-tenant runner launch.
 
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier from the caller.
@@ -383,11 +389,12 @@ def create_imports_router(
                 status_code=503, detail="host support is not configured on this server"
             )
         user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise HTTPException(status_code=409, detail="host is offline")

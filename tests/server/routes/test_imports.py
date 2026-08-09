@@ -104,6 +104,49 @@ async def host_env(
         )
 
 
+@pytest_asyncio.fixture()
+async def auth_host_env(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> AsyncIterator[_HostEnv]:
+    """Build a ``host_env`` with a real auth provider wired in.
+
+    ``host_env`` builds its app without an ``auth_provider``, so
+    ``require_user`` always returns ``None`` and the cross-tenant
+    branch of the host-owner check can never fire. This mirrors it but
+    adds ``UnifiedAuthProvider`` in strict header mode (the deployed
+    multi-user posture), so requests need an ``X-Forwarded-Email``
+    header and the ownership check is actually exercised.
+
+    :param runtime_init: Ensures runtime singletons are initialized.
+    :param db_uri: SQLite URI shared by every store in the app.
+    :param tmp_path: Per-test scratch dir for artifact/cache stores.
+    :returns: Async iterator yielding the assembled environment.
+    """
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    host_store = HostStore(db_uri)
+    app: FastAPI = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=host_store,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield _HostEnv(
+            client=client,
+            host_store=host_store,
+            host_registry=app.state.host_registry,
+        )
+
+
 def _register_offline_host(env: _HostEnv, host_id: str) -> None:
     """Record a host the caller owns that has no live connection.
 
@@ -114,18 +157,19 @@ def _register_offline_host(env: _HostEnv, host_id: str) -> None:
     env.host_store.set_offline(host_id)
 
 
-def _connect_host(env: _HostEnv, host_id: str) -> None:
-    """Record a host the caller owns and put a live connection in the registry.
+def _connect_host(env: _HostEnv, host_id: str, owner: str = _HOST_OWNER) -> None:
+    """Record a host owned by ``owner`` and put a live connection in the registry.
 
     :param env: The host-enabled environment.
     :param host_id: Host identifier to connect.
+    :param owner: User id the host is registered under.
     """
-    env.host_store.upsert_on_connect(host_id, name=host_id, user_id=_HOST_OWNER)
+    env.host_store.upsert_on_connect(host_id, name=host_id, user_id=owner)
     env.host_registry.register(
         host_id=host_id,
         ws=_FakeHostWebSocket(),  # type: ignore[arg-type] — duck-typed
         hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name=host_id),
-        owner=_HOST_OWNER,
+        owner=owner,
     )
 
 
@@ -377,6 +421,26 @@ async def test_list_local_sessions_reports_unknown_host(host_env: _HostEnv) -> N
     assert response.status_code == 404
 
 
+async def test_list_local_sessions_rejects_other_users_host(auth_host_env: _HostEnv) -> None:
+    """Browsing another user's host is a 403, via the shared host-owner check.
+
+    Pins the browse endpoint to :func:`resolve_host_owner`'s exact
+    contract rather than a bespoke inline check: same status code and
+    the same ``"not your host"`` detail text asserted for the
+    host-launch routes.
+    """
+    _connect_host(auth_host_env, _HOST_A, owner="alice@example.com")
+
+    response = await auth_host_env.client.get(
+        "/v1/imports/local-sessions",
+        params={"host_id": _HOST_A, "source": "claude"},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json().get("detail") == "not your host"
+
+
 async def test_list_local_sessions_surfaces_host_failure(
     host_env: _HostEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -533,6 +597,29 @@ async def test_import_local_session_creates_session(
     assert conversation.workspace == "/repo"
     assert conversation.external_session_id == "abc"
     assert conversation.labels["omnigent.wrapper"] == "claude-code-native-ui"
+
+
+async def test_import_local_session_rejects_other_users_host(
+    auth_host_env: _HostEnv,
+) -> None:
+    """Importing from another user's host is a 403, not a private transcript leak.
+
+    Without the shared ownership check, naming another user's
+    ``host_id`` would proxy that user's local Claude/Codex history
+    into the caller's session. Asserting the same detail text as the
+    host-launch routes pins this to :func:`resolve_host_owner` rather
+    than a route-local reimplementation.
+    """
+    _connect_host(auth_host_env, _HOST_A, owner="alice@example.com")
+
+    response = await auth_host_env.client.post(
+        "/v1/imports/local-sessions",
+        json={"host_id": _HOST_A, "source": "claude", "external_session_id": "abc"},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json().get("detail") == "not your host"
 
 
 async def test_import_local_session_reports_missing_source_session(
