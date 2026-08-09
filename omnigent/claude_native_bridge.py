@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib import error, request
 
-from omnigent._platform import stable_user_id
+from omnigent._platform import is_wsl, stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.json_types import JsonObject as _JsonObject
@@ -214,6 +214,44 @@ _TERMINAL_FAILURE_TAIL_CHARS = 800
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
+
+
+class ClaudeNativeHookInterpreterMismatchError(RuntimeError):
+    """Raised when a Windows Claude CLI cannot execute WSL hook commands."""
+
+
+def validate_claude_hook_interpreter_compatibility(
+    claude_path: str,
+    *,
+    wsl: bool | None = None,
+) -> None:
+    """Reject the known WSL runner / Windows-native Claude CLI mismatch.
+
+    Claude Code runs hooks through its own shell. A Windows-native CLI launched
+    from WSL cannot resolve Omnigent's WSL Python path embedded in those hooks,
+    so allowing this combination only produces an opaque readiness timeout.
+
+    :param claude_path: Resolved executable path that will launch Claude Code.
+    :param wsl: Test seam; ``None`` detects the current runtime.
+    :raises ClaudeNativeHookInterpreterMismatchError: If a WSL runner would
+        launch a Windows-native Claude executable.
+    """
+    if not (is_wsl() if wsl is None else wsl):
+        return
+    normalized_path = claude_path.replace("\\", "/")
+    path_lower = normalized_path.lower()
+    is_windows_mount = bool(re.match(r"^/mnt/[a-z](?:/|$)", path_lower))
+    has_windows_extension = Path(path_lower).suffix in {".exe", ".cmd", ".bat", ".ps1"}
+    if not (is_windows_mount or has_windows_extension):
+        return
+    raise ClaudeNativeHookInterpreterMismatchError(
+        "Claude Code executable "
+        f"{claude_path!r} is Windows-native, but Omnigent is running under WSL. "
+        "Claude Code cannot run Omnigent's WSL Python hook command from its Windows shell. "
+        "Install @anthropic-ai/claude-code from WSL (for example, `npm install -g "
+        "@anthropic-ai/claude-code`) so a WSL-native `claude` binary wins PATH resolution, "
+        "then retry."
+    )
 
 
 def _absolute_syntactic_path(path: Path) -> Path:

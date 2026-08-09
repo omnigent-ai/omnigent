@@ -13,10 +13,12 @@ import pytest
 
 from omnigent import claude_native_hook, native_policy_hook
 from omnigent.claude_native_bridge import (
+    ClaudeNativeHookInterpreterMismatchError,
     build_hook_settings,
     prepare_bridge_dir,
     read_transcript_path,
     record_hook_event,
+    validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
 from tests.native_hook_helpers import make_failing_client
@@ -33,6 +35,32 @@ def _trust_tmp_bridge_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
+
+
+def test_wsl_rejects_windows_native_claude_for_hook_interpreter() -> None:
+    """WSL must fail before Windows Claude Code reaches its incompatible hook."""
+    path = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError, match="WSL-native"):
+        validate_claude_hook_interpreter_compatibility(path, wsl=True)
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError):
+        validate_claude_hook_interpreter_compatibility("/opt/claude/claude.exe", wsl=True)
+
+
+@pytest.mark.parametrize(
+    ("path", "wsl"),
+    [
+        ("/home/example/.local/bin/claude", True),
+        ("/usr/local/bin/claude", False),
+        ("/Applications/Claude/bin/claude", False),
+        ("C:/Users/example/AppData/Roaming/npm/claude.cmd", False),
+    ],
+    ids=["wsl-native-claude", "linux", "macos", "windows"],
+)
+def test_claude_hook_interpreter_check_allows_compatible_platforms(path: str, wsl: bool) -> None:
+    """Only the WSL runner plus Windows-native CLI combination is rejected."""
+    validate_claude_hook_interpreter_compatibility(path, wsl=wsl)
 
 
 def test_session_start_hook_records_transcript_state_without_output(
