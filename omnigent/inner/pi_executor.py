@@ -42,6 +42,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -93,6 +94,7 @@ from .executor import (
 logger = logging.getLogger(__name__)
 
 _TOOL_TURN_MAX_CONTINUATIONS = 2
+_TOOL_EXECUTION_MAX_SECONDS = 600.0
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
@@ -1073,6 +1075,7 @@ class _PiRpcSession:
     _line_queue: Queue[str | None] = field(default_factory=Queue)
     _stderr_lines: list[str] = field(default_factory=list)
     _tmp_dir: str | None = None
+    _last_read_timed_out: bool = False
 
     async def start(
         self,
@@ -1199,8 +1202,11 @@ class _PiRpcSession:
     async def read_line(self, timeout: float = 120.0) -> str | None:
         """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
         try:
-            return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
+            line = await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
+            self._last_read_timed_out = False
+            return line
         except asyncio.TimeoutError:
+            self._last_read_timed_out = True
             return None
 
     async def close(self) -> None:
@@ -2441,6 +2447,8 @@ class PiExecutor(Executor):
         last_tool_failed = False
         failure_recovery_requested = False
         tool_turn_continuations = 0
+        active_tool_calls = 0
+        active_tool_started_at: float | None = None
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
         # fallback). Summed into a turn-level usage dict at completion so a
@@ -2496,6 +2504,31 @@ class PiExecutor(Executor):
             if line is None:
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
+                elif active_tool_calls:
+                    if not rpc._last_read_timed_out:
+                        yield ExecutorError(
+                            message="Pi process ended while a tool call was still running.",
+                            retryable=True,
+                        )
+                        return
+                    elapsed = (
+                        time.monotonic() - active_tool_started_at
+                        if active_tool_started_at is not None
+                        else 0.0
+                    )
+                    if elapsed < _TOOL_EXECUTION_MAX_SECONDS:
+                        logger.info(
+                            "PiExecutor: tool call still running after %.1fs; waiting",
+                            elapsed,
+                        )
+                        continue
+                    yield ExecutorError(
+                        message=(
+                            "Pi tool execution did not complete within "
+                            f"{int(_TOOL_EXECUTION_MAX_SECONDS)} seconds."
+                        ),
+                        retryable=True,
+                    )
                 elif saw_tool_activity and (
                     not completion_text_ready
                     or (last_tool_failed and not failure_recovery_requested)
@@ -2579,6 +2612,9 @@ class PiExecutor(Executor):
             if event_type == "tool_execution_start":
                 saw_tool_activity = True
                 completion_text_ready = False
+                if active_tool_calls == 0:
+                    active_tool_started_at = time.monotonic()
+                active_tool_calls += 1
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
                 yield ToolCallRequest(
@@ -2589,6 +2625,9 @@ class PiExecutor(Executor):
 
             if event_type == "tool_execution_end":
                 saw_tool_activity = True
+                active_tool_calls = max(0, active_tool_calls - 1)
+                if active_tool_calls == 0:
+                    active_tool_started_at = None
                 tool_name = event.get("toolName", "unknown")
                 is_error = event.get("isError", False)
                 result = event.get("result")

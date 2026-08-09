@@ -4622,7 +4622,9 @@ def test_pi_retries_idle_timeout_after_tool_activity() -> None:
 
         async def read_line(timeout=120.0):
             del timeout
-            return lines.pop(0) if lines else None
+            line = lines.pop(0) if lines else None
+            rpc._last_read_timed_out = line is None
+            return line
 
         rpc.read_line = read_line
         events = [
@@ -4642,6 +4644,69 @@ def test_pi_retries_idle_timeout_after_tool_activity() -> None:
             json.loads(line) for line in b"".join(rpc.process.stdin.data).decode().splitlines()
         ]
         assert len([item for item in commands if item.get("type") == "prompt"]) == 2
+
+    _run(_test())
+
+
+def test_pi_waits_when_tool_execution_exceeds_idle_timeout() -> None:
+    """A quiet in-flight tool is not mistaken for an incomplete turn."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc([])
+        lines: list[str | None] = [
+            json.dumps({"type": "response", "success": True}),
+            json.dumps(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "oracle__search",
+                    "args": {"query": "review the PR"},
+                }
+            ),
+            None,
+            json.dumps(
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "oracle__search",
+                    "isError": False,
+                    "result": {"summary": "evidence collected"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "delta": "The PR needs changes.",
+                    },
+                }
+            ),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ]
+
+        async def read_line(timeout=120.0):
+            del timeout
+            line = lines.pop(0) if lines else None
+            rpc._last_read_timed_out = line is None
+            return line
+
+        rpc.read_line = read_line
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "review the PR"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "The PR needs changes."
+        commands = [
+            json.loads(line) for line in b"".join(rpc.process.stdin.data).decode().splitlines()
+        ]
+        assert len([item for item in commands if item.get("type") == "prompt"]) == 1
 
     _run(_test())
 
