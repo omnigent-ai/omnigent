@@ -152,11 +152,15 @@ export function AppShell() {
   );
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on the Terminals tab the FileViewer
-  // is unmounted, so the 720 floor would just waste horizontal space.
+  // is unmounted, so the 720 floor would just waste horizontal space. Both
+  // the Files and Changes tabs surface the inline viewer, so either qualifies.
   // 240px (CommentsPanel default/min width) + 480px comfortable code viewer
   // width. The panel can be dragged wider, but this floor keeps it usable at
   // its default; widening past it is the user's choice via the inline handle.
-  const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
+  const inlinePanelMinWidth =
+    (rightRailTab === "files" || rightRailTab === "changes") && fileViewerCommentsOpen
+      ? 720
+      : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
