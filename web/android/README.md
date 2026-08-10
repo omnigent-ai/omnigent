@@ -179,12 +179,25 @@ keytool -genkeypair -v -keystore omnigent-upload.jks \
   -keyalg RSA -keysize 2048 -validity 10000 -alias omnigent-upload
 ```
 
-Build the Play-ready App Bundle (Play requires an `.aab`, not an APK); bump
-`versionCode` in `app/build.gradle.kts` before each upload:
+Build the Play-ready App Bundle (Play requires an `.aab`, not an APK):
 
 ```sh
 ./gradlew bundleRelease   # → app/build/outputs/bundle/release/app-release.aab
 ```
+
+### Versioning
+
+`versionCode` and `versionName` default to the values in
+`app/build.gradle.kts`, and either can be overridden at build time — no source
+edit needed for a one-off build:
+
+```sh
+./gradlew bundleRelease -PversionCode=10 -PversionName=0.2.0
+```
+
+Bump `versionCode` for every Play upload (Play rejects a reused code). The
+`Android Bundle` workflow takes both as `workflow_dispatch` inputs; leaving
+`version-name` blank keeps the checked-in default.
 
 ### Automated publishing (Gradle Play Publisher)
 
@@ -205,8 +218,7 @@ export PLAY_SERVICE_ACCOUNT_JSON=/path/to/play-credentials.json
 ```
 
 The publish tasks are inert when no credentials file is present, so ordinary
-builds are unaffected. Bump `versionCode` before each publish (Play rejects a
-reused code). Change the target track via `track.set(...)` in
+builds are unaffected. Change the target track via `track.set(...)` in
 `app/build.gradle.kts` (`internal` → `alpha` → `beta` → `production`).
 
 > Status: builds clean — `gradlew :app:assembleDebug :app:lintDebug` produces a

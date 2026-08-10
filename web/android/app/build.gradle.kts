@@ -30,6 +30,15 @@ fun signingValue(
 
 val storeFilePath = signingValue("storeFile", "OMNIGENT_KEYSTORE_FILE")
 
+// Version is overridable at build time so release builds can be stamped without
+// editing this file: ./gradlew bundleRelease -PversionCode=10 -PversionName=0.2.0
+// The defaults below apply to local and debug builds.
+fun buildProperty(key: String): String? =
+    (project.findProperty(key) as? String)?.takeIf { it.isNotBlank() }
+
+val appVersionCode = buildProperty("versionCode")?.toIntOrNull() ?: 9
+val appVersionName = buildProperty("versionName") ?: "0.1.3"
+
 android {
     namespace = "ai.omnigent.android"
     compileSdk = 36
@@ -38,8 +47,8 @@ android {
         applicationId = "ai.omnigent.android"
         minSdk = 28
         targetSdk = 36
-        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 9
-        versionName = "0.1.3"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
