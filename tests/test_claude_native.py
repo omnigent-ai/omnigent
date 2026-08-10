@@ -6856,6 +6856,8 @@ def test_resolve_native_claude_config_ambient_key(
     native Claude would ignore the ambient credential.
     """
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+    # An ambient gateway ANTHROPIC_BASE_URL would be honored and flip the assert (#4279).
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
     assert cfg is not None
@@ -6869,6 +6871,8 @@ def test_resolve_native_claude_config_ambient_prefixed_key(
 ) -> None:
     """A prefixed Anthropic key routes native Claude without raw env exposure."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # An ambient gateway ANTHROPIC_BASE_URL would be honored and flip the assert (#4279).
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
