@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -37,6 +38,20 @@ def _stub_claude(
     return calls
 
 
+def _stub_managed_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    payload: dict[str, Any] | None,
+) -> None:
+    if payload is None:
+        paths: tuple[Any, ...] = (tmp_path / "absent.json",)
+    else:
+        settings = tmp_path / "managed-settings.json"
+        settings.write_text(json.dumps(payload), encoding="utf-8")
+        paths = (settings,)
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", paths)
+
+
 def _stub_codex(monkeypatch: pytest.MonkeyPatch, launch: NativeCodexLaunch) -> None:
     monkeypatch.setattr(
         codex_native_app_server,
@@ -62,16 +77,21 @@ def test_claude_gateway_backed_for_gateway_env_with_helper(
 
 def test_claude_not_gateway_backed_without_api_key_helper(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
 ) -> None:
     _stub_claude(
         monkeypatch,
         ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": _GATEWAY_ANTHROPIC_URL}),
     )
+    _stub_managed_settings(monkeypatch, tmp_path, None)
 
     assert claude_gateway_inference_backed() is False
 
 
-def test_claude_not_gateway_backed_for_bedrock(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_claude_not_gateway_backed_for_bedrock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
     _stub_claude(
         monkeypatch,
         ClaudeNativeUcodeConfig(
@@ -81,12 +101,70 @@ def test_claude_not_gateway_backed_for_bedrock(monkeypatch: pytest.MonkeyPatch) 
             },
         ),
     )
+    _stub_managed_settings(monkeypatch, tmp_path, None)
 
     assert claude_gateway_inference_backed() is False
 
 
-def test_claude_not_gateway_backed_for_cli_login(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_claude_not_gateway_backed_for_cli_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
     _stub_claude(monkeypatch, None)
+    _stub_managed_settings(monkeypatch, tmp_path, None)
+
+    assert claude_gateway_inference_backed() is False
+
+
+def test_claude_gateway_backed_for_subscription_with_managed_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    _stub_claude(monkeypatch, None)
+    _stub_managed_settings(
+        monkeypatch,
+        tmp_path,
+        {
+            "env": {"ANTHROPIC_BASE_URL": _GATEWAY_ANTHROPIC_URL},
+            "apiKeyHelper": "jq -r '.access_token' ~/.databricks/model-serving-token.json",
+        },
+    )
+
+    assert claude_gateway_inference_backed() is True
+
+
+def test_claude_gateway_backed_for_subscription_with_use_gateway_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    _stub_claude(monkeypatch, None)
+    _stub_managed_settings(
+        monkeypatch,
+        tmp_path,
+        {
+            "env": {
+                "ANTHROPIC_BASE_URL": _GATEWAY_ANTHROPIC_URL,
+                "CLAUDE_CODE_USE_GATEWAY": "1",
+            }
+        },
+    )
+
+    assert claude_gateway_inference_backed() is True
+
+
+def test_claude_not_gateway_backed_for_managed_non_databricks_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    _stub_claude(monkeypatch, None)
+    _stub_managed_settings(
+        monkeypatch,
+        tmp_path,
+        {
+            "env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            "apiKeyHelper": "jq -r '.access_token' ~/.databricks/model-serving-token.json",
+        },
+    )
 
     assert claude_gateway_inference_backed() is False
 
