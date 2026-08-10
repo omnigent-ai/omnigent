@@ -163,9 +163,19 @@ function buildTree(files: WorkspaceFile[], sort: ChangedSort = "alpha"): TreeNod
 /**
  * Module-level cache that survives component unmount/remount within a JS
  * session (e.g. when the user opens the FileViewer and navigates back).
- * Keyed by conversationId so each conversation has independent state.
+ *
+ * Keyed by conversation AND browse location: node paths are relative to the
+ * browsed root, so a set captured at one root describes different directories
+ * at another. Carrying it across a re-root would collapse the new tree (its
+ * paths match nothing) and could expand an unrelated same-named folder.
+ * Keying by both also means navigating back restores what was open there.
  */
 const expandedPathsCache = new Map<string, Set<string>>();
+
+/** Cache key for one conversation's tree at one browsed root. */
+function expandedCacheKey(conversationId: string, browseLocation: string): string {
+  return `${conversationId}\u0000${browseLocation}`;
+}
 
 /** Compute the default open set: all non-lazy dirs start expanded. */
 function defaultExpandedPaths(files: WorkspaceFile[]): Set<string> {
@@ -205,6 +215,7 @@ export function FolderTree({
   isSearchError = false,
   searchError = null,
   browseLocation = "",
+  onNavigateDir,
 }: {
   files: WorkspaceFile[] | undefined;
   isLoading: boolean;
@@ -239,18 +250,25 @@ export function FolderTree({
    * directory expansion resolves node paths against it.
    */
   browseLocation?: string;
+  /**
+   * Re-root the panel onto one of the tree's directories, given its path
+   * relative to the current location. Double-clicking a folder opens it,
+   * matching Finder; a single click still just expands in place.
+   */
+  onNavigateDir?: (relativePath: string) => void;
 }) {
   // Initialise from the module-level cache so expanded state survives
   // unmount/remount (e.g. opening the FileViewer and navigating back).
+  const cacheKey = conversationId ? expandedCacheKey(conversationId, browseLocation) : null;
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
-    if (!conversationId) return new Set();
-    const cached = expandedPathsCache.get(conversationId);
+    if (!cacheKey) return new Set();
+    const cached = expandedPathsCache.get(cacheKey);
     if (cached) return new Set(cached);
     // If files are already available (React Query cache hit), seed defaults now
     // to avoid a flash of all-collapsed state.
     if (files) {
       const initial = defaultExpandedPaths(files);
-      expandedPathsCache.set(conversationId, initial);
+      expandedPathsCache.set(cacheKey, initial);
       return new Set(initial);
     }
     return new Set();
@@ -258,24 +276,25 @@ export function FolderTree({
 
   // When files arrive for the first time (async load) and no cache entry
   // exists yet, compute and persist the default open set. Also re-sync from
-  // the cache when the panel switches conversations without remounting —
-  // otherwise the tree keeps the previous conversation's expanded set. A
-  // layout effect so the switch resolves before paint (no collapsed flash).
-  const expandedForRef = useRef(conversationId);
+  // the cache when the panel switches conversations OR re-roots onto another
+  // directory without remounting — otherwise the tree keeps an expanded set
+  // describing a different root. A layout effect so the switch resolves
+  // before paint (no collapsed flash).
+  const expandedForRef = useRef(cacheKey);
   useLayoutEffect(() => {
-    if (!conversationId) return;
-    const switched = expandedForRef.current !== conversationId;
-    expandedForRef.current = conversationId;
-    const cached = expandedPathsCache.get(conversationId);
+    if (!cacheKey) return;
+    const switched = expandedForRef.current !== cacheKey;
+    expandedForRef.current = cacheKey;
+    const cached = expandedPathsCache.get(cacheKey);
     if (cached) {
       if (switched) setExpandedPaths(new Set(cached));
       return;
     }
     if (!files) return;
     const initial = defaultExpandedPaths(files);
-    expandedPathsCache.set(conversationId, initial);
+    expandedPathsCache.set(cacheKey, initial);
     setExpandedPaths(new Set(initial));
-  }, [conversationId, files]);
+  }, [cacheKey, files]);
 
   // Map from file path → change status, for file-level badges in the tree.
   const changedFileMap = useMemo<Map<string, WorkspaceChangedFile["status"]>>(() => {
@@ -308,11 +327,11 @@ export function FolderTree({
         const next = new Set(prev);
         if (next.has(path)) next.delete(path);
         else next.add(path);
-        if (conversationId) expandedPathsCache.set(conversationId, next);
+        if (cacheKey) expandedPathsCache.set(cacheKey, next);
         return next;
       });
     },
-    [conversationId],
+    [cacheKey],
   );
 
   // When a search query is active, render a flat filtered list instead of the tree.
@@ -418,6 +437,7 @@ export function FolderTree({
             dirtyDirMap={dirtyDirMap}
             sort={sort}
             browseLocation={browseLocation}
+            onNavigateDir={onNavigateDir}
           />
         ))}
       </ul>
@@ -623,6 +643,7 @@ function TreeNodeRow({
   dirtyDirMap,
   sort,
   browseLocation,
+  onNavigateDir,
 }: {
   node: TreeNode;
   depth: number;
@@ -636,6 +657,8 @@ function TreeNodeRow({
   sort: ChangedSort;
   /** Absolute path currently browsed; node paths resolve against it. */
   browseLocation: string;
+  /** Re-root onto a directory (double-click), path relative to the root. */
+  onNavigateDir?: (relativePath: string) => void;
 }) {
   const open = node.type === "dir" && expandedPaths.has(node.path);
   const isLazyDir = node.type === "dir" && node.lazy === true;
@@ -709,6 +732,11 @@ function TreeNodeRow({
           type="button"
           className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
           onClick={() => onTogglePath(node.path)}
+          // Finder's contract: single click expands in place, double click
+          // opens the folder as the new working folder. The browser fires the
+          // two single clicks first, so the row toggles twice (a no-op) before
+          // re-rooting replaces the tree outright.
+          onDoubleClick={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
           aria-expanded={open}
         >
           <ChevronRightIcon
@@ -782,6 +810,7 @@ function TreeNodeRow({
               dirtyDirMap={dirtyDirMap}
               sort={sort}
               browseLocation={browseLocation}
+              onNavigateDir={onNavigateDir}
             />
           ))}
         </ul>

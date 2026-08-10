@@ -20,6 +20,7 @@ import {
   RunnerOfflineError,
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
+  relativizeToWorkspace,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
   toWorkspaceRelativePath,
@@ -142,6 +143,40 @@ function FileSearchProbe({
   enabled?: boolean;
 }) {
   useWorkspaceFileSearch(id, query, include, exclude, { enabled });
+  return null;
+}
+
+function AllFilesPathsProbe({
+  id,
+  location,
+  onPaths,
+}: {
+  id: string;
+  location: string;
+  onPaths: (paths: string[]) => void;
+}) {
+  const query = useWorkspaceAllFiles(id, {}, location);
+  useEffect(() => {
+    if (query.isSuccess) onPaths(query.data.data.map((f) => f.path));
+  }, [query.isSuccess, query.data, onPaths]);
+  return null;
+}
+
+function DirectoryPathsProbe({
+  id,
+  path,
+  location,
+  onPaths,
+}: {
+  id: string;
+  path: string;
+  location: string;
+  onPaths: (paths: string[]) => void;
+}) {
+  const query = useWorkspaceDirectory(id, path, location);
+  useEffect(() => {
+    if (query.isSuccess) onPaths(query.data.map((f) => f.path));
+  }, [query.isSuccess, query.data, onPaths]);
   return null;
 }
 
@@ -748,6 +783,25 @@ describe("looksLikeWorkspaceFilePath", () => {
   });
 });
 
+describe("relativizeToWorkspace", () => {
+  // The wire form decides the authorization level the server applies: an
+  // absolute location is owner-gated (it can name any path on the host), a
+  // relative one is not. So a folder INSIDE the workspace must go out
+  // relative, or every collaborator browsing their own workspace gets a 403.
+  it.each([
+    [null, "/work/proj", "", "the root is the empty location"],
+    ["/work/proj", "/work/proj", "", "the root itself normalizes to empty"],
+    ["/work/proj/", "/work/proj", "", "a trailing slash on the root still matches"],
+    ["/work/proj/src", "/work/proj", "src", "a child goes out relative"],
+    ["/work/proj/src/ui", "/work/proj", "src/ui", "a deep child keeps its subpath"],
+    ["/etc", "/work/proj", "/etc", "an outside path stays absolute"],
+    ["/work/proj-old", "/work/proj", "/work/proj-old", "a name-prefixed sibling is NOT a child"],
+    ["/work/proj", null, "/work/proj", "an unknown root cannot be relativized"],
+  ])("%s under %s -> %s (%s)", (browsed, root, expected, why) => {
+    expect(relativizeToWorkspace(browsed, root), why).toBe(expected);
+  });
+});
+
 describe("toWorkspaceRelativePath", () => {
   const ROOT = "/home/u/ws";
   const HOME = "/home/u";
@@ -995,5 +1049,83 @@ describe("runnerOfflineRetryDelay", () => {
     expect(runnerOfflineRetryDelay(3)).toBe(8000);
     expect(runnerOfflineRetryDelay(4)).toBe(15_000);
     expect(runnerOfflineRetryDelay(10)).toBe(15_000);
+  });
+});
+
+describe("browse-location listings normalize to paths relative to the location", () => {
+  // The runner answers the two wire forms with DIFFERENT path shapes: a
+  // relative location is echoed back as a prefix on every entry, an absolute
+  // one is not. The panel picks the wire form on authorization grounds, so it
+  // must not also inherit a shape change -- an un-stripped prefix renders the
+  // browsed folder as an extra level inside its own tree.
+  function entries(...paths: string[]): Response {
+    return jsonResponse({
+      object: "list",
+      data: paths.map((path) => ({
+        id: path,
+        name: path.split("/").pop(),
+        path,
+        type: "file",
+        bytes: 1,
+        modified_at: null,
+      })),
+      has_more: false,
+    });
+  }
+
+  beforeEach(() => {
+    onlineMock.mockReturnValue(true);
+  });
+
+  it("strips the echoed prefix a relative location comes back with", async () => {
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(entries("reports/summary.md", "reports/q3.csv"));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_rel" location="reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
+  });
+
+  it("leaves an absolute location's already-bare paths alone", async () => {
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(entries("summary.md"));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_abs" location="/elsewhere/reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md"]);
+  });
+
+  it.each([
+    ["reports", "reports/quarterly/q3.csv", "a relative location echoes the whole target"],
+    ["/elsewhere/reports", "q3.csv", "an absolute one lists bare"],
+  ])("roots a lazily-expanded directory's children under it (%s)", async (location, wirePath) => {
+    // Children address themselves relative to the tree's root, not to the
+    // directory that was listed -- otherwise expanding one level deeper
+    // would request the wrong path.
+    fetchMock.mockResolvedValueOnce(entries(wirePath));
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <DirectoryPathsProbe id="conv_dir" path="quarterly" location={location} onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
   });
 });

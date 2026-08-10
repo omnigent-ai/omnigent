@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import uuid
 from collections.abc import Iterator
@@ -292,3 +293,55 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         _absolute_fs_url(live_server, session_id, outside).removeprefix(live_server)
     )
     assert allowed.status_code == 200, allowed.text
+
+
+def test_shared_collaborator_double_clicks_into_a_workspace_folder(
+    browser: Browser,
+    live_server: str,
+    shared_browse: _SharedBrowse,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A collaborator CAN open a folder inside the workspace by double-click.
+
+    The counterpart to the test above, and the reason the panel sends an
+    in-workspace location in RELATIVE form: relative is authorized at ordinary
+    read level, absolute is owner-gated (the 403 pinned above). Sending the
+    folder's absolute path would refuse a collaborator a folder already listed
+    in front of them.
+    """
+    session_id = shared_browse.session_id
+
+    env = shared_browse.owner.get(f"/v1/sessions/{session_id}/resources/environments/default")
+    env.raise_for_status()
+    root = Path(env.json()["metadata"]["root"])
+    folder = root / "shared-subfolder"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "inside.txt").write_text("reachable without owner rights\n")
+    # The workspace is a real checkout shared with every other test in the
+    # shard, so this fixture directory must not outlive the test.
+    request.addfinalizer(lambda: shutil.rmtree(folder, ignore_errors=True))
+
+    grant = shared_browse.owner.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": shared_browse.bob_email, "level": _LEVEL_EDIT},
+    )
+    assert grant.status_code in (200, 201, 204), grant.text
+
+    bob_ctx = _user_context(browser, shared_browse.bob_email)
+    bob_page = bob_ctx.new_page()
+    try:
+        _open_files_tree(bob_page, live_server, session_id)
+        bob_rail = bob_page.get_by_role("complementary", name="Workspace")
+
+        row = bob_rail.get_by_role("button", name="shared-subfolder/", exact=True)
+        expect(row).to_be_visible(timeout=30_000)
+        row.dblclick()
+
+        # Re-rooted for a non-owner: the folder's contents are the top level.
+        expect(bob_rail.get_by_text("inside.txt")).to_be_visible(timeout=30_000)
+        expect(row).to_have_count(0)
+        # Still no way OUT of the workspace -- navigating in does not hand a
+        # collaborator the owner-scoped browser.
+        expect(bob_rail.get_by_test_id("browse-location-path")).to_have_count(0)
+    finally:
+        bob_page.close()

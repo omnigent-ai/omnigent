@@ -231,3 +231,41 @@ describe("FolderTree trailing column", () => {
     expect(copyTextMock).toHaveBeenCalledWith("src");
   });
 });
+
+describe("FolderTree double-click to open a folder", () => {
+  it("re-roots onto the folder on double click, but only expands on a single click", () => {
+    // Finder's contract. A single click must keep working as the expand
+    // toggle -- if double click stole it, the tree would be unusable.
+    const onNavigateDir = vi.fn();
+    renderTree({ files: [dir("src"), file("README.md")], onNavigateDir });
+
+    const folder = screen.getByRole("button", { name: "src/" });
+
+    fireEvent.click(folder);
+    expect(onNavigateDir, "a single click must not re-root").not.toHaveBeenCalled();
+
+    fireEvent.doubleClick(folder);
+    expect(onNavigateDir).toHaveBeenCalledWith("src");
+  });
+
+  it("passes the path relative to the browsed root, not the bare folder name", () => {
+    // Nested rows must report their full path from the current root, or
+    // re-rooting from a deep row would land in the wrong directory.
+    const onNavigateDir = vi.fn();
+    renderTree({ files: [file("src/components/Button.tsx")], onNavigateDir });
+
+    fireEvent.doubleClick(screen.getByRole("button", { name: "components/" }));
+
+    expect(onNavigateDir).toHaveBeenCalledWith("src/components");
+  });
+
+  it("leaves folders inert when no navigate handler is supplied", () => {
+    // The prop is optional; without it the row must still expand normally.
+    renderTree({ files: [dir("src")] });
+
+    const folder = screen.getByRole("button", { name: "src/" });
+    fireEvent.doubleClick(folder);
+
+    expect(folder).toBeInTheDocument();
+  });
+});

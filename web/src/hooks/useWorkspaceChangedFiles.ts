@@ -319,15 +319,37 @@ interface FilesystemListResponse {
   has_more: boolean;
 }
 
-/** Normalize a raw filesystem list payload into `WorkspaceFile[]`. */
-function mapFilesystemEntries(json: FilesystemListResponse): WorkspaceFile[] {
-  return json.data.map((e) => ({
-    path: e.path,
-    name: e.name,
-    type: e.type === "directory" ? "directory" : "file",
-    bytes: e.bytes,
-    modified_at: e.modified_at,
-  }));
+/**
+ * Normalize a raw filesystem list payload into `WorkspaceFile[]` whose paths
+ * are relative to the browsed location.
+ *
+ * The two wire forms of a location disagree about the shape they list back: a
+ * RELATIVE target is echoed as a prefix on every entry (``"reports"`` yields
+ * ``"reports/summary.md"``) while an absolute one is not (``"summary.md"``).
+ * Stripping the relative prefix makes them interchangeable, so the panel can
+ * choose the wire form on authorization grounds alone.
+ *
+ * @param json Raw list payload.
+ * @param target Location that was listed, ``""`` for the workspace root.
+ * @param prefix Path re-attached to every entry, for callers whose paths must
+ *   stay relative to a shallower root than the directory they listed.
+ */
+function mapFilesystemEntries(
+  json: FilesystemListResponse,
+  target = "",
+  prefix = "",
+): WorkspaceFile[] {
+  const echoed = target && !target.startsWith("/") ? `${target}/` : "";
+  return json.data.map((e) => {
+    const relative = echoed && e.path.startsWith(echoed) ? e.path.slice(echoed.length) : e.path;
+    return {
+      path: joinBrowseLocation(prefix, relative),
+      name: e.name,
+      type: e.type === "directory" ? "directory" : "file",
+      bytes: e.bytes,
+      modified_at: e.modified_at,
+    };
+  });
 }
 
 async function fetchWorkspaceAllFiles(
@@ -362,7 +384,7 @@ async function fetchWorkspaceAllFiles(
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { available: true, data: mapFilesystemEntries(json) };
+  return { available: true, data: mapFilesystemEntries(json, location) };
 }
 
 /**
@@ -437,6 +459,33 @@ export function joinBrowseLocation(location: string, relative: string): string {
   return location === "/" ? `/${relative}` : `${location}/${relative}`;
 }
 
+/**
+ * Express a browsed absolute path as a location relative to the workspace,
+ * falling back to the absolute form when it lies outside.
+ *
+ * The two forms are not interchangeable on the wire: the server authorizes an
+ * absolute location at owner level (it can name any path on the host) but a
+ * relative one at the viewer's normal read level. Sending a subfolder of the
+ * workspace in absolute form would therefore refuse every collaborator, even
+ * though the folder sits inside the workspace they can already list.
+ *
+ * @param browsed Absolute path being browsed, or ``null`` for the root.
+ * @param workspaceRoot Absolute workspace root, or ``null`` when unknown.
+ * @returns ``""`` for the root, a relative path when inside, else absolute.
+ */
+export function relativizeToWorkspace(
+  browsed: string | null,
+  workspaceRoot: string | null,
+): string {
+  if (!browsed) return "";
+  if (!workspaceRoot) return browsed;
+  const root = workspaceRoot.replace(/\/$/, "");
+  if (browsed === root) return "";
+  // The separator guard keeps a sibling like "/work/project-old" from being
+  // read as a child of "/work/project".
+  return browsed.startsWith(`${root}/`) ? browsed.slice(root.length + 1) : browsed;
+}
+
 // ── Recursive file search ──────────────────────────────────────────────────────
 
 async function fetchWorkspaceFileSearch(
@@ -459,7 +508,7 @@ async function fetchWorkspaceFileSearch(
   // results rather than surfacing an error.
   if (res.status === 404) return [];
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
+  return mapFilesystemEntries((await res.json()) as FilesystemListResponse, location);
 }
 
 /**
@@ -513,12 +562,15 @@ async function fetchWorkspaceDirectory(
   dirPath: string,
   location = "",
 ): Promise<WorkspaceFile[]> {
-  const encodedPath = browseLocationSegment(joinBrowseLocation(location, dirPath));
+  const target = joinBrowseLocation(location, dirPath);
+  const encodedPath = browseLocationSegment(target);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?limit=1000&order=asc`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
+  // The tree addresses children relative to the location it is rooted at, one
+  // level shallower than the directory just listed.
+  return mapFilesystemEntries((await res.json()) as FilesystemListResponse, target, dirPath);
 }
 
 // ── Path existence check (parent-directory listing) ──────────────────────────

@@ -13,6 +13,7 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
@@ -24,7 +25,11 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  // Keep the module's PURE path helpers real. relativizeToWorkspace decides
+  // the wire form (and therefore the authorization level) of every request the
+  // panel makes, so stubbing it would test a fiction.
+  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
@@ -152,6 +157,7 @@ function renderPanel({
   treeSearchResults = [],
   isSearching = false,
   reachable = null,
+  onFileSelect = vi.fn(),
 }: {
   conversationId: string;
   flatView?: boolean;
@@ -166,6 +172,7 @@ function renderPanel({
     unconfined: boolean;
     roots: { path: string; access: string; origin: string }[];
   } | null;
+  onFileSelect?: (path: string) => void;
 }) {
   useAllFilesMock.mockReturnValue(allFilesResult(files));
   useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
@@ -183,7 +190,7 @@ function renderPanel({
               sort="recent"
               onSortChange={vi.fn()}
               flatView={flatView}
-              onFileSelect={vi.fn()}
+              onFileSelect={onFileSelect}
               showHidden={showHidden}
               onShowHiddenChange={vi.fn()}
               onClose={onClose}
@@ -1541,5 +1548,54 @@ describe("FilesPanel header copy path", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy folder path: etc" }));
 
     expect(copyTextMock).toHaveBeenCalledWith("/etc");
+  });
+});
+
+describe("FilesPanel double-click navigation", () => {
+  it("re-roots onto a double-clicked folder and asks the server RELATIVELY", () => {
+    // The wire form is the point. A subfolder of the workspace must be
+    // requested relative, because the server authorizes an absolute location
+    // at OWNER level -- sending "/home/user/proj/src" would 403 every
+    // collaborator browsing a folder they can already list.
+    renderPanel({
+      conversationId: "conv_dblclick",
+      flatView: false,
+      files: [file("src/App.tsx")],
+      workingDir: "/home/user/proj",
+    });
+
+    useAllFilesMock.mockClear();
+    fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
+
+    expect(useAllFilesMock).toHaveBeenCalledWith("conv_dblclick", { enabled: true }, "src");
+    // The header still names the absolute directory the user is standing in.
+    expect(screen.getByText("src")).toBeInTheDocument();
+  });
+
+  it("re-attaches the browsed folder when opening a file the tree named", () => {
+    // Tree paths are relative to where the tree is rooted, but the viewer
+    // resolves against the workspace root -- so after navigating into a
+    // folder, handing it the bare name would open the wrong file (or none).
+    const onFileSelect = vi.fn();
+    renderPanel({
+      conversationId: "conv_open_after_nav",
+      flatView: false,
+      files: [file("src/App.tsx")],
+      workingDir: "/home/user/proj",
+      onFileSelect,
+    });
+
+    // Re-rooting swaps the listing for one relative to the NEW root, which is
+    // why the bare name reaches the panel in the first place.
+    useAllFilesMock.mockImplementation((_id: unknown, _opts: unknown, location?: string) =>
+      location === "src"
+        ? allFilesResult([file("App.tsx")])
+        : allFilesResult([file("src/App.tsx")]),
+    );
+
+    fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
+    fireEvent.click(screen.getByText("App.tsx"));
+
+    expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx");
   });
 });

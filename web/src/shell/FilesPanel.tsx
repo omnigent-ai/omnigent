@@ -18,6 +18,8 @@ import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHeal
 import { useChatStore } from "@/store/chatStore";
 import {
   PathUnreachableError,
+  joinBrowseLocation,
+  relativizeToWorkspace,
   useWorkspaceChangedFiles,
   useWorkspaceAllFiles,
   useWorkspaceEnvironment,
@@ -279,12 +281,34 @@ export function FilesPanel({
   }, [conversationId]);
   const workingDir = browseLocation ?? workspaceRoot;
   // The wire form: "" means the workspace root (the historical relative
-  // contract); anything else is an absolute path.
-  const locationParam = browseLocation ?? "";
+  // contract). A location INSIDE the workspace is sent relative to it, and
+  // only a genuinely outside one is sent absolute. That distinction is not
+  // cosmetic: the server gates absolute paths at owner level, so sending an
+  // absolute path for a subfolder would 403 every collaborator browsing the
+  // workspace they can already read.
+  const locationParam = relativizeToWorkspace(browseLocation, workspaceRoot);
 
   function navigateTo(absolutePath: string) {
     setBrowseError(null);
     setBrowseLocation(absolutePath === workspaceRoot ? null : absolutePath);
+  }
+
+  /** Re-root onto a directory of the current tree (double-click to open). */
+  function navigateToChild(relativePath: string) {
+    if (!workingDir) return;
+    navigateTo(`${workingDir.replace(/\/$/, "")}/${relativePath}`);
+  }
+
+  /**
+   * Open a file the TREE named. Tree paths are relative to the browsed
+   * location while the viewer resolves against the workspace root, so an
+   * in-workspace location has to be re-attached — otherwise a file opened
+   * after navigating into a folder is looked for in the wrong place. An
+   * absolute location has no workspace-relative form to hand over, so it is
+   * passed through as before.
+   */
+  function openTreeFile(path: string) {
+    onFileSelect(locationParam.startsWith("/") ? path : joinBrowseLocation(locationParam, path));
   }
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
@@ -527,7 +551,7 @@ export function FilesPanel({
             isLoading={allFilesQuery.isLoading}
             isError={allFilesQuery.isError}
             error={allFilesQuery.error}
-            onFileSelect={onFileSelect}
+            onFileSelect={openTreeFile}
             conversationId={conversationId}
             showHidden={showHidden}
             onShowHidden={() => onShowHiddenChange(true)}
@@ -540,6 +564,7 @@ export function FilesPanel({
             isSearchError={treeSearchQuery.isError}
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
             browseLocation={locationParam}
+            onNavigateDir={navigateToChild}
           />
         )}
       </section>

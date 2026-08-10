@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse
@@ -62,6 +63,60 @@ def test_files_rail_working_folder_header_is_a_static_label(
     # no toggle needed. Scope is the rail tab now (Files vs Changes), not an
     # in-panel switch.
     expect(rail.get_by_role("searchbox", name="Search all files")).to_be_visible()
+
+
+def test_files_panel_double_click_opens_a_folder_as_the_working_folder(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+) -> None:
+    """Double-clicking a folder in the tree re-roots the panel onto it.
+
+    Finder's contract, driven through the real server, runner, and filesystem:
+    the panel asks for the folder, the runner lists it, and the tree redraws at
+    the new root. A single click must still only expand the row, or the tree
+    would be unusable.
+
+    The wire form this navigation uses (relative, so a non-owner is not refused)
+    is pinned separately, by the collaborator test in
+    ``collaboration/test_browse_outside_workspace.py`` -- an owner is allowed
+    either form, so this test cannot tell them apart.
+    """
+    base_url, session_id = seeded_session
+
+    env = page.request.get(f"{base_url}/v1/sessions/{session_id}/resources/environments/default")
+    assert env.status == 200, env.text()
+    root = Path(env.json()["metadata"]["root"])
+    folder = root / "double-click-demo"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "inside.txt").write_text("proof the tree re-rooted\n")
+    # The workspace is a real checkout shared with every other test in the
+    # shard, so this fixture directory must not outlive the test.
+    request.addfinalizer(lambda: shutil.rmtree(folder, ignore_errors=True))
+
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Files")).click()
+
+    row = rail.get_by_role("button", name="double-click-demo/", exact=True)
+    expect(row).to_be_visible(timeout=30_000)
+
+    # Single click = expand in place. The row stays, so we are still rooted at
+    # the workspace. Click again to collapse, leaving the pre-double-click
+    # state identical to the pre-single-click one.
+    row.click()
+    expect(row).to_have_attribute("aria-expanded", "true")
+    row.click()
+    expect(row).to_have_attribute("aria-expanded", "false")
+
+    row.dblclick()
+
+    # Re-rooted: the folder's own contents are the top level now, the folder
+    # row is gone, and the header names where we are.
+    expect(rail.get_by_text("inside.txt")).to_be_visible(timeout=30_000)
+    expect(row).to_have_count(0)
+    expect(rail.get_by_text("double-click-demo")).to_be_visible()
 
 
 _FAKE_HOST_ID = "host_files_panel_browse"
