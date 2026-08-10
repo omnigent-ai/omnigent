@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from omnigent.server import manager_webhook_dispatcher as dispatcher
+from omnigent.server import manager_webhook_signing as signing
 from omnigent.stores.session_lifecycle_store.sqlalchemy_store import (
     SqlAlchemySessionLifecycleStore,
 )
@@ -41,7 +42,7 @@ def store(db_uri: str) -> SqlAlchemySessionLifecycleStore:
 
 @pytest.fixture(autouse=True)
 def _webhook_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_MANAGER_WEBHOOK_SECRET", _SECRET)
+    monkeypatch.setenv(signing.SECRET_ENV_VAR, _SECRET)
 
 
 def _insert_event(store: SqlAlchemySessionLifecycleStore, *, session_id: str) -> str:
@@ -180,7 +181,7 @@ async def test_missing_secret_log_is_redacted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The "missing secret" error path (never signs/sends) still logs cleanly."""
-    monkeypatch.delenv("OMNIGENT_MANAGER_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv(signing.SECRET_ENV_VAR, raising=False)
     session_id = _hex_id("session-c")
     event_id = _insert_event(store, session_id=session_id)
     app = _build_fake_manager(always_fail=False)

@@ -125,7 +125,7 @@ def store(db_uri: str) -> SqlAlchemySessionLifecycleStore:
 
 @pytest.fixture(autouse=True)
 def _webhook_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_MANAGER_WEBHOOK_SECRET", _SECRET)
+    monkeypatch.setenv(signing.SECRET_ENV_VAR, _SECRET)
 
 
 def _enable_dispatch(monkeypatch: pytest.MonkeyPatch, *, endpoint: str = _ENDPOINT) -> None:

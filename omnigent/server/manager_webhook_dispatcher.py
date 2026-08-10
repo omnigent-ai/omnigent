@@ -155,7 +155,7 @@ async def _deliver_one(
             next_attempt_at=int(time.time()) + int(_backoff_seconds(event.attempt_count)),
             dead_letter_after_attempts=_DEAD_LETTER_AFTER_ATTEMPTS,
             error_code="missing_secret",
-            error_message="OMNIGENT_MANAGER_WEBHOOK_SECRET is not set",
+            error_message=f"{signing.SECRET_ENV_VAR} is not set",
         )
         _log_attempt(
             event,

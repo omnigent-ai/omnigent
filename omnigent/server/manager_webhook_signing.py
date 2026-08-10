@@ -19,8 +19,8 @@ import hashlib
 import hmac
 import os
 
-_SECRET_ENV = "OMNIGENT_MANAGER_WEBHOOK_SECRET"
-_SECRET_PREVIOUS_ENV = "OMNIGENT_MANAGER_WEBHOOK_SECRET_PREVIOUS"
+SECRET_ENV_VAR = "OMNIGENT_MANAGER_WEBHOOK_SECRET"
+PREVIOUS_SECRET_ENV_VAR = "OMNIGENT_MANAGER_WEBHOOK_SECRET_PREVIOUS"
 
 # Recommended replay-window tolerance (seconds) — see module docstring on
 # omnigent/server/manager_webhook_dispatcher.py for the delivery side and
@@ -30,13 +30,13 @@ DEFAULT_TOLERANCE_SECONDS = 300
 
 def current_secret() -> str | None:
     """The active signing secret, or ``None`` if unset (signing disabled)."""
-    value = os.environ.get(_SECRET_ENV)
+    value = os.environ.get(SECRET_ENV_VAR)
     return value if value else None
 
 
 def previous_secret() -> str | None:
     """The previous secret during a rotation window, or ``None``."""
-    value = os.environ.get(_SECRET_PREVIOUS_ENV)
+    value = os.environ.get(PREVIOUS_SECRET_ENV_VAR)
     return value if value else None
 
 

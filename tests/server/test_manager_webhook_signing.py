@@ -238,22 +238,22 @@ def test_verify_ignores_empty_secret_candidates() -> None:
 
 
 def test_current_secret_reads_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_MANAGER_WEBHOOK_SECRET", "abc123")
+    monkeypatch.setenv(signing.SECRET_ENV_VAR, "abc123")
     assert signing.current_secret() == "abc123"
 
 
 def test_current_secret_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OMNIGENT_MANAGER_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv(signing.SECRET_ENV_VAR, raising=False)
     assert signing.current_secret() is None
 
 
 def test_previous_secret_reads_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_MANAGER_WEBHOOK_SECRET_PREVIOUS", "old123")
+    monkeypatch.setenv(signing.PREVIOUS_SECRET_ENV_VAR, "old123")
     assert signing.previous_secret() == "old123"
 
 
 def test_previous_secret_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OMNIGENT_MANAGER_WEBHOOK_SECRET_PREVIOUS", raising=False)
+    monkeypatch.delenv(signing.PREVIOUS_SECRET_ENV_VAR, raising=False)
     assert signing.previous_secret() is None
 
 
