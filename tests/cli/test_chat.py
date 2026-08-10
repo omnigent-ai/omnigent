@@ -1482,6 +1482,70 @@ def test_prepare_chat_session_via_daemon_reports_create_failure_as_click_error(
     assert "launch" not in captured
 
 
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        httpx.ConnectError("All connection attempts failed"),
+        httpx.ConnectTimeout("timed out establishing a connection"),
+        httpx.ProxyError("proxy refused the tunnel"),
+    ],
+    ids=["connect-error", "connect-timeout", "proxy-error"],
+)
+@pytest.mark.parametrize(
+    ("server_url", "expected_hint"),
+    [
+        # A local server that stopped — the user restarts it.
+        ("http://127.0.0.1:6767", "omnigent stop"),
+        # A remote target — the URL, the network, or a proxy is at fault.
+        ("https://example.databricksapps.com", "proxy"),
+    ],
+)
+def test_prepare_chat_session_via_daemon_reports_unreachable_server_as_click_error(
+    server_url: str,
+    expected_hint: str,
+    transport_error: httpx.HTTPError,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused connection is a ``ClickException``, not a crash screen.
+
+    These are transport failures, so they never reach the SDK's
+    ``OmnigentError`` handling above and used to escape all the way to the
+    crash handler — turning "the server isn't reachable" into a branded crash
+    report with a traceback and no actionable advice. All three are siblings
+    under ``TransportError``, so catching one does not cover the others.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    async def _refused(_self: object, _bundle: bytes, *, filename: str, workspace: str) -> object:
+        raise transport_error
+
+    monkeypatch.setattr(_FakeSessionsApi, "create", _refused)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        asyncio.run(
+            _prepare_chat_session_via_daemon(
+                base_url=server_url,
+                headers={},
+                auth=None,
+                host_id="host_x",
+                bundle=b"bundle-bytes",
+                resume_conversation_id=None,
+                fork_session_id=None,
+                workspace="/tmp/proj",
+            )
+        )
+
+    message = str(excinfo.value)
+    # The URL identifies which server was unreachable.
+    assert server_url in message
+    # The advice has to differ: restarting a local server is not the fix for
+    # an unreachable remote one.
+    assert expected_hint in message
+    # No runner is launched against a server we could not reach.
+    assert "launch" not in captured
+
+
 # ── OMNIGENT_MODEL env-var fallback ───────────────────
 #
 # These tests pin explicit-environment and discovered-default precedence on

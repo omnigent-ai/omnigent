@@ -51,6 +51,7 @@ import {
   SquarePenIcon,
   Trash2Icon,
   XIcon,
+  PanelLeftOpenIcon,
 } from "lucide-react";
 import {
   DndContext,
@@ -254,6 +255,12 @@ interface SidebarProps {
   open: boolean;
   onClose: () => void;
   /**
+   * Pin a peeking sidebar fully open (the in-sidebar toggle shown while
+   * peeking). Optional (defaults to a no-op) so the sidebar renders standalone
+   * in tests.
+   */
+  onOpen?: () => void;
+  /**
    * Live open fraction (0 = closed, 1 = open) while the iOS shell's left-edge
    * swipe is dragging the sidebar; `null` when not dragging. When set, the
    * mobile overlay tracks it directly (transition suppressed) so the drawer
@@ -268,6 +275,10 @@ interface SidebarProps {
    * Optional (defaults to a no-op) so the sidebar renders standalone in tests.
    */
   onOpenSearch?: () => void;
+  /**
+   * Whether the sidebar is peeking.
+   */
+  peek?: boolean;
 }
 
 /**
@@ -451,7 +462,14 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored]);
 }
 
-export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
+export function Sidebar({
+  open,
+  onClose,
+  onOpen,
+  dragProgress = null,
+  onOpenSearch,
+  peek,
+}: SidebarProps) {
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -646,11 +664,37 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // interactive even though `open` hasn't flipped yet — treat a live drag as
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
-  const effectiveOpen = open || dragging;
+  const effectiveOpen = open || dragging || peek;
+
+  // While peeking, leaving the card closes it after a short grace period;
+  // re-entering before that fires cancels the close so a wobble doesn't
+  // dismiss it.
+  const peekCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPeekClose = useCallback(() => {
+    if (peekCloseTimer.current) {
+      clearTimeout(peekCloseTimer.current);
+      peekCloseTimer.current = null;
+    }
+  }, []);
+  useEffect(() => cancelPeekClose, [cancelPeekClose]);
 
   return (
     <aside
       aria-label="Conversations"
+      onPointerEnter={cancelPeekClose}
+      onPointerLeave={() => {
+        if (!peek) return;
+        cancelPeekClose();
+        // Defer closing if any context menu is open
+        const tryClose = () => {
+          if (document.querySelector('[role="menu"][data-state="open"]')) {
+            peekCloseTimer.current = setTimeout(tryClose, 200);
+            return;
+          }
+          onClose();
+        };
+        peekCloseTimer.current = setTimeout(tryClose, 200);
+      }}
       className={cn(
         // Base: bg + flex column. No transition — expand/collapse snaps
         // instantly (animating the width also lagged drag-to-resize).
@@ -681,8 +725,17 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // divider — no outer margin or rounding. Width (the user-resizable
         // variable) animates →0 to push main; when closed the border
         // collapses too so nothing lingers.
-        "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
-        open ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+        "md:translate-x-0 md:overflow-hidden",
+        // Normal desktop flow: relative panel that pushes main. Suppressed while
+        // peeking so its `md:inset-auto`/`md:relative` don't override the
+        // floating-card positioning below (same `md:` layer, source order wins).
+        !peek && "md:relative md:inset-auto",
+        open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+        // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
+        // ringed and shadowed, sliding+fading in from the left so it reads as an
+        // overlay rather than a push.
+        peek &&
+          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
       )}
       style={
         {
@@ -705,11 +758,15 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
       {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
           full-screen overlay with no resize affordance; the parent's ``inert``
-          when closed also keeps it from being draggable while collapsed. */}
-      <div
-        {...resizeHandleProps}
-        className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
-      />
+          when closed also keeps it from being draggable while collapsed.
+          Hidden while peeking too — the peek card is a fixed-width flyout, not
+          a resizable panel. */}
+      {!peek && (
+        <div
+          {...resizeHandleProps}
+          className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+        />
+      )}
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
@@ -768,26 +825,49 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Settings</TooltipContent>
               </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Close sidebar"
-                    onClick={onClose}
-                    className="size-6 text-muted-foreground hover:text-foreground"
-                  >
-                    {/* panel-right-open while the sidebar IS open — this button
+              {!peek ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Close sidebar"
+                      onClick={onClose}
+                      className="size-6 text-muted-foreground hover:text-foreground"
+                    >
+                      {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
                     covers the collapsed state). */}
-                    <PanelRightOpenIcon className="ui-icon" />
-                  </Button>
-                </TooltipTrigger>
-                {/* Bottom placement keeps the tooltip clear of the macOS
+                      <PanelRightOpenIcon className="ui-icon" />
+                    </Button>
+                  </TooltipTrigger>
+                  {/* Bottom placement keeps the tooltip clear of the macOS
                 Electron shell's traffic lights at the window's top edge. */}
-                <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
-              </Tooltip>
+                  <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
+                </Tooltip>
+              ) : (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Open sidebar"
+                      onClick={onOpen}
+                      className="size-6 text-muted-foreground hover:text-foreground"
+                    >
+                      {/* panel-right-open while the sidebar IS open — this button
+                    only renders in the open state (ChatHeader's PanelLeftIcon
+                    covers the collapsed state). */}
+                      <PanelLeftOpenIcon className="ui-icon" />
+                    </Button>
+                  </TooltipTrigger>
+                  {/* Bottom placement keeps the tooltip clear of the macOS
+                Electron shell's traffic lights at the window's top edge. */}
+                  <TooltipContent side="bottom">Open sidebar</TooltipContent>
+                </Tooltip>
+              )}
             </div>
           </div>
 
@@ -3210,12 +3290,13 @@ function ConversationRow({
     );
   }
 
-  // Archiving is a single PATCH (see runArchive); show a
-  // status row for the span instead of leaving the row looking idle. On
-  // success
-  // the list refetches and the row drops out of the default view (or
-  // flips to its archived state under "Show archived"); on failure the
-  // flag clears and the interactive row returns so the user can retry.
+  // Archiving is a single PATCH (see runArchive); show a status row for the
+  // span instead of leaving the row looking idle. The spinner stays up until
+  // the row itself leaves the sidebar: on success the list refetches and this
+  // row unmounts (dropped from the default view), which removes the spinner
+  // with it — it is deliberately NOT cleared on PATCH-settle, or it would
+  // vanish a round-trip before the row does. On failure the flag clears and
+  // the interactive row returns so the user can retry.
   if (isArchiving) {
     return (
       <li>
@@ -3258,8 +3339,17 @@ function ConversationRow({
     // tears down a host-spawned runner) in the background once the flag is
     // committed. Sending a client stop too would race that one against the
     // same runner, and the loser gets a 503 from the already-killed pane.
-    // "Archiving…" shows until the archive settles (success → row leaves
-    // the default list; failure → interactive row returns for a retry).
+    //
+    // "Archiving…" must stay up until the row actually LEAVES the sidebar,
+    // not merely until the PATCH resolves. The PATCH success only kicks off
+    // an async `["conversations"]` refetch (see useArchiveConversation); the
+    // row drops out a round-trip later, once that refetch lands and the
+    // archived row is filtered out of the rendered list. Clearing the
+    // spinner on settle (the old behavior) reopened that gap: the row flashed
+    // back to its plain, clickable form — spinner gone — while the session
+    // was still listed. So we DON'T clear it on success: this row unmounts
+    // when the refetch removes it, which tears the spinner down with it.
+    // Only an error clears the flag, restoring the interactive row for retry.
     setIsArchiving(true);
     archive.mutate(
       { id: conversation.id, archived: true },
@@ -3267,7 +3357,7 @@ function ConversationRow({
         // Point the user at where the session went — it's no longer in
         // the sidebar list, so surface its new home in Settings.
         onSuccess: showArchivedToast,
-        onSettled: () => setIsArchiving(false),
+        onError: () => setIsArchiving(false),
       },
     );
   }

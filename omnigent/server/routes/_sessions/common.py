@@ -196,6 +196,18 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 
+# Optional structured failure fields (present when the runner classified the
+# failure — see ``omnigent.runner.launch_failure``), persisted so a reload
+# renders the same clear failure card instead of only the raw code + message.
+_LAST_TASK_ERROR_TITLE_LABEL_KEY: str = "omnigent.last_task_error_title"
+
+
+_LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
+
+
+_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
@@ -804,8 +816,11 @@ __all__ = [
     "_LABEL_VALUE_MAX_LEN",
     "_LAST_CONTEXT_TOKENS_LABEL_KEY",
     "_LAST_CONTEXT_WINDOW_LABEL_KEY",
+    "_LAST_TASK_ERROR_CAUSE_LABEL_KEY",
     "_LAST_TASK_ERROR_CODE_LABEL_KEY",
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
+    "_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY",
+    "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",

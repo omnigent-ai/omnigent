@@ -44,12 +44,14 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import importlib.util
 import json
 import os
 import selectors
 import socket
 import sys
 import threading
+from pathlib import Path
 from typing import Any, cast
 
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
@@ -78,6 +80,35 @@ _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 # genuinely alive) instead of exiting, so a test can kill the zygote out from
 # under a live child and assert the crash-recovery path. Never set in prod.
 _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
+
+
+def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | None:
+    """Read ``(BUILD_TIME_EPOCH, COMMIT_SHA)`` from the on-disk ``_build_info.py``.
+
+    Loaded fresh from the file every call — never via ``sys.modules`` — so the
+    value tracks what an in-place ``omnigent`` upgrade rewrote on disk, not
+    what this process imported at boot.
+
+    :param package_dir: Directory holding ``_build_info.py``; defaults to the
+        installed ``omnigent`` package directory.
+    :returns: The stamp, or ``None`` when the file is missing or unreadable
+        (e.g. an unbuilt source checkout, or a package mid-rewrite).
+    """
+    if package_dir is None:
+        import omnigent
+
+        package_dir = Path(omnigent.__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location(
+        "_omnigent_zygote_build_probe", package_dir / "_build_info.py"
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        return float(module.BUILD_TIME_EPOCH), str(module.COMMIT_SHA)
+    except Exception:  # noqa: BLE001 — any failure means "stamp unknown"
+        return None
 
 
 def _import_runner_graph() -> None:
@@ -267,9 +298,20 @@ class _ZygoteServer:
     thread per connection.
 
     :param control_sock: The daemon control socket (role ``"daemon"``).
+    :param graph_stamp: The on-disk build stamp captured when the zygote
+        imported its graph, or ``None`` when unknown (unbuilt checkout).
+        Harness forks are refused once the on-disk stamp no longer matches:
+        the child would import the lazily-loaded harness modules from the
+        *new* files against the *old* pre-imported graph, breaking on any
+        cross-version import (e.g. a name added to a preloaded module).
     """
 
-    def __init__(self, control_sock: socket.socket) -> None:
+    def __init__(
+        self,
+        control_sock: socket.socket,
+        graph_stamp: tuple[float, str] | None = None,
+    ) -> None:
+        self._graph_stamp = graph_stamp
         self._sel = selectors.DefaultSelector()
         # Exit codes of reaped children, held until the requester polls; the
         # daemon/runner are not these children's parents and cannot waitpid().
@@ -488,6 +530,23 @@ class _ZygoteServer:
         :param conn: The runner socket to answer on.
         :param request: The ``fork_harness`` request (``argv`` + ``env``).
         """
+        if self._graph_stamp is not None and _disk_build_stamp() != self._graph_stamp:
+            # An in-place upgrade rewrote the package after this zygote
+            # imported its graph. A forked child would import the harness
+            # module from the new files against the old in-memory graph —
+            # a mixed-version process that fails on any new cross-module
+            # import. Refuse; the runner falls back to a direct exec, which
+            # runs the new code coherently.
+            _send(
+                conn,
+                {
+                    "error": (
+                        "omnigent was upgraded on disk after the zygote imported "
+                        "its graph; refusing to fork a mixed-version harness"
+                    )
+                },
+            )
+            return
         try:
             pid = os.fork()
         except OSError as exc:
@@ -583,6 +642,9 @@ def main() -> None:
 
     control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=control_fd)
 
+    # Capture the disk stamp of the graph about to be imported, so harness
+    # forks can detect an in-place upgrade landing after this point.
+    graph_stamp = _disk_build_stamp()
     _import_runner_graph()
     # The import graph is now static; move it out of GC's tracked set so cyclic
     # collections stay cheap and don't dirty shared pages in forked children.
@@ -606,7 +668,7 @@ def main() -> None:
 
     # Ctrl+C is a normal operator-driven shutdown; exit quietly without a traceback.
     with contextlib.suppress(KeyboardInterrupt):
-        _ZygoteServer(control_sock).serve()
+        _ZygoteServer(control_sock, graph_stamp=graph_stamp).serve()
 
 
 if __name__ == "__main__":

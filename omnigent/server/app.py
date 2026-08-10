@@ -2066,47 +2066,44 @@ def create_app(
         )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
-    async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark the turns *this* runner interrupted as offline.
 
-        Filters by ``runner_id`` against ``conversation_store`` so a
-        disconnect on one runner does not flip every cached session
-        (e.g. sessions owned by other runners on the same server, or
-        sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``.
-        :func:`_mark_runner_sessions_offline` then narrows that set to
-        the sessions actually mid-turn and stamps the disconnect cause
-        on them, so idle sub-agents keep their finished state and the
-        interrupted ones read as a recoverable disconnect.
+    # Pending per-runner grace timers: a disconnect schedules the
+    # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
+    # immediately, so transient tunnel drops (ingress recycles,
+    # sleep-wake reconnects) that re-register within the grace never
+    # flap their sessions to failed.
+    _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _cancel_disconnect_grace(runner_id: str) -> None:
+        """Cancel and forget the pending disconnect-grace timer, if any."""
+        pending = _disconnect_grace_tasks.pop(runner_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
+        """Reconcile a dropped runner's sessions once the grace expires.
+
+        A runner that re-registered inside the grace makes this a no-op
+        via the live-tunnel re-check (the same newest-wins rule the
+        immediate path used); one still gone hands its bound sessions to
+        :func:`_mark_runner_sessions_offline`, which fails only the
+        interrupted turns and stamps the disconnect cause.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.routes.sessions import (
+            RUNNER_DISCONNECT_GRACE_S,
+            _mark_runner_sessions_offline,
+        )
         from omnigent.server.schemas import ErrorDetail
 
-        # Newest-wins guard: a superseded tunnel's teardown fires this
-        # hook after a fresh tunnel for the same ``runner_id`` already
-        # registered (``TunnelRegistry.register`` retires the old
-        # session, whose helper tasks then error out and run this
-        # teardown). Marking the runner's sessions ``failed`` here would
-        # clobber the live tunnel's recovery: reconnect-recovery
-        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
-        # may have just cleared a stale ``runner_disconnected`` failure,
-        # and this stale disconnect would silently re-fail the session.
-        # If a live tunnel is registered for this runner, the runner is
-        # NOT offline, so skip. Mirrors the registry's own
-        # generation-guarded ``deregister``.
+        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
-                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
                 runner_id,
             )
             return
-        runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
-
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -2131,6 +2128,66 @@ def create_app(
             conversation_store,
         )
 
+    async def _on_runner_disconnect(runner_id: str) -> None:
+        """Schedule offline-marking for the turns *this* runner interrupted.
+
+        Filters by ``runner_id`` against ``conversation_store`` so a
+        disconnect on one runner does not flip every cached session
+        (e.g. sessions owned by other runners on the same server, or
+        sessions left in the module-level cache by earlier tests on
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
+
+        The user-visible failed flip waits out a reconnect grace
+        (``RUNNER_DISCONNECT_GRACE_S``): transient drops re-register
+        well inside it and the timer's live-tunnel re-check turns them
+        into no-ops, so routine recycles never flap sessions to failed.
+        Runner invalidation and liveness clearing stay immediate so
+        reconnect re-initialization still happens.
+
+        :param runner_id: The disconnected runner's id.
+        """
+        # Newest-wins guard: a superseded tunnel's teardown fires this
+        # hook after a fresh tunnel for the same ``runner_id`` already
+        # registered (``TunnelRegistry.register`` retires the old
+        # session, whose helper tasks then error out and run this
+        # teardown). Marking the runner's sessions ``failed`` here would
+        # clobber the live tunnel's recovery: reconnect-recovery
+        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
+        # may have just cleared a stale ``runner_disconnected`` failure,
+        # and this stale disconnect would silently re-fail the session.
+        # If a live tunnel is registered for this runner, the runner is
+        # NOT offline, so skip. Mirrors the registry's own
+        # generation-guarded ``deregister``.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                runner_id,
+            )
+            return
+        runner_session_initializer.invalidate_runner(runner_id)
+        # Graceful disconnect: clear the persisted liveness stamp so other
+        # replicas flip offline immediately rather than after the TTL.
+        session_live_state.clear_runner_liveness(runner_id)
+
+        # Replace any pending timer so a rapid drop-reconnect-drop gives
+        # each outage a full grace window.
+        _cancel_disconnect_grace(runner_id)
+        task = asyncio.create_task(
+            _mark_disconnected_runner_failed(runner_id),
+            name=f"runner-disconnect-grace-{runner_id}",
+        )
+        _disconnect_grace_tasks[runner_id] = task
+
+        def _clear_grace_slot(t: asyncio.Task[None]) -> None:
+            if _disconnect_grace_tasks.get(runner_id) is t:
+                _disconnect_grace_tasks.pop(runner_id, None)
+
+        task.add_done_callback(_clear_grace_slot)
+
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
@@ -2152,6 +2209,10 @@ def create_app(
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
+        # The crash report is authoritative and carries the richer cause;
+        # cancel any pending disconnect-grace timer so it can't re-run the
+        # disconnect reconciliation on top of it.
+        _cancel_disconnect_grace(runner_id)
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )

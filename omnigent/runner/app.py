@@ -81,6 +81,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
@@ -2175,17 +2176,35 @@ def create_runner_app(
             "argv omitted because terminal args may contain secrets)"
         )
 
-    def _format_required_terminal_exit_output(event: TerminalExitEvent) -> str:
+    def _format_required_terminal_exit_output(
+        event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
+    ) -> str:
         command = _format_terminal_command_for_failure(event)
         cwd = event.cwd or "unknown"
-        parts = [
-            "Required terminal exited unexpectedly; the session runtime is no longer available.",
-            "",
-            "Terminal diagnostics:",
-            f"terminal: {event.terminal_name}:{event.session_key}",
-            f"command: {command}",
-            f"cwd: {cwd}",
-        ]
+        parts: list[str] = []
+        if diagnosis is not None:
+            # Lead with the human interpretation so the failure reads clearly
+            # even before the raw diagnostics block.
+            parts.extend([diagnosis.title, "", diagnosis.cause])
+            if diagnosis.remediation:
+                parts.extend(["", f"Try this: {diagnosis.remediation}"])
+        else:
+            parts.append(
+                "Required terminal exited unexpectedly; the session runtime is no longer "
+                "available."
+            )
+        exited_with = (
+            f" (exited with status {event.exit_status})" if event.exit_status is not None else ""
+        )
+        parts.extend(
+            [
+                "",
+                "Terminal diagnostics:",
+                f"terminal: {event.terminal_name}:{event.session_key}",
+                f"command: {command}{exited_with}",
+                f"cwd: {cwd}",
+            ]
+        )
         if event.last_output:
             parts.extend(["", "Last captured terminal output:", event.last_output])
         else:
@@ -2197,6 +2216,29 @@ def create_runner_app(
                 ]
             )
         return "\n".join(parts)
+
+    def _build_required_terminal_error(event: TerminalExitEvent) -> dict[str, str]:
+        """Build the structured ``session.status`` error for a required-terminal exit.
+
+        Always carries ``code`` + a fully-composed ``message`` (back-compat: the
+        REPL and older clients render it verbatim). When the failure is
+        recognized, also carries ``title`` / ``cause`` / ``remediation`` so the
+        web UI can render a friendly card instead of the raw enum + blob.
+        """
+        # Classify once; the message formatter reuses the same diagnosis.
+        diagnosis = classify_terminal_failure(
+            command=event.command,
+            exit_status=event.exit_status,
+            output=event.last_output,
+        )
+        message = _format_required_terminal_exit_output(event, diagnosis)
+        error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
+        if diagnosis is not None:
+            error["title"] = diagnosis.title
+            error["cause"] = diagnosis.cause
+            if diagnosis.remediation:
+                error["remediation"] = diagnosis.remediation
+        return error
 
     def _release_required_terminal_session(session_id: str) -> None:
         if process_manager is None:
@@ -2250,22 +2292,19 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        output = _format_required_terminal_exit_output(event)
+        error = _build_required_terminal_error(event)
         _publish_event(
             event.session_id,
             {
                 "type": "session.status",
                 "status": "failed",
-                "error": {
-                    "code": "required_terminal_exited",
-                    "message": output,
-                },
+                "error": error,
             },
         )
         _mark_subagent_terminal_and_wake(
             event.session_id,
             status="failed",
-            output=output,
+            output=error["message"],
         )
         _release_required_terminal_session(event.session_id)
 
@@ -2479,12 +2518,20 @@ def create_runner_app(
             FilesystemPathNotFound,
             FileTooLarge,
             InvalidPath,
+            PathUnreachable,
             UnsupportedMediaType,
         )
 
         status = 500
+        error: dict[str, object] = {"code": exc.code, "message": exc.message}
         if isinstance(exc, FilesystemPathNotFound):
             status = 404
+        elif isinstance(exc, PathUnreachable):
+            # 403, not 400: the path is well-formed, the caller just may not
+            # see it. Carries the reachable roots so a UI can say what IS
+            # available without a second round trip.
+            status = 403
+            error["reachable_roots"] = exc.reachable_roots
         elif isinstance(exc, InvalidPath):
             status = 400
         elif isinstance(exc, DirectoryNotEmpty):
@@ -2495,9 +2542,7 @@ def create_runner_app(
             status = 415
         return JSONResponse(
             status_code=status,
-            content={
-                "error": {"code": exc.code, "message": exc.message},
-            },
+            content={"error": error},
         )
 
     @app.get("/health")
@@ -6572,6 +6617,39 @@ def create_runner_app(
             order=order,
         )
 
+    def _environment_reach(root: str, agent_spec: AgentSpec | None) -> dict[str, object]:
+        """Describe what the default environment's file browsing can reach.
+
+        ``unconfined`` reports that no OS-level sandbox is applied, so the
+        environment's shell already reads anything the runner can and a
+        browser may range beyond the listed roots. ``roots`` always names
+        the grants the environment's own file tools reach, workspace first,
+        so a caller can anchor on the workspace and label the rest.
+
+        :param root: Resolved absolute environment root.
+        :param agent_spec: Agent spec for the session, if any.
+        :returns: JSON-ready ``{"unconfined": bool, "roots": [...]}``.
+        """
+        from omnigent.inner.sandbox import (
+            ReachableRoot,
+            is_unconfined,
+            reach_payload,
+            reachable_roots,
+            resolve_sandbox,
+        )
+
+        root_path = Path(root)
+        spec_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
+        if spec_os_env is None:
+            # No spec to resolve (dev/standalone): report the root alone
+            # rather than guessing a wider reach.
+            return reach_payload(
+                [ReachableRoot(path=root_path, access="write", origin="cwd", kind="tree")],
+                unconfined=False,
+            )
+        policy = resolve_sandbox(spec_os_env, root_path)
+        return reach_payload(reachable_roots(root_path, policy), unconfined=is_unconfined(policy))
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}")
     async def get_session_environment(
         session_id: str,
@@ -6606,6 +6684,7 @@ def create_runner_app(
                 home = os.path.expanduser("~")
                 if os.path.isabs(home):
                     metadata["home"] = home
+                metadata["reachable"] = _environment_reach(root, agent_spec)
                 content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,
@@ -7221,6 +7300,49 @@ def create_runner_app(
         exclude: str | None = Query(default=None),
         limit: int = Query(default=500, ge=1, le=500),
     ) -> JSONResponse:
+        return await _fs_search(
+            session_id,
+            environment_id,
+            "",
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    @app.get(
+        "/v1/sessions/{session_id}/resources/environments/{environment_id}/search/{path:path}"
+    )
+    async def search_environment_files_under(
+        session_id: str,
+        environment_id: str,
+        path: str,
+        q: str = Query(min_length=1, pattern=r".*\S.*"),
+        include: str | None = Query(default=None),
+        exclude: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> JSONResponse:
+        """Search under a directory, so results match what the tree shows."""
+        return await _fs_search(
+            session_id,
+            environment_id,
+            path,
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    async def _fs_search(
+        session_id: str,
+        environment_id: str,
+        path: str,
+        *,
+        q: str,
+        include: str | None,
+        exclude: str | None,
+        limit: int,
+    ) -> JSONResponse:
         from omnigent.runner.environment_filesystem import (
             CallerProcessFilesystem,
             split_glob_list,
@@ -7233,8 +7355,9 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env)
-        entries = await fs.search_files(
+        entries, truncated = await fs.search_files(
             q,
+            path=path,
             include=include_patterns,
             exclude=exclude_patterns,
             limit=limit,
@@ -7242,7 +7365,15 @@ def create_runner_app(
         data = [_fs_entry_to_dict(e) for e in entries]
         return JSONResponse(
             status_code=200,
-            content={"object": "list", "data": data, "has_more": len(entries) >= limit},
+            content={
+                "object": "list",
+                "base": str(fs._resolve(path)),
+                "data": data,
+                "has_more": len(entries) >= limit,
+                # The scan budget ran out before the tree did, so "no matches"
+                # here would be a lie — the caller must be able to say so.
+                "truncated": truncated,
+            },
         )
 
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
@@ -7954,6 +8085,9 @@ def create_runner_app(
                 status_code=200,
                 content={
                     "object": "list",
+                    # Absolute base the entry paths are relative to. Callers
+                    # that only ever browse the workspace can keep ignoring it.
+                    "base": str(resolved),
                     "data": data,
                     "first_id": page.first_id,
                     "last_id": page.last_id,
@@ -8746,9 +8880,13 @@ def create_runner_app_from_env() -> FastAPI:
     server_url = os.environ.get("RUNNER_SERVER_URL", "").strip()
     if not server_url:
         raise RuntimeError("RUNNER_SERVER_URL is required for the runner subprocess factory")
+    from omnigent_client._http import is_loopback_url
+
     server_client = httpx.AsyncClient(
         base_url=server_url,
         timeout=httpx.Timeout(5.0, read=None),
+        # A proxy cannot reach a loopback server, so local targets bypass it.
+        trust_env=not is_loopback_url(server_url),
     )
     return create_runner_app(server_client=server_client)
 
@@ -8958,6 +9096,7 @@ def _build_spawn_env_from_spec(
             _build_copilot_spawn_env,
             _build_cursor_spawn_env,
             _build_goose_spawn_env,
+            _build_hermes_spawn_env,
             _build_kimi_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
@@ -8978,6 +9117,8 @@ def _build_spawn_env_from_spec(
             env = _build_antigravity_spawn_env(effective_spec)
         elif harness == "kimi":
             env = _build_kimi_spawn_env(effective_spec, cwd=cwd)
+        elif harness == "hermes":
+            env = _build_hermes_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "qwen":
             env = _build_qwen_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "goose":

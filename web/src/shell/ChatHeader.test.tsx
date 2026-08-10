@@ -33,6 +33,7 @@ const mobileMenu = {
   subagentsWorking: 0,
   agentCount: 1,
   onOpenFiles: () => {},
+  onOpenChanges: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
   onOpenTodos: () => {},

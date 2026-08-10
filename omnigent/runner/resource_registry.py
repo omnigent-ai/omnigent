@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.inner.sandbox import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
     from omnigent.claude_native_status_file import SessionStatusPoller
@@ -144,6 +146,10 @@ class TerminalExitEvent:
         specs may contain credentials or other launch-only secrets.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
+    :param exit_status: The inner process's exit code, when tmux captured one
+        from ``#{pane_dead_status}`` (terminals with ``keep_alive_after_exit``).
+        ``None`` when unknown — e.g. the tmux server vanished before the status
+        could be read, or the terminal doesn't keep the pane alive after exit.
     :param session_was_idle: Whether the session's last PTY-derived status was
         ``idle`` at exit. ``True`` marks a clean shutdown after the turn
         finished; ``False`` (the default — last seen ``running``, or never
@@ -159,6 +165,7 @@ class TerminalExitEvent:
     args_count: int | None = None
     cwd: str | None = None
     last_output: str | None = None
+    exit_status: int | None = None
     session_was_idle: bool = False
 
 
@@ -170,27 +177,32 @@ def _trim_terminal_exit_output(text: str | None) -> str | None:
     if not stripped:
         return None
     lines = stripped.splitlines()
+    omitted_lines = 0
     if len(lines) > _TERMINAL_EXIT_OUTPUT_MAX_LINES:
-        lines = [
-            f"... omitted {len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES} earlier line(s) ...",
-            *lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:],
-        ]
-    clipped = "\n".join(lines)
-    if len(clipped) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
-        clipped = (
-            f"... omitted {len(clipped) - _TERMINAL_EXIT_OUTPUT_MAX_CHARS} "
-            "earlier character(s) ...\n"
-            f"{clipped[-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]}"
-        )
-    return clipped
+        omitted_lines = len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES
+        lines = lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:]
+    # Drop whole leading lines until the body fits the char budget, so the
+    # first surviving line is never a mid-word fragment (the "rity reasons"
+    # cut). One line longer than the budget is hard-clipped as a last resort.
+    while len(lines) > 1 and len("\n".join(lines)) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
+        lines.pop(0)
+        omitted_lines += 1
+    if len(lines) == 1 and len(lines[0]) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
+        lines[0] = lines[0][-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]
+    if omitted_lines:
+        lines.insert(0, f"... omitted {omitted_lines} earlier line(s) ...")
+    return "\n".join(lines)
 
 
 def _terminal_exit_diagnostics(
     instance: TerminalInstance | None,
-) -> tuple[str | None, int | None, str | None, str | None]:
-    """Extract generic launch/output diagnostics from a terminal instance."""
+) -> tuple[str | None, int | None, str | None, str | None, int | None]:
+    """Extract generic launch/output diagnostics from a terminal instance.
+
+    :returns: ``(command, args_count, cwd, last_output, exit_status)``.
+    """
     if instance is None:
-        return None, None, None, None
+        return None, None, None, None, None
 
     raw_command = getattr(instance, "command", None)
     command = raw_command if isinstance(raw_command, str) and raw_command else None
@@ -212,7 +224,18 @@ def _terminal_exit_diagnostics(
             if isinstance(raw_last_output, str):
                 last_output = _trim_terminal_exit_output(raw_last_output)
 
-    return command, args_count, cwd, last_output
+    exit_status: int | None = None
+    read_exit_status = getattr(instance, "last_exit_status", None)
+    if callable(read_exit_status):
+        try:
+            raw_exit_status = read_exit_status()
+        except Exception:
+            _logger.exception("Failed to read terminal exit status")
+        else:
+            if isinstance(raw_exit_status, int):
+                exit_status = raw_exit_status
+
+    return command, args_count, cwd, last_output, exit_status
 
 
 def _monotonic() -> float:
@@ -227,14 +250,54 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+# Allowlist rather than a denylist: a denylist only stops the separators it
+# thought to enumerate, and the previous one let a backslash through — a real
+# separator on a Windows host.
+_UNSAFE_SESSION_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
 def _sanitize_session_id(session_id: str) -> str:
     """Sanitize a session id for safe use as a filesystem path component.
 
+    Real ids are ``uuid4().hex``, so this is a no-op for them. It exists so a
+    malformed or hostile id can never become a separator or a parent
+    reference.
+
+    Note the allowlist deliberately keeps ``.`` (ids may carry one), which
+    means it does NOT by itself stop ``.`` or ``..`` — those are handled
+    explicitly below. An allowlist that merely permits dots is not enough.
+
     :param session_id: Raw session/conversation identifier,
         e.g. ``"conv_abc123"`` or ``"user/session"``.
-    :returns: Sanitized string safe for directory names.
+    :returns: A single path component: never empty, never a traversal.
     """
-    return session_id.replace("/", "_").replace("..", "_")
+    safe = _UNSAFE_SESSION_ID_CHARS.sub("_", session_id)
+    # "", ".", "..", "..." — empty or pure traversal once used as a component.
+    if set(safe) <= {"."}:
+        return "_" * max(len(safe), 1)
+    return safe
+
+
+def _contained_session_dir(root: str | Path, session_id: str) -> str:
+    """Join *session_id* under *root* and prove the result stayed there.
+
+    :func:`_sanitize_session_id` already reduces the id to one safe component.
+    This asserts the property that actually matters — the joined path really
+    is inside the runner workspace — instead of trusting that reduction. The
+    two are independent, so a gap in either alone is not enough to escape.
+
+    :param root: Runner workspace root, e.g. ``"/var/omnigent/sessions"``.
+    :param session_id: Raw session/conversation identifier.
+    :returns: Absolute path to the session directory.
+    :raises ValueError: If the joined path escapes *root*.
+    """
+    prefix = containment_prefix(os.path.realpath(str(root)))
+    contained = contained_realpath(
+        os.path.join(str(root), _sanitize_session_id(session_id)), prefix
+    )
+    if contained is None:
+        raise ValueError(f"session id {session_id!r} escapes the runner workspace root {root!r}")
+    return contained
 
 
 def _session_workspace(session_id: str) -> str:
@@ -243,12 +306,13 @@ def _session_workspace(session_id: str) -> str:
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :returns: Absolute path to the session workspace directory.
+    :raises ValueError: If the session id escapes the workspace root.
     """
     root = os.environ.get(
         "OMNIGENT_RUNNER_OS_ENV_ROOT",
         _DEFAULT_WORKSPACE_ROOT,
     )
-    return os.path.join(root, _sanitize_session_id(session_id), "workspace")
+    return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
 class SessionResourceRegistry:
@@ -692,7 +756,7 @@ class SessionResourceRegistry:
         if self._runner_workspace is not None:
             if self._per_session_workspace:
                 # Isolate sessions under the shared workspace.
-                default_cwd = str(self._runner_workspace / _sanitize_session_id(session_id))
+                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
                 os.makedirs(default_cwd, mode=0o700, exist_ok=True)
                 os.chmod(default_cwd, 0o700)  # ensure mode even if pre-existing
             else:
@@ -791,7 +855,7 @@ class SessionResourceRegistry:
         # don't share a cwd.
         if self._runner_workspace is not None:
             if self._per_session_workspace:
-                default_cwd = str(self._runner_workspace / _sanitize_session_id(session_id))
+                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
             else:
                 default_cwd = str(self._runner_workspace)
             return str(Path(default_cwd).resolve())
@@ -1324,7 +1388,7 @@ class SessionResourceRegistry:
             )
             lifecycle = observed
 
-        command, args_count, cwd, last_output = _terminal_exit_diagnostics(instance)
+        command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
         session_was_idle = self._take_session_status_memo(session_id) == "idle"
@@ -1353,6 +1417,7 @@ class SessionResourceRegistry:
                     args_count=args_count,
                     cwd=cwd,
                     last_output=last_output,
+                    exit_status=exit_status,
                     session_was_idle=session_was_idle,
                 )
             )

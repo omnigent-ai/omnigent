@@ -37,6 +37,7 @@ from omnigent_client import (
 from omnigent_client import (
     OmnigentError as ClientOmnigentError,
 )
+from omnigent_client._http import is_loopback_url
 from rich.console import Console
 
 from omnigent._wrapper_labels import (
@@ -1404,6 +1405,29 @@ def _await_accounts_first_run_setup(
     )
 
 
+def _unreachable_server_message(base_url: str) -> str:
+    """
+    Build the user-facing message for a server we could not connect to.
+
+    A refused connection is an environment problem, not a bug worth a
+    crash-handler traceback, so name the URL and the likeliest fix.
+
+    :param base_url: Server base URL that refused the connection, e.g.
+        ``"http://127.0.0.1:6767"``.
+    :returns: A message naming the URL and how to recover.
+    """
+    if is_loopback_url(base_url):
+        return (
+            f"Could not connect to the local Omnigent server at {base_url}. "
+            "It may have stopped — run `omnigent stop`, then try again. "
+            "Server logs are under ~/.omnigent/logs/server/."
+        )
+    return (
+        f"Could not connect to the Omnigent server at {base_url}. "
+        "Check the URL, your network connection, and any HTTP proxy settings."
+    )
+
+
 async def _prepare_chat_session_via_daemon(
     *,
     base_url: str,
@@ -1442,8 +1466,8 @@ async def _prepare_chat_session_via_daemon(
         slow cold start is not silent. ``None`` (the default) runs without
         any progress updates.
     :returns: The prepared session id + bound runner id.
-    :raises click.ClickException: If session create/fork or runner launch
-        fails.
+    :raises click.ClickException: If the server is unreachable, or session
+        create/fork or runner launch fails.
     """
     from omnigent_client import OmnigentClient
 
@@ -1458,49 +1482,63 @@ async def _prepare_chat_session_via_daemon(
     )
     from omnigent.native_terminal import bind_session_runner
 
-    async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
-        try:
-            if fork_session_id is not None:
-                fork_result = await sdk.sessions.fork(fork_session_id)
-                session_id = fork_result["id"]
-            elif resume_conversation_id is not None:
-                session_id = resume_conversation_id
-            else:
-                created = await sdk.sessions.create(
-                    bundle, filename="agent.tar.gz", workspace=workspace
-                )
-                session_id = created.id
-        except ClientOmnigentError as exc:
-            # Any create/fork/resume rejection here is a server-side answer, not
-            # a client bug worth a traceback: a wrong base URL that answers
-            # /health but has no session API, a fork of a session that is gone,
-            # a permission refusal. Name the URL, since a wrong one is the case
-            # that looks least like itself, and pass the server's message through.
-            raise click.ClickException(f"Could not start a session on {base_url}: {exc}") from exc
+    try:
+        async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
+            try:
+                if fork_session_id is not None:
+                    fork_result = await sdk.sessions.fork(fork_session_id)
+                    session_id = fork_result["id"]
+                elif resume_conversation_id is not None:
+                    session_id = resume_conversation_id
+                else:
+                    created = await sdk.sessions.create(
+                        bundle, filename="agent.tar.gz", workspace=workspace
+                    )
+                    session_id = created.id
+            except ClientOmnigentError as exc:
+                # Any create/fork/resume rejection here is a server-side answer, not
+                # a client bug worth a traceback: a wrong base URL that answers
+                # /health but has no session API, a fork of a session that is gone,
+                # a permission refusal. Name the URL, since a wrong one is the case
+                # that looks least like itself, and pass the server's message through.
+                raise click.ClickException(
+                    f"Could not start a session on {base_url}: {exc}"
+                ) from exc
 
-    # A separate raw httpx client for the host-runner protocol (the daemon
-    # launch helpers operate on httpx, not the SDK).
-    timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
-        if progress is not None:
-            progress.update(STARTUP_PHASE_CONNECTING)
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S)
-        if progress is not None:
-            progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
-        runner_id = await launch_or_reuse_daemon_runner(
-            client, host_id=host_id, session_id=session_id, workspace=workspace
-        )
-        await wait_for_runner_online(
-            client, runner_id, timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S
-        )
-        # launch_or_reuse_daemon_runner's atomic-bind / online-reuse paths
-        # don't pass through replace_runner_id, so re-bind via PATCH to
-        # clear the ``omnigent.stopped`` marker on resumed sessions. Must run
-        # AFTER wait_for_runner_online — a freshly launched runner isn't
-        # registered until then, and replace_runner_id 400s on an unregistered id.
-        await bind_session_runner(client, session_id, runner_id)
+        # A separate raw httpx client for the host-runner protocol (the daemon
+        # launch helpers operate on httpx, not the SDK).
+        timeout = httpx.Timeout(30.0, read=120.0)
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            headers=headers,
+            auth=auth,
+            timeout=timeout,
+            trust_env=not is_loopback_url(base_url),
+        ) as client:
+            if progress is not None:
+                progress.update(STARTUP_PHASE_CONNECTING)
+            await wait_for_host_online(
+                client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+            )
+            if progress is not None:
+                progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
+            runner_id = await launch_or_reuse_daemon_runner(
+                client, host_id=host_id, session_id=session_id, workspace=workspace
+            )
+            await wait_for_runner_online(
+                client, runner_id, timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S
+            )
+            # launch_or_reuse_daemon_runner's atomic-bind / online-reuse paths
+            # don't pass through replace_runner_id, so re-bind via PATCH to
+            # clear the ``omnigent.stopped`` marker on resumed sessions. Must run
+            # AFTER wait_for_runner_online — a freshly launched runner isn't
+            # registered until then, and replace_runner_id 400s on an unregistered id.
+            await bind_session_runner(client, session_id, runner_id)
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
+        # No connection was ever established — a stopped local server, a wrong
+        # --server URL, or a proxy refusing the tunnel. These three are
+        # siblings under TransportError, so each has to be named.
+        raise click.ClickException(_unreachable_server_message(base_url)) from exc
     return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
 
 

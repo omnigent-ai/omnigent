@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangleIcon, MonitorCloudIcon, GitBranchIcon, MonitorIcon } from "lucide-react";
+import { AlertTriangleIcon, GitBranchIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -20,45 +20,18 @@ import {
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
+import { HostLabel } from "./HostLabel";
 import { buildReconnectCommand } from "./ReconnectSessionDialog";
 import {
   isValidWorkspace,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
 } from "./NewChatDialog";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHosts } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
-
-/**
- * Compact host label for the Select item — mirrors NewChatDialog's
- * HostOption (which is private to that module).
- */
-function HostLabel({ host }: { host: Host }) {
-  const isOnline = host.status === "online";
-  return (
-    <span className="flex items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
-        <MonitorCloudIcon className="size-4 text-muted-foreground" />
-      ) : (
-        <MonitorIcon className="size-4 text-muted-foreground" />
-      )}
-      <span className="font-mono text-sm">{host.name}</span>
-      <span
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
-          isOnline ? "text-green-600" : "text-muted-foreground"
-        }`}
-      >
-        <span
-          className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
-        />
-        {host.status}
-      </span>
-    </span>
-  );
-}
 
 /**
  * Dialog surfaced when the user tries to chat with an unbound *coding*

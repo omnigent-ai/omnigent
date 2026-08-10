@@ -401,6 +401,7 @@ class _InitialAuthTokenFactory:
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
         self._fallback_resolved = False
+        self._no_credential_logged = False
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
@@ -415,22 +416,27 @@ class _InitialAuthTokenFactory:
                     _proxy_bearer=self._last_initial_token,
                 )
                 self._fallback_resolved = True
-            # Managed mint failed because the proxy bearer is expired — the
-            # initial bearer was injected once and cannot self-renew. Skip
-            # managed mint entirely and go straight to SDK/OIDC.
-            if getattr(self._fallback_factory, "proxy_auth_failed", False):
+            token = self._fallback_factory() if self._fallback_factory is not None else None
+            # Managed mint cannot renew itself when its proxy bearer expires —
+            # the injected host bearer before a first mint, or the minted JWT
+            # once a session outlives it. Re-resolve SDK/OIDC in the same call
+            # so the request that hit the failure still gets a credential.
+            if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
                 self._fallback_factory = _make_auth_token_factory(
                     self._server_url,
                     _allow_initial_token=False,
                     _allow_delegated_mint=False,
                 )
-            if self._fallback_factory is None:
+                token = self._fallback_factory() if self._fallback_factory is not None else None
+            if self._fallback_factory is None and not self._no_credential_logged:
+                # This state is terminal for the process, so say it once
+                # rather than on every subsequent callback.
+                self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
                     "to renew it; run `databricks auth login` to re-authenticate"
                 )
-                return None
-            return self._fallback_factory()
+            return token
 
     @property
     def declined(self) -> bool:
@@ -675,7 +681,9 @@ def _make_managed_mint_factory(
         until process restart). If such a post-install mint then gets a
         definitive refusal, the factory latches ``declined`` and returns
         ``None`` thereafter, and :class:`_RunnerDatabricksAuth` falls back to
-        bare requests.
+        bare requests. A post-install 401/403 with no still-valid cache
+        latches ``proxy_auth_failed`` instead, which
+        :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -712,6 +720,11 @@ class _ManagedMintTokenFactory:
     requests instead of failing closed. The latch matters when the
     construction probe loses a boot race (a connection error installs the
     factory, then the first real mint learns the server never mints).
+
+    A mint 401/403 with no still-valid cached token latches
+    :attr:`proxy_auth_failed` instead: the credential presented to the proxy
+    died (the seeded host bearer, or the minted JWT once a session outlives
+    it), so callers should re-resolve SDK/OIDC rather than send bare requests.
     """
 
     def __init__(
@@ -747,8 +760,10 @@ class _ManagedMintTokenFactory:
         """Return a fresh owner JWT, or ``None``.
 
         :returns: The cached or freshly-minted JWT; ``None`` after a
-            definitive server decline (sets :attr:`declined`) or on a
-            transient mint failure with no still-valid cached token.
+            definitive server decline (sets :attr:`declined`), after a mint
+            401/403 with no still-valid cached token (sets
+            :attr:`proxy_auth_failed`), or on a transient mint failure with
+            no still-valid cached token.
         """
         if self.declined:
             return None
@@ -779,13 +794,15 @@ class _ManagedMintTokenFactory:
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
-                # The proxy bearer is expired or invalid. If we have never
-                # successfully minted, there is no self-sustaining refresh
-                # loop to fall back to — signal proxy_auth_failed so the
-                # caller can try SDK/OIDC instead of looping on a dead bearer.
-                if self._cached_token is None:
+                # The proxy bearer is expired or invalid — the seeded host
+                # bearer, or the minted JWT once a session outlives it. With
+                # no still-valid cache left the mint loop cannot renew itself:
+                # latch proxy_auth_failed so the caller re-resolves SDK/OIDC
+                # instead of failing closed on every callback.
+                cached = self._still_valid_cached_token(now)
+                if cached is None:
                     self.proxy_auth_failed = True
-                    return None
+                return cached
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             # Transient mint failure: keep serving the cached token while
@@ -832,6 +849,8 @@ def _mint_managed_owner_token(
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
     """
+    from omnigent_client._http import is_loopback_url
+
     from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -843,7 +862,7 @@ def _mint_managed_owner_token(
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
-    with httpx.Client(timeout=10.0) as client:
+    with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()
@@ -1179,6 +1198,8 @@ def create_app(
     # tunnel the runner opened to the Omnigent server at startup).
     # stdio_cwd=runner_workspace ensures relative command paths like
     # ".venv/bin/python" resolve against the user's project root.
+    from omnigent_client._http import is_loopback_url
+
     from omnigent.runner.mcp_manager import RunnerMcpManager
 
     # Reuse the caller's factory when given (shares one resolved SDK auth +
@@ -1188,6 +1209,8 @@ def create_app(
     binding_token = _runner_tunnel_binding_token_from_env()
     server_client = httpx.AsyncClient(
         base_url=server_url,
+        # A proxy cannot reach a loopback server, so local targets bypass it.
+        trust_env=not is_loopback_url(server_url),
         auth=_RunnerDatabricksAuth(auth_token_factory),
         # Announce the runner as a first-party non-browser client via the
         # sentinel Origin. The server's require_trusted_origin CSRF guard on
@@ -1626,16 +1649,46 @@ def _install_signal_handlers(
             record_reason(f"received {signal.Signals(sig).name}")
         stop_event.set()
 
+    degraded = False
+
+    def _try_add_handler(sig: int, callback: Callable[..., None], *args: object) -> None:
+        """Register one handler; degrade instead of crashing the runner.
+
+        ``add_signal_handler`` raises RuntimeError when the loop's signal
+        wakeup fd is unusable — observed in zygote-forked runners whose
+        wakeup fd ended up in blocking mode ("the fd N must be in
+        non-blocking mode"), crash-looping every fork of the session.
+        Graceful-shutdown handlers are a nicety: a runner without them
+        still serves sessions and still exits via the parent-death
+        backstop, so warn once and continue instead of dying.
+
+        :param sig: Signal number to register.
+        :param callback: Handler invoked when the signal arrives.
+        :param args: Positional arguments passed to ``callback``.
+        :returns: None.
+        """
+        nonlocal degraded
+        if degraded:
+            return
+        try:
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, callback, *args)
+        except RuntimeError:
+            degraded = True
+            _logger.warning(
+                "Signal handler registration failed; continuing without "
+                "graceful-shutdown signal handling",
+                exc_info=True,
+            )
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
+        _try_add_handler(sig, _handle_shutdown_signal, sig)
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
         if RUNNER_ADOPT_SIGNAL is None:
             return
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+        _try_add_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
 
 
 def _install_crash_logging() -> None:

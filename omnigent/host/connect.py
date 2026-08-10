@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import functools
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
@@ -278,14 +280,15 @@ def _url_is_loopback(url: str) -> bool:
     """Whether ``url``'s host is loopback (``127.0.0.1`` / ``localhost`` / ``::1``).
 
     Used to distinguish a daemon-spawned local server (no proxy in
-    front) from a remote deploy behind the Databricks Apps ingress, so
-    the reconnect heuristic only treats an abrupt ``no close frame`` as
-    a benign ingress recycle when there actually IS an ingress.
+    front) from a remote deploy behind the Databricks Apps ingress: the
+    reconnect loop treats an abrupt ``no close frame`` as a benign
+    ingress recycle only when there IS an ingress, and bounds
+    connection-refused retries only when the server is local.
 
     :param url: A server or ws:// URL, e.g. ``"ws://127.0.0.1:49175"``.
     :returns: ``True`` for a loopback host, ``False`` otherwise (incl.
         unparseable URLs — fail toward "remote", the safer default for
-        the recycle heuristic).
+        both reconnect heuristics).
     """
     from urllib.parse import urlparse
 
@@ -295,9 +298,37 @@ def _url_is_loopback(url: str) -> bool:
         return False
 
 
+def _connection_refused(exc: BaseException) -> bool:
+    """Whether *exc* means the target port actively refused the connection.
+
+    Dual-stack connects surface wrapped: asyncio combines per-address
+    failures into ``OSError("Multiple exceptions: ...")`` whose errno is
+    lost (only the ``[Errno N]`` texts survive), or an exception group.
+    A wrapped form counts only when every sub-error is itself refused.
+
+    :param exc: The exception a connect attempt raised.
+    :returns: ``True`` for a connection-refused failure, ``False``
+        otherwise (fail toward "not refused" — the loop keeps retrying).
+    """
+    # BaseExceptionGroup is a 3.11+ builtin (we require 3.12); ruff's pinned
+    # py310 target misflags it as undefined.
+    if isinstance(exc, BaseExceptionGroup):  # noqa: F821
+        return all(_connection_refused(sub) for sub in exc.exceptions)
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno is not None:
+        return exc.errno == errno.ECONNREFUSED
+    errnos = re.findall(r"\[Errno (\d+)\]", str(exc))
+    return bool(errnos) and all(int(n) == errno.ECONNREFUSED for n in errnos)
+
+
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+# Consecutive connection-refused failures against a loopback server before the
+# host exits (~5 minutes at the backoff cap). Refused on loopback means no
+# process listens on the port — the local server is gone, not unreachable.
+_LOOPBACK_REFUSED_FATAL_ATTEMPTS = 30
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -547,11 +578,13 @@ class HostConnectError(Exception):
 
     Raised when the WebSocket upgrade fails in a way that reconnecting
     can never fix — the Databricks Apps proxy bounced the connection to
-    a login page (wrong/absent workspace credentials), or the server
+    a login page (wrong/absent workspace credentials), the server
     returned a permanent ``4xx`` (unauthenticated, unauthorized, or a
-    build that predates the host API). The reconnect loop re-raises this
-    instead of backing off, so ``omnigent host`` exits with an
-    actionable message rather than looping silently forever.
+    build that predates the host API), or a loopback server refused a
+    sustained streak of connects (nothing listens — the local server is
+    gone). The reconnect loop re-raises this instead of backing off, so
+    ``omnigent host`` exits with an actionable message rather than
+    looping silently forever.
 
     The message is the full, user-facing explanation including the
     suggested fix; it is printed verbatim by :func:`run_host_process`.
@@ -757,6 +790,10 @@ class HostProcess:
         # reset by a successful upgrade. Gates the once-per-episode terminal
         # notice so a VPN outage doesn't spam stderr on every retry.
         self._auth_retry_streak = 0
+        # Consecutive connection-refused connect failures; reset by an accepted
+        # upgrade or any non-refused error. Fatal past a bounded streak only
+        # when the server URL is loopback (the local server is gone).
+        self._refused_streak = 0
         # Live tunnel connection, set by _serve_frames for the watcher
         # tasks (which outlive any single connection) to report on.
         self._ws: websockets.asyncio.client.ClientConnection | None = None
@@ -2382,6 +2419,9 @@ class HostProcess:
         disconnect. Ctrl-C / SIGTERM exit cleanly.
 
         :returns: None. Runs until the process is terminated.
+        :raises HostConnectError: On a permanent failure — auth /
+            authorization / outdated server, or a loopback server that
+            kept refusing connections (the local server is gone).
         """
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
@@ -2405,7 +2445,7 @@ class HostProcess:
                     # server). Do NOT back off and retry — propagate so
                     # ``run_host_process`` can fail loud.
                     raise
-                except Exception as exc:  # noqa: BLE001 — reconnect loop
+                except Exception as exc:
                     if not isinstance(exc, InvalidURI):
                         # Any non-redirect failure (5xx bounce, network
                         # blip, mid-serve drop) breaks a login-redirect
@@ -2414,6 +2454,28 @@ class HostProcess:
                         # riding out a messy restart isn't killed by
                         # redirects accumulated across unrelated errors.
                         self._login_redirect_streak = 0
+                    # Refused on loopback is decisive: nothing listens on the
+                    # port and no network path can heal it, so bound the
+                    # retries. Remote refusals retry forever (outages recover).
+                    if _connection_refused(exc) and _url_is_loopback(self._server_url):
+                        self._refused_streak += 1
+                        if self._refused_streak >= _LOOPBACK_REFUSED_FATAL_ATTEMPTS:
+                            _logger.error(
+                                "Giving up: %s refused %d consecutive connection "
+                                "attempts — no server is listening there anymore. "
+                                "Exiting.",
+                                self._server_url,
+                                self._refused_streak,
+                            )
+                            raise HostConnectError(
+                                f"The server at {self._server_url} refused "
+                                f"{self._refused_streak} consecutive connection "
+                                "attempts — nothing is listening on that local "
+                                "address anymore. Start the server, then run "
+                                "`omnigent host` again."
+                            ) from exc
+                    else:
+                        self._refused_streak = 0
                     # Classify the disconnect to choose a reconnect cadence.
                     #
                     # 1012 "service restart" / 1001 "going away" are explicit
@@ -2536,6 +2598,7 @@ class HostProcess:
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
+        self._refused_streak = 0
         try:
             await self._serve_frames(ws)
         finally:
@@ -2873,8 +2936,9 @@ def run_host_process(
     :param config_path: Optional path to ``config.yaml``.
         Defaults to ``~/.omnigent/config.yaml``.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
-        fails permanently (auth / authorization / outdated server). The
-        actionable cause is printed to stderr first.
+        fails permanently (auth / authorization / outdated server, or a
+        loopback server that is gone). The actionable cause is printed
+        to stderr first.
     """
     host_log_path = configure_process_logging("host")
     # Initialize tracing so the host daemon exports its own spans

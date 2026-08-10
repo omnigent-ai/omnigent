@@ -999,3 +999,52 @@ describe("sharing kill switch", () => {
     expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
   });
 });
+
+describe("peek mode row menu", () => {
+  // Peek render variant: the menu content portals OUTSIDE the <aside>, so
+  // moving the pointer from the kebab into the open menu fires the aside's
+  // onPointerLeave. The grace-period close must hold while a menu is open.
+  function renderPeek() {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter>
+            <Sidebar open={false} peek onClose={onClose} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    return { onClose };
+  }
+
+  beforeEach(() => vi.useFakeTimers({ shouldAdvanceTime: true }));
+  afterEach(() => vi.useRealTimers());
+
+  it("holds the peek open while a row's kebab menu is open", () => {
+    const { onClose } = renderPeek();
+
+    // Open the row's kebab (Radix opens on pointerdown) — its content portals
+    // outside the aside, so the pointer entering it leaves the aside.
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+
+    const aside = screen.getByRole("complementary", { name: "Conversations" });
+    fireEvent.pointerLeave(aside);
+
+    // Grace period elapses, but the open menu holds the peek — no close.
+    vi.advanceTimersByTime(1000);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("closes once the menu is gone and the pointer is away", () => {
+    const { onClose } = renderPeek();
+
+    const aside = screen.getByRole("complementary", { name: "Conversations" });
+    // No menu open: a plain pointer-leave closes after the grace period.
+    fireEvent.pointerLeave(aside);
+    vi.advanceTimersByTime(1000);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});

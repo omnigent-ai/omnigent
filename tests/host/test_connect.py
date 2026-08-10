@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import subprocess
 import threading
@@ -3665,6 +3666,130 @@ async def test_run_reconnects_on_transient_upgrade_failure(
 
     # 2 = transient attempt + cancel attempt → it genuinely reconnected.
     assert spy.call_count == 2
+
+
+def _refused_exc() -> ConnectionRefusedError:
+    """A single-stack connection-refused, as asyncio raises it.
+
+    :returns: ``ConnectionRefusedError`` with the platform's errno set.
+    """
+    return ConnectionRefusedError(errno.ECONNREFUSED, "Connect call failed ('127.0.0.1', 5566)")
+
+
+def _dual_stack_refused_exc() -> OSError:
+    """The combined dual-stack refusal asyncio raises for ``localhost``.
+
+    ``create_connection`` folds the per-address failures into one
+    ``OSError`` whose errno is lost — only the per-address ``[Errno N]``
+    texts survive in the message.
+
+    :returns: ``OSError`` shaped like asyncio's combined failure.
+    """
+    e = errno.ECONNREFUSED
+    return OSError(
+        f"Multiple exceptions: [Errno {e}] Connect call failed ('::1', 5566, 0, 0), "
+        f"[Errno {e}] Connect call failed ('127.0.0.1', 5566)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("refused_exc", "server_url"),
+    [
+        (_refused_exc(), "http://127.0.0.1:5566"),
+        (_dual_stack_refused_exc(), "http://localhost:5566"),
+    ],
+    ids=["single-stack", "dual-stack-combined"],
+)
+async def test_loopback_host_exits_after_sustained_connection_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refused_exc: OSError,
+    server_url: str,
+) -> None:
+    """Persistent connection-refused against a loopback server exits the host.
+
+    A dead local server never comes back on its own, yet the reconnect
+    loop retried forever at the backoff cap — zombie hosts looped for
+    days against dead loopback ports. After a bounded refused streak the
+    host must log one clear ERROR and exit via the permanent-failure
+    path. Dual-stack refusals arrive as asyncio's combined ``OSError``
+    (errno lost) and must count exactly the same.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._LOOPBACK_REFUSED_FATAL_ATTEMPTS", 3)
+    spy = _ConnectSpy([refused_exc])
+    _patch_connect(monkeypatch, spy)
+    host = _host(server_url)
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+        with pytest.raises(HostConnectError) as excinfo:
+            await host.run()
+
+    # Exactly the threshold — no premature death, no infinite loop.
+    assert spy.call_count == 3
+    # The fatal message names the dead address (printed by run_host_process).
+    assert server_url in str(excinfo.value)
+    # ONE clear ERROR explaining the exit, not one per retry.
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert server_url in errors[0].message
+    assert "no server is listening" in errors[0].message
+
+
+async def test_remote_host_retries_connection_refused_past_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection-refused against a REMOTE server never turns fatal.
+
+    A refusal from a remote endpoint can be an outage or a rolling
+    deploy — it recovers, so the host must keep retrying past the
+    loopback fatal threshold. Only loopback refusals prove the server
+    is gone for good.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._LOOPBACK_REFUSED_FATAL_ATTEMPTS", 3)
+    refused = _refused_exc()
+    # More refusals than the threshold, then a cancel to end the test.
+    spy = _ConnectSpy([refused, refused, refused, refused, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: a fatal misfire would raise HostConnectError on
+    # the 3rd refusal (call_count 3) instead of reaching the cancel.
+    await host.run()
+
+    # 5 = 4 retried refusals (past the threshold of 3) + the ending cancel.
+    assert spy.call_count == 5
+
+
+async def test_accepted_connect_resets_loopback_refused_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful connect resets the loopback refused streak.
+
+    Only CONSECUTIVE refusals may kill the host: a streak interrupted by
+    a real connection (server came back, then died again) must start
+    counting from zero, not inherit pre-recovery refusals.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._LOOPBACK_REFUSED_FATAL_ATTEMPTS", 3)
+    # The accepted connect sends a real hello; skip its slow CLI probes —
+    # only the streak accounting is under test here.
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    refused = _refused_exc()
+    # 2 refusals (one short of fatal), an accepted upgrade (its tunnel
+    # drops on first recv), then refusals repeating until fatal.
+    spy = _ConnectSpy([refused, refused, None, refused])
+    _patch_connect(monkeypatch, spy)
+    host = _host("http://localhost:5566")
+
+    with pytest.raises(HostConnectError):
+        await host.run()
+
+    # 6 = 2 refusals + accepted connect + 3 FRESH refusals to reach the
+    # threshold. 5 would mean the accepted connect did not reset the
+    # streak (pre-recovery refusals were counted toward the exit).
+    assert spy.call_count == 6
 
 
 def test_run_host_process_exits_nonzero_on_fatal(
