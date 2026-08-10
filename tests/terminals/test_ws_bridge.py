@@ -23,8 +23,10 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import tty
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -71,6 +73,23 @@ def test_importing_claude_native_does_not_pull_in_fastapi() -> None:
     assert result.returncode == 0, (
         f"claude_native import pulled in the FastAPI stack. stderr:\n{result.stderr}"
     )
+
+
+@pytest.fixture
+def short_tmp_parent() -> Iterator[Path]:
+    """
+    Per-test parent directory under ``/tmp`` with a short path.
+
+    macOS caps an AF_UNIX socket path at ~103 bytes, and pytest's
+    :data:`tmp_path` resolves under ``/private/var/folders/...`` — long
+    enough on its own to blow that budget. A ``tmux -S`` server on such a
+    path never starts, failing with "File name too long".
+    """
+    parent = Path(tempfile.mkdtemp(prefix="omni-ws-", dir="/tmp"))
+    try:
+        yield parent
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 @pytest.mark.asyncio
@@ -376,7 +395,9 @@ def _new_tmux_session(socket_path: Path, target: str = "main") -> list[str]:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux required")
 @pytest.mark.asyncio
-async def test_tmux_session_alive_tracks_real_session(tmp_path: Path) -> None:
+async def test_tmux_session_alive_tracks_real_session(
+    short_tmp_parent: Path, tmp_path: Path
+) -> None:
     """
     ``_tmux_session_alive`` is ``True`` for a live session, ``False``
     once the server is killed, and ``False`` for an unknown socket.
@@ -384,9 +405,11 @@ async def test_tmux_session_alive_tracks_real_session(tmp_path: Path) -> None:
     This is the signal the bridge uses to tell a detach (session alive)
     apart from a session exit.
 
-    :param tmp_path: Pytest tmp directory for the private socket.
+    :param short_tmp_parent: Short-pathed tmp directory for the private socket.
+    :param tmp_path: Pytest tmp directory for the never-created socket path.
     """
-    socket_path = tmp_path / "tmux.sock"
+    # short_tmp_parent keeps tmux -S within macOS's 103-byte AF_UNIX cap.
+    socket_path = short_tmp_parent / "tmux.sock"
     base = _new_tmux_session(socket_path)
     try:
         assert await _tmux_session_alive(str(socket_path), "main") is True
@@ -403,7 +426,7 @@ async def test_tmux_session_alive_tracks_real_session(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux required")
 @pytest.mark.asyncio
-async def test_tmux_session_alive_false_for_dead_pane(tmp_path: Path) -> None:
+async def test_tmux_session_alive_false_for_dead_pane(short_tmp_parent: Path) -> None:
     """
     A kept-alive session whose pane process exited reads as not-alive.
 
@@ -413,9 +436,10 @@ async def test_tmux_session_alive_false_for_dead_pane(tmp_path: Path) -> None:
     would treat the crash as a mere detach and the web client would reconnect
     to a dead pane forever instead of closing.
 
-    :param tmp_path: Pytest tmp directory for the private socket.
+    :param short_tmp_parent: Short-pathed tmp directory for the private socket.
     """
-    socket_path = tmp_path / "tmux.sock"
+    # short_tmp_parent keeps tmux -S within macOS's 103-byte AF_UNIX cap.
+    socket_path = short_tmp_parent / "tmux.sock"
     base = ["tmux", "-S", str(socket_path), "-f", "/dev/null"]
     # One command sequence on a fresh server (";" separates tmux commands):
     # set remain-on-exit globally BEFORE new-session so the session inherits it
@@ -523,7 +547,7 @@ async def test_bridge_advertises_safe_osc52_capability(
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux required")
 @pytest.mark.asyncio
 async def test_bridge_detach_closes_4405_and_leaves_session_alive(
-    tmp_path: Path,
+    short_tmp_parent: Path,
 ) -> None:
     """
     A tmux detach closes the attach WS with 4405, not 4404, and leaves
@@ -541,9 +565,10 @@ async def test_bridge_detach_closes_4405_and_leaves_session_alive(
     retry ``detach-client`` until the bridge actually ends, polling the
     external tmux server's client state rather than guessing a delay.
 
-    :param tmp_path: Pytest tmp directory for the private socket.
+    :param short_tmp_parent: Short-pathed tmp directory for the private socket.
     """
-    socket_path = tmp_path / "tmux.sock"
+    # short_tmp_parent keeps tmux -S within macOS's 103-byte AF_UNIX cap.
+    socket_path = short_tmp_parent / "tmux.sock"
     base = _new_tmux_session(socket_path)
     ws = _ParkingFakeWebSocket()
     bridge_task = asyncio.create_task(
@@ -617,7 +642,7 @@ class _CollectingFakeWebSocket(_ParkingFakeWebSocket):
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux required")
 @pytest.mark.asyncio
 async def test_bridge_attach_renders_pane_with_dumb_ambient_term(
-    tmp_path: Path,
+    short_tmp_parent: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -638,14 +663,15 @@ async def test_bridge_attach_renders_pane_with_dumb_ambient_term(
     "open terminal failed" error and exits — the marker never arrives
     and this test times out at the wait below.
 
-    :param tmp_path: Pytest tmp directory for the private socket.
+    :param short_tmp_parent: Short-pathed tmp directory for the private socket.
     :param monkeypatch: Used to set the ambient ``TERM=dumb``.
     """
     # The sandbox condition: every process in the chain (including the
     # tmux server about to be spawned) sees a dumb TERM.
     monkeypatch.setenv("TERM", "dumb")
 
-    socket_path = tmp_path / "tmux.sock"
+    # short_tmp_parent keeps tmux -S within macOS's 103-byte AF_UNIX cap.
+    socket_path = short_tmp_parent / "tmux.sock"
     base = ["tmux", "-S", str(socket_path), "-f", "/dev/null"]
     marker = "BRIDGE_TERM_PIN_OK"
     subprocess.run(
