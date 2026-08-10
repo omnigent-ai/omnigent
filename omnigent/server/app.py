@@ -59,6 +59,7 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
+from omnigent.server.routes.claude_profiles import create_claude_profiles_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
@@ -2064,6 +2065,11 @@ def create_app(
             prefix="/v1",
             tags=["projects"],
         )
+    app.include_router(
+        create_claude_profiles_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["claude_profiles"],
+    )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:

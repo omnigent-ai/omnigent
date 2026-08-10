@@ -40,6 +40,7 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/hooks/useClaudeProfiles", () => ({ useClaudeProfiles: () => ({ data: [] }) }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),

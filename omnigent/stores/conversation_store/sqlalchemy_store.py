@@ -109,6 +109,7 @@ _SESSION_OVERRIDE_KEYS = (
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
+    "claude_profile",
 )
 
 
@@ -200,6 +201,7 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        claude_profile=overrides["claude_profile"],
         sub_agent_name=meta.sub_agent_name if meta else None,
         external_session_id=meta.external_session_id if meta else None,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
@@ -2636,6 +2638,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        claude_profile: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -2665,6 +2668,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param _unset_harness_override: When ``True``, clear
             ``harness_override`` to ``None`` (used to replace the
             ``"auto"`` sentinel after first-message routing resolves).
+        :param claude_profile: Per-session Claude Code account profile
+            name (issue #503), e.g. ``"work"``. ``None`` leaves
+            unchanged; set once at session create, no ``_unset``
+            variant (the harness bakes it into the spawn env on the
+            first turn).
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -2720,6 +2728,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif harness_override is not None:
                 overrides["harness_override"] = harness_override
+                overrides_changed = True
+            if claude_profile is not None:
+                overrides["claude_profile"] = claude_profile
                 overrides_changed = True
             if overrides_changed:
                 row.session_overrides = _encode_session_overrides(overrides)
@@ -3493,9 +3504,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             creating_clone = cloned_agent_bundle_location is not None
             # Model-family-bound overrides (reasoning_effort, model_override, and
-            # — same gate — harness_override) copy only when copy_model_settings.
-            # The routing switches (cost_control_mode_override,
-            # subagent_routing_override) are intentionally never carried onto a fork.
+            # — same gate — harness_override and claude_profile) copy only when
+            # copy_model_settings. The Claude account profile is account-bound like
+            # the model, so it follows the same gate. The routing switches
+            # (cost_control_mode_override, subagent_routing_override) are
+            # intentionally never carried onto a fork.
             fork_overrides = _encode_session_overrides(
                 {
                     "reasoning_effort": (
@@ -3506,6 +3519,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ),
                     "harness_override": (
                         source_overrides["harness_override"] if copy_model_settings else None
+                    ),
+                    "claude_profile": (
+                        source_overrides["claude_profile"] if copy_model_settings else None
                     ),
                 }
             )

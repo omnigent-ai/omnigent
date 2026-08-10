@@ -1373,6 +1373,22 @@ class SessionCreateRequest(BaseModel):
         real message after the create returns. ``None`` everywhere else,
         including the bundle-agent auto path, which routes on the first
         message event instead.
+    :param claude_profile: Optional per-session Claude Code account
+        profile name to persist at create time (issue #503), e.g.
+        ``"work"``. Set by the web UI's new-chat account picker; the
+        runner resolves the name to a ``config_dir`` against its
+        local ``~/.omnigent/config.yaml`` ``claude_profiles:`` block
+        and injects it as ``CLAUDE_CONFIG_DIR`` on the spawned Claude
+        CLI subprocess, isolating credentials / settings / session
+        state per profile. Takes precedence over the agent spec's
+        ``executor.config.claude_profile``. Validated server-side
+        against a conservative profile-name charset. ``None`` (the
+        default) uses the spec's declared profile, else the CLI's
+        default ``~/.claude``. Create-time only — there is no PATCH
+        path, since the harness bakes the config dir into the spawn
+        env on the first turn. JSON create only — the multipart
+        bundled-upload path (``SessionCreateMetadata``) does not accept
+        this field; bundled uploads supply their own spec.
     """
 
     agent_id: str
@@ -1392,6 +1408,7 @@ class SessionCreateRequest(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+    claude_profile: str | None = None
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> SessionCreateRequest:

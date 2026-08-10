@@ -37,6 +37,7 @@ import {
   type Host,
 } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import { useClaudeProfiles } from "@/hooks/useClaudeProfiles";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -75,6 +76,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
 }));
+vi.mock("@/hooks/useClaudeProfiles", () => ({ useClaudeProfiles: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -168,6 +170,7 @@ const CODEX_MODEL_OPTIONS_RESULT = {
 
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
+const useClaudeProfilesMock = vi.mocked(useClaudeProfiles);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useHostWorktreesMock = vi.mocked(useHostWorktrees);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
@@ -684,6 +687,7 @@ function setupLandingMocks() {
   useHostWorktreesMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
+  useClaudeProfilesMock.mockReset();
   // Reset the install hooks to their inert defaults: per-test overrides
   // (a pending install set, a callback-firing mutate) must not leak into the
   // next test — a stale pending set would disable the Install button and make
@@ -703,6 +707,10 @@ function setupLandingMocks() {
     data: [],
   } as unknown as ReturnType<typeof useDirectorySessions>);
   useRunnerHealthMock.mockReturnValue(new Map<string, boolean>());
+  // No operator-configured claude_profiles by default → picker hidden.
+  useClaudeProfilesMock.mockReturnValue({
+    data: [],
+  } as unknown as ReturnType<typeof useClaudeProfiles>);
   useHostFilesystemMock.mockReturnValue({
     data: undefined,
     isLoading: false,
