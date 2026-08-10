@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from omnigent.server.accounts_bootstrap import (
     bootstrap_admin,
@@ -404,6 +405,22 @@ def test_mint_runner_token_returns_none_for_header_source() -> None:
             return None
 
     assert _Base().mint_runner_token("alice@example.com", 1800) is None
+
+
+def test_header_source_mints_and_validates_internal_runner_token() -> None:
+    """Header auth accepts only its own server-minted runner bearer."""
+    provider = UnifiedAuthProvider(source="header", runner_token_secret=b"r" * 32)
+    token = provider.mint_runner_token("alice@example.com", 1800)
+    assert token is not None
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+        }
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
 
 
 def test_mint_runner_token_expired_resolves_to_none() -> None:

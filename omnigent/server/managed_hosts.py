@@ -164,10 +164,21 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "coda",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+        "coda",
+    }
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -221,6 +232,10 @@ OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # reconnects while still expiring tokens of Pods nobody deleted. A relaunch
 # mints a fresh token (and the per-Pod token Secret is replaced).
 KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+CODA_MAX_LEASE_S = 12 * 3600
+CODA_MANAGED_TOKEN_TTL_S = 13 * 3600
+CODA_DEFAULT_MAX_SESSIONS_PER_LEASE = 10
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -484,6 +499,7 @@ class ManagedSandboxConfig:
     managed_launch_supported: bool = True
     provider: str | None = None
     host_config: dict[str, object] | None = None
+    max_sessions_per_lease: int | None = None
 
 
 @dataclass
@@ -835,6 +851,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    max_sessions_per_lease: int | None = None
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -938,6 +955,28 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             secret_mounts=secret_mounts,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "coda":
+        coda_section = _parse_provider_section(raw, "coda") or {}
+        _reject_unknown_keys(
+            coda_section,
+            {"app_name", "app_url", "workspace_path", "max_sessions_per_lease"},
+            "sandbox.coda",
+        )
+        app_name = _parse_provider_string(raw, "coda", "app_name")
+        app_url = _parse_provider_string(raw, "coda", "app_url")
+        if not app_name or not app_url:
+            raise ValueError("sandbox.coda requires app_name and app_url")
+        workspace_path = _parse_provider_string(raw, "coda", "workspace_path")
+        max_sessions_per_lease = (
+            _parse_provider_positive_int(raw, "coda", "max_sessions_per_lease")
+            or CODA_DEFAULT_MAX_SESSIONS_PER_LEASE
+        )
+        launcher_factory = _coda_launcher_factory(
+            app_name=app_name,
+            app_url=app_url,
+            workspace_path=workspace_path,
+        )
+        token_ttl_s = CODA_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -950,6 +989,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         managed_launch_supported=provider in PROVIDERS_WITH_MANAGED_LAUNCH,
         provider=provider,
         host_config=host_config,
+        max_sessions_per_lease=(max_sessions_per_lease if provider == "coda" else None),
     )
 
 
@@ -2130,6 +2170,25 @@ def _reject_overlapping_kubernetes_mounts(
                 )
 
 
+def _coda_launcher_factory(
+    *, app_name: str, app_url: str, workspace_path: str | None
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: coda`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+        if workspace_path is None:
+            return CodaProvider(app_name=app_name, app_url=app_url)
+        return CodaProvider(
+            app_name=app_name,
+            app_url=app_url,
+            workspace_path=workspace_path,
+        )
+
+    return _build
+
+
 def _kubernetes_launcher_factory(
     *,
     image: str | None,
@@ -2246,6 +2305,11 @@ async def launch_managed_host(
         startup, or registration fails.
     """
     launcher = config.launcher_factory()
+    if launcher.provider == "coda":
+        from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+        if isinstance(launcher, CodaProvider):
+            launcher.set_lease_owner(owner)
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -2328,6 +2392,11 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
+    if launcher.provider == "coda":
+        from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+        if isinstance(launcher, CodaProvider):
+            launcher.set_lease_owner(host.user_id)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.

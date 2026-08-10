@@ -573,6 +573,7 @@ def _cleanup_host(host: HostProcess) -> None:
 
 async def test_handle_launch_spawns_subprocess(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Verify that _handle_launch spawns a subprocess with the correct
@@ -582,6 +583,9 @@ async def test_handle_launch_spawns_subprocess(
     failed or the result frame construction is wrong.
     """
     host = _make_host_process()
+    # Managed hosts still pass their ingress bearer to the runner bootstrap;
+    # delegated owner-token minting cannot cross Apps without it.
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "managed-launch-token")
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
     host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
@@ -2058,6 +2062,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
+        "CODA_SP_TOKEN_BROKER_URL": "http://127.0.0.1:43210/token",
+        "CODA_VENV_PYTHON": "/app/python/.venv/bin/python",
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
@@ -2115,6 +2121,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert (
         env["OMNIGENT_DATABRICKS_EXTRA_HEADERS"] == '{"x-databricks-route-hint": "instance-abc"}'
     )
+    assert env["CODA_SP_TOKEN_BROKER_URL"] == "http://127.0.0.1:43210/token"
+    assert env["CODA_VENV_PYTHON"] == "/app/python/.venv/bin/python"
     # Process logging controls forward so host-spawned runners honor --debug
     # and --log-to-stderr.
     assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
@@ -3321,6 +3329,99 @@ def test_build_connect_headers_retains_auth_factory(
     assert launch_token == "warm-host-token"
     assert factory_builds == ["https://app.example.databricksapps.com"]
     assert token_calls == [1, 1, 1]
+
+
+def test_managed_headers_unchanged_for_non_databricks_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed host on a non-Databricks server URL sends no bearer.
+
+    Regression invariant for the ingress-bearer path: Modal / E2B / Kubernetes
+    server URLs must keep exactly today's headers so no Databricks credential
+    ever leaves the workspace's trust domain.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    # Ambient Databricks creds are present but must not matter off-Databricks.
+    monkeypatch.setenv("DATABRICKS_HOST", "https://acme.cloud.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "sp-bearer")
+    monkeypatch.setattr(
+        entry_mod, "_make_auth_token_factory", lambda *, server_url=None: lambda: "sp-bearer"
+    )
+
+    headers = _host("https://omnigent.internal.example.com")._build_connect_headers()
+
+    assert headers == {
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        "X-Omnigent-Host-Token": "launch-token",
+    }
+
+
+def test_managed_headers_add_ingress_bearer_on_databricks_apps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed host behind the Apps ingress sends both auth headers.
+
+    The ingress rejects an upgrade that carries only the launch-token header,
+    so ``Authorization`` rides alongside it; the server still authenticates the
+    host by the launch token.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    minted: list[int] = []
+
+    def _make_factory(*, server_url: str | None = None) -> object:
+        def _factory() -> str:
+            minted.append(1)
+            return f"sp-token-{len(minted)}"
+
+        return _factory
+
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://acme.cloud.databricks.com")
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
+
+    host = _host("https://omnigent-1234.aws.databricksapps.com")
+    first = host._build_connect_headers()
+    second = host._build_connect_headers()
+
+    assert first["X-Omnigent-Host-Token"] == "launch-token"
+    assert first["Authorization"] == "Bearer sp-token-1"
+    # Re-resolved per upgrade attempt so a multi-hour reconnect picks up a
+    # refreshed service-principal token.
+    assert second["Authorization"] == "Bearer sp-token-2"
+
+
+def test_managed_headers_skip_bearer_without_databricks_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No Databricks credential source means no bearer, even on Databricks.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    for var in (
+        "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CONFIG_PROFILE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    headers = _host("https://omnigent-1234.aws.databricksapps.com")._build_connect_headers()
+
+    assert "Authorization" not in headers
+    assert headers["X-Omnigent-Host-Token"] == "launch-token"
 
 
 async def test_run_retries_on_login_redirect(

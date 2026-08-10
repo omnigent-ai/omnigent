@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import click
 import pytest
 import pytest_asyncio
 from asgiref.testing import ApplicationCommunicator
@@ -490,6 +491,123 @@ async def test_managed_session_create_end_to_end(
     # The tunnels list holds the fake hosts open through the delete;
     # release them only now.
     del tunnels
+
+
+async def test_coda_two_sessions_adopt_one_host(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+    from omnigent.runner.identity import token_bound_runner_id
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    class FakeCoda(CodaProvider):
+        def __init__(self) -> None:
+            super().__init__(
+                app_name="coda-main",
+                app_url="https://coda.example.com",
+                request_fn=lambda _method, _path, _body: {},
+                app_getter=lambda _: None,
+            )
+
+        def prepare(self) -> None:
+            return None
+
+        def provision(self, _name: str) -> str:
+            return "coda:coda-main#lease-a"
+
+        def start_host(self, sandbox_id: str, **kwargs: object) -> str:
+            future = asyncio.run_coroutine_threadsafe(
+                _fake_sandbox_host(
+                    env.app,
+                    str(kwargs["host_id"]),
+                    str(kwargs["host_name"]),
+                    str(kwargs["token"]),
+                ),
+                loop,
+            )
+            host_futures.append(asyncio.wrap_future(future, loop=loop))
+            return "/app/python/source_code/coda-sessions/first"
+
+        def allocate_workspace(self, _sandbox_id: str, session_id: str) -> str:
+            return f"/app/python/source_code/coda-sessions/{session_id}"
+
+    fake = FakeCoda()
+    env.app.state.sandbox_config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=13 * 3600,
+        provider="coda",
+        max_sessions_per_lease=10,
+    )
+    agent = await create_test_agent(env.client, name="coda-adoption-agent")
+    first_resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    first = await _wait_for_managed_binding(env, first_resp.json()["id"])
+    tunnel = await host_futures[0]
+
+    async def answer_next_launch() -> None:
+        for _ in range(50):
+            output = await tunnel.receive_output(timeout=10.0)
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                continue
+            if isinstance(frame, HostLaunchRunnerFrame):
+                await tunnel.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostLaunchRunnerResultFrame(
+                                request_id=frame.request_id,
+                                status="launched",
+                                runner_id=token_bound_runner_id(frame.binding_token),
+                            )
+                        ),
+                    }
+                )
+                return
+        raise AssertionError("adopted host did not receive second launch")
+
+    responder = asyncio.create_task(answer_next_launch())
+    second_resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    await responder
+    second = env.conv_store.get_conversation(second_resp.json()["id"])
+    assert second is not None
+    assert first.host_id == second.host_id
+    assert first.runner_id != second.runner_id
+    assert first.workspace != second.workspace
+    assert len(env.host_store.list_hosts(RESERVED_USER_LOCAL)) == 1
+
+    before_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
+
+    def _allocation_failure(_sandbox_id: str, _session_id: str) -> str:
+        raise click.ClickException("allocation failed")
+
+    monkeypatch.setattr(fake, "allocate_workspace", _allocation_failure)
+    with pytest.raises(click.ClickException, match="allocation failed"):
+        await env.client.post(
+            "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+        )
+    after_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
+    assert after_failure == before_failure
+
+    assert (await env.client.delete(f"/v1/sessions/{first.id}")).status_code == 200
+    assert env.host_store.get_host(first.host_id) is not None
+    assert (await env.client.delete(f"/v1/sessions/{second.id}")).status_code == 200
+    assert env.host_store.get_host(first.host_id) is None
 
 
 async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(

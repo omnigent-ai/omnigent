@@ -21,6 +21,15 @@ variables:
       UC schema (catalog.schema) holding the OTel destination tables.
       The platform writes to <schema>.otel_logs, otel_metrics, otel_spans.
     default: main.omnigent_logs
+  coda_app_name:
+    description: "Optional managed CoDA Databricks App name."
+    default: ""
+  coda_app_url:
+    description: "Optional managed CoDA Databricks App URL."
+    default: ""
+  omnigent_public_server_url:
+    description: "Public URL this Omnigent App exposes to managed CoDA hosts."
+    default: ""
 
 resources:
   apps:
@@ -44,6 +53,12 @@ resources:
             value_from: artifact_volume
           - name: OTEL_TRACES_SAMPLER
             value: 'always_on'
+          - name: CODA_APP_NAME
+            value: ${var.coda_app_name}
+          - name: CODA_APP_URL
+            value: ${var.coda_app_url}
+          - name: OMNIGENT_PUBLIC_SERVER_URL
+            value: ${var.omnigent_public_server_url}
       resources:
         - name: postgres
           postgres:
