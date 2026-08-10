@@ -683,12 +683,17 @@ export function Sidebar({
       aria-label="Conversations"
       onPointerEnter={cancelPeekClose}
       onPointerLeave={() => {
-        if (peek) {
-          cancelPeekClose();
-          peekCloseTimer.current = setTimeout(() => {
-            onClose();
-          }, 200);
-        }
+        if (!peek) return;
+        cancelPeekClose();
+        // Defer closing if any context menu is open
+        const tryClose = () => {
+          if (document.querySelector('[role="menu"][data-state="open"]')) {
+            peekCloseTimer.current = setTimeout(tryClose, 200);
+            return;
+          }
+          onClose();
+        };
+        peekCloseTimer.current = setTimeout(tryClose, 200);
       }}
       className={cn(
         // Base: bg + flex column. No transition — expand/collapse snaps
