@@ -3224,6 +3224,10 @@ export function NewChatLandingScreen() {
               value={message}
               onChange={(e) => {
                 setMessage(e.target.value);
+                // A rejected attachment is never added, so there's no chip to
+                // remove and nothing else would ever clear this. Left sticky it
+                // reads as a blocker on a composer the user can actually submit.
+                if (attachmentError !== null) setAttachmentError(null);
                 // Recompute the active "@"-mention from the caret each keystroke
                 // (native terminal agents with a workspace — ``mentionEnabled``).
                 setMention(

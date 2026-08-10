@@ -2399,6 +2399,24 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
     expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
   });
+
+  it("clears the rejection notice once the user types", () => {
+    // The rejected file is never attached, so there is no chip to remove and
+    // nothing else clears the notice. Left sticky it reads as a blocker on a
+    // composer that can actually be submitted.
+    renderLanding();
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [zip] },
+    });
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "never mind, just a question" },
+    });
+
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
 });
 
 // The "@"-file-mention browser on the launcher mirrors the in-session
