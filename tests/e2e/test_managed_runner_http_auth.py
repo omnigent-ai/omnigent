@@ -45,6 +45,7 @@ import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import pytest
@@ -239,11 +240,20 @@ def _start_apps_edge_proxy(
 
         def _relay(self) -> None:
             """Forward one request upstream, or 403 a forbidden mint."""
+            # Constrain the request target to the API paths this test drives:
+            # an absolute-form target (scheme/netloc) would override the
+            # forward client's fixed base_url, so only origin-form ``/v1/...``
+            # targets are relayed; everything else is refused.
+            parts = urlsplit(self.path)
+            if parts.scheme or parts.netloc or not parts.path.startswith("/v1/"):
+                self.send_error(404)
+                return
+            target = urlunsplit(("", "", parts.path, parts.query, ""))
             if (
                 forbid_mint.is_set()
                 and self.command == "POST"
-                and self.path.startswith("/v1/runners/")
-                and self.path.endswith("/token")
+                and parts.path.startswith("/v1/runners/")
+                and parts.path.endswith("/token")
             ):
                 body = b"Invalid Token"
                 self.send_response(403)
@@ -259,9 +269,7 @@ def _start_apps_edge_proxy(
                 for name, value in self.headers.items()
                 if name.lower() not in ("host", "content-length", "connection", "accept-encoding")
             }
-            upstream_resp = forward.request(
-                self.command, self.path, content=content, headers=headers
-            )
+            upstream_resp = forward.request(self.command, target, content=content, headers=headers)
             self.send_response(upstream_resp.status_code)
             for name in ("Content-Type", "X-Agent-Name", "Location"):
                 value = upstream_resp.headers.get(name)

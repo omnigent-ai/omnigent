@@ -401,6 +401,7 @@ class _InitialAuthTokenFactory:
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
         self._fallback_resolved = False
+        self._no_credential_logged = False
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
@@ -427,7 +428,10 @@ class _InitialAuthTokenFactory:
                     _allow_delegated_mint=False,
                 )
                 token = self._fallback_factory() if self._fallback_factory is not None else None
-            if self._fallback_factory is None:
+            if self._fallback_factory is None and not self._no_credential_logged:
+                # This state is terminal for the process, so say it once
+                # rather than on every subsequent callback.
+                self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
                     "to renew it; run `databricks auth login` to re-authenticate"
