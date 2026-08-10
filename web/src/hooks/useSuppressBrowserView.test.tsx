@@ -1,7 +1,7 @@
 import { render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { SuppressBrowserView } from "./useSuppressBrowserView";
+import { resyncBrowserSuppression, SuppressBrowserView } from "./useSuppressBrowserView";
 
 /** Install a `window.omnigentDesktop` with a spied browserSetSuppressed. */
 function installBridge() {
@@ -40,5 +40,26 @@ describe("SuppressBrowserView", () => {
   it("is a no-op outside a browser-capable shell (no bridge)", () => {
     // No window.omnigentDesktop installed — must not throw.
     expect(() => render(<SuppressBrowserView />).unmount()).not.toThrow();
+  });
+});
+
+describe("resyncBrowserSuppression", () => {
+  it("pushes false when no overlay is open (clears a stale suppression after reload)", () => {
+    const spy = installBridge();
+    resyncBrowserSuppression();
+    expect(spy.mock.calls).toEqual([[false]]);
+  });
+
+  it("pushes true when an overlay is currently open", () => {
+    const spy = installBridge();
+    const view = render(<SuppressBrowserView />);
+    spy.mockClear();
+    resyncBrowserSuppression();
+    expect(spy.mock.calls).toEqual([[true]]);
+    view.unmount();
+  });
+
+  it("is a no-op without the desktop bridge", () => {
+    expect(() => resyncBrowserSuppression()).not.toThrow();
   });
 });

@@ -28,6 +28,20 @@ function browserSuppressor(): ((suppressed: boolean) => unknown) | undefined {
 }
 
 /**
+ * Re-assert the renderer's suppression state to the main process.
+ *
+ * The main-process flag persists across a renderer reload/crash, but this
+ * module's `openOverlayCount` resets to 0. If the renderer reloads while an
+ * overlay is open, the unmount cleanup that would clear suppression never
+ * fires, leaving the pane hidden forever. Call this once on shell mount so a
+ * fresh renderer pushes its real state (`count > 0`) — normally `false`,
+ * clearing a stale `true`. Idempotent; no-op outside a browser-capable shell.
+ */
+export function resyncBrowserSuppression(): void {
+  void browserSuppressor()?.(openOverlayCount > 0);
+}
+
+/**
  * Renders nothing; suppresses the embedded browser view for as long as it is
  * mounted.
  *

@@ -44,6 +44,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   AGENT_TERMINAL_IDS,
   inventoryTerminals,
@@ -573,6 +574,14 @@ export function AppShell() {
   // only mounts while its tab is selected) so it's listening before the first
   // browser_navigate. No-op outside Electron / with no conversation.
   useBrowserAgentRelay(conversationId);
+
+  // Clear a stale browser-view suppression left by a renderer reload/crash: the
+  // main-process flag persists but this renderer's overlay count reset to 0, so
+  // a dialog open across the reload would strand the pane hidden. Re-assert our
+  // real state once on mount. No-op outside a browser-capable shell.
+  useEffect(() => {
+    resyncBrowserSuppression();
+  }, []);
 
   // Auto-surface the Browser tab on a `navigate` action, so a browser_navigate
   // fired while another tab is selected doesn't load into a hidden pane.
