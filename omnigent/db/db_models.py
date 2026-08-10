@@ -1583,3 +1583,226 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
         ),
     )
+
+
+class SqlSessionLifecycleCursor(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_lifecycle_cursors`` table.
+
+    Per-``(workspace_id, session_id)`` sequence allocator for
+    ``session_lifecycle_outbox`` rows. The outbox lives on a possibly
+    different physical database than ``conversations``/``conversation_items``
+    (``ConversationBase``), so ``sequence`` cannot be allocated by locking
+    through the conversation engine (``_lock_conversation``) — this row is
+    locked on the metadata engine instead, in the same transaction as the
+    outbox insert it protects.
+
+    :param session_id: The session (conversation) this cursor tracks.
+    :param next_sequence: The next ``sequence`` value to assign to a new
+        outbox row for this session. Starts at 1.
+    """
+
+    __tablename__ = "session_lifecycle_cursors"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    next_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="1")
+
+
+class SqlSessionLifecycleOutbox(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_lifecycle_outbox`` table.
+
+    A transactional outbox of durable, stable-ID lifecycle events
+    (``session.completed`` / ``session.failed`` / ``session.awaiting_decision``
+    / ``session.resumed``) pushed to the configured manager webhook. Rows are
+    inserted synchronously in the same transaction as the fact they report,
+    then delivered asynchronously by the dispatcher (see
+    ``omnigent/server/manager_webhook_dispatcher.py``).
+
+    :param id: The externally stable ``event_id`` — deterministic (UUIDv5),
+        not random, so a retried producer call resolves to the same row via
+        this primary key rather than a separate dedupe query.
+    :param session_id: The session this event reports on. No DB foreign key
+        (Rule R032) — application-owned like ``scheduled_task_runs.conversation_id``.
+    :param event_type: One of ``session.completed`` / ``session.failed`` /
+        ``session.awaiting_decision`` / ``session.resumed``, stored as a
+        stable int code (see ``omnigent.db.enum_codecs.SESSION_LIFECYCLE_EVENT_TYPE``).
+    :param transition_key: Stable source identity the event was derived from,
+        e.g. ``turn:{response_id}:completed`` or
+        ``elicitation:{elicitation_id}:awaiting_decision``. Combined with
+        ``event_type`` in the idempotency unique constraint.
+    :param sequence: Monotonic per ``(workspace_id, session_id)``, allocated
+        from :class:`SqlSessionLifecycleCursor` in the same transaction as
+        this row's insert.
+    :param event_version: Wire envelope version; bumped on a breaking payload
+        change under the same ``event_type``.
+    :param payload: JSON event ``data`` (redacted/allowlisted before insert),
+        stored compressed.
+    :param status: Delivery status — ``pending``/``leased``/``delivered``/
+        ``dead_letter``/``paused``, stored as a stable int code (see
+        ``omnigent.db.enum_codecs.SESSION_LIFECYCLE_OUTBOX_STATUS``).
+    :param attempt_count: Number of delivery attempts made so far.
+    :param next_attempt_at: Unix epoch seconds; the dispatcher's claim filter.
+    :param lease_owner: Replica identity holding the current delivery
+        attempt's lease, or ``None`` when not leased.
+    :param lease_expires_at: Unix epoch seconds the current lease expires;
+        used to reclaim a row whose claiming replica crashed mid-delivery.
+    :param last_attempt_at: Unix epoch seconds of the most recent delivery
+        attempt, or ``None`` before the first attempt.
+    :param delivered_at: Unix epoch seconds the row reached ``delivered``, or
+        ``None`` until then.
+    :param last_http_status: HTTP status of the most recent delivery attempt,
+        or ``None`` before the first attempt.
+    :param last_error_code: Short, sanitized failure classification from the
+        most recent failed attempt; never raw response body.
+    :param last_error_message: Short, sanitized failure detail from the most
+        recent failed attempt; never raw response body.
+    :param created_at: Unix epoch seconds the row was inserted.
+    """
+
+    __tablename__ = "session_lifecycle_outbox"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    event_type: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    transition_key: Mapped[str] = mapped_column(String(192), nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    payload: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    next_attempt_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_attempt_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    delivered_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_http_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_message: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN (1, 2, 3, 4)",
+            name="ck_session_lifecycle_outbox_event_type",
+        ),
+        CheckConstraint(
+            "status IN (1, 2, 3, 4, 5)",
+            name="ck_session_lifecycle_outbox_status",
+        ),
+        # Ordering + prevents double-allocation of a sequence number.
+        UniqueConstraint(
+            "workspace_id",
+            "session_id",
+            "sequence",
+            name="uq_session_lifecycle_outbox_session_sequence",
+        ),
+        # Idempotency key: a retried producer call resolves to the existing
+        # row instead of racing the cursor into a duplicate.
+        UniqueConstraint(
+            "workspace_id",
+            "session_id",
+            "event_type",
+            "transition_key",
+            name="uq_session_lifecycle_outbox_transition",
+        ),
+        # Dispatcher's hot claim query.
+        Index(
+            "ix_session_lifecycle_outbox_claim",
+            "status",
+            "next_attempt_at",
+            "workspace_id",
+        ),
+        # Per-session ordering / head lookup (lowest non-delivered sequence).
+        Index(
+            "ix_session_lifecycle_outbox_session_order",
+            "workspace_id",
+            "session_id",
+            "sequence",
+            "status",
+        ),
+    )
+
+
+class SqlSessionElicitation(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_elicitations`` table.
+
+    A durable ledger of human-decision elicitations, narrower than a general
+    cross-restart resume guarantee (see
+    ``docs/architecture/2026-08-10-durable-session-lifecycle-push.md`` §5.4):
+    it always records that a decision was made and survives a restart, but
+    whether the runner can actually consume that decision is classified by
+    which process died (no restart / server restart with runner alive /
+    runner dead), not promised uniformly by this table.
+
+    :param id: The elicitation id (``== elicitation_id``), e.g.
+        ``"elicit_a1b2c3..."`` — a prefixed opaque token, not a bare-hex
+        UUID, so this is a plain ``String`` column, not :class:`Uuid16`.
+    :param session_id: The owning session. No DB foreign key (Rule R032).
+    :param status: ``pending``/``decided``/``delivered_to_runner``/``expired``,
+        stored as a stable int code (see
+        ``omnigent.db.enum_codecs.SESSION_ELICITATION_STATUS``).
+    :param request_payload: Allowlisted elicitation request fields (prompt,
+        choices, requesting tool/action name, correlation IDs), stored
+        compressed. Written at registration time.
+    :param decision_payload: Allowlisted decision fields, stored compressed.
+        ``None`` until a verdict is recorded.
+    :param decided_by: The manager identity from the signed callback, or
+        ``None`` for a web-UI verdict.
+    :param created_at: Unix epoch seconds the row was created.
+    :param decided_at: Unix epoch seconds the verdict was durably recorded,
+        or ``None`` before then.
+    :param resolved_at: Unix epoch seconds a live/reconnected runner actually
+        consumed the decision, or ``None`` before then (including the
+        ``410 elicitation_not_resolvable`` case, which never sets this).
+    """
+
+    __tablename__ = "session_elicitations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    # NOT Uuid16: elicitation_id is a prefixed opaque token
+    # (f"elicit_{secrets.token_hex(16)}", or a caller-supplied id like
+    # "elicit_codex_abc123") — not a bare-hex UUID, so it cannot use the
+    # 16-raw-byte encoding every other id column here does.
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    request_payload: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    decision_payload: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    decided_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resolved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN (1, 2, 3, 4)",
+            name="ck_session_elicitations_status",
+        ),
+        Index(
+            "ix_session_elicitations_session_id",
+            "workspace_id",
+            "session_id",
+        ),
+    )

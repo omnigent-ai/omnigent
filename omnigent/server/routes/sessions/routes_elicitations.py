@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from fastapi import (
     APIRouter,
+    HTTPException,
     Request,
 )
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     pending_elicitations,
 )
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_outbox
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -49,6 +53,7 @@ from omnigent.server.schemas import (
     ElicitationResult,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import runner_seen_is_fresh
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -108,9 +113,19 @@ def register_elicitations_routes(
         :param body: The MCP-shaped verdict — ``action``
             (``"accept"`` / ``"decline"`` / ``"cancel"``) plus
             optional form ``content``.
-        :returns: ``{"queued": False}`` — resolution is synchronous
-            and persists no conversation item.
+        :returns: ``{"queued": False, "resolved": bool, "pending_redelivery": bool}``.
+            ``resolved=True`` when the verdict was consumed synchronously
+            (no restart, or the runner was reachable on this delivery
+            attempt); ``pending_redelivery=True`` when the verdict is
+            durably recorded but the runner's tunnel isn't currently
+            reachable and appears to have recently reconnected elsewhere
+            (OMN-104 §5.4 case (b) — redelivered on tunnel reconnect).
         :raises OmnigentError: 404 if no session exists.
+        :raises HTTPException: 410 (``error_code=elicitation_not_resolvable``)
+            when the runner/host is not believed to be alive at all
+            (OMN-104 §5.4 case (c)) — the verdict is still durably
+            recorded (see ``session_elicitations``), but the endpoint does
+            not claim the session resumed, because it structurally did not.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -122,13 +137,104 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        # Ownership check on the DURABLE ledger, mirroring the in-memory
+        # ownership guard inside _resolve_elicitation (_harness_elicitation_owners):
+        # a session must not durably decide an elicitation it doesn't own.
+        # A cross-session id is treated exactly like an untracked one below
+        # — the call is accepted (202) but nothing is persisted or
+        # classified, matching the pre-OMN-104 no-op contract.
+        existing_elicitation = session_outbox.get_elicitation(elicitation_id)
+        owned_by_this_session = (
+            existing_elicitation is not None and existing_elicitation.session_id == session_id
+        )
+        # Durably persist the verdict FIRST, unconditionally (once
+        # ownership is established) — before any attempt to resolve an
+        # in-memory Future or reach the runner. This is what lets the
+        # classification below distinguish "durably recorded but not yet
+        # consumed" from "silently dropped" after a restart (OMN-104 §5.4).
+        decision_record = (
+            session_outbox.record_decision(
+                elicitation_id=elicitation_id,
+                decision=body.model_dump(exclude_none=True),
+                decided_by=user_id,
+            )
+            if owned_by_this_session
+            else None
+        )
+        outcome = await _resolve_elicitation(
+            session_id, _resolve_data, runner_router, conversation_store
+        )
+        if decision_record is None:
+            # No durable OMN-104 ledger row for this id — either the feature
+            # isn't wired, or (the common case for this shared endpoint) the
+            # id was never registered via record_elicitation_raised / is
+            # already resolved / is unknown. Preserve the pre-OMN-104
+            # contract exactly rather than 410ing a request that always used
+            # to be a harmless idempotent no-op.
+            await _apply_pending_policy_ask_writes(
+                session_id, conv, conversation_store, agent_store, _resolve_data
+            )
+            return {"queued": False}
+        if decision_record.status in ("delivered_to_runner", "expired"):
+            # Already truthfully resumed (by an earlier call to this
+            # endpoint, or by reconnect redelivery) — idempotent no-op, not
+            # a fresh classification. A duplicate resolve must not risk a
+            # 410 just because the harness Future it already consumed is
+            # now done().
+            await _apply_pending_policy_ask_writes(
+                session_id, conv, conversation_store, agent_store, _resolve_data
+            )
+            return {"queued": False, "resolved": True, "pending_redelivery": False}
+        resolved = outcome.harness_future_resolved or outcome.forward_outcome == "delivered"
+        pending_redelivery = False
+        if resolved:
+            # Truthful acknowledgement achieved synchronously (either an
+            # in-process Future was set, or the runner's own handler ran
+            # pending_approvals.resolve(...) and returned 2xx) — emit
+            # session.resumed now.
+            session_outbox.record_elicitation_resumed(
+                workspace_id=current_workspace_id(), elicitation_id=elicitation_id
+            )
+        else:
+            # Not resolved synchronously. Classify by whether the runner is
+            # believed alive at all (cross-replica, DB-backed freshness —
+            # not this replica's local tunnel registry, which a manager's
+            # request may not share with the replica holding the tunnel):
+            # fresh -> server restart / this replica's tunnel is stale, but
+            # the runner is expected to reconnect soon, so the decided-but-
+            # undelivered row is redelivered on that reconnect (see
+            # _on_runner_connect in app.py). Not fresh (or no runner at
+            # all) -> the runner process itself is not believed alive; no
+            # durable row can rebind a coroutine that no longer exists.
+            connectivity = await asyncio.to_thread(
+                conversation_store.get_session_connectivity, [session_id]
+            )
+            conn = connectivity.get(session_id)
+            runner_alive = (
+                conn is not None
+                and conn.runner_id is not None
+                and runner_seen_is_fresh(conn.runner_last_seen, now=int(time.time()))
+            )
+            if runner_alive:
+                pending_redelivery = True
+            else:
+                raise HTTPException(
+                    status_code=410,
+                    detail={
+                        "error_code": "elicitation_not_resolvable",
+                        "message": (
+                            "The runner for this session is not reachable and is not "
+                            "believed to be alive; the decision was recorded but could "
+                            "not be delivered."
+                        ),
+                    },
+                )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(
             session_id, conv, conversation_store, agent_store, _resolve_data
         )
-        return {"queued": False}
+        return {"queued": False, "resolved": resolved, "pending_redelivery": pending_redelivery}
 
     @router.get(
         "/sessions/{session_id}/elicitations/{elicitation_id}",

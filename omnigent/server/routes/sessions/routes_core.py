@@ -751,6 +751,7 @@ def register_core_routes(
             host_store=getattr(request.app.state, "host_store", None),
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
             viewer_id=user_id,
+            session_lifecycle_store=getattr(request.app.state, "session_lifecycle_store", None),
         )
 
     @router.get(

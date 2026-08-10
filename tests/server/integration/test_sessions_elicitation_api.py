@@ -193,12 +193,17 @@ async def test_post_resolve_already_resolved_is_idempotent(
             _ = await hook_task
 
         # Second resolve — the Future is already done; should still 202.
+        # OMN-104: the durable elicitation ledger already transitioned to
+        # delivered_to_runner on the first resolve, so this is the
+        # already-resumed idempotent no-op branch — "resolved": True,
+        # not a fresh classification (and not a 410, even though the
+        # harness Future it already consumed is now done()).
         second = await client.post(
             f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
             json={"action": "decline"},
         )
         assert second.status_code == 202, second.text
-        assert second.json() == {"queued": False}
+        assert second.json() == {"queued": False, "resolved": True, "pending_redelivery": False}
     finally:
         if not hook_task.done():
             hook_task.cancel()

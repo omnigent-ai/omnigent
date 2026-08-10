@@ -42,6 +42,7 @@ from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
 )
+from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import (
     Agent,
@@ -87,7 +88,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state
+from omnigent.server import presence, session_live_state, session_outbox
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -2656,7 +2657,7 @@ async def _forward_approval_to_runner(
     session_id: str,
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
-) -> None:
+) -> Literal["no_runner", "delivered", "unreachable"]:
     """
     Forward an approval verdict to the session's bound runner.
 
@@ -2676,12 +2677,22 @@ async def _forward_approval_to_runner(
         "action": "accept"}``.
     :param runner_router: Router used to resolve the bound runner, or
         ``None`` in in-process setups (forward skipped).
+    :returns: ``"no_runner"`` when no tunnel is bound *on this replica*
+        (in-process setup, or the runner's tunnel is held by a different
+        replica — not itself proof the runner is dead, see OMN-104's
+        harness-classified elicitation resolution, which additionally
+        consults the cross-replica ``runner_last_seen`` freshness signal
+        before concluding a runner is unreachable); ``"delivered"`` on a
+        2xx response (the runner's own handler ran
+        ``pending_approvals.resolve(...)`` — a truthful acknowledgement,
+        not just "accepted"); ``"unreachable"`` on a transport error or a
+        non-2xx response.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
-        return
+        return "no_runner"
     try:
-        await runner_client.post(
+        response = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json={"type": _APPROVAL_TYPE, "data": data},
             timeout=10.0,
@@ -2691,6 +2702,15 @@ async def _forward_approval_to_runner(
             "Approval forward failed for %r",
             session_id,
         )
+        return "unreachable"
+    if 200 <= response.status_code < 300:
+        return "delivered"
+    _logger.warning(
+        "Approval forward for %r rejected by runner: %s",
+        session_id,
+        response.status_code,
+    )
+    return "unreachable"
 
 
 def _parse_external_assistant_message(
@@ -3622,6 +3642,33 @@ def _publish_status(
             error_code=error.code if error is not None else None,
             error=error.message if error is not None else None,
         )
+    # Durable manager-webhook lifecycle events (OMN-104). Bound to this same
+    # edge — the same terminal signal that just drove
+    # persist_scheduled_run_completion above — not re-derived from either
+    # best-effort mirror. Read the open turn's response id from
+    # _session_active_response_cache BEFORE it is popped a few lines below:
+    # an idle transition with no cached response id means no turn was
+    # actually open (or this is an idle->idle no-op), so nothing is emitted.
+    # No secondary gate on background_task_count — see
+    # docs/architecture/2026-08-10-durable-session-lifecycle-push.md §5.1.
+    open_response_id = _session_active_response_cache.get(session_id)
+    if status == "idle" and open_response_id is not None:
+        session_outbox.record_session_completed(
+            workspace_id=current_workspace_id(),
+            session_id=session_id,
+            response_id=open_response_id,
+            background_task_count=background_task_count,
+        )
+    elif status == "failed":
+        failed_response_id = open_response_id or response_id
+        if failed_response_id is not None:
+            session_outbox.record_session_failed(
+                workspace_id=current_workspace_id(),
+                session_id=session_id,
+                response_id=failed_response_id,
+                error_code=error.code if error is not None else "unknown",
+                error_message=error.message if error is not None else "",
+            )
     # Track the in-flight response id for snapshot-based reconnect (see
     # _session_active_response_cache). A running/waiting edge that names a
     # turn opens it; any idle/failed edge closes it.

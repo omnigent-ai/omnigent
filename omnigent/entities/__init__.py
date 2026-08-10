@@ -30,6 +30,7 @@ from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
 from omnigent.entities.project import Project
 from omnigent.entities.scheduled_task import ScheduledTask, ScheduledTaskRun
+from omnigent.entities.session_lifecycle import LifecycleOutboxEvent, SessionElicitation
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -54,6 +55,7 @@ __all__ = [
     "FunctionCallData",
     "FunctionCallOutputData",
     "ItemData",
+    "LifecycleOutboxEvent",
     "LoadedAgent",
     "MessageData",
     "NativeToolData",
@@ -67,6 +69,7 @@ __all__ = [
     "RoutingDecisionData",
     "ScheduledTask",
     "ScheduledTaskRun",
+    "SessionElicitation",
     "SessionPermission",
     "SessionResourceView",
     "SlashCommandData",

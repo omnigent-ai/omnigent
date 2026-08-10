@@ -1,10 +1,12 @@
 """FastAPI application — main entry point for the omnigent server."""
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
 import re
+import socket
 import tarfile
 import time
 import uuid
@@ -14,6 +16,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,13 +44,14 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, session_outbox
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.managed_hosts import ManagedSandboxConfig
+from omnigent.server.manager_webhook_dispatcher import cancel_dispatcher, run_dispatcher
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -58,6 +62,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.routes._sessions.common import _APPROVAL_TYPE
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -96,6 +101,9 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.stores.session_lifecycle_store.sqlalchemy_store import (
+    SqlAlchemySessionLifecycleStore,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -929,6 +937,14 @@ def create_app(
     _mcp_pool = ServerMcpPool()
     server_metrics = ServerPerformanceMetrics()
     server_metrics_otel = ServerMetricsOtelPublisher()
+    # Durable session-lifecycle outbox (OMN-104) — same physical DB as the
+    # rest of OmnigentBase (conversation_store.storage_location, not
+    # conversation_storage_location: the outbox must share a transaction
+    # with the OmnigentBase facts it reports on, not the AP/conversation
+    # engine). Constructed here (before the lifespan) so both the
+    # dispatcher task below and session_outbox.configure() (called
+    # synchronously further down in create_app) share the same instance.
+    session_lifecycle_store = SqlAlchemySessionLifecycleStore(conversation_store.storage_location)
 
     @asynccontextmanager
     async def _lifespan(
@@ -1049,6 +1065,16 @@ def create_app(
                         exc,
                     )
 
+        # Manager-webhook dispatcher (OMN-104): always started (same pattern
+        # as metrics_publish_task below), regardless of
+        # manager_webhook.enabled — see manager_webhook_dispatcher.py's
+        # module docstring on why it no-ops rather than being conditionally
+        # constructed. One per replica; safe under multi-replica because
+        # claiming is row-leased, not because only one replica runs it.
+        _dispatcher_lease_owner = f"{socket.gethostname()}-{os.getpid()}"
+        manager_webhook_dispatcher_task = asyncio.create_task(
+            run_dispatcher(session_lifecycle_store, lease_owner=_dispatcher_lease_owner)
+        )
         metrics_publish_task = asyncio.create_task(
             publish_server_metrics_periodically(
                 server_metrics,
@@ -1124,6 +1150,7 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            await cancel_dispatcher(manager_webhook_dispatcher_task)
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the
@@ -1261,6 +1288,13 @@ def create_app(
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    # Wire the durable session-lifecycle outbox (constructed above, before
+    # _lifespan, so the dispatcher task can also close over it). Writes
+    # happen regardless of manager_webhook.enabled so poll/reconcile-
+    # independent delivery can be turned on later without a backfill; only
+    # the dispatcher (started in _lifespan) is gated on config.
+    session_outbox.configure(session_lifecycle_store)
+    app.state.session_lifecycle_store = session_lifecycle_store
 
     @app.middleware("http")
     async def _record_server_metrics(
@@ -2249,6 +2283,44 @@ def create_app(
                 routed.client,
                 conversation_store,
             )
+            # OMN-104 §5.4 case (b): redeliver any decided-but-undelivered
+            # elicitation verdicts now that this session's runner tunnel is
+            # back. A durable session_elicitations row plus this reconnect
+            # hook is what makes the manager's earlier decision-endpoint
+            # response ("recorded, pending redelivery") eventually true —
+            # reuses the runner's existing approval-POST contract rather
+            # than inventing a second delivery mechanism.
+            for undelivered in session_lifecycle_store.list_decided_undelivered(conv.id):
+                try:
+                    decision_payload = (
+                        json.loads(undelivered.decision_payload)
+                        if undelivered.decision_payload
+                        else {}
+                    )
+                    response = await routed.client.post(
+                        f"/v1/sessions/{conv.id}/events",
+                        json={
+                            "type": _APPROVAL_TYPE,
+                            "data": {"elicitation_id": undelivered.id, **decision_payload},
+                        },
+                        timeout=10.0,
+                    )
+                    if 200 <= response.status_code < 300:
+                        session_outbox.record_elicitation_resumed(
+                            workspace_id=undelivered.workspace_id,
+                            elicitation_id=undelivered.id,
+                        )
+                    else:
+                        _logger.warning(
+                            "Reconnect redelivery for elicitation %s rejected by runner: %s",
+                            undelivered.id,
+                            response.status_code,
+                        )
+                except (httpx.HTTPError, ConnectionError):
+                    _logger.exception(
+                        "Reconnect redelivery failed for elicitation %s",
+                        undelivered.id,
+                    )
             # The session's terminal exists as of the handshake above, so its
             # model catalogs are answerable now. Warming them here is what
             # keeps the first routed message off the runner round trip. The
