@@ -2030,6 +2030,7 @@ async def _execute_subagent_tool(
 
             session_stream.publish(conversation_id, _evt.model_dump())
 
+    assert session_name is not None
     # Register the child→parent mapping so the runner can fan out the
     # child's status/preview deltas onto the PARENT's stream (the child's
     # own relay isn't running when only the parent is being viewed). The
