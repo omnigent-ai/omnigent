@@ -328,21 +328,17 @@ describe("Sidebar shift-click selection", () => {
   });
 
   it("labels Delete with the owned count when the selection is mixed-ownership", async () => {
-    // A project folder can hold sessions owned by other users (the folder query
-    // isn't ownership-filtered). Delete acts only on owned rows, so its label
-    // must reflect the owned count — not the raw "N selected" — when they differ.
-    projectsMock.push("Alpha");
-    const mine = conv("mine", { owner: "viewer", labels: { omni_project: "Alpha" } });
-    const theirs = conv("theirs", { owner: "someone_else", labels: { omni_project: "Alpha" } });
+    // The flat "All sessions" list mixes the viewer's own sessions with ones
+    // shared to them by other owners. Delete acts only on owned rows, so its
+    // label must reflect the owned count — not the raw "N selected" — when they
+    // differ. (Project folders are owner-only, so mixed ownership only arises in
+    // the flat list, not a folder.)
+    const mine = conv("mine", { owner: "viewer" });
+    const theirs = conv("theirs", { owner: "someone_else" });
     mockConversations([mine, theirs]);
-    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
     renderSidebar();
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(screen.getByRole("button", { name: /select/i }));
 
     // Select both rows — "2 selected", but only the owned one is deletable.
     fireEvent.click(await screen.findByRole("link", { name: "mine" }));

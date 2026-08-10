@@ -8,7 +8,7 @@ import pytest
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
 from issue_prioritization.databricks_io import SparkIssueSource
-from issue_prioritization.domain import IssueType, Priority, Severity
+from issue_prioritization.domain import Impact, IssueType, Priority
 
 
 def test_bronze_adapter_accepts_github_structs_and_json() -> None:
@@ -31,7 +31,7 @@ def test_bronze_adapter_accepts_github_structs_and_json() -> None:
     classification = Classification(
         issue_number=42,
         issue_type=IssueType.BUG,
-        severity=Severity.S1,
+        impact=Impact.HIGH,
         area_keys=("android",),
         component_labels=("comp:android",),
         reasoning="No login workaround",

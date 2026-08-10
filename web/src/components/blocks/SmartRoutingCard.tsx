@@ -173,7 +173,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
     >
       <div className="flex items-center gap-1.5 text-sm">
         <BrainIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="font-medium">Intelligent routing</span>
+        <span className="font-medium">Smart routing</span>
         {judging ? (
           <Shimmer as="span" className="text-sm">
             {`Weighing ${tasks.length} ${taskNoun}…`}

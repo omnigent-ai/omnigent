@@ -57,6 +57,12 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # without it a corporate-CA user upgrading would hit TLS failures from
         # every harness that does not happen to own a NODE_ prefix of its own.
         "NODE_EXTRA_CA_CERTS",
+        # ssh-agent socket path, so an agent's git-over-SSH and SSH-cert
+        # tooling authenticates. A path to a unix socket, not a bearer token:
+        # reaching the agent still requires the user's own ssh-agent to be
+        # running and to hold the key. Shared here because every harness runs
+        # git, not just the one whose bug surfaced it.
+        "SSH_AUTH_SOCK",
         OMNIGENT_SESSION_ENV_VAR,
     }
 )

@@ -23,7 +23,8 @@
  *   entering them stays inside settings — the sidebar keeps the section nav
  *   instead of snapping back to the conversation list.
  * - **Archived sessions** — archived sessions, moved out of the sidebar
- *   list. Not clickable; each row reveals Delete / Unarchive on hover.
+ *   list. Not clickable; each row reveals Delete / Unarchive on hover, and
+ *   Unarchive opens the restored session.
  */
 
 import {
@@ -91,6 +92,7 @@ import {
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
+import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import {
   normalizeResolvedTheme,
@@ -2017,8 +2019,10 @@ function ArchivedSection() {
  * One archived-session row. Not clickable (archived sessions aren't a
  * navigation target here); the title + timestamp read as a record, and the
  * Delete / Unarchive controls reveal on hover (always visible on touch).
+ * Unarchive navigates to the restored session once the PATCH lands.
  */
 function ArchivedRow({ conversation }: { conversation: Conversation }) {
+  const navigate = useNavigate();
   const archive = useArchiveConversation();
   const del = useStopAndDeleteConversation();
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -2061,7 +2065,14 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
           className="gap-1.5 dark:bg-secondary dark:hover:bg-secondary/80"
           data-testid="unarchive-conversation"
           disabled={busy}
-          onClick={() => archive.mutate({ id: conversation.id, archived: false })}
+          onClick={() =>
+            archive.mutate(
+              { id: conversation.id, archived: false },
+              // Unarchiving is how a user brings a session back into play, so
+              // land them in it — the row leaves this list either way.
+              { onSuccess: () => navigate(`/c/${conversation.id}`) },
+            )
+          }
         >
           <ArchiveRestoreIcon className="size-3.5" />
           Unarchive

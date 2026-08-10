@@ -32,6 +32,7 @@ from omnigent.cli import (
     _expand_config_env_vars,
     _extract_global_logging_flags,
     _HostHttpResult,
+    _is_local_server_request,
     _is_removed_ad_hoc_invocation,
     _is_run_shorthand,
     _load_global_config,
@@ -43,6 +44,7 @@ from omnigent.cli import (
     _resolve_bundle_env_vars,
     _resolve_default_agent_target,
     _resolve_first_run_plan,
+    _resolve_server_url,
     _save_global_config,
     _save_local_config,
     _server_uvicorn_log_config,
@@ -3753,6 +3755,126 @@ def test_run_server_without_agent_dispatches_direct_server(
     )
 
 
+@pytest.mark.parametrize("alias", ["", "local", "LOCAL", " local "])
+def test_run_local_server_alias_beats_configured_remote(
+    alias: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run AGENT --server local`` targets a local server, not the configured one.
+
+    ``--server local`` (and the older ``--server ""``) is the documented way to
+    ask for a local server "instead of a remote one", so it has to beat the
+    ``server`` config default rather than fall back to it. ``run_chat`` gets
+    ``server_url=None``, the sentinel ``_ensure_backend`` reads as local mode.
+    Matching ignores case and surrounding space, so a shell-quoted
+    ``--server " local "`` behaves the same.
+    """
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda *_a, **_kw: {"server": "https://configured.example.com"},
+    )
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "tests/resources/examples/hello_world.yaml", "--server", alias]
+    )
+
+    assert result.exit_code == 0, result.output
+    kwargs = run_chat.call_args.kwargs
+    assert kwargs["target"] == "tests/resources/examples/hello_world.yaml"
+    assert kwargs["server_url"] is None
+
+
+def test_run_localhost_server_is_still_remote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``localhost`` URL stays an explicit server — only bare ``local`` is the alias.
+
+    The local-mode aliases match the whole value, so hosts that merely *start*
+    with "local" keep their normal explicit-server behavior instead of being
+    swallowed by the alias.
+    """
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "tests/resources/examples/hello_world.yaml", "--server", "localhost:8000"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["server_url"] == "localhost:8000"
+
+
+@pytest.mark.parametrize("alias", ["", "local"])
+def test_run_local_server_alias_without_agent_is_not_a_direct_server(
+    alias: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run --server local`` (no AGENT) resolves the default agent locally.
+
+    Regression: the no-AGENT direct-server branch gated on ``server is not
+    None``, so an empty ``--server`` was misread as a direct server URL and
+    normalized to the bare scheme ``"https:"``. That string is not
+    ``_is_url``-shaped, so it was then taken for an agent path and the run died
+    with "Agent path not found: https:" — while a configured remote silently
+    replaced the local server the user asked for.
+    """
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda *_a, **_kw: {
+            "server": "https://configured.example.com",
+            "default_agent": "tests/resources/examples/hello_world.yaml",
+        },
+    )
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, ["run", "--server", alias])
+
+    assert result.exit_code == 0, result.output
+    kwargs = run_chat.call_args.kwargs
+    # The bug put the bogus normalized URL in the AGENT slot.
+    assert kwargs["target"] == "tests/resources/examples/hello_world.yaml"
+    assert kwargs["server_url"] is None
+
+
+@pytest.mark.parametrize("value", ["", "   ", "local", "LOCAL"])
+def test_resolve_server_url_rejects_local_server_aliases(value: str) -> None:
+    """A local-server alias fails loud instead of normalizing to a bogus URL.
+
+    Normalizing an empty string used to produce the bare scheme ``"https:"``
+    (``https://`` from the default-scheme step, then trailing-slash-trimmed),
+    which every caller then treated as a real URL; ``"local"`` would likewise
+    become the unroutable ``https://local``. Callers route local mode before
+    reaching here and must never pass an alias in.
+    """
+    with pytest.raises(ClickException, match="selects a local server"):
+        _resolve_server_url(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", True),
+        ("   ", True),
+        ("local", True),
+        ("LOCAL", True),
+        (" local ", True),
+        (None, False),
+        ("localhost", False),
+        ("localhost:8000", False),
+        ("http://localhost:6767", False),
+        ("https://example.databricksapps.com", False),
+    ],
+)
+def test_is_local_server_request(value: str | None, expected: bool) -> None:
+    """Only a whole-value ``""``/``local`` selects local mode.
+
+    ``None`` means the flag was absent (the config default still applies), and a
+    host that merely starts with "local" is a real server, so neither counts.
+    """
+    assert _is_local_server_request(value) is expected
+
+
 def test_run_server_resume_by_id_forwards_to_run_attach(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5597,12 +5719,12 @@ def test_native_terminal_dispatch_specs_cover_registered_native_agents() -> None
         (
             "claude-native",
             "omnigent.claude_native.run_claude_native",
-            {"extra_args": ("--model", "native-model")},
+            {"extra_args": ("--model", "native-model"), "prompt": None},
         ),
         (
             "codex-native",
             "omnigent.codex_native.run_codex_native",
-            {"extra_args": (), "model": "native-model"},
+            {"extra_args": (), "model": "native-model", "prompt": None},
         ),
         (
             "pi-native",
@@ -5767,6 +5889,34 @@ def test_dispatch_native_terminal_harness_kiro_forwards_prompt(
 
     assert handled is True
     assert captured["prompt"] == "review repo"
+
+
+@pytest.mark.parametrize(
+    ("harness", "target"),
+    [
+        ("claude-native", "omnigent.claude_native.run_claude_native"),
+        ("codex-native", "omnigent.codex_native.run_codex_native"),
+    ],
+)
+def test_dispatch_native_terminal_harness_forwards_prompt_to_claude_and_codex(
+    monkeypatch: pytest.MonkeyPatch, harness: str, target: str
+) -> None:
+    """``run --harness claude-native -p`` is supported, not rejected.
+
+    Both wrappers deliver the text as the TUI's initial input, so a prompt is
+    no longer a REPL-only option for them. A multi-line prompt must arrive as
+    one value — the wrappers put it on argv rather than pasting it.
+    """
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(target, lambda **kwargs: captured.update(kwargs))
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(harness=harness, prompt="first line\nsecond line")
+    )
+
+    assert handled is True
+    assert captured["prompt"] == "first line\nsecond line"
 
 
 @pytest.mark.parametrize(

@@ -36,8 +36,10 @@ import {
   type UserMessageBlock,
   slashCommandEchoItemId,
   slashCommandEchoText,
+  structuredErrorFields,
 } from "./blocks";
 import type { StreamEvent } from "./events";
+import { routingExtras } from "./routingDecision";
 import type { Response } from "./types";
 
 const DEFAULT_FLUSH_THRESHOLD = 30;
@@ -660,6 +662,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         applied: event.applied,
         rationale: event.rationale,
         ...(event.agent !== undefined && { agent: event.agent }),
+        routing: routingExtras(event.routing),
       } satisfies RoutingDecisionBlock;
       return;
     }
@@ -776,6 +779,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         message: event.error.message,
         source: event.source,
         code: event.error.code,
+        ...structuredErrorFields(event.error),
       } satisfies ErrorBlock;
       return;
     }
@@ -808,6 +812,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           message: event.response.error.message ?? "",
           source: "",
           code: event.response.error.code ?? "response_failed",
+          ...structuredErrorFields(event.response.error),
         } satisfies ErrorBlock;
       }
       yield {

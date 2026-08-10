@@ -36,7 +36,14 @@ function pr({
 // `env` overrides process.env for the run.
 async function run(
   nodes,
-  { linked = {}, env = {}, linkError = false, maintainers = [], existingComments = {} } = {}
+  {
+    linked = {},
+    env = {},
+    linkError = false,
+    maintainers = [],
+    existingComments = {},
+    issues = {},
+  } = {}
 ) {
   const commented = [];
   const labeled = [];
@@ -46,13 +53,26 @@ async function run(
     repos: {},
     graphql: async (query, vars) => {
       if (vars.searchQuery) queries.push(vars.searchQuery);
-      if (query.includes("pullRequest(number:")) {
+      // ONE_PR_QUERY also contains "pullRequest(number:", so match on the field
+      // that is unique to the link lookup.
+      if (query.includes("closingIssuesReferences")) {
         if (linkError) throw new Error("boom");
         return {
           repository: {
             pullRequest: {
               closingIssuesReferences: { totalCount: linked[vars.number] ?? 0 },
             },
+          },
+        };
+      }
+      // Single-PR fetch (the instant path).
+      if (query.includes("createdAt")) {
+        const pr = nodes.find((n) => n.number === vars.number) ?? null;
+        return {
+          repository: {
+            pullRequest: pr
+              ? { state: "OPEN", createdAt: "2026-08-06T00:00:00Z", ...pr }
+              : null,
           },
         };
       }
@@ -77,6 +97,20 @@ async function run(
         listComments: "listComments",
         createComment: async ({ issue_number, body }) => commented.push({ issue_number, body }),
         addLabels: async ({ issue_number, labels: ls }) => labeled.push({ issue_number, labels: ls }),
+        // `issues` maps number -> "issue" | "pr" | undefined (404).
+        get: async ({ issue_number }) => {
+          const kind = issues[issue_number];
+          if (!kind) {
+            const err = new Error("Not Found");
+            err.status = 404;
+            throw err;
+          }
+          // "issue" (open), "closed", "draft", or "pr".
+          if (kind === "pr") return { data: { pull_request: {}, state: "open" } };
+          if (kind === "closed") return { data: { state: "closed" } };
+          if (kind === "draft") return { data: { state: "open", draft: true } };
+          return { data: { state: "open" } };
+        },
       },
     },
   };
@@ -196,6 +230,35 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
   );
 }
 
+// ---- tracking-reference parsing (pure) ----
+{
+  const { trackingReferences: refs } = script;
+  assert.deepStrictEqual(refs("Refs #3644"), [3644], "Refs #N");
+  assert.deepStrictEqual(refs("Part of #123"), [123], "Part of #N");
+  assert.deepStrictEqual(refs("blah\nRelated to #5\nblah"), [5], "Related to #N");
+  assert.deepStrictEqual(refs("Towards #9"), [9], "Towards #N");
+  assert.deepStrictEqual(
+    refs("Part of https://github.com/omnigent-ai/omnigent/issues/321"),
+    [321],
+    "full issue URL"
+  );
+  assert.deepStrictEqual(refs("Refs omnigent-ai/omnigent#77"), [77], "cross-repo ref");
+  assert.deepStrictEqual(refs("Part of #7 and refs #7"), [7], "dedupes");
+  // A bare mention is a cross-reference, not a statement about this PR.
+  assert.deepStrictEqual(refs("similar to #77 maybe"), [], "bare #N does not count");
+  assert.deepStrictEqual(refs("this fixes the thing generally"), [], "prose does not count");
+  assert.deepStrictEqual(refs(""), [], "empty body");
+  assert.deepStrictEqual(refs(undefined), [], "missing body");
+  // Quoted and fenced text is shown, not asserted.
+  assert.deepStrictEqual(refs("> Part of #123"), [], "blockquote excluded");
+  assert.deepStrictEqual(refs("  > - `Part of #123` example"), [], "indented blockquote excluded");
+  assert.deepStrictEqual(refs("```\nPart of #123\n```"), [], "fenced block excluded");
+  assert.deepStrictEqual(refs("~~~\nRefs #123\n~~~"), [], "tilde fence excluded");
+  assert.deepStrictEqual(refs("> quoted #9\n\nPart of #7"), [7], "keeps the asserted one");
+  // An unterminated fence swallows the rest, which is the safe direction.
+  assert.deepStrictEqual(refs("```\nPart of #5"), [], "unterminated fence excluded");
+}
+
 // ---- end-to-end behaviour ----
 (async () => {
   // Forward-only: the search must never reach past the effective date, so the
@@ -222,7 +285,122 @@ for (const tracked of ["Bug fix", "Feature", "UI / frontend change"]) {
     assert.match(commented[0].body, /@alice/);
     assert.match(commented[0].body, /Closes #123/);
     assert.ok(commented[0].body.startsWith(script.MARKER), "comment carries the dedupe marker");
+    // House style: no em dashes in anything a contributor reads.
+    assert.ok(!commented[0].body.includes("—"), "no em dashes in the nudge");
+    // The exemption must not read as a free opt-out.
+    assert.match(commented[0].body, /require an issue for every PR/);
+    assert.match(commented[0].body, /even when it also touches docs or tests/);
     assert.deepStrictEqual(labeled, [], "no label is applied");
+  }
+
+  // A non-closing reference to a real ISSUE satisfies the rule: a PR that only
+  // partly addresses an issue should not have to claim it closes it.
+  for (const kw of ["Part of #77", "Related to #77", "Towards #77", "Refs #77", "See #77"]) {
+    const { commented } = await run([pr({ number: 50, body: `Work here.\n\n${kw}` })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 0, `${kw} must satisfy the rule`);
+  }
+
+  // ...but only when it resolves to an OPEN, non-draft issue.
+  for (const [kind, why] of [
+    ["pr", "a reference to a PR does not count"],
+    ["closed", "a closed issue is not tracked work"],
+    ["draft", "a draft issue is not agreed work yet"],
+  ]) {
+    const { commented } = await run([pr({ number: 51, body: "Refs #88" })], {
+      env: ENFORCE,
+      issues: { 88: kind },
+    });
+    assert.strictEqual(commented.length, 1, why);
+  }
+
+  // Quoted or fenced text is shown, not asserted. A PR that documents the bot's
+  // own comment must not satisfy its own rule -- this fired on a real PR.
+  {
+    const quoted = "See the wording:\n\n> - `Part of #77` if this is one step towards it.\n";
+    const { commented } = await run([pr({ number: 54, body: quoted })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 1, "a blockquoted example does not count");
+  }
+  {
+    const fenced = "Example:\n\n```\nPart of #77\n```\n";
+    const { commented } = await run([pr({ number: 55, body: fenced })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 1, "a fenced example does not count");
+  }
+  // A real reference alongside a quoted one still counts.
+  {
+    const both = "> quoting `Part of #99` here\n\nPart of #77\n";
+    const { commented } = await run([pr({ number: 56, body: both })], {
+      env: ENFORCE,
+      issues: { 77: "issue", 99: "issue" },
+    });
+    assert.strictEqual(commented.length, 0, "an asserted reference still counts");
+  }
+
+  // A bare mention is a cross-reference, not a claim about this PR.
+  {
+    const { commented } = await run([pr({ number: 52, body: "similar to #77 maybe" })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 1, "a bare #N does not count");
+  }
+
+  // An unresolvable number proves nothing; keep checking the rest.
+  {
+    const { commented } = await run([pr({ number: 53, body: "Refs #999\nPart of #77" })], {
+      env: ENFORCE,
+      issues: { 77: "issue" },
+    });
+    assert.strictEqual(commented.length, 0, "falls through to the next candidate");
+  }
+
+  // ---- the instant path: PR_NUMBER names one PR ----
+  // Same verdict as the sweep would reach, so the two routes cannot disagree.
+  {
+    const nodes = [pr({ number: 60, author: "alice" }), pr({ number: 61 })];
+    const { commented } = await run(nodes, { env: { ...ENFORCE, PR_NUMBER: "60" } });
+    assert.deepStrictEqual(
+      commented.map((c) => c.issue_number),
+      [60],
+      "only the named PR is touched"
+    );
+  }
+  // An exempt PR named by an event is still exempt.
+  {
+    const { commented } = await run([pr({ number: 62, assoc: "MEMBER" })], {
+      env: { ...ENFORCE, PR_NUMBER: "62" },
+    });
+    assert.strictEqual(commented.length, 0, "the instant path honours exemptions");
+  }
+  // The effective-date floor still applies: an event is not a licence to reach
+  // into the backlog.
+  {
+    const old = pr({ number: 63 });
+    old.createdAt = "2026-07-01T00:00:00Z";
+    const { commented } = await run([old], { env: { ...ENFORCE, PR_NUMBER: "63" } });
+    assert.strictEqual(commented.length, 0, "a pre-cutoff PR is skipped");
+  }
+  // A PR that closed between the event and the run is left alone.
+  {
+    const closed = pr({ number: 64 });
+    closed.state = "CLOSED";
+    const { commented } = await run([closed], { env: { ...ENFORCE, PR_NUMBER: "64" } });
+    assert.strictEqual(commented.length, 0, "a closed PR is skipped");
+  }
+  // An unknown number is a no-op rather than a crash.
+  {
+    const { commented } = await run([pr({ number: 65 })], {
+      env: { ...ENFORCE, PR_NUMBER: "999" },
+    });
+    assert.strictEqual(commented.length, 0, "an unresolvable PR number is a no-op");
   }
 
   // A linked PR is left alone even when enforcing.

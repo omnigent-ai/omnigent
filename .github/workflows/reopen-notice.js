@@ -13,13 +13,13 @@
 const MARKER = "<!-- reopen-notice -->";
 
 const authorClosed = () =>
-  `${MARKER}\nClosed. If you want to pick this back up, comment \`/reopen\` — ` +
+  `${MARKER}\nClosed. If you want to pick this back up, comment \`/reopen\`. ` +
   `GitHub only lets maintainers press the Reopen button, so this command does it for you. ` +
   `It needs the source branch to still exist.`;
 
 const maintainerClosed = (author) =>
   `${MARKER}\n@${author} this PR was closed by a maintainer. If you think that was a mistake, ` +
-  `reply here and ask them to reopen it — \`/reopen\` only undoes automated closes. ` +
+  `reply here and ask them to reopen it. \`/reopen\` only undoes automated closes. ` +
   `See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md#reopening-a-closed-pr).`;
 
 module.exports = async ({ github, context, core }) => {

@@ -181,6 +181,14 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
+def test_real_builders_pass_ssh_auth_sock(monkeypatch):
+    """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
+    sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
+    monkeypatch.setattr("os.environ", {"SSH_AUTH_SOCK": sock})
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        assert build().get("SSH_AUTH_SOCK") == sock, harness
+
+
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))
 def test_no_harness_inherits_unrelated_secrets(harness, hostile_env):
     env = clean_agent_env(allow_prefixes=HARNESS_PREFIXES[harness], source=hostile_env)
@@ -252,3 +260,23 @@ def test_declared_passthrough_tolerates_a_missing_chain():
 
     assert declared_passthrough(None) == ()
     assert declared_passthrough(_NoSandbox()) == ()
+
+
+def test_acp_agent_declaration_passes_only_what_it_names(hostile_env, monkeypatch):
+    """A generic-ACP agent's own ``env_passthrough`` is an allowlist, not a bypass.
+
+    The executor cannot infer which family an arbitrary agent authenticates
+    with, so the agent names its variables. Everything it does not name stays
+    withheld — a declaration must not reopen the whole environment.
+    """
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+
+    monkeypatch.setattr("os.environ", {**hostile_env, "XAI_API_KEY": "declared-and-wanted"})
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=("XAI_API_KEY",))
+    )
+    env = ex._build_spawn_env()
+
+    assert env.get("XAI_API_KEY") == "declared-and-wanted"
+    for name in CANARY_SECRETS:
+        assert name not in env, name

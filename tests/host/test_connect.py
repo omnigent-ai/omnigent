@@ -509,6 +509,38 @@ async def test_handle_model_options_rejects_unsupported_harness() -> None:
     )
 
 
+async def test_handle_model_options_reports_the_endpoints_wider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generations no picker row names are still launchable, so they ship too."""
+    from omnigent import claude_native
+
+    monkeypatch.setattr(
+        claude_native,
+        "resolve_native_claude_config",
+        lambda *, spec: claude_native.ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5"},
+            model="system.ai.claude-opus-5",
+            routable_models=("system.ai.claude-opus-5", "system.ai.claude-opus-4-8"),
+        ),
+    )
+    monkeypatch.setattr(
+        claude_native,
+        "claude_native_model_options",
+        lambda config: [{"id": "opus", "model": "system.ai.claude-opus-5"}],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+    )
+
+    assert result.routable_models == [
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
+    ]
+
+
 def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 
@@ -611,6 +643,14 @@ async def test_handle_launch_spawns_subprocess(
     # regresses, long-lived daemons intermittently fail to start sessions.
     assert spawned_kwargs.get("stdin") == subprocess.DEVNULL, (
         "runner subprocess must be spawned with stdin=subprocess.DEVNULL"
+    )
+
+    # Runners must start in the session workspace, not the daemon's inherited
+    # cwd: a daemon launched from a directory that was later deleted (temp
+    # checkout, removed worktree) makes every Path.cwd() in the runner raise
+    # FileNotFoundError, and native terminals then fail to start.
+    assert spawned_kwargs.get("cwd") == str(workspace), (
+        "runner subprocess must be spawned with cwd=<session workspace>"
     )
 
     # Clean up the spawned sleep process (and its exit watcher).
@@ -966,6 +1006,7 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
     receive loop, so a slow probe can never stall the tunnel keepalive.
     """
     readiness = iter(({"pi": True},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -999,6 +1040,7 @@ async def test_live_host_full_refresh_detects_auth_completion(
 ) -> None:
     """The full-refresh fallback catches readiness changes beyond binary installs."""
     readiness = iter(({"codex": True},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -1034,6 +1076,7 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
         return {"codex": "needs-auth"}
 
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
@@ -1053,6 +1096,40 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
 
     assert calls["n"] >= 2
     assert ws.sent == []
+    _cleanup_host(host)
+
+
+async def test_live_host_repushes_when_only_gateway_inference_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway-inference flip alone must reach the server, readiness unchanged."""
+    gateway = iter(({"codex": False}, {"codex": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: {"codex": True},
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.gateway_inference_map",
+        lambda: next(gateway, {"codex": True}),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": True}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+    assert refresh.gateway_inference == {"codex": True}
     _cleanup_host(host)
 
 
@@ -1978,6 +2055,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "KUBECONFIG": "/home/alice/.kube/config",
+        "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
         "OMNIGENT_LOG_LEVEL": "DEBUG",
@@ -2024,6 +2102,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # SSH_AUTH_SOCK is a socket path on the same footing. Dropping it leaves
+    # every runner-spawned context without ssh-agent auth, so git-over-SSH and
+    # SSH-cert tooling fail with "dial unix: missing address".
+    assert env["SSH_AUTH_SOCK"] == "/private/tmp/com.apple.launchd.7Qk/Listeners"
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"

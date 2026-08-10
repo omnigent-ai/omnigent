@@ -26,6 +26,7 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
@@ -97,6 +98,7 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     configure_process_logging,
+    display_log_path,
     env_truthy,
     open_process_log_file,
     process_log_dir,
@@ -165,21 +167,6 @@ def _runner_log_dir() -> Path:
         ``<data-dir>/logs/runner``.
     """
     return process_log_dir("runner")
-
-
-def _display_log_path(path: Path) -> str:
-    """Format a log path for display, collapsing the home prefix to ``~``.
-
-    :param path: Absolute path, typically under the user's state dir, e.g.
-        ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
-    :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
-        otherwise ``str(path)``.
-    """
-    try:
-        return f"~/{path.relative_to(Path.home())}"
-    except ValueError:
-        # Not under $HOME (e.g. an OMNIGENT_DATA_DIR outside home).
-        return str(path)
 
 
 # Max bytes read from the end of a dead runner's log when composing an
@@ -279,7 +266,7 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     message = "runner process exited"
     if exit_code is not None:
         message += f" with code {exit_code}"
-    message += f" (log on host: {_display_log_path(log_path)})"
+    message += f" (log on host: {display_log_path(log_path)})"
     tail = _read_log_tail(log_path)
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
@@ -446,6 +433,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # not match what the host owner configured (e.g. a non-standard
         # kubeconfig location or a colon-separated multi-file list).
         "KUBECONFIG",
+        # ssh-agent socket path. Same class as KUBECONFIG above: a path to a
+        # unix socket, not a bearer secret. Without it every runner-spawned
+        # context (sys_os_shell, terminal panes, coding sub-agents) loses
+        # ssh-agent auth, so git-over-SSH and SSH-cert-authenticated tooling
+        # fail with "dial unix: missing address".
+        "SSH_AUTH_SOCK",
         # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
         # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
         # telemetry.init() no-ops there and omni-runner / omni-harness export
@@ -1271,7 +1264,7 @@ class HostProcess:
         # zygote would retain its exit status forever. On cancellation we let
         # the spawn land and then tear that runner down.
         spawn = asyncio.ensure_future(
-            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug)
+            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
         )
         try:
             proc, log_path = await asyncio.shield(spawn)
@@ -1311,7 +1304,7 @@ class HostProcess:
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
         print(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
-            f"    log: {_display_log_path(log_path)}"
+            f"    log: {display_log_path(log_path)}"
             f"{session_line}",
             flush=True,
         )
@@ -1325,6 +1318,7 @@ class HostProcess:
         self,
         env: dict[str, str],
         session_slug: str,
+        workspace: Path,
     ) -> tuple[subprocess.Popen[bytes] | ZygoteRunnerProc, Path]:
         """Open the session log and spawn the runner, via zygote or direct Popen.
 
@@ -1338,6 +1332,7 @@ class HostProcess:
         :param env: Runner environment from :func:`_build_runner_env` (its
             ``RUNNER_PARENT_PID`` is the daemon pid; overridden on the zygote path).
         :param session_slug: Sanitized session id fragment for the log filename.
+        :param workspace: Existing session workspace to use as the runner's cwd.
         :returns: ``(process_handle, log_path)`` — the handle quacks like Popen.
         :raises OSError: If the log file or a direct Popen spawn fails.
         """
@@ -1353,7 +1348,7 @@ class HostProcess:
                     # getppid()-based orphan check must watch the zygote pid.
                     zygote_env = dict(env)
                     zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
-                    proc = zygote.fork_runner(zygote_env, str(log_path))
+                    proc = zygote.fork_runner(zygote_env, str(log_path), str(workspace))
                     _logger.info(
                         "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
                         zygote.pid,
@@ -1377,6 +1372,8 @@ class HostProcess:
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "omnigent.runner._entry"],
                     env=env,
+                    # A daemon may outlive the checkout it started from.
+                    cwd=str(workspace),
                     # Runners are WS-tunnel clients with no interactive input.
                     # Give them a clean /dev/null stdin instead of inheriting the
                     # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
@@ -1852,6 +1849,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 configured_harnesses=configured_harness_map(),
+                gateway_inference=gateway_inference_map(),
             )
         installed, reason = try_install_harness_cli(key)
         if not installed:
@@ -1865,6 +1863,7 @@ class HostProcess:
             request_id=frame.request_id,
             status="ok",
             configured_harnesses=configured_harness_map(),
+            gateway_inference=gateway_inference_map(),
         )
 
     def _handle_store_secret(self, frame: HostStoreSecretFrame) -> HostStoreSecretResultFrame:
@@ -1966,6 +1965,7 @@ class HostProcess:
             request_id=frame.request_id,
             status="ok",
             configured_harnesses=configured_harness_map(),
+            gateway_inference=gateway_inference_map(),
         )
 
     def _handle_detect_credentials(
@@ -2203,6 +2203,9 @@ class HostProcess:
             request_id=frame.request_id,
             status="ok",
             models=models,
+            # The picker names the newest model of each family; the endpoint
+            # serves older generations too, and a launch takes an exact id.
+            routable_models=list(config.routable_models) if config is not None else [],
         )
 
     @staticmethod
@@ -2652,6 +2655,7 @@ class HostProcess:
         except Exception:  # noqa: BLE001
             pass
         configured_harnesses = await asyncio.to_thread(configured_harness_map)
+        gateway_inference = await asyncio.to_thread(gateway_inference_map)
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -2660,6 +2664,7 @@ class HostProcess:
             # Off the event loop: probes PATH and reads local config.
             # The loop below refreshes changes; launch remains authoritative.
             configured_harnesses=configured_harnesses,
+            gateway_inference=gateway_inference,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
         )
@@ -2722,6 +2727,10 @@ class HostProcess:
         :returns: None. Runs until cancelled when the connection ends.
         """
         configured = initial
+        # Gateway-backing baseline, recomputed with readiness: a flip alone
+        # (same binaries, new credentials) must reach the server without a
+        # reconnect.
+        gateway = await asyncio.to_thread(gateway_inference_map)
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
@@ -2738,12 +2747,19 @@ class HostProcess:
             if not refresh_full:
                 continue
             latest = await asyncio.to_thread(configured_harness_map)
+            latest_gateway = await asyncio.to_thread(gateway_inference_map)
             next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
-            if latest != configured:
+            if latest != configured or latest_gateway != gateway:
                 await ws.send(
-                    encode_host_frame(HostHarnessReadinessFrame(configured_harnesses=latest))
+                    encode_host_frame(
+                        HostHarnessReadinessFrame(
+                            configured_harnesses=latest,
+                            gateway_inference=latest_gateway,
+                        )
+                    )
                 )
                 configured = latest
+                gateway = latest_gateway
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str
@@ -2881,13 +2897,13 @@ def run_host_process(
     # work goes to per-runner files under the runner dir (the exact
     # file is printed when each runner launches). The host process's
     # own diagnostics go to the host destination.
-    print(f"Session logs: {_display_log_path(_runner_log_dir())}/")
-    print(f"This host's log: {_display_log_path(host_log_path)}")
+    print(f"Session logs: {display_log_path(_runner_log_dir())}/")
+    print(f"This host's log: {display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
-        print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
+        print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
     host = HostProcess(identity, server_url)
     try:

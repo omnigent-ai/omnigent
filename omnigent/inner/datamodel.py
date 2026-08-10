@@ -511,11 +511,12 @@ class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
 
     # Backend identifier, e.g. ``"linux_bwrap"``,
-    # ``"darwin_seatbelt"``, or ``"none"``. The dataclass default of
-    # ``"linux_bwrap"`` is a safe sentinel for in-process construction
-    # (``OSEnvSandboxSpec(type=self.type_name)`` is the idiomatic call
-    # site); YAML parsers map a missing ``type:`` field to the platform
-    # default at parse time via
+    # ``"darwin_seatbelt"``, or ``"none"``. YAML also accepts ``"auto"``
+    # and resolves it to the platform default before constructing this value.
+    # The dataclass default of ``"linux_bwrap"`` is a safe sentinel for
+    # in-process construction (``OSEnvSandboxSpec(type=self.type_name)`` is
+    # the idiomatic call site); YAML parsers map a missing ``type:`` field to
+    # the platform default at parse time via
     # :func:`omnigent.inner.sandbox._default_sandbox_for_platform`,
     # which picks ``linux_bwrap`` on Linux (with ``bwrap`` on PATH)
     # and ``darwin_seatbelt`` on macOS.

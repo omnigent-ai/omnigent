@@ -7,8 +7,10 @@ import {
   WRAPPER_LABEL_KEY,
   isFullySupportedNativeCodingAgent,
   isNativeTerminalSession,
+  isNativeWrapper,
   isRecentHarness,
   nativeCodingAgentForHarness,
+  nativeCodingAgentForSubagentWrapper,
   nativeWrapperLabelsForAgent,
 } from "./nativeCodingAgents";
 
@@ -100,6 +102,38 @@ describe("nativeWrapperLabelsForAgent", () => {
       [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
       [WRAPPER_LABEL_KEY]: "opencode-native-ui",
     });
+  });
+});
+
+describe("nativeCodingAgentForSubagentWrapper", () => {
+  it("resolves the vendor that spawned a native sub-agent child", () => {
+    expect(nativeCodingAgentForSubagentWrapper("claude-code-native-ui-subagent")?.displayName).toBe(
+      "Claude Code",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("codex-native-ui-subagent")?.displayName).toBe(
+      "Codex",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("opencode-native-ui-subagent")?.displayName).toBe(
+      "OpenCode",
+    );
+  });
+
+  it("does not resolve parent wrappers or unknown labels", () => {
+    expect(nativeCodingAgentForSubagentWrapper("claude-code-native-ui")).toBeUndefined();
+    expect(nativeCodingAgentForSubagentWrapper("pi-native-ui-subagent")).toBeUndefined();
+    expect(nativeCodingAgentForSubagentWrapper(null)).toBeUndefined();
+  });
+
+  // The two lookups stay disjoint: a sub-agent child owns no PTY and takes no
+  // input, so it must not read as a native-terminal session (which would, for
+  // one, hide Smart Routing's eligibility check behind the wrong branch).
+  it("keeps sub-agent wrappers out of the native-terminal wrapper lookup", () => {
+    expect(isNativeWrapper("claude-code-native-ui-subagent")).toBe(false);
+    expect(
+      isNativeTerminalSession({
+        labels: { [WRAPPER_LABEL_KEY]: "claude-code-native-ui-subagent" },
+      }),
+    ).toBe(false);
   });
 });
 

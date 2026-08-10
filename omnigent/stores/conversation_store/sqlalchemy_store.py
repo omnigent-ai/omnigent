@@ -107,6 +107,7 @@ _SESSION_OVERRIDE_KEYS = (
     "reasoning_effort",
     "model_override",
     "cost_control_mode_override",
+    "subagent_routing_override",
     "harness_override",
 )
 
@@ -116,7 +117,7 @@ def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
 
     Omits keys whose value is ``None`` and returns ``None`` when nothing is
     set, so a session on all agent/spec defaults stores SQL ``NULL`` rather
-    than an empty object. Only the four :data:`_SESSION_OVERRIDE_KEYS` are
+    than an empty object. Only the :data:`_SESSION_OVERRIDE_KEYS` are
     considered; any other keys in *overrides* are ignored.
 
     :param overrides: Mapping of override key to value (missing / ``None``
@@ -132,7 +133,7 @@ def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
 def _decode_session_overrides(raw: str | None) -> dict[str, str | None]:
     """Unpack the ``session_overrides`` blob to a full override dict.
 
-    Every one of the four :data:`_SESSION_OVERRIDE_KEYS` is present in the
+    Every one of the :data:`_SESSION_OVERRIDE_KEYS` is present in the
     result (unset keys read back as ``None``) so read-modify-write callers can
     treat the dict uniformly regardless of which overrides were stored.
 
@@ -197,6 +198,7 @@ def _to_conversation(
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
+        subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
         sub_agent_name=meta.sub_agent_name if meta else None,
         external_session_id=meta.external_session_id if meta else None,
@@ -2628,6 +2630,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_model_override: bool = False,
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
@@ -2651,6 +2655,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_cost_control_mode_override: When ``True``, clear
             ``cost_control_mode_override`` to ``None``.
+        :param subagent_routing_override: Per-session subagent-routing
+            switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
+        :param _unset_subagent_routing_override: When ``True``, clear
+            ``subagent_routing_override`` to ``None``, which reads as
+            Default (the switch is two-state; nothing is inherited).
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged.
         :param _unset_harness_override: When ``True``, clear
@@ -2699,6 +2708,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif cost_control_mode_override is not None:
                 overrides["cost_control_mode_override"] = cost_control_mode_override
+                overrides_changed = True
+            if _unset_subagent_routing_override:
+                overrides["subagent_routing_override"] = None
+                overrides_changed = True
+            elif subagent_routing_override is not None:
+                overrides["subagent_routing_override"] = subagent_routing_override
                 overrides_changed = True
             if _unset_harness_override:
                 overrides["harness_override"] = None
@@ -3479,7 +3494,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             creating_clone = cloned_agent_bundle_location is not None
             # Model-family-bound overrides (reasoning_effort, model_override, and
             # — same gate — harness_override) copy only when copy_model_settings.
-            # cost_control_mode_override is intentionally never carried onto a fork.
+            # The routing switches (cost_control_mode_override,
+            # subagent_routing_override) are intentionally never carried onto a fork.
             fork_overrides = _encode_session_overrides(
                 {
                     "reasoning_effort": (

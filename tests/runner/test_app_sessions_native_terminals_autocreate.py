@@ -34,6 +34,16 @@ from omnigent.claude_native_bridge import (
     prepare_bridge_dir,
     read_permission_hook_config,
 )
+from omnigent.codex_native_bridge import (
+    CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    CodexNativeBridgeState,
+)
+from omnigent.codex_native_bridge import (
+    prepare_bridge_dir as prepare_codex_bridge_dir,
+)
+from omnigent.codex_native_bridge import (
+    write_bridge_state as write_codex_bridge_state,
+)
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
@@ -988,7 +998,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # ``omnigent.claude_native`` per call, so patch it at the source.
     monkeypatch.setattr(
         "omnigent.claude_native._ucode_config_for_profile",
-        lambda profile: ucode,
+        lambda profile, *, refresh_models=True: ucode,
     )
 
     captured: dict[str, Any] = {}
@@ -1713,6 +1723,7 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
 
 def test_publish_native_terminal_start_error_emits_failed_status_only(
     caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
 ) -> None:
     """
     Native terminal startup failure publishes a generic ``failed`` status.
@@ -1724,12 +1735,13 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     and then publish/persist a second error when the user message
     fast-fails against the same terminal.
 
-    The published/returned message is a fixed, client-safe string — the raw
-    exception text (which can embed paths/CLI details) is logged for
+    The published/returned message names the runner's log file — the raw
+    exception text (which can embed paths/CLI details) is logged there for
     operators, not surfaced on the session stream.
 
     :param caplog: Pytest log capture fixture, used to confirm the raw
         cause is logged server-side.
+    :param pinned_runner_log: The log path the message must name.
     """
     published: list[_PublishedEvent] = []
 
@@ -1744,10 +1756,13 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
             ImportError("Native Codex requires the 'codex' CLI on PATH."),
         )
 
-    # Generic, client-safe payload — no raw exception text.
+    # Client-safe payload pointing at the runner log — no raw exception text.
     assert error == {
         "code": "native_terminal_start_failed",
-        "message": "Native Codex terminal failed to start; see runner logs for details.",
+        "message": (
+            "Native Codex terminal failed to start; "
+            f"see the runner log for details: {pinned_runner_log}"
+        ),
     }
     # The raw cause must NOT leak into the surfaced message, but MUST be
     # logged for operators. If this fails, the redaction regressed (raw
@@ -2584,6 +2599,255 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
 
 
+@dataclass
+class _CodexAutoCreateScenario:
+    """
+    One case for the codex-native auto-create guard route test.
+
+    :param case_id: Pytest id, e.g. ``"new_rotation_target_skips"``.
+    :param bridge_state_session: ``session_id`` recorded in the shared
+        bridge state, e.g. ``"3bb59abc6e20b834cbb2269f28880895"``, or
+        ``None`` to leave the bridge unseeded (fresh session).
+    :param terminal_under: Session id that owns a live ``codex:main``
+        terminal in the registry, or ``None`` for no live terminal.
+    :param bridge_id_label: Value reported for the session's
+        :data:`CODEX_NATIVE_BRIDGE_ID_LABEL_KEY` label, e.g.
+        ``"bridge_shared"`` for a rotation target (shares the original's
+        bridge) or the session's own id for a fresh session.
+    :param expect_auto_create: Whether the guard should invoke
+        ``_auto_create_codex_terminal`` for the new session.
+    """
+
+    case_id: str
+    bridge_state_session: str | None
+    terminal_under: str | None
+    bridge_id_label: str
+    expect_auto_create: bool
+
+
+class _CodexSnapshotServerClient:
+    """
+    Server-client stub for the codex auto-create guard route test.
+
+    Answers the GETs the codex branch issues: the session snapshot
+    (non-``None`` so ``_codex_session_needs_runner_terminal`` reports the
+    session needs a terminal) and the labels lookup (returns the bridge-id
+    label so the transfer-inbound check resolves the shared bridge dir).
+    A real stub class — not ``MagicMock`` — so an unexpected call shape
+    fails loudly instead of silently returning a mock.
+    """
+
+    def __init__(self, bridge_id_label: str) -> None:
+        """
+        :param bridge_id_label: Bridge id to report on the session's
+            ``labels``, e.g. ``"bridge_shared"``.
+        """
+        self._bridge_id_label = bridge_id_label
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """
+        Return a canned snapshot or labels payload for *url*.
+
+        :param url: Request path, e.g. ``"/v1/sessions/<id>"`` or
+            ``"/v1/sessions/<id>/labels"``.
+        :returns: A response object exposing ``status_code`` and ``json()``
+            matching the subset the runner reads.
+        """
+        del kwargs
+        labels = {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: self._bridge_id_label}
+
+        class _Response:
+            """Minimal httpx-like response with the fields the runner reads."""
+
+            def __init__(self, payload: dict[str, Any]) -> None:
+                """:param payload: JSON body returned by ``json()``."""
+                self.status_code = 200
+                self._payload = payload
+
+            def json(self) -> dict[str, Any]:
+                """:returns: The canned JSON payload."""
+                return self._payload
+
+        if url.endswith("/labels"):
+            return _Response({"labels": labels})
+        return _Response({"id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d", "labels": labels})
+
+
+_CODEX_AUTO_CREATE_SCENARIOS = [
+    # Rotation target: the bridge's active session still owns the live codex
+    # terminal that is about to be transferred onto the new session.
+    _CodexAutoCreateScenario(
+        case_id="new_rotation_target_skips",
+        bridge_state_session="3bb59abc6e20b834cbb2269f28880895",
+        terminal_under="3bb59abc6e20b834cbb2269f28880895",
+        bridge_id_label="bridge_shared",
+        expect_auto_create=False,
+    ),
+    # Fresh host-spawned session: own bridge, no recorded state, no terminal —
+    # it must bootstrap its own Codex.
+    _CodexAutoCreateScenario(
+        case_id="fresh_session_creates",
+        bridge_state_session=None,
+        terminal_under=None,
+        bridge_id_label="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+        expect_auto_create=True,
+    ),
+    # The bridge's recorded session is the new session itself (e.g. a relaunch
+    # after the terminal died) — not a rotation, so auto-create proceeds.
+    _CodexAutoCreateScenario(
+        case_id="active_is_self_creates",
+        bridge_state_session="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+    # The bridge names a sibling but no live terminal exists under it —
+    # nothing to transfer in, so auto-create proceeds.
+    _CodexAutoCreateScenario(
+        case_id="dead_terminal_under_active_creates",
+        bridge_state_session="3bb59abc6e20b834cbb2269f28880895",
+        terminal_under=None,
+        bridge_id_label="bridge_shared",
+        expect_auto_create=True,
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    _CODEX_AUTO_CREATE_SCENARIOS,
+    ids=[s.case_id for s in _CODEX_AUTO_CREATE_SCENARIOS],
+)
+async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
+    scenario: _CodexAutoCreateScenario,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The codex-native auto-create guard skips ``/new`` rotation targets.
+
+    A native Codex ``/new`` starts a fresh thread in the SAME terminal, and
+    the forwarder rotates Omnigent ownership onto a fresh session before
+    transferring that terminal onto it. The bind reaches the runner's
+    ``POST /v1/sessions`` before the transfer runs, so the new session
+    momentarily has no terminal. Auto-creating a second ``codex:main`` here
+    makes the rotation's transfer 409, so the terminal — and the tmux status
+    link it carries — stays owned by the superseded session while the web
+    session streams from the new one.
+
+    Drives the real route with the real guard. Each scenario seeds the shared
+    bridge state's ``session_id`` and the terminal registry, then asserts
+    whether ``_auto_create_codex_terminal`` ran. Reverting the guard turns the
+    ``new_rotation_target_skips`` case red. Mirrors the claude-native and
+    antigravity-native guard tests above.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_bridge._BRIDGE_ROOT",
+        tmp_path / "codex-native",
+    )
+
+    # Seed the shared bridge state so the guard reads the original
+    # (terminal-owning) session as the bridge's active session.
+    if scenario.bridge_state_session is not None:
+        seed_dir = prepare_codex_bridge_dir(scenario.bridge_id_label)
+        write_codex_bridge_state(
+            seed_dir,
+            CodexNativeBridgeState(
+                session_id=scenario.bridge_state_session,
+                socket_path="ws://127.0.0.1:9876",
+                thread_id="thread_old",
+                codex_home=str(tmp_path / "codex-home"),
+            ),
+        )
+
+    # Seed a live codex:main terminal under the original session so the guard's
+    # registry probe finds the terminal that would be transferred. Poking
+    # ``_by_conversation`` directly is the established registry-test idiom — a
+    # real TerminalInstance without launching tmux.
+    terminal_registry = TerminalRegistry()
+    if scenario.terminal_under is not None:
+        instance = TerminalInstance(
+            name="codex",
+            session_key="main",
+            socket_path=tmp_path / "codex.sock",
+            private_dir=tmp_path / "codex",
+            running=True,
+        )
+        terminal_registry._by_conversation[scenario.terminal_under] = {("codex", "main"): instance}
+
+    created: list[str] = []
+
+    async def _recording_auto_create(
+        session_id: str, resource_registry: Any, publish_event: Any, **_kwargs: Any
+    ) -> None:
+        """
+        Record the auto-create call instead of launching a real Codex.
+
+        :param session_id: Session id the guard chose to auto-create for.
+        :param resource_registry: Unused — the real launch path is stubbed.
+        :param publish_event: Unused — the real launch path is stubbed.
+        :param _kwargs: Absorbs keyword args added to the real function.
+        :returns: None.
+        """
+        del resource_registry, publish_event
+        created.append(session_id)
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _recording_auto_create,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the codex-native spec for any agent id.
+
+        :param agent_id: Requested agent id (unused — fixed spec).
+        :param session_id: Requested session id (unused — fixed spec).
+        :returns: The codex-native :class:`AgentSpec`.
+        """
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_CodexSnapshotServerClient(  # type: ignore[arg-type]
+            scenario.bridge_id_label
+        ),
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+    assert resp.status_code == 201, resp.text
+
+    if scenario.expect_auto_create:
+        # Fresh / no-live-sibling sessions must still bootstrap their own
+        # Codex — the guard only suppresses true rotation targets.
+        assert created == ["2d1b1a96e3e08f2cd43c0cc4b695ac5d"], (
+            f"Expected auto-create for {scenario.case_id}; got {created}"
+        )
+    else:
+        # The rotation target's terminal arrives via transfer. Auto-create here
+        # is the regression: it 409s the transfer, so the terminal and its tmux
+        # status link stay on the superseded session.
+        assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
+
+
 @pytest.mark.asyncio
 async def test_auto_create_claude_terminal_registers_permission_hook(
     tmp_path: Path,
@@ -2707,3 +2971,213 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+
+
+# ── What a plain claude-native launch must NOT carry ─────────────────
+#
+# A session created without Smart Routing has to launch byte-for-byte like a
+# pre-Smart-Routing one: no spawn-routing endpoint (so no loopback server, no
+# bearer token on disk, and no ``Task`` PreToolUse hook paying a hook
+# subprocess plus a round trip on every spawn), and no custom-picker-slot pin
+# displacing the workspace's own picker row.
+#
+# Accepted consequence: the class is stamped at create, so flipping the gear's
+# Subagent-routing toggle on for a plain session is inert until recreate.
+
+
+async def _run_auto_create_claude_terminal_for_routing_class(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    routed: bool,
+    auto_harness: bool = False,
+) -> Any:
+    """Drive the claude-native launch and return the captured terminal spec.
+
+    :param routed: Stamp ``cost_control_mode_override="on"``, as the create
+        path does for a session launched on Smart Routing.
+    :param auto_harness: Stamp the auto-harness label and sentinel WITHOUT the
+        cost-control field, which is the shape a sub-agent child of a routed
+        parent is created with.
+    """
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "auth:\n  type: databricks\n  profile: test-profile\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    # ``opus`` resolves to the newer generation, so the launch model
+    # (opus-4-7) has no spelling of its own — exactly the case the pin was
+    # added for, and the case that overwrites the workspace's picker row.
+    ucode = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "workspace-picker-row",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Workspace pick",
+        },
+        api_key_helper="printf %s sk-sentinel-do-not-use",
+        model="databricks-claude-opus-4-7",
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native._ucode_config_for_profile",
+        lambda profile, *, refresh_models=True: ucode,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    snapshot: dict[str, Any] = {"labels": {}}
+    if routed:
+        snapshot["cost_control_mode_override"] = "on"
+    if auto_harness:
+        from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+        snapshot["labels"][AUTO_HARNESS_LABEL_KEY] = "1"
+        snapshot["harness_override"] = "auto"
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
+    )
+    try:
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+        )
+    finally:
+        from omnigent.runner import subagent_routing, turn_routing
+
+        subagent_routing.shutdown_session_router(session_id)
+        turn_routing.shutdown_session_turn_router(session_id)
+        await fake_client.aclose()
+    return captured["spec"]
+
+
+def _claude_pretooluse_matchers(spec: Any) -> list[str | None]:
+    settings = _load_claude_invocation_settings(spec.args)
+    return [entry.get("matcher") for entry in settings["hooks"].get("PreToolUse", [])]
+
+
+def _claude_hook_commands(spec: Any) -> list[str]:
+    settings = _load_claude_invocation_settings(spec.args)
+    return [
+        hook.get("command", "")
+        for entries in settings["hooks"].values()
+        for entry in entries
+        for hook in entry.get("hooks", [])
+    ]
+
+
+async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f601",
+        routed=False,
+    )
+
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER not in _claude_pretooluse_matchers(
+        spec
+    )
+    assert all("claude_router_hook" not in command for command in _claude_hook_commands(spec))
+    # The workspace's own picker row survives untouched.
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "workspace-picker-row"
+
+
+async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f602",
+        routed=True,
+    )
+
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # A pinned session's spawns stay on the claude family, so it gets neither
+    # the routed-spawn note nor the pre-approvals the cross-family hop needs.
+    assert "--append-system-prompt" not in spec.args
+
+
+async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sub-agent child of a routed parent: auto-harness label, no cost stamp.
+
+    Such a child is created with ``harness_override="auto"`` and the
+    auto-harness label but no ``cost_control_mode_override``. Deriving
+    ``routing_enabled`` from the cost field alone launched it with the
+    routed-spawn note and the four pre-approved tools while starting no router
+    and pinning no arms — an argv that tells Claude to route spawns through a
+    hook nothing answers.
+    """
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f603",
+        routed=False,
+        auto_harness=True,
+    )
+
+    # The whole routed apparatus, not just the spawn note.
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # And the auto-harness extras, which only make sense alongside the router.
+    assert "--append-system-prompt" in spec.args
+    allowed = spec.args[spec.args.index("--allowedTools") + 1]
+    assert "mcp__omnigent__sys_session_create" in allowed
+
+
+def test_routed_spawn_launch_args_need_a_router() -> None:
+    """The note and pre-approvals never ship without the router that serves them."""
+    from omnigent.runner.native.orchestration import _routed_spawn_launch_args
+
+    note, tools = _routed_spawn_launch_args(True)
+    assert note and tools
+    assert _routed_spawn_launch_args(True, router_started=False) == (None, ())
+    assert _routed_spawn_launch_args(False) == (None, ())

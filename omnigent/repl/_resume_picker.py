@@ -28,7 +28,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TextIO
 
@@ -1659,7 +1659,7 @@ def _format_when(created_at: int) -> str:
         return f"{delta // 3600}h ago"
     if delta < 7 * 86400:
         return f"{delta // 86400}d ago"
-    return datetime.fromtimestamp(created_at).strftime("%b %d %H:%M")
+    return datetime.fromtimestamp(created_at, tz=timezone.utc).astimezone().strftime("%b %d %H:%M")
 
 
 def _read_line_choice(in_: TextIO) -> str | None:

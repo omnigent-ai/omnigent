@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MessageContent, MessageResponse } from "./message";
+import { MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -29,6 +29,29 @@ describe("MessageContent", () => {
     expect(content).toHaveClass("text-ui", "group-[.is-user]:px-3", "group-[.is-user]:py-2");
     expect(content).not.toHaveClass("text-[0.8125rem]", "leading-[1.125rem]");
     expect(content).not.toHaveClass("group-[.is-user]:px-4", "group-[.is-user]:py-3");
+  });
+});
+
+describe("MessageAction", () => {
+  it("uses muted color by default and foreground color on hover", () => {
+    render(
+      <MessageAction label="Copy">
+        <svg aria-hidden />
+      </MessageAction>,
+    );
+
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+  });
+});
+
+describe("MessageActions", () => {
+  it("uses 12px spacing between actions", () => {
+    render(<MessageActions data-testid="message-actions">Actions</MessageActions>);
+
+    expect(screen.getByTestId("message-actions")).toHaveClass("gap-3");
   });
 });
 

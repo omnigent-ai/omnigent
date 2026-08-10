@@ -663,9 +663,15 @@ def _run_with_local_server(
                 prompt=prompt,
             )
             if resolved_session_id is None:
+                # A native ``/new`` rotates ownership to a fresh session, so
+                # read the active id from bridge state instead of the id this
+                # process started with — otherwise the hint resumes a session
+                # the user already cleared away from.
                 echo_native_resume_hint(
                     native_command="codex",
-                    session_id=prepared.session_id,
+                    session_id=(
+                        _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
+                    ),
                 )
 
         asyncio.run(_drive())
@@ -774,9 +780,13 @@ def _run_with_remote_server(
                 recover=_recover,
             )
             if resolved_session_id is None:
+                # See the local path: ``/new`` rotation means bridge state,
+                # not ``prepared``, holds the session worth resuming.
                 echo_native_resume_hint(
                     native_command="codex",
-                    session_id=prepared.session_id,
+                    session_id=(
+                        _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
+                    ),
                     server=base_url,
                 )
 

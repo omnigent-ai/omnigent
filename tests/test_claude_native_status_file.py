@@ -29,6 +29,8 @@ def _write_session_file(
     session_id: str,
     status: str,
     kind: str = "interactive",
+    status_updated_at: int = 1785480000000,
+    blocked_on: str | None = None,
 ) -> Path:
     """Write a minimal ``<pid>.json`` matching Claude's schema.
 
@@ -49,8 +51,9 @@ def _write_session_file(
                 "cwd": "/repo",
                 "kind": kind,
                 "status": status,
-                "statusUpdatedAt": 1785480000000,
-                "updatedAt": 1785480000000,
+                "statusUpdatedAt": status_updated_at,
+                "updatedAt": status_updated_at,
+                **({"waitingFor": blocked_on} if blocked_on is not None else {}),
             }
         ),
         encoding="utf-8",
@@ -161,7 +164,7 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=published.append,
+        on_status=lambda status, _reason: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -185,7 +188,7 @@ def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:
     (tmp_path / "sessions").mkdir()
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=published.append,
+        on_status=lambda status, _reason: published.append(status),
         pane_pid_getter=_StubPidGetter(404),
         session_id_getter=lambda: None,
         config_dir=tmp_path,
@@ -204,7 +207,7 @@ def test_poller_deactivates_when_file_vanishes(tmp_path: Path) -> None:
     path = _write_session_file(sessions, pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=published.append,
+        on_status=lambda status, _reason: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,
@@ -215,3 +218,162 @@ def test_poller_deactivates_when_file_vanishes(tmp_path: Path) -> None:
     path.unlink()
     poller.tick()
     assert not poller.active
+
+
+def test_shell_status_maps_to_idle(tmp_path: Path) -> None:
+    """``shell`` is Claude's idle-family value, not a working one.
+
+    The interactive writer substitutes ``shell`` for ``idle`` while a shell is
+    attached. Leaving it unmapped made the read unparseable, so the transition
+    was dropped and the session kept whatever status it already had.
+    """
+    path = _write_session_file(tmp_path / "sessions", pid=7, session_id="s", status="shell")
+    status = read_session_status(path)
+    assert status is not None
+    assert status.runner_status == IDLE
+    assert status.raw_status == "shell"
+
+
+def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> None:
+    """An unrecognized literal must not swallow the next real edge.
+
+    The file is an undocumented internal detail whose vocabulary can grow. A
+    value we cannot map leaves us blind to that transition, so the dedup
+    baseline has to drop — otherwise the next readable status looks like a
+    duplicate of a stale one and never publishes.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [RUNNING]
+
+    # A literal this version does not know about.
+    _write_session_file(sessions, pid=1, session_id="s", status="teleporting")
+    poller.tick()
+    assert published == [RUNNING]
+
+    # Back to a value we understand — same runner status as before, but our
+    # knowledge lapsed in between, so it must publish rather than dedup.
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller.tick()
+    assert published == [RUNNING, RUNNING]
+
+
+def test_asserts_running_only_while_fresh(tmp_path: Path) -> None:
+    """The running level is trusted only briefly after it was written.
+
+    Claude keeps reporting ``busy`` while a delegate or background task is
+    active, long after the turn ended. Treating that as authoritative forever
+    would pin the session to "Working…"; past the window the pane watcher
+    decides again.
+    """
+    sessions = tmp_path / "sessions"
+    now = 1785480100.0
+    _write_session_file(
+        sessions,
+        pid=1,
+        session_id="s",
+        status="busy",
+        status_updated_at=int((now - 2) * 1000),
+    )
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert poller.asserts_running(ttl_s=10.0, now=now) is True
+    assert poller.asserts_running(ttl_s=1.0, now=now) is False
+
+    # An idle level never asserts running, however fresh.
+    _write_session_file(
+        sessions,
+        pid=1,
+        session_id="s",
+        status="idle",
+        status_updated_at=int(now * 1000),
+    )
+    poller.tick()
+    assert poller.asserts_running(ttl_s=10.0, now=now) is False
+
+
+def test_waiting_carries_its_reason(tmp_path: Path) -> None:
+    """``waiting`` exposes ``waitingFor`` so the UI can say what it is parked on."""
+    sessions = tmp_path / "sessions"
+    parked = _write_session_file(
+        sessions, pid=1, session_id="s", status="waiting", blocked_on="permission prompt"
+    )
+    status = read_session_status(parked)
+    assert status is not None
+    assert status.runner_status == RUNNING
+    assert status.blocked_on == "permission prompt"
+
+    # The writer merges updates into the existing record, so a reason left
+    # behind by an earlier ``waiting`` must not leak onto a later status.
+    busy = _write_session_file(
+        sessions, pid=2, session_id="s", status="busy", blocked_on="permission prompt"
+    )
+    assert read_session_status(busy).blocked_on is None
+
+
+def test_poller_publishes_when_only_the_reason_changes(tmp_path: Path) -> None:
+    """``busy`` → ``waiting`` must publish even though both map to running.
+
+    Deduping on the runner status alone would swallow the transition and the
+    reason would never reach the UI.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    _write_session_file(
+        sessions, pid=1, session_id="s", status="waiting", blocked_on="dialog open"
+    )
+    poller.tick()
+    assert published == [(RUNNING, None), (RUNNING, "dialog open")]
+    assert poller.blocked_on == "dialog open"
+
+
+def test_waiting_level_does_not_decay(tmp_path: Path) -> None:
+    """A dialog holds the session open however long it stays up.
+
+    Unlike ``busy`` — which a background task keeps set past its turn — a
+    ``waiting`` clears only when Claude writes a new status, so it is safe to
+    trust indefinitely and wrong to time out (the pane is quiet the whole time).
+    """
+    sessions = tmp_path / "sessions"
+    now = 1785480100.0
+    _write_session_file(
+        sessions,
+        pid=1,
+        session_id="s",
+        status="waiting",
+        status_updated_at=int((now - 3600) * 1000),
+        blocked_on="input needed",
+    )
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert poller.asserts_running(ttl_s=10.0, now=now) is True

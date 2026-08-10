@@ -53,6 +53,57 @@ const DECLARED_EXEMPT_TYPE = /- \[[xX]\]\s*(?:Refactor \/ chore|Docs|Test \/ CI)
 // otherwise ticking `Test / CI` next to `Bug fix` is a free opt-out.
 const DECLARED_TRACKED_TYPE = /- \[[xX]\]\s*(?:Bug fix|Feature|UI \/ frontend change)\b/;
 
+// Non-closing references to an issue. GitHub only creates a *link* for the
+// closing keywords, so these never reach closingIssuesReferences -- but they do
+// say the work is tracked, which is what the rule is actually asking for. A PR
+// that only partly addresses an issue should not have to claim it closes it.
+// Deliberately excludes a bare `#123`, which is a cross-reference rather than a
+// statement about this PR.
+const TRACKING_REFERENCE =
+  /\b(?:part of|related to|towards?|refs?|references?|see(?:\s+also)?)\b[:\s]*(?:https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/(\d+)|(?:[\w.-]+\/[\w.-]+)?#(\d+))/gi;
+
+// Strips text that is being shown rather than asserted: fenced code blocks and
+// blockquoted lines. Without this, a PR that quotes documentation containing
+// "Part of #123" satisfies its own rule, which happened on the first live run.
+function assertedText(body) {
+  return (body ?? "")
+    .replace(/```[\s\S]*?(?:```|$)/g, "")
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, "")
+    .split("\n")
+    .filter((line) => !/^\s*>/.test(line))
+    .join("\n");
+}
+
+// Issue numbers a body claims to be working towards, deduped and in order.
+function trackingReferences(body) {
+  const seen = [];
+  for (const m of assertedText(body).matchAll(TRACKING_REFERENCE)) {
+    const n = Number(m[1] ?? m[2]);
+    if (n && !seen.includes(n)) seen.push(n);
+  }
+  return seen;
+}
+
+// Resolve one reference: is it an OPEN, non-draft issue in this repo?
+//
+// Shared so the nudge and the ready-for-review gate cannot drift on what counts.
+//   - a pull request is not a tracking record
+//   - a closed issue is not tracked work
+//   - a draft issue is not agreed work yet
+// Returns false when the number cannot be resolved: unverifiable is not evidence.
+async function resolvesToOpenIssue({ github, core, owner, repo, number }) {
+  try {
+    const { data } = await github.rest.issues.get({ owner, repo, issue_number: number });
+    if (data.pull_request) return false;
+    if (data.state !== "open") return false;
+    if (data.draft) return false;
+    return true;
+  } catch (err) {
+    core?.warning?.(`Could not resolve #${number}: ${err.message}`);
+    return false;
+  }
+}
+
 const QUERY = `
   query($cursor: String, $searchQuery: String!) {
     rateLimit { remaining resetAt }
@@ -70,6 +121,29 @@ const QUERY = `
           labels(first: 30) { nodes { name } }
           body
         }
+      }
+    }
+  }
+`;
+
+// The same node shape as QUERY, for one named PR. `state` and `createdAt` are
+// extra: an event can name a PR that has since closed, or one predating the
+// effective date, and neither should be touched.
+const ONE_PR_QUERY = `
+  query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        number
+        title
+        state
+        createdAt
+        isDraft
+        additions
+        deletions
+        authorAssociation
+        author { login __typename }
+        labels(first: 30) { nodes { name } }
+        body
       }
     }
   }
@@ -113,11 +187,18 @@ function exemptReason(pr, maintainers = new Set()) {
 }
 
 const message = (author) =>
-  `@${author} This PR doesn't link an issue.
+  `@${author} Thanks for the PR! It doesn't reference an issue yet.
 
-Please edit the description to link the issue this PR addresses with a closing keyword, e.g. \`Closes #123\`, or link it from the **Development** section of the sidebar. Linking gives the PR the issue's priority in our review queue, and closes the issue automatically on merge.
+**We require an issue for every PR**, so the work can be prioritized before it's reviewed. Add one to the description:
 
-If this change genuinely has no associated issue, check **Refactor / chore**, **Docs**, or **Test / CI** under *Type of change* — those types don't need one. Anything else should have an issue so it can be prioritized; open one if it doesn't exist yet.
+- \`Closes #123\` if this PR finishes the issue. That links it, gives your PR the issue's priority, and closes the issue when this merges. You can also link it from the **Development** section of the sidebar.
+- \`Part of #123\` if this is one step towards it. \`Related to\`, \`Towards\`, and \`Refs\` work the same way, and leave the issue open.
+
+No issue exists for this yet? Open one first, then reference it. That's how we track what's worth doing, and it's usually quicker than it sounds. Note a reference has to point at an issue: naming another PR doesn't count.
+
+The only exceptions are changes with no user-visible behaviour: pure **Refactor / chore**, **Docs**, or **Test / CI** work. If that's genuinely what this is, check that box under *Type of change*. Anything that fixes a bug, adds a feature, or changes the UI needs an issue, even when it also touches docs or tests.
+
+See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md#every-pr-needs-an-issue) for the full policy.
 
 _No action is taken beyond this comment._`;
 
@@ -159,28 +240,49 @@ module.exports = async ({ context, github, core }) => {
       core.warning(`Could not load .github/MAINTAINER: ${err.message}`);
     }
 
-    const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
-    // Never look further back than the effective date, whichever is later.
-    const cutoff = new Date(
-      Math.max(windowStart.getTime(), new Date(EFFECTIVE_FROM).getTime())
-    );
-    const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
-    console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
-
-    let cursor = null;
-    let hasNextPage = true;
+    // One PR when an event names it, the whole window on the cron sweep. Only the
+    // fetch differs: every decision below runs identically either way, so the
+    // instant path and the sweep can never reach different verdicts.
     const allPRs = [];
-    while (hasNextPage) {
-      const response = await github.graphql(QUERY, { cursor, searchQuery });
-      const { remaining, resetAt } = response.rateLimit;
-      console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
-      const { nodes, pageInfo } = response.search;
-      hasNextPage = pageInfo.hasNextPage;
-      cursor = pageInfo.endCursor;
-      allPRs.push(...nodes);
+    const single = Number(process.env.PR_NUMBER) || null;
+    if (single) {
+      const resp = await github.graphql(ONE_PR_QUERY, { owner, repo, number: single });
+      const pr = resp.repository.pullRequest;
+      // The effective date still applies: an event on an older PR is not a licence
+      // to reach into the backlog.
+      if (!pr) {
+        console.log(`#${single} not found; nothing to do.`);
+      } else if (new Date(pr.createdAt) < new Date(EFFECTIVE_FROM)) {
+        console.log(`#${single} predates ${EFFECTIVE_FROM}; skipping.`);
+      } else if (pr.state !== "OPEN") {
+        console.log(`#${single} is ${pr.state}; skipping.`);
+      } else {
+        allPRs.push(pr);
+      }
+      console.log(`Checking #${single} (enforce=${enforce})`);
+    } else {
+      const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+      // Never look further back than the effective date, whichever is later.
+      const cutoff = new Date(
+        Math.max(windowStart.getTime(), new Date(EFFECTIVE_FROM).getTime())
+      );
+      const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+      const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
+      console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
+
+      let cursor = null;
+      let hasNextPage = true;
+      while (hasNextPage) {
+        const response = await github.graphql(QUERY, { cursor, searchQuery });
+        const { remaining, resetAt } = response.rateLimit;
+        console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
+        const { nodes, pageInfo } = response.search;
+        hasNextPage = pageInfo.hasNextPage;
+        cursor = pageInfo.endCursor;
+        allPRs.push(...nodes);
+      }
+      console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
     }
-    console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
 
     const verdicts = [];
     let flagged = 0;
@@ -207,6 +309,21 @@ module.exports = async ({ context, github, core }) => {
       }
       if (linkCount > 0) {
         verdicts.push({ pr: pr.number, verdict: "ok", reason: `${linkCount} linked` });
+        continue;
+      }
+
+      // No closing link, but the body may still name the issue it works towards.
+      // Each candidate is resolved: "Refs #4147" often points at another PR, and a
+      // closed or draft issue is not tracked work.
+      let tracked = null;
+      for (const candidate of trackingReferences(pr.body)) {
+        if (await resolvesToOpenIssue({ github, core, owner, repo, number: candidate })) {
+          tracked = candidate;
+          break;
+        }
+      }
+      if (tracked) {
+        verdicts.push({ pr: pr.number, verdict: "ok", reason: `references #${tracked}` });
         continue;
       }
 
@@ -258,7 +375,7 @@ module.exports = async ({ context, github, core }) => {
     // The full verdict list, so a dry run can be reviewed before enforcing.
     if (core.summary) {
       core.summary
-        .addHeading(`Issue-link check ${enforce ? "(enforcing)" : "(dry run — nothing changed)"}`, 3)
+        .addHeading(`Issue-link check ${enforce ? "(enforcing)" : "(dry run, nothing changed)"}`, 3)
         .addRaw(`\n${summary}\n\n`)
         .addTable([
           [
@@ -281,5 +398,8 @@ module.exports = async ({ context, github, core }) => {
 
 // Exported for the offline unit test.
 module.exports.exemptReason = exemptReason;
+module.exports.trackingReferences = trackingReferences;
+module.exports.assertedText = assertedText;
+module.exports.resolvesToOpenIssue = resolvesToOpenIssue;
 module.exports.MARKER = MARKER;
 module.exports.EFFECTIVE_FROM = EFFECTIVE_FROM;
