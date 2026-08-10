@@ -14,8 +14,11 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
+
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+
 import { useSession } from "@/hooks/useSession";
-import { useChatStore } from "@/store/chatStore";
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
@@ -1542,31 +1545,6 @@ describe("FilesPanel browse location", () => {
   });
 });
 
-describe("FilesPanel tells the agent where the user is looking", () => {
-  const UNCONFINED_REACH = {
-    unconfined: true,
-    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
-  };
-
-  it("publishes the browsed directory so the composer can pass it on", () => {
-    // Navigating a viewer cannot move the agent's working directory, so the
-    // only way it can act on "these files" is for the composer to tell it.
-    // The panel and composer are sibling subtrees, hence the store hop.
-    renderPanel({
-      conversationId: "conv_publish",
-      files: [],
-      workingDir: "/home/user/proj",
-      reachable: UNCONFINED_REACH,
-    });
-    expect(useChatStore.getState().browseLocation).toBeNull();
-
-    fireEvent.click(screen.getByTestId("browse-location-path"));
-    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
-
-    expect(useChatStore.getState().browseLocation).toBe("/etc");
-  });
-});
-
 describe("FilesPanel browse permission", () => {
   const UNCONFINED_REACH = {
     unconfined: true,
@@ -1633,5 +1611,44 @@ describe("FilesPanel browse permission", () => {
     });
 
     expect(screen.getByTestId("browse-location-path")).toBeInTheDocument();
+  });
+});
+
+describe("FilesPanel header copy path", () => {
+  const UNCONFINED_REACH = {
+    unconfined: true,
+    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+  };
+
+  it("copies the working folder's absolute path from the header", () => {
+    renderPanel({
+      conversationId: "conv_copy_header",
+      files: [],
+      workingDir: "/home/user/proj",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy folder path: proj" }));
+
+    // The header copies the ABSOLUTE path -- pasting a basename would be
+    // useless, and the header is the one place the full path is on screen.
+    expect(copyTextMock).toHaveBeenCalledWith("/home/user/proj");
+  });
+
+  it("copies the browsed directory after navigating away from the workspace", () => {
+    // The header tracks wherever the panel is pointed, so the copy must
+    // follow it rather than pinning to the session's workspace.
+    renderPanel({
+      conversationId: "conv_copy_browsed",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED_REACH,
+    });
+
+    fireEvent.click(screen.getByTestId("browse-location-path"));
+    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy folder path: etc" }));
+
+    expect(copyTextMock).toHaveBeenCalledWith("/etc");
   });
 });

@@ -80,7 +80,6 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   }),
 }));
 
-import { browsingMarkerFor } from "@/lib/composerMentions";
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
@@ -198,23 +197,6 @@ describe("mentionMarkerFor", () => {
     // sane default.
     expect(mentionMarkerFor(null, "a.ts")).toBe("[Attached: a.ts]");
     expect(mentionMarkerFor("some-sdk-harness", "a.ts")).toBe("[Attached: a.ts]");
-  });
-});
-
-describe("browsingMarkerFor", () => {
-  // Navigating the files panel cannot move the agent's working directory, and
-  // a native harness discards the system prompt, so the message text is the
-  // only channel that can tell the agent where the user is looking.
-  it("names the browsed directory as ambient context", () => {
-    expect(browsingMarkerFor("/Users/me/app-templates")).toBe(
-      "[The user's file browser is open at: /Users/me/app-templates]",
-    );
-  });
-
-  it("is harness-agnostic prose, not an attachment instruction", () => {
-    // Deliberately NOT the "[Attached: …]" wording: the user did not choose to
-    // attach this directory, so it must not read as "go open this".
-    expect(browsingMarkerFor("/tmp")).not.toContain("Attached");
   });
 });
 

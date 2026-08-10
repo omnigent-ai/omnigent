@@ -244,19 +244,6 @@ export interface ChatState {
    */
   redirectToConversationId: string | null;
   /**
-   * Absolute directory the files panel is browsing, when it has been pointed
-   * somewhere other than the session's workspace. Null while it shows the
-   * workspace (the agent's actual working directory, so there is nothing
-   * extra to say).
-   *
-   * Lives here because the panel and the composer sit in sibling subtrees
-   * under AppShell. The composer reads it to tell the agent where the user
-   * is looking — navigating a viewer cannot move the agent's working
-   * directory, so the only way it can act on "these files" is to be told.
-   */
-  browseLocation: string | null;
-  setBrowseLocation: (path: string | null) => void;
-  /**
    * Flat block list (history + streaming). Renderer walks this.
    *
    * Terminal-observed (claude-native) live streaming inserts a
@@ -1050,8 +1037,6 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
 export const useChatStore = create<ChatState>((set, get) => ({
   conversationId: null,
   redirectToConversationId: null,
-  browseLocation: null,
-  setBrowseLocation: (path) => set({ browseLocation: path }),
   blocks: [],
   pendingUserMessages: [],
   queuedMessages: [],

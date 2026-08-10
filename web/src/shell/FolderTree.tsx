@@ -11,6 +11,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { type ChangedSort, compareChangedFiles, type SortableFile } from "./FlatFileList";
 import { formatBytes, gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
+import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
@@ -509,6 +510,7 @@ function FileRowItem({
             </span>
           )}
         </button>
+        <CopyPathButton path={path} revealOnHover />
         {bytes !== null && !isDeleted ? (
           <div className="relative shrink-0 flex items-center">
             <span className="text-muted-foreground text-[10px] group-hover:invisible">

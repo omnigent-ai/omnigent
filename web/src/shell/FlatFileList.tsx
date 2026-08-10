@@ -4,6 +4,7 @@ import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
+import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
@@ -122,6 +123,7 @@ function FileListItem({
             )}
           </span>
         )}
+        <CopyPathButton path={file.path} revealOnHover />
         <span className="relative flex shrink-0 items-center justify-center">
           <span
             className={cn(

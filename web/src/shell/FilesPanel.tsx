@@ -27,6 +27,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { BrowseLocationBar } from "./BrowseLocationBar";
+import { CopyPathButton } from "./CopyPathButton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -328,13 +329,11 @@ export function FilesPanel({
   // panel keeps opening there and a session switch never strands the user in
   // a directory belonging to the session they just left.
   const [browseLocation, setBrowseLocation] = useState<string | null>(null);
-  const publishBrowseLocation = useChatStore((s) => s.setBrowseLocation);
   const [browseError, setBrowseError] = useState<string | null>(null);
   useEffect(() => {
     setBrowseLocation(null);
     setBrowseError(null);
-    publishBrowseLocation(null);
-  }, [conversationId, publishBrowseLocation]);
+  }, [conversationId]);
   const workingDir = browseLocation ?? workspaceRoot;
   // The wire form: "" means the workspace root (the historical relative
   // contract); anything else is an absolute path.
@@ -342,9 +341,7 @@ export function FilesPanel({
 
   function navigateTo(absolutePath: string) {
     setBrowseError(null);
-    const next = absolutePath === workspaceRoot ? null : absolutePath;
-    setBrowseLocation(next);
-    publishBrowseLocation(next);
+    setBrowseLocation(absolutePath === workspaceRoot ? null : absolutePath);
   }
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
@@ -453,6 +450,13 @@ export function FilesPanel({
           </TooltipProvider>
         )}
         <div className="ml-auto flex items-center gap-1">
+          {workingDir && (
+            // Its own provider: the header has no TooltipProvider ancestor
+            // (each control here brings one), unlike the file rows.
+            <TooltipProvider>
+              <CopyPathButton path={workingDir} label="Copy folder path" />
+            </TooltipProvider>
+          )}
           <HiddenFilesToggle
             showHidden={showHidden}
             onToggle={() => onShowHiddenChange(!showHidden)}
