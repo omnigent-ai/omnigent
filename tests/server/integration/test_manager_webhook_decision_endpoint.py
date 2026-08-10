@@ -51,14 +51,20 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import session_outbox
+from omnigent.server.app import create_app
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_sessions_elicitation_resolve_url import (
     _create_session,
@@ -310,9 +316,12 @@ async def test_decision_endpoint_mid_disconnect_grace_gets_pending_not_410(
     # already cleared (stale/None), same as session_live_state.clear_runner_liveness.
     conv_store.touch_runner_liveness([runner_id], int(time.time()) - 10_000)
 
-    # Mark the runner grace-pending, mirroring what _on_runner_disconnect
-    # stamps into app.state.runner_disconnect_grace_deadline.
-    app.state.runner_disconnect_grace_deadline = {runner_id: time.time() + 10.0}
+    # Mark the runner grace-pending via the DURABLE store column (OMN-104
+    # §5.4 cross-replica fix) — the same write path
+    # session_live_state.set_runner_disconnect_grace uses in production,
+    # deliberately NOT app.state, so this test proves the decision endpoint
+    # classifies correctly from the shared DB row alone.
+    conv_store.set_runner_disconnect_grace(runner_id, int(time.time()) + 10)
 
     try:
         verdict = await client.post(
@@ -332,7 +341,7 @@ async def test_decision_endpoint_mid_disconnect_grace_gets_pending_not_410(
         deliveries, _ = store.list_deliveries(session_id, limit=100)
         assert [d for d in deliveries if d.event_type == "session.resumed"] == []
     finally:
-        app.state.runner_disconnect_grace_deadline = {}
+        conv_store.clear_runner_disconnect_grace(runner_id)
 
 
 async def test_decision_endpoint_after_grace_expires_410s_normally(
@@ -363,7 +372,7 @@ async def test_decision_endpoint_after_grace_expires_410s_normally(
     conv_store.touch_runner_liveness([runner_id], int(time.time()) - 10_000)
 
     # Deadline in the past: the grace has expired, no reconnect happened.
-    app.state.runner_disconnect_grace_deadline = {runner_id: time.time() - 1.0}
+    conv_store.set_runner_disconnect_grace(runner_id, int(time.time()) - 1)
 
     try:
         verdict = await client.post(
@@ -373,7 +382,112 @@ async def test_decision_endpoint_after_grace_expires_410s_normally(
         assert verdict.status_code == 410, verdict.text
         assert verdict.json()["detail"]["error_code"] == "elicitation_not_resolvable"
     finally:
-        app.state.runner_disconnect_grace_deadline = {}
+        conv_store.clear_runner_disconnect_grace(runner_id)
+
+
+async def _build_replica(
+    db_uri: str, tmp_path: Path, *, name: str
+) -> tuple[FastAPI, httpx.AsyncClient]:
+    """
+    Construct a genuinely independent ``create_app()`` instance + client,
+    sharing only *db_uri* — no shared Python object identity, no shared
+    ``app.state``, matching a real multi-replica deployment where each
+    replica is a separate OS process.
+
+    :param db_uri: Database URI shared by every replica in the test.
+    :param tmp_path: Pytest temp dir; each replica gets its own artifact
+        subdirectory so they don't contend over the same files on disk.
+    :param name: Distinguishing subdirectory name, e.g. ``"replica_a"``.
+    :returns: ``(app, client)`` for this replica.
+    """
+    artifact_store = LocalArtifactStore(str(tmp_path / name / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / name / "cache",
+        ),
+    )
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=f"http://{name}")
+    return app, client
+
+
+async def test_decision_endpoint_cross_replica_mid_grace_gets_pending_not_410(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    Round-4 cross-vendor review: the reconnect-grace marker must be
+    cross-replica, not per-process. Before this fix, the grace deadline
+    lived only in the tunnel-holding replica's in-memory ``app.state`` —
+    invisible to any OTHER replica handling a manager decision request,
+    which would see the already-cleared ``runner_last_seen`` with no
+    local grace entry and falsely 410 even though the runner is still
+    within its reconnect window on the other replica.
+
+    Simulates the disconnect being handled by "replica A" (a durable
+    store write, mirroring what ``_on_runner_disconnect`` does — not a
+    fabrication, the same call ``session_live_state.set_runner_disconnect_grace``
+    makes), then submits the decision through a SEPARATELY CONSTRUCTED
+    "replica B" — its own ``create_app()`` instance, its own
+    ``ConversationStore`` object, no shared in-process state with replica
+    A at all, only the same database — and asserts replica B correctly
+    returns 202/pending-redelivery rather than a false 410.
+    """
+    _app_a, client_a = await _build_replica(db_uri, tmp_path, name="replica_a")
+    app_b, client_b = await _build_replica(db_uri, tmp_path, name="replica_b")
+    try:
+        # Session/agent creation routed through replica A — irrelevant
+        # which replica originates them, both read/write the same DB.
+        agent = await create_test_agent(client_a, "test-cross-replica-grace")
+        session_id = await _create_session(client_a, agent["id"])
+        elicitation_id = "elicit_cross_replica_grace"
+
+        session_outbox.record_elicitation_raised(
+            workspace_id=0,
+            session_id=session_id,
+            elicitation_id=elicitation_id,
+            request={"message": "Approve?", "mode": "form"},
+        )
+
+        conv_store_a = SqlAlchemyConversationStore(db_uri)
+        runner_id = "runner_cross_replica"
+        assert conv_store_a.set_runner_id(session_id, runner_id)
+        # Simulate the exact state a real disconnect leaves behind on the
+        # SHARED liveness column: stale/cleared.
+        conv_store_a.touch_runner_liveness([runner_id], int(time.time()) - 10_000)
+        # "Replica A" durably records the disconnect-grace marker — the
+        # same durable write path production code takes, not app.state.
+        conv_store_a.set_runner_disconnect_grace(runner_id, int(time.time()) + 10)
+
+        try:
+            # The decision arrives on REPLICA B — which never itself
+            # observed this runner's disconnect and has no local
+            # in-memory knowledge of it whatsoever.
+            verdict = await client_b.post(
+                f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+                json={"action": "accept"},
+            )
+            assert verdict.status_code == 202, verdict.text
+            body = verdict.json()
+            assert body["resolved"] is False
+            assert body["pending_redelivery"] is True
+
+            store = app_b.state.session_lifecycle_store
+            elicitation = store.get_elicitation(elicitation_id)
+            assert elicitation is not None
+            assert elicitation.status == "decided"
+
+            deliveries, _ = store.list_deliveries(session_id, limit=100)
+            assert [d for d in deliveries if d.event_type == "session.resumed"] == []
+        finally:
+            conv_store_a.clear_runner_disconnect_grace(runner_id)
+    finally:
+        await client_a.aclose()
+        await client_b.aclose()
 
 
 def _fake_runner_client_factory(status_code: int, *, header: str | None):

@@ -299,3 +299,44 @@ def clear_runner_liveness(runner_id: str) -> None:
     if _store is None:
         return
     _submit("runner_liveness_clear", _store.clear_runner_liveness, runner_id)
+
+
+def set_runner_disconnect_grace(runner_id: str, grace_deadline: float) -> None:
+    """
+    Durably stamp the post-disconnect reconnect-grace deadline (OMN-104 §5.4).
+
+    Called alongside :func:`clear_runner_liveness` from the SAME disconnect
+    handler, so a manager decision request landing on a DIFFERENT replica
+    than the one holding the tunnel can still see "this runner disconnected
+    and is still within its reconnect grace" instead of falling through to
+    the now-cleared ``runner_last_seen`` freshness check and misclassifying
+    a runner that is about to reconnect as dead — the same class of bug
+    BLOCKING #1 (round 1) fixed for the single-replica case, exposed one
+    layer further out for a multi-replica deployment.
+
+    :param runner_id: The disconnected runner's id.
+    :param grace_deadline: Epoch seconds the grace expires at.
+    """
+    if _store is None:
+        return
+    _submit(
+        "runner_disconnect_grace_set",
+        _store.set_runner_disconnect_grace,
+        runner_id,
+        int(grace_deadline),
+    )
+
+
+def clear_runner_disconnect_grace(runner_id: str) -> None:
+    """
+    Durably clear the reconnect-grace deadline for a runner.
+
+    Called on reconnect (the grace is no longer pending) and once the
+    grace genuinely expires with no reconnect (the runner is now confirmed
+    dead, not merely presumed).
+
+    :param runner_id: The runner whose grace-pending marker should be cleared.
+    """
+    if _store is None:
+        return
+    _submit("runner_disconnect_grace_clear", _store.clear_runner_disconnect_grace, runner_id)

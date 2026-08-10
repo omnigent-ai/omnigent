@@ -190,18 +190,20 @@ def register_elicitations_routes(
             # decision arriving inside that window would see stale
             # liveness and be misclassified as "runner dead" even though
             # the runner is very likely still alive and about to
-            # reconnect. Consult the grace-pending marker FIRST (this
-            # replica's own view, mirroring the tunnel registry it's
-            # derived from) before falling back to the cross-replica
-            # freshness signal, which is only meaningful once the grace
-            # has genuinely elapsed with no reconnect.
-            grace_deadlines: dict[str, float] = getattr(
-                request.app.state, "runner_disconnect_grace_deadline", {}
-            )
+            # reconnect. Consult the grace-pending marker FIRST — durable
+            # (SessionConnectivity.runner_disconnect_grace_deadline, written
+            # by the replica holding the tunnel at the same moment it
+            # clears runner_last_seen; see
+            # session_live_state.set_runner_disconnect_grace), so this
+            # check is correct regardless of which replica this decision
+            # request landed on — before falling back to the cross-replica
+            # freshness signal, which is only meaningful once the grace has
+            # genuinely elapsed with no reconnect.
             runner_in_disconnect_grace = (
                 conn is not None
                 and conn.runner_id is not None
-                and grace_deadlines.get(conn.runner_id, 0.0) > now
+                and conn.runner_disconnect_grace_deadline is not None
+                and conn.runner_disconnect_grace_deadline > now
             )
             runner_alive = runner_in_disconnect_grace or (
                 conn is not None

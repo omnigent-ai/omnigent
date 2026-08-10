@@ -2119,28 +2119,26 @@ def create_app(
     # sleep-wake reconnects) that re-register within the grace never
     # flap their sessions to failed.
     _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
-    # OMN-104 §5.4: runner_id -> epoch-seconds deadline while a runner is
-    # inside its disconnect grace (mirrors _disconnect_grace_tasks, kept
-    # separately so it survives being read from a different module).
+    # OMN-104 §5.4: the grace-pending marker is durable
+    # (omnigent_conversation_metadata.runner_disconnect_grace_deadline via
+    # session_live_state.set_runner_disconnect_grace/clear_runner_disconnect_grace),
+    # not per-process state — a manager decision can land on ANY server
+    # replica, not just the one holding this runner's tunnel.
     # session_live_state.clear_runner_liveness() nulls runner_last_seen
-    # IMMEDIATELY on disconnect (not after the grace) — so a decision
-    # arriving mid-grace would otherwise see stale liveness and be
-    # misclassified as "runner dead" (410) even though the runner is very
-    # likely about to reconnect. Exposed via app.state so the decision
-    # endpoint (a different module) can consult it before falling back to
-    # the cross-replica runner_last_seen freshness check. Per-replica, like
-    # the tunnel registry and _disconnect_grace_tasks themselves — this is
-    # not a downgrade from the existing per-replica-only mechanisms it
-    # complements.
-    _runner_disconnect_grace_deadline: dict[str, float] = {}
-    app.state.runner_disconnect_grace_deadline = _runner_disconnect_grace_deadline
+    # IMMEDIATELY on disconnect (not after the grace), on that SAME durable
+    # row — so a decision arriving mid-grace on a different replica would
+    # otherwise see stale liveness with no local grace entry to consult and
+    # be misclassified as "runner dead" (410) even though the runner is
+    # very likely about to reconnect. The decision endpoint reads this via
+    # SessionConnectivity.runner_disconnect_grace_deadline (cross-replica,
+    # like runner_last_seen itself), not app.state.
 
     def _cancel_disconnect_grace(runner_id: str) -> None:
         """Cancel and forget the pending disconnect-grace timer, if any."""
         pending = _disconnect_grace_tasks.pop(runner_id, None)
         if pending is not None and not pending.done():
             pending.cancel()
-        _runner_disconnect_grace_deadline.pop(runner_id, None)
+        session_live_state.clear_runner_disconnect_grace(runner_id)
 
     async def _mark_disconnected_runner_failed(runner_id: str) -> None:
         """Reconcile a dropped runner's sessions once the grace expires.
@@ -2169,14 +2167,14 @@ def create_app(
             # clearing here too covers any ordering where this timer's
             # live-tunnel check observes the reconnect before that handler's
             # own clear runs.
-            _runner_disconnect_grace_deadline.pop(runner_id, None)
+            session_live_state.clear_runner_disconnect_grace(runner_id)
             return
         # Grace expired with no reconnect: the runner is now CONFIRMED dead,
         # not merely presumed — clear the grace-pending marker so decision
         # classification correctly falls through to the (now genuinely
         # stale) runner_last_seen freshness check instead of treating this
         # runner as still-possibly-reconnecting.
-        _runner_disconnect_grace_deadline.pop(runner_id, None)
+        session_live_state.clear_runner_disconnect_grace(runner_id)
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -2253,10 +2251,15 @@ def create_app(
 
         # OMN-104 §5.4: mark this runner as grace-pending (not confirmed
         # dead) for the same duration the failed-marking timer waits, so a
-        # decision arriving in this window is classified as "pending
-        # redelivery", not "runner dead" — see _runner_disconnect_grace_deadline
-        # above and its consumer in routes_elicitations.py.
-        _runner_disconnect_grace_deadline[runner_id] = time.time() + RUNNER_DISCONNECT_GRACE_S
+        # decision arriving in this window — on ANY replica, not just this
+        # one — is classified as "pending redelivery", not "runner dead".
+        # Durable (see session_live_state.set_runner_disconnect_grace),
+        # written alongside clear_runner_liveness above; consumed via
+        # SessionConnectivity.runner_disconnect_grace_deadline in
+        # routes_elicitations.py.
+        session_live_state.set_runner_disconnect_grace(
+            runner_id, time.time() + RUNNER_DISCONNECT_GRACE_S
+        )
         task = asyncio.create_task(
             _mark_disconnected_runner_failed(runner_id),
             name=f"runner-disconnect-grace-{runner_id}",
@@ -2334,7 +2337,7 @@ def create_app(
         # pending grace expiry"; clear the grace-pending marker so decision
         # classification goes back to the normal runner_seen_is_fresh path
         # (now correctly fresh, per the touch_runner_liveness call above).
-        _runner_disconnect_grace_deadline.pop(runner_id, None)
+        session_live_state.clear_runner_disconnect_grace(runner_id)
 
         # Direct by-runner lookup instead of list-everything-and-filter:
         # the listing path may be backed by an eventually-consistent

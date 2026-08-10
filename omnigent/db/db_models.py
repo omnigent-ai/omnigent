@@ -644,6 +644,13 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Epoch seconds the bound runner's post-disconnect reconnect grace
+    # (OMN-104 §5.4) expires at; NULL when not currently grace-pending.
+    # Written by the replica holding the tunnel on disconnect, alongside
+    # nulling runner_last_seen — so any OTHER replica handling a manager
+    # decision request can classify "runner is mid-grace, not dead" without
+    # needing the local in-memory registry the disconnect happened on.
+    runner_disconnect_grace_deadline: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.

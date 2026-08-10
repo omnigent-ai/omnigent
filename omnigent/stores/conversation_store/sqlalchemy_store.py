@@ -1126,6 +1126,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.runner_id,
                     SqlConversationMetadata.host_id,
                     SqlConversationMetadata.runner_last_seen,
+                    SqlConversationMetadata.runner_disconnect_grace_deadline,
                 ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id.in_(unique_ids),
@@ -1155,6 +1156,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 host_id=row.host_id,
                 needs_workspace=row.id in needs_workspace_ids,
                 runner_last_seen=row.runner_last_seen,
+                runner_disconnect_grace_deadline=row.runner_disconnect_grace_deadline,
             )
             for row in meta_rows
         }
@@ -2890,6 +2892,49 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.runner_id == runner_id,
                 )
                 .values(runner_last_seen=None)
+            )
+
+    def set_runner_disconnect_grace(self, runner_id: str, grace_deadline: int) -> None:
+        """
+        Stamp ``runner_disconnect_grace_deadline`` for sessions bound to a runner.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param runner_id: The disconnected runner's id.
+        :param grace_deadline: Epoch seconds the grace expires at.
+        """
+        from sqlalchemy import update
+
+        with self._session("set_runner_disconnect_grace") as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.runner_id == runner_id,
+                )
+                .values(runner_disconnect_grace_deadline=grace_deadline)
+            )
+
+    def clear_runner_disconnect_grace(self, runner_id: str) -> None:
+        """
+        Clear ``runner_disconnect_grace_deadline`` for sessions bound to a runner.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param runner_id: The runner whose grace-pending marker should be cleared.
+        """
+        from sqlalchemy import update
+
+        with self._session("clear_runner_disconnect_grace") as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.runner_id == runner_id,
+                )
+                .values(runner_disconnect_grace_deadline=None)
             )
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
