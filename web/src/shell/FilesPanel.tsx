@@ -322,6 +322,13 @@ export function FilesPanel({
   const workingDir = envQuery.data?.root ?? null;
   const changedFiles = changedQuery.data?.data ?? [];
   const changedCount = changedFiles.length;
+  const lineTotals = changedFiles.reduce(
+    (totals, file) => ({
+      additions: totals.additions + (file.lines_added ?? 0),
+      deletions: totals.deletions + (file.lines_removed ?? 0),
+    }),
+    { additions: 0, deletions: 0 },
+  );
   const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
   ).length;
@@ -447,6 +454,16 @@ export function FilesPanel({
             </div>
             <SortSelector sort={changedSort} onChange={onSortChange} />
           </div>
+        </div>
+      )}
+      {flatView && (lineTotals.additions > 0 || lineTotals.deletions > 0) && (
+        <div
+          className="flex shrink-0 justify-start gap-1.5 px-4 pb-1 font-mono text-sm md:text-xs"
+          aria-label="Changed line totals"
+        >
+          <span className="text-foreground">Total:</span>
+          <span className="text-green-600 dark:text-green-400">+{lineTotals.additions}</span>
+          <span className="text-destructive">&minus;{lineTotals.deletions}</span>
         </div>
       )}
       {!flatView && (
