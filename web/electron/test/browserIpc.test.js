@@ -109,6 +109,7 @@ function nonceFromScripts(scripts) {
 function makeRegistry(conversationId, webContents) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
+  const suppressedCalls = []; // booleans passed to setSuppressed, in order
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
@@ -120,11 +121,11 @@ function makeRegistry(conversationId, webContents) {
     },
     setActive: () => ({ ok: true }),
     setSuppressed: (s) => {
-      entries.lastSuppressed = s;
+      suppressedCalls.push(s);
       return { ok: true };
     },
     close: () => ({ ok: true, removed: true }),
-    _entries: entries,
+    suppressedCalls,
   };
 }
 
@@ -192,10 +193,9 @@ describe("browserIpc — overlay suppression (#3980)", () => {
     const { ipcMain, registry, event } = setup();
     let r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: true });
     assert.equal(r.ok, true);
-    assert.equal(registry._entries.lastSuppressed, true);
     r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: false });
     assert.equal(r.ok, true);
-    assert.equal(registry._entries.lastSuppressed, false);
+    assert.deepEqual(registry.suppressedCalls, [true, false]);
   });
 
   it("rejects an unpinned sender", async () => {
