@@ -621,7 +621,7 @@ def test_describe_exception_never_blank(exc: BaseException):
     """No bare stdlib exception yields an empty description."""
     assert describe_exception(exc).strip() != ""
 
-    
+
 # ---------------------------------------------------------------------------
 # Spawn env: the agent must actually receive credentials (#4281)
 # ---------------------------------------------------------------------------
