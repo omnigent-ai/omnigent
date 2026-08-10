@@ -124,6 +124,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ANTIGRAVITY_NATIVE_HARNESS,
     _APPROVAL_TYPE,
     _CHILD_PREVIEW_LIMIT,
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
@@ -7815,12 +7816,12 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
-    polly's native workers (claude-native / codex-native / cursor-native)
-    launch in a headless pane where no human can answer an ApprovalCard, so
-    every Edit/Write/Bash that prompts stalls the worker. This translates a
-    worker bundle's declared full-bypass intent into the per-session
-    ``terminal_launch_args`` the runner already appends to the native CLI
-    argv:
+    polly's native workers (claude-native / codex-native / cursor-native /
+    antigravity-native) launch in a headless pane where no human can answer
+    an ApprovalCard, so every Edit/Write/Bash that prompts stalls the
+    worker. This translates a worker bundle's declared full-bypass intent
+    into the per-session ``terminal_launch_args`` the runner already appends
+    to the native CLI argv:
 
     - claude-native + ``executor.config.permission_mode`` set ->
       ``["--permission-mode", "<value>"]``. The value is passed through
@@ -7846,6 +7847,12 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       to ``auto`` or ``auto-review``, emit ``["--auto-review"]`` instead
       (Smart Auto) so a bundle can choose Claude-style auto without full
       yolo.
+    - antigravity-native -> ``["--dangerously-skip-permissions"]`` by
+      DEFAULT. Headless agy workers otherwise stall on agy's native
+      ``request-review`` permission prompt for every tool call (neither the
+      human nor the parent orchestrator can resolve it in-band). An
+      explicit ``executor.config.yolo: false`` opts back into native
+      prompting / web-mirrored approval cards.
 
     Only those native harnesses are translated; for any other harness
     (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
@@ -7894,6 +7901,17 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--yolo"])
+    if harness == _ANTIGRAVITY_NATIVE_HARNESS:
+        # Headless default: full bypass. The runner already threads
+        # ``terminal_launch_args`` into ``build_agy_launch(..., extra_args=...)``
+        # with ``headless=False`` / ``permission_mode=None`` (web-attended
+        # launch path), so without this deriver branch agy keeps its default
+        # ``toolPermission=request-review`` and every tool call stalls an
+        # unattended batcave/polly worker. ``yolo: false`` is the
+        # keep-prompting opt-out.
+        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+            return None
+        return _validate_terminal_launch_args(["--dangerously-skip-permissions"])
     return None
 
 
