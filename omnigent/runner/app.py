@@ -22,7 +22,7 @@ import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
@@ -7316,8 +7316,9 @@ def create_runner_app(
                 status_code=500,
                 content={"error": {"code": "git_status_failed", "message": exc.reason}},
             )
-        data = [
-            {
+        data: list[dict[str, Any]] = []
+        for rec in raw_changes:
+            entry: dict[str, Any] = {
                 "object": "session.environment.filesystem.entry",
                 "path": rec["path"],
                 "name": rec["path"].split("/")[-1],
@@ -7327,8 +7328,11 @@ def create_runner_app(
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
             }
-            for rec in raw_changes
-        ]
+            if "staged" in rec:
+                entry["staged"] = rec["staged"]
+            if "unstaged" in rec:
+                entry["unstaged"] = rec["unstaged"]
+            data.append(entry)
         return JSONResponse(
             status_code=200,
             content={"object": "list", "data": data, "has_more": False},
