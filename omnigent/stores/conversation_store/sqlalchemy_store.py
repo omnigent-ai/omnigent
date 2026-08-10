@@ -236,6 +236,7 @@ def _to_conversation(
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
         archived=row.archived,
+        archived_at=row.archived_at,
         live_status=(
             decode_session_live_status(meta.live_status)
             if meta and meta.live_status is not None
@@ -2819,8 +2820,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 row.session_overrides = _encode_session_overrides(overrides)
                 ap_changed = True
             if archived is not None:
-                # archived lives on the AP conversations row; a visible state change.
                 row.archived = archived
+                row.archived_at = now if archived else None
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now

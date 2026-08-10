@@ -178,6 +178,11 @@ export interface Conversation {
    */
   archived?: boolean;
   /**
+   * Unix epoch seconds when the session was archived; null/undefined when
+   * not archived. Used by the retention UI to age out old archived sessions.
+   */
+  archived_at?: number | null;
+  /**
    * Total review comments (any status) on this session. Together with
    * `comments_updated_at` it forms a change fingerprint: an add or edit
    * bumps the timestamp, a delete changes the count. SessionUpdatesProvider
@@ -340,6 +345,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     host_online: wire.host_online ?? undefined,
     git_branch: wire.git_branch ?? null,
     archived: wire.archived ?? false,
+    archived_at: wire.archived_at ?? null,
   };
 }
 
