@@ -435,6 +435,12 @@ export interface ChatState {
    * prompt destructively consumed — so an upload 415 or a runner 503 left
    * the user with an error and nothing to resend. The composer drains this
    * (matching on conversation id) and clears it.
+   *
+   * Single-slot: a second failure in the same session replaces the first's
+   * retained draft (last failure wins). A send that fails before any session
+   * id resolves isn't captured — there is no composer keyed to restore it
+   * into — but the landing path binds a session first, so the reported flow
+   * is covered.
    */
   failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
   /**
