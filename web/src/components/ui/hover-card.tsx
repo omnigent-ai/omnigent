@@ -2,7 +2,6 @@ import * as React from "react";
 import * as HoverCardPrimitive from "radix-ui/hover-card";
 
 import { getEmbedRoot } from "@/lib/host";
-import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 
 function HoverCard({ ...props }: React.ComponentProps<typeof HoverCardPrimitive.Root>) {
@@ -19,8 +18,6 @@ function HoverCardContent({
   sideOffset = 4,
   ...props
 }: React.ComponentProps<typeof HoverCardPrimitive.Content>) {
-  // Hide the native browser view while this hover card is open (issue #3980).
-  useSuppressBrowserView();
   return (
     <HoverCardPrimitive.Portal
       data-slot="hover-card-portal"

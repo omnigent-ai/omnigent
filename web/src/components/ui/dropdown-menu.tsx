@@ -2,7 +2,6 @@ import * as React from "react";
 import * as DropdownMenuPrimitive from "radix-ui/dropdown-menu";
 
 import { getEmbedRoot } from "@/lib/host";
-import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
 
@@ -34,8 +33,6 @@ function DropdownMenuContent({
   sideOffset = 4,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
-  // Hide the native browser view while this menu is open (issue #3980).
-  useSuppressBrowserView();
   return (
     <DropdownMenuPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <DropdownMenuPrimitive.Content

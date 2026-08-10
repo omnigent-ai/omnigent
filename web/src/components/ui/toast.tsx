@@ -12,8 +12,6 @@
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { XIcon } from "lucide-react";
 
-import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
-
 const TOAST_EVENT = "omnigent:toast";
 const DEFAULT_DURATION_MS = 6000;
 
@@ -58,19 +56,11 @@ export function Toaster() {
 
   return (
     <div className="pointer-events-none fixed inset-x-0 top-4 z-[100] flex flex-col items-center gap-2 px-4">
-      {/* Hide the native browser view while any toast shows (#3980). */}
-      <SuppressBrowserWhileShown />
       {toasts.map((t) => (
         <ToastRow key={t.id} item={t} onDismiss={dismiss} />
       ))}
     </div>
   );
-}
-
-/** Renders nothing; suppresses the native browser view for its lifetime. */
-function SuppressBrowserWhileShown() {
-  useSuppressBrowserView();
-  return null;
 }
 
 function ToastRow({ item, onDismiss }: { item: ToastItem; onDismiss: (id: number) => void }) {

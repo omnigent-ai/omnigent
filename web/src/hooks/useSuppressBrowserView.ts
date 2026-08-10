@@ -1,15 +1,14 @@
 import { useEffect } from "react";
 
 // The embedded browser is a native Electron WebContentsView that paints ABOVE
-// the entire renderer DOM, so CSS z-index can't lift a dialog/menu/tooltip/toast
-// over it (issue #3980). While any such overlay is open we ask the main process
-// to hide the view in place (setVisible(false)); it reappears when the last one
-// closes.
+// the entire renderer DOM, so CSS z-index can't lift an overlay over it (issue
+// #3980). While a suppressing overlay is open we ask the main process to hide
+// the view in place (setVisible(false)); it reappears when the last one closes.
 //
-// Overlays stack (a toast can auto-dismiss while a dialog is still open), so a
-// module-level ref count gates the IPC: only 0→1 suppresses and only 1→0
-// restores. A plain boolean per-overlay would let the toast's cleanup un-hide
-// the view out from under the dialog.
+// Applied narrowly — modal dialogs and the rail's "Open new" menu — not to
+// every popover/tooltip. Those can still stack (a dialog opening the menu),
+// so a module-level ref count gates the IPC: only 0→1 suppresses and only 1→0
+// restores.
 
 let openOverlayCount = 0;
 
@@ -29,11 +28,17 @@ function browserSuppressor(): ((suppressed: boolean) => unknown) | undefined {
 }
 
 /**
- * Suppress the embedded browser view for the lifetime of the calling component.
- * Mount an overlay's Content through this so the native view is hidden while it
- * shows. No-op outside a browser-capable Electron shell.
+ * Renders nothing; suppresses the embedded browser view for as long as it is
+ * mounted.
+ *
+ * MUST be mounted only WHILE an overlay is open. Radix `Content` WRAPPERS
+ * (DialogContent, TooltipContent, …) stay mounted in the JSX tree even when
+ * closed, so putting this in a wrapper body would suppress forever. Radix only
+ * mounts the actual `<Primitive.Content>` element (and its children) while
+ * open, so render this as a CHILD inside that element — then its mount/unmount
+ * tracks the overlay's open state exactly. No-op outside a browser-capable shell.
  */
-export function useSuppressBrowserView(): void {
+export function SuppressBrowserView(): null {
   useEffect(() => {
     if (!browserSuppressor()) return;
     openOverlayCount += 1;
@@ -43,4 +48,5 @@ export function useSuppressBrowserView(): void {
       if (openOverlayCount === 0) void browserSuppressor()?.(false);
     };
   }, []);
+  return null;
 }
