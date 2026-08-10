@@ -131,20 +131,24 @@ def test_jina_backend_keyless(tool_ctx: ToolContext) -> None:
     assert "api_key" not in result  # no "missing api_key" error
 
 
-def test_jina_url_appended_and_markdown_header(tool_ctx: ToolContext) -> None:
-    """Jina Reader is called as ``{base}/{url}`` and asks for markdown."""
+def test_jina_url_is_percent_encoded(tool_ctx: ToolContext) -> None:
+    """
+    The target URL is percent-encoded so its own query string is not parsed
+    as r.jina.ai's — a URL with ``?q=x`` must survive intact.
+    """
     fake_response = MagicMock()
     fake_response.text = "content"
 
     tool = WebScrapeTool(config={"scrape_provider": "jina"})
     with patch("omnigent.tools.builtins.web_scrape_jina.httpx.get") as mock_get:
         mock_get.return_value = fake_response
-        tool.invoke(json.dumps({"url": "https://example.com/page"}), tool_ctx)
+        tool.invoke(json.dumps({"url": "https://example.com/p?q=x&n=2"}), tool_ctx)
 
     url = mock_get.call_args.args[0]
     headers = mock_get.call_args.kwargs["headers"]
-    assert url.endswith("/https://example.com/page")
-    assert headers["X-Return-Format"] == "markdown"
+    # The whole target URL is encoded into a single path segment (no bare '?').
+    assert url.endswith("/https%3A%2F%2Fexample.com%2Fp%3Fq%3Dx%26n%3D2")
+    assert headers["Accept"] == "text/markdown"
     assert "Authorization" not in headers  # keyless
 
 
@@ -193,7 +197,8 @@ def test_jina_empty_content_message(tool_ctx: ToolContext) -> None:
 def test_nimble_backend_via_spec_config(tool_ctx: ToolContext) -> None:
     """With scrape_provider=nimble and api_key, the tool returns extracted content."""
     fake_response = MagicMock()
-    fake_response.json.return_value = {"parsing": {"content": "The page body."}}
+    # Nimble nests the body under ``data`` — markdown for the markdown format.
+    fake_response.json.return_value = {"data": {"markdown": "The page body."}}
 
     tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "nimble-key"})
     with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
@@ -201,6 +206,38 @@ def test_nimble_backend_via_spec_config(tool_ctx: ToolContext) -> None:
         result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
 
     assert "The page body." in result
+
+
+def test_nimble_reads_parsing_content(tool_ctx: ToolContext) -> None:
+    """A parsed extract under ``data.parsing.content`` is read too."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"data": {"parsing": {"content": "Parsed body."}}}
+
+    tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "k"})
+    with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+
+    assert "Parsed body." in result
+
+
+def test_nimble_requests_formats_array_and_main_content(tool_ctx: ToolContext) -> None:
+    """
+    The request body uses Nimble's ``formats`` array and asks for the
+    Readability ``main_content`` markdown backend (not a scalar output_format).
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"data": {"markdown": "body"}}
+
+    tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "k"})
+    with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+
+    body = mock_post.call_args.kwargs["json"]
+    assert body["formats"] == ["markdown"]
+    assert body["markdown_backend"] == "main_content"
+    assert "output_format" not in body
 
 
 def test_nimble_missing_key_returns_error(tool_ctx: ToolContext) -> None:
@@ -213,7 +250,7 @@ def test_nimble_missing_key_returns_error(tool_ctx: ToolContext) -> None:
 def test_nimble_spec_config_used_in_http_call(tool_ctx: ToolContext) -> None:
     """api_key is a Bearer header; the body carries url / driver / render."""
     fake_response = MagicMock()
-    fake_response.json.return_value = {"content": "body"}
+    fake_response.json.return_value = {"data": {"markdown": "body"}}
 
     tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "spec-nimble"})
     with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
@@ -232,7 +269,7 @@ def test_nimble_spec_config_used_in_http_call(tool_ctx: ToolContext) -> None:
 def test_nimble_sends_x_client_source_header(tool_ctx: ToolContext) -> None:
     """Every request carries the ``X-Client-Source`` header identifying Omnigent."""
     fake_response = MagicMock()
-    fake_response.json.return_value = {"content": "body"}
+    fake_response.json.return_value = {"data": {"markdown": "body"}}
 
     tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "spec-nimble"})
     with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
@@ -257,6 +294,7 @@ def test_nimble_vx6_disables_render(tool_ctx: ToolContext) -> None:
     fake_response = MagicMock()
     fake_response.json.return_value = {"content": "body"}
 
+    fake_response.json.return_value = {"data": {"markdown": "body"}}
     tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "k", "driver": "vx6"})
     with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
         mock_post.return_value = fake_response
@@ -265,6 +303,8 @@ def test_nimble_vx6_disables_render(tool_ctx: ToolContext) -> None:
     body = mock_post.call_args.kwargs["json"]
     assert body["driver"] == "vx6"
     assert body["render"] is False
+    # vx6 is plain HTTP — no markdown_backend needed, but still markdown format.
+    assert body["formats"] == ["markdown"]
 
 
 def test_nimble_http_error_returns_error_string(tool_ctx: ToolContext) -> None:
@@ -284,7 +324,7 @@ def test_nimble_http_error_returns_error_string(tool_ctx: ToolContext) -> None:
 def test_nimble_detects_block_page(tool_ctx: ToolContext) -> None:
     """A short body that is only a captcha/denied marker is reported as blocked."""
     fake_response = MagicMock()
-    fake_response.json.return_value = {"content": "Access denied. Are you a robot?"}
+    fake_response.json.return_value = {"data": {"markdown": "Access denied. Are you a robot?"}}
 
     tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "k"})
     with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
@@ -294,10 +334,27 @@ def test_nimble_detects_block_page(tool_ctx: ToolContext) -> None:
     assert "bot-protected" in result
 
 
+def test_nimble_block_detection_boundary_at_500(tool_ctx: ToolContext) -> None:
+    """A body >= 500 chars is NOT block-flagged even if it mentions a marker."""
+    # A legitimate article that merely discusses captchas, padded past 500 chars.
+    body = "This article explains how captcha systems work. " + ("detail " * 80)
+    assert len(body) >= 500
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"data": {"markdown": body}}
+
+    tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "k"})
+    with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+
+    assert "bot-protected" not in result
+    assert "captcha systems work" in result
+
+
 def test_nimble_empty_content_suggests_stronger_driver(tool_ctx: ToolContext) -> None:
     """Empty extracted content suggests trying a stronger driver."""
     fake_response = MagicMock()
-    fake_response.json.return_value = {"parsing": {}, "content": ""}
+    fake_response.json.return_value = {"data": {"markdown": ""}}
 
     tool = WebScrapeTool(config={"scrape_provider": "nimble", "api_key": "k"})
     with patch("omnigent.tools.builtins.web_scrape_nimble.httpx.post") as mock_post:
@@ -359,6 +416,30 @@ def test_firecrawl_rejects_unsupported_proxy(tool_ctx: ToolContext) -> None:
     assert mock_post.call_count == 0, "Must not call the API for an invalid proxy."
 
 
+def test_firecrawl_accepts_enhanced_proxy(tool_ctx: ToolContext) -> None:
+    """``enhanced`` is a valid proxy tier (the residential/harder-target one)."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"success": True, "data": {"markdown": "body"}}
+    tool = WebScrapeTool(
+        config={"scrape_provider": "firecrawl", "api_key": "k", "proxy": "enhanced"}
+    )
+    with patch("omnigent.tools.builtins.web_scrape_firecrawl.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert mock_post.call_args.kwargs["json"]["proxy"] == "enhanced"
+
+
+def test_firecrawl_missing_success_treated_as_failure(tool_ctx: ToolContext) -> None:
+    """A response with no ``success`` field is treated as a failure, not content."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"data": {"markdown": "leaked"}}  # no "success"
+    tool = WebScrapeTool(config={"scrape_provider": "firecrawl", "api_key": "k"})
+    with patch("omnigent.tools.builtins.web_scrape_firecrawl.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert "was not scraped successfully" in result
+
+
 def test_firecrawl_http_error_returns_error_string(tool_ctx: ToolContext) -> None:
     """An HTTP error (e.g. 402 quota) is returned as a string, never raised."""
     fake_response = MagicMock()
@@ -382,3 +463,74 @@ def test_firecrawl_empty_content_message(tool_ctx: ToolContext) -> None:
         mock_post.return_value = fake_response
         result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
     assert "no content extracted" in result
+
+
+# ── Finalize: source header + central truncation ─────
+
+
+def test_success_prepends_source_header(tool_ctx: ToolContext) -> None:
+    """A successful scrape is prefixed with a ``Source: <url>`` line for grounding."""
+    fake_response = MagicMock()
+    fake_response.text = "The article body."
+    tool = WebScrapeTool(config={"scrape_provider": "jina"})
+    with patch("omnigent.tools.builtins.web_scrape_jina.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com/a"}), tool_ctx)
+    assert result.startswith("Source: https://example.com/a\n\n")
+    assert result.endswith("The article body.")
+
+
+def test_error_returns_have_no_source_header(tool_ctx: ToolContext) -> None:
+    """Error/notice returns are passed through verbatim (no Source header)."""
+    fake_response = MagicMock()
+    fake_response.text = "   "  # empty → no-content notice
+    tool = WebScrapeTool(config={"scrape_provider": "jina"})
+    with patch("omnigent.tools.builtins.web_scrape_jina.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert not result.startswith("Source:")
+    assert result.startswith("web_scrape:")
+
+
+def test_content_truncated_centrally(tool_ctx: ToolContext) -> None:
+    """Content beyond the cap is truncated once, centrally, with a marker."""
+    huge = "x" * 60_000
+    fake_response = MagicMock()
+    fake_response.text = huge
+    tool = WebScrapeTool(config={"scrape_provider": "jina"})
+    with patch("omnigent.tools.builtins.web_scrape_jina.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert result.endswith("[content truncated]")
+    assert "x" * 50_000 in result
+    assert len(result) < 60_000  # actually shortened
+
+
+def test_unicode_content_preserved(tool_ctx: ToolContext) -> None:
+    """Multibyte unicode (CJK, emoji, RTL) survives intact."""
+    body = "# 你好\n\nHello 🌍 مرحبا"
+    fake_response = MagicMock()
+    fake_response.text = body
+    tool = WebScrapeTool(config={"scrape_provider": "jina"})
+    with patch("omnigent.tools.builtins.web_scrape_jina.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert "你好" in result and "🌍" in result and "مرحبا" in result
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("refused"),
+        httpx.ReadTimeout("slow"),
+        httpx.TooManyRedirects("loop"),
+        httpx.RemoteProtocolError("bad frame"),
+    ],
+)
+def test_jina_request_errors_never_raise(tool_ctx: ToolContext, exc: Exception) -> None:
+    """Every httpx.RequestError subclass is caught and returned as a string."""
+    tool = WebScrapeTool(config={"scrape_provider": "jina"})
+    with patch("omnigent.tools.builtins.web_scrape_jina.httpx.get") as mock_get:
+        mock_get.side_effect = exc
+        result = tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+    assert result.startswith("Jina scrape error:")

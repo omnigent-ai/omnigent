@@ -1,14 +1,15 @@
-"""Built-in tool: unified web scrape (bot-resistant single-URL fetch).
+"""Built-in tool: unified web scrape (single-URL page reader).
 
-Fetches the full content of one URL as clean text/markdown through a managed
-scraping backend that renders JavaScript and evades anti-bot protection — so an
-agent can read pages that a plain HTTP fetch (``web_fetch``) gets a 403 or an
-empty JS skeleton from. Complements ``web_search`` (which returns result links,
-not page content).
+Fetches the content of one URL as clean text/markdown through a managed
+scraping backend that renders JavaScript and (on the keyed backends) handles
+bot protection — so an agent can read pages that a plain HTTP fetch
+(``web_fetch``) gets a 403 or an empty JS skeleton from. Complements
+``web_search`` (which returns result links, not page content).
 
 The ``scrape_provider`` key in the spec selects the backend from the
-``_BACKENDS`` registry; there is no default and no env var fallback, so the spec
-is self-contained and the engine used is explicit.
+``_BACKENDS`` registry; there is no default and no ``api_key`` env-var fallback,
+so the spec is self-contained and the engine used is explicit. (A backend may
+read an ``OMNIGENT_*_BASE_URL`` override, used only to point tests at a mock.)
 
 Usage in config.yaml::
 
@@ -18,11 +19,22 @@ Usage in config.yaml::
           scrape_provider: nimble      # or firecrawl / jina
           api_key: ${NIMBLE_API_KEY}   # keyed backends need it; jina is keyless
           # driver: vx8                # nimble only (vx6/vx8/vx10)
+          # output_format: markdown    # nimble only (markdown/html)
+          # proxy: auto                # firecrawl only (basic/enhanced/auto)
+
+Responsible use:
+    This tool performs a single, user-initiated fetch of one URL — it is not a
+    crawler. It is intended for public, non-authenticated pages, and it does not
+    bypass logins or paywalls: it reads a page as an unauthenticated visitor
+    would. Fetching is delegated to the configured provider, which honors the
+    site's ``robots.txt``. You remain responsible for using it in line with the
+    target site's Terms of Service and applicable law (e.g. not scraping
+    personal data without a lawful basis). This is general guidance, not legal
+    advice.
 """
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -30,7 +42,10 @@ from typing import Any
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
-_logger = logging.getLogger(__name__)
+# Cap returned content so one large page cannot dominate the model context.
+# Applied centrally here so every backend truncates identically; the runtime
+# also enforces a much larger global tool-output cap as a backstop.
+_MAX_CONTENT_CHARS = 50_000
 
 
 @dataclass(frozen=True)
@@ -80,12 +95,15 @@ class WebScrapeTool(Tool):
         :returns: Human-readable description of the tool.
         """
         return (
-            "Fetch the full content of a single web page as clean "
-            "markdown, getting past bot protection and JavaScript "
-            "rendering that block a plain fetch. Use for reading a "
-            "specific URL (articles, docs, product pages) — especially "
-            "when a normal fetch returns a 403 or an empty page. For "
-            "finding URLs, use web_search first."
+            "Fetch one web page's content as clean markdown, rendering "
+            "JavaScript and (on the keyed backends) getting past bot "
+            "protection that blocks a plain fetch. Use for reading a specific "
+            "URL you already have — articles, docs, product pages — especially "
+            "when a plain fetch returns a 403 or an empty page. This is a "
+            "single-page read, not a crawler, and it calls a rate-limited or "
+            "paid backend, so use it deliberately. To find URLs, use "
+            "web_search first; for a quick unprotected fetch, web_fetch may "
+            "suffice."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -102,10 +120,14 @@ class WebScrapeTool(Tool):
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "The URL to scrape (http or https).",
+                            "description": (
+                                "A single http/https URL to fetch and read "
+                                "(one page — not a site to crawl)."
+                            ),
                         },
                     },
                     "required": ["url"],
+                    "additionalProperties": False,
                 },
             },
         }
@@ -159,12 +181,46 @@ def _scrape(url: str, config: dict[str, str]) -> str:
     backend = config.get("scrape_provider")
 
     engine = _BACKENDS.get(backend) if backend else None
-    if engine is not None:
-        return engine.run(url, config)
+    if engine is None:
+        if backend:
+            return f"web_scrape error: unknown scrape_provider {backend!r}. {_backend_hint()}"
+        return f"web_scrape error: no scrape_provider configured. {_backend_hint()}"
 
-    if backend:
-        return f"web_scrape error: unknown scrape_provider {backend!r}. {_backend_hint()}"
-    return f"web_scrape error: no scrape_provider configured. {_backend_hint()}"
+    result = engine.run(url, config)
+    return _finalize(result, url)
+
+
+def _finalize(result: str, url: str) -> str:
+    """
+    Add a source header and cap length for a successful scrape.
+
+    Backends signal failure with a message rather than raising; those are
+    returned untouched (no header, no truncation) so the model sees the raw
+    diagnostic. A real page body gets a one-line ``Source:`` header — so the
+    model can ground and cite the content — and is capped at
+    :data:`_MAX_CONTENT_CHARS`.
+
+    :param result: The backend's return value (page content or an error/notice).
+    :param url: The scraped URL, used in the source header.
+    :returns: The finalized tool output.
+    """
+    if _is_backend_error(result):
+        return result
+    if len(result) > _MAX_CONTENT_CHARS:
+        result = result[:_MAX_CONTENT_CHARS] + "\n\n[content truncated]"
+    return f"Source: {url}\n\n{result}"
+
+
+def _is_backend_error(result: str) -> bool:
+    """
+    :returns: True if ``result`` is a backend error/notice rather than content.
+
+    Backends prefix diagnostics with ``Error:``, ``web_scrape ...``, or
+    ``<Provider> scrape error:``; content never starts this way.
+    """
+    return result.startswith(("Error:", "web_scrape:", "web_scrape error:")) or (
+        " scrape error:" in result[:40]
+    )
 
 
 def _run_nimble(url: str, config: dict[str, str]) -> str:

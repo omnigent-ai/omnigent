@@ -13,26 +13,24 @@ Configured in the agent spec::
           scrape_provider: firecrawl
           api_key: ${FIRECRAWL_API_KEY}
           # optional:
-          # proxy: auto            # basic | stealth | auto (default; escalates on block)
+          # proxy: auto            # basic | enhanced | auto (default; escalates on block)
 
 See https://docs.firecrawl.dev/api-reference/endpoint/scrape
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import Any
 
 import httpx
 
-_logger = logging.getLogger(__name__)
-
 _DEFAULT_BASE_URL = "https://api.firecrawl.dev"
+# Proxy tier, escalating: ``basic`` (datacenter) -> ``enhanced`` (residential /
+# harder targets) -> ``auto`` (start basic, retry enhanced on a block).
 _DEFAULT_PROXY = "auto"
-_VALID_PROXIES = frozenset({"basic", "stealth", "auto"})
+_VALID_PROXIES = frozenset({"basic", "enhanced", "auto"})
 _DEFAULT_TIMEOUT_S = 120.0
-_MAX_CONTENT_CHARS = 50_000
 
 
 def _base_url() -> str:
@@ -77,7 +75,8 @@ def _scrape_firecrawl(url: str, config: dict[str, str]) -> str:
                 "and plan in the web_scrape config)."
             )
         return f"Firecrawl scrape error: HTTP {code}"
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.RequestError as exc:
+        # Covers connect/timeout/redirect/protocol/decoding errors uniformly.
         return f"Firecrawl scrape error: {exc}"
 
     try:
@@ -92,18 +91,18 @@ def _format_scrape(payload: dict[str, Any], url: str) -> str:
     Pull the markdown out of Firecrawl's ``/v2/scrape`` response.
 
     Firecrawl returns ``{"success": bool, "data": {"markdown": str, ...}}``.
+    A response missing ``success`` is treated as a failure — the field is part
+    of the documented contract, so its absence signals a malformed response.
 
     :param payload: The parsed JSON response.
     :param url: The requested URL (for the empty-result message).
-    :returns: The markdown (capped), or an error/empty message.
+    :returns: The markdown, or an error/empty message. Central truncation is
+        applied by the dispatcher, not here.
     """
-    if not isinstance(payload, dict) or not payload.get("success", True):
+    if not isinstance(payload, dict) or not payload.get("success", False):
         return f"Firecrawl scrape error: {url} was not scraped successfully."
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    markdown = data.get("markdown") or ""
+    markdown = data.get("markdown")
     if not isinstance(markdown, str) or not markdown.strip():
         return f"web_scrape: no content extracted from {url} (page may be empty or blocked)."
-    markdown = markdown.strip()
-    if len(markdown) > _MAX_CONTENT_CHARS:
-        markdown = markdown[:_MAX_CONTENT_CHARS] + "\n\n[content truncated]"
-    return markdown
+    return markdown.strip()

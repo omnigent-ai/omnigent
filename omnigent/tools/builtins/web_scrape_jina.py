@@ -20,16 +20,13 @@ See https://jina.ai/reader
 
 from __future__ import annotations
 
-import logging
 import os
+from urllib.parse import quote
 
 import httpx
 
-_logger = logging.getLogger(__name__)
-
 _DEFAULT_BASE_URL = "https://r.jina.ai"
 _DEFAULT_TIMEOUT_S = 90.0
-_MAX_CONTENT_CHARS = 50_000
 
 
 def _base_url() -> str:
@@ -49,22 +46,27 @@ def _scrape_jina(url: str, config: dict[str, str]) -> str:
     :returns: Extracted markdown, or an error message (never raises).
     """
     headers = {
-        # Ask Reader for markdown explicitly (its default) and JS-rendered content.
+        # Ask Reader for markdown (its default) rather than the JSON envelope.
         "Accept": "text/markdown",
-        "X-Return-Format": "markdown",
     }
     api_key = config.get("api_key")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    # Percent-encode the target URL so its own query string / fragment is not
+    # parsed as r.jina.ai's — otherwise "https://r.jina.ai/https://site?q=x"
+    # would attach "?q=x" to the Reader request, not the page being scraped.
+    target = f"{_base_url()}/{quote(url, safe='')}"
+
     try:
         resp = httpx.get(
-            f"{_base_url()}/{url}",
+            target,
             headers=headers,
             timeout=_DEFAULT_TIMEOUT_S,
             follow_redirects=True,
         )
         resp.raise_for_status()
+        content = (resp.text or "").strip()
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         if code == 429:
@@ -73,12 +75,10 @@ def _scrape_jina(url: str, config: dict[str, str]) -> str:
                 "web_scrape config to raise the limit."
             )
         return f"Jina scrape error: HTTP {code}"
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.RequestError as exc:
+        # Covers connect/timeout/redirect/protocol/decoding errors uniformly.
         return f"Jina scrape error: {exc}"
 
-    content = (resp.text or "").strip()
     if not content:
         return f"web_scrape: no content extracted from {url} (page may be empty or blocked)."
-    if len(content) > _MAX_CONTENT_CHARS:
-        content = content[:_MAX_CONTENT_CHARS] + "\n\n[content truncated]"
     return content

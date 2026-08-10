@@ -25,15 +25,12 @@ See https://docs.nimbleway.com/api-reference/web-api/extract
 
 from __future__ import annotations
 
-import logging
 import os
 
 # Any: Nimble's JSON response is a heterogeneous dict with mixed value types.
 from typing import Any
 
 import httpx
-
-_logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://sdk.nimbleway.com"
 
@@ -60,7 +57,7 @@ _MAX_CONTENT_CHARS = 50_000
 
 # Substrings that indicate the target site (not Nimble) blocked the fetch, so
 # the tool can say "blocked" rather than returning a captcha/denied page as if
-# it were content. Mirrors the ferguson Nimble PoC's block-marker set.
+# it were content.
 _BLOCK_MARKERS = (
     "captcha",
     "access denied",
@@ -115,6 +112,19 @@ def _scrape_nimble(url: str, config: dict[str, str]) -> str:
             f"Use one of: {', '.join(sorted(_VALID_OUTPUT_FORMATS))}."
         )
 
+    # ``formats`` is a list in preference order; we request the single chosen
+    # format. For markdown, ``markdown_backend: main_content`` runs Mozilla
+    # Readability first so boilerplate (nav/ads) is stripped before conversion.
+    body: dict[str, Any] = {
+        "url": url,
+        "formats": [output_format],
+        # ``render`` turns on the browser; ``vx8``/``vx10`` add anti-bot.
+        "render": driver != "vx6",
+        "driver": driver,
+    }
+    if output_format == "markdown":
+        body["markdown_backend"] = "main_content"
+
     try:
         resp = httpx.post(
             f"{_base_url()}/v2/extract",
@@ -123,13 +133,7 @@ def _scrape_nimble(url: str, config: dict[str, str]) -> str:
                 "Content-Type": "application/json",
                 "X-Client-Source": _CLIENT_SOURCE,
             },
-            json={
-                "url": url,
-                # ``render`` turns on the browser; ``vx8``/``vx10`` add anti-bot.
-                "render": driver != "vx6",
-                "driver": driver,
-                "output_format": output_format,
-            },
+            json=body,
             timeout=_DEFAULT_TIMEOUT_S,
         )
         resp.raise_for_status()
@@ -141,7 +145,8 @@ def _scrape_nimble(url: str, config: dict[str, str]) -> str:
                 "api_key in the web_scrape config)."
             )
         return f"Nimble scrape error: HTTP {code}"
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.RequestError as exc:
+        # Covers connect/timeout/redirect/protocol/decoding errors uniformly.
         return f"Nimble scrape error: {exc}"
 
     try:
@@ -157,8 +162,9 @@ def _format_scrape(payload: dict[str, Any], url: str, driver: str) -> str:
     """
     Pull the extracted content out of Nimble's ``/v2/extract`` response.
 
-    Nimble nests the page body under ``parsing``/``content`` (or a top-level
-    ``content``/``html_content``) depending on tier; we take the first
+    The page body lives under ``data`` — ``data.markdown`` / ``data.html``, or
+    ``data.parsing.content`` for a parsed extract. We take the first present
+    (not merely truthy) one so a legitimately empty field doesn't mask a later
     non-empty one. A body that is only a block marker (captcha/denied) is
     reported as blocked so the model doesn't treat it as real content.
 
@@ -166,16 +172,18 @@ def _format_scrape(payload: dict[str, Any], url: str, driver: str) -> str:
     :param url: The requested URL (for the blocked-message text).
     :param driver: The driver used (named in the blocked message so the caller
         can retry a stronger tier).
-    :returns: The content (capped), or a blocked/empty message.
+    :returns: The content, or a blocked/empty message. Central truncation is
+        applied by the dispatcher, not here.
     """
-    parsing = payload.get("parsing") if isinstance(payload.get("parsing"), dict) else {}
-    content = (
-        parsing.get("content")
-        or payload.get("content")
-        or payload.get("html_content")
-        or payload.get("markdown")
-        or ""
-    )
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    parsing = data.get("parsing") if isinstance(data.get("parsing"), dict) else {}
+    # First value that is present (not None) — an empty string is a real answer
+    # (empty page), so ``or``-chaining would wrongly skip it for a later field.
+    content: object = ""
+    for candidate in (data.get("markdown"), data.get("html"), parsing.get("content")):
+        if candidate is not None:
+            content = candidate
+            break
     if not isinstance(content, str):
         content = str(content)
     content = content.strip()
@@ -194,6 +202,4 @@ def _format_scrape(payload: dict[str, Any], url: str, driver: str) -> str:
             "(vx10) or a different scrape_provider."
         )
 
-    if len(content) > _MAX_CONTENT_CHARS:
-        content = content[:_MAX_CONTENT_CHARS] + "\n\n[content truncated]"
     return content
