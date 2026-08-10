@@ -10,6 +10,7 @@ import { useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
+  BlocksIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -32,6 +33,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 export type SettingsSectionId =
   | "appearance"
   | "git"
+  | "integrations"
   | "shortcuts"
   | "account"
   | "members"
@@ -44,6 +46,7 @@ export type SettingsSectionId =
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "git",
+  "integrations",
   "shortcuts",
   "account",
   "members",
@@ -81,12 +84,18 @@ export function settingsNavGroups(
   isDesktop: boolean,
   isAdmin = false,
   isSingleUser = false,
+  githubEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
   ];
+  // Integrations (Connect GitHub) appears only when the server has a
+  // GitHub App configured. Slots right after Git — it's git-adjacent.
+  if (githubEnabled) {
+    general.splice(2, 0, { id: "integrations", label: "Integrations", icon: BlocksIcon });
+  }
   if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
     // on a deploy with sign-in.
@@ -201,12 +210,14 @@ export function SettingsSidebarBody({
   // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
+  const githubEnabled = info !== "loading" && info.github_app_enabled;
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,
     isElectronShell(),
     isAdmin,
     isSingleUserMode(info),
+    githubEnabled,
   );
 
   return (
