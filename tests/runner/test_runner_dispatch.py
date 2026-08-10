@@ -2518,6 +2518,73 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert session_inbox.empty()
 
 
+@pytest.mark.asyncio
+async def test_sys_read_inbox_surfaces_undelivered_terminal_subagent_work() -> None:
+    """
+    ``sys_read_inbox`` surfaces sub-agents that finished but never delivered (SIL-925).
+
+    A work entry can never reach ``delivered=True`` when the runner has no
+    parent inbox for it (``missing_parent_inbox`` —
+    omnigent-ai/omnigent#3274) and the forwarder's bounded retries have
+    since exhausted. The queue-based drain below has nothing to show, but
+    the caller must not conclude nothing happened: this is the structural
+    fallback signal (an empty queue does not mean an empty inbox) — a
+    stranded child is reported explicitly instead of only being
+    discoverable via a direct ``sys_session_get_info`` poll.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_parent_sil925"
+    child_id = "conv_child_sil925"
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="stranded",
+    )
+    try:
+        ack = runner_app.mark_subagent_work_terminal(
+            child_id,
+            status="completed",
+            output="DONE_BUT_UNDELIVERED",
+        )
+        assert ack.reason == "missing_parent_inbox"
+        assert ack.delivered is False
+
+        inbox_output = await execute_tool(
+            tool_name="sys_read_inbox",
+            arguments="{}",
+            conversation_id=parent_id,
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert "sub-agent(s) finished but their completion could not be delivered" in inbox_output
+    assert "worker" in inbox_output
+    assert child_id in inbox_output
+    assert "sys_session_get_info" in inbox_output
+
+
+@pytest.mark.asyncio
+async def test_sys_read_inbox_stays_empty_without_undelivered_subagent_work() -> None:
+    """
+    ``sys_read_inbox`` reports empty when nothing is stranded (SIL-925).
+
+    Guards the additive change from firing for every ``conversation_id`` —
+    only a session with a genuinely undelivered terminal child gets the
+    structural notice.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    inbox_output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        conversation_id="conv_parent_with_nothing_pending",
+    )
+    assert inbox_output == "Inbox is empty — no completed tasks."
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_error"),
     [
