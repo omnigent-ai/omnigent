@@ -1418,6 +1418,12 @@ def _build_pi_spawn_env(
         env["HARNESS_PI_CWD"] = str(cwd)
     if workdir is not None:
         env["HARNESS_PI_BUNDLE_DIR"] = str(workdir)
+    smart_compaction = spec.executor.config.get("smart_compaction")
+    if isinstance(smart_compaction, dict):
+        env["HARNESS_PI_SMART_COMPACTION"] = json.dumps(
+            smart_compaction,
+            sort_keys=True,
+        )
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_PI_OS_ENV"] = os_env_payload

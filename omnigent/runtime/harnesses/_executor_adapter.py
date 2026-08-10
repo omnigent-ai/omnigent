@@ -1579,6 +1579,8 @@ class ExecutorAdapter(HarnessApp):
                     summary=event.summary,
                     summary_model=event.model,
                     compacted_messages=event.compacted_messages,
+                    handover=event.handover,
+                    handover_loaded=event.handover_loaded,
                 )
             )
         # ExecutorError handled by the caller (re-raises so the

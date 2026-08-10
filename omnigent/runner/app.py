@@ -148,8 +148,10 @@ from omnigent.runtime.prompt import (
 )
 from omnigent.runtime.session_checkpoint import (
     SessionCheckpoint,
+    SessionHandover,
     build_checkpoint,
     checkpoint_instruction,
+    handover_instruction,
     latest_user_directive,
     prune_covered_history,
 )
@@ -174,7 +176,7 @@ _logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class _CheckpointToolCall:
-    operation: Literal["load", "save"]
+    operation: Literal["load", "save", "handover_load", "handover_save"]
     outcome: str
     latency_ms: float
     checkpoint: SessionCheckpoint | None
@@ -2074,6 +2076,8 @@ def create_runner_app(
     _checkpoint_enabled_sessions: set[str] = set()
     _checkpoint_turn_status: dict[str, Literal["idle", "failed", "cancelled"]] = {}
     _checkpoint_trace_states: dict[str, _CheckpointTraceState] = {}
+    _session_checkpoints: dict[str, SessionCheckpoint] = {}
+    _session_handovers: dict[str, SessionHandover] = {}
     app.state.checkpoint_turn_status = _checkpoint_turn_status
 
     def _checkpoint_epoch(session_id: str) -> int:
@@ -2088,12 +2092,14 @@ def create_runner_app(
         if parent_traceparent is None:
             return
         checkpoint = call.checkpoint
+        is_handover = call.operation.startswith("handover_")
+        operation = call.operation.removeprefix("handover_")
         telemetry.record_completed_tool_call(
-            f"session_checkpoint.{call.operation}",
+            f"{'session_handover' if is_handover else 'session_checkpoint'}.{operation}",
             parent_traceparent=parent_traceparent,
             attributes={
                 "session.id": session_id,
-                "checkpoint.operation": call.operation,
+                "checkpoint.operation": operation,
                 "checkpoint.outcome": call.outcome,
                 "checkpoint.latency_ms": call.latency_ms,
                 "checkpoint.status": checkpoint.status if checkpoint is not None else "absent",
@@ -2101,6 +2107,8 @@ def create_runner_app(
                 "checkpoint.covered_item_count": (
                     len(checkpoint.covered_items) if checkpoint is not None else 0
                 ),
+                "handover.present": bool(checkpoint and checkpoint.handover),
+                "handover.count": checkpoint.handover_count if checkpoint is not None else 0,
             },
             input_value=call.input_value,
             output_value=call.output_value,
@@ -2279,6 +2287,8 @@ def create_runner_app(
         turn_epoch = _begin_checkpoint_trace(session_id)
         checkpoint = await _read_session_checkpoint(session_id, turn_epoch)
         if checkpoint is None:
+            _session_checkpoints.pop(session_id, None)
+            _session_handovers.pop(session_id, None)
             return None, history
         checkpoint = checkpoint.model_copy(
             update={
@@ -2287,6 +2297,26 @@ def create_runner_app(
                 "updated_at": datetime.now(UTC).isoformat(),
             }
         )
+        _session_checkpoints[session_id] = checkpoint
+        if checkpoint.handover is not None:
+            _session_handovers[session_id] = checkpoint.handover
+            _record_checkpoint_tool_call(
+                session_id,
+                turn_epoch,
+                _CheckpointToolCall(
+                    operation="handover_load",
+                    outcome="success",
+                    latency_ms=0.0,
+                    checkpoint=checkpoint,
+                    input_value={"session_id": session_id},
+                    output_value={
+                        "session_id": session_id,
+                        "handover": checkpoint.handover.model_dump(mode="json"),
+                    },
+                ),
+            )
+        else:
+            _session_handovers.pop(session_id, None)
         await _write_session_checkpoint(checkpoint, turn_epoch)
         return checkpoint, cast(list[_JsonObject], prune_covered_history(checkpoint, history))
 
@@ -2308,11 +2338,23 @@ def create_runner_app(
         if status is None:
             return
         try:
+            active_checkpoint = _session_checkpoints.get(session_id)
+            handover = _session_handovers.get(session_id)
             checkpoint = build_checkpoint(
                 session_id=session_id,
                 history=_session_histories.get(session_id, []),
                 status=status,
+                handover=handover,
+                handover_count=(
+                    active_checkpoint.handover_count
+                    if active_checkpoint is not None
+                    else int(handover is not None)
+                ),
             )
+            if checkpoint.status == "complete":
+                checkpoint = checkpoint.model_copy(update={"handover": None})
+                _session_handovers.pop(session_id, None)
+            _session_checkpoints[session_id] = checkpoint
             await _write_session_checkpoint(checkpoint, resolved_epoch)
         except (TypeError, ValueError):
             _logger.warning(
@@ -3633,6 +3675,8 @@ def create_runner_app(
         _session_histories.pop(session_id, None)
         _checkpoint_enabled_sessions.discard(session_id)
         _checkpoint_turn_status.pop(session_id, None)
+        _session_checkpoints.pop(session_id, None)
+        _session_handovers.pop(session_id, None)
         _author_attribution_sessions.discard(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -3900,6 +3944,17 @@ def create_runner_app(
         token_count = cast(int, event.get("total_tokens") or 0)
         model = cast(str | None, event.get("summary_model"))
         last_item_id = _last_server_item_id.get(conv)
+        handover: SessionHandover | None = None
+        raw_handover = event.get("handover")
+        if isinstance(raw_handover, Mapping):
+            try:
+                handover = SessionHandover.model_validate(raw_handover)
+            except (TypeError, ValueError):
+                _logger.warning(
+                    "Ignoring invalid harness handover for %s",
+                    conv,
+                    exc_info=True,
+                )
 
         if not last_item_id:
             _logger.warning(
@@ -3907,33 +3962,34 @@ def create_runner_app(
                 "server-side last_item_id available",
                 conv,
             )
-            return
-
+            if handover is None:
+                return
         compacted_messages = cast(list[_JsonObject] | None, event.get("compacted_messages"))
-        compaction_event: _JsonObject = {
-            "type": "compaction",
-            "summary": summary,
-            "last_item_id": last_item_id,
-            "model": model,
-            "token_count": token_count,
-        }
-        if compacted_messages:
-            compaction_event["compacted_messages"] = compacted_messages
-        try:
-            await server_client.post(
-                f"/v1/sessions/{conv}/events",
-                json={
-                    "type": "compaction",
-                    "data": compaction_event,
-                },
-                timeout=10.0,
-            )
-        except (httpx.HTTPError, RuntimeError):
-            _logger.warning(
-                "Failed to persist harness compaction item for %s",
-                conv,
-                exc_info=True,
-            )
+        if last_item_id:
+            compaction_event: _JsonObject = {
+                "type": "compaction",
+                "summary": summary,
+                "last_item_id": last_item_id,
+                "model": model,
+                "token_count": token_count,
+            }
+            if compacted_messages:
+                compaction_event["compacted_messages"] = compacted_messages
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "compaction",
+                        "data": compaction_event,
+                    },
+                    timeout=10.0,
+                )
+            except (httpx.HTTPError, RuntimeError):
+                _logger.warning(
+                    "Failed to persist harness compaction item for %s",
+                    conv,
+                    exc_info=True,
+                )
 
         if compacted_messages:
             _session_histories[conv] = compacted_messages
@@ -3964,6 +4020,51 @@ def create_runner_app(
                     ],
                 },
             ]
+
+        if handover is None:
+            return
+
+        _session_handovers[conv] = handover
+        prior_checkpoint = _session_checkpoints.get(conv)
+        checkpoint = build_checkpoint(
+            session_id=conv,
+            history=_session_histories.get(conv, []),
+            status="active",
+            handover=handover,
+            handover_count=(prior_checkpoint.handover_count if prior_checkpoint else 0) + 1,
+        )
+        _session_checkpoints[conv] = checkpoint
+        state = _checkpoint_trace_states.get(conv)
+        turn_epoch = state.turn_epoch if state is not None else _checkpoint_epoch(conv)
+        await _write_session_checkpoint(checkpoint, turn_epoch)
+        handover_payload = handover.model_dump(mode="json")
+        _record_checkpoint_tool_call(
+            conv,
+            turn_epoch,
+            _CheckpointToolCall(
+                operation="handover_save",
+                outcome="success",
+                latency_ms=0.0,
+                checkpoint=checkpoint,
+                input_value={"session_id": conv, "handover": handover_payload},
+                output_value={"session_id": conv, "saved": True},
+            ),
+        )
+        if event.get("handover_loaded") is True:
+            _record_checkpoint_tool_call(
+                conv,
+                turn_epoch,
+                _CheckpointToolCall(
+                    operation="handover_load",
+                    outcome="success",
+                    latency_ms=0.0,
+                    checkpoint=checkpoint,
+                    input_value={"session_id": conv},
+                    output_value={"session_id": conv, "handover": handover_payload},
+                ),
+            )
+
+    app.state.handle_harness_compaction = _handle_harness_compaction
 
     _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
     _CANCELLATION_MARKER_TEXT = (
@@ -5881,6 +5982,11 @@ def create_runner_app(
                     and conv in _author_attribution_sessions
                     else None,
                     checkpoint_instruction(checkpoint) if checkpoint is not None else None,
+                    (
+                        handover_instruction(checkpoint.handover)
+                        if checkpoint is not None and checkpoint.handover is not None
+                        else None
+                    ),
                 )
                 if instruction is not None
             )
@@ -6868,7 +6974,18 @@ def create_runner_app(
                         message_body["content"] = checkpoint_history
                         message_body["instructions"] = append_framework_instructions(
                             cast(str | None, message_body.get("instructions")),
-                            (checkpoint_instruction(checkpoint),),
+                            tuple(
+                                instruction
+                                for instruction in (
+                                    checkpoint_instruction(checkpoint),
+                                    (
+                                        handover_instruction(checkpoint.handover)
+                                        if checkpoint.handover is not None
+                                        else None
+                                    ),
+                                )
+                                if instruction is not None
+                            ),
                         )
                     response = await _stream_message_to_harness(message_body, conversation_id)
                     if isinstance(response, StreamingResponse):

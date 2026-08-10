@@ -3894,6 +3894,8 @@ class CompactionCompletedEvent(_SSEEventBase):
     summary: str | None = None
     summary_model: str | None = None
     compacted_messages: list[dict[str, Any]] | None = None
+    handover: dict[str, Any] | None = None
+    handover_loaded: bool = False
 
 
 class CompactionFailedEvent(_SSEEventBase):

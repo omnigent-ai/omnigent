@@ -63,6 +63,8 @@ Env vars read at startup:
   bundled-skill directory.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
   future use; currently unused by Pi.
+- ``HARNESS_PI_SMART_COMPACTION``: JSON-encoded structured handover
+  settings from ``executor.config.smart_compaction``.
 """
 
 from __future__ import annotations
@@ -77,7 +79,7 @@ from fastapi import FastAPI
 from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
-from omnigent.inner.pi_executor import PiExecutor
+from omnigent.inner.pi_executor import PiExecutor, SmartCompactionConfig
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ _ENV_OS_ENV = "HARNESS_PI_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_PI_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_PI_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
+_ENV_SMART_COMPACTION = "HARNESS_PI_SMART_COMPACTION"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
 _ENV_GATEWAY_BASE_URLS = "HARNESS_PI_GATEWAY_BASE_URLS"
 _ENV_GATEWAY_OPENAI_WIRE_API = "HARNESS_PI_GATEWAY_OPENAI_WIRE_API"
@@ -234,6 +237,7 @@ def _build_pi_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        smart_compaction=_resolve_smart_compaction(),
     )
 
 
@@ -270,6 +274,39 @@ def _resolve_skills_filter() -> str | list[str]:
         decoded,
     )
     return "all"
+
+
+def _resolve_smart_compaction() -> SmartCompactionConfig:
+    """Decode the optional structured handover configuration."""
+    raw = os.environ.get(_ENV_SMART_COMPACTION, "").strip()
+    if not raw:
+        return SmartCompactionConfig()
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise TypeError("value must be an object")
+        enabled = payload.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a boolean")
+        instructions = payload.get("instructions", "")
+        if not isinstance(instructions, str):
+            raise TypeError("instructions must be a string")
+        return SmartCompactionConfig(
+            enabled=enabled,
+            trigger_tokens=int(payload.get("trigger_tokens", 0)),
+            handover_max_tokens=int(payload.get("handover_max_tokens", 4096)),
+            source_max_chars=int(payload.get("source_max_chars", 320_000)),
+            timeout_seconds=float(payload.get("timeout_seconds", 300.0)),
+            poll_interval_seconds=float(payload.get("poll_interval_seconds", 15.0)),
+            instructions=instructions,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        _logger.warning(
+            "Ignoring invalid %s value: %s",
+            _ENV_SMART_COMPACTION,
+            exc,
+        )
+        return SmartCompactionConfig()
 
 
 def create_app() -> FastAPI:

@@ -8,7 +8,7 @@ import pytest
 
 from omnigent.runner import create_runner_app
 from omnigent.runtime import telemetry
-from omnigent.runtime.session_checkpoint import build_checkpoint
+from omnigent.runtime.session_checkpoint import SessionHandover, build_checkpoint
 
 
 class _Response:
@@ -162,3 +162,128 @@ async def test_runner_records_checkpoint_load_and_save_as_agent_tool_leaves(
     ]
     assert recorded[-1]["attributes"]["checkpoint.status"] in {"idle", "complete"}
     app.state.session_histories.pop(session_id, None)
+
+
+async def test_runner_records_handover_load_as_agent_tool_leaf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    session_id = "conv_handover_trace"
+    handover = SessionHandover(
+        original_directive="Continue the task.",
+        objective="Finish the runtime change.",
+        phase="validate",
+        remaining_work=["Run tests."],
+        next_action="Run tests.",
+        context_tokens=56000,
+        created_at="2026-08-10T12:00:00+00:00",
+    )
+    stored = build_checkpoint(
+        session_id=session_id,
+        history=_prior_history(),
+        status="active",
+        handover=handover,
+        handover_count=1,
+    )
+    server = _CheckpointServer(stored.model_dump(mode="json"))
+    recorded: list[dict[str, Any]] = []
+
+    def _record(tool_name: str, **kwargs: Any) -> None:
+        recorded.append({"tool_name": tool_name, **kwargs})
+
+    monkeypatch.setattr(telemetry, "record_completed_tool_call", _record)
+    app = create_runner_app(server_client=cast(Any, server))
+
+    checkpoint, _ = await app.state.checkpoint_for_turn(
+        session_id,
+        "pi",
+        _prior_history(),
+    )
+
+    assert checkpoint is not None
+    parent = "00-" + "3" * 32 + "-" + "4" * 16 + "-01"
+    app.state.bind_checkpoint_traceparent(session_id, parent)
+
+    assert [call["tool_name"] for call in recorded] == [
+        "session_checkpoint.load",
+        "session_handover.load",
+        "session_checkpoint.save",
+    ]
+    assert recorded[1]["attributes"]["handover.present"] is True
+
+
+async def test_runner_records_handover_save_and_immediate_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    session_id = "conv_handover_rollover"
+    server = _CheckpointServer(None)
+    recorded: list[dict[str, Any]] = []
+
+    def _record(tool_name: str, **kwargs: Any) -> None:
+        recorded.append({"tool_name": tool_name, **kwargs})
+
+    monkeypatch.setattr(telemetry, "record_completed_tool_call", _record)
+    app = create_runner_app(server_client=cast(Any, server))
+    history = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue the task."}],
+        }
+    ]
+    await app.state.checkpoint_for_turn(session_id, "pi", history)
+    parent = "00-" + "5" * 32 + "-" + "6" * 16 + "-01"
+    app.state.bind_checkpoint_traceparent(session_id, parent)
+
+    handover = SessionHandover(
+        original_directive="Continue the task.",
+        objective="Finish the runtime change.",
+        phase="validate",
+        remaining_work=["Run tests."],
+        next_action="Run tests.",
+        context_tokens=56000,
+        created_at="2026-08-10T12:00:00+00:00",
+    )
+    await app.state.handle_harness_compaction(
+        session_id,
+        {
+            "summary": "Structured handover",
+            "total_tokens": 900,
+            "handover": handover.model_dump(mode="json"),
+            "handover_loaded": True,
+            "compacted_messages": history,
+        },
+    )
+
+    assert [call["tool_name"] for call in recorded] == [
+        "session_checkpoint.load",
+        "session_checkpoint.save",
+        "session_handover.save",
+        "session_handover.load",
+    ]
+    assert server.writes[-1]["checkpoint"]["handover"]["next_action"] == "Run tests."
+
+
+async def test_generic_compaction_without_anchor_keeps_runner_history() -> None:
+    session_id = "conv_generic_compaction"
+    server = _CheckpointServer(None)
+    app = create_runner_app(server_client=cast(Any, server))
+    history = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Keep this history."}],
+        }
+    ]
+    app.state.session_histories[session_id] = history
+
+    await app.state.handle_harness_compaction(
+        session_id,
+        {
+            "summary": "Generic summary",
+            "total_tokens": 100,
+        },
+    )
+
+    assert app.state.session_histories[session_id] == history

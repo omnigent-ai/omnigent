@@ -40,6 +40,7 @@ absent (skip) or be a build that honors ``OPENAI_BASE_URL``.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import uuid
 from pathlib import Path
@@ -156,3 +157,104 @@ def test_per_harness_pi_one_shot(
         f"Pi assistant text shorter than {_MIN_ASSISTANT_CHARS} "
         f"chars; got {observed['assistant_text']!r}"
     )
+
+
+def test_per_harness_pi_continues_after_structured_handover(
+    omnigent_repo_root: Path,
+    omnigent_python: Path,
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """A tool-driven Pi turn crosses the configured threshold and continues."""
+    model = f"mock-harness-pi-handover-{uuid.uuid4().hex[:8]}"
+    draft = {
+        "original_directive": "model copy",
+        "objective": "Read the file and finish the response.",
+        "phase": "answer",
+        "completed_outcomes": ["Read README.md."],
+        "verified_facts": ["README.md exists."],
+        "validations": [],
+        "failed_approaches": [],
+        "decisions": [],
+        "remaining_work": ["Return the completion marker."],
+        "next_action": "Return HANDOVER_CONTINUED.",
+        "theories": [],
+        "do_not_repeat": ["Do not read README.md again."],
+        "blockers": [],
+        "user_questions": [],
+        "active_waits": [],
+        "evidence_refs": ["README.md"],
+        "loaded_skills": [],
+    }
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_readme",
+                        "name": "sys_os_read",
+                        "arguments": json.dumps({"path": "README.md"}),
+                    }
+                ]
+            },
+            {"text": json.dumps(draft)},
+            {"text": "HANDOVER_CONTINUED"},
+        ],
+        key=model,
+    )
+
+    yaml_path = tmp_path / "pi-handover.yaml"
+    yaml_path.write_text(
+        f"""
+spec_version: 1
+name: pi_handover
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    smart_compaction:
+      enabled: true
+      trigger_tokens: 1
+      handover_max_tokens: 2048
+      source_max_chars: 65536
+      timeout_seconds: 60
+      poll_interval_seconds: 1
+  model: {model}
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+prompt: Read README.md, then report completion.
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(omnigent_python),
+            "-m",
+            "omnigent",
+            "run",
+            str(yaml_path),
+            "--model",
+            model,
+            "--harness",
+            _HARNESS,
+            "-p",
+            "Read README.md and finish the task.",
+            "--no-log",
+            "--no-session",
+        ],
+        env=mock_credentials_env,
+        cwd=str(omnigent_repo_root),
+        capture_output=True,
+        text=True,
+        timeout=_RUN_TIMEOUT_SEC,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "HANDOVER_CONTINUED" in result.stdout

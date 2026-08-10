@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -18,6 +19,7 @@ import pytest
 
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
+    CompactionComplete,
     ExecutorConfig,
     ExecutorError,
     LLMCallComplete,
@@ -31,9 +33,12 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.pi_executor import (
     PiExecutor,
+    SmartCompactionConfig,
     _build_models_json,
     _databricks_model_wire_catalog,
     _generate_extension_js,
+    _generate_handover_extension_js,
+    _handover_from_compaction,
     _pi_provider_for_model,
     _PiRpcSession,
     _redact_argv_for_log,
@@ -730,6 +735,155 @@ class TestGenerateExtensionJs(unittest.TestCase):
         # block verdict is honored.
         self.assertIn('kind: "policy_eval"', js)
         self.assertIn("block: true", js)
+
+
+def test_generate_handover_extension_uses_tools_disabled_completion() -> None:
+    js = _generate_handover_extension_js(
+        SmartCompactionConfig(
+            enabled=True,
+            trigger_tokens=56000,
+            handover_max_tokens=4096,
+            source_max_chars=280000,
+        )
+    )
+
+    assert 'pi.on("session_before_compact"' in js
+    assert "ctx.modelRegistry.complete" in js
+    assert "registerTool" not in js
+    assert "handoverMaxTokens" in js
+    assert "__omnigent_handover_v1__" in js
+
+
+def test_handover_compaction_details_validate_structured_state() -> None:
+    result = {
+        "summary": "structured",
+        "details": {
+            "type": "omnigent_session_handover",
+            "draft": {
+                "original_directive": "model copy",
+                "objective": "Finish the task.",
+                "phase": "validate",
+                "completed_outcomes": ["Edited the runtime."],
+                "verified_facts": [],
+                "validations": [],
+                "failed_approaches": [],
+                "decisions": [],
+                "remaining_work": ["Run tests."],
+                "next_action": "Run tests.",
+                "theories": [],
+                "do_not_repeat": ["Do not repeat the edit."],
+                "blockers": [],
+                "user_questions": [],
+                "active_waits": [],
+                "evidence_refs": [],
+                "loaded_skills": [],
+            },
+        },
+    }
+
+    handover = _handover_from_compaction(
+        result=result,
+        original_directive="Exact directive.",
+        repository_state=None,
+        context_tokens=56000,
+    )
+
+    assert handover.mode == "structured"
+    assert handover.original_directive == "Exact directive."
+    assert handover.next_action == "Run tests."
+    assert handover.context_tokens == 56000
+
+
+def test_generated_handover_extension_returns_structured_compaction(
+    tmp_path: Path,
+) -> None:
+    node_path = shutil.which("node")
+    if node_path is None:
+        pytest.skip("node is required for generated Pi handover extension tests")
+
+    extension_path = tmp_path / "omnigent_handover.js"
+    runner_path = tmp_path / "run_handover.js"
+    extension_path.write_text(
+        _generate_handover_extension_js(SmartCompactionConfig(enabled=True, trigger_tokens=56000)),
+        encoding="utf-8",
+    )
+    draft = {
+        "original_directive": "model copy",
+        "objective": "Finish the task.",
+        "phase": "validate",
+        "completed_outcomes": [],
+        "verified_facts": [],
+        "validations": [],
+        "failed_approaches": [],
+        "decisions": [],
+        "remaining_work": ["Run tests."],
+        "next_action": "Run tests.",
+        "theories": [],
+        "do_not_repeat": [],
+        "blockers": [],
+        "user_questions": [],
+        "active_waits": [],
+        "evidence_refs": [],
+        "loaded_skills": [],
+    }
+    runner_path.write_text(
+        textwrap.dedent(
+            f"""
+            const extension = require(process.argv[2]);
+            let handler;
+            extension({{
+              on(event, fn) {{
+                if (event === "session_before_compact") handler = fn;
+              }}
+            }});
+
+            (async () => {{
+              const result = await handler(
+                {{
+                  customInstructions: "OMNIGENT_STRUCTURED_HANDOVER_V1\\n"
+                    + JSON.stringify({{ original_directive: "Exact directive." }}),
+                  branchEntries: [
+                    {{
+                      type: "message",
+                      message: {{ role: "user", content: "Exact directive." }}
+                    }}
+                  ],
+                  preparation: {{ tokensBefore: 56000 }},
+                  signal: new AbortController().signal
+                }},
+                {{
+                  model: {{ provider: "mock", id: "mock-model" }},
+                  modelRegistry: {{
+                    complete: async () => ({{
+                      content: [{{ type: "text", text: {json.dumps(json.dumps(draft))} }}],
+                      usage: {{ input: 10, output: 5, totalTokens: 15 }}
+                    }})
+                  }}
+                }}
+              );
+              process.stdout.write(JSON.stringify(result));
+            }})().catch((error) => {{
+              process.stderr.write(error && error.stack ? error.stack : String(error));
+              process.exit(1);
+            }});
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [node_path, str(runner_path), str(extension_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    payload = json.loads(result.stdout)
+
+    compaction = payload["compaction"]
+    assert compaction["firstKeptEntryId"] == "__omnigent_handover_v1__"
+    assert compaction["details"]["type"] == "omnigent_session_handover"
+    assert compaction["details"]["draft"]["original_directive"] == "Exact directive."
 
 
 # ---------------------------------------------------------------------------
@@ -1699,6 +1853,29 @@ class TestBuildEnvAndDir(unittest.TestCase):
             shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
+def test_smart_compaction_adds_handover_extension_without_tools() -> None:
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(
+            smart_compaction=SmartCompactionConfig(
+                enabled=True,
+                trigger_tokens=56000,
+            )
+        )
+
+    config = executor._build_env_and_dir([], None, None, None)
+    try:
+        extension_paths = [
+            config.extra_args[index + 1]
+            for index, value in enumerate(config.extra_args)
+            if value == "--extension"
+        ]
+        assert len(extension_paths) == 1
+        content = Path(extension_paths[0]).read_text(encoding="utf-8")
+        assert 'pi.on("session_before_compact"' in content
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
 def test_gateway_seeds_managed_settings_from_global_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2003,6 +2180,178 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(tool_completes), 1)
             self.assertEqual(tool_completes[0].name, "add")
             self.assertEqual(tool_completes[0].status, ToolCallStatus.SUCCESS)
+
+        _run(_test())
+
+    def test_smart_compaction_resets_pi_and_continues_from_handover(self):
+        async def _test():
+            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+                executor = PiExecutor(
+                    smart_compaction=SmartCompactionConfig(
+                        enabled=True,
+                        trigger_tokens=50,
+                        instructions="Preserve semantic progress.",
+                    )
+                )
+
+            first_rpc = _PiRpcSession()
+            first_rpc._line_queue = asyncio.Queue()
+            first_rpc.process = MagicMock()
+            first_rpc.process.returncode = None
+            first_writer = _FakeStreamWriter()
+            first_rpc.process.stdin = first_writer
+            first_rpc._stderr_lines = []
+
+            draft = {
+                "original_directive": "model copy",
+                "objective": "Finish the task.",
+                "phase": "validate",
+                "completed_outcomes": ["Read the target file."],
+                "verified_facts": ["The file exists."],
+                "validations": [],
+                "failed_approaches": [],
+                "decisions": [],
+                "remaining_work": ["Return the final result."],
+                "next_action": "Return the final result.",
+                "theories": [],
+                "do_not_repeat": ["Do not read the file again."],
+                "blockers": [],
+                "user_questions": [],
+                "active_waits": [],
+                "evidence_refs": ["README.md"],
+                "loaded_skills": [],
+            }
+            first_lines = [
+                {"type": "response", "success": True},
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "toolUse",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "call-read",
+                                "name": "sys_os_read",
+                                "arguments": {"path": "README.md"},
+                            }
+                        ],
+                        "usage": {
+                            "input": 50,
+                            "output": 10,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                            "totalTokens": 60,
+                        },
+                    },
+                },
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "sys_os_read",
+                    "args": {"path": "README.md"},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "sys_os_read",
+                    "isError": False,
+                    "result": {"content": "read"},
+                },
+                {"type": "turn_end"},
+                {"type": "agent_end", "messages": []},
+                {"type": "compaction_start", "reason": "manual"},
+                {
+                    "type": "compaction_end",
+                    "reason": "manual",
+                    "aborted": False,
+                    "result": {
+                        "summary": "structured handover",
+                        "estimatedTokensAfter": 800,
+                        "details": {
+                            "type": "omnigent_session_handover",
+                            "version": 1,
+                            "draft": draft,
+                        },
+                    },
+                },
+            ]
+            for event in first_lines:
+                first_rpc._line_queue.put_nowait(json.dumps(event))
+
+            second_rpc = _PiRpcSession()
+            second_rpc._line_queue = asyncio.Queue()
+            second_rpc.process = MagicMock()
+            second_rpc.process.returncode = None
+            second_rpc.process.stdin = _FakeStreamWriter()
+            second_rpc._stderr_lines = []
+            second_lines = [
+                {"type": "response", "success": True},
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "done"},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {
+                            "input": 20,
+                            "output": 4,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                            "totalTokens": 24,
+                        },
+                    },
+                },
+                {"type": "agent_end", "messages": []},
+            ]
+            for event in second_lines:
+                second_rpc._line_queue.put_nowait(json.dumps(event))
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return first_rpc
+
+            continuation: dict[str, str] = {}
+
+            async def fake_restart(**kwargs):
+                continuation["text"] = kwargs["continuation"]
+                return second_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+            executor._restart_rpc_for_handover = fake_restart
+
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Exact directive."}],
+                    [],
+                    "system",
+                )
+            ]
+
+            compacted = [event for event in events if isinstance(event, CompactionComplete)]
+            completed = [event for event in events if isinstance(event, TurnComplete)]
+            self.assertEqual(len(compacted), 1)
+            self.assertTrue(compacted[0].handover_loaded)
+            self.assertEqual(compacted[0].handover["mode"], "structured")
+            self.assertEqual(
+                compacted[0].handover["original_directive"],
+                "Exact directive.",
+            )
+            self.assertIn("<session_handover>", continuation["text"])
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0].response, "done")
+
+            sent = [json.loads(frame) for frame in first_writer.data]
+            compact_commands = [frame for frame in sent if frame.get("type") == "compact"]
+            self.assertEqual(len(compact_commands), 1)
+            self.assertIn(
+                "OMNIGENT_STRUCTURED_HANDOVER_V1",
+                compact_commands[0]["customInstructions"],
+            )
 
         _run(_test())
 

@@ -321,6 +321,54 @@ def test_skills_filter_env_var_missing_falls_back_to_all(
     assert captured["skills_filter"] == "all"
 
 
+def test_smart_compaction_env_threads_typed_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HARNESS_PI_SMART_COMPACTION",
+        json.dumps(
+            {
+                "enabled": True,
+                "trigger_tokens": 56000,
+                "handover_max_tokens": 4096,
+                "source_max_chars": 280000,
+                "timeout_seconds": 300,
+                "poll_interval_seconds": 15,
+                "instructions": "Keep semantic progress.",
+            }
+        ),
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        _fake_init,
+    ):
+        pi_harness._build_pi_executor()
+
+    config = captured["smart_compaction"]
+    assert config.enabled is True
+    assert config.trigger_tokens == 56000
+    assert config.handover_max_tokens == 4096
+    assert config.instructions == "Keep semantic progress."
+
+
+def test_invalid_smart_compaction_env_disables_feature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "HARNESS_PI_SMART_COMPACTION",
+        '{"enabled":true,"trigger_tokens":0}',
+    )
+
+    config = pi_harness._resolve_smart_compaction()
+
+    assert config.enabled is False
+
+
 def test_bundle_dir_and_agent_name_env_vars_thread_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

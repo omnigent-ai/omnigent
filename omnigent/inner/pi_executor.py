@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
@@ -46,6 +47,7 @@ import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
@@ -68,6 +70,11 @@ from omnigent.runtime.prompt import (
     PI_TOOL_TURN_CONTINUATION,
     append_framework_instructions,
 )
+from omnigent.runtime.session_checkpoint import (
+    RepositoryState,
+    SemanticHandoverDraft,
+    SessionHandover,
+)
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -75,6 +82,7 @@ from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -165,6 +173,31 @@ class _PiMessageUsage(TypedDict):
 
 class _PiTurnUsage(_PiMessageUsage):
     context_tokens: int
+
+
+@dataclass(frozen=True)
+class SmartCompactionConfig:
+    """Configured structured rollover for long Pi agent loops."""
+
+    enabled: bool = False
+    trigger_tokens: int = 0
+    handover_max_tokens: int = 4096
+    source_max_chars: int = 320_000
+    timeout_seconds: float = 300.0
+    poll_interval_seconds: float = 15.0
+    instructions: str = ""
+
+    def __post_init__(self) -> None:
+        if self.enabled and self.trigger_tokens <= 0:
+            raise ValueError("smart compaction trigger_tokens must be positive")
+        if self.handover_max_tokens < 512:
+            raise ValueError("smart compaction handover_max_tokens must be at least 512")
+        if self.source_max_chars < 16_384:
+            raise ValueError("smart compaction source_max_chars must be at least 16384")
+        if self.timeout_seconds <= 0:
+            raise ValueError("smart compaction timeout_seconds must be positive")
+        if self.poll_interval_seconds <= 0:
+            raise ValueError("smart compaction poll_interval_seconds must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +607,138 @@ module.exports = function(pi) {{
       }},
     }});
   }}
+}};
+"""
+
+
+def _generate_handover_extension_js(config: SmartCompactionConfig) -> str:
+    """Generate the tools-disabled structured handover extension."""
+    settings_json = json.dumps(
+        {
+            "handoverMaxTokens": config.handover_max_tokens,
+            "sourceMaxChars": config.source_max_chars,
+        },
+        indent=2,
+    )
+    return f"""\
+// Auto-generated Omnigent context handover extension for Pi.
+const SETTINGS = {settings_json};
+const REQUEST_PREFIX = "OMNIGENT_STRUCTURED_HANDOVER_V1\\n";
+const FIRST_KEPT_SENTINEL = "__omnigent_handover_v1__";
+
+function renderEntry(entry) {{
+  if (!entry || typeof entry !== "object") return "";
+  if (entry.type === "message" && entry.message) {{
+    return JSON.stringify(entry.message);
+  }}
+  if (entry.type === "compaction" && typeof entry.summary === "string") {{
+    return JSON.stringify({{ role: "compactionSummary", summary: entry.summary }});
+  }}
+  if (entry.type === "custom_message") {{
+    return JSON.stringify({{
+      role: "custom",
+      customType: entry.customType,
+      content: entry.content
+    }});
+  }}
+  return "";
+}}
+
+function boundedTranscript(entries) {{
+  const full = entries.map(renderEntry).filter(Boolean).join("\\n");
+  if (full.length <= SETTINGS.sourceMaxChars) return full;
+  const headChars = Math.min(48000, Math.floor(SETTINGS.sourceMaxChars / 4));
+  const tailChars = SETTINGS.sourceMaxChars - headChars;
+  return full.slice(0, headChars)
+    + "\\n[older context omitted at the handover boundary]\\n"
+    + full.slice(-tailChars);
+}}
+
+function extractJson(text) {{
+  const trimmed = String(text || "").trim();
+  const start = trimmed.indexOf("{{");
+  const end = trimmed.lastIndexOf("}}");
+  if (start < 0 || end <= start) throw new Error("handover response did not contain JSON");
+  return JSON.parse(trimmed.slice(start, end + 1));
+}}
+
+module.exports = function(pi) {{
+  pi.on("session_before_compact", async (event, ctx) => {{
+    const instructions = event && event.customInstructions;
+    if (typeof instructions !== "string" || !instructions.startsWith(REQUEST_PREFIX)) return;
+    if (!ctx.model) return;
+
+    let request;
+    try {{
+      request = JSON.parse(instructions.slice(REQUEST_PREFIX.length));
+    }} catch (_error) {{
+      return;
+    }}
+
+    const transcript = boundedTranscript(event.branchEntries || []);
+    let response;
+    try {{
+      const completionOptions = {{
+        signal: event.signal,
+        cacheRetention: "none"
+      }};
+      completionOptions["max" + "Tokens"] = SETTINGS.handoverMaxTokens;
+      response = await ctx.modelRegistry.complete(
+        ctx.model,
+        {{
+          systemPrompt: [
+            "Create a task handover for a fresh context.",
+            "Return one JSON object that matches the supplied schema.",
+            "Describe goals and outcomes, not a transcript of calls.",
+            "Separate verified facts from theories. Preserve failures, retry conditions,",
+            "remaining work, the exact next action, blockers, active waits, and loaded skills.",
+            "Do not use markdown fences or add text outside the JSON object."
+          ].join(" "),
+          messages: [{{
+            role: "user",
+            content: [{{
+              type: "text",
+              text: JSON.stringify(request) + "\\n\\n<conversation>\\n"
+                + transcript + "\\n</conversation>"
+            }}],
+            timestamp: Date.now()
+          }}]
+        }},
+        completionOptions
+      );
+    }} catch (_error) {{
+      return;
+    }}
+
+    const text = (response.content || [])
+      .filter((part) => part && part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("\\n");
+
+    let draft;
+    try {{
+      draft = extractJson(text);
+    }} catch (_error) {{
+      return;
+    }}
+    if (!draft || typeof draft !== "object") return;
+    draft.original_directive = request.original_directive;
+
+    const summary = "Structured session handover:\\n" + JSON.stringify(draft, null, 2);
+    return {{
+      compaction: {{
+        summary,
+        firstKeptEntryId: FIRST_KEPT_SENTINEL,
+        tokensBefore: event.preparation.tokensBefore,
+        usage: response.usage,
+        details: {{
+          type: "omnigent_session_handover",
+          version: 1,
+          draft
+        }}
+      }}
+    }};
+  }});
 }};
 """
 
@@ -1753,6 +1918,207 @@ def _aggregate_pi_turn_usage(
     }
 
 
+def _compaction_usage(
+    result: Mapping[str, Any],
+    fallback_model: str | None,
+) -> dict[str, Any] | None:
+    raw = result.get("usage")
+    if not isinstance(raw, Mapping):
+        return None
+    input_tokens = int(raw.get("input") or 0)
+    output_tokens = int(raw.get("output") or 0)
+    cache_read = int(raw.get("cacheRead") or 0)
+    cache_write = int(raw.get("cacheWrite") or 0)
+    total_tokens = int(raw.get("totalTokens") or 0)
+    if not (input_tokens or output_tokens):
+        return None
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens or (input_tokens + output_tokens),
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+        "context_tokens": total_tokens
+        or (input_tokens + output_tokens + cache_read + cache_write),
+        "model": fallback_model,
+    }
+
+
+def _latest_user_directive(messages: Sequence[Message]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            text = _extract_text(message).strip()
+            if text:
+                return text
+    return "Continue the current user request."
+
+
+def _git_output(cwd: str, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _repository_name(remote: str | None) -> str | None:
+    if not remote:
+        return None
+    match = re.search(r"github\.com[/:]([^/\s]+/[^/\s]+?)(?:\.git)?$", remote)
+    return match.group(1) if match else None
+
+
+def _capture_repository_state(cwd: str | None) -> RepositoryState | None:
+    """Read bounded Git state without changing the worktree."""
+    if not cwd:
+        return None
+    root = _git_output(cwd, "rev-parse", "--show-toplevel")
+    if not root:
+        return RepositoryState(workspace=cwd)
+
+    branch = _git_output(root, "branch", "--show-current") or None
+    head = _git_output(root, "rev-parse", "HEAD") or None
+    upstream_head = _git_output(root, "rev-parse", "@{upstream}") or None
+    remote = _git_output(root, "remote", "get-url", "origin")
+    status = _git_output(root, "status", "--porcelain=v1", "-z") or ""
+
+    staged: list[str] = []
+    modified: list[str] = []
+    untracked: list[str] = []
+    deleted: list[str] = []
+    for record in status.split("\0"):
+        if len(record) < 4 or record[2] != " ":
+            continue
+        index_status, worktree_status = record[0], record[1]
+        path = record[3:]
+        if index_status == "?" and worktree_status == "?":
+            untracked.append(path)
+            continue
+        if index_status not in {" ", "?"}:
+            staged.append(path)
+        if worktree_status not in {" ", "?"}:
+            modified.append(path)
+        if "D" in {index_status, worktree_status}:
+            deleted.append(path)
+
+    return RepositoryState(
+        workspace=root,
+        repo=_repository_name(remote),
+        branch=branch,
+        head=head,
+        upstream_head=upstream_head,
+        staged_paths=staged,
+        modified_paths=modified,
+        untracked_paths=untracked,
+        deleted_paths=deleted,
+    )
+
+
+def _build_handover_request(
+    *,
+    config: SmartCompactionConfig,
+    original_directive: str,
+    repository_state: RepositoryState | None,
+) -> str:
+    payload = {
+        "original_directive": original_directive,
+        "agent_instructions": config.instructions,
+        "authoritative_repository_state": (
+            repository_state.model_dump(mode="json") if repository_state is not None else None
+        ),
+        "schema": SemanticHandoverDraft.model_json_schema(),
+    }
+    return "OMNIGENT_STRUCTURED_HANDOVER_V1\n" + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _handover_from_compaction(
+    *,
+    result: Mapping[str, Any],
+    original_directive: str,
+    repository_state: RepositoryState | None,
+    context_tokens: int,
+) -> SessionHandover:
+    summary = str(result.get("summary") or "")
+    details = result.get("details")
+    if isinstance(details, Mapping) and details.get("type") == "omnigent_session_handover":
+        draft_payload = details.get("draft")
+        if isinstance(draft_payload, Mapping):
+            draft = SemanticHandoverDraft.model_validate(
+                {
+                    **draft_payload,
+                    "original_directive": original_directive,
+                }
+            )
+            return SessionHandover(
+                **draft.model_dump(mode="python"),
+                mode="structured",
+                repository_state=repository_state,
+                context_tokens=context_tokens,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+
+    fallback_text = summary or "The structured handover was unavailable."
+    return SessionHandover(
+        mode="generic",
+        original_directive=original_directive,
+        objective="Continue the original task from the fallback compaction summary.",
+        phase="investigate",
+        remaining_work=["Reconcile the fallback summary with current repository state."],
+        next_action="Read the fallback summary, then take the first unfinished action.",
+        repository_state=repository_state,
+        context_tokens=context_tokens,
+        fallback_summary=fallback_text,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def _handover_continuation(handover: SessionHandover) -> str:
+    payload = json.dumps(handover.model_dump(mode="json"), ensure_ascii=False)
+    return (
+        "Framework context rollover completed. Continue the same task automatically. "
+        "Treat repository_state as authoritative, start with next_action, preserve completed "
+        "outcomes, and do not repeat do_not_repeat items. Do not summarize again or ask the "
+        f"user to restart. <session_handover>{payload}</session_handover>"
+    )
+
+
+def _handover_compacted_messages(handover: SessionHandover) -> list[Message]:
+    return [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": handover.original_directive,
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": _handover_continuation(handover),
+                }
+            ],
+        },
+    ]
+
+
 class PiExecutor(Executor):
     """Execute agent turns via the Pi coding agent (``pi --mode rpc``)."""
 
@@ -1774,6 +2140,7 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        smart_compaction: SmartCompactionConfig | None = None,
     ) -> None:
         """Create a PiExecutor.
 
@@ -1831,6 +2198,8 @@ class PiExecutor(Executor):
             so Pi sees zero skills; a list adds ``--no-skills`` plus
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
+        :param smart_compaction: Optional configured threshold and semantic
+            handover settings for resetting long Pi contexts.
         """
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
@@ -1884,6 +2253,7 @@ class PiExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._smart_compaction = smart_compaction or SmartCompactionConfig()
         # Resolve once at construction (the bundle layout doesn't
         # change across turns within a session). Each turn's
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
@@ -2261,6 +2631,12 @@ class PiExecutor(Executor):
                 with open(fallback_path, "w") as f:
                     json.dump(retry_settings, f, indent=2)
 
+        if self._smart_compaction.enabled:
+            handover_path = os.path.join(tmp_dir, "omnigent_handover.js")
+            with open(handover_path, "w") as f:
+                f.write(_generate_handover_extension_js(self._smart_compaction))
+            extra_args.extend(["--extension", handover_path])
+
         # Generate the Omnigent tool bridge extension if tools are available.
         if tools and tool_server_port is not None:
             if tool_server_token is None:
@@ -2363,6 +2739,35 @@ class PiExecutor(Executor):
         state._has_sent_prompt = False
         return rpc
 
+    async def _restart_rpc_for_handover(
+        self,
+        *,
+        session_key: str,
+        current_rpc: _PiRpcSession,
+        system_prompt: str,
+        model: str | None,
+        tools: list[ToolSpec],
+        continuation: str,
+        command_id: str,
+    ) -> _PiRpcSession:
+        """Start a fresh Pi process and load the validated handover."""
+        state = self._session_states.setdefault(session_key, _PiSessionState())
+        if state.rpc is current_rpc:
+            await current_rpc.close()
+            state.rpc = None
+        rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
+        state = self._session_states.get(session_key)
+        if state is not None:
+            state._has_sent_prompt = True
+        await rpc.send_command(
+            {
+                "type": "prompt",
+                "message": continuation,
+                "id": command_id,
+            }
+        )
+        return rpc
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -2382,6 +2787,7 @@ class PiExecutor(Executor):
                     self._databricks_token = token
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
+        original_directive = _latest_user_directive(messages)
         pi_system_prompt = (
             append_framework_instructions(
                 system_prompt,
@@ -2460,6 +2866,13 @@ class PiExecutor(Executor):
         pending_error: str | None = None
         saw_message_end = False
         pending_llm_input: list[Message] = []
+        handover_due_context_tokens = 0
+        handover_in_progress = False
+        handover_started_at: float | None = None
+        handover_command_id: str | None = None
+        handover_repository_state: RepositoryState | None = None
+        handover_llm_started = False
+        handover_count = 0
 
         async def _continue_tool_turn(
             *,
@@ -2501,8 +2914,32 @@ class PiExecutor(Executor):
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            read_timeout = 120.0 if pending_error is None else 10.0
+            if handover_in_progress:
+                started_at = handover_started_at or time.monotonic()
+                remaining = self._smart_compaction.timeout_seconds - (
+                    time.monotonic() - started_at
+                )
+                if remaining <= 0:
+                    error_text = (
+                        "Pi structured handover did not complete within "
+                        f"{int(self._smart_compaction.timeout_seconds)} seconds."
+                    )
+                    if handover_llm_started:
+                        yield LLMCallComplete(
+                            model=model,
+                            error=error_text,
+                        )
+                    yield ExecutorError(
+                        message=error_text,
+                        retryable=True,
+                    )
+                    return
+                read_timeout = min(self._smart_compaction.poll_interval_seconds, remaining)
+            line = await rpc.read_line(timeout=read_timeout)
             if line is None:
+                if handover_in_progress:
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                 elif active_tool_calls:
@@ -2568,6 +3005,62 @@ class PiExecutor(Executor):
             # Skip the command-ack response.
             if event_type == "response":
                 if not event.get("success", True):
+                    if handover_in_progress and event.get("id") == handover_command_id:
+                        error_text = str(event.get("error") or "Pi compaction command failed")
+                        if handover_llm_started:
+                            yield LLMCallComplete(
+                                model=model,
+                                error=error_text,
+                            )
+                            handover_llm_started = False
+                        handover = _handover_from_compaction(
+                            result={"summary": error_text},
+                            original_directive=original_directive,
+                            repository_state=handover_repository_state,
+                            context_tokens=handover_due_context_tokens,
+                        )
+                        continuation = _handover_continuation(handover)
+                        handover_count += 1
+                        cmd_id = f"turn_{id(messages)}_handover_{handover_count}"
+                        try:
+                            rpc = await self._restart_rpc_for_handover(
+                                session_key=session_key,
+                                current_rpc=rpc,
+                                system_prompt=pi_system_prompt,
+                                model=model,
+                                tools=tools,
+                                continuation=continuation,
+                                command_id=cmd_id,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            yield ExecutorError(
+                                message=f"Failed to load fallback Pi handover: {exc}",
+                                retryable=True,
+                            )
+                            return
+                        pending_llm_input = [{"role": "user", "content": continuation}]
+                        handover_in_progress = False
+                        handover_started_at = None
+                        handover_command_id = None
+                        handover_due_context_tokens = 0
+                        handover_repository_state = None
+                        pending_error = None
+                        saw_message_end = False
+                        completion_text_ready = False
+                        last_tool_failed = False
+                        failure_recovery_requested = False
+                        tool_turn_continuations = 0
+                        active_tool_calls = 0
+                        active_tool_started_at = None
+                        yield CompactionComplete(
+                            summary=handover.fallback_summary,
+                            token_count=0,
+                            model=model,
+                            compacted_messages=_handover_compacted_messages(handover),
+                            handover=handover.model_dump(mode="json"),
+                            handover_loaded=True,
+                        )
+                        continue
                     yield ExecutorError(message=event.get("error", "Pi command failed"))
                     return
                 continue
@@ -2705,8 +3198,144 @@ class PiExecutor(Executor):
                 )
                 continue
 
+            if event_type == "turn_end":
+                if (
+                    self._smart_compaction.enabled
+                    and handover_due_context_tokens >= self._smart_compaction.trigger_tokens
+                    and not handover_in_progress
+                ):
+                    handover_repository_state = cast(
+                        RepositoryState | None,
+                        await run_sync_on_thread(_capture_repository_state, self._cwd),
+                    )
+                    request_text = _build_handover_request(
+                        config=self._smart_compaction,
+                        original_directive=original_directive,
+                        repository_state=handover_repository_state,
+                    )
+                    handover_command_id = f"handover_{id(messages)}_{handover_count + 1}"
+                    handover_in_progress = True
+                    handover_started_at = time.monotonic()
+                    try:
+                        await rpc.send_command(
+                            {
+                                "type": "compact",
+                                "customInstructions": request_text,
+                                "id": handover_command_id,
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        yield ExecutorError(
+                            message=f"Failed to start Pi structured handover: {exc}",
+                            retryable=True,
+                        )
+                        return
+                continue
+
+            if event_type == "compaction_start":
+                if handover_in_progress and not handover_llm_started:
+                    handover_started_at = time.monotonic()
+                    handover_llm_started = True
+                    yield LLMCallStarted(
+                        model=model,
+                        input=[
+                            {
+                                "role": "user",
+                                "content": "Generate a structured session handover.",
+                            }
+                        ],
+                    )
+                continue
+
+            if event_type == "compaction_end":
+                raw_result = event.get("result")
+                if not isinstance(raw_result, Mapping):
+                    if not handover_in_progress:
+                        continue
+                    raw_result = {
+                        "summary": str(
+                            event.get("errorMessage")
+                            or "Pi structured handover did not return a summary."
+                        )
+                    }
+
+                if not handover_in_progress:
+                    yield CompactionComplete(
+                        summary=str(raw_result.get("summary") or ""),
+                        token_count=int(raw_result.get("estimatedTokensAfter") or 0),
+                        model=model,
+                    )
+                    continue
+
+                if handover_llm_started:
+                    yield LLMCallComplete(
+                        model=model,
+                        usage=_compaction_usage(raw_result, model),
+                        response=str(raw_result.get("summary") or ""),
+                    )
+                    handover_llm_started = False
+                try:
+                    handover = _handover_from_compaction(
+                        result=raw_result,
+                        original_directive=original_directive,
+                        repository_state=handover_repository_state,
+                        context_tokens=handover_due_context_tokens,
+                    )
+                except (TypeError, ValueError):
+                    handover = _handover_from_compaction(
+                        result={"summary": str(raw_result.get("summary") or "")},
+                        original_directive=original_directive,
+                        repository_state=handover_repository_state,
+                        context_tokens=handover_due_context_tokens,
+                    )
+                continuation = _handover_continuation(handover)
+                handover_count += 1
+                cmd_id = f"turn_{id(messages)}_handover_{handover_count}"
+                try:
+                    rpc = await self._restart_rpc_for_handover(
+                        session_key=session_key,
+                        current_rpc=rpc,
+                        system_prompt=pi_system_prompt,
+                        model=model,
+                        tools=tools,
+                        continuation=continuation,
+                        command_id=cmd_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    yield ExecutorError(
+                        message=f"Failed to load Pi structured handover: {exc}",
+                        retryable=True,
+                    )
+                    return
+
+                pending_llm_input = [{"role": "user", "content": continuation}]
+                handover_in_progress = False
+                handover_started_at = None
+                handover_command_id = None
+                handover_due_context_tokens = 0
+                handover_repository_state = None
+                pending_error = None
+                saw_message_end = False
+                completion_text_ready = False
+                last_tool_failed = False
+                failure_recovery_requested = False
+                tool_turn_continuations = 0
+                active_tool_calls = 0
+                active_tool_started_at = None
+                yield CompactionComplete(
+                    summary=str(raw_result.get("summary") or ""),
+                    token_count=int(raw_result.get("estimatedTokensAfter") or 0),
+                    model=model,
+                    compacted_messages=_handover_compacted_messages(handover),
+                    handover=handover.model_dump(mode="json"),
+                    handover_loaded=True,
+                )
+                continue
+
             # Agent ended — the turn is complete.
             if event_type == "agent_end":
+                if handover_in_progress:
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
@@ -2805,11 +3434,28 @@ class PiExecutor(Executor):
                 captured = _extract_pi_turn_usage(msg, model)
                 if captured is not None:
                     message_usages.append(captured)
+                    context_tokens = captured["total_tokens"] or (
+                        captured["input_tokens"]
+                        + captured["output_tokens"]
+                        + captured["cache_read_input_tokens"]
+                        + captured["cache_creation_input_tokens"]
+                    )
+                    if (
+                        self._smart_compaction.enabled
+                        and context_tokens >= self._smart_compaction.trigger_tokens
+                        and _pi_message_has_tool_call(msg)
+                    ):
+                        handover_due_context_tokens = max(
+                            handover_due_context_tokens,
+                            context_tokens,
+                        )
                 raw_stop = msg.get("stopReason")
                 stop: str | None = raw_stop if isinstance(raw_stop, str) else None
                 call_error = None
                 if stop in {"aborted", "error"}:
                     call_error = str(msg.get("errorMessage", stop))
+                if stop == "aborted" and handover_in_progress:
+                    call_error = None
                 call_response, call_reasoning = _extract_pi_message_output(msg)
                 yield LLMCallComplete(
                     model=_pi_message_model(msg, model),
@@ -2818,7 +3464,7 @@ class PiExecutor(Executor):
                     reasoning=call_reasoning,
                     error=call_error,
                 )
-                if stop == "aborted":
+                if stop == "aborted" and not handover_in_progress:
                     yield ExecutorError(message=call_error or stop)
                     return
                 if stop == "error":

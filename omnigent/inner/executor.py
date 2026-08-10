@@ -264,12 +264,18 @@ class CompactionComplete(ExecutorEvent):
         session replays these instead of the full original history.
         ``None`` when the harness cannot export its compacted state
         (e.g. claude-sdk where compaction is internal to the CLI).
+    :param handover: Validated structured handover state when compaction
+        reset an active harness context. ``None`` for generic compaction.
+    :param handover_loaded: Whether the harness started its fresh context
+        from ``handover`` before emitting this event.
     """
 
     summary: str
     token_count: int
     model: str | None = None
     compacted_messages: CompactedMessages | None = None
+    handover: ExecutorExtra | None = None
+    handover_loaded: bool = False
 
 
 @dataclass

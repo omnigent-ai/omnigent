@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 
 from omnigent.runtime.session_checkpoint import (
+    RepositoryState,
+    SessionHandover,
     build_checkpoint,
     checkpoint_instruction,
+    handover_instruction,
     prune_covered_history,
 )
 
@@ -54,6 +57,43 @@ def test_checkpoint_pairs_normalized_tools_and_resumes_at_pull_request() -> None
     assert "Do not recreate the verified branch." in checkpoint.do_not_repeat
     assert "Do not repeat the verified git commit." in checkpoint.do_not_repeat
     assert "Do not repeat the verified git push." in checkpoint.do_not_repeat
+
+
+def test_checkpoint_carries_structured_handover_without_replacing_tool_state() -> None:
+    handover = SessionHandover(
+        original_directive="Implement the change.",
+        objective="Finish the contribution.",
+        phase="validate",
+        completed_outcomes=["Updated the runtime."],
+        verified_facts=["The target branch is feature/checkpoint."],
+        remaining_work=["Run the focused tests."],
+        next_action="Run the focused tests.",
+        do_not_repeat=["Do not repeat the edit."],
+        repository_state=RepositoryState(
+            workspace="/workspace/repository",
+            repo="example/repository",
+            branch="feature/checkpoint",
+            head="a" * 40,
+            modified_paths=["runtime.py"],
+        ),
+        context_tokens=56000,
+        created_at="2026-08-10T12:00:00+00:00",
+    )
+
+    checkpoint = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[{"type": "message", "role": "user", "content": "Implement the change."}],
+        status="active",
+        handover=handover,
+        handover_count=1,
+    )
+
+    assert checkpoint.phase == "validate"
+    assert checkpoint.handover == handover
+    assert checkpoint.handover_count == 1
+    instruction = handover_instruction(handover)
+    assert "<session_handover>" in instruction
+    assert '"next_action": "Run the focused tests."' in instruction
 
 
 def test_checkpoint_understands_verified_commit_helper_for_existing_pr() -> None:
