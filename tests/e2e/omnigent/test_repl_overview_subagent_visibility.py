@@ -212,7 +212,7 @@ def test_repl_overview_subagent_visibility(
         # detail header renders "Session: <worker>:<worker>-1", but the two-column
         # overlay wraps the narrow detail column and splits "Session: <worker>:",
         # so it never matches contiguously — sync on the sidebar label instead.)
-        child.expect(f"{worker_label_prefix}{worker_tool}-1", timeout=_EXPECT_SUBAGENT_TIMEOUT)
+        child.expect(f"{worker_tool}-1", timeout=_EXPECT_SUBAGENT_TIMEOUT)
         # Select the sub-agent target so its detail pane (Session header +
         # message stream, incl. the dispatched user message) renders; TAB
         # cycles main -> sub-agent.
