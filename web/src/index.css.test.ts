@@ -196,7 +196,7 @@ describe("index.css sidebar canvas", () => {
     /:root:not\(\.dark\)\[data-theme\] \.conversations-sidebar,[^{]*\.dark\[data-theme\] \.conversations-sidebar \{[^}]*\}/,
   )?.[0];
   const lightEdgeRule = cssSource.match(
-    /html:not\(\.dark\) \.conversations-sidebar \{[^}]*\}/,
+    /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
   const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
 
