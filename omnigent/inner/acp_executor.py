@@ -53,6 +53,7 @@ import math
 import os
 import secrets
 import shlex
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,8 +75,10 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
+from omnigent.process_logging import current_process_log_path, display_log_path
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +139,14 @@ if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
 
 # Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
+
+# Agent stderr kept for diagnostics: how many trailing lines to retain, how many
+# to quote in a turn error, and the per-line cap (a chatty CLI can emit one
+# enormous line, and the error goes in a UI toast).
+_STDERR_RING_LINES = 20
+_STDERR_QUOTED_LINES = 5
+_STDERR_LINE_LIMIT = 500
+_STDERR_QUOTED_LIMIT = 1000
 
 # ACP protocol version this executor targets (matches Goose 1.38 / Qwen).
 _PROTOCOL_VERSION = 1
@@ -289,6 +300,11 @@ class AcpExecutor(Executor):
         self._queue: asyncio.Queue[_AcpJsonObject] = asyncio.Queue()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        # Last few agent stderr lines, attached to a startup failure. An agent
+        # that dies or stalls during the handshake usually explains why on
+        # stderr ("no API key", "unknown flag"), and that text is the whole
+        # diagnosis; without it the turn error names only the stalled RPC.
+        self._recent_stderr: deque[str] = deque(maxlen=_STDERR_RING_LINES)
         # Serializes stdin writes: run_turn (prompt / request replies) and the
         # adapter's interrupt_session() write from different tasks.
         self._write_lock = asyncio.Lock()
@@ -404,11 +420,33 @@ class AcpExecutor(Executor):
             )
             return binary, rest
 
+    def _startup_error_message(self, exc: BaseException) -> str:
+        """Describe a handshake failure, quoting the agent's own stderr.
+
+        Builds on :func:`describe_exception` (which keeps a bare
+        ``TimeoutError`` from rendering blank), then appends what the agent
+        printed — that text ("no API key", "unknown flag") is usually the actual
+        diagnosis — and the log file so the full traceback is findable.
+        """
+        detail = describe_exception(exc)
+        if self._recent_stderr:
+            tail = " | ".join(list(self._recent_stderr)[-_STDERR_QUOTED_LINES:])
+            # Cap here too, not just per line in the reader: this string ends up
+            # in a UI toast, and the ring can hold several long lines.
+            if len(tail) > _STDERR_QUOTED_LIMIT:
+                tail = tail[:_STDERR_QUOTED_LIMIT] + "...[truncated]"
+            detail = f"{detail}; {self._config.name} stderr: {tail}"
+        log_path = current_process_log_path()
+        if log_path is not None:
+            detail = f"{detail} (harness log: {display_log_path(log_path)})"
+        return detail
+
     async def _read_stderr(self) -> None:
         """Continuously drain the agent's stderr, logging each line at debug.
 
         Prevents a chatty CLI from filling the OS pipe buffer (~64 KiB) and
-        stalling the turn.
+        stalling the turn. Also retains the trailing lines so a startup failure
+        can quote what the agent said before it gave up.
         """
         assert self._proc and self._proc.stderr
         try:
@@ -418,6 +456,9 @@ class AcpExecutor(Executor):
                     break
                 line = raw_line.decode("utf-8", errors="replace").rstrip()
                 if line:
+                    if len(line) > _STDERR_LINE_LIMIT:
+                        line = line[:_STDERR_LINE_LIMIT] + "...[truncated]"
+                    self._recent_stderr.append(line)
                     logger.debug("acp[%s] stderr: %s", self._config.name, line)
         except asyncio.CancelledError:
             # Expected: close() cancels this reader task on teardown.
@@ -472,7 +513,7 @@ class AcpExecutor(Executor):
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
-            await self._queue.put({"type": "error", "message": str(exc)})
+            await self._queue.put({"type": "error", "message": describe_exception(exc)})
 
     async def _send(self, msg: _AcpJsonObject) -> None:
         """Write one newline-terminated JSON message to the agent's stdin."""
@@ -1057,7 +1098,7 @@ class AcpExecutor(Executor):
             await self._ensure_initialized()
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return
 
         # A fresh ACP session holds no prior context. Captured before the latch
