@@ -19,9 +19,74 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.policies.builtins.safety import ask_on_os_tools, block_skills
+from omnigent.policies.builtins.safety import (
+    ask_on_os_tools,
+    block_skills,
+    tool_budget_per_turn,
+)
 from omnigent.policies.schema import PolicyEvent
 from tests.policies.builtins.helpers import tool_call_event as tc
+
+
+def test_tool_budget_resets_and_limits_each_turn() -> None:
+    policy = tool_budget_per_turn(max_calls=3, max_failures=2)
+    reset = policy(
+        {
+            "type": "request",
+            "data": {"user_content": "continue"},
+            "session_state": {
+                "_policy_turn_tool_call_count": 3,
+                "_policy_turn_tool_failure_count": 2,
+            },
+        }
+    )
+    allowed = policy(
+        {
+            **tc("sys_os_read", {"path": "README.md"}),
+            "session_state": {"_policy_turn_tool_call_count": 2},
+        }
+    )
+    denied = policy(
+        {
+            **tc("sys_os_read", {"path": "README.md"}),
+            "session_state": {"_policy_turn_tool_call_count": 3},
+        }
+    )
+
+    assert reset["state_updates"] == [
+        {"key": "_policy_turn_tool_call_count", "action": "set", "value": 0},
+        {"key": "_policy_turn_tool_failure_count", "action": "set", "value": 0},
+    ]
+    assert allowed["result"] == "ALLOW"
+    assert allowed["state_updates"] == [
+        {"key": "_policy_turn_tool_call_count", "action": "increment", "value": 1}
+    ]
+    assert denied["result"] == "DENY"
+    assert "3-tool budget" in denied["reason"]
+
+
+def test_tool_budget_stops_after_failed_results() -> None:
+    policy = tool_budget_per_turn(max_calls=12, max_failures=2)
+    failure = policy(
+        {
+            "type": "tool_result",
+            "data": {"result": '{"exit_code":129,"error":"unknown option"}'},
+            "session_state": {"_policy_turn_tool_failure_count": 1},
+        }
+    )
+    denied = policy(
+        {
+            **tc("sys_os_shell", {"command": "git status"}),
+            "session_state": {"_policy_turn_tool_failure_count": 2},
+        }
+    )
+
+    assert failure["state_updates"] == [
+        {"key": "_policy_turn_tool_failure_count", "action": "increment", "value": 1}
+    ]
+    assert denied["result"] == "DENY"
+    assert "2 failed tool calls" in denied["reason"]
+
 
 # ── ask_on_os_tools: Omnigent sys_os_* tools ─────────────────────────────
 

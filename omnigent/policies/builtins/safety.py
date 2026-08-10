@@ -120,6 +120,95 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
     return evaluate
 
 
+_TURN_TOOL_COUNT_KEY = "_policy_turn_tool_call_count"
+_TURN_TOOL_FAILURE_KEY = "_policy_turn_tool_failure_count"
+
+
+def _state_count(value: object) -> int:
+    try:
+        return int(value) if isinstance(value, int | float | str) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tool_result_failed(data: object) -> bool:
+    if isinstance(data, dict) and "result" in data:
+        data = data["result"]
+    if isinstance(data, str):
+        try:
+            data = _json.loads(data)
+        except (TypeError, ValueError):
+            return bool(_re.match(r"^\s*(?:error|fatal)\s*:", data, _re.IGNORECASE))
+    if not isinstance(data, dict):
+        return False
+    exit_code = data.get("exit_code")
+    return bool(
+        data.get("isError") is True
+        or data.get("is_error") is True
+        or data.get("success") is False
+        or data.get("error") not in (None, False, "", {}, [])
+        or (isinstance(exit_code, int | float) and exit_code != 0)
+        or str(data.get("status", "")).lower() in {"error", "failed", "failure", "cancelled"}
+        or str(data.get("outcome", "")).lower() in {"error", "failed", "failure", "cancelled"}
+    )
+
+
+def tool_budget_per_turn(
+    max_calls: int = 12,
+    max_failures: int = 2,
+) -> PolicyCallable:
+    """Factory: bound tool calls and failed results within one user turn."""
+    max_calls = max(1, max_calls)
+    max_failures = max(1, max_failures)
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        event_type = event.get("type")
+        if event_type == "request":
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _TURN_TOOL_COUNT_KEY, "action": "set", "value": 0},
+                    {"key": _TURN_TOOL_FAILURE_KEY, "action": "set", "value": 0},
+                ],
+            }
+        state = event.get("session_state") or {}
+        calls = _state_count(state.get(_TURN_TOOL_COUNT_KEY, 0))
+        failures = _state_count(state.get(_TURN_TOOL_FAILURE_KEY, 0))
+        if event_type == "tool_call":
+            if failures >= max_failures:
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        f"Stopped after {failures} failed tool calls in this turn. "
+                        "Read the errors and report the blocker."
+                    ),
+                }
+            if calls >= max_calls:
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        f"Exceeded the {max_calls}-tool budget for this turn. "
+                        "Checkpoint progress and continue in a new turn."
+                    ),
+                }
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _TURN_TOOL_COUNT_KEY, "action": "increment", "value": 1},
+                ],
+            }
+        if event_type == "tool_result" and _tool_result_failed(event.get("data")):
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _TURN_TOOL_FAILURE_KEY, "action": "increment", "value": 1},
+                ],
+            }
+        return _ALLOW
+
+    return evaluate
+
+
 _LOOP_STATE_KEY = "_policy_loop_recent_hashes"
 
 
@@ -673,6 +762,32 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 },
             },
             "required": ["limit"],
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.tool_budget_per_turn",
+        "kind": "factory",
+        "name": "Limit Tool Calls Per Turn",
+        "description": (
+            "Resets on each user request, limits tool calls within the turn, "
+            "and stops further calls after a bounded number of failed results."
+        ),
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "max_calls": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum tool calls allowed in one user turn.",
+                    "default": 12,
+                },
+                "max_failures": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Failed tool results allowed before later calls are denied.",
+                    "default": 2,
+                },
+            },
         },
     },
     {
