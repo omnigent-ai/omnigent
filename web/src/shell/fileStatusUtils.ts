@@ -16,6 +16,17 @@ import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
  */
 export const ROW_META_SLOT_CLASS = "w-14";
 
+/**
+ * Footprint of one row action icon button — a 14px glyph plus 2px of padding
+ * on each side (``size-3.5`` + ``p-0.5``).
+ *
+ * Rendered as an empty spacer where a row has no download button (a deleted
+ * file, a directory) so the copy button beside it keeps the same x as on rows
+ * that do. Without it, an absent download slides the copy button 20px right on
+ * exactly those rows.
+ */
+export const ROW_ACTION_SIZE_CLASS = "size-[18px]";
+
 export function gitStatusLetter(status: WorkspaceChangedFile["status"]): string {
   switch (status) {
     case "created":

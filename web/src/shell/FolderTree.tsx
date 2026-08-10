@@ -11,6 +11,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { type ChangedSort, compareChangedFiles, type SortableFile } from "./FlatFileList";
 import {
+  ROW_ACTION_SIZE_CLASS,
   ROW_META_SLOT_CLASS,
   formatBytes,
   gitStatusLabel,
@@ -515,9 +516,9 @@ function FileRowItem({
             </span>
           )}
         </button>
-        <CopyPathButton path={path} revealOnHover />
-        {/* Always rendered, even when there is no size to show, so every row
-            (including directories) shares one trailing column. */}
+        {/* One trailing column, always rendered so every row (directories
+            included) shares it: metadata at rest, the copy/download pair on
+            hover. */}
         <span
           className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
         >
@@ -526,11 +527,14 @@ function FileRowItem({
               {formatBytes(bytes)}
             </span>
           )}
-          {!isDeleted && conversationId && (
-            <span className="absolute inset-0 flex items-center justify-end">
+          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+            <CopyPathButton path={path} revealOnHover />
+            {!isDeleted && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={path} />
-            </span>
-          )}
+            ) : (
+              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+            )}
+          </span>
         </span>
       </div>
       {tooltip}
@@ -721,10 +725,18 @@ function TreeNodeRow({
             </span>
           )}
         </button>
-        <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
-        {/* Empty, but present: keeps folders on the same trailing column as
-            files, which carry a size here. */}
-        <span className={cn("shrink-0", ROW_META_SLOT_CLASS)} />
+        {/* The same trailing column as a file row. A folder has no size and
+            nothing to download, so the column shows only the copy button —
+            with the download's footprint reserved beside it so that button
+            lands in the same x as every file row's. */}
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
+          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+            <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
+            <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+          </span>
+        </span>
       </div>
       {open && (
         <ul className="flex flex-col gap-0.5">

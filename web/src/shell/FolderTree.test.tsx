@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
-import { ROW_META_SLOT_CLASS } from "./fileStatusUtils";
+import { ROW_ACTION_SIZE_CLASS, ROW_META_SLOT_CLASS } from "./fileStatusUtils";
 import { FolderTree } from "./FolderTree";
 
 afterEach(cleanup);
@@ -185,9 +185,19 @@ describe("FolderTree trailing column", () => {
     const copyButtons = screen.getAllByRole("button", { name: /^Copy (path|folder path):/ });
     expect(copyButtons).toHaveLength(3);
     for (const button of copyButtons) {
-      const slot = button.nextElementSibling;
-      expect(slot, "every row needs a trailing slot after the copy button").not.toBeNull();
-      expect(slot).toHaveClass(ROW_META_SLOT_CLASS);
+      // The copy button lives inside the fixed-width trailing column...
+      const slot = button.closest(`.${ROW_META_SLOT_CLASS}`);
+      expect(slot, "every row's copy button must sit in the trailing column").not.toBeNull();
+      // ...paired with the download button, or with a spacer standing in for
+      // it (folders, deleted files) so the pair keeps one x on every row.
+      const beside = button.nextElementSibling;
+      expect(beside, "the copy button must be followed by its pair").not.toBeNull();
+      const isDownload = beside?.getAttribute("aria-label")?.startsWith("Download");
+      const isReservedSpacer = beside?.classList.contains(ROW_ACTION_SIZE_CLASS);
+      expect(
+        isDownload || isReservedSpacer,
+        "copy must be adjacent to the download button (or its reserved footprint)",
+      ).toBe(true);
     }
   });
 
