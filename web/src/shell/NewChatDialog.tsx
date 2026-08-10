@@ -1272,7 +1272,7 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center"
+                        className="cursor-pointer items-center"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
@@ -1311,7 +1311,7 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center"
+                    className="cursor-pointer items-center"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
@@ -1599,7 +1599,7 @@ function HarnessConfigModal({
                   disabled={smartRoutingOn}
                 >
                   <SelectTrigger
-                    className="w-full"
+                    className="w-full cursor-pointer"
                     data-testid="new-chat-landing-config-effort"
                     aria-label="Reasoning effort"
                   >
@@ -1704,7 +1704,7 @@ function HarnessConfigModal({
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
                 <SelectTrigger
-                  className="w-full"
+                  className="w-full cursor-pointer"
                   data-testid="new-chat-landing-config-harness"
                   aria-label="Agent Harness"
                 >
@@ -3752,7 +3752,7 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderIcon className="ui-icon" />
@@ -3760,6 +3760,7 @@ export function NewChatLandingScreen() {
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
       <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
+      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
     </button>
   );
 
@@ -4233,7 +4234,7 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     {selectedHost?.status === "online" && !sandboxSelected ? (
@@ -4247,6 +4248,7 @@ export function NewChatLandingScreen() {
                       <MonitorIcon className="ui-icon" />
                     )}
                     <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
+                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -4406,13 +4408,14 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
                       <span className="hidden max-w-40 truncate text-sm sm:block">
                         {sandboxRepoLabel}
                       </span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-96 p-3">
@@ -4513,13 +4516,14 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
                       <span className="hidden max-w-32 truncate text-sm sm:block">
                         {worktreeLabel}
                       </span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent

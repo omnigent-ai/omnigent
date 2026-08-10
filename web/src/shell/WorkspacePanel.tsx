@@ -3,6 +3,7 @@ import {
   CheckIcon,
   FileIcon,
   FilesIcon,
+  GitCompareIcon,
   GlobeIcon,
   ListTodoIcon,
   Loader2Icon,
@@ -514,12 +515,12 @@ interface WorkspacePanelProps {
    * file + its comments + URL) so they can't drift from the tab state.
    */
   onRightRailTabChange: (next: RightRailTab) => void;
-  /** Whether the Files tab is available (agent spec exposes an os_env). */
+  /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   /** Whether the Browser tab is available — Electron shell only (hidden in a
    *  plain web build, which has no embedded WebContentsView). */
   showBrowserTab: boolean;
-  /** Count of changed files, shown as the Files tab badge. */
+  /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /**
    * Whether the Shells tab is available — AppShell's combined gate
@@ -582,10 +583,6 @@ interface WorkspacePanelProps {
   filesPanelSort: ChangedSort;
   /** Change the changed-files sort order. */
   onSortChange: (sort: ChangedSort) => void;
-  /** Files view scope: false = full tree, true = changed-only flat list. */
-  filesPanelFlatView: boolean;
-  /** Toggle the Files view scope (persisted by AppShell). */
-  onFlatViewChange: (flat: boolean) => void;
   /** Whether the Files panel shows dotfiles/hidden entries. */
   filesPanelShowHidden: boolean;
   /** Toggle hidden-file visibility in the Files panel. */
@@ -599,7 +596,7 @@ interface WorkspacePanelProps {
 /**
  * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
  * floating card (bg-card, rounded, bordered, shadowed) sitting below the
- * full-width chat header band. Internally tabbed between Files,
+ * full-width chat header band. Internally tabbed between Files, Changes,
  * Terminals, Agents and Tasks so each can claim the full rail height
  * instead of competing for a vertically-split slot.
  *
@@ -644,8 +641,6 @@ export function WorkspacePanel({
   permissionLevel,
   filesPanelSort,
   onSortChange,
-  filesPanelFlatView,
-  onFlatViewChange,
   filesPanelShowHidden,
   onShowHiddenChange,
   liveness,
@@ -700,9 +695,11 @@ export function WorkspacePanel({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Tab strip, in display order Files · Agents · Shells · Tasks.
-          Files and Agents are always present (the Agents panel lists at
-          least the main agent). Shells shows whenever AppShell's gate
+      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
+          Files (full folder tree) and Changes (changed-files-only list) are
+          two peer tabs — same gate (an on-disk workspace), same FilesPanel,
+          each pinned to one scope. Agents is always present (the Agents panel
+          lists at least the main agent). Shells shows whenever AppShell's gate
           allows it (the agent declares shell access, or a shell already
           exists) — the empty state carries the "+ New shell"
           affordance, so an empty tab is an entry point, not a dead end.
@@ -728,16 +725,28 @@ export function WorkspacePanel({
           }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
-          <TabsList variant="pill" className="gap-0">
+          <TabsList variant="pill" className="gap-1">
             {showFilesPanel && (
               <WorkspaceTabTooltip label="Files">
                 <TabsTrigger
                   value="files"
-                  aria-label={changedCount > 0 ? `Files ${changedCount} changed` : "Files"}
+                  aria-label="Files"
                   className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
                 >
                   <FilesIcon className="size-4" />
                   <span className="sr-only">Files</span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {showFilesPanel && (
+              <WorkspaceTabTooltip label="Changes">
+                <TabsTrigger
+                  value="changes"
+                  aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+                  className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
+                >
+                  <GitCompareIcon className="size-4" />
+                  <span className="sr-only">Changes</span>
                   {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
                 </TabsTrigger>
               </WorkspaceTabTooltip>
@@ -882,7 +891,8 @@ export function WorkspacePanel({
         </WorkspaceTabTooltip>
       </div>
       {/* Tab content — single slot. An open shell tab holds its xterm; a
-          file tab holds FileViewer; the Files tab shows FilesPanel; the
+          file tab holds FileViewer; the Files/Changes tabs show FilesPanel
+          (tree vs changed-only list); the
           Shells tab holds the list-only inline section (clicking a row
           opens the shell as a tab above, surfacing its xterm here);
           Subagents lists the root's children + a "main" link back to the
@@ -923,8 +933,7 @@ export function WorkspacePanel({
             <FilesPanel
               frameless
               onFileSelect={openFileViewer}
-              flatView={filesPanelFlatView}
-              onFlatViewChange={onFlatViewChange}
+              flatView={rightRailTab === "changes"}
               showHidden={filesPanelShowHidden}
               onShowHiddenChange={onShowHiddenChange}
               sort={filesPanelSort}

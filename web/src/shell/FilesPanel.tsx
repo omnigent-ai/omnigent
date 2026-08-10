@@ -5,8 +5,6 @@ import {
   EyeOffIcon,
   FileClockIcon,
   FileTypeIcon,
-  FolderTreeIcon,
-  ListIcon,
   MoonIcon,
   SearchIcon,
   SlidersHorizontalIcon,
@@ -37,8 +35,12 @@ import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
+  /**
+   * Which scope this panel renders: false = full folder tree, true =
+   * changed-files-only flat list. Fixed by the caller (the Files vs Changes
+   * rail tab / mobile drawer) rather than switched inside the panel.
+   */
   flatView: boolean;
-  onFlatViewChange: (flatView: boolean) => void;
   /**
    * Whether hidden files (dot-prefixed paths) are visible. Lifted to
    * the parent so the state survives inline→drawer transitions.
@@ -160,64 +162,6 @@ function SortSelector({
 }
 
 // ---------------------------------------------------------------------------
-// FileScopeSwitch — segmented Changed | All control that flips the whole Files
-// view between the changed-files-only flat list (Changed) and the full folder
-// tree (All). One control replaces the old separate Files / Changes rail tabs.
-// ---------------------------------------------------------------------------
-
-// Leading cell in the search toolbar. Rounded-full pills match the rail tabs;
-// the active scope uses the same theme selection surface as the sidebar.
-function FileScopeSwitch({
-  flatView,
-  onChange,
-  count,
-}: {
-  flatView: boolean;
-  onChange: (flatView: boolean) => void;
-  count: number;
-}) {
-  const changedSelected = flatView;
-  const allSelected = !flatView;
-  const pill =
-    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-ui font-medium leading-5 transition-colors";
-  const activePill = "bg-muted text-foreground";
-  const idlePill = "text-muted-foreground hover:text-foreground";
-  return (
-    <div role="radiogroup" aria-label="File scope" className="flex shrink-0 items-center gap-1">
-      <button
-        type="button"
-        role="radio"
-        aria-checked={changedSelected}
-        aria-label="Changed"
-        title="Show changed files only"
-        onClick={() => onChange(true)}
-        className={cn(pill, changedSelected ? activePill : idlePill)}
-      >
-        <ListIcon className="size-3.5 shrink-0" />
-        Changed
-        {count > 0 && (
-          <span className="shrink-0 font-normal text-sm text-muted-foreground tabular-nums">
-            {count}
-          </span>
-        )}
-      </button>
-      <button
-        type="button"
-        role="radio"
-        aria-checked={allSelected}
-        aria-label="All"
-        title="Show the full folder tree"
-        onClick={() => onChange(false)}
-        className={cn(pill, allSelected ? activePill : idlePill)}
-      >
-        <FolderTreeIcon className="size-3.5 shrink-0" />
-        All
-      </button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // SearchFilterInput — labeled glob input for "files to include" / "exclude"
 // ---------------------------------------------------------------------------
 
@@ -265,7 +209,6 @@ function SearchFilterInput({
 export function FilesPanel({
   onFileSelect,
   flatView,
-  onFlatViewChange,
   showHidden,
   onShowHiddenChange,
   sort: changedSort,
@@ -321,7 +264,6 @@ export function FilesPanel({
   });
   const workingDir = envQuery.data?.root ?? null;
   const changedFiles = changedQuery.data?.data ?? [];
-  const changedCount = changedFiles.length;
   const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
   ).length;
@@ -432,7 +374,6 @@ export function FilesPanel({
           className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
           onClick={(e) => e.stopPropagation()}
         >
-          <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
@@ -452,7 +393,6 @@ export function FilesPanel({
       {!flatView && (
         <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-            <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
