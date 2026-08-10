@@ -35,6 +35,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ResourceEventData,
+    SessionElicitation,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -1786,6 +1787,113 @@ async def _resolve_elicitation(
     return ElicitationResolutionOutcome(
         harness_future_resolved=harness_future_resolved,
         forward_outcome=forward_outcome,
+    )
+
+
+@dataclass(frozen=True)
+class DurableElicitationResolution:
+    """
+    Result of :func:`_resolve_elicitation_durably` — the shared OMN-104
+    durable-write sequence layered on top of :func:`_resolve_elicitation`.
+
+    :param outcome: The underlying :func:`_resolve_elicitation` result.
+    :param decision_record: The durable ledger row after the write, or
+        ``None`` when this id has no durable OMN-104 row at all (the
+        pre-OMN-104 no-op contract — an untracked/legacy/cross-session id).
+    :param resolved: ``True`` if this call durably recorded (or found
+        already recorded) a truthful ``session.resumed``.
+    """
+
+    outcome: ElicitationResolutionOutcome
+    decision_record: SessionElicitation | None
+    resolved: bool
+
+
+async def _resolve_elicitation_durably(
+    session_id: str,
+    data: dict[str, Any],
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore | None,
+    *,
+    decided_by: str | None,
+) -> DurableElicitationResolution:
+    """
+    Durably persist a verdict, then resolve it (OMN-104).
+
+    The single sequence — ownership check, durable ``record_decision``
+    BEFORE any attempt to resolve an in-memory Future or reach the
+    runner, then classify and ``record_elicitation_resumed`` on a
+    truthful ack — shared by EVERY entry point that can consume/resolve
+    an elicitation: the dedicated ``.../resolve`` URL endpoint and the
+    generic ``type == "approval"`` branch of ``POST /v1/sessions/{id}
+    /events``. A second entry point bypassing this sequence was exactly
+    the cross-vendor review finding this function exists to close —
+    both must go through here so neither can durably decide (or resume)
+    an elicitation the other doesn't durably record.
+
+    :param session_id: Session/conversation identifier that owns the
+        elicitation, e.g. ``"conv_abc123"``.
+    :param data: Approval payload carrying ``elicitation_id`` plus the
+        MCP ``ElicitationResult`` fields (``action``, optional
+        ``content``).
+    :param runner_router: Router used to resolve the session's bound
+        runner for the forward, or ``None`` in in-process setups.
+    :param conversation_store: Optional store used to mirror the
+        resolved signal into ancestor streams.
+    :param decided_by: Manager identity from a signed callback, or
+        ``None`` for a web-UI/generic-event verdict.
+    :returns: The durable resolution result — see
+        :class:`DurableElicitationResolution`.
+    """
+    elicitation_id = data.get("elicitation_id", "")
+    existing_elicitation = (
+        session_outbox.get_elicitation(elicitation_id)
+        if isinstance(elicitation_id, str) and elicitation_id
+        else None
+    )
+    owned_by_this_session = (
+        existing_elicitation is not None and existing_elicitation.session_id == session_id
+    )
+    # Durably persist the verdict FIRST, unconditionally (once ownership is
+    # established) — before any attempt to resolve an in-memory Future or
+    # reach the runner. This is what lets the classification below
+    # distinguish "durably recorded but not yet consumed" from "silently
+    # dropped" after a restart (OMN-104 §5.4).
+    decision_record = (
+        session_outbox.record_decision(
+            elicitation_id=elicitation_id,
+            decision={k: v for k, v in data.items() if k != "elicitation_id"},
+            decided_by=decided_by,
+        )
+        if owned_by_this_session
+        else None
+    )
+    outcome = await _resolve_elicitation(session_id, data, runner_router, conversation_store)
+    if decision_record is None:
+        # No durable OMN-104 ledger row for this id — either the feature
+        # isn't wired, or (the common case for these shared entry points)
+        # the id was never registered via record_elicitation_raised / is
+        # already resolved / is unknown. Preserve the pre-OMN-104 no-op
+        # contract exactly rather than treating an always-harmless call
+        # as a fresh classification.
+        return DurableElicitationResolution(outcome=outcome, decision_record=None, resolved=False)
+    if decision_record.status in ("delivered_to_runner", "expired"):
+        # Already truthfully resumed (by an earlier call, or by reconnect
+        # redelivery) — idempotent no-op, not a fresh classification.
+        return DurableElicitationResolution(
+            outcome=outcome, decision_record=decision_record, resolved=True
+        )
+    resolved = outcome.harness_future_resolved or outcome.forward_outcome == "delivered"
+    if resolved:
+        # Truthful acknowledgement achieved synchronously (either an
+        # in-process Future was set, or the runner's own handler ran
+        # pending_approvals.resolve(...) and returned 2xx) — emit
+        # session.resumed now.
+        session_outbox.record_elicitation_resumed(
+            workspace_id=current_workspace_id(), elicitation_id=elicitation_id
+        )
+    return DurableElicitationResolution(
+        outcome=outcome, decision_record=decision_record, resolved=resolved
     )
 
 
@@ -6019,6 +6127,26 @@ async def _relay_runner_stream_once(
                                 },
                             }
                     if evt_type == "response.elicitation_request":
+                        # Durable elicitation ledger + session.awaiting_decision
+                        # outbox row (OMN-104), written before publish. This is
+                        # the harness-subprocess ctx.elicit() path (generic
+                        # scaffold-backed harnesses) relayed here from the
+                        # runner — distinct from _publish_and_wait_for_
+                        # harness_elicitation's claude-native/codex-native
+                        # hook contract, which never reaches this relay loop.
+                        _relay_elicitation_id = event.get("elicitation_id")
+                        _relay_params = event.get("params")
+                        if (
+                            isinstance(_relay_elicitation_id, str)
+                            and _relay_elicitation_id
+                            and isinstance(_relay_params, dict)
+                        ):
+                            session_outbox.record_elicitation_raised(
+                                workspace_id=current_workspace_id(),
+                                session_id=session_id,
+                                elicitation_id=_relay_elicitation_id,
+                                request=_relay_params,
+                            )
                         session_stream.publish(session_id, event)
                         await asyncio.to_thread(
                             _publish_elicitation_request_to_ancestors,
@@ -6247,6 +6375,17 @@ async def _register_policy_elicitation(
     # runner which resolves it. No server-side state needed.
     _elicit_event = build_elicitation_request_event(
         elicitation_id, elicitation, session_id=session_id
+    )
+    # Durable elicitation ledger + session.awaiting_decision outbox row
+    # (OMN-104), written before publish — this is the policy/cost-ASK
+    # path (relay tool-call gate and MCP tools/call gate both funnel
+    # through here), the primary real-world elicitation type for the
+    # runner's pending_approvals registry.
+    session_outbox.record_elicitation_raised(
+        workspace_id=current_workspace_id(),
+        session_id=session_id,
+        elicitation_id=elicitation_id,
+        request=_elicit_event["params"],
     )
     session_stream.publish(session_id, _elicit_event)
     await asyncio.to_thread(
@@ -9187,6 +9326,7 @@ __all__ = [
     "_register_policy_elicitation",
     "_relay_runner_stream",
     "_resolve_elicitation",
+    "_resolve_elicitation_durably",
     "_run_managed_launch",
     "_run_managed_wake",
     "_runner_reject_detail",

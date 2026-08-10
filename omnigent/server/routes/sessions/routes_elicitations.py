@@ -12,13 +12,11 @@ from fastapi import (
     Request,
 )
 
-from omnigent.db.db_models import current_workspace_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     pending_elicitations,
 )
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import session_outbox
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -47,7 +45,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
 )
 from omnigent.server.routes._sessions.orchestration import (
-    _resolve_elicitation,
+    _resolve_elicitation_durably,
 )
 from omnigent.server.schemas import (
     ElicitationResult,
@@ -137,33 +135,16 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        # Ownership check on the DURABLE ledger, mirroring the in-memory
-        # ownership guard inside _resolve_elicitation (_harness_elicitation_owners):
-        # a session must not durably decide an elicitation it doesn't own.
-        # A cross-session id is treated exactly like an untracked one below
-        # — the call is accepted (202) but nothing is persisted or
-        # classified, matching the pre-OMN-104 no-op contract.
-        existing_elicitation = session_outbox.get_elicitation(elicitation_id)
-        owned_by_this_session = (
-            existing_elicitation is not None and existing_elicitation.session_id == session_id
+        # The shared OMN-104 durable sequence (ownership check, durable
+        # record_decision BEFORE any attempt to resolve an in-memory Future
+        # or reach the runner, then classify + record_elicitation_resumed
+        # on a truthful ack) — also used by the generic ``approval`` event
+        # branch of POST /v1/sessions/{id}/events, so both entry points
+        # that can resolve an elicitation go through identical durability.
+        durable = await _resolve_elicitation_durably(
+            session_id, _resolve_data, runner_router, conversation_store, decided_by=user_id
         )
-        # Durably persist the verdict FIRST, unconditionally (once
-        # ownership is established) — before any attempt to resolve an
-        # in-memory Future or reach the runner. This is what lets the
-        # classification below distinguish "durably recorded but not yet
-        # consumed" from "silently dropped" after a restart (OMN-104 §5.4).
-        decision_record = (
-            session_outbox.record_decision(
-                elicitation_id=elicitation_id,
-                decision=body.model_dump(exclude_none=True),
-                decided_by=user_id,
-            )
-            if owned_by_this_session
-            else None
-        )
-        outcome = await _resolve_elicitation(
-            session_id, _resolve_data, runner_router, conversation_store
-        )
+        decision_record = durable.decision_record
         if decision_record is None:
             # No durable OMN-104 ledger row for this id — either the feature
             # isn't wired, or (the common case for this shared endpoint) the
@@ -185,17 +166,9 @@ def register_elicitations_routes(
                 session_id, conv, conversation_store, agent_store, _resolve_data
             )
             return {"queued": False, "resolved": True, "pending_redelivery": False}
-        resolved = outcome.harness_future_resolved or outcome.forward_outcome == "delivered"
+        resolved = durable.resolved
         pending_redelivery = False
-        if resolved:
-            # Truthful acknowledgement achieved synchronously (either an
-            # in-process Future was set, or the runner's own handler ran
-            # pending_approvals.resolve(...) and returned 2xx) — emit
-            # session.resumed now.
-            session_outbox.record_elicitation_resumed(
-                workspace_id=current_workspace_id(), elicitation_id=elicitation_id
-            )
-        else:
+        if not resolved:
             # Not resolved synchronously. Classify by whether the runner is
             # believed alive at all (cross-replica, DB-backed freshness —
             # not this replica's local tunnel registry, which a manager's

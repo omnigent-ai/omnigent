@@ -14,6 +14,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import (
     ErrorData,
     NewConversationItem,
@@ -35,7 +36,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, session_outbox
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -178,7 +179,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_session_usage,
     _persist_host_launch_failure_turn,
     _persist_native_terminal_failure,
-    _resolve_elicitation,
+    _resolve_elicitation_durably,
     _wait_for_host_bound_runner_client,
 )
 from omnigent.server.schemas import (
@@ -674,13 +675,18 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
-            # Deliver the verdict through the shared resolver: it
-            # sets any server-side harness Future (owner-checked),
-            # clears the sidebar badge, and forwards
-            # to the runner for runner-side (policy) elicitations.
+            # Deliver the verdict through the shared durable resolver: it
+            # durably records the decision, sets any server-side harness
+            # Future (owner-checked), clears the sidebar badge, forwards
+            # to the runner for runner-side (policy) elicitations, and
+            # durably records session.resumed on a truthful ack (OMN-104).
             # The dedicated URL endpoint (``.../elicitations/{eid}/
-            # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            # resolve``) routes through the same helper — this generic
+            # events path must not be a second, less-durable way to
+            # consume/resolve the same elicitation.
+            await _resolve_elicitation_durably(
+                session_id, body.data, runner_router, conversation_store, decided_by=user_id
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
@@ -710,6 +716,18 @@ def register_events_routes(
                 params=elicit_params,
             )
             _mcp_elicit_payload = event.model_dump()
+            # Durable elicitation ledger + session.awaiting_decision outbox
+            # row (OMN-104), written before publish. This is an external
+            # MCP server's own elicitation/create request relayed through
+            # the generic events endpoint — distinct from both the
+            # Omnigent-internal policy ASK gate and the harness-subprocess
+            # ctx.elicit() relay, and previously had no durable write at all.
+            session_outbox.record_elicitation_raised(
+                workspace_id=current_workspace_id(),
+                session_id=session_id,
+                elicitation_id=elicit_id,
+                request=elicit_params.model_dump(exclude_none=True),
+            )
             from omnigent.server.routes import sessions as _sessions_facade
 
             _sessions_facade.session_stream.publish(session_id, _mcp_elicit_payload)
