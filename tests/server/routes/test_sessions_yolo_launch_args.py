@@ -1,13 +1,14 @@
 """Unit tests for native-worker YOLO ``terminal_launch_args`` derivation.
 
 Nessie's native sub-agent workers (claude-native / codex-native /
-cursor-native) launch in a headless pane where no human can answer an
-approval prompt. The server translates a worker's bypass stance into the
-per-session ``terminal_launch_args`` the runner appends to the native
-CLI argv: claude-native opts in via ``permission_mode``, while
-codex-native and cursor-native default to full bypass (issue #171 /
-cursor ``--yolo``) because the headless seam has no safe non-bypass
-default, with ``yolo: false`` as the opt-out.
+cursor-native / antigravity-native) launch in a headless pane where no
+human can answer an approval prompt. The server translates a worker's
+bypass stance into the per-session ``terminal_launch_args`` the runner
+appends to the native CLI argv: claude-native opts in via
+``permission_mode``, while codex-native, cursor-native, and
+antigravity-native default to full bypass (issue #171 / cursor ``--yolo``
+/ agy ``--dangerously-skip-permissions``) because the headless seam has
+no safe non-bypass default, with ``yolo: false`` as the opt-out.
 
 These tests exercise the pure translation helper
 ``_derive_terminal_launch_args_from_spec`` directly with real
@@ -177,6 +178,45 @@ def test_cursor_native_permission_mode_auto_uses_auto_review() -> None:
     assert _derive_terminal_launch_args_from_spec(spec) == ["--auto-review"]
 
 
+def test_antigravity_native_defaults_to_skip_permissions_flag() -> None:
+    """
+    A headless antigravity-native sub-agent defaults to skip-permissions.
+
+    Batcave/polly agy workers launch where neither the human nor the parent
+    orchestrator can answer agy's ``request-review`` prompts in-band. Without
+    ``--dangerously-skip-permissions`` the worker stalls on every tool call —
+    the same headless seam that forced codex/cursor's default bypass.
+    """
+    agy = _spec_with_config({"harness": "antigravity-native"})
+    assert _derive_terminal_launch_args_from_spec(agy) == [
+        "--dangerously-skip-permissions",
+    ]
+
+
+def test_antigravity_native_yolo_true_translates_to_skip_permissions_flag() -> None:
+    """
+    antigravity-native + ``yolo`` (string ``"True"``) -> skip-permissions.
+
+    The spec parser stringifies ``yolo: true`` into ``"True"``, so this is
+    the value the server actually sees in production.
+    """
+    spec = _spec_with_config({"harness": "antigravity-native", "yolo": "True"})
+    assert _derive_terminal_launch_args_from_spec(spec) == [
+        "--dangerously-skip-permissions",
+    ]
+
+
+def test_antigravity_native_yolo_false_opts_out() -> None:
+    """
+    ``yolo: false`` keeps antigravity-native prompting (no launch args).
+
+    Explicit opt-out for bundles that want agy's native request-review
+    prompts mirrored to the web UI instead of auto-bypass.
+    """
+    spec = _spec_with_config({"harness": "antigravity-native", "yolo": "False"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
 @pytest.mark.parametrize(
     "harness",
     ["claude-sdk", "codex", "openai-agents", "cursor"],
@@ -185,7 +225,7 @@ def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
     """
     Non-native harnesses never get terminal args, even with bypass fields.
 
-    ``terminal_launch_args`` is a native-terminal (claude/codex/cursor TUI)
+    ``terminal_launch_args`` is a native-terminal (claude/codex/cursor/agy TUI)
     concept; a claude-sdk / cursor-sdk worker sets bypass via the SDK
     permission mode spawn env, not a CLI flag. Translating these fields for
     a non-native harness would emit a flag the runner has no terminal to
