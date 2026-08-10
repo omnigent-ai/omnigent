@@ -1,7 +1,7 @@
 """add session_lifecycle_outbox, session_lifecycle_cursors, session_elicitations
 
 Revision ID: a8b9c0d1e2f3
-Revises: f7a8b9c0d1e2
+Revises: d5e9f1a2b3c4
 Create Date: 2026-08-10 00:00:00.000000
 
 Adds the durable-session-lifecycle-push tables (OMN-104): a transactional
@@ -28,7 +28,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "a8b9c0d1e2f3"
-down_revision: str | None = "f7a8b9c0d1e2"
+down_revision: str | None = "d5e9f1a2b3c4"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

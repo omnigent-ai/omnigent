@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
-_PREVIOUS_HEAD = "f7a8b9c0d1e2"
+_PREVIOUS_HEAD = "d5e9f1a2b3c4"
 _HEAD = "a8b9c0d1e2f3"
 
 _HEX16 = "00" * 16  # 16 raw bytes = 32 hex chars, a valid Uuid16 literal
