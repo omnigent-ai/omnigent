@@ -1718,11 +1718,17 @@ async def _execute_subagent_tool(
 
     # Named mode: (agent, title) spawn-or-continue.
     sub_agent_name = args.get("agent")
-    session_name = args.get("title")
+    llm_title_hint = args.get("title")
     if not isinstance(sub_agent_name, str) or not sub_agent_name:
         return "Error: sys_session_send requires 'agent' (or 'session_id')"
-    if not session_name or not isinstance(session_name, str):
-        return "Error: sys_session_send requires non-empty 'title' string"
+    if llm_title_hint is not None and not isinstance(llm_title_hint, str):
+        llm_title_hint = None
+
+    # When the LLM provides a title that matches an existing child's
+    # session_name (e.g. the structured name from a prior handle), use
+    # it for spawn-or-continue. Otherwise auto-generate a structured
+    # name below.
+    session_name: str | None = llm_title_hint if llm_title_hint else None
 
     # Verify the sub-agent exists in the parent spec.
     if not _has_subagent(sub_agent_name, agent_spec):
@@ -1752,14 +1758,17 @@ async def _execute_subagent_tool(
     if parent_agent_id is None:
         return "Error: cannot resolve parent agent_id for sub-agent dispatch"
 
-    existing = await _find_existing_child_session(
-        server_client=server_client,
-        conversation_id=conversation_id,
-        agent=str(sub_agent_name),
-        title=session_name,
-    )
-    if isinstance(existing, str):
-        return existing
+    # If the LLM provided a title, try to find an existing child.
+    existing: _JsonObject | str | None = None
+    if session_name:
+        existing = await _find_existing_child_session(
+            server_client=server_client,
+            conversation_id=conversation_id,
+            agent=str(sub_agent_name),
+            title=session_name,
+        )
+        if isinstance(existing, str):
+            return existing
     created_child = False
     child_wrapper_label: str | None = None
     if existing is not None:
@@ -1816,6 +1825,22 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        # Auto-generate a structured session name (e.g. "researcher-1").
+        # Recover ordinals from existing children on first spawn after
+        # runner restart to avoid duplicates.
+        _all_children = await _list_child_sessions(
+            server_client=server_client,
+            conversation_id=conversation_id,
+            tool=str(sub_agent_name),
+        )
+        if not isinstance(_all_children, str):
+            _runner_app.recover_subagent_ordinals(
+                conversation_id, str(sub_agent_name), _all_children,
+            )
+        ordinal = _runner_app.next_subagent_ordinal(
+            conversation_id, str(sub_agent_name),
+        )
+        session_name = f"{sub_agent_name}-{ordinal}"
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -1959,6 +1984,18 @@ async def _execute_subagent_tool(
                     child_session_id,
                     exc_info=True,
                 )
+
+        # Store the LLM's semantic title hint as a label so the
+        # background display-name generator can use it as context.
+        if llm_title_hint:
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{child_session_id}/labels",
+                    json={"omnigent.subagent.hint": llm_title_hint},
+                    timeout=10.0,
+                )
+            except httpx.HTTPError:
+                pass
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the

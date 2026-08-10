@@ -842,6 +842,22 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_display_name(
+        self,
+        conversation_id: str,
+        display_name: str,
+    ) -> Conversation | None:
+        """Set a human-readable display name on a sub-agent conversation.
+
+        :param conversation_id: Conversation to update.
+        :param display_name: Short task-derived label, e.g.
+            ``"Investigate auth token refresh"``.
+        :returns: The updated conversation, or ``None`` when the row
+            does not exist.
+        """
+        ...
+
+    @abstractmethod
     def set_labels(
         self,
         conversation_id: str,

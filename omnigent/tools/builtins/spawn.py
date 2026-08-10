@@ -228,15 +228,13 @@ def _build_sys_session_send_schema(
             "title": {
                 "type": "string",
                 "description": (
-                    "Named mode: a unique-within-this-parent "
-                    "task-based identity for the sub-agent session, "
-                    "e.g. 'auth' or 'payments'. Reusing it in a later "
-                    "sys_session_send call continues the same "
-                    "conversation. Every independent parallel call "
-                    "for the same agent must use a distinct title; "
-                    "reusing a title cannot start another concurrent "
-                    "turn. Pair with 'agent'; omit when using "
-                    "'session_id'."
+                    "Named mode: optional semantic hint for the "
+                    "sub-agent session (e.g. 'auth' or 'payments'). "
+                    "A structured name (e.g. 'researcher-1') is "
+                    "auto-assigned and returned in the response "
+                    "handle — use that name or 'session_id' to "
+                    "continue the same session. Pair with 'agent'; "
+                    "omit when using 'session_id'."
                 ),
             },
         }

@@ -808,6 +808,7 @@ class ChildSessionSummary(BaseModel):
     object: str = "child_session"
     parent_session_id: str
     title: str | None = None
+    display_name: str | None = None
     tool: str | None = None
     session_name: str | None = None
     kind: str = "sub_agent"

@@ -112,6 +112,7 @@ class BackgroundSessionTitleCoordinator:
         self._generation_slots = asyncio.Semaphore(max_concurrency)
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
+        self._scheduled_display_name_ids: set[str] = set()
 
     def schedule(
         self,
@@ -147,6 +148,41 @@ class BackgroundSessionTitleCoordinator:
         def _discard(completed: asyncio.Task[None]) -> None:
             self._pending.discard(completed)
             self._scheduled_session_ids.discard(session_id)
+
+        task.add_done_callback(_discard)
+
+    def schedule_display_name(
+        self,
+        *,
+        session_id: str,
+        prompt: str,
+        agent_id: str | None = None,
+        harness_override: str | None = None,
+        model_override: str | None = None,
+        sub_agent_name: str | None = None,
+    ) -> None:
+        """Schedule a display-name attempt for a child session."""
+        if session_id in self._scheduled_display_name_ids:
+            return
+        self._scheduled_display_name_ids.add(session_id)
+        task = asyncio.create_task(
+            self._run_display_name(
+                request=BackgroundTitleRequest(
+                    session_id=session_id,
+                    prompt=prompt,
+                    agent_id=agent_id,
+                    harness_override=harness_override,
+                    model_override=model_override,
+                    sub_agent_name=sub_agent_name,
+                ),
+            ),
+            name=f"background-display-name-{session_id}",
+        )
+        self._pending.add(task)
+
+        def _discard(completed: asyncio.Task[None]) -> None:
+            self._pending.discard(completed)
+            self._scheduled_display_name_ids.discard(session_id)
 
         task.add_done_callback(_discard)
 
@@ -220,6 +256,55 @@ class BackgroundSessionTitleCoordinator:
         except Exception:  # noqa: BLE001 - background metadata must never fail the user turn
             _logger.warning(
                 "background session title failed session=%s elapsed_ms=%.1f",
+                request.session_id,
+                (time.perf_counter() - started) * 1000,
+                exc_info=True,
+            )
+
+    async def _run_display_name(
+        self,
+        *,
+        request: BackgroundTitleRequest,
+    ) -> None:
+        """Generate a display name for a child session and write it to display_name."""
+        started = time.perf_counter()
+        try:
+            async with self._generation_slots:
+                generated = await asyncio.wait_for(
+                    self._generator(request),
+                    timeout=self._timeout_seconds,
+                )
+            title = normalize_background_title(generated)
+            if title is None:
+                _logger.info(
+                    "background display name skipped session=%s "
+                    "reason=invalid_title elapsed_ms=%.1f",
+                    request.session_id,
+                    (time.perf_counter() - started) * 1000,
+                )
+                return
+            updated = await asyncio.to_thread(
+                self._conversation_store.set_display_name,
+                request.session_id,
+                title,
+            )
+            _logger.info(
+                "background display name completed session=%s set=%s elapsed_ms=%.1f",
+                request.session_id,
+                updated is not None,
+                (time.perf_counter() - started) * 1000,
+            )
+        except TimeoutError:
+            _logger.info(
+                "background display name timed out session=%s elapsed_ms=%.1f",
+                request.session_id,
+                (time.perf_counter() - started) * 1000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "background display name failed session=%s elapsed_ms=%.1f",
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
                 exc_info=True,
@@ -305,7 +390,26 @@ def prepare_background_session_title(
     )
 
 
-def _background_title_prompt(event: SessionEventInput) -> str:
+def schedule_background_child_display_name(
+    *,
+    coordinator: BackgroundSessionTitleCoordinator | None,
+    session_id: str,
+    prompt: str,
+    agent_id: str | None = None,
+    sub_agent_name: str | None = None,
+) -> None:
+    """Schedule a background display-name attempt for a child session."""
+    if coordinator is None or not prompt:
+        return
+    coordinator.schedule_display_name(
+        session_id=session_id,
+        prompt=prompt,
+        agent_id=agent_id,
+        sub_agent_name=sub_agent_name,
+    )
+
+
+def background_title_prompt(event: SessionEventInput) -> str:
     if event.type == "slash_command":
         name = event.data.get("name")
         arguments = event.data.get("arguments", "")
