@@ -406,6 +406,32 @@ def run_uv_lock(src: Path) -> None:
         env=env,
         check=True,
     )
+    _normalize_generated_lock(src / "uv.lock")
+
+
+def _normalize_generated_lock(lock_path: Path) -> None:
+    """Rewrite any non-public registry/wheel URLs in the generated lock.
+
+    A machine-level uv config with ``default = true`` overrides
+    ``--index-url``, so uv can bake a private mirror host into the
+    lock's ``registry`` and direct ``url`` entries. Those are not
+    resolvable from the Databricks Apps build runtime. Reuse the repo's
+    canonical normalizer to rewrite them back to public PyPI so the
+    deployed lock is always fetchable.
+
+    :param lock_path: The generated ``src/uv.lock`` to normalize in place.
+    """
+    sys.path.insert(0, str(_repo_root() / "scripts"))
+    try:
+        from normalize_uv_lock_registry import non_canonical_entries, normalize_text
+    finally:
+        sys.path.pop(0)
+
+    original = lock_path.read_text()
+    if not non_canonical_entries(original):
+        return
+    lock_path.write_text(normalize_text(original))
+    _log(f"normalized proxy URLs in {lock_path.name} to public PyPI")
 
 
 def write_uv_dependency_files(
