@@ -169,6 +169,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _MODEL_TOKEN_KEYS,
     _NATIVE_POLICY_NOT_ENFORCED_CODE,
     _NATIVE_TERMINAL_ENSURE_FAILED_CODE,
+    _PENDING_APPROVAL_RESOLVED_HEADER,
     _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RUNNER_CONVICTION_POLL_S,
     _RUNNER_FORWARD_TIMEOUT,
@@ -2657,7 +2658,7 @@ async def _forward_approval_to_runner(
     session_id: str,
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
-) -> Literal["no_runner", "delivered", "unreachable"]:
+) -> Literal["no_runner", "delivered", "not_consumed", "unreachable"]:
     """
     Forward an approval verdict to the session's bound runner.
 
@@ -2682,11 +2683,24 @@ async def _forward_approval_to_runner(
         replica — not itself proof the runner is dead, see OMN-104's
         harness-classified elicitation resolution, which additionally
         consults the cross-replica ``runner_last_seen`` freshness signal
-        before concluding a runner is unreachable); ``"delivered"`` on a
-        2xx response (the runner's own handler ran
-        ``pending_approvals.resolve(...)`` — a truthful acknowledgement,
-        not just "accepted"); ``"unreachable"`` on a transport error or a
-        non-2xx response.
+        before concluding a runner is unreachable); ``"delivered"`` when
+        EITHER of two independent truthful-consumption signals fires:
+        the runner's response carries
+        ``X-Omnigent-Pending-Approval-Resolved: true`` (its own
+        ``pending_approvals.resolve(...)`` call found and resolved a
+        tracked Future — the policy/cost-ASK elicitation path), OR the
+        response is 2xx (the runner unconditionally also forwards the
+        same event to the harness subprocess, whose own
+        ``_resolve_elicitation`` raises 404 for any id that isn't a
+        genuinely outstanding ``ctx.elicit()`` Future — see
+        ``ErrorCode.NOT_FOUND`` -> 404 — so a 2xx from that forward is
+        itself already truthful for the harness-native elicitation path).
+        Consuming either signal alone is sufficient: an unknown, stale,
+        or already-resolved ``elicitation_id`` cannot satisfy either one,
+        since ``pending_approvals.resolve()`` only returns ``True`` for a
+        tracked Future and the harness only returns 2xx for a genuine
+        ``_in_flight`` match. That case returns ``"not_consumed"``.
+        ``"unreachable"`` on a transport error.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
@@ -2703,8 +2717,23 @@ async def _forward_approval_to_runner(
             session_id,
         )
         return "unreachable"
-    if 200 <= response.status_code < 300:
+    if response.headers.get(_PENDING_APPROVAL_RESOLVED_HEADER) == "true":
         return "delivered"
+    if 200 <= response.status_code < 300:
+        # The runner's outer 2xx here — without the header — reflects the
+        # harness-native ctx.elicit() path: the runner unconditionally
+        # also forwards this event to the harness subprocess, whose own
+        # _resolve_elicitation raises 404 (ErrorCode.NOT_FOUND) for any id
+        # that isn't a genuinely outstanding Future, so a 2xx here is
+        # itself already truthful — not a bare "reached the runner".
+        return "delivered"
+    if response.status_code == 404:
+        _logger.info(
+            "Approval forward for %r reached the runner but was not truthfully "
+            "consumed (unknown/stale/already-resolved elicitation)",
+            session_id,
+        )
+        return "not_consumed"
     _logger.warning(
         "Approval forward for %r rejected by runner: %s",
         session_id,

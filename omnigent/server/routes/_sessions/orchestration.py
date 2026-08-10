@@ -1663,7 +1663,7 @@ class ElicitationResolutionOutcome:
     """
 
     harness_future_resolved: bool
-    forward_outcome: Literal["no_runner", "delivered", "unreachable"]
+    forward_outcome: Literal["no_runner", "delivered", "not_consumed", "unreachable"]
 
 
 async def _resolve_elicitation(

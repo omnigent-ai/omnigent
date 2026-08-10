@@ -85,6 +85,38 @@ def test_verify_rejects_tampered_body() -> None:
     )
 
 
+def test_verify_rejects_missing_signature() -> None:
+    """An empty/absent ``X-Omnigent-Signature`` header must not verify.
+
+    Distinct from "tampered" (a syntactically-shaped but wrong signature) —
+    this is what a receiver sees when the header is missing entirely, e.g.
+    ``request.headers.get("X-Omnigent-Signature", "")``. The acceptance
+    contract requires both missing AND invalid HMAC rejection.
+    """
+    now = 1_800_000_000
+    assert not signing.verify(
+        signature_header="",
+        timestamp=now,
+        event_id="evt1",
+        raw_json_body="{}",
+        now=now,
+        secrets=["s3cr3t"],
+    )
+
+
+def test_verify_rejects_malformed_signature_header() -> None:
+    """A present but malformed header (wrong prefix/shape) must not verify."""
+    now = 1_800_000_000
+    assert not signing.verify(
+        signature_header="not-a-real-signature",
+        timestamp=now,
+        event_id="evt1",
+        raw_json_body="{}",
+        now=now,
+        secrets=["s3cr3t"],
+    )
+
+
 def test_verify_rejects_tampered_event_id() -> None:
     now = 1_800_000_000
     signature = signing.sign(secret="s3cr3t", timestamp=now, event_id="evt1", raw_json_body="{}")

@@ -210,10 +210,30 @@ def register_elicitations_routes(
                 conversation_store.get_session_connectivity, [session_id]
             )
             conn = connectivity.get(session_id)
-            runner_alive = (
+            now = time.time()
+            # a632550e's reconnect grace clears runner_last_seen the INSTANT
+            # a runner disconnects — well before the grace it also grants
+            # that same runner actually expires. Without this check, a
+            # decision arriving inside that window would see stale
+            # liveness and be misclassified as "runner dead" even though
+            # the runner is very likely still alive and about to
+            # reconnect. Consult the grace-pending marker FIRST (this
+            # replica's own view, mirroring the tunnel registry it's
+            # derived from) before falling back to the cross-replica
+            # freshness signal, which is only meaningful once the grace
+            # has genuinely elapsed with no reconnect.
+            grace_deadlines: dict[str, float] = getattr(
+                request.app.state, "runner_disconnect_grace_deadline", {}
+            )
+            runner_in_disconnect_grace = (
                 conn is not None
                 and conn.runner_id is not None
-                and runner_seen_is_fresh(conn.runner_last_seen, now=int(time.time()))
+                and grace_deadlines.get(conn.runner_id, 0.0) > now
+            )
+            runner_alive = runner_in_disconnect_grace or (
+                conn is not None
+                and conn.runner_id is not None
+                and runner_seen_is_fresh(conn.runner_last_seen, now=int(now))
             )
             if runner_alive:
                 pending_redelivery = True

@@ -55,6 +55,17 @@ _INTERRUPT_TYPE: str = "interrupt"
 _APPROVAL_TYPE: str = "approval"
 
 
+# OMN-104 §5.4: header the runner stamps on its POST /v1/sessions/{id}/events
+# response to an "approval" event, carrying whether pending_approvals.resolve()
+# found and resolved a tracked Future — a 2xx alone is not truthful consumption
+# (it also fires for an unknown/stale/already-resolved elicitation_id). Must
+# match omnigent/runner/app.py's _PENDING_APPROVAL_RESOLVED_HEADER — the
+# server and runner are separate deployable units (no shared import), so this
+# wire-protocol constant is duplicated across the boundary like _APPROVAL_TYPE
+# itself (runner/app.py checks the bare string "approval" directly).
+_PENDING_APPROVAL_RESOLVED_HEADER: str = "X-Omnigent-Pending-Approval-Resolved"
+
+
 _MCP_ELICITATION_TYPE: str = "mcp_elicitation"
 
 

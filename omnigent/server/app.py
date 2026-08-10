@@ -62,7 +62,10 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
-from omnigent.server.routes._sessions.common import _APPROVAL_TYPE
+from omnigent.server.routes._sessions.common import (
+    _APPROVAL_TYPE,
+    _PENDING_APPROVAL_RESOLVED_HEADER,
+)
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -87,6 +90,7 @@ from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.server_config import manager_webhook_config
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -945,6 +949,14 @@ def create_app(
     # dispatcher task below and session_outbox.configure() (called
     # synchronously further down in create_app) share the same instance.
     session_lifecycle_store = SqlAlchemySessionLifecycleStore(conversation_store.storage_location)
+    # Fail closed at boot, not lazily: manager_webhook_dispatcher re-checks
+    # this same config every idle cycle and just logs+idles on
+    # ManagerWebhookConfigError (a config file edited to a bad state after
+    # boot must not crash a running server) — but an operator who enables
+    # the webhook with a bad config from the start deserves an immediate,
+    # loud startup failure, not a server that appears to boot fine and then
+    # silently never delivers anything.
+    manager_webhook_config()
 
     @asynccontextmanager
     async def _lifespan(
@@ -2107,12 +2119,28 @@ def create_app(
     # sleep-wake reconnects) that re-register within the grace never
     # flap their sessions to failed.
     _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+    # OMN-104 §5.4: runner_id -> epoch-seconds deadline while a runner is
+    # inside its disconnect grace (mirrors _disconnect_grace_tasks, kept
+    # separately so it survives being read from a different module).
+    # session_live_state.clear_runner_liveness() nulls runner_last_seen
+    # IMMEDIATELY on disconnect (not after the grace) — so a decision
+    # arriving mid-grace would otherwise see stale liveness and be
+    # misclassified as "runner dead" (410) even though the runner is very
+    # likely about to reconnect. Exposed via app.state so the decision
+    # endpoint (a different module) can consult it before falling back to
+    # the cross-replica runner_last_seen freshness check. Per-replica, like
+    # the tunnel registry and _disconnect_grace_tasks themselves — this is
+    # not a downgrade from the existing per-replica-only mechanisms it
+    # complements.
+    _runner_disconnect_grace_deadline: dict[str, float] = {}
+    app.state.runner_disconnect_grace_deadline = _runner_disconnect_grace_deadline
 
     def _cancel_disconnect_grace(runner_id: str) -> None:
         """Cancel and forget the pending disconnect-grace timer, if any."""
         pending = _disconnect_grace_tasks.pop(runner_id, None)
         if pending is not None and not pending.done():
             pending.cancel()
+        _runner_disconnect_grace_deadline.pop(runner_id, None)
 
     async def _mark_disconnected_runner_failed(runner_id: str) -> None:
         """Reconcile a dropped runner's sessions once the grace expires.
@@ -2137,7 +2165,18 @@ def create_app(
                 "Runner %s reconnected within the disconnect grace; skipping offline-marking",
                 runner_id,
             )
+            # Defensive: _on_runner_connect already clears this on reconnect;
+            # clearing here too covers any ordering where this timer's
+            # live-tunnel check observes the reconnect before that handler's
+            # own clear runs.
+            _runner_disconnect_grace_deadline.pop(runner_id, None)
             return
+        # Grace expired with no reconnect: the runner is now CONFIRMED dead,
+        # not merely presumed — clear the grace-pending marker so decision
+        # classification correctly falls through to the (now genuinely
+        # stale) runner_last_seen freshness check instead of treating this
+        # runner as still-possibly-reconnecting.
+        _runner_disconnect_grace_deadline.pop(runner_id, None)
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -2210,6 +2249,14 @@ def create_app(
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
+        from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+        # OMN-104 §5.4: mark this runner as grace-pending (not confirmed
+        # dead) for the same duration the failed-marking timer waits, so a
+        # decision arriving in this window is classified as "pending
+        # redelivery", not "runner dead" — see _runner_disconnect_grace_deadline
+        # above and its consumer in routes_elicitations.py.
+        _runner_disconnect_grace_deadline[runner_id] = time.time() + RUNNER_DISCONNECT_GRACE_S
         task = asyncio.create_task(
             _mark_disconnected_runner_failed(runner_id),
             name=f"runner-disconnect-grace-{runner_id}",
@@ -2283,6 +2330,11 @@ def create_app(
         # Stamp liveness immediately so other replicas see the runner
         # online before the first periodic sweep.
         session_live_state.touch_runner_liveness([runner_id])
+        # The runner is back — it's no longer merely "presumed alive
+        # pending grace expiry"; clear the grace-pending marker so decision
+        # classification goes back to the normal runner_seen_is_fresh path
+        # (now correctly fresh, per the touch_runner_liveness call above).
+        _runner_disconnect_grace_deadline.pop(runner_id, None)
 
         # Direct by-runner lookup instead of list-everything-and-filter:
         # the listing path may be backed by an eventually-consistent
@@ -2366,14 +2418,29 @@ def create_app(
                         },
                         timeout=10.0,
                     )
-                    if 200 <= response.status_code < 300:
+                    # Truthful consumption is EITHER of two independent
+                    # signals (see helpers.py's _forward_approval_to_runner,
+                    # same contract): the runner's own
+                    # pending_approvals.resolve() header (the policy/cost-ASK
+                    # path), or a bare 2xx (the harness-native ctx.elicit()
+                    # path — the runner unconditionally also forwards this
+                    # event to the harness subprocess, whose own
+                    # _resolve_elicitation 404s for any id that isn't a
+                    # genuine _in_flight match, so a 2xx here is itself
+                    # already truthful, not merely "reached the runner").
+                    # session.resumed must only ever reflect a verdict the
+                    # runner actually consumed via one of these two paths.
+                    if response.headers.get(_PENDING_APPROVAL_RESOLVED_HEADER) == "true" or (
+                        200 <= response.status_code < 300
+                    ):
                         session_outbox.record_elicitation_resumed(
                             workspace_id=undelivered.workspace_id,
                             elicitation_id=undelivered.id,
                         )
                     else:
                         _logger.warning(
-                            "Reconnect redelivery for elicitation %s rejected by runner: %s",
+                            "Reconnect redelivery for elicitation %s not truthfully "
+                            "consumed by runner (status=%s)",
                             undelivered.id,
                             response.status_code,
                         )

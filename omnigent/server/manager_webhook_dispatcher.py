@@ -255,10 +255,12 @@ async def _run_once(
     try:
         config = manager_webhook_config()
     except ManagerWebhookConfigError:
-        # Fails closed at boot (create_app raises before serving traffic if
-        # misconfigured) — a config edited to a bad state after boot is
-        # logged once per cycle and treated as disabled, never crashes the
-        # dispatcher loop.
+        # create_app() already calls manager_webhook_config() once at boot
+        # and lets this same exception type propagate (fail closed before
+        # serving traffic) — so reaching this branch means the config file
+        # was edited into a bad state on disk *after* a successful boot.
+        # A running server must not crash on that; log once per cycle and
+        # treat as disabled until the file is fixed.
         _logger.warning("manager_webhook config invalid; dispatcher idling", exc_info=True)
         return 0
     if not config.enabled or config.endpoint is None:
