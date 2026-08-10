@@ -505,10 +505,7 @@ function FileRowItem({
             // Centred in the shared status column so the A/M/D badge lands in
             // the same x as a directory row's dirty dot.
             <span
-              className={cn(
-                "flex shrink-0 items-center justify-center",
-                ROW_STATUS_SLOT_CLASS,
-              )}
+              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
             >
               <span
                 className={cn(
