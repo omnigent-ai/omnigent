@@ -92,7 +92,8 @@ class OmnigentClient:
             auth=auth,
             timeout=sse_timeout,
             # A proxy cannot reach our loopback server, so bypass the
-            # environment's proxy settings when the target is local.
+            # environment for local targets. Loopback is plain HTTP with
+            # explicit headers, so losing netrc/CA env with it costs nothing.
             trust_env=not is_loopback_url(self._base_url),
         )
 

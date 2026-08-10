@@ -1534,9 +1534,10 @@ async def _prepare_chat_session_via_daemon(
             # AFTER wait_for_runner_online — a freshly launched runner isn't
             # registered until then, and replace_runner_id 400s on an unregistered id.
             await bind_session_runner(client, session_id, runner_id)
-    except httpx.ConnectError as exc:
-        # The server never answered the socket — a stopped local server, a
-        # wrong --server URL, or a proxy that swallowed the request.
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
+        # No connection was ever established — a stopped local server, a wrong
+        # --server URL, or a proxy refusing the tunnel. These three are
+        # siblings under TransportError, so each has to be named.
         raise click.ClickException(_unreachable_server_message(base_url)) from exc
     return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
 

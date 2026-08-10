@@ -75,6 +75,7 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
@@ -589,7 +590,12 @@ async def _prepare_antigravity_terminal(
     :raises click.ClickException: If any server operation fails.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         bridge_id: str
         conversation_id: str
         resume = False
@@ -781,7 +787,12 @@ async def _prepare_antigravity_terminal_via_daemon(
     :raises click.ClickException: If setup fails.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         bridge_id: str
         conversation_id: str
         resume = False
@@ -1612,6 +1623,7 @@ async def _close_antigravity_terminal(
     try:
         async with httpx.AsyncClient(
             base_url=base_url,
+            trust_env=not is_loopback_url(base_url),
             headers=headers,
             timeout=httpx.Timeout(10.0),
         ) as client:

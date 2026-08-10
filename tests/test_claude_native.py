@@ -5908,6 +5908,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
         :param base_url: Omnigent server base URL.
         :param headers: HTTP headers passed by the wrapper.
         :param timeout: Request timeout in seconds.
+        :param trust_env: Whether env proxy settings are honored.
         """
 
         def __init__(
@@ -5916,6 +5917,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             base_url: str,
             headers: dict[str, str],
             timeout: float,
+            trust_env: bool,
         ) -> None:
             """
             Capture construction arguments for later assertions.
@@ -5923,6 +5925,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             :param base_url: Omnigent server base URL.
             :param headers: HTTP headers passed by the wrapper.
             :param timeout: Request timeout in seconds.
+            :param trust_env: Whether env proxy settings are honored.
             :returns: None.
             """
             calls.append(
@@ -5930,6 +5933,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
                     "base_url": base_url,
                     "headers": headers,
                     "timeout": timeout,
+                    "trust_env": trust_env,
                 }
             )
 
@@ -5987,6 +5991,9 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             "base_url": "http://ap.example",
             "headers": {"Authorization": "Bearer token"},
             "timeout": 10.0,
+            # A remote host keeps the environment's proxy — only loopback
+            # targets, which a proxy cannot reach, opt out.
+            "trust_env": True,
         },
         {"url": "/v1/sessions/conv%20with%20space"},
     ]

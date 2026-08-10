@@ -1483,6 +1483,15 @@ def test_prepare_chat_session_via_daemon_reports_create_failure_as_click_error(
 
 
 @pytest.mark.parametrize(
+    "transport_error",
+    [
+        httpx.ConnectError("All connection attempts failed"),
+        httpx.ConnectTimeout("timed out establishing a connection"),
+        httpx.ProxyError("proxy refused the tunnel"),
+    ],
+    ids=["connect-error", "connect-timeout", "proxy-error"],
+)
+@pytest.mark.parametrize(
     ("server_url", "expected_hint"),
     [
         # A local server that stopped — the user restarts it.
@@ -1494,20 +1503,22 @@ def test_prepare_chat_session_via_daemon_reports_create_failure_as_click_error(
 def test_prepare_chat_session_via_daemon_reports_unreachable_server_as_click_error(
     server_url: str,
     expected_hint: str,
+    transport_error: httpx.HTTPError,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A refused connection is a ``ClickException``, not a crash screen.
 
-    ``httpx.ConnectError`` is a transport failure, so it never reaches the
-    SDK's ``OmnigentError`` handling above and used to escape all the way to
-    the crash handler — turning "the server isn't reachable" into a branded
-    crash report with a traceback and no actionable advice.
+    These are transport failures, so they never reach the SDK's
+    ``OmnigentError`` handling above and used to escape all the way to the
+    crash handler — turning "the server isn't reachable" into a branded crash
+    report with a traceback and no actionable advice. All three are siblings
+    under ``TransportError``, so catching one does not cover the others.
     """
     captured: dict[str, object] = {}
     _patch_daemon_launch(monkeypatch, captured)
 
     async def _refused(_self: object, _bundle: bytes, *, filename: str, workspace: str) -> object:
-        raise httpx.ConnectError("All connection attempts failed")
+        raise transport_error
 
     monkeypatch.setattr(_FakeSessionsApi, "create", _refused)
 
