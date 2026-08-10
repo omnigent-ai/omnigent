@@ -2527,7 +2527,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         active_stmt = active_stmt.where(
                             SqlConversationMetadata.id.in_(qualifying_ids)
                         )
-                    with self._session() as meta_sess:
+                    with self._session("list_conversations") as meta_sess:
                         active_match = list(meta_sess.execute(active_stmt).scalars())
                 # Closed is derived from either the explicit label or the legacy
                 # title-suffix marker (see omnigent.session_lifecycle), both of

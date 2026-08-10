@@ -96,6 +96,17 @@ function childRow(container: HTMLElement, childId: string): HTMLElement {
   return el;
 }
 
+// Lifecycle status filter in the panel's toolbar; pick an option to narrow the
+// agent rows (the default is "Any status").
+function selectAgentStatusFilter(value: "all" | "active" | "completed") {
+  fireEvent.pointerDown(screen.getByTestId("subagents-status-filter"), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  fireEvent.click(screen.getByTestId(`subagents-status-filter-${value}`));
+}
+
 function collapseToggleFor(container: HTMLElement, childId: string): HTMLElement {
   const row = childRow(container, childId);
   const toggle = row
@@ -1506,7 +1517,7 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
   });
 
-  it("filters agent rows by status via the toolbar dropdown", async () => {
+  it("filters agent rows by status via the toolbar dropdown", () => {
     mockChildTree({
       conv_parent: [
         childInfo({ id: "c_working", tool: "researcher", busy: true }),
@@ -1528,9 +1539,7 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "c_done")).toBeInTheDocument();
     expect(childRow(container, "c_idle")).toBeInTheDocument();
 
-    // HoverCard opens after its openDelay, not synchronously on mouseenter.
-    fireEvent.pointerEnter(screen.getByTestId("subagents-status-filter-button"));
-    fireEvent.click(await screen.findByTestId("subagents-status-filter-active"));
+    selectAgentStatusFilter("active");
 
     // Active: launching/working/awaiting.
     expect(childRow(container, "c_working")).toBeInTheDocument();
@@ -1538,8 +1547,7 @@ describe("SubagentsPanel", () => {
     expect(() => childRow(container, "c_done")).toThrow();
     expect(() => childRow(container, "c_idle")).toThrow();
 
-    fireEvent.pointerEnter(screen.getByTestId("subagents-status-filter-button"));
-    fireEvent.click(await screen.findByTestId("subagents-status-filter-completed"));
+    selectAgentStatusFilter("completed");
 
     // Completed: everything settled (done/idle/failed/disconnected/other).
     expect(() => childRow(container, "c_working")).toThrow();
@@ -1547,35 +1555,21 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "c_done")).toBeInTheDocument();
     expect(childRow(container, "c_idle")).toBeInTheDocument();
 
-    fireEvent.pointerEnter(screen.getByTestId("subagents-status-filter-button"));
-    fireEvent.click(await screen.findByTestId("subagents-status-filter-all"));
+    selectAgentStatusFilter("all");
 
     // Back to unfiltered.
     expect(childRow(container, "c_working")).toBeInTheDocument();
     expect(childRow(container, "c_idle")).toBeInTheDocument();
   });
 
-  it("opens the status filter menu on hover, without a click", async () => {
-    mockChildTree({ conv_parent: [childInfo({ id: "c_idle", tool: "researcher" })] });
-
-    renderPanel();
-
-    const button = screen.getByTestId("subagents-status-filter-button");
-    expect(screen.queryByTestId("subagents-status-filter-active")).toBeNull();
-
-    fireEvent.pointerEnter(button);
-    expect(await screen.findByTestId("subagents-status-filter-active")).toBeInTheDocument();
-  });
-
-  it("always shows the main row regardless of the status filter", async () => {
+  it("always shows the main row regardless of the status filter", () => {
     mockChildTree({
       conv_parent: [childInfo({ id: "c_idle", tool: "researcher" })],
     });
 
     renderPanel();
 
-    fireEvent.pointerEnter(screen.getByTestId("subagents-status-filter-button"));
-    fireEvent.click(await screen.findByTestId("subagents-status-filter-active"));
+    selectAgentStatusFilter("active");
 
     // The idle child is filtered out, but "main" is always present.
     expect(screen.getByTestId("subagent-main-row")).toBeInTheDocument();

@@ -1,22 +1,18 @@
 """Browser e2e for the sidebar's session status filter.
 
-The header filter button (``sidebar-status-filter-button``) opens a
-`HoverCard`-based menu on hover — not click — offering All/Active/Completed
-(``GET /v1/sessions?status=``). "Active" is a session currently
-running/waiting on an agent; "Completed" is everything else, including any
-session carrying the ``omnigent.closed`` label regardless of its live
-status (see ``matchesSessionStatusFilter`` in ``useSessionState.ts`` and the
-server-side ``status`` param on ``ConversationStore.list_conversations``).
+The Sessions heading's filter funnel (``session-filter``) carries a second
+radio group below the scope options: Any status / Active / Completed.
+"Active" is a session currently running or waiting on an agent; "Completed"
+is everything else, including any session carrying the ``omnigent.closed``
+label regardless of its live status (see ``matchesSessionStatusFilter`` in
+``useSessionState.ts``).
 
-These drive the real chain the ``Sidebar`` unit tests mock out: hovering the
-real header button opens the real `HoverCard` (proving the hover interaction
-and its containment inside the sidebar actually work in a browser, not just
-via a synthetic ``fireEvent.pointerEnter``), and selecting an option re-reads
-the live, unmocked ``GET /v1/sessions`` list. Neither seeded session here is
-ever actually running, so this covers the "completed" bucket (idle and
-closed) and the "active" filter correctly excluding both — the "running"
-bucket would need a live agent turn, which is out of scope for this UI-only
-gate.
+This drives the real chain the ``Sidebar`` unit tests mock out: the real
+funnel, the real Radix menu, and the live unmocked ``GET /v1/sessions`` list.
+Neither seeded session is ever actually running, so this covers the
+"completed" bucket (idle and closed) and "Active" correctly excluding both;
+the "running" bucket would need a live agent turn, out of scope for a
+UI-only gate.
 """
 
 from __future__ import annotations
@@ -37,9 +33,7 @@ def _seed_session(base_url: str, *, title: str, closed: bool = False) -> str:
     Creation goes through the same multipart ``POST /v1/sessions`` path as
     ``test_archived_project_filter.py``'s ``_seed_archived_session``; a
     ``PATCH`` sets the title and, when ``closed``, the ``omnigent.closed``
-    label — the same reserved-but-client-settable key
-    ``sys_session_close`` writes (see
-    ``_reject_server_reserved_label_seed``, which does not block it).
+    label — the same key ``sys_session_close`` writes.
 
     :param base_url: The live server base URL.
     :param title: Unique title so the row is easy to spot among other
@@ -76,32 +70,24 @@ def _delete_sessions(base_url: str, session_ids: list[str]) -> None:
             httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
 
 
-def _open_status_filter(page: Page) -> None:
-    """Hover the header status-filter button until its menu is visible.
-
-    Playwright's ``hover()`` dispatches real pointer events, so this
-    exercises the same ``onPointerEnter`` path Radix's `HoverCard` listens
-    on (a synthetic ``fireEvent.mouseEnter`` in the unit tests does not —
-    see ``useSessionState`` / ``SessionStatusFilterMenu``). ``expect(...
-    ).to_be_visible()`` absorbs the HoverCard's ``openDelay``.
-    """
-    page.get_by_test_id("sidebar-status-filter-button").hover()
-    expect(page.get_by_test_id("sidebar-status-filter-active")).to_be_visible()
+def _set_status_filter(page: Page, value: str) -> None:
+    """Open the Sessions filter funnel and pick a status (all/active/completed)."""
+    page.get_by_test_id("session-filter").click()
+    page.get_by_test_id(f"session-status-filter-{value}").click()
 
 
-def test_sidebar_status_filter_opens_on_hover_and_filters(
+def test_sidebar_status_filter_narrows_the_session_list(
     page: Page,
     live_server: str,
 ) -> None:
-    """Hovering the header button opens the menu; selecting a status filters.
+    """Selecting a status in the Sessions filter menu narrows the list.
 
     Seeds one plain (idle, never-observed) session and one closed session,
     then asserts:
 
-    - the menu is closed until hovered, and opens without a click;
     - "Active" hides both (neither is running);
     - "Completed" shows both, including the closed one;
-    - "All sessions" restores the full list.
+    - "Any status" restores the full list.
     """
     uniq = uuid.uuid4().hex[:8]
     titles = {
@@ -120,25 +106,19 @@ def test_sidebar_status_filter_opens_on_hover_and_filters(
         expect(idle_row).to_be_visible()
         expect(closed_row).to_be_visible()
 
-        # Closed until hovered — no click has happened yet.
-        expect(page.get_by_test_id("sidebar-status-filter-active")).to_be_hidden()
-
-        _open_status_filter(page)
-        page.get_by_test_id("sidebar-status-filter-active").click()
+        _set_status_filter(page, "active")
 
         # Active: neither session is running.
         expect(idle_row).to_be_hidden()
         expect(closed_row).to_be_hidden()
 
-        _open_status_filter(page)
-        page.get_by_test_id("sidebar-status-filter-completed").click()
+        _set_status_filter(page, "completed")
 
         # Completed: idle (never observed) and closed both qualify.
         expect(idle_row).to_be_visible()
         expect(closed_row).to_be_visible()
 
-        _open_status_filter(page)
-        page.get_by_test_id("sidebar-status-filter-all").click()
+        _set_status_filter(page, "all")
 
         # Back to unfiltered.
         expect(idle_row).to_be_visible()
