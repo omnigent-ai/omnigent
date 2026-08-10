@@ -104,6 +104,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_TURN_MAX_CONTINUATIONS = 2
 _TOOL_EXECUTION_MAX_SECONDS = 600.0
+_POST_TOOL_EVENT_IDLE_TIMEOUT_SECONDS = 70.0
 _PRINTED_TOOL_INTENT_MAX_CHARS = 4096
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
@@ -2949,7 +2950,14 @@ class PiExecutor(Executor):
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
-            read_timeout = 120.0 if pending_error is None else 10.0
+            if pending_error is not None:
+                read_timeout = 10.0
+            elif saw_tool_activity and active_tool_calls == 0:
+                # Three silent waits (initial + two continuations) must finish
+                # before the scaffold's default 240-second idle watchdog.
+                read_timeout = _POST_TOOL_EVENT_IDLE_TIMEOUT_SECONDS
+            else:
+                read_timeout = 120.0
             if handover_in_progress:
                 started_at = handover_started_at or time.monotonic()
                 remaining = self._smart_compaction.timeout_seconds - (
@@ -3235,9 +3243,12 @@ class PiExecutor(Executor):
                 continue
 
             if event_type == "turn_end":
+                tool_results = event.get("toolResults")
                 if (
                     self._smart_compaction.enabled
                     and handover_due_context_tokens >= self._smart_compaction.trigger_tokens
+                    and isinstance(tool_results, list)
+                    and len(tool_results) > 0
                     and not handover_in_progress
                 ):
                     handover_repository_state = cast(
@@ -3525,7 +3536,6 @@ class PiExecutor(Executor):
                     if (
                         self._smart_compaction.enabled
                         and context_tokens >= self._smart_compaction.trigger_tokens
-                        and _pi_message_has_tool_call(msg)
                     ):
                         handover_due_context_tokens = max(
                             handover_due_context_tokens,

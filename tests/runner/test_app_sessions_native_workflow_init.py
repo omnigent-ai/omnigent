@@ -11,9 +11,12 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData
 
 from omnigent import native_dispatch
 from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
@@ -1918,6 +1921,56 @@ async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
     assert execute_resp.status_code == 200
     assert execute_resp.json() == {"result": {"output": "called jira__search_issues"}}
     assert mcp_manager.call_tool_invocations == [("jira__search_issues", {"query": "asyncio"})]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_surfaces_safe_unknown_tool_error(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown nested MCP tool name gives the agent a corrective action."""
+    app, mcp_manager, _harness_client, _server_client = _build_app_with_mcp_tool(
+        tool_name="github__call_tool"
+    )
+    error = McpError(ErrorData(code=-32601, message='unknown tool "pull_requests_get"'))
+    monkeypatch.setattr(mcp_manager, "call_tool", AsyncMock(side_effect=error))
+
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "45b93c2054454d66965963eea24c58ae",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+            },
+        )
+        assert seed_resp.status_code == 201, seed_resp.text
+
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            execute_resp = await client.post(
+                "/v1/sessions/45b93c2054454d66965963eea24c58ae/mcp/execute",
+                json={
+                    "method": "tools/call",
+                    "params": {
+                        "name": "github__call_tool",
+                        "arguments": {
+                            "name": "pull_requests_get",
+                            "arguments": {},
+                        },
+                    },
+                },
+            )
+
+    assert execute_resp.status_code == 200
+    assert execute_resp.json() == {
+        "error": {
+            "code": -32000,
+            "message": (
+                'Unknown MCP tool "pull_requests_get". '
+                "Search the tool catalog and use the returned exact name."
+            ),
+        }
+    }
+    assert 'unknown tool "pull_requests_get"' in caplog.text
 
 
 @pytest.mark.asyncio

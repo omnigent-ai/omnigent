@@ -2387,7 +2387,7 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
-    def test_smart_compaction_resets_pi_and_continues_from_handover(self):
+    def test_smart_compaction_uses_completed_tool_batch_when_message_omits_call(self):
         async def _test():
             with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
                 executor = PiExecutor(
@@ -2433,14 +2433,7 @@ class TestRunTurn(unittest.TestCase):
                         "role": "assistant",
                         "model": "test-model",
                         "stopReason": "toolUse",
-                        "content": [
-                            {
-                                "type": "toolCall",
-                                "id": "call-read",
-                                "name": "sys_os_read",
-                                "arguments": {"path": "README.md"},
-                            }
-                        ],
+                        "content": [{"type": "text", "text": "I will read the file."}],
                         "usage": {
                             "input": 50,
                             "output": 10,
@@ -2461,7 +2454,18 @@ class TestRunTurn(unittest.TestCase):
                     "isError": False,
                     "result": {"content": "read"},
                 },
-                {"type": "turn_end"},
+                {
+                    "type": "turn_end",
+                    "toolResults": [
+                        {
+                            "role": "toolResult",
+                            "toolCallId": "call-read",
+                            "toolName": "sys_os_read",
+                            "content": [{"type": "text", "text": "read"}],
+                            "isError": False,
+                        }
+                    ],
+                },
                 {"type": "agent_end", "messages": []},
                 {"type": "compaction_start", "reason": "manual"},
                 {
@@ -5173,10 +5177,13 @@ def test_pi_retries_idle_timeout_after_tool_activity() -> None:
             json.dumps({"type": "agent_end", "messages": []}),
         ]
 
+        idle_timeouts: list[float] = []
+
         async def read_line(timeout=120.0):
-            del timeout
             line = lines.pop(0) if lines else None
             rpc._last_read_timed_out = line is None
+            if line is None:
+                idle_timeouts.append(timeout)
             return line
 
         rpc.read_line = read_line
@@ -5199,6 +5206,7 @@ def test_pi_retries_idle_timeout_after_tool_activity() -> None:
         prompts = [item for item in commands if item.get("type") == "prompt"]
         assert len(prompts) == 2
         assert prompts[1]["streamingBehavior"] == "followUp"
+        assert idle_timeouts == [70.0]
 
     _run(_test())
 

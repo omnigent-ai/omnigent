@@ -343,6 +343,21 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     return "Request failed on the runner; see runner logs for details."
 
 
+def _client_safe_mcp_error_detail(exc: BaseException) -> str:
+    """Return an actionable MCP error only when its payload is safe."""
+    message = str(exc).strip()
+    prefix = 'unknown tool "'
+    if message.startswith(prefix) and message.endswith('"'):
+        tool_name = message[len(prefix) : -1]
+        if tool_name and all(char.isalnum() or char in "_.:-" for char in tool_name):
+            _logger.warning("MCP tool dispatch failed: %s", exc, exc_info=True)
+            return (
+                f'Unknown MCP tool "{tool_name}". '
+                "Search the tool catalog and use the returned exact name."
+            )
+    return _client_safe_error_detail(exc, context="MCP tool dispatch")
+
+
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
 SpecResolver: TypeAlias = Callable[[str, str | None], Awaitable[_SpecEntry | None]]
 _ResourceType: TypeAlias = Literal["environment", "terminal", "file"]
@@ -9145,9 +9160,7 @@ def create_runner_app(
                         content={
                             "error": {
                                 "code": -32000,
-                                "message": _client_safe_error_detail(
-                                    exc, context="MCP tool dispatch"
-                                ),
+                                "message": _client_safe_mcp_error_detail(exc),
                             }
                         },
                     )
