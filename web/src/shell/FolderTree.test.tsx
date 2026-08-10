@@ -5,7 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
-import { ROW_ACTION_SIZE_CLASS, ROW_META_SLOT_CLASS } from "./fileStatusUtils";
+import {
+  ROW_ACTION_SIZE_CLASS,
+  ROW_META_SLOT_CLASS,
+  ROW_STATUS_SLOT_CLASS,
+} from "./fileStatusUtils";
 import { FolderTree } from "./FolderTree";
 
 afterEach(cleanup);
@@ -149,11 +153,13 @@ describe("FolderTree file size / download alignment", () => {
     expect(slot).toContainElement(overlay);
   });
 
-  it("renders the dirty-directory dot in a fixed-width slot matching the download column", () => {
-    // The directory status dot must align with the file rows' download button
-    // column, so it lives in a fixed-width (w-[22px]) centered container.
+  it("puts a folder's dirty dot and a file's status letter in one shared column", () => {
+    // The two git-status markers must land in the same x down the tree. Each
+    // sized to its own content instead put them ~4px apart: the dot had a
+    // fixed 22px box while the letter was a variable-width badge centred on
+    // itself. Both now centre in ROW_STATUS_SLOT_CLASS.
     renderTree({
-      files: [dir("src")],
+      files: [dir("src"), file("app.ts")],
       changedFiles: [
         {
           path: "src/app.ts",
@@ -164,12 +170,24 @@ describe("FolderTree file size / download alignment", () => {
           lines_added: null,
           lines_removed: null,
         },
+        {
+          path: "app.ts",
+          name: "app.ts",
+          status: "created",
+          bytes: 1,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
       ],
     });
 
-    const dot = screen.getByText("●");
-    const slot = dot.parentElement;
-    expect(slot).toHaveClass("w-[22px]");
+    const dotSlot = screen.getByText("●").parentElement;
+    const letterSlot = screen.getByTitle("Added").parentElement;
+    for (const slot of [dotSlot, letterSlot]) {
+      expect(slot).toHaveClass(ROW_STATUS_SLOT_CLASS);
+      expect(slot).toHaveClass("justify-center");
+    }
   });
 });
 

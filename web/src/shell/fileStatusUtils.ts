@@ -27,6 +27,17 @@ export const ROW_META_SLOT_CLASS = "w-14";
  */
 export const ROW_ACTION_SIZE_CLASS = "size-[18px]";
 
+/**
+ * Width of the git-status marker column at the end of a tree row's name button
+ * — the A/M/D badge on files, the dirty dot on directories.
+ *
+ * Both markers are centred in this same box so they share one column. Sizing
+ * each to its own content instead left them ~4px apart: the dot already had a
+ * 22px box while the letter was a variable-width badge centred on itself, so
+ * the two markers never quite lined up down the tree.
+ */
+export const ROW_STATUS_SLOT_CLASS = "w-[22px]";
+
 export function gitStatusLetter(status: WorkspaceChangedFile["status"]): string {
   switch (status) {
     case "created":

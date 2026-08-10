@@ -13,6 +13,7 @@ import { type ChangedSort, compareChangedFiles, type SortableFile } from "./Flat
 import {
   ROW_ACTION_SIZE_CLASS,
   ROW_META_SLOT_CLASS,
+  ROW_STATUS_SLOT_CLASS,
   formatBytes,
   gitStatusLabel,
   gitStatusLetter,
@@ -501,18 +502,27 @@ function FileRowItem({
             {labelIsPath ? <bdi>{displayLabel}</bdi> : displayLabel}
           </span>
           {fileStatus && (
+            // Centred in the shared status column so the A/M/D badge lands in
+            // the same x as a directory row's dirty dot.
             <span
               className={cn(
-                "shrink-0 rounded px-1 py-0.5 font-mono text-[10px]",
-                isDeleted
-                  ? "bg-destructive/10 text-destructive"
-                  : fileStatus === "created"
-                    ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                    : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                "flex shrink-0 items-center justify-center",
+                ROW_STATUS_SLOT_CLASS,
               )}
-              title={gitStatusLabel(fileStatus)}
             >
-              {gitStatusLetter(fileStatus)}
+              <span
+                className={cn(
+                  "rounded px-1 py-0.5 font-mono text-[10px]",
+                  isDeleted
+                    ? "bg-destructive/10 text-destructive"
+                    : fileStatus === "created"
+                      ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                      : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                )}
+                title={gitStatusLabel(fileStatus)}
+              >
+                {gitStatusLetter(fileStatus)}
+              </span>
             </span>
           )}
         </button>
@@ -720,7 +730,10 @@ function TreeNodeRow({
             {node.name}/
           </span>
           {dirStatus && (
-            <span className="flex w-[22px] shrink-0 items-center justify-center" aria-hidden>
+            <span
+              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+              aria-hidden
+            >
               <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
             </span>
           )}
