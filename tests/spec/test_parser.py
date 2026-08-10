@@ -2482,6 +2482,32 @@ def test_parse_executor_config_field(tmp_path: Path) -> None:
     }
 
 
+def test_parse_executor_preserves_smart_compaction_mapping(tmp_path: Path) -> None:
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "config": {
+                "harness": "pi",
+                "smart_compaction": {
+                    "enabled": True,
+                    "trigger_tokens": 56000,
+                    "handover_max_tokens": 4096,
+                },
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.executor.config["smart_compaction"] == {
+        "enabled": True,
+        "trigger_tokens": 56000,
+        "handover_max_tokens": 4096,
+    }
+
+
 def test_parse_executor_config_missing_defaults_to_empty(
     tmp_path: Path,
 ) -> None:

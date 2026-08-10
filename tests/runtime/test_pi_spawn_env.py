@@ -11,11 +11,14 @@ This is a unit test — no subprocess spawn, no real pi CLI.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from omnigent.runtime.workflow import _build_pi_spawn_env
+from omnigent.spec.parser import parse
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig
 
 
@@ -100,6 +103,30 @@ def test_pi_spawn_env_serializes_smart_compaction_config() -> None:
     assert env["HARNESS_PI_SMART_COMPACTION"] == (
         '{"enabled": true, "handover_max_tokens": 4096, "trigger_tokens": 56000}'
     )
+
+
+def test_pi_spawn_env_preserves_smart_compaction_from_yaml(tmp_path: Path) -> None:
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "config": {
+                "harness": "pi",
+                "smart_compaction": {
+                    "enabled": True,
+                    "trigger_tokens": 56000,
+                },
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    env = _build_pi_spawn_env(parse(tmp_path))
+
+    assert json.loads(env["HARNESS_PI_SMART_COMPACTION"]) == {
+        "enabled": True,
+        "trigger_tokens": 56000,
+    }
 
 
 def _ucode_state_for_pi(

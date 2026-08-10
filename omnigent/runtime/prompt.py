@@ -55,6 +55,12 @@ PI_TOOL_TURN_CONTINUATION = (
     "declared boundary is exhausted."
 )
 
+PI_PRINTED_TOOL_RECOVERY = (
+    "Your previous response printed a tool invocation instead of making a protocol call. "
+    "Invoke the registered tool `{tool_name}` now. Do not describe, quote, or fence the call. "
+    "Use the supplied tool schema and continue the task from its result."
+)
+
 
 def shared_message_attribution_enabled() -> bool:
     """Return whether shared-message authors are visible to the model.

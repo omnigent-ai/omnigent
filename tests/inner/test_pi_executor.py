@@ -41,6 +41,7 @@ from omnigent.inner.pi_executor import (
     _handover_from_compaction,
     _pi_provider_for_model,
     _PiRpcSession,
+    _printed_tool_target,
     _redact_argv_for_log,
     _safe_dumps,
     _sanitize_schema,
@@ -2023,6 +2024,19 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_printed_tool_target_recognizes_exact_and_legacy_invocations() -> None:
+    tool_names = ("load_skill", "sys_os_read", "oracle__search")
+
+    assert _printed_tool_target('sys_os_read(path="README.md")', tool_names) == "sys_os_read"
+    assert _printed_tool_target('sys_os_read path="README.md"', tool_names) == "sys_os_read"
+    assert _printed_tool_target("```skill\ncontribute\n```", tool_names) == "load_skill"
+    assert (
+        _printed_tool_target("```search\nquery=Vaultwarden\n```", tool_names) == "oracle__search"
+    )
+    assert _printed_tool_target("```bash\ngit status\n```", tool_names) is None
+    assert _printed_tool_target("Use sys_os_read when you need the file.", tool_names) is None
+
+
 class TestRunTurn(unittest.TestCase):
     def _make_executor(self):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
@@ -2118,6 +2132,196 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(text_chunks[1].text, "world")
             self.assertEqual(len(turn_complete), 1)
             self.assertEqual(turn_complete[0].response, "Hello world")
+
+        _run(_test())
+
+    def test_printed_tool_intent_gets_one_protocol_recovery(self):
+        async def _test():
+            executor = self._make_executor()
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            writer = _FakeStreamWriter()
+            fake_rpc.process.stdin = writer
+            fake_rpc._stderr_lines = []
+
+            printed = 'sys_os_read(path="README.md")'
+            assistant_usage = {
+                "input": 100,
+                "output": 20,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 120,
+            }
+            events = [
+                {"type": "response", "success": True},
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "delta": "Searching first.",
+                    },
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "toolUse",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "call-search",
+                                "name": "oracle__search",
+                                "arguments": {"query": "README"},
+                            }
+                        ],
+                        "usage": assistant_usage,
+                    },
+                },
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "oracle__search",
+                    "args": {"query": "README"},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "oracle__search",
+                    "isError": False,
+                    "result": {"content": "search result"},
+                },
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": printed},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": printed}],
+                        "usage": assistant_usage,
+                    },
+                },
+                {
+                    "type": "agent_end",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": printed}],
+                        }
+                    ],
+                },
+                {"type": "response", "success": True},
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "toolUse",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "call-read",
+                                "name": "sys_os_read",
+                                "arguments": {"path": "README.md"},
+                            }
+                        ],
+                        "usage": assistant_usage,
+                    },
+                },
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "sys_os_read",
+                    "args": {"path": "README.md"},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "sys_os_read",
+                    "isError": False,
+                    "result": {"content": "README"},
+                },
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "done"},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": assistant_usage,
+                    },
+                },
+                {"type": "agent_end", "messages": []},
+            ]
+            for event in events:
+                fake_rpc._line_queue.put_nowait(json.dumps(event))
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+            tools = [
+                {
+                    "name": "oracle__search",
+                    "description": "Search evidence.",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "name": "sys_os_read",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object"},
+                },
+            ]
+
+            emitted = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Read README.md"}],
+                    tools,
+                    "system",
+                )
+            ]
+
+            requests = [event for event in emitted if isinstance(event, ToolCallRequest)]
+            completed = [event for event in emitted if isinstance(event, TurnComplete)]
+            self.assertEqual(
+                [event.name for event in requests],
+                ["oracle__search", "sys_os_read"],
+            )
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0].response, "done")
+
+            commands = [json.loads(frame) for frame in writer.data]
+            recovery = [
+                command
+                for command in commands
+                if command.get("id", "").endswith("_printed_tool_recovery")
+            ]
+            self.assertEqual(len(recovery), 1)
+            self.assertIn("Invoke the registered tool `sys_os_read` now", recovery[0]["message"])
+            self.assertEqual(recovery[0]["streamingBehavior"], "followUp")
 
         _run(_test())
 

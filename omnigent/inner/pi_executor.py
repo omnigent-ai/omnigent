@@ -67,6 +67,7 @@ from omnigent.pi_native_credentials import (
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.runtime.prompt import (
     PI_AGENT_COMPLETION_INSTRUCTION,
+    PI_PRINTED_TOOL_RECOVERY,
     PI_TOOL_TURN_CONTINUATION,
     append_framework_instructions,
 )
@@ -103,6 +104,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_TURN_MAX_CONTINUATIONS = 2
 _TOOL_EXECUTION_MAX_SECONDS = 600.0
+_PRINTED_TOOL_INTENT_MAX_CHARS = 4096
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
@@ -1853,6 +1855,34 @@ def _pi_message_has_tool_call(message: object) -> bool:
     )
 
 
+def _printed_tool_target(text: str, tool_names: Sequence[str]) -> str | None:
+    """Return the registered tool a short printed invocation intended to call."""
+    candidate = text.strip()
+    if not candidate or len(candidate) > _PRINTED_TOOL_INTENT_MAX_CHARS:
+        return None
+
+    registered = {name for name in tool_names if name}
+    for name in sorted(registered, key=len, reverse=True):
+        if re.match(
+            rf"^{re.escape(name)}(?:\s*\(|\s+[A-Za-z_][A-Za-z0-9_-]*\s*=)",
+            candidate,
+        ):
+            return name
+
+    fenced = re.match(r"^```(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s*(?:\r?\n|$)", candidate)
+    if fenced is None:
+        return None
+    printed_name = fenced.group("name")
+    if printed_name in registered:
+        return printed_name
+    aliases = {
+        "skill": "load_skill",
+        "search": "oracle__search",
+    }
+    target = aliases.get(printed_name)
+    return target if target in registered else None
+
+
 def _aggregate_pi_turn_usage(
     message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
@@ -2865,6 +2895,7 @@ class PiExecutor(Executor):
         # ``agent_end`` so the terminal event is consumed off the RPC stream.
         pending_error: str | None = None
         saw_message_end = False
+        last_assistant_requested_tool = False
         pending_llm_input: list[Message] = []
         handover_due_context_tokens = 0
         handover_in_progress = False
@@ -2873,6 +2904,10 @@ class PiExecutor(Executor):
         handover_repository_state: RepositoryState | None = None
         handover_llm_started = False
         handover_count = 0
+        printed_tool_recoveries = 0
+        registered_tool_names = tuple(
+            name for name in (tool.get("name") for tool in tools) if isinstance(name, str)
+        )
 
         async def _continue_tool_turn(
             *,
@@ -3072,6 +3107,7 @@ class PiExecutor(Executor):
                     and message_started.get("role") == "assistant"
                 ):
                     saw_message_end = False
+                    last_assistant_requested_tool = False
                     call_input = list(pending_llm_input) or None
                     pending_llm_input.clear()
                     yield LLMCallStarted(
@@ -3347,6 +3383,7 @@ class PiExecutor(Executor):
                         if not isinstance(m, dict) or m.get("role") != "assistant":
                             continue
                         last_assistant = m
+                        last_assistant_requested_tool = _pi_message_has_tool_call(m)
                         content = m.get("content", [])
                         if isinstance(content, str):
                             end_response_text = content
@@ -3385,6 +3422,50 @@ class PiExecutor(Executor):
                     completion_text_ready = True
                     if not response_text:
                         response_text = end_response_text
+
+                if (
+                    printed_tool_recoveries > 0
+                    and not response_text.strip()
+                    and not end_response_text.strip()
+                    and not last_assistant_requested_tool
+                ):
+                    yield ExecutorError(
+                        message="Pi ended printed tool recovery without a response.",
+                        retryable=True,
+                    )
+                    return
+
+                printed_tool_text = end_response_text or response_text
+                printed_tool_target = (
+                    _printed_tool_target(printed_tool_text, registered_tool_names)
+                    if not last_assistant_requested_tool and printed_tool_recoveries == 0
+                    else None
+                )
+                if printed_tool_target is not None:
+                    printed_tool_recoveries += 1
+                    recovery_prompt = PI_PRINTED_TOOL_RECOVERY.format(
+                        tool_name=printed_tool_target
+                    )
+                    pending_llm_input = [{"role": "user", "content": recovery_prompt}]
+                    response_text = ""
+                    streamed_any = False
+                    completion_text_ready = False
+                    try:
+                        await rpc.send_command(
+                            {
+                                "type": "prompt",
+                                "message": recovery_prompt,
+                                "id": f"{cmd_id}_printed_tool_recovery",
+                                "streamingBehavior": "followUp",
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        yield ExecutorError(
+                            message=f"Failed to recover printed Pi tool intent: {exc}",
+                            retryable=True,
+                        )
+                        return
+                    continue
 
                 needs_completion_text = saw_tool_activity and not completion_text_ready
                 needs_failure_recovery = last_tool_failed and not failure_recovery_requested
@@ -3431,6 +3512,7 @@ class PiExecutor(Executor):
                         pending_llm_input.append(traced_input)
                     continue
                 saw_message_end = True
+                last_assistant_requested_tool = _pi_message_has_tool_call(msg)
                 captured = _extract_pi_turn_usage(msg, model)
                 if captured is not None:
                     message_usages.append(captured)
