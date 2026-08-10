@@ -1835,10 +1835,13 @@ async def _execute_subagent_tool(
         )
         if not isinstance(_all_children, str):
             _runner_app.recover_subagent_ordinals(
-                conversation_id, str(sub_agent_name), _all_children,
+                conversation_id,
+                str(sub_agent_name),
+                _all_children,
             )
         ordinal = _runner_app.next_subagent_ordinal(
-            conversation_id, str(sub_agent_name),
+            conversation_id,
+            str(sub_agent_name),
         )
         session_name = f"{sub_agent_name}-{ordinal}"
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)

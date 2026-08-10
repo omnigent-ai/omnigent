@@ -369,7 +369,7 @@ def prepare_background_session_title(
     ):
         return None
 
-    prompt = _background_title_prompt(event)
+    prompt = background_title_prompt(event)
     if not prompt:
         return None
 
