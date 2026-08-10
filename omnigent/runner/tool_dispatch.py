@@ -325,6 +325,11 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
+# web_scrape — the bot-resistant single-URL fetch builtin. Runner-local (like
+# web_search) so a wrapped harness's web_scrape call resolves to the spec's
+# configured backend (nimble / firecrawl / jina) via WebScrapeTool.invoke.
+_WEB_SCRAPE_TOOLS = frozenset({"web_scrape"})
+
 # nimble_research — Nimble Agent API v2 research runs (start → poll → result).
 # Runner-local so a non-OpenAI model's nimble_research call resolves to
 # NimbleResearchTool.invoke, the same posture as web_search.
@@ -623,6 +628,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _WEB_SCRAPE_TOOLS
     | _NIMBLE_RESEARCH_TOOLS
     | _NIMBLE_EXTRACT_TOOLS
     | _HINDSIGHT_TOOLS
@@ -2824,6 +2830,64 @@ async def _execute_web_search_tool(
     ctx = ToolContext(
         task_id=task_id or "web_search",
         agent_id=agent_id or "web_search",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
+def _web_scrape_config_from_spec(agent_spec: AgentSpec | None) -> dict[str, str]:
+    """
+    Return the ``web_scrape`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_web_search_config_from_spec`: scans ``spec.tools.builtins``
+    for the entry named ``"web_scrape"`` and returns its ``config``
+    (scrape_provider + credentials + optional driver). Empty dict when the
+    builtin is a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The web_scrape config dict, e.g.
+        ``{"scrape_provider": "nimble", "api_key": "..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "web_scrape":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_web_scrape_tool(
+    args: _JsonObject,
+    *,
+    agent_spec: AgentSpec | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``web_scrape`` tool call to the spec's configured backend.
+
+    Builds ``WebScrapeTool`` from the spec's ``web_scrape`` builtin config and
+    runs its synchronous ``invoke`` off the event loop (the backend makes a
+    blocking HTTP call), mirroring :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``url`` (required).
+    :param agent_spec: Parent agent's spec; carries the web_scrape config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The extracted page content, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.web_scrape import WebScrapeTool
+
+    config = _web_scrape_config_from_spec(agent_spec)
+    tool = WebScrapeTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "web_scrape",
+        agent_id=agent_id or "web_scrape",
         conversation_id=conversation_id,
     )
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
@@ -5173,6 +5237,14 @@ async def execute_tool(
             )
         elif tool_name in _WEB_SEARCH_TOOLS:
             output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _WEB_SCRAPE_TOOLS:
+            output = await _execute_web_scrape_tool(
                 args,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
