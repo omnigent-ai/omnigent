@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from claude_agent_sdk.types import SystemMessage as SDKSystemMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -1365,6 +1366,7 @@ class TestSystemMessages(unittest.TestCase):
             settings["apiKeyHelper"],
             "databricks auth token --host https://host",
         )
+        self.assertEqual(settings["cleanupPeriodDays"], 7)
         # The CLI talks to the loopback shim; the shim forwards to the
         # real gateway. A direct gateway URL here would mean the shim was
         # bypassed and opus thinking.display stays stripped.
@@ -1664,6 +1666,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                             "prompt": prompt,
                             "session_id": session_id,
                             "extra_args": getattr(self.options, "extra_args", {}),
+                            "settings": getattr(self.options, "settings", None),
                             "tools": getattr(self.options, "tools", None),
                             "allowed_tools": getattr(self.options, "allowed_tools", None),
                         }
@@ -1697,9 +1700,10 @@ class TestStreamEventStreaming(unittest.TestCase):
             # leakage. It was dropped because bare mode also kills
             # CLAUDE.md auto-discovery, plugin sync, and skill loading —
             # which the spec's ``skills:`` field is the proper knob for.
+            self.assertEqual(query_calls[0]["extra_args"], {})
             self.assertEqual(
-                query_calls[0]["extra_args"],
-                {"no-session-persistence": None},
+                json.loads(query_calls[0]["settings"]),
+                {"cleanupPeriodDays": 7},
             )
             # Skill is always in the base tool set so the Skill tool is
             # actually exposed to the model when ``skills="all"`` (the
@@ -4290,6 +4294,48 @@ class TestToolCallPolicyGate(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def test_read_compacted_messages_exports_disk_transcript() -> None:
+    from omnigent.inner.claude_sdk_executor import _read_compacted_messages
+
+    disk_messages = [
+        SimpleNamespace(
+            type="user",
+            message={"content": [{"type": "text", "text": "kept"}]},
+        ),
+        SimpleNamespace(type="assistant", message="ignored"),
+    ]
+    with patch(
+        "claude_agent_sdk.get_session_messages", return_value=disk_messages
+    ) as mock_get_messages:
+        exported = _read_compacted_messages("claude-session", directory="/workspace")
+
+    assert exported == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "text", "text": "kept"}],
+        }
+    ]
+    mock_get_messages.assert_called_once_with("claude-session", directory="/workspace")
+
+
+def test_compaction_boundary_uses_real_sdk_system_message_shape() -> None:
+    from omnigent.inner.claude_sdk_executor import _is_compaction_boundary
+
+    real = SDKSystemMessage(
+        subtype="compact_boundary",
+        data={"hook_event_name": "PreCompact"},
+    )
+    fictional = SimpleNamespace(
+        subtype="hook_started",
+        data={"hook_event": "PreCompact"},
+        hook_event_name="PreCompact",
+    )
+
+    assert _is_compaction_boundary(real)
+    assert not _is_compaction_boundary(fictional)
+
+
 def test_precompact_hook_emits_compaction_complete_with_session_messages() -> None:
     """When PreCompact fires and a ResultMessage carries a session_id,
     CompactionComplete is emitted with compacted_messages read from
@@ -4312,15 +4358,6 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
                 },
             )()
 
-    class _SystemMessage:
-        def __init__(self, subtype, data, hook_event_name=None):
-            self.subtype = subtype
-            self.data = data
-            self.hook_event_name = hook_event_name
-
-    class _HookEventMessage(_SystemMessage):
-        pass
-
     class _FakeSessionMessage:
         def __init__(self, type, message):
             self.type = type
@@ -4329,7 +4366,7 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
     class _FakeSDK:
         AssistantMessage = type("AssistantMessage", (), {})
         UserMessage = type("UserMessage", (), {})
-        SystemMessage = _SystemMessage
+        SystemMessage = SDKSystemMessage
         ResultMessage = _ResultMessage
         StreamEvent = type("StreamEvent", (), {})
         ClaudeAgentOptions = type(
@@ -4348,10 +4385,9 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
 
             async def query(self, prompt, session_id="default"):
                 _FakeSDK.messages = [
-                    _HookEventMessage(
-                        subtype="hook_started",
-                        data={"hook_event": "PreCompact"},
-                        hook_event_name="PreCompact",
+                    SDKSystemMessage(
+                        subtype="compact_boundary",
+                        data={"hook_event_name": "PreCompact"},
                     ),
                     _ResultMessage("claude-uuid-123", "compacted result"),
                 ]
@@ -4376,9 +4412,16 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
                 return_value=_FakeSDK,
             ),
             patch(
-                "claude_agent_sdk.get_session_messages",
-                return_value=fake_session_msgs,
-            ) as mock_get_msgs,
+                "omnigent.inner.claude_sdk_executor._read_compacted_messages",
+                return_value=[
+                    {
+                        "type": "message",
+                        "role": msg.type,
+                        "content": msg.message["content"],
+                    }
+                    for msg in fake_session_msgs
+                ],
+            ) as mock_read_compacted,
         ):
             events = [
                 e
@@ -4396,7 +4439,7 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
         assert len(ce.compacted_messages) == 2
         assert ce.compacted_messages[0]["role"] == "user"
         assert ce.compacted_messages[1]["role"] == "assistant"
-        mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
+        mock_read_compacted.assert_called_once_with("claude-uuid-123", directory=None)
         # CompactionComplete before TurnComplete
         turn_completes = [e for e in events if isinstance(e, TurnComplete)]
         assert len(turn_completes) == 1
@@ -4531,3 +4574,298 @@ async def test_enqueue_session_message_returns_false_without_queuing() -> None:
 
     assert result is False
     assert not query_called, "query() must not be called during enqueue"
+
+
+class _OverflowTestResult:
+    def __init__(
+        self,
+        result: str,
+        *,
+        is_error: bool,
+        api_error_status: int | None = None,
+    ) -> None:
+        self.session_id = "claude-overflow-session"
+        self.result = result
+        self.is_error = is_error
+        self.api_error_status = api_error_status
+        self.errors = None
+        self.stop_reason = None
+        self.usage = None
+
+
+class _OverflowTestHang:
+    pass
+
+
+class _OverflowTestSentinel:
+    pass
+
+
+def _overflow_test_sdk(responses):
+    created = []
+
+    class _FakeSDK:
+        AssistantMessage = _OverflowTestSentinel
+        UserMessage = _OverflowTestSentinel
+        SystemMessage = SDKSystemMessage
+        ResultMessage = _OverflowTestResult
+        StreamEvent = _OverflowTestSentinel
+        TextBlock = _OverflowTestSentinel
+        ThinkingBlock = _OverflowTestSentinel
+        ToolUseBlock = _OverflowTestSentinel
+        ToolResultBlock = _OverflowTestSentinel
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        @staticmethod
+        def create_sdk_mcp_server(**kwargs):
+            return kwargs
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+                self.queries = []
+                self.current = []
+                self.disconnects = 0
+                created.append(self)
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                self.queries.append(prompt)
+                self.current = responses[len(self.queries) - 1]
+                if isinstance(self.current, _OverflowTestHang):
+                    await asyncio.Event().wait()
+
+            async def receive_response(self):
+                for message in self.current:
+                    yield message
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+    return _FakeSDK, created
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_compacts_persistent_client_and_retries_once() -> None:
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, TurnComplete
+
+    overflow = _OverflowTestResult(
+        "API Error: 400 Your input exceeds the context window of this model",
+        is_error=True,
+        api_error_status=400,
+    )
+    compacted = _OverflowTestResult("Compacted", is_error=False)
+    recovered = _OverflowTestResult("recovered", is_error=False)
+    sdk, created = _overflow_test_sdk(
+        [
+            [overflow],
+            [
+                SDKSystemMessage(
+                    subtype="compact_boundary",
+                    data={"hook_event_name": "PreCompact"},
+                ),
+                compacted,
+            ],
+            [recovered],
+        ]
+    )
+    compacted_messages = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "text", "text": "summary"}],
+        }
+    ]
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk),
+        patch(
+            "omnigent.inner.claude_sdk_executor._read_compacted_messages",
+            return_value=compacted_messages,
+        ) as mock_read_compacted,
+    ):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    mock_read_compacted.assert_called_once_with(compacted.session_id, directory=None)
+    assert len(created) == 1
+    assert created[0].queries == [
+        "hello",
+        "/compact",
+        "Continue responding to the previous user message after compaction.",
+    ]
+    boundary = next(event for event in events if isinstance(event, CompactionComplete))
+    assert boundary.compacted_messages == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "text", "text": "summary"}],
+        }
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "recovered"
+    assert executor._overflow_recovery_sessions == set()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_evicted_client_does_not_retry() -> None:
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, ExecutorError
+
+    overflow_text = "API Error: 400 input exceeds context window"
+    overflow = _OverflowTestResult(
+        overflow_text,
+        is_error=True,
+        api_error_status=400,
+    )
+    compacted = _OverflowTestResult("Compacted", is_error=False)
+    sdk, created = _overflow_test_sdk(
+        [
+            [overflow],
+            [SDKSystemMessage(subtype="compact_boundary", data={}), compacted],
+        ]
+    )
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk),
+        patch(
+            "omnigent.inner.claude_sdk_executor._read_compacted_messages",
+            return_value=[
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "summary"}],
+                }
+            ],
+        ),
+    ):
+        events = []
+        async for event in executor.run_turn(messages, [], ""):
+            events.append(event)
+            if isinstance(event, CompactionComplete):
+                await executor.close_session("session-a")
+
+    assert created[0].queries == ["hello", "/compact"]
+    assert created[0].disconnects == 1
+    assert isinstance(events[-1], ExecutorError)
+    assert events[-1].message == overflow_text
+    assert executor._clients == {}
+    assert executor._overflow_recovery_sessions == set()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_second_failure_does_not_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    overflow = _OverflowTestResult(
+        "API Error: 400 input exceeds context window",
+        is_error=True,
+        api_error_status=400,
+    )
+    compacted = _OverflowTestResult("Compacted", is_error=False)
+    sdk, created = _overflow_test_sdk(
+        [
+            [overflow],
+            [SDKSystemMessage(subtype="compact_boundary", data={}), compacted],
+            [overflow],
+        ]
+    )
+    monkeypatch.setattr(
+        "claude_agent_sdk.get_session_messages",
+        lambda *args, **kwargs: [
+            SimpleNamespace(
+                type="assistant", message={"content": [{"type": "text", "text": "summary"}]}
+            )
+        ],
+    )
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert len(created) == 1
+    assert created[0].queries == [
+        "hello",
+        "/compact",
+        "Continue responding to the previous user message after compaction.",
+    ]
+    assert isinstance(events[-1], ExecutorError)
+    assert executor._clients == {}
+    assert executor._overflow_recovery_sessions == set()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_compaction_timeout_preserves_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    overflow_text = "API Error: 400 input exceeds context window"
+    overflow = _OverflowTestResult(
+        overflow_text,
+        is_error=True,
+        api_error_status=400,
+    )
+    sdk, created = _overflow_test_sdk([[overflow], _OverflowTestHang()])
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor._COMPACT_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert created[0].queries == ["hello", "/compact"]
+    assert isinstance(events[-1], ExecutorError)
+    assert events[-1].message == overflow_text
+    assert executor._clients == {}
+
+
+@pytest.mark.asyncio
+async def test_ordinary_provider_400_does_not_trigger_context_recovery() -> None:
+    from unittest.mock import patch
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    bad_request = _OverflowTestResult(
+        "API Error: 400 invalid temperature",
+        is_error=True,
+        api_error_status=400,
+    )
+    sdk, created = _overflow_test_sdk([[bad_request]])
+
+    executor = ClaudeSDKExecutor()
+    messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert len(created) == 1
+    assert created[0].queries == ["hello"]
+    assert isinstance(events[-1], ExecutorError)

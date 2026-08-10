@@ -58,6 +58,7 @@ from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -279,9 +280,13 @@ class _UserMessageObj(Protocol):
 class _ResultMessageObj(Protocol):
     """Structural view of ``claude_agent_sdk.ResultMessage``."""
 
+    session_id: str
     result: str | None
     is_error: bool | None
     usage: dict[str, Any] | None  # type: ignore[explicit-any]
+    errors: list[str] | None
+    api_error_status: int | None
+    stop_reason: str | None
 
 
 class _SystemMessageObj(Protocol):
@@ -345,10 +350,46 @@ class _ClaudeSDK(Protocol):
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+_COMPACT_TIMEOUT_SECONDS = 60.0
+_OVERFLOW_RETRY_PROMPT = "Continue responding to the previous user message after compaction."
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
 _STREAM_IDLE_WARN_SECONDS = 600.0
+
+
+def _is_compaction_boundary(message: _SystemMessageObj) -> bool:
+    """Return whether a real SDK system message marks compaction."""
+    return (
+        message.subtype == "compact_boundary"
+        or message.data.get("hook_event_name") == "PreCompact"
+    )
+
+
+def _is_context_window_overflow(result: _ResultMessageObj) -> bool:
+    """Return whether an SDK error is specifically a provider context overflow."""
+    if getattr(result, "stop_reason", None) == "model_context_window_exceeded":
+        return True
+    if getattr(result, "api_error_status", None) != 400:
+        return False
+    errors = getattr(result, "errors", None) or []
+    text = " ".join([result.result or "", *errors]).lower()
+    normalized = " ".join(text.split())
+    return (
+        "context window" in normalized and ("exceed" in normalized or "too long" in normalized)
+    ) or "prompt is too long" in normalized
+
+
+def _read_compacted_messages(session_id: str, *, directory: str | None) -> list[_JsonObject]:
+    """Export the CLI's post-compaction transcript for durable resume."""
+    from claude_agent_sdk import get_session_messages
+
+    return [
+        {"type": "message", "role": item.type, "content": item.message.get("content", [])}
+        for item in get_session_messages(session_id, directory=directory)
+        if isinstance(item.message, dict)
+    ]
+
 
 # ── Multimodal content block conversion ──────────────────────
 
@@ -1505,6 +1546,8 @@ class ClaudeSDKExecutor(Executor):
         # Force-close tasks for clients evicted on turn cancellation, kept
         # referenced so they are not GC'd mid-close.
         self._cancel_close_tasks: set[asyncio.Task[None]] = set()
+        # One native compact-and-retry attempt per user turn.
+        self._overflow_recovery_sessions: set[str] = set()
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1762,6 +1805,60 @@ class ClaudeSDKExecutor(Executor):
         task = asyncio.create_task(self._force_close_client(state.client))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    async def _compact_live_client(
+        self,
+        sdk: _ClaudeSDK,
+        *,
+        client: _ClaudeClient,
+        session_key: str,
+        fallback_session_id: str | None,
+        model: str | None,
+    ) -> CompactionComplete | None:
+        """Force Claude Code's native compaction and export its replacement history."""
+        await client.query("/compact", session_id=session_key)
+        stream = client.receive_response()
+        saw_precompact = False
+        compact_session_id = fallback_session_id
+        compact_usage: dict[str, Any] | None = None  # type: ignore[explicit-any]
+        try:
+            async for message in stream:
+                if isinstance(message, sdk.SystemMessage):
+                    saw_precompact = saw_precompact or _is_compaction_boundary(
+                        cast(_SystemMessageObj, message)
+                    )
+                elif isinstance(message, sdk.ResultMessage):
+                    result = cast(_ResultMessageObj, message)
+                    compact_session_id = result.session_id or compact_session_id
+                    if result.is_error:
+                        return None
+                    compact_usage = result.usage
+        finally:
+            aclose = getattr(stream, _ACLOSE_ATTR, None)
+            if aclose is not None:
+                await aclose()
+        if not saw_precompact or not compact_session_id:
+            return None
+
+        compacted_messages = _read_compacted_messages(compact_session_id, directory=self._cwd)
+        if not compacted_messages:
+            return None
+        context_tokens = 0
+        if compact_usage:
+            context_tokens = sum(
+                int(compact_usage.get(key) or 0)
+                for key in (
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                )
+            )
+        return CompactionComplete(
+            summary="[Claude Code compaction — context recovered after overflow]",
+            token_count=context_tokens,
+            model=model,
+            compacted_messages=compacted_messages,
+        )
 
     async def close(self) -> None:
         session_keys = list(self._clients)
@@ -2266,11 +2363,13 @@ class ClaudeSDKExecutor(Executor):
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
-        settings_payload = (
-            json.dumps({"apiKeyHelper": api_key_helper}, separators=(",", ":"))
-            if api_key_helper
-            else None
-        )
+        # Claude CLI JSONL transcripts contain conversation and tool inputs/outputs.
+        # They are local working data for compaction export, retained for seven days;
+        # Omnigent's conversation store remains authoritative.
+        settings: _JsonObject = {"cleanupPeriodDays": 7}
+        if api_key_helper:
+            settings["apiKeyHelper"] = api_key_helper
+        settings_payload = json.dumps(settings, separators=(",", ":"))
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -2303,9 +2402,9 @@ class ClaudeSDKExecutor(Executor):
         # NOT passed: bare mode skips CLAUDE.md auto-discovery,
         # plugin sync, and auto-memory — exactly the host config
         # users expect to leak through to a ``claude-sdk`` harness
-        # they explicitly opted into. ``no-session-persistence``
-        # stays because omnigent owns conversation persistence
-        # via its own conversation store.
+        # they explicitly opted into. CLI transcript persistence stays
+        # enabled as the local compaction/export source; Omnigent's
+        # conversation store remains authoritative.
         # OS-environment tools are provided via Omnigent ``sys_os_*``
         # MCP tools (declared via ``os_env`` in the spec), not the
         # SDK's native Bash/Read/Edit/Write.  Only the Skill tool
@@ -2342,7 +2441,6 @@ class ClaudeSDKExecutor(Executor):
             "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
-            "extra_args": {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
         # Only forward ``setting_sources`` when explicitly set.
@@ -2437,6 +2535,7 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        context_overflow = False
         compaction_occurred: bool = False
         claude_session_id: str | None = None
 
@@ -2732,6 +2831,7 @@ class ClaudeSDKExecutor(Executor):
                             # Harness-level failure (e.g. expired login). Surface
                             # as an executor error rather than assistant content.
                             failure_text = result_msg.result or "claude-sdk harness error"
+                            context_overflow = _is_context_window_overflow(result_msg)
                             logger.error(
                                 "claude-sdk ResultMessage is_error=True for agent %r: %s",
                                 self._agent_name,
@@ -2840,9 +2940,9 @@ class ClaudeSDKExecutor(Executor):
                                     f"{endpoint_hint}"
                                 )
                                 break
-                        elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
+                        elif _is_compaction_boundary(system_msg):
                             compaction_occurred = True
-                            logger.info("Claude SDK compaction detected (PreCompact hook)")
+                            logger.info("Claude SDK compaction detected (compact boundary)")
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:
@@ -2884,6 +2984,55 @@ class ClaudeSDKExecutor(Executor):
             )
             return
         if terminal_error:
+            if context_overflow:
+                if session_key in self._overflow_recovery_sessions:
+                    # The one allowed retry also overflowed. Drop the dead
+                    # transcript; the persisted boundary makes the next turn
+                    # cold-start safely.
+                    await self._close_live_client(session_key)
+                else:
+                    self._overflow_recovery_sessions.add(session_key)
+                    try:
+                        compaction = await asyncio.wait_for(
+                            self._compact_live_client(
+                                sdk,
+                                client=client,
+                                session_key=session_key,
+                                fallback_session_id=claude_session_id,
+                                model=observed_model or model,
+                            ),
+                            timeout=_COMPACT_TIMEOUT_SECONDS,
+                        )
+                        if compaction is not None and session_key in self._clients:
+                            yield compaction
+                            if session_key in self._clients:
+                                retry_messages: list[Message] = [
+                                    {
+                                        "role": "user",
+                                        "content": _OVERFLOW_RETRY_PROMPT,
+                                        "session_id": session_key,
+                                    }
+                                ]
+                                async for event in self.run_turn(
+                                    retry_messages,
+                                    tools,
+                                    system_prompt,
+                                    config,
+                                ):
+                                    yield event
+                                return
+                    except asyncio.CancelledError:
+                        self._evict_client_on_cancel(session_key)
+                        raise
+                    except Exception:  # noqa: BLE001 — recovery failure preserves original error
+                        logger.warning(
+                            "Claude SDK native compaction recovery failed for session %s",
+                            session_key,
+                            exc_info=True,
+                        )
+                    finally:
+                        self._overflow_recovery_sessions.discard(session_key)
+                    await self._close_live_client(session_key)
             yield ExecutorError(message=terminal_error)
             return
 
@@ -2931,8 +3080,6 @@ class ClaudeSDKExecutor(Executor):
         _notify_usage_from_dict(model=model, usage=turn_usage)
 
         if compaction_occurred and claude_session_id:
-            from omnigent.inner.executor import CompactionComplete
-
             _compaction_tokens = 0
             if turn_usage is not None:
                 _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
@@ -2941,14 +3088,7 @@ class ClaudeSDKExecutor(Executor):
             # environments where the CLI's own transcript is lost.
             _compacted: list[_JsonObject] | None = None
             try:
-                from claude_agent_sdk import get_session_messages
-
-                _msgs = get_session_messages(claude_session_id, directory=self._cwd)
-                _compacted = [
-                    {"type": "message", "role": m.type, "content": m.message.get("content", [])}
-                    for m in _msgs
-                    if isinstance(m.message, dict)
-                ]
+                _compacted = _read_compacted_messages(claude_session_id, directory=self._cwd)
                 if not _compacted:
                     logger.warning(
                         "Claude post-compaction read returned no messages "
