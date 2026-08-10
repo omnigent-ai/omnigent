@@ -2313,6 +2313,100 @@ async def test_forwarder_waits_for_missing_fresh_transcript_without_warning(
 
 
 @pytest.mark.asyncio
+async def test_measured_prefix_seed_keeps_a_prompt_injected_during_boot(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression: a prompt Claude records while booting must still forward.
+
+    Cold resume writes the transcript prefix itself, then launches Claude. The
+    forwarder cannot seed until Claude's first hook advertises the transcript
+    path — and the executor's ``inject_user_message`` waits on the same boot,
+    so the paste routinely lands first. Seeding from a live end-offset then
+    puts the user's prompt BEHIND the cursor: visible in the TUI pane, absent
+    from the Omnigent DB, silently, for the session's lifetime.
+
+    Passing the prefix length measured before launch makes the skip exactly the
+    prefix, so the boot-window records survive however late the seed runs.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    # The synthesized prefix, complete before Claude starts.
+    transcript_path.write_text(
+        "".join(
+            json.dumps({"type": "user", "uuid": f"old{n}", "message": {"role": "user"}}) + "\n"
+            for n in range(3)
+        ),
+        encoding="utf-8",
+    )
+    prefix_bytes = transcript_path.stat().st_size
+    # Claude boots and records the freshly-injected prompt before the forwarder
+    # is scheduled to seed.
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "boot-window-prompt",
+                    "message": {"role": "user", "content": "wake up and check the deploy"},
+                }
+            )
+            + "\n"
+        )
+
+    state = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=transcript_path,
+        start_at_end=True,
+        session_id="conv_boot_window",
+        start_at_offset=prefix_bytes,
+    )
+
+    # The measured prefix wins over ``start_at_end``: the cursor sits at the
+    # prefix boundary, not at EOF, so the prompt is still ahead of it.
+    assert state.byte_offset == prefix_bytes
+    result = forwarder._read_transcript_items_for_state(state, "claude-native-ui", None)
+    forwarded = [
+        block.get("text")
+        for item in result.items
+        for block in (item.data.get("content") or [])
+        if isinstance(block, dict)
+    ]
+    assert "wake up and check the deploy" in forwarded
+
+
+@pytest.mark.asyncio
+async def test_measured_prefix_never_seeks_past_the_transcript_end(tmp_path: Path) -> None:
+    """
+    A prefix length larger than the file clamps to the end.
+
+    Defensive: the measurement and the seed are separated by Claude's launch,
+    so a truncated or replaced transcript would otherwise leave the cursor
+    beyond EOF, where every later read looks like a stale-cursor reset.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "uuid": "only", "message": {"role": "user"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    state = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=transcript_path,
+        start_at_end=True,
+        session_id="conv_clamp",
+        start_at_offset=10**9,
+    )
+
+    assert state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
 async def test_forwarder_skips_to_end_on_stale_byte_cursor_state(tmp_path: Path) -> None:
     """
     Stale byte-offset state skips to end of the replaced transcript.
@@ -3410,34 +3504,42 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
 
 
-def test_model_alias_for_collapses_concrete_id_to_tier_alias() -> None:
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-opus-4-8", "opus"),
+        ("anthropic/claude-opus-4-7", "opus"),
+        # The default Sonnet (4.6) collapses to the generic "sonnet" alias —
+        # the row it is bound to.
+        ("databricks-claude-sonnet-4-6", "sonnet"),
+        ("claude-sonnet-4-6", "sonnet"),
+        ("claude-haiku-4-5", "haiku"),
+        # Fable (the tier above Opus) collapses to its own alias — a miss
+        # here means a TUI switch to claude-fable-5 never reaches the picker.
+        ("claude-fable-5", "fable"),
+        ("databricks-claude-fable-5", "fable"),
+        # Sonnet 5 routes to its own opt-in picker slot, not the generic
+        # "sonnet" row — both ids contain the substring "sonnet", so a miss
+        # here means a TUI switch to the newer Sonnet generation would
+        # wrongly light up the default-Sonnet row instead.
+        ("anthropic/claude-sonnet-5", "sonnet_5"),
+        ("databricks-claude-sonnet-5", "sonnet_5"),
+        # Unknown family or empty → None (don't surface an unrenderable id).
+        ("gpt-5-4-mini", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_model_alias_for_collapses_concrete_id_to_tier_alias(
+    model: str | None, expected: str | None
+) -> None:
     """
     ``_model_alias_for`` maps a concrete transcript model id to the
     picker's tier alias so a TUI ``/model`` switch lands on a picker
     row. Covers Anthropic + Databricks-gateway id shapes and the
     no-match / empty cases (caller skips the post on ``None``).
     """
-    assert forwarder._model_alias_for("claude-opus-4-8") == "opus"
-    assert forwarder._model_alias_for("anthropic/claude-opus-4-7") == "opus"
-    # The default Sonnet (4.6) collapses to the generic "sonnet" alias — the
-    # row it is bound to.
-    assert forwarder._model_alias_for("databricks-claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-haiku-4-5") == "haiku"
-    # Fable (the tier above Opus) collapses to its own alias — a miss
-    # here means a TUI switch to claude-fable-5 never reaches the picker.
-    assert forwarder._model_alias_for("claude-fable-5") == "fable"
-    assert forwarder._model_alias_for("databricks-claude-fable-5") == "fable"
-    # Sonnet 5 routes to its own opt-in picker slot, not the generic "sonnet"
-    # row — both ids contain the substring "sonnet", so a miss here means
-    # a TUI switch to the newer Sonnet generation would wrongly light up
-    # the default-Sonnet row instead.
-    assert forwarder._model_alias_for("anthropic/claude-sonnet-5") == "sonnet_5"
-    assert forwarder._model_alias_for("databricks-claude-sonnet-5") == "sonnet_5"
-    # Unknown family or empty → None (don't surface an unrenderable id).
-    assert forwarder._model_alias_for("gpt-5-4-mini") is None
-    assert forwarder._model_alias_for("") is None
-    assert forwarder._model_alias_for(None) is None
+    assert forwarder._model_alias_for(model) == expected
 
 
 @pytest.mark.asyncio
@@ -5286,6 +5388,201 @@ def test_delta_forward_state_round_trips(tmp_path: Path) -> None:
     assert forwarder._read_delta_forward_state(bridge_dir).byte_offset == 0
     forwarder._write_delta_forward_state(bridge_dir, forwarder.DeltaForwardState(byte_offset=512))
     assert forwarder._read_delta_forward_state(bridge_dir).byte_offset == 512
+
+
+def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -> None:
+    """
+    The turn-settle latch survives a forwarder restart via the cursor file.
+
+    A restart inside a scheduled-wake gap must still mark the wake; a
+    pre-latch state file (no ``settled_response_id`` key) loads as None.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b2", workspace=tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript,
+        line_cursor=3,
+        byte_offset=64,
+        current_response_id="resp_a",
+        settled_response_id="resp_a",
+        pending_settled_response_id="resp_b",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    loaded = forwarder._read_forward_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.settled_response_id == "resp_a"
+    assert loaded.pending_settled_response_id == "resp_b"
+
+    raw = json.loads((bridge_dir / forwarder._FORWARDER_STATE_FILE).read_text("utf-8"))
+    del raw["settled_response_id"]
+    (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text(json.dumps(raw), "utf-8")
+    legacy = forwarder._read_forward_state(bridge_dir)
+    assert legacy is not None
+    assert legacy.settled_response_id is None
+
+
+def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
+    """
+    A pending settle activates only once its turn has no output in flight.
+
+    The turn's final message can be delta-held across polls and forward
+    AFTER its Stop edge posted — promoting while that batch still
+    carries the turn's output would mis-read the tail as a scheduled
+    wake and split the answer into a phantom new turn.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    dedupe.pending_settled_response_id = "resp_a"
+    tail = ClaudeTranscriptItem(
+        source_id="s1:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "tail"}]},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [tail]) is False
+    assert dedupe.settled_response_id is None
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # A late tool result also defers: it can surface EARLIER than the
+    # held assistant tail, and promoting on it would mis-mark that tail.
+    late_result = ClaudeTranscriptItem(
+        source_id="s2:0:function_call_output",
+        item_type="function_call_output",
+        data={"call_id": "c1", "output": "done"},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [late_result]) is False
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # Items for OTHER turns don't defer; a truly quiet batch promotes.
+    other = ClaudeTranscriptItem(
+        source_id="s3:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
+        response_id="resp_b",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [other]) is True
+    assert dedupe.settled_response_id == "resp_a"
+    assert dedupe.pending_settled_response_id is None
+
+    # Idempotent once promoted.
+    assert forwarder._promote_pending_settle(dedupe, []) is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wake_forwards_marker_and_new_running_edge(tmp_path: Path) -> None:
+    """
+    The full wake pipeline: settle → quiet-poll promote → marked new turn.
+
+    Poll 1 forwards a turn; its Stop edge records the pending settle
+    (covered by the status-events test — recorded directly here). Poll 2
+    is quiet and promotes the settle, persisting it. Poll 3 sees new
+    assistant entries — a cron firing writes no user entry — and must
+    POST a fresh turn-start ``running`` edge plus the scheduled-wake
+    marker ahead of the resumed output, all under a new response id.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "iter-one",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Iteration 1: all green."}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every forwarder POST, recording its payload.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        payload = json.loads(request.content.decode("utf-8"))
+        assert isinstance(payload, dict)
+        requests.append(payload)
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        after_turn = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        turn_one_id = after_turn.current_response_id
+        assert turn_one_id is not None
+
+        # The turn ends: the Stop edge records the pending settle.
+        dedupe.pending_settled_response_id = turn_one_id
+        quiet = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=after_turn,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert dedupe.settled_response_id == turn_one_id
+        assert quiet.settled_response_id == turn_one_id
+
+        # A cron firing appends assistant output with NO user entry.
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "iter-two",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Iteration 2: still green."}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        requests.clear()
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=quiet,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    kinds = [request["type"] for request in requests]
+    assert kinds[0] == "external_session_status"
+    running = requests[0]["data"]
+    wake_turn_id = running["response_id"]
+    assert running["status"] == "running"
+    assert wake_turn_id != turn_one_id
+    items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    assert [item["item_data"]["role"] for item in items] == ["user", "assistant"]
+    assert items[0]["item_data"]["content"] == [
+        {"type": "input_text", "text": "[System: scheduled prompt fired]"}
+    ]
+    assert {item["response_id"] for item in items} == {wake_turn_id}
 
 
 async def test_post_external_output_text_delta_sends_expected_payload(tmp_path: Path) -> None:
@@ -7164,6 +7461,7 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
                 bridge_dir=bridge_dir,
                 state=state,
                 retry_tracker=_PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
                 task_subjects={},
                 task_statuses={},
                 task_order=[],
@@ -7522,6 +7820,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
         return httpx.Response(200, json={})
 
     transport = httpx.MockTransport(handler)
+    dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
         hook_state = await forwarder._ensure_hook_state(
             bridge_dir, start_at_end=False, session_id="conv_abc"
@@ -7532,11 +7831,17 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
             bridge_dir=bridge_dir,
             state=hook_state,
             retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
             task_subjects={},
             task_statuses={},
             task_order=[],
             response_id="resp_turn_1",
         )
+
+    # The posted turn-end edge records the turn as a PENDING settle for
+    # scheduled-wake detection (it activates once the transcript is quiet).
+    assert dedupe.pending_settled_response_id == "resp_turn_1"
+    assert dedupe.settled_response_id is None
 
     assert bodies == [
         {

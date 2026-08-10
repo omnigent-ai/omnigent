@@ -278,7 +278,7 @@ function EmptyState({
         <div className="flex flex-col items-center gap-2 py-12 text-center">
           <ClockIcon className="size-8 text-muted-foreground/50" />
           <p className="text-ui font-medium">No automations yet</p>
-          <p className="max-w-sm text-xs text-muted-foreground">
+          <p className="max-w-sm text-sm text-muted-foreground">
             Create a task to run an agent session automatically on a recurring schedule.
           </p>
           {showSuggestions && (

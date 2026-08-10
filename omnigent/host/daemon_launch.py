@@ -20,6 +20,7 @@ import click
 import httpx
 
 from omnigent.claude_native_bridge import url_component
+from omnigent.process_logging import display_log_path, process_log_dir
 
 # Poll cadence while waiting for a daemon-spawned runner to connect its
 # tunnel or for a resource to appear.
@@ -159,7 +160,7 @@ async def wait_for_runner_online(
     message = f"Runner {runner_id!r} did not connect within {timeout_s:.0f}s."
     if last_error is not None:
         message += f" Last connection error: {last_error!r}."
-    message += " Check the runner logs under ~/.omnigent/logs/runner/."
+    message += f" Check the runner logs under {display_log_path(process_log_dir('runner'))}/."
     raise click.ClickException(message)
 
 

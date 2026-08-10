@@ -22,6 +22,8 @@
 		B1000000000000000000000C /* URL+Omnigent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000C /* URL+Omnigent.swift */; };
 		B10000000000000000000011 /* ChatTerminalBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* ChatTerminalBar.swift */; };
 		B10000000000000000000012 /* SafariView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* SafariView.swift */; };
+		B10000000000000000000015 /* ManagedConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000015 /* ManagedConfiguration.swift */; };
+		B10000000000000000000016 /* ManagedConfigurationProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* ManagedConfigurationProvider.swift */; };
 		B1000000000000000000000D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000D /* Assets.xcassets */; };
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
 		B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* PrivacyInfo.xcprivacy */; };
@@ -30,11 +32,13 @@
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
 		B20000000000000000000004 /* DeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* DeepLinkTests.swift */; };
 		B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */; };
+		B20000000000000000000007 /* ManagedConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* ManagedConfigurationTests.swift */; };
 		B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
 		B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
 		B40000000000000000000001 /* OmnigentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000001 /* OmnigentUITests.swift */; };
 		B40000000000000000000002 /* SnapshotHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000002 /* SnapshotHelper.swift */; };
 		B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000003 /* RedirectConsentUITests.swift */; };
+		B40000000000000000000005 /* ManagedServersUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000005 /* ManagedServersUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -70,6 +74,8 @@
 		A1000000000000000000000C /* URL+Omnigent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "URL+Omnigent.swift"; sourceTree = "<group>"; };
 		A10000000000000000000011 /* ChatTerminalBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTerminalBar.swift; sourceTree = "<group>"; };
 		A10000000000000000000012 /* SafariView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafariView.swift; sourceTree = "<group>"; };
+		A10000000000000000000015 /* ManagedConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfiguration.swift; sourceTree = "<group>"; };
+		A10000000000000000000016 /* ManagedConfigurationProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfigurationProvider.swift; sourceTree = "<group>"; };
 		A1000000000000000000000D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A1000000000000000000000E /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; name = AppIcon.icon; path = "../platform-assets/AppIcon.icon"; sourceTree = "<group>"; };
 		A1000000000000000000000F /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
@@ -80,11 +86,13 @@
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000004 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderRedirectTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000007 /* ManagedConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfigurationTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000006 /* MockHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockHTTPServer.swift; sourceTree = "<group>"; };
 		A30000000000000000000003 /* OmnigentUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000001 /* OmnigentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentUITests.swift; sourceTree = "<group>"; };
 		A40000000000000000000002 /* SnapshotHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotHelper.swift; sourceTree = "<group>"; };
 		A40000000000000000000003 /* RedirectConsentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RedirectConsentUITests.swift; sourceTree = "<group>"; };
+		A40000000000000000000005 /* ManagedServersUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedServersUITests.swift; sourceTree = "<group>"; };
 		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -153,6 +161,8 @@
 				A1000000000000000000000C /* URL+Omnigent.swift */,
 				A10000000000000000000011 /* ChatTerminalBar.swift */,
 				A10000000000000000000012 /* SafariView.swift */,
+				A10000000000000000000015 /* ManagedConfiguration.swift */,
+				A10000000000000000000016 /* ManagedConfigurationProvider.swift */,
 				A1000000000000000000000D /* Assets.xcassets */,
 				A10000000000000000000013 /* PrivacyInfo.xcprivacy */,
 				A1000000000000000000000F /* Info-Debug.plist */,
@@ -169,6 +179,7 @@
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
 				A20000000000000000000004 /* DeepLinkTests.swift */,
 				A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */,
+				A20000000000000000000007 /* ManagedConfigurationTests.swift */,
 				A20000000000000000000006 /* MockHTTPServer.swift */,
 			);
 			path = OmnigentTests;
@@ -180,6 +191,7 @@
 				A40000000000000000000001 /* OmnigentUITests.swift */,
 				A40000000000000000000002 /* SnapshotHelper.swift */,
 				A40000000000000000000003 /* RedirectConsentUITests.swift */,
+				A40000000000000000000005 /* ManagedServersUITests.swift */,
 			);
 			path = OmnigentUITests;
 			sourceTree = "<group>";
@@ -338,6 +350,8 @@
 				B1000000000000000000000C /* URL+Omnigent.swift in Sources */,
 				B10000000000000000000011 /* ChatTerminalBar.swift in Sources */,
 				B10000000000000000000012 /* SafariView.swift in Sources */,
+				B10000000000000000000015 /* ManagedConfiguration.swift in Sources */,
+				B10000000000000000000016 /* ManagedConfigurationProvider.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -350,6 +364,7 @@
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
 				B20000000000000000000004 /* DeepLinkTests.swift in Sources */,
 				B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */,
+				B20000000000000000000007 /* ManagedConfigurationTests.swift in Sources */,
 				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -361,6 +376,7 @@
 				B40000000000000000000001 /* OmnigentUITests.swift in Sources */,
 				B40000000000000000000002 /* SnapshotHelper.swift in Sources */,
 				B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */,
+				B40000000000000000000005 /* ManagedServersUITests.swift in Sources */,
 				B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -432,7 +448,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -487,7 +503,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
@@ -511,12 +527,12 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Omnigent/Info-Debug.plist";
 				VERSIONING_SYSTEM = "apple-generic";
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -542,12 +558,12 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Omnigent/Info-Release.plist";
 				VERSIONING_SYSTEM = "apple-generic";
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -566,7 +582,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -590,7 +606,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -613,7 +629,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -636,7 +652,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

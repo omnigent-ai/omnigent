@@ -5,8 +5,6 @@ import {
   EyeOffIcon,
   FileClockIcon,
   FileTypeIcon,
-  FolderTreeIcon,
-  ListIcon,
   MoonIcon,
   SearchIcon,
   SlidersHorizontalIcon,
@@ -37,8 +35,12 @@ import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
+  /**
+   * Which scope this panel renders: false = full folder tree, true =
+   * changed-files-only flat list. Fixed by the caller (the Files vs Changes
+   * rail tab / mobile drawer) rather than switched inside the panel.
+   */
   flatView: boolean;
-  onFlatViewChange: (flatView: boolean) => void;
   /**
    * Whether hidden files (dot-prefixed paths) are visible. Lifted to
    * the parent so the state survives inline→drawer transitions.
@@ -139,7 +141,7 @@ function SortSelector({
         <button
           type="button"
           aria-label={`Sort: ${active.label}`}
-          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-xs hover:bg-muted hover:text-foreground"
+          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-sm hover:bg-muted hover:text-foreground"
         >
           <span>Sort:</span>
           <active.Icon className="size-3.5" />
@@ -156,64 +158,6 @@ function SortSelector({
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// FileScopeSwitch — segmented Changed | All control that flips the whole Files
-// view between the changed-files-only flat list (Changed) and the full folder
-// tree (All). One control replaces the old separate Files / Changes rail tabs.
-// ---------------------------------------------------------------------------
-
-// Leading cell in the search toolbar. Rounded-full pills match the rail tabs;
-// the active scope uses the same theme selection surface as the sidebar.
-function FileScopeSwitch({
-  flatView,
-  onChange,
-  count,
-}: {
-  flatView: boolean;
-  onChange: (flatView: boolean) => void;
-  count: number;
-}) {
-  const changedSelected = flatView;
-  const allSelected = !flatView;
-  const pill =
-    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-[13px] font-medium leading-5 transition-colors";
-  const activePill = "bg-muted text-foreground";
-  const idlePill = "text-muted-foreground hover:text-foreground";
-  return (
-    <div role="radiogroup" aria-label="File scope" className="flex shrink-0 items-center gap-1">
-      <button
-        type="button"
-        role="radio"
-        aria-checked={changedSelected}
-        aria-label="Changed"
-        title="Show changed files only"
-        onClick={() => onChange(true)}
-        className={cn(pill, changedSelected ? activePill : idlePill)}
-      >
-        <ListIcon className="size-3.5 shrink-0" />
-        Changed
-        {count > 0 && (
-          <span className="shrink-0 font-normal text-[11px] text-muted-foreground tabular-nums">
-            {count}
-          </span>
-        )}
-      </button>
-      <button
-        type="button"
-        role="radio"
-        aria-checked={allSelected}
-        aria-label="All"
-        title="Show the full folder tree"
-        onClick={() => onChange(false)}
-        className={cn(pill, allSelected ? activePill : idlePill)}
-      >
-        <FolderTreeIcon className="size-3.5 shrink-0" />
-        All
-      </button>
-    </div>
   );
 }
 
@@ -239,7 +183,7 @@ function SearchFilterInput({
       </span>
       <input
         aria-label={label}
-        className="w-full rounded border border-border bg-transparent px-2 py-1 font-mono text-xs outline-none placeholder:text-muted-foreground focus:border-ring"
+        className="w-full rounded border border-border bg-transparent px-2 py-1 font-mono text-sm outline-none placeholder:text-muted-foreground focus:border-ring"
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         type="text"
@@ -265,7 +209,6 @@ function SearchFilterInput({
 export function FilesPanel({
   onFileSelect,
   flatView,
-  onFlatViewChange,
   showHidden,
   onShowHiddenChange,
   sort: changedSort,
@@ -321,7 +264,6 @@ export function FilesPanel({
   });
   const workingDir = envQuery.data?.root ?? null;
   const changedFiles = changedQuery.data?.data ?? [];
-  const changedCount = changedFiles.length;
   const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
   ).length;
@@ -432,13 +374,12 @@ export function FilesPanel({
           className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
           onClick={(e) => e.stopPropagation()}
         >
-          <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
               <input
                 aria-label="Search changed files"
-                className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                 onChange={(event) => setChangedSearch(event.target.value)}
                 placeholder="Search"
                 type="search"
@@ -452,13 +393,12 @@ export function FilesPanel({
       {!flatView && (
         <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-            <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
                 <input
                   aria-label="Search all files"
-                  className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                  className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                   onChange={(event) => setTreeSearch(event.target.value)}
                   placeholder="Search"
                   type="search"
@@ -565,7 +505,7 @@ function WorkingDirLabel({ dir }: { dir: string }) {
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="inline-block max-w-full truncate font-mono text-[11px] text-muted-foreground cursor-default">
+            <span className="inline-block max-w-full truncate font-mono text-sm text-muted-foreground cursor-default">
               {dirBasename(dir)}
             </span>
           </TooltipTrigger>

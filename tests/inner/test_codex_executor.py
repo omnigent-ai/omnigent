@@ -238,15 +238,19 @@ class TestCodexExecutor(unittest.TestCase):
             any("--host" in override for override in executor._codex_config_overrides)
         )
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # must be applied via a `--help` capability probe ($force), never
-        # passed unconditionally — an older CLI rejects the unknown flag and
-        # yields an empty token → silent 401.
+        # stays behind a `--help` capability probe — an older CLI rejects the
+        # unknown flag and yields an empty token → silent 401.
         auth_override = next(
             o for o in executor._codex_config_overrides if "databricks auth token" in o
         )
         self.assertIn("databricks auth token --help", auth_override)
-        self.assertIn("force=--force-refresh", auth_override)
-        self.assertNotIn('--profile "test-profile" --force-refresh', auth_override)
+        # And even where it exists it is only ATTEMPTED: it fails outright on a
+        # stale refresh token, so an empty result must fall back to the cached
+        # token rather than turning a usable credential into an auth failure.
+        self.assertIn("--force-refresh", auth_override)
+        # (the TOML fragment escapes the shell's quotes, so match on the test)
+        self.assertIn("if [ -z ", auth_override)
+        self.assertIn("$token", auth_override)
 
     def test_constructor_databricks_flag_with_host_override_skips_profile_lookup(self):
         with (
@@ -3418,3 +3422,27 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
             expected = str(Path(writable_dir) / ".codex-tmp")
             self.assertEqual(dir_used, expected)
+
+
+def test_run_turn_cli_config_passes_no_model_to_thread_create():
+    """On the cli-config path (model_provider_override set), model=None is passed
+    to thread/create so the codex binary uses its own configured model rather than
+    forwarding an unresolvable alias (e.g. gpt-5.6) to the Databricks UC API."""
+
+    async def _t():
+        fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.6",
+            model_provider_override="Databricks",
+            app_session_factory=lambda **kwargs: fake_session,
+        )
+        async for _ in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}],
+            [],
+            "",
+        ):
+            pass
+        assert fake_session.calls[0]["model"] is None
+
+    _run(_t())

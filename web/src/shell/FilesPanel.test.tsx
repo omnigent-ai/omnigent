@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -145,7 +145,6 @@ function renderPanel({
               onSortChange={vi.fn()}
               flatView={flatView}
               onFileSelect={vi.fn()}
-              onFlatViewChange={vi.fn()}
               showHidden={showHidden}
               onShowHiddenChange={vi.fn()}
               onClose={onClose}
@@ -217,8 +216,8 @@ describe("FilesPanel working folder header role", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
-    // Content is always shown — the scope switch is part of it.
-    expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
+    // Content is always shown — the tree search box is part of it.
+    expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
   it("renders the header as a static label (no toggle button) in frameless (inline rail) mode", () => {
@@ -240,7 +239,6 @@ describe("FilesPanel working folder header role", () => {
                 frameless
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -252,7 +250,7 @@ describe("FilesPanel working folder header role", () => {
 
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
-    expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
   it("renders a static label header with a Close button in the drawer", () => {
@@ -264,7 +262,7 @@ describe("FilesPanel working folder header role", () => {
   });
 });
 
-describe("FilesPanel scope switch (Changed | All) visibility", () => {
+describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {
   it("does not enable the root filesystem listing while showing Changed files", () => {
     renderPanel({
       conversationId: "conv_changed_only",
@@ -300,114 +298,18 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
     });
   });
 
-  it("shows the scope switch in frameless (inline right-rail) mode", () => {
-    // The single Files rail tab owns its scope via this switch, so it must be
-    // present in frameless mode (where the old separate rail tabs used to live).
-    useAllFilesMock.mockReturnValue(allFilesResult([file("src/App.tsx")]));
-    useChangedFilesMock.mockReturnValue(changedFilesResult([changedFile("src/App.tsx")]));
-    useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult());
-    useSearchMock.mockReturnValue(searchResult());
-
-    render(
-      <MemoryRouter initialEntries={["/c/conv_frameless"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                frameless
-                flatView={false}
-                onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
-
-    // Both segments present; All is selected (flatView=false), Changed is not.
-    const changed = screen.getByRole("radio", { name: /^changed$/i });
-    const all = screen.getByRole("radio", { name: /^all$/i });
-    expect(changed).toHaveAttribute("aria-checked", "false");
-    expect(all).toHaveAttribute("aria-checked", "true");
-    expect(changed).not.toHaveClass("bg-muted");
-    expect(all).toHaveClass("bg-muted");
-  });
-
-  it("shows the scope switch in full-screen drawer mode (onClose)", () => {
+  it("does not render an in-panel scope switch (scope is the rail tab now)", () => {
+    // The Changed|All segmented control was replaced by two peer rail tabs;
+    // the panel itself no longer offers a scope toggle.
     renderPanel({
-      conversationId: "conv_drawer_tabs",
+      conversationId: "conv_no_switch",
+      flatView: false,
       files: [file("src/App.tsx")],
-      onClose: vi.fn(),
     });
 
-    expect(screen.getByRole("radio", { name: /^changed$/i })).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: /^all$/i })).toBeInTheDocument();
-  });
-
-  it("calls onFlatViewChange(true) when the Changed segment is clicked", () => {
-    const onFlatViewChange = vi.fn();
-    useAllFilesMock.mockReturnValue(allFilesResult([file("src/App.tsx")]));
-    useChangedFilesMock.mockReturnValue(changedFilesResult([changedFile("src/App.tsx")]));
-    useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult());
-    useSearchMock.mockReturnValue(searchResult());
-
-    render(
-      <MemoryRouter initialEntries={["/c/conv_toggle"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                frameless
-                flatView={false}
-                onFileSelect={vi.fn()}
-                onFlatViewChange={onFlatViewChange}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(screen.getByRole("radio", { name: /^changed$/i }));
-    // Selecting Changed switches to the changed-files-only flat list.
-    expect(onFlatViewChange).toHaveBeenCalledWith(true);
-  });
-});
-
-describe("FilesPanel Changed pill", () => {
-  // The Changed pill shows the file count only — no +/− line totals.
-  function changedPill() {
-    return screen.getByRole("radio", { name: /^changed$/i });
-  }
-
-  it("shows the file count but no +/− line totals", () => {
-    renderPanel({
-      conversationId: "conv_pill_count",
-      flatView: true,
-      files: [],
-      changedFiles: [
-        changedFile("src/a.ts", "modified", 10, 2),
-        changedFile("src/b.ts", "modified", 5, 1),
-      ],
-    });
-
-    const pill = changedPill();
-    expect(within(pill).getByText("2")).toBeInTheDocument(); // file count
-    expect(within(pill).queryByText(/^\+/)).not.toBeInTheDocument();
-    expect(within(pill).queryByText(/^−/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup", { name: "File scope" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /^changed$/i })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /^all$/i })).toBeNull();
   });
 });
 
@@ -430,7 +332,6 @@ describe("FilesPanel changed files search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -492,7 +393,6 @@ describe("FilesPanel changed files search", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -514,7 +414,6 @@ describe("FilesPanel changed files search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -588,7 +487,6 @@ describe("FilesPanel changed files search", () => {
                     onClose={() => setDrawerOpen(false)}
                     onFileSelect={vi.fn()}
                     flatView={false}
-                    onFlatViewChange={vi.fn()}
                     showHidden={showHidden}
                     onShowHiddenChange={setShowHidden}
                   />
@@ -602,7 +500,6 @@ describe("FilesPanel changed files search", () => {
                         onSortChange={vi.fn()}
                         flatView={false}
                         onFileSelect={vi.fn()}
-                        onFlatViewChange={vi.fn()}
                         showHidden={showHidden}
                         onShowHiddenChange={setShowHidden}
                       />
@@ -657,7 +554,6 @@ describe("FilesPanel changed files search", () => {
                     onClose={() => setDrawerOpen(false)}
                     onFileSelect={vi.fn()}
                     flatView={false}
-                    onFlatViewChange={vi.fn()}
                     showHidden={showHidden}
                     onShowHiddenChange={setShowHidden}
                   />
@@ -671,7 +567,6 @@ describe("FilesPanel changed files search", () => {
                         onSortChange={vi.fn()}
                         flatView={false}
                         onFileSelect={vi.fn()}
-                        onFlatViewChange={vi.fn()}
                         showHidden={showHidden}
                         onShowHiddenChange={setShowHidden}
                       />
@@ -720,7 +615,6 @@ describe("FilesPanel changed files search", () => {
                   onSortChange={vi.fn()}
                   flatView={true}
                   onFileSelect={vi.fn()}
-                  onFlatViewChange={vi.fn()}
                   showHidden={showHidden}
                   onShowHiddenChange={setShowHidden}
                 />
@@ -773,7 +667,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -964,7 +857,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -986,7 +878,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1194,7 +1085,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={true}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1217,7 +1107,6 @@ describe("FilesPanel tree (Explore) search", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1311,7 +1200,6 @@ describe("FilesPanel scroll position persistence", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />

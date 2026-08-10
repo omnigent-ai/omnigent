@@ -96,7 +96,7 @@ def _resolve_out_dir(out_dir: str | None) -> Path:
     if out_dir:
         out = Path(out_dir)
     else:
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
         out = _RESULTS_ROOT / f"omnigent_load_test-{stamp}"
     out.mkdir(parents=True, exist_ok=True)
     return out

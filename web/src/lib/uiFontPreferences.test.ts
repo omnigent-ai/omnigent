@@ -24,6 +24,7 @@ afterEach(() => {
 describe("uiFontPreferences", () => {
   it("returns the default when nothing is stored", () => {
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
+    expect(UI_FONT_SIZE_DEFAULT).toBe(13);
   });
 
   it("round-trips a valid size", () => {

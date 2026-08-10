@@ -3,7 +3,7 @@
 The desktop Workspace rail renders ``FilesPanel`` in its ``frameless``
 (inline) mode. The working-folder header is a plain label: the file list is
 the whole point of the panel, so there is nothing to collapse to. The header
-must NOT be a button and the file-scope switch (the panel content) must be
+must NOT be a button and the panel content (the file list / search) must be
 visible with no toggle needed.
 
 This is the regression guard against reintroducing the collapse chevron: the
@@ -48,6 +48,7 @@ def test_files_rail_working_folder_header_is_a_static_label(
     expect(rail.get_by_text("Working folder")).to_be_visible(timeout=30_000)
     expect(rail.get_by_role("button", name=re.compile("Working folder"))).to_have_count(0)
 
-    # The content is always shown: the file-scope switch (Changed | All) is
-    # visible with no toggle needed.
-    expect(rail.get_by_role("radiogroup", name="File scope")).to_be_visible()
+    # The content is always shown: the Files (tree) search box is visible with
+    # no toggle needed. Scope is the rail tab now (Files vs Changes), not an
+    # in-panel switch.
+    expect(rail.get_by_role("searchbox", name="Search all files")).to_be_visible()

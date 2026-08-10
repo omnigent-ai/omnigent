@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
+from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment, create_os_environment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner import resource_registry as resource_registry_mod
@@ -1627,7 +1628,9 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
     status_edges: list[_StatusEdge] = []
     registry.set_terminal_activity_publisher(lambda _sid, _tid: None)
     registry.set_session_status_publisher(
-        lambda sid, status: status_edges.append(_StatusEdge(session_id=sid, status=status))
+        lambda sid, status, _reason=None: status_edges.append(
+            _StatusEdge(session_id=sid, status=status)
+        )
     )
 
     await registry.launch_required_terminal(
@@ -1755,7 +1758,7 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
     registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
     # The idle-reset behaviour is only wired for the claude-native role, so
     # the status publisher must be installed to exercise on_idle.
-    registry.set_session_status_publisher(lambda _sid, _status: None)
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
 
     await registry.launch_required_terminal(
         session_id="conv_throttle",
@@ -2119,6 +2122,140 @@ async def test_unbound_agent_snapshot_is_not_cached_and_retries(
     # The bundle resolved only once the agent had bound.
     assert resolver_count == 1, (
         f"expected one bundle resolution (after binding), got {resolver_count}"
+    )
+
+
+def _git_env() -> dict[str, str]:
+    """Build an env dict with dummy git identity.
+
+    :returns: Copy of the current environment with GIT_AUTHOR_* and
+        GIT_COMMITTER_* set to safe dummy values.
+    """
+    return {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_does_not_latch_session_workspace(
+    tmp_path: Path,
+) -> None:
+    """A transient non-200 snapshot does not latch the session onto the
+    runner's global workspace: a later read resolves the real worktree.
+
+    The workspace projection is memoized separately from the snapshot
+    itself, so a single failed fetch used to pin ``workspace=None`` for
+    the session's lifetime. Everything keyed off it (the filesystem
+    registry here, the harness cwd in production) then silently read the
+    global ``runner_workspace`` instead of the session's git worktree,
+    with no later fetch to recover from.
+
+    :param tmp_path: Temporary root holding both git workspaces.
+    :returns: None.
+    """
+    env = _git_env()
+    conv = "conv_latch"
+
+    # Runner's global workspace: a clean git repo, so reading it yields
+    # no changed files and is distinguishable from the worktree.
+    runner_ws = tmp_path / "workspace"
+    runner_ws.mkdir()
+    subprocess.run(["git", "init"], cwd=runner_ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=runner_ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    # Session's server-stored workspace: a separate git repo standing in
+    # for a worktree, carrying one uncommitted file as the marker.
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    (worktree / "agent_change.py").write_text("# written by agent")
+
+    server_reachable = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Stub Omnigent server: fail every snapshot until it is reachable.
+
+        :param request: Outbound request from the runner.
+        :returns: 503 while unreachable, then the bound snapshot naming
+            the worktree as the session workspace.
+        """
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            if not server_reachable:
+                return httpx.Response(503, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "id": conv,
+                    "agent_id": "ag_latch",
+                    "created_at": 1000,
+                    "workspace": str(worktree),
+                },
+            )
+        return httpx.Response(200, json={})
+
+    # The session's OS env is pre-seeded, so the filesystem endpoints run
+    # without a spec resolver and the snapshot is fetched lazily.
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(worktree),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    registry = SessionResourceRegistry()
+    registry._primary_envs[conv] = os_env
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=runner_ws,
+        server_client=server_client,
+    )
+    changes_url = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            during_outage = await c.get(changes_url)
+            server_reachable = True
+            after_recovery = await c.get(changes_url)
+    finally:
+        await server_client.aclose()
+
+    # While the server is down the read still succeeds off the global
+    # workspace fallback, which is clean and so reports nothing.
+    assert during_outage.status_code == 200, during_outage.text
+    assert during_outage.json()["data"] == []
+    assert after_recovery.status_code == 200, after_recovery.text
+    paths = [entry["path"] for entry in after_recovery.json()["data"]]
+    # The marker only exists in the worktree. Its absence means the failed
+    # fetch memoized workspace=None and the session is stuck on the global
+    # runner workspace with no fetch left to recover it.
+    assert "agent_change.py" in paths, (
+        f"expected the worktree's changed file after recovery, got {paths}; "
+        f"empty means the transient failure latched workspace=None and the "
+        f"session stayed pinned to the global runner workspace"
     )
 
 

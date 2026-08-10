@@ -303,11 +303,7 @@ export const CodeBlockContainer = ({
       className,
     )}
     data-language={language}
-    style={{
-      containIntrinsicSize: "auto 200px",
-      contentVisibility: "auto",
-      ...style,
-    }}
+    style={style}
     {...props}
   />
 );
@@ -319,7 +315,7 @@ export const CodeBlockHeader = ({
 }: HTMLAttributes<HTMLDivElement>) => (
   <div
     className={cn(
-      "flex items-center justify-between border-b bg-muted/80 px-3 py-2 text-muted-foreground text-xs",
+      "flex items-center justify-between border-b bg-muted/80 px-3 py-2 text-muted-foreground text-sm",
       className,
     )}
     {...props}
@@ -495,7 +491,7 @@ export const CodeBlockLanguageSelectorTrigger = ({
   ...props
 }: CodeBlockLanguageSelectorTriggerProps) => (
   <SelectTrigger
-    className={cn("h-7 border-none bg-transparent px-2 text-xs shadow-none", className)}
+    className={cn("h-7 border-none bg-transparent px-2 text-sm shadow-none", className)}
     size="sm"
     {...props}
   />

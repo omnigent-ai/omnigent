@@ -57,13 +57,17 @@ import {
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
-import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper as isNativeWrapperLabel,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
+import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
@@ -89,6 +93,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
+import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -103,32 +108,36 @@ import type { RightRailTab } from "./railTabs";
  *     each panel's width, pushing the main content accordingly. No backdrop —
  *     side panels aren't covering anything.
  *
- * The right slot holds either `FilesPanel` (file tree) or `FileViewer`
- * (code + comments) — never both at once. Selecting a file transitions
- * from the tree view to the code view in the same slot. The "← Back"
- * button in `FileViewer` returns to the file tree.
+ * The right slot holds either `FilesPanel` (file tree / changed list) or
+ * `FileViewer` (code + comments) — never both at once. Selecting a file
+ * transitions from the list to the code view in the same slot. The "← Back"
+ * button in `FileViewer` returns to the list.
  *
  * Default open state is taken from the initial viewport: the left sidebar is
  * open on desktop and closed on mobile. The right files panel starts closed.
  *
  * **Mobile session-rail entry**: the desktop right column has no room on
  * a phone, so the rail's contents are reached via a top-right FAB that
- * opens a dropdown with "Files" and "Terminals" (the latter only when
- * one or more terminals exist). Each entry opens the matching push
- * panel — the FAB and the desktop rail cards route through the same
+ * opens a dropdown with "Files", "Changes" and "Terminals" (the latter
+ * only when one or more terminals exist). Each entry opens the matching
+ * push panel — the FAB and the desktop rail tabs route through the same
  * open*() handlers.
  *
  * **Right rail tabs (desktop)**: the aside is internally tabbed between
- * Files, Terminals and Agents so each can claim the full rail height
- * instead of competing for a vertically-split slot. Files is the default;
- * within it a "Changed only" toggle filters the full folder tree down to
- * just the changed files (flat list). Opening a file (chat link or rail
- * click) forces the rail to the Files tab so the viewer is visible.
- * Terminal-first sessions render the terminal inline in main and therefore
- * hide the rail's Terminals tab. The Agents tab only appears once there's
- * more than one agent (the root has at least one child).
+ * Files, Changes, Terminals and Agents so each can claim the full rail
+ * height instead of competing for a vertically-split slot. Files (full
+ * folder tree) and Changes (changed-files-only flat list) are peer tabs —
+ * the selected tab *is* the scope. Opening a file (chat link or rail click)
+ * forces the rail to a files scope so the viewer is visible. Terminal-first
+ * sessions render the terminal inline in main and therefore hide the rail's
+ * Terminals tab. The Agents tab only appears once there's more than one
+ * agent (the root has at least one child).
  */
 export function AppShell() {
+  // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
+  // here so it works on every chat route, regardless of where focus sits.
+  useApproveHotkey();
+
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
@@ -143,15 +152,28 @@ export function AppShell() {
   );
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on the Terminals tab the FileViewer
-  // is unmounted, so the 720 floor would just waste horizontal space.
+  // is unmounted, so the 720 floor would just waste horizontal space. Both
+  // the Files and Changes tabs surface the inline viewer, so either qualifies.
   // 240px (CommentsPanel default/min width) + 480px comfortable code viewer
   // width. The panel can be dragged wider, but this floor keeps it usable at
   // its default; widening past it is the user's choice via the inline handle.
-  const inlinePanelMinWidth = rightRailTab === "files" && fileViewerCommentsOpen ? 720 : undefined;
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
+  const inlinePanelMinWidth =
+    (rightRailTab === "files" || rightRailTab === "changes") && fileViewerCommentsOpen
+      ? 720
+      : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  const [sidebarPeek, setSidebarPeek] = useState(false);
+
+  // Reads the same module-level store Sidebar drives, so the rail's ceiling
+  // tracks the live sidebar width (including a drag) rather than a guess.
+  const { width: sidebarWidth } = useResizableSidebar();
+  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
+    useResizableInlinePanel(
+      conversationId ?? null,
+      inlinePanelMinWidth,
+      sidebarOpen ? sidebarWidth : 0,
+    );
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -198,35 +220,27 @@ export function AppShell() {
   // Ordered list of open shell tabs (``terminalTabKey`` values) shown in the
   // right rail's tab strip beside the file tabs. ``selectedTerminalKey`` is the
   // active one (mutually exclusive with ``selectedFilePath`` — the rail's
-  // content slot shows one thing). Not persisted: terminal keys are
-  // session-scoped and the PTYs don't survive a reload, so a fresh visit starts
-  // with no shell tabs; a prune effect drops keys whose terminal has gone away.
-  const [openTerminals, setOpenTerminals] = useState<string[]>([]);
-  const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(null);
+  // content slot shows one thing). Persisted per-session (like file tabs) so a
+  // session switch or reload restores the tab strip; the PTYs live on the
+  // server and are re-fetched by ``useTerminals``, and a prune effect drops any
+  // keys whose terminal has actually gone away once the list loads.
+  const [openTerminals, setOpenTerminals] = useState<string[]>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).openTerminals ?? []) : [],
+  );
+  const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).selectedTerminalKey ?? null) : null,
+  );
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.
   const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
   // Sidebar open-state captured when entering full screen, so exiting can
   // restore whatever the user had (collapsed stays collapsed; open reopens).
   const sidebarOpenBeforeMaximizeRef = useRef(false);
-  // false = full folder tree ("All"), true = changed-files-only flat list.
-  // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
-  // the persisted, app-global preference (defaults to "All") so the choice
-  // carries over as the user switches in and out of sessions and survives a
-  // refresh. A deep-link ?view= URL param overrides it transiently below.
-  //
-  // The remembered scope is also held in a ref, mirroring FileViewer's
-  // persistedPrefsRef. It's the in-memory source of truth the conversation-
-  // switch effect falls back to — so a toggle is preserved across switches
-  // even if the localStorage write was swallowed (Safari private mode /
-  // blocked storage), rather than re-reading storage and reverting to the
-  // default each switch. The lazy useState initializer reads localStorage
-  // exactly once; the ref seeds from that initial value (useRef ignores its
-  // argument after mount), so we don't re-read storage on every render.
-  const [filesPanelFlatView, setFilesPanelFlatView] = useState(
-    () => readFilesPanelPreferences().changedOnly,
-  );
-  const filesPanelScopePrefRef = useRef(filesPanelFlatView);
+  // Scope of the mobile Files drawer: false = full folder tree, true =
+  // changed-files-only flat list. On desktop the scope is the selected rail
+  // tab (Files vs Changes); on a phone there's no tab strip, so the two FAB
+  // entries open this drawer pinned to their scope.
+  const [filesDrawerFlatView, setFilesDrawerFlatView] = useState(false);
   // Tracks which conversation the current rail tab / open-files state belongs
   // to, so the persist effect targets the right session even before a switch's
   // restore has re-rendered. Set by the conversation-restore effect.
@@ -255,8 +269,8 @@ export function AppShell() {
   // Appearance "Workspace panel" default; reopening a session restores how
   // the user last left it. Toggled via the header's PanelRightIcon, mirroring
   // the sidebar collapse. With no conversation the rail can't render, so the
-  // state stays false — leaving it true would let rail-gated side effects
-  // (the ?view= URL sync) fire on non-session routes like the home page.
+  // state stays false — leaving it true would let rail-gated side effects fire
+  // on non-session routes like the home page.
   const [rightPanelOpen, setRightPanelOpen] = useState(() =>
     conversationId
       ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
@@ -286,7 +300,11 @@ export function AppShell() {
   // terminal. The hook is react-query-backed and dedup'd with the rail.
   // reconcileWhilePending: self-heals if the live resource.created SSE was
   // missed (see UseTerminalsOptions for the why).
-  const { terminals } = useTerminals(conversationId ?? null, {
+  const {
+    terminals,
+    isLoading: terminalsLoading,
+    error: terminalsError,
+  } = useTerminals(conversationId ?? null, {
     reconcileWhilePending: terminalPending,
   });
 
@@ -343,10 +361,6 @@ export function AppShell() {
     conversationId,
     conversationsData !== undefined,
   );
-  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
-  // Cmd/Ctrl+Enter accepts the pending prompt only when this viewer has
-  // owner or delegated approval authority.
-  useApproveHotkey(canApprove);
   // Labels can come from the sidebar row (``activeConv``) for top-level
   // sessions OR the per-session snapshot (``activeSession``) for ALL
   // sessions including children. The sidebar list omits child (sub-agent)
@@ -419,11 +433,13 @@ export function AppShell() {
   const hasAgentInfo = !!conversationId && agentHasInfo(boundAgent, conversationId);
   // Whether the mobile three-dot menu has any entry to offer.
   const hasHeaderMenu = canShare || hasAgentInfo;
+  // The live snapshot is authoritative; the sidebar row is only a fallback
+  // (it is absent entirely for sub-agent children, which the list omits).
+  const wrapperLabel =
+    activeSession?.labels?.[WRAPPER_LABEL_KEY] ?? activeConv?.labels?.[WRAPPER_LABEL_KEY] ?? null;
   // Claude-native sub-agents have no terminal of their own — the parent
   // owns the tmux pane.
-  const isClaudeNativeSubagent =
-    activeSession?.labels?.["omnigent.wrapper"] === "claude-code-native-ui-subagent" ||
-    activeConv?.labels?.["omnigent.wrapper"] === "claude-code-native-ui-subagent";
+  const isClaudeNativeSubagent = wrapperLabel === "claude-code-native-ui-subagent";
   // Hide the rail Shells tab only for claude-native sub-agents — they
   // have no terminals of their own (the parent owns the tmux pane).
   // Native top-level sessions get the same Shells rail as SDK ones;
@@ -510,6 +526,9 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
+        // Changes tab shares the Files gate — same on-disk workspace, just the
+        // changed-files scope.
+        changes: showFilesPanel,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -539,12 +558,12 @@ export function AppShell() {
   // Keep the selected tab valid. When the current tab disappears — files
   // panel turns off, or the Shells tab hides (native wrapper / no shell
   // and no shell access) — fall back to the first still-visible tab in
-  // display order (Files · Agents · Shells · Tasks · Browser). Picking the first
-  // available (rather than ping-ponging between two effects) keeps this
-  // convergent even when several tabs vanish at once.
+  // display order (Files · Changes · Agents · Shells · Tasks · Browser). Picking
+  // the first available (rather than ping-ponging between two effects) keeps
+  // this convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "subagents", "terminals", "todos", "browser"] as const).find(
+    const next = (["files", "changes", "subagents", "terminals", "todos", "browser"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -704,11 +723,13 @@ export function AppShell() {
     setFilesPanelShowHidden(false);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
-      // effects like the ?view= URL sync stay quiet on non-session routes.
+      // effects stay quiet on non-session routes.
       setRightPanelOpen(false);
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
+      setOpenTerminals([]);
+      setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
       stateConvRef.current = null;
       return;
@@ -718,29 +739,11 @@ export function AppShell() {
     const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
     setPanelInitialKeyState(stored);
 
-    // Restore the Files view scope. A deep-link ?view= param wins and forces
-    // the rail onto the Files tab: ?view=changed → "Changed" (flat list),
-    // ?view=explore is the legacy tree param. With no param, fall back to the
-    // user's remembered choice (defaults to "All") so the scope stays sticky
-    // across session switches.
-    const viewParam = searchParams.get("view");
-    // ``nextTab`` stays null when there's no explicit signal to restore a tab
-    // (no ?view=, no persisted tab, no file to surface). In that case we leave
-    // ``rightRailTab`` untouched so the tab-fallback effect can still land on
-    // the first *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null;
-    if (viewParam === "changed") {
-      setFilesPanelFlatView(true);
-      nextTab = "files";
-    } else if (viewParam === "explore") {
-      setFilesPanelFlatView(false);
-      nextTab = "files";
-    } else {
-      // Fall back to the remembered choice from the in-memory ref (not a
-      // fresh localStorage read) so a swallowed write can't reset the scope.
-      setFilesPanelFlatView(filesPanelScopePrefRef.current);
-      nextTab = persisted.rightRailTab ?? null;
-    }
+    // Restore the selected rail tab (the Files vs Changes scope is now the tab
+    // itself). ``nextTab`` stays null when there's no persisted tab and no file
+    // to surface, so the tab-fallback effect can still land on the first
+    // *available* tab — forcing "files" here would shadow it.
+    let nextTab: RightRailTab | null = persisted.rightRailTab ?? null;
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -753,11 +756,12 @@ export function AppShell() {
     const nextSelected = urlFile ?? persisted.selectedFilePath ?? null;
     setOpenFiles(nextOpenFiles);
     setSelectedFilePath(nextSelected);
-    // Shell tabs are session-scoped and not persisted — a switch starts the
-    // incoming session with no open shell tabs (the prune effect would drop
-    // stale keys anyway once its terminals load).
-    setOpenTerminals([]);
-    setSelectedTerminalKey(null);
+    // Restore the open shell tabs from the per-session store. The prune effect
+    // drops any key whose terminal no longer exists once this session's
+    // terminal list loads, so a dead PTY can't leave a phantom tab. A restored
+    // shell selection must not coexist with a file selection (one content slot).
+    setOpenTerminals(persisted.openTerminals ?? []);
+    setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
     // A maximized rail is transient too — the incoming session starts docked.
     // If we were maximized, restore the sidebar we collapsed on entry (the
     // toggle handler won't run on a session switch).
@@ -765,25 +769,23 @@ export function AppShell() {
       if (wasMaximized) restoreSidebarAfterMaximize();
       return false;
     });
-    // A selected file must be visible in the rail. The Agents/Todos/Terminals
-    // tabs don't render the inline viewer, so pull the rail to Files.
-    if (nextSelected && nextTab !== "files") {
+    // A selected file must be visible in the rail. The Files and Changes tabs
+    // both surface the inline viewer; the Agents/Todos/Terminals tabs don't, so
+    // pull the rail to Files unless it's already on a files scope.
+    if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
     }
     if (nextTab !== null) setRightRailTab(nextTab);
 
     // Restore the rail open-state for this session. A deep link / reload that
-    // carries a workspace signal — a file to open (?file=), a files-scope view
-    // (?view=changed|explore), or a comment to surface (?comment=) — reveals
-    // the rail even when this session was last left closed; otherwise the
-    // linked file/comment would render into a collapsed, invisible panel. This
-    // is transient: it doesn't rewrite the session's saved open-state.
+    // carries a workspace signal — a file to open (?file=) or a comment to
+    // surface (?comment=) — reveals the rail even when this session was last
+    // left closed; otherwise the linked file/comment would render into a
+    // collapsed, invisible panel. This is transient: it doesn't rewrite the
+    // session's saved open-state.
     const commentParam = searchParams.get("comment");
     const hasWorkspaceUrlSignal =
-      urlFile !== null ||
-      viewParam === "changed" ||
-      viewParam === "explore" ||
-      (commentParam !== null && commentParam !== "");
+      urlFile !== null || (commentParam !== null && commentParam !== "");
     setRightPanelOpen((persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal);
 
     stateConvRef.current = conversationId;
@@ -802,43 +804,14 @@ export function AppShell() {
     }
     const id = stateConvRef.current;
     if (!id) return;
-    writeSessionWorkspaceState(id, { rightRailTab, openFiles, selectedFilePath });
-  }, [rightRailTab, openFiles, selectedFilePath]);
-
-  // Sync the Files-panel scope into the URL. The tree is the default, so we
-  // only write the param for "Changed only" — and only while the rail is open,
-  // since the scope is meaningless (and shouldn't deep-link the rail back open)
-  // once the workspace is collapsed. Collapsing thus drops ?view= here.
-  useEffect(() => {
-    // Skip when the URL already agrees: setSearchParams always navigates, and
-    // a no-op write replays this effect's stale params over whatever another
-    // same-commit effect just wrote (e.g. the one-shot ?sidebar=open strip).
-    const current = new URLSearchParams(window.location.search);
-    const wantChanged = rightPanelOpen && filesPanelFlatView;
-    if (wantChanged ? current.get("view") === "changed" : !current.has("view")) return;
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        if (wantChanged) {
-          next.set("view", "changed");
-        } else {
-          next.delete("view");
-        }
-        return next;
-      },
-      { replace: true },
-    );
-  }, [filesPanelFlatView, rightPanelOpen]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Manual scope changes (the Changed | All toggle) persist the choice so it
-  // sticks across session switches and page refreshes. Update the in-memory
-  // ref too (the conversation-switch fallback), so the choice survives even if
-  // the localStorage write is swallowed.
-  const handleFilesFlatViewChange = useCallback((v: boolean) => {
-    filesPanelScopePrefRef.current = v;
-    setFilesPanelFlatView(v);
-    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), changedOnly: v });
-  }, []);
+    writeSessionWorkspaceState(id, {
+      rightRailTab,
+      openFiles,
+      selectedFilePath,
+      openTerminals,
+      selectedTerminalKey,
+    });
+  }, [rightRailTab, openFiles, selectedFilePath, openTerminals, selectedTerminalKey]);
 
   const handleFilesSortChange = useCallback((s: ChangedSort) => {
     setFilesPanelSort(s);
@@ -902,22 +875,18 @@ export function AppShell() {
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
   // than a stale one captured at first mount (see ``showScopeView`` below).
-  const clearFileViewerUrl = useCallback(
-    (includeView = false) => {
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.delete("file");
-          next.delete("diff");
-          next.delete("comment");
-          if (includeView) next.delete("view");
-          return next;
-        },
-        { replace: true },
-      );
-    },
-    [setSearchParams],
-  );
+  const clearFileViewerUrl = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("file");
+        next.delete("diff");
+        next.delete("comment");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -931,8 +900,7 @@ export function AppShell() {
     if (next) {
       if (selectedFilePath) {
         // Reopening lands back on the file remembered in per-session
-        // state, so re-add ?file= to keep the URL shareable — mirroring
-        // how the scope-sync effect re-adds ?view= on reopen. diff and
+        // state, so re-add ?file= to keep the URL shareable. diff and
         // comment are URL-only ephemerals (not remembered), so they
         // intentionally don't rehydrate. Imperative (not an effect) to
         // avoid the FileViewer diff-sync race documented in that effect.
@@ -950,9 +918,18 @@ export function AppShell() {
       // Collapsing the rail hides the workspace, so strip the deep-
       // link params that point into it; otherwise the URL advertises
       // a workspace view a reload would re-open.
-      clearFileViewerUrl(true);
+      clearFileViewerUrl();
     }
     setRightPanelOpen(next);
+  };
+
+  // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
+  // sidebar counts as open, so toggling collapses it; either way peek is
+  // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
+  // floating-card layout the rest of the shell treats as a pushing panel).
+  const toggleLeftSidebar = () => {
+    setSidebarOpen(!(sidebarOpen || sidebarPeek));
+    setSidebarPeek(false);
   };
 
   // Toggle the workspace rail's full-screen (maximized) state. Entering
@@ -977,7 +954,7 @@ export function AppShell() {
   // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
   // here where both panels' open-state lives.
   useSidebarToggleHotkeys({
-    onToggleLeft: () => setSidebarOpen((prev) => !prev),
+    onToggleLeft: toggleLeftSidebar,
     onToggleRight: toggleRightPanel,
   });
 
@@ -1060,9 +1037,9 @@ export function AppShell() {
   // Switch the workspace rail's tab. The side effect (closing any open
   // file + its comments + URL) lives here, not in WorkspacePanel, so the
   // tab state and the file state can't drift apart — the rail stays a
-  // dumb view. A single Files tab now owns the viewer, so there's no
+  // dumb view. The Files/Changes tabs own the viewer, so there's no
   // per-tab file to stash and restore; switching tabs just closes any
-  // open file.
+  // open file to reveal the picked tab's scope list.
   function handleRightRailTabChange(next: RightRailTab) {
     setRightRailTab(next);
     if (selectedFilePath !== null) {
@@ -1131,15 +1108,19 @@ export function AppShell() {
   // Prune shell tabs whose terminal has gone away (closed by the agent, or the
   // runner went offline and emptied the list). Keeps the strip from pointing at
   // dead PTYs; the active selection falls back to the Shells list when its tab
-  // is dropped.
+  // is dropped. Skip while the list is still loading OR the fetch errored so
+  // restored (persisted) tabs aren't wiped by a non-authoritative empty list —
+  // an errored read is `[]` too, and pruning against it would discard tabs
+  // whose PTYs we simply couldn't reach.
   useEffect(() => {
+    if (terminalsLoading || terminalsError !== null) return;
     const valid = new Set(terminals.map((t) => terminalTabKey(t)));
     setOpenTerminals((prev) => {
       const next = prev.filter((k) => valid.has(k));
       return next.length === prev.length ? prev : next;
     });
     setSelectedTerminalKey((active) => (active !== null && !valid.has(active) ? null : active));
-  }, [terminals]);
+  }, [terminals, terminalsLoading, terminalsError]);
 
   function openExecutionLogsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1152,10 +1133,9 @@ export function AppShell() {
     setExecutionLogsKey(key);
   }
 
-  // Mobile FAB → "Files" opens the files drawer (mirrors the desktop rail's
-  // Files tab). The "Changed only" scope is the drawer's own toggle, shared
-  // with the desktop rail via ``filesPanelFlatView``, so we don't force it.
-  function openFilesPanel() {
+  // Mobile FAB → "Files" / "Changes" both open the files drawer (mirroring the
+  // desktop rail's two tabs); the entry picks the scope the drawer opens in.
+  function openFilesDrawer(flatView: boolean) {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
     setPanelInitialKey(null); // close terminals panel
@@ -1163,8 +1143,11 @@ export function AppShell() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setFilesDrawerFlatView(flatView);
     setFilesPanelOpen(true);
   }
+  const openFilesPanel = () => openFilesDrawer(false);
+  const openChangesPanel = () => openFilesDrawer(true);
 
   // Mobile FAB → "Agents" opens the subagents list (the desktop rail's
   // Agents tab) as a full-screen drawer.
@@ -1282,6 +1265,25 @@ export function AppShell() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" stays a pill view.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+
+  // A runner stop/disconnect empties the terminal list; if that lands while the
+  // terminal view is open, flip back to chat rather than stranding the user on
+  // "No terminals available" (and chat is where the composer resumes it).
+  // Edge-triggered + startingUp-guarded so a cold boot / relaunch isn't yanked.
+  const hadTerminalRef = useRef(false);
+  useEffect(() => {
+    if (
+      terminalFirst &&
+      panelOpen &&
+      hadTerminalRef.current &&
+      !terminalsAvailable &&
+      !terminalStartingUp
+    ) {
+      setPanelInitialKey(null);
+    }
+    hadTerminalRef.current = terminalsAvailable;
+  }, [terminalFirst, panelOpen, terminalsAvailable, terminalStartingUp, setPanelInitialKey]);
+
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
       isClaudeNative,
@@ -1360,8 +1362,16 @@ export function AppShell() {
             )}
             <Sidebar
               open={sidebarOpen}
+              onOpen={() => {
+                setSidebarOpen(true);
+                setSidebarPeek(false);
+              }}
+              peek={sidebarPeek}
               dragProgress={sidebarDragProgress}
-              onClose={() => setSidebarOpen(false)}
+              onClose={() => {
+                setSidebarOpen(false);
+                setSidebarPeek(false);
+              }}
               onOpenSearch={() => setCommandPaletteOpen(true)}
             />
 
@@ -1391,12 +1401,21 @@ export function AppShell() {
                 }
               >
                 <ChatHeader
-                  sidebarOpen={sidebarOpen}
-                  onOpenSidebar={() => setSidebarOpen(true)}
+                  sidebarOpen={sidebarOpen || sidebarPeek}
+                  onOpenSidebar={(peek?: boolean) => {
+                    if (peek) {
+                      setSidebarPeek(true);
+                      setSidebarOpen(false);
+                    } else {
+                      setSidebarOpen(true);
+                      setSidebarPeek(false);
+                    }
+                  }}
                   isChildSession={isChildSession}
                   parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
                   boundAgent={boundAgent}
+                  wrapperLabel={wrapperLabel}
                   canShare={canShare}
                   shareDisabled={shareDisabled}
                   shareDisabledReason={shareDisabledReason}
@@ -1433,6 +1452,7 @@ export function AppShell() {
                     subagentsWorking,
                     agentCount,
                     onOpenFiles: openFilesPanel,
+                    onOpenChanges: openChangesPanel,
                     onOpenShells: openShellsPanel,
                     onOpenSubagents: openSubagentsPanel,
                     onOpenTodos: openTodosPanel,
@@ -1442,6 +1462,20 @@ export function AppShell() {
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
                 </main>
+
+                {/* Debug-mode execution-logs rail — desktop only, hidden when a
+              push panel is open (the panel itself becomes the focus). Only
+              rendered in debug mode so the column doesn't occupy space in
+              normal use. */}
+                {conversationId && debugMode && !panelOpen && !executionLogsOpen && (
+                  <div className="hidden md:flex md:flex-col md:w-56 md:shrink-0 md:border-l md:border-border md:overflow-y-auto md:px-2 md:pb-2 md:pt-12 md:gap-2">
+                    <SessionRail
+                      conversationId={conversationId}
+                      onExpandExecutionLogs={openExecutionLogsPanel}
+                      suppressed={false}
+                    />
+                  </div>
+                )}
 
                 {/* Right workspace card — gated on conversationId (panels have
               no workspace to read without a session), default-open,
@@ -1487,8 +1521,6 @@ export function AppShell() {
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}
-                    filesPanelFlatView={filesPanelFlatView}
-                    onFlatViewChange={handleFilesFlatViewChange}
                     filesPanelShowHidden={filesPanelShowHidden}
                     onShowHiddenChange={setFilesPanelShowHidden}
                     liveness={liveness}
@@ -1526,8 +1558,7 @@ export function AppShell() {
                   open={filesPanelOpen}
                   onClose={() => setFilesPanelOpen(false)}
                   onFileSelect={openFileViewer}
-                  flatView={filesPanelFlatView}
-                  onFlatViewChange={handleFilesFlatViewChange}
+                  flatView={filesDrawerFlatView}
                   showHidden={filesPanelShowHidden}
                   onShowHiddenChange={setFilesPanelShowHidden}
                   sort={filesPanelSort}
@@ -1595,7 +1626,6 @@ export function AppShell() {
               sessionId={conversationId}
               open={shareOpen}
               onOpenChange={setShareOpen}
-              canDelegateApprovals={isOwnerLevel(permissionLevel)}
             />
           )}
           {conversationId && (
@@ -1643,7 +1673,7 @@ export function AppShell() {
           <CommandPalette
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
-            onToggleLeftSidebar={() => setSidebarOpen((prev) => !prev)}
+            onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
           />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so

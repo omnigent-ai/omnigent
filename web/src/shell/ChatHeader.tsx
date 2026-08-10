@@ -3,6 +3,7 @@ import {
   ChevronLeftIcon,
   EllipsisVerticalIcon,
   FileIcon,
+  GitCompareIcon,
   InfoIcon,
   ListIcon,
   ListTodoIcon,
@@ -23,11 +24,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
+import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
+import { useCallback, useEffect, useRef } from "react";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -75,8 +79,10 @@ interface MobileSessionMenuProps {
    * entry badge) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Open the mobile files drawer. */
+  /** Open the mobile files drawer (full folder tree). */
   onOpenFiles: () => void;
+  /** Open the mobile files drawer pinned to the changed-files list. */
+  onOpenChanges: () => void;
   /** Open the mobile shells drawer. */
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
@@ -96,7 +102,7 @@ interface ChatHeaderProps {
   /** Whether the left sidebar is open (hides the open-sidebar button). */
   sidebarOpen: boolean;
   /** Open the left sidebar. */
-  onOpenSidebar: () => void;
+  onOpenSidebar: (peek?: boolean) => void;
   /** Whether the active session is a sub-agent (shows the back link). */
   isChildSession: boolean;
   /** Parent session id for the back link's destination (when a child). */
@@ -105,6 +111,13 @@ interface ChatHeaderProps {
   conversationId: string | undefined;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
+  /**
+   * The session's ``omnigent.wrapper`` label, or ``null``. Names the vendor
+   * in the sub-agent breadcrumb: a native sub-agent child reuses its
+   * parent's ``<vendor>-native-ui`` agent row, whose name is an Omnigent
+   * internal the user should never see.
+   */
+  wrapperLabel: string | null;
   /** Whether the Share button/menu entry should render. */
   canShare: boolean;
   /** Whether the rendered Share controls should be disabled. */
@@ -161,6 +174,7 @@ export function ChatHeader({
   parentSessionId,
   conversationId,
   boundAgent,
+  wrapperLabel,
   canShare,
   shareDisabled = false,
   shareDisabledReason,
@@ -174,6 +188,35 @@ export function ChatHeader({
   onToggleRightPanel,
   mobileMenu,
 }: ChatHeaderProps) {
+  // Dwell on the toggle for 1s to peek the sidebar; leaving before then cancels
+  // the pending peek so a quick pass-over never opens it. Peek is a desktop
+  // hover affordance — on mobile the toggle just opens the full-screen overlay,
+  // so a tap's synthetic pointerenter must not trigger it.
+  const isMobile = useIsMobileViewport();
+  const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPeek = useCallback(() => {
+    if (peekTimer.current) {
+      clearTimeout(peekTimer.current);
+      peekTimer.current = null;
+    }
+  }, []);
+  const onPeekSidebar = useCallback(() => {
+    if (isMobile) return;
+    cancelPeek();
+    peekTimer.current = setTimeout(() => {
+      onOpenSidebar(true);
+    }, 400);
+  }, [isMobile, onOpenSidebar, cancelPeek]);
+  useEffect(() => cancelPeek, [cancelPeek]);
+  // A native sub-agent (a Claude Code Task, a Codex collab thread) is bound to
+  // its parent's `<vendor>-native-ui` row, so its agent name is an internal
+  // the server itself hides (`public_agent_name`). Name the product instead,
+  // matching the Agents rail and the composer. Every other sub-agent keeps its
+  // own agent name, which is already human-readable. Only the child branch
+  // below reads this, so it stays behind `isChildSession`.
+  const subAgentName = isChildSession
+    ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null)
+    : null;
   return (
     <header
       className={cn(
@@ -205,8 +248,13 @@ export function ChatHeader({
                 variant="ghost"
                 size="icon"
                 aria-label="Open sidebar"
-                onClick={onOpenSidebar}
+                onClick={() => {
+                  cancelPeek();
+                  onOpenSidebar(false);
+                }}
                 className="text-muted-foreground hover:text-foreground"
+                onPointerEnter={onPeekSidebar}
+                onPointerLeave={cancelPeek}
               >
                 <PanelLeftIcon className="size-4" />
               </Button>
@@ -236,8 +284,8 @@ export function ChatHeader({
                 <span>Back</span>
               </Link>
             </Button>
-            {/* Divider + sub-agent identity. The agent name (from the bound
-                agent) plus the "Sub-agent" caption make the nesting obvious
+            {/* Divider + sub-agent identity. The name (see ``subAgentName``)
+                plus the "Sub-agent" caption make the nesting obvious
                 on a phone, where the sidebar — and the tree it shows — is
                 collapsed. Falls back to a plain "Sub-agent" label until the
                 agent snapshot resolves, so the two lines never both read
@@ -245,12 +293,12 @@ export function ChatHeader({
             <span aria-hidden className="mx-1 h-5 w-px bg-border" />
             <div className="flex min-w-0 items-center gap-2">
               <BotIcon className="size-4 shrink-0 text-muted-foreground" />
-              {boundAgent?.name ? (
+              {subAgentName ? (
                 <div className="flex min-w-0 flex-col leading-tight">
                   <span className="truncate text-ui font-semibold text-foreground">
-                    {boundAgent.name}
+                    {subAgentName}
                   </span>
-                  <span className="text-xs text-muted-foreground">Sub-agent</span>
+                  <span className="text-sm text-muted-foreground">Sub-agent</span>
                 </div>
               ) : (
                 <span className="text-ui font-semibold text-foreground">Sub-agent</span>
@@ -260,7 +308,7 @@ export function ChatHeader({
         )}
       </div>
 
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-2">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -337,7 +385,7 @@ export function ChatHeader({
                   title={shareDisabledReason}
                   // share-button-glassy (index.css) paints the pink gradient,
                   // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white"
+                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white"
                 >
                   <span className="flex size-4 shrink-0 items-center justify-center">
                     <UserPlusIcon />
@@ -355,7 +403,7 @@ export function ChatHeader({
             onClick={onShare}
             // share-button-glassy (index.css) paints the pink gradient,
             // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white md:inline-flex"
+            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white md:inline-flex"
           >
             <span className="flex size-4 shrink-0 items-center justify-center">
               <UserPlusIcon />
@@ -369,10 +417,10 @@ export function ChatHeader({
               <Button
                 type="button"
                 variant="ghost"
-                size="icon"
+                size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
                 onClick={onToggleRightPanel}
-                className="hidden md:inline-flex text-muted-foreground hover:text-foreground"
+                className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
               >
                 {rightPanelOpen ? (
                   <PanelRightCloseIcon className="size-4" />
@@ -425,6 +473,15 @@ export function ChatHeader({
                   >
                     <FileIcon className="size-4" />
                     Files
+                  </DropdownMenuItem>
+                )}
+                {showFilesPanel && (
+                  <DropdownMenuItem
+                    onSelect={mobileMenu.onOpenChanges}
+                    className="gap-2.5 px-2.5 py-2 text-ui"
+                  >
+                    <GitCompareIcon className="size-4" />
+                    Changes
                     {mobileMenu.changedCount > 0 && (
                       <span
                         className={cn(TAB_BADGE_BASE, "ml-auto bg-muted text-muted-foreground")}

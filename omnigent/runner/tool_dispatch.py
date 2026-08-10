@@ -4259,6 +4259,123 @@ def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
     return entries
 
 
+#: Budget for the confinement lookup. Short on purpose: a slow or wedged
+#: server must not hold an agent listing open, and an unanswered lookup
+#: fails open to the unfiltered list.
+_SPAWN_FAMILY_TIMEOUT_S = 5.0
+
+#: Resolved confinement per session. Routing state is stamped at create and
+#: never changes, so one lookup serves every later ``sys_agent_list``. Only
+#: sessions with routing armed locally reach it, and only answered lookups
+#: are stored, so a fail-open miss is retried next call.
+_spawn_family_cache: dict[str, str | None] = {}
+
+
+async def _spawn_family(
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> str | None:
+    """Return the model family a session's spawns are confined to.
+
+    Only a session running Smart Routing on a PINNED harness confines
+    them: its spawns are routed inside its own family, so an agent from
+    another family has no candidate model it could be routed onto and
+    must never be offered as spawnable in the first place. An
+    auto-harness session hands the family choice to the router, and a
+    plain session is not routed at all — both see the whole surface, byte
+    for byte as before.
+
+    The runner-local routing class answers for those two cases without
+    touching the server, so a plain session — the overwhelming majority —
+    pays nothing for a feature it does not use. Only a locally pinned
+    routed session spends the one cached lookup that reads the
+    subagent-routing switch.
+
+    Best-effort: an unreadable or slow session read fails open to "no
+    confinement", because a discovery listing must not block on the
+    routing lookup. The child-create gate is the enforcement.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session's id, or ``None``.
+    :returns: ``"claude"`` / ``"gpt"`` / ``"pi"`` when the caller's spawns
+        are confined to that family, else ``None``.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.runner.subagent_routing import (
+        auto_harness_session,
+        harness_family,
+        session_routing_class,
+        subagent_routing_enabled,
+    )
+
+    if conversation_id is None:
+        return None
+    local = session_routing_class(conversation_id)
+    if not local.routing_enabled or local.auto_harness:
+        return None
+    if conversation_id in _spawn_family_cache:
+        return _spawn_family_cache[conversation_id]
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            # Only the routing fields are read, so skip the history and
+            # runner-liveness work the full snapshot would do.
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=_SPAWN_FAMILY_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — discovery must not fail on this read
+        return None
+    if resp.status_code != 200:
+        return None
+    snapshot = _string_object_dict(resp.json())
+    if snapshot is None:
+        return None
+    family: str | None = None
+    if subagent_routing_enabled(_optional_string(snapshot.get("subagent_routing_override"))):
+        harness = _optional_string(snapshot.get("harness"))
+        labels = _string_object_dict(snapshot.get("labels")) or {}
+        # The shared predicate reads the same two fields off a conversation row.
+        row = SimpleNamespace(
+            labels={key: value for key, value in labels.items() if isinstance(value, str)},
+            harness_override=harness,
+        )
+        if not auto_harness_session(row):
+            family = harness_family(harness)
+    _spawn_family_cache[conversation_id] = family
+    return family
+
+
+def forget_spawn_family(conversation_id: str) -> None:
+    """Drop the cached spawn confinement for a finished session.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    _spawn_family_cache.pop(conversation_id, None)
+
+
+def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_JsonObject]:
+    """Drop built-in agents *family* cannot serve.
+
+    :param builtins: Projected ``builtins`` rows, each carrying ``harness``.
+    :param family: The caller's confined family, or ``None`` to keep all.
+    :returns: The rows a session confined to *family* may spawn. An agent
+        whose harness has no family (unknown, or multi-family like pi) is
+        kept: nothing proves it is out of family.
+    """
+    if family is None:
+        return builtins
+    from omnigent.runner.subagent_routing import harness_family
+
+    kept: list[_JsonObject] = []
+    for row in builtins:
+        harness = row.get("harness")
+        row_family = harness_family(harness) if isinstance(harness, str) else None
+        if row_family is None or row_family == family:
+            kept.append(row)
+    return kept
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -4283,6 +4400,12 @@ async def _agent_list_via_rest(
       (YAMLs authored with ``sys_os_write`` per the agent-authoring
       skill), projected to ``{name, path, description}``.
 
+    On a pinned Smart Routing session the ``builtins`` section is confined
+    to the caller's own model family (:func:`_spawn_family`) — an agent it
+    could never route a spawn onto is not a launchable agent for it. The
+    other two sections carry no harness to filter on; the child-create gate
+    refuses those.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_spec: The running agent's spec, for os_env cwd
         resolution of the local-config scan.
@@ -4296,7 +4419,11 @@ async def _agent_list_via_rest(
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
-    return json.dumps(_project_agent_list(builtins_raw, sessions_raw, local_configs))
+    listing = _project_agent_list(builtins_raw, sessions_raw, local_configs)
+    listing["builtins"] = _in_spawn_family(
+        listing["builtins"], await _spawn_family(server_client, conversation_id)
+    )
+    return json.dumps(listing)
 
 
 def _project_agent_list(

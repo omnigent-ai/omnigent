@@ -551,13 +551,10 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     private func failedURL(from error: NSError) -> URL? {
-      if let url = error.userInfo[NSURLErrorFailingURLErrorKey] as? URL {
-        return url
-      }
-      if let value = error.userInfo[NSURLErrorFailingURLStringErrorKey] as? String {
-        return URL(string: value)
-      }
-      return nil
+      // The string-keyed variant this used to fall back on is deprecated and
+      // redundant on the supported OS versions; callers already fall back to the
+      // web view's own URL when the key is absent.
+      error.userInfo[NSURLErrorFailingURLErrorKey] as? URL
     }
 
     private func injectWorkspaceChromeCSS(_ webView: WKWebView) {

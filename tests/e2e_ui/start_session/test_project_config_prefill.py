@@ -445,3 +445,163 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
             assert labels.get("omni_project") == _PROJECT_NAME, body
         finally:
             await browser.close()
+
+
+# The worktree-list endpoint the composer probes for the seeded workspace.
+_WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
+# The user's most-recent workspace on the host — a LINKED worktree of the repo
+# whose main tree lives at _MAIN_REPO. Seeded into localStorage so the auto-seed
+# would land here (the pre-fix behavior) unless the fork-fresh redirect fires.
+_MAIN_REPO = "/work/gamma"
+_LINKED_WORKTREE = "/work/gamma-worktrees/feature-x"
+
+
+def _base_branch_config_body() -> str:
+    """``GET /v1/projects/{id}`` whose stored config sets a default base branch."""
+    return json.dumps(
+        {
+            "id": _PROJECT_ID,
+            "name": _PROJECT_NAME,
+            "config": {"host_id": _HOST_ID, "base_branch": "develop"},
+        }
+    )
+
+
+def _worktrees_body() -> str:
+    """``GET /v1/hosts/{id}/worktrees`` — the repo's main tree plus one linked
+    worktree (the recent workspace). The composer's fork-fresh probe reads this
+    to decide the recent path is a worktree and redirect to the main tree."""
+    return json.dumps(
+        {
+            "object": "list",
+            "data": [
+                {"path": _MAIN_REPO, "branch": "main", "is_main": True, "detached": False},
+                {
+                    "path": _LINKED_WORKTREE,
+                    "branch": "feature/x",
+                    "is_main": False,
+                    "detached": False,
+                },
+            ],
+        }
+    )
+
+
+def test_composer_forks_fresh_from_project_default_over_last_worktree(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A project default base branch forks fresh instead of reusing the last worktree.
+
+    Regression: the composer auto-seeds the working directory from the user's
+    most-recent workspace. When that path is an existing (linked) worktree, the
+    branch prefilled from it and the project's stored default base branch was
+    silently dropped — a fresh new-chat continued in the old worktree instead of
+    forking off the default. With a default configured, the composer now probes
+    the recent path, redirects the seed to the repo's MAIN work tree, and
+    auto-names a fresh worktree branch so the create forks off the default:
+    ``git: {branch_name: worktree-<hex>, base_branch: "develop"}`` at the main
+    repo — NOT an ``existing_worktree`` bind in the linked worktree.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_fork_fresh(base_url, session_id))
+
+
+async def _drive_fork_fresh(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_projects_list(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_projects_list_body()
+                )
+
+            async def handle_project_config(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_base_branch_config_body()
+                )
+
+            async def handle_worktrees(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_worktrees_body()
+                )
+
+            async def handle_events(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    create_bodies.append(route.request.post_data_json)
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": session_id}),
+                    )
+                else:
+                    await route.continue_()
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route("**/v1/sessions/projects", handle_projects_list)
+            await page.route(_PROJECT_CFG_RE, handle_project_config)
+            await page.route(_WORKTREES_RE, handle_worktrees)
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(_SESSIONS_RE, handle_sessions)
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # The most-recent workspace is a LINKED worktree — the pre-fix
+            # auto-seed would land here and reuse it.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["{_LINKED_WORKTREE}"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # The workspace chip shows the MAIN repo (gamma), not the linked
+            # worktree — proof the fork-fresh redirect fired.
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "gamma", timeout=15_000
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("start fresh")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            # Seeded at the MAIN repo, not the linked worktree.
+            assert body["workspace"] == _MAIN_REPO, body
+            git = body.get("git") or {}
+            # A fresh worktree forked off the project default — not a bind.
+            assert re.fullmatch(r"worktree-[0-9a-f]{8}", git.get("branch_name", "")), body
+            assert git.get("base_branch") == "develop", body
+            assert "existing_worktree" not in git, body
+        finally:
+            await browser.close()

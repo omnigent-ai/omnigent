@@ -120,7 +120,7 @@ def test_fork_runner_reports_pid_and_exit_code(manager: ZygoteManager, tmp_path)
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
     assert isinstance(proc, ZygoteRunnerProc)
     assert proc.pid != manager.pid
     assert _wait_exit(proc) == 0
@@ -132,7 +132,7 @@ def test_fork_runner_nonzero_exit_is_reported(manager: ZygoteManager, tmp_path) 
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_fork_env(7), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(7), str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 7
 
 
@@ -148,7 +148,7 @@ def test_child_systemexit_code_is_preserved(manager: ZygoteManager, tmp_path) ->
     """
     env = _fork_env(5)
     env["OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"] = "1"
-    proc = manager.fork_runner(env, str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(env, str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 5
 
 
@@ -158,9 +158,9 @@ def test_zygote_serves_multiple_forks(manager: ZygoteManager, tmp_path) -> None:
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child logs.
     """
-    first = manager.fork_runner(_fork_env(0), str(tmp_path / "a.log"))
+    first = manager.fork_runner(_fork_env(0), str(tmp_path / "a.log"), str(tmp_path))
     assert _wait_exit(first) == 0
-    second = manager.fork_runner(_fork_env(3), str(tmp_path / "b.log"))
+    second = manager.fork_runner(_fork_env(3), str(tmp_path / "b.log"), str(tmp_path))
     assert second.pid != first.pid
     assert _wait_exit(second) == 3
 
@@ -174,7 +174,7 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 0
     proc.terminate()
     proc.kill()
@@ -190,7 +190,7 @@ def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
     manager.stop()
     try:
         assert proc.poll() is None  # pid still alive -> honestly "still live"
@@ -206,7 +206,7 @@ def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) ->
     """
     manager.stop()
     with pytest.raises(ZygoteUnavailable):
-        manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+        manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
 
 
 def test_child_env_is_isolated_between_forks(manager: ZygoteManager, tmp_path) -> None:
@@ -225,14 +225,34 @@ def test_child_env_is_isolated_between_forks(manager: ZygoteManager, tmp_path) -
     env_b = _fork_env(0)
     env_b["OMNIGENT_ZYGOTE_MARKER"] = "bbb"
 
-    proc_a = manager.fork_runner(env_a, str(log_a))
+    proc_a = manager.fork_runner(env_a, str(log_a), str(tmp_path))
     assert _wait_exit(proc_a) == 0
-    proc_b = manager.fork_runner(env_b, str(log_b))
+    proc_b = manager.fork_runner(env_b, str(log_b), str(tmp_path))
     assert _wait_exit(proc_b) == 0
 
     assert proc_a.pid != proc_b.pid
     assert "marker=aaa" in log_a.read_text()
     assert "marker=bbb" in log_b.read_text()
+
+
+def test_forked_runner_runs_in_the_requested_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """The forked child chdirs into the workspace, not the zygote's own cwd.
+
+    A daemon may outlive the checkout it started from, so a runner that
+    inherited its cwd would raise ``FileNotFoundError`` from every
+    ``Path.cwd()``. The seam child echoes its cwd to its log.
+
+    :param manager: The started manager fixture (cwd = the pytest process's).
+    :param tmp_path: Temp dir for the workspace and the child's log.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    log = tmp_path / "runner.log"
+
+    proc = manager.fork_runner(_fork_env(0), str(log), str(workspace))
+    assert _wait_exit(proc) == 0
+
+    assert f"cwd={workspace.resolve()}\n" in log.read_text()
 
 
 def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_path) -> None:
@@ -248,7 +268,7 @@ def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_pa
     env = _fork_env(0)
     env["OMNIGENT_LOG_TTY_FD"] = "999"  # bogus daemon-side number
     log = tmp_path / "runner.log"
-    proc = manager.fork_runner(env, str(log))
+    proc = manager.fork_runner(env, str(log), str(tmp_path))
     assert _wait_exit(proc) == 0
     assert "tty_fd=\n" in log.read_text()
 
@@ -454,15 +474,16 @@ def _sleep_env(seconds: float) -> dict[str, str]:
     }
 
 
-def test_poll_after_zygote_crash_reports_dead_runner(manager: ZygoteManager) -> None:
+def test_poll_after_zygote_crash_reports_dead_runner(manager: ZygoteManager, tmp_path) -> None:
     """A vanished zygote surfaces a dead runner as failed, never eternal alive.
 
     Without this the daemon's ``_watch_runner`` loops forever on ``poll() is
     None`` and reports a gone session as alive.
 
     :param manager: The started manager fixture.
+    :param tmp_path: Temp dir used as the forked child's workspace.
     """
-    proc = manager.fork_runner(_sleep_env(30), "/dev/null")
+    proc = manager.fork_runner(_sleep_env(30), "/dev/null", str(tmp_path))
     assert proc.poll() is None  # child is alive
 
     # Kill the zygote out from under the still-live runner.
@@ -503,7 +524,7 @@ def test_dropped_runner_harness_exit_codes_do_not_leak(manager: ZygoteManager, t
     :param tmp_path: Temp dir for the harness child's log.
     """
     # A runner that lives long enough to host a harness fork, then exits.
-    proc = manager.fork_runner(_sleep_env(2), "/dev/null")
+    proc = manager.fork_runner(_sleep_env(2), "/dev/null", str(tmp_path))
     runner_pid = proc.pid
 
     # The runner's own control socket back to the zygote is internal to the
@@ -606,7 +627,7 @@ def test_zygote_still_forks_after_a_malformed_request(manager: ZygoteManager, tm
     :param tmp_path: Temp dir for the child's log.
     """
     assert "error" in _raw_exchange(manager, b"[]\n")
-    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 0
 
 

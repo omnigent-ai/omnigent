@@ -64,7 +64,7 @@ export function CommandGoalDialog({
           </DialogHeader>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-condition">
+            <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-condition">
               Completion condition
             </label>
             <Textarea

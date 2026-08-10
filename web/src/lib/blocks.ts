@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
+import type { RoutingDecisionExtras } from "./routingDecision";
 import type { RememberScope, Response } from "./types";
 
 /**
@@ -209,6 +210,8 @@ export function slashCommandEchoItemId(slashItemId: string): string {
 export interface RoutingDecisionBlock {
   type: "routing_decision";
   ctx: BlockContext;
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
@@ -307,6 +310,32 @@ export interface ErrorBlock {
   source: string;
   /** Machine-readable error code, e.g. "llm_auth_failed". Empty when omitted. */
   code: string;
+  /**
+   * Optional friendly headline naming what went wrong, e.g. "Claude Code
+   * can't run as root". Present when the runner classified the failure;
+   * lets the banner show a clear title instead of the raw `code`.
+   */
+  title?: string;
+  /** Optional one/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Optional concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
+}
+
+/**
+ * Extract the optional structured failure fields (`title` / `cause` /
+ * `remediation`) from any error-shaped source, dropping absent ones so an
+ * `ErrorBlock` stays minimal when the failure wasn't classified. Spread the
+ * result into an `ErrorBlock` alongside `message` / `source` / `code`.
+ */
+export function structuredErrorFields(
+  src: { title?: string | null; cause?: string | null; remediation?: string | null } | null,
+): Pick<ErrorBlock, "title" | "cause" | "remediation"> {
+  const out: Pick<ErrorBlock, "title" | "cause" | "remediation"> = {};
+  if (src?.title) out.title = src.title;
+  if (src?.cause) out.cause = src.cause;
+  if (src?.remediation) out.remediation = src.remediation;
+  return out;
 }
 
 /** The server is retrying. */

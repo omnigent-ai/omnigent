@@ -97,8 +97,13 @@ class _PopenKwargs(TypedDict, total=False):
 #   non-interactive startup.
 # - ``PROMPT_COMMAND``: arbitrary command run by bash before each prompt.
 # - ``CDPATH``: changes the resolution of relative paths in shell ``cd``.
-# - ``SSH_AUTH_SOCK``: the user's running ssh-agent socket — a
-#   credential surface masquerading as a path.
+# - ``SSH_AUTH_SOCK``: the user's ssh-agent socket. Allowed through the
+#   weaker host→runner and harness-CLI boundaries (a socket path, like
+#   ``KUBECONFIG``), but an ACTIVE sandbox is where the agent is being
+#   deliberately confined, and signing with the user's keys is exactly
+#   what that confinement is for. Opt in per-spec, and grant the socket
+#   path too: under seatbelt / bwrap the name alone points at something
+#   unreachable.
 # - ``DBUS_SESSION_BUS_ADDRESS``: lets the helper talk to the user's
 #   D-Bus session.
 # - ``XDG_RUNTIME_DIR``: per-session socket directory (Wayland, ssh-

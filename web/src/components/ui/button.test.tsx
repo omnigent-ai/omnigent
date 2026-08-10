@@ -29,7 +29,17 @@ afterEach(() => {
 const TRANSLATE_UTILITY = /(^|:)-?translate-/;
 
 const VARIANTS = ["default", "outline", "secondary", "ghost", "destructive", "link"] as const;
-const SIZES = ["default", "xs", "sm", "lg", "icon", "icon-xs", "icon-sm", "icon-lg"] as const;
+const SIZES = [
+  "default",
+  "xs",
+  "sm",
+  "lg",
+  "icon",
+  "icon-xxs",
+  "icon-xs",
+  "icon-sm",
+  "icon-lg",
+] as const;
 
 describe("buttonVariants translate/transform composition", () => {
   it.each(VARIANTS.flatMap((variant) => SIZES.map((size) => ({ variant, size }))))(
@@ -71,6 +81,71 @@ describe("buttonVariants icon geometry", () => {
     // index.css owns the fixed geometry through this semantic hook; callers can
     // opt an exceptional icon out with data-icon-size.
     expect(classes).toContain("button-standard-icons");
+  });
+
+  it("makes icon-xxs a transparent 14px container with a 14px glyph", () => {
+    render(
+      <Button variant="ghost" size="icon-xxs" aria-label="Tiny icon">
+        <svg aria-hidden />
+      </Button>,
+    );
+
+    expect(screen.getByRole("button", { name: "Tiny icon" })).toHaveClass(
+      "size-3.5",
+      "bg-transparent",
+      "hover:bg-transparent",
+      "dark:hover:bg-transparent",
+      "[&_svg]:size-3.5!",
+      "[&_svg]:p-0!",
+    );
+  });
+
+  it("mutes ghost icon buttons by default without changing primary icon contrast", () => {
+    render(
+      <>
+        <Button variant="ghost" size="icon" aria-label="Ghost icon">
+          <svg aria-hidden />
+        </Button>
+        <Button size="icon" aria-label="Primary icon">
+          <svg aria-hidden />
+        </Button>
+      </>,
+    );
+
+    expect(screen.getByRole("button", { name: "Ghost icon" })).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Primary icon" })).toHaveClass(
+      "text-primary-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Primary icon" })).not.toHaveClass(
+      "text-muted-foreground",
+    );
+  });
+});
+
+describe("Button radius scale", () => {
+  it("maps default, small, and extra-small buttons to 8px, 6px, and 4px tokens", () => {
+    render(
+      <>
+        <Button data-testid="button-md">Medium</Button>
+        <Button size="sm" data-testid="button-sm">
+          Small
+        </Button>
+        <Button size="xs" data-testid="button-xs">
+          Extra small
+        </Button>
+        <Button size="icon-xs" aria-label="Compact icon" data-testid="button-icon-xs">
+          <svg aria-hidden />
+        </Button>
+      </>,
+    );
+
+    expect(screen.getByTestId("button-md")).toHaveClass("rounded-lg");
+    expect(screen.getByTestId("button-sm")).toHaveClass("rounded-[var(--radius-md)]");
+    expect(screen.getByTestId("button-xs")).toHaveClass("rounded-[var(--radius-sm)]");
+    expect(screen.getByTestId("button-icon-xs")).toHaveClass("rounded-[var(--radius-md)]");
   });
 });
 

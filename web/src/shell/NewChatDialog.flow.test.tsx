@@ -1,5 +1,6 @@
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -49,6 +50,27 @@ vi.mock("@/lib/routing", () => ({
 // (keyed by conversation id), not router state — assert on that call.
 vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
+}));
+
+// The create races the POST against the updates stream's announcement of the
+// new session row. Stub the stream so a test decides when (and with what row)
+// that announcement lands, and can inspect the matcher the screen built to
+// tell its own session apart from everything else the stream pushes.
+const pushMatchers: ((item: SessionListWireItem) => boolean)[] = [];
+let announcePushedSession: ((row: SessionListWireItem | null) => void) | null = null;
+vi.mock("@/lib/sessionUpdatesSocket", () => ({
+  nextPushedSession: (match: (item: SessionListWireItem) => boolean, signal: AbortSignal) => {
+    pushMatchers.push(match);
+    return new Promise<SessionListWireItem | null>((resolve) => {
+      announcePushedSession = resolve;
+      signal.addEventListener("abort", () => resolve(null), { once: true });
+    });
+  },
+  // Inert transport for anything else in the tree that observes connectivity.
+  sessionUpdatesSocket: {
+    subscribeStatus: () => () => {},
+    isConnected: () => true,
+  },
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -144,10 +166,26 @@ function setAgents(agents: AvailableAgent[]): void {
   >);
 }
 
-function renderLanding(): void {
+function renderLanding(cachedSessionIds: string[] = []): void {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  if (cachedSessionIds.length > 0) {
+    // Sessions already on screen when the create starts. "Never seen by this
+    // tab" is part of how the screen recognizes its own announced row, so the
+    // case that covers that seeds the cache the check reads.
+    client.setQueryData(["conversations", "", false], {
+      pages: [
+        {
+          data: cachedSessionIds.map((id) => ({ id })),
+          first_id: cachedSessionIds[0],
+          last_id: cachedSessionIds.at(-1),
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
+  }
   function Wrapper({ children }: { children: ReactNode }) {
     return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
   }
@@ -177,9 +215,16 @@ function openWorktree(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
 }
 
-/** Open the picker and commit (select + close) an agent by clicking its row. */
+/**
+ * Open the picker and commit (select + close) an agent by clicking its row.
+ * Only the fully supported harnesses lead inline; the rest sit under "More", so
+ * drill in when the row isn't already listed.
+ */
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+  }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
@@ -213,6 +258,8 @@ function saveConfig(): void {
 beforeEach(() => {
   navigateMock.mockReset();
   setPendingInitialPromptMock.mockReset();
+  pushMatchers.length = 0;
+  announcePushedSession = null;
   vi.mocked(authenticatedFetch).mockReset();
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
@@ -261,6 +308,64 @@ describe("NewChatLandingScreen create flow", () => {
 
     // On success the screen routes to the freshly created session.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("opens the session on the stream's announcement instead of waiting for the create", async () => {
+    // POST /v1/sessions doesn't answer until the host has spawned a runner — a
+    // process boot, seconds of it — but the session row exists, and is
+    // announced on the updates stream, almost immediately. Hold the POST open
+    // for the whole test: if the screen still routes, it routed on the
+    // announcement, which is the entire point.
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>(() => {}) as ReturnType<typeof authenticatedFetch>,
+    );
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(announcePushedSession).not.toBeNull());
+    act(() => announcePushedSession?.({ id: "conv_pushed" }));
+
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_pushed"));
+    // The first message is handed off under the same id. That coupling is why
+    // the id has to be RIGHT and not merely early — a wrong one would post the
+    // user's message into somebody else's conversation.
+    expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+      "conv_pushed",
+      expect.objectContaining({ text: "inspect the repo" }),
+    );
+  });
+
+  it("recognizes only the session it just asked for among the stream's pushes", async () => {
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>(() => {}) as ReturnType<typeof authenticatedFetch>,
+    );
+
+    renderLanding(["conv_existing"]);
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(pushMatchers).toHaveLength(1));
+    const isOurs = pushMatchers[0]!;
+    const ours: SessionListWireItem = {
+      id: "conv_mine",
+      agent_id: "ag_hello",
+      host_id: "host_1",
+    };
+    expect(isOurs(ours)).toBe(true);
+
+    // The stream announces every session that becomes visible to this user and
+    // restates the ones already on screen, so each of these would otherwise be
+    // mistaken for the create's own row: a session started elsewhere on another
+    // agent or host, a sub-agent child (never what a create returns), and a row
+    // this tab was already showing.
+    expect(isOurs({ ...ours, agent_id: "ag_other" })).toBe(false);
+    expect(isOurs({ ...ours, host_id: "host_2" })).toBe(false);
+    expect(isOurs({ ...ours, parent_session_id: "conv_parent" })).toBe(false);
+    expect(isOurs({ ...ours, id: "conv_existing" })).toBe(false);
   });
 
   it("shows a busy spinner on the submit button while the create is in flight", async () => {
@@ -314,7 +419,7 @@ describe("NewChatLandingScreen create flow", () => {
     // inputs (host id, recents, derived home) change, so nothing ever
     // re-filled the field — the chip dropped back to its empty placeholder.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: /corey-laptop/ }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
 
     expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo");
   });
@@ -756,6 +861,54 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(init.body as string);
     expect(body.labels?.["omnigent.wrapper"]).toBe("opencode-native-ui");
     expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("records the launched harness so the picker can promote it later", async () => {
+    // The picker promotes previously-launched harnesses out of "More"; this is
+    // the write half of that contract. OpenCode isn't fully supported, so
+    // without this record it would stay behind "More" forever.
+    setAgents([
+      agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" }),
+      agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_opencode" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(localStorage.getItem("omnigent:recent-harnesses")).toBeNull();
+
+    selectAgent("ag_opencode");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    // Stored under the canonical harness id, not the agent name or wrapper.
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:recent-harnesses") ?? "[]")).toEqual([
+        "opencode-native",
+      ]),
+    );
+  });
+
+  it("does not record a harness when the create fails", async () => {
+    // Only a successful launch earns a primary slot — a failed create must not
+    // promote the harness the user merely attempted.
+    setAgents([agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({ detail: "boom" }),
+      text: async () => "boom",
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    expect(localStorage.getItem("omnigent:recent-harnesses")).toBeNull();
   });
 
   it("omits terminal_launch_args when permission mode is left at default for claude-native", async () => {

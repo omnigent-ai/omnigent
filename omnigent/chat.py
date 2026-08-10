@@ -28,6 +28,7 @@ import httpx
 import yaml
 from omnigent_client import (
     OmnigentClient,
+    RegisteredAgent,
     SessionToolCallInfo,
     ToolCallable,
     ToolCallInfo,
@@ -35,14 +36,6 @@ from omnigent_client import (
 )
 from omnigent_client import (
     OmnigentError as ClientOmnigentError,
-)
-from omnigent_client._events import (
-    ErrorEvent,
-    ResponseCancelled,
-    ResponseCompleted,
-    ResponseFailed,
-    ResponseIncomplete,
-    TextDelta,
 )
 from rich.console import Console
 
@@ -113,6 +106,17 @@ _REMOTE_RUNNER_STOP_GRACE_SECONDS = 8.0
 # is. Fetched ``order="desc"`` (newest first) precisely so the window
 # tracks the end of the conversation, not its start.
 _RECONCILE_ITEMS_LIMIT = 100
+
+# Race-window guard for each headless ``-p`` turn wait (the first turn
+# and the extra-turns loop). Expiry alone does not end the turn — the
+# session status decides whether to keep waiting (turn still running)
+# or reconcile against the durable transcript (terminal event lost).
+# Module-level so tests can patch it.
+_PER_TURN_TIMEOUT_S = 120.0
+
+# Overall budget for following one headless ``-p`` session to idle
+# (first-turn recovery and the extra-turns loop share it).
+_LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
 # Optional bearer token for remote omnigent servers that sit
 # behind an auth proxy (for example Databricks Apps). When set, the
@@ -1455,16 +1459,24 @@ async def _prepare_chat_session_via_daemon(
     from omnigent.native_terminal import bind_session_runner
 
     async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
-        if fork_session_id is not None:
-            fork_result = await sdk.sessions.fork(fork_session_id)
-            session_id = fork_result["id"]
-        elif resume_conversation_id is not None:
-            session_id = resume_conversation_id
-        else:
-            created = await sdk.sessions.create(
-                bundle, filename="agent.tar.gz", workspace=workspace
-            )
-            session_id = created.id
+        try:
+            if fork_session_id is not None:
+                fork_result = await sdk.sessions.fork(fork_session_id)
+                session_id = fork_result["id"]
+            elif resume_conversation_id is not None:
+                session_id = resume_conversation_id
+            else:
+                created = await sdk.sessions.create(
+                    bundle, filename="agent.tar.gz", workspace=workspace
+                )
+                session_id = created.id
+        except ClientOmnigentError as exc:
+            # Any create/fork/resume rejection here is a server-side answer, not
+            # a client bug worth a traceback: a wrong base URL that answers
+            # /health but has no session API, a fork of a session that is gone,
+            # a permission refusal. Name the URL, since a wrong one is the case
+            # that looks least like itself, and pass the server's message through.
+            raise click.ClickException(f"Could not start a session on {base_url}: {exc}") from exc
 
     # A separate raw httpx client for the host-runner protocol (the daemon
     # launch helpers operate on httpx, not the SDK).
@@ -2029,46 +2041,20 @@ def _run_headless_prompt(
             headers=_server_headers(runner_id=runner_id),
             auth=_server_auth(server_url=base_url),
         ) as client:
-            if session_bundle is not None:
-                result_text = await _query_sessions_once(
-                    client=client,
-                    agent_name=agent_name,
-                    tool_handler=tool_handler,
-                    prompt=prompt,
-                    session_bundle=session_bundle,
-                    session_bundle_filename=session_bundle_filename,
-                    runner_id=runner_id,
-                )
-                if result_text:
-                    print(result_text)
-                return
-
-            session = client.session(model=agent_name, tool_handler=tool_handler)
-            chunks: list[str] = []
-            terminal_text: str | None = None
-            error_text: str | None = None
-            async for event in session.send(prompt):
-                if isinstance(event, TextDelta):
-                    chunks.append(event.delta)
-                elif isinstance(event, ErrorEvent):
-                    error_text = event.error.message or event.error.code
-                elif isinstance(
-                    event,
-                    ResponseCompleted | ResponseFailed | ResponseIncomplete | ResponseCancelled,
-                ):
-                    terminal_text = _response_output_text(event.response.output)
-
-            streamed_text = "".join(chunks)
-            # Prefer the real error from a response.error SSE event over the
-            # generic terminal-event message ("Failed to retrieve final response")
-            # that _build_terminal_event substitutes when it can't read the task.
-            if streamed_text:
-                print(streamed_text)
-            elif error_text:
-                print(f"Error: {error_text}", file=sys.stderr)
-                raise SystemExit(1)
-            elif terminal_text:
-                print(terminal_text)
+            # Both a local bundle and a remote registered agent go through
+            # the sessions API; _query_sessions_once picks the create route
+            # from whether a bundle was supplied.
+            result_text = await _query_sessions_once(
+                client=client,
+                agent_name=agent_name,
+                tool_handler=tool_handler,
+                prompt=prompt,
+                session_bundle=session_bundle,
+                session_bundle_filename=session_bundle_filename,
+                runner_id=runner_id,
+            )
+            if result_text:
+                print(result_text)
 
     try:
         asyncio.run(_main())
@@ -2087,7 +2073,7 @@ async def _query_sessions_once(
     agent_name: str,
     tool_handler: ToolHandler | None,
     prompt: str,
-    session_bundle: bytes,
+    session_bundle: bytes | None,
     session_bundle_filename: str,
     runner_id: str | None,
     resume_conversation_id: str | None = None,
@@ -2098,10 +2084,13 @@ async def _query_sessions_once(
 
     :param client: Connected SDK client.
     :param agent_name: Agent display name, e.g. ``"hello_world"``.
-        Used only for tool-handler validation messages.
+        Used for tool-handler validation messages, and to resolve the
+        registered agent when no bundle is supplied.
     :param tool_handler: Optional client-side tool handler.
     :param prompt: User prompt for the single turn.
-    :param session_bundle: Gzipped agent tarball bytes.
+    :param session_bundle: Gzipped agent tarball bytes, or ``None``
+        when the agent is already registered server-side (remote-URL
+        target) and the session should bind by ``agent_id`` instead.
     :param session_bundle_filename: Multipart filename, e.g.
         ``"agent.tar.gz"``.
     :param runner_id: Registered runner id, e.g.
@@ -2117,6 +2106,22 @@ async def _query_sessions_once(
     """
     from omnigent_client import SessionsChat
 
+    # Remote target: no local bundle means no local runner either, so
+    # adopt one the server already has online before the dispatch
+    # precondition is checked.
+    agent: RegisteredAgent | None = None
+    if runner_id is None and session_bundle is None:
+        agent = await client.sessions.resolve_agent(agent_name)
+        runner_id = await client.sessions.resolve_online_runner(
+            harness=agent.harness,
+            canonicalize=lambda name: canonicalize_harness(name) or name,
+        )
+        if runner_id is None:
+            raise RuntimeError(
+                "This server has no online runner to run the turn. Start one against "
+                "it with `omnigent host --server <url>` (or run the agent locally "
+                "with `omnigent run <agent.yaml>`), then retry."
+            )
     if runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
@@ -2128,14 +2133,23 @@ async def _query_sessions_once(
         bound = await client.sessions.get(resume_conversation_id)
         await client.sessions.bind_runner(resume_conversation_id, runner_id=runner_id)
     else:
-        created = await client.sessions.create(
-            session_bundle,
-            filename=session_bundle_filename,
-            # Record CLI cwd so the Web UI can show "ran locally
-            # in <workspace>" for one-shot sessions. CLI sessions
-            # don't set host_id; this column is purely informational.
-            workspace=os.getcwd(),
-        )
+        # Record CLI cwd so the Web UI can show "ran locally in
+        # <workspace>" for one-shot sessions. CLI sessions don't set
+        # host_id; this column is purely informational.
+        if session_bundle is None:
+            # Remote target: the agent is registered server-side, so
+            # bind by id rather than uploading a bundle we don't have.
+            agent = agent or await client.sessions.resolve_agent(agent_name)
+            created = await client.sessions.create_from_agent_id(
+                agent.id,
+                workspace=os.getcwd(),
+            )
+        else:
+            created = await client.sessions.create(
+                session_bundle,
+                filename=session_bundle_filename,
+                workspace=os.getcwd(),
+            )
         bound = await client.sessions.bind_runner(created.id, runner_id=runner_id)
     if on_session_ready is not None:
         on_session_ready(bound.id)
@@ -2163,13 +2177,61 @@ async def _query_sessions_once(
     # interactive REPL is immune by construction (it renders a ``failed``
     # status as a transient error and polls the snapshot as a backstop),
     # so this brings headless ``-p`` to parity.
+    # Race-window guard for the first turn, mirroring the multi-turn
+    # loop's use of ``_PER_TURN_TIMEOUT_S`` below. Two failure modes are
+    # already reconciled via ``_persisted_turn_text``: an
+    # ``OmnigentError`` (session flipped to ``failed``) and an empty
+    # ``result.text`` (subscribe-after-post race where the SSE
+    # subscription missed ``response.completed`` but the connection
+    # closed promptly). A THIRD variant of the same race is NOT an error
+    # and does NOT close the connection: the runner's terminal event is
+    # dropped, but the stream's periodic heartbeats (``session.heartbeat``,
+    # not a turn-terminal event) keep arriving on schedule forever, so
+    # ``SessionsChat.send`` never raises and never returns. Without a
+    # bound here, a lost terminal event hangs the CLI indefinitely even
+    # though the runner already completed and persisted the turn
+    # server-side. ``asyncio.wait_for`` cancels the underlying ``send()``
+    # generator on timeout, which runs its ``finally`` and closes the SSE
+    # subscription cleanly.
     try:
-        result = await chat.query(prompt)
+        result = await asyncio.wait_for(chat.query(prompt), timeout=_PER_TURN_TIMEOUT_S)
     except ClientOmnigentError:
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
         raise
+    except TimeoutError:
+        # The guard tripping does NOT mean the turn is over: a healthy
+        # first turn can simply outlast it (long generation, slow
+        # tools), and the server persists each assistant item as it
+        # completes, so reconciling immediately would return a
+        # mid-turn fragment as if it were the final answer. The session
+        # status distinguishes the two cases: keep waiting while the
+        # runner reports the turn in flight (mirroring the extra-turns
+        # loop below, which refreshes and continues on ``await_turn``
+        # timeouts), and reconcile only once the session is no longer
+        # running or the overall budget expires. ``await_turn`` here is
+        # a status-change waiter; its text (at most the tail of the
+        # turn, since the subscription is fresh) is discarded because
+        # the transcript read below returns the whole turn's output.
+        # An async orchestrator stays ``running`` until its sub-agents
+        # and synthesis finish, so this also follows those to idle.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_LOOP_TIMEOUT_S):
+                while True:
+                    await chat.refresh()
+                    if chat.status not in ("running", "launching"):
+                        break
+                    await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+        reconciled = await _persisted_turn_text(client, bound.id)
+        if reconciled is not None:
+            return reconciled
+        raise RuntimeError(
+            f"Turn did not complete within {_PER_TURN_TIMEOUT_S:.0f}s and no "
+            "persisted assistant text was found to reconcile against "
+            "(subscribe-after-post race: the terminal event was lost and "
+            "the runner appears not to have completed either)."
+        ) from None
     all_text_parts: list[str] = []
     if result.text:
         all_text_parts.append(result.text)
@@ -2215,8 +2277,8 @@ async def _query_sessions_once(
     # even when await_turn times out (sub-agents still running), unlike the
     # last_turn_saw_waiting flag which would incorrectly exit on timeout.
     _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
-    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard per synthesis turn
-    _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+    # ``_PER_TURN_TIMEOUT_S`` / ``_LOOP_TIMEOUT_S`` are module-level;
+    # they also guard the first-turn query above.
 
     async def _drain_extra_turns() -> None:
         # Probe: collect synthesis text or status events that arrive quickly.
@@ -3834,35 +3896,29 @@ def _run_one_shot(
             headers=_server_headers(runner_id=runner_id),
             auth=_server_auth(server_url=base_url),
         ) as client:
-            if session_bundle is not None:
-                text = await _query_sessions_once(
-                    client=client,
-                    agent_name=agent_name,
-                    tool_handler=tool_handler,
-                    prompt=prompt,
-                    session_bundle=session_bundle,
-                    session_bundle_filename=session_bundle_filename,
-                    runner_id=runner_id,
-                    resume_conversation_id=resume_conversation_id,
-                    on_session_ready=(
-                        lambda session_id: open_conversation_link_if_enabled(
-                            base_url=base_url,
-                            conversation_id=session_id,
-                            enabled=auto_open_conversation,
-                            warn=lambda message: click.echo(message, err=True),
-                        )
-                    ),
-                )
-                if text:
-                    click.echo(text)
-                return
-            result = await client.query(
-                model=agent_name,
-                input=prompt,
+            # Both a local bundle and a remote registered agent go through
+            # the sessions API; _query_sessions_once picks the create route
+            # from whether a bundle was supplied.
+            text = await _query_sessions_once(
+                client=client,
+                agent_name=agent_name,
                 tool_handler=tool_handler,
+                prompt=prompt,
+                session_bundle=session_bundle,
+                session_bundle_filename=session_bundle_filename,
+                runner_id=runner_id,
+                resume_conversation_id=resume_conversation_id,
+                on_session_ready=(
+                    lambda session_id: open_conversation_link_if_enabled(
+                        base_url=base_url,
+                        conversation_id=session_id,
+                        enabled=auto_open_conversation,
+                        warn=lambda message: click.echo(message, err=True),
+                    )
+                ),
             )
-            if result.text:
-                click.echo(result.text)
+            if text:
+                click.echo(text)
 
     try:
         asyncio.run(_main())

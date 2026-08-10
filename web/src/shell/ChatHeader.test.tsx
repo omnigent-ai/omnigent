@@ -33,6 +33,7 @@ const mobileMenu = {
   subagentsWorking: 0,
   agentCount: 1,
   onOpenFiles: () => {},
+  onOpenChanges: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
   onOpenTodos: () => {},
@@ -44,6 +45,7 @@ function renderHeader(props: {
   isChildSession?: boolean;
   parentSessionId?: string;
   boundAgent?: Agent;
+  wrapperLabel?: string | null;
   canShare?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
@@ -61,6 +63,7 @@ function renderHeader(props: {
           // isolating the left-slot affordances under test.
           conversationId={undefined}
           boundAgent={props.boundAgent}
+          wrapperLabel={props.wrapperLabel ?? null}
           canShare={props.canShare ?? false}
           shareDisabled={props.shareDisabled}
           shareDisabledReason={props.shareDisabledReason}
@@ -91,7 +94,7 @@ describe("ChatHeader — deployed Share presentation", () => {
       "gap-1",
       "rounded-[6px]",
       "px-2",
-      "text-[13px]",
+      "text-ui",
       "share-button-glassy",
       "md:inline-flex",
     );
@@ -115,7 +118,7 @@ describe("ChatHeader — deployed Share presentation", () => {
       "gap-1",
       "rounded-[6px]",
       "px-2",
-      "text-[13px]",
+      "text-ui",
       "share-button-glassy",
     );
     expect(share.querySelector(".lucide-user-plus")).not.toBeNull();
@@ -174,6 +177,21 @@ describe("ChatHeader — sub-agent affordance", () => {
     expect(screen.getByText("Sub-agent")).toBeInTheDocument();
   });
 
+  it("names the product, not the internal wrapper row, on a native sub-agent", () => {
+    // A Claude Code Task child is bound to its parent's `claude-native-ui`
+    // agent — an Omnigent internal the server hides everywhere else
+    // (`public_agent_name`). The wrapper label names the product instead.
+    renderHeader({
+      sidebarOpen: true,
+      isChildSession: true,
+      parentSessionId: "parent-123",
+      boundAgent: { id: "a1", name: "claude-native-ui" },
+      wrapperLabel: "claude-code-native-ui-subagent",
+    });
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.queryByText("claude-native-ui")).toBeNull();
+  });
+
   it("falls back to a lone 'Sub-agent' label before the agent snapshot loads", () => {
     renderHeader({
       sidebarOpen: true,
@@ -230,6 +248,7 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 parentSessionId={undefined}
                 conversationId="sess-1"
                 boundAgent={undefined}
+                wrapperLabel={null}
                 canShare={false}
                 onShare={() => {}}
                 hasAgentInfo={false}
@@ -250,6 +269,7 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               parentSessionId={undefined}
               conversationId="sess-1"
               boundAgent={undefined}
+              wrapperLabel={null}
               canShare={false}
               onShare={() => {}}
               hasAgentInfo={false}
@@ -272,17 +292,17 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("mounts the ViewModeToggle for a terminal-first session", () => {
     renderHeaderWithSession(makeTerminalFirstCtx());
     expect(
-      screen.getByRole("button", { name: /switch between chat and terminal/i }),
+      screen.getByRole("group", { name: /switch between chat and terminal/i }),
     ).toBeInTheDocument();
   });
 
   it("omits the toggle for a non-terminal-first session", () => {
     renderHeaderWithSession(makeTerminalFirstCtx({ isTerminalFirst: false }));
-    expect(screen.queryByRole("button", { name: /switch between chat and terminal/i })).toBeNull();
+    expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
   });
 
   it("omits the toggle when there is no TerminalFirst context", () => {
     renderHeaderWithSession(null);
-    expect(screen.queryByRole("button", { name: /switch between chat and terminal/i })).toBeNull();
+    expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
   });
 });

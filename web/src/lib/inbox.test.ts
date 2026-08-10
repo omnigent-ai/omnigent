@@ -53,23 +53,9 @@ describe("collectInboxItems", () => {
     // display-label helpers (wrapper label → "Claude Code", etc.).
     expect(items[0].row).toBe(row);
     expect(items[0].resolveSessionId).toBe("conv_a");
-    expect(items[0].canApprove).toBe(true);
     // Content must survive the parse, not just the structure.
     expect(items[0].elicitation.message).toBe("approve elicit_1?");
     expect(items[0].elicitation.policyName).toBe("ask_everything");
-  });
-
-  it("carries the snapshot viewer's approval capability", () => {
-    const row = makeRow({ id: "conv_shared" });
-    const items = collectInboxItems([
-      {
-        row,
-        pendingElicitations: [makeRawElicitation("elicit_shared")],
-        canApprove: false,
-      },
-    ]);
-
-    expect(items[0].canApprove).toBe(false);
   });
 
   it("routes mirrored child prompts to the child via target_session_id", () => {
