@@ -2477,6 +2477,90 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_exit_classifies_root_failure(tmp_path: Path) -> None:
+    """A recognized failure carries structured title/cause/remediation.
+
+    When the terminal output matches a known failure (Claude refusing
+    ``--dangerously-skip-permissions`` as root), the ``failed`` status event
+    carries the friendly ``title`` / ``cause`` / ``remediation`` fields (so the
+    web UI can render a clear card) in addition to the composed ``message``.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = uuid.uuid4().hex
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "claude"
+    instance.args = ["--dangerously-skip-permissions"]
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot(
+        "--dangerously-skip-permissions cannot be run with root privileges for security reasons"
+    )
+    instance._remember_exit_status("1 1")
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+
+    async def _collect_failed() -> dict[str, Any]:
+        while True:
+            queue = _session_event_queues_ref.get(conv_id)
+            if queue is not None:
+                while not queue.empty():
+                    item = queue.get_nowait()
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "session.status"
+                        and item.get("status") == "failed"
+                    ):
+                        return item
+            await asyncio.sleep(0)
+
+    try:
+        await resource_registry.observe_required_terminal(conv_id, "claude", "main", instance)
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        failed = await asyncio.wait_for(_collect_failed(), timeout=1.0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    error = failed["error"]
+    assert error["code"] == "required_terminal_exited"
+    assert error["title"] == "Claude Code can't run as root"
+    assert "root" in error["cause"].lower()
+    assert "non-root" in error["remediation"].lower()
+    # The composed message leads with the diagnosis and still carries the raw
+    # diagnostics (exit status included) for the collapsible details view.
+    assert error["message"].startswith("Claude Code can't run as root")
+    assert "exited with status 1" in error["message"]
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path: Path) -> None:
     """
     A required terminal that exits while the session is idle is a clean shutdown.

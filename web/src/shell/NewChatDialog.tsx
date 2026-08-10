@@ -1682,20 +1682,6 @@ function HarnessConfigModal({
                   ariaLabel="Approval"
                 />
               </ConfigRow>
-              {/* Persistent danger banner while full-bypass is selected. */}
-              {isCodex && draftBypass && (
-                <div
-                  role="alert"
-                  data-testid="new-chat-landing-bypass-sandbox-banner"
-                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium leading-relaxed text-destructive"
-                >
-                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-                  <span>
-                    Danger: this session runs Codex with approvals and the sandbox disabled. It can
-                    edit any file and run any command without asking.
-                  </span>
-                </div>
-              )}
             </>
           )}
 
@@ -4736,25 +4722,6 @@ export function NewChatLandingScreen() {
                   hostName: harnessWarningHost?.name,
                   fallbackAgentName: selectedAgent?.display_name,
                 })}
-              </span>
-            </p>
-          )}
-
-          {/* Persistent danger banner — stays under the composer while full
-              bypass is armed (the in-menu banner vanishes when the Advanced
-              tray closes), so the dangerous stance is always visible before
-              the session is created. Gated on the codex-native capability so
-              a stale toggle from a since-switched agent can't show it. */}
-          {supportsApprovalMode && bypassSandbox && (
-            <p
-              role="alert"
-              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium text-destructive"
-              data-testid="new-chat-landing-bypass-sandbox-active-banner"
-            >
-              <TriangleAlertIcon className="size-3.5 shrink-0" />
-              <span>
-                Codex will run with approvals and the sandbox disabled — it can edit any file and
-                run any command without asking.
               </span>
             </p>
           )}

@@ -291,29 +291,35 @@ export function WorkspacePicker({
 
   const { data, isLoading, error, isPlaceholderData } = useHostFilesystem(hostId, path);
 
-  // Once the home listing comes back, derive the home dir's
-  // absolute path from the first entry's parent. Only first
-  // entry — they all share the same parent. Skip placeholder data
-  // (the prior directory kept on screen during a load) or we'd
-  // derive home from the wrong directory's entries.
+  // Resolve the host's home dir independently of where the picker is
+  // browsing, so a typed "~"-relative path can be expanded even when the
+  // picker opened straight at an absolute initialPath and thus never visits
+  // the "" home view. The query fires at mount and disables once home
+  // resolves; when the picker IS at the home view it shares the main
+  // listing's query key, so this adds no extra fetch there. An empty home
+  // has no entry to derive from and stays unresolved (the picker still
+  // opens onto it fine, and "~" typing is moot in an empty home).
+  const { data: homeData, isPlaceholderData: homeIsPlaceholder } = useHostFilesystem(
+    hostId,
+    resolvedHome === null ? "" : null,
+  );
+
+  // Derive the home dir's absolute path from the first entry's parent (all
+  // entries share one parent). Skip placeholder data (the prior directory
+  // kept on screen during a load) or we'd derive home from the wrong dir.
   useEffect(() => {
-    if (
-      path === "" &&
-      resolvedHome === null &&
-      !isPlaceholderData &&
-      data &&
-      data.entries.length > 0
-    ) {
-      const first = data.entries[0];
-      // first.path is "/Users/corey/x" → parent is "/Users/corey".
-      const idx = first.path.lastIndexOf("/");
-      if (idx > 0) {
-        setResolvedHome(first.path.slice(0, idx));
-      } else if (idx === 0) {
-        setResolvedHome("/");
-      }
+    if (resolvedHome !== null || homeIsPlaceholder || !homeData || homeData.entries.length === 0) {
+      return;
     }
-  }, [path, resolvedHome, data, isPlaceholderData]);
+    const first = homeData.entries[0];
+    // first.path is "/Users/corey/x" → parent is "/Users/corey".
+    const idx = first.path.lastIndexOf("/");
+    if (idx > 0) {
+      setResolvedHome(first.path.slice(0, idx));
+    } else if (idx === 0) {
+      setResolvedHome("/");
+    }
+  }, [resolvedHome, homeData, homeIsPlaceholder]);
 
   // Absolute path of the directory currently shown, derived from the
   // first entry's parent (entries share one parent). This is how a ""
