@@ -3290,12 +3290,13 @@ function ConversationRow({
     );
   }
 
-  // Archiving is a single PATCH (see runArchive); show a
-  // status row for the span instead of leaving the row looking idle. On
-  // success
-  // the list refetches and the row drops out of the default view (or
-  // flips to its archived state under "Show archived"); on failure the
-  // flag clears and the interactive row returns so the user can retry.
+  // Archiving is a single PATCH (see runArchive); show a status row for the
+  // span instead of leaving the row looking idle. The spinner stays up until
+  // the row itself leaves the sidebar: on success the list refetches and this
+  // row unmounts (dropped from the default view), which removes the spinner
+  // with it — it is deliberately NOT cleared on PATCH-settle, or it would
+  // vanish a round-trip before the row does. On failure the flag clears and
+  // the interactive row returns so the user can retry.
   if (isArchiving) {
     return (
       <li>
@@ -3338,8 +3339,17 @@ function ConversationRow({
     // tears down a host-spawned runner) in the background once the flag is
     // committed. Sending a client stop too would race that one against the
     // same runner, and the loser gets a 503 from the already-killed pane.
-    // "Archiving…" shows until the archive settles (success → row leaves
-    // the default list; failure → interactive row returns for a retry).
+    //
+    // "Archiving…" must stay up until the row actually LEAVES the sidebar,
+    // not merely until the PATCH resolves. The PATCH success only kicks off
+    // an async `["conversations"]` refetch (see useArchiveConversation); the
+    // row drops out a round-trip later, once that refetch lands and the
+    // archived row is filtered out of the rendered list. Clearing the
+    // spinner on settle (the old behavior) reopened that gap: the row flashed
+    // back to its plain, clickable form — spinner gone — while the session
+    // was still listed. So we DON'T clear it on success: this row unmounts
+    // when the refetch removes it, which tears the spinner down with it.
+    // Only an error clears the flag, restoring the interactive row for retry.
     setIsArchiving(true);
     archive.mutate(
       { id: conversation.id, archived: true },
@@ -3347,7 +3357,7 @@ function ConversationRow({
         // Point the user at where the session went — it's no longer in
         // the sidebar list, so surface its new home in Settings.
         onSuccess: showArchivedToast,
-        onSettled: () => setIsArchiving(false),
+        onError: () => setIsArchiving(false),
       },
     );
   }

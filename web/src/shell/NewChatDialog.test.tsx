@@ -2717,6 +2717,56 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
+
+  // An unsupported attachment has to be caught HERE, before the session
+  // exists. Letting it through means the upload only 415s after the session
+  // is created and navigated into — stranding the typed message in a session
+  // the user never wanted.
+  it("rejects an unsupported attachment instead of attaching it", () => {
+    renderLanding();
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [zip] },
+    });
+    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "only images, PDF, and text/code files are supported",
+    );
+  });
+
+  it("keeps the supported files from a mixed drop and names the rejected one", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.drop(composer, { dataTransfer: { files: [ok, zip] } });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "photos.zip",
+    );
+    // Removing the accepted chip clears the stale rejection notice too.
+    fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+
+  it("clears the rejection notice once the user types", () => {
+    // The rejected file is never attached, so there is no chip to remove and
+    // nothing else clears the notice. Left sticky it reads as a blocker on a
+    // composer that can actually be submitted.
+    renderLanding();
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [zip] },
+    });
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "never mind, just a question" },
+    });
+
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
 });
 
 // The "@"-file-mention browser on the launcher mirrors the in-session

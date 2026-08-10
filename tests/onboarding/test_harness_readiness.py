@@ -32,6 +32,11 @@ def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # Copilot also accepts a ``gh auth login`` session as a token, so a developer's
+    # real gh login would otherwise flip their verdict here too.
+    import omnigent.onboarding.copilot_auth as _ca
+
+    monkeypatch.setattr(_ca, "gh_cli_github_token", lambda host=None: None)
     # Codex readiness resolves the binary via resolve_cli_binary, which honors
     # an OMNIGENT_CODEX_PATH override and probes on-disk global install dirs.
     # Clear the override and stub the fallback dirs so a developer's real codex
@@ -66,6 +71,11 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
             else:
                 version = "9.9.9\n"
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout=version, stderr="")
+        if argv[:3] == ["gh", "auth", "token"]:
+            # Copilot readiness falls back to the ``gh`` CLI login when no token
+            # is configured. Report "logged out" so these tests stay about CLI
+            # presence; the fallback itself is covered in test_copilot_auth.py.
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="")
         raise AssertionError(f"unexpected subprocess during readiness tests: {argv!r}")
 
     monkeypatch.setattr(hi.subprocess, "run", _stub_run)
@@ -422,6 +432,24 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "pi-native",
     ):
         assert result[missing] == "binary-missing", f"{missing} should name the missing CLI binary"
+
+
+def test_copilot_ready_via_gh_cli_login_without_stored_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``gh auth login`` session alone makes copilot ready.
+
+    Without this, a logged-in user is told to paste a token that ``gh`` already
+    holds — and on macOS ``gh`` keeps it in the keychain, where the Copilot CLI
+    (which only reads ``oauth_token`` out of ``hosts.yml``) can't see it.
+    """
+    import omnigent.onboarding.copilot_auth as _ca
+
+    _all_clis_installed(monkeypatch)
+    assert configured_harness_map()["copilot"] is False
+
+    monkeypatch.setattr(_ca, "gh_cli_github_token", lambda host=None: "gho_from_gh")
+    assert configured_harness_map()["copilot"] is True
 
 
 def test_configured_harness_map_all_true_with_clis(

@@ -720,6 +720,115 @@ def test_initial_host_token_re_resolves_to_sdk_when_proxy_auth_fails(
     assert token == "sdk-token"
 
 
+def test_managed_mint_403_after_prior_mint_latches_proxy_auth_failed_at_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-mint 403 latches ``proxy_auth_failed`` once the cache fully expires.
+
+    The OMNI-2529 deadlock: an idle session crosses the owner JWT's 60-minute
+    lifetime, so the re-mint presents the already-expired JWT as its own proxy
+    bearer and the Apps edge answers 403. The old 401/403 branch only latched
+    when no mint had *ever* succeeded, so this state set neither latch and
+    ``auth_flow`` raised ``httpx.RequestError`` forever. Walks the full
+    timeline: mint OK → 403 inside the refresh-skew window (cache still
+    served, no latch) → 403 after full expiry (latch).
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _mint_ok_then_403(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Mint once, then 403 every re-mint like an Apps edge on a dead bearer."""
+        calls.append(1)
+        if len(calls) == 1:
+            return ("minted-jwt", time.time() + 3600)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "Invalid Token", request=request, response=httpx.Response(403, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_ok_then_403)
+
+    factory = _make_managed_mint_factory(
+        "https://s.example.com", "btok", proxy_bearer="host-bearer"
+    )
+    assert factory is not None
+    assert factory() == "minted-jwt"  # served from the probe's cache
+
+    # 403 inside the refresh-skew window: the cached JWT is still valid, so it
+    # keeps being served and nothing latches (the next attempt may succeed).
+    factory._cached_expires_at = time.time() + 60.0
+    assert factory() == "minted-jwt"
+    assert factory.proxy_auth_failed is False
+    assert factory.declined is False
+
+    # 403 after full expiry: no still-valid cache remains, so the mint loop
+    # cannot renew itself — proxy_auth_failed must latch so callers re-resolve
+    # SDK/OIDC instead of failing closed on every callback.
+    factory._cached_expires_at = time.time() - 1.0
+    assert factory() is None
+    assert factory.proxy_auth_failed is True
+    assert factory.declined is False  # bare requests would be wrong here
+
+
+def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-install mint 403 at full expiry re-resolves SDK/OIDC in the same call.
+
+    Extends the construction-time fallback above to the mid-session case: the
+    managed mint worked (the runner ran on minted JWTs), then the session
+    outlived the JWT and the re-mint 403s. The factory chain must hand the
+    *current* request an SDK/OIDC token rather than returning ``None`` — one
+    ``None`` here means a raised callback, and before the fix it was ``None``
+    forever.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+
+    class _SdkAuth:
+        def current_token(self) -> str:
+            return "sdk-token"
+
+    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    calls: list[int] = []
+
+    def _mint_ok_then_403(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        calls.append(1)
+        if len(calls) == 1:
+            return ("minted-jwt", time.time() + 3600)
+        request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
+        raise httpx.HTTPStatusError(
+            "403", request=request, response=httpx.Response(403, request=request)
+        )
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN", "host-bearer")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_ok_then_403)
+
+    factory = _make_auth_token_factory()
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    factory.invalidate()
+    assert factory() == "minted-jwt"  # managed mint installed and serving
+
+    mint_factory = factory._fallback_factory
+    assert isinstance(mint_factory, _ManagedMintTokenFactory)
+    # The session outlives the minted JWT, and the edge 403s the re-mint.
+    mint_factory._cached_expires_at = time.time() - 1.0
+
+    assert factory() == "sdk-token"
+
+
 def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

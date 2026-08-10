@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1741,6 +1742,56 @@ def test_get_openai_client_model_service_without_provider_fails_loudly(monkeypat
 
     with pytest.raises(ValueError, match="No provider credentials"):
         _get_openai_async_client(model="production.agents.support_assistant")
+
+
+def test_get_openai_client_unpinned_model_does_not_route_to_databricks(monkeypatch):
+    """An unpinned model is not a Databricks signal.
+
+    Leaving the model unset means "use the provider default", not
+    "this is Databricks-hosted". Routing it to ambient Databricks auth
+    made a credential-less OpenAI agent fail with an "install
+    databricks-sdk" error instead of naming the missing OpenAI key.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="no model is pinned"):
+        _get_openai_async_client(model=None)
+
+
+def test_get_openai_client_databricks_model_still_uses_ambient_auth(monkeypatch):
+    """A ``databricks-`` model keeps the ambient Databricks fallback.
+
+    Guards the unpinned-model fix from over-reaching into the legacy
+    Databricks routing path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    calls: list[str | None] = []
+
+    def _fake_resolve(profile=None, **kwargs):
+        calls.append(profile)
+        return httpx.BasicAuth("token", ""), "https://example.databricks.com"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    client = _get_openai_async_client(model="databricks-gpt-5-5")
+
+    assert calls == [None], "a 'databricks-' model must still resolve ambient Databricks auth"
+    assert (
+        str(client.base_url).rstrip("/") == "https://example.databricks.com/ai-gateway/openai/v1"
+    )
 
 
 def test_get_openai_client_invalid_profile_raises_auth_error(monkeypatch):

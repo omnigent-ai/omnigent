@@ -69,7 +69,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
@@ -1880,9 +1880,21 @@ export function NewChatLandingScreen() {
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
   const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const addFiles = (incoming: File[]) => setFiles((prev) => [...prev, ...incoming]);
-  const removeFile = (index: number) => setFiles((prev) => prev.filter((_, i) => i !== index));
+  // Reject unsupported types (only images, PDF, and text/code) and oversized
+  // files here, before the session exists. Without this the upload only fails
+  // after the session is created and navigated into, where the first turn's
+  // 415 strands the typed message in a session the user never wanted.
+  const addFiles = (incoming: File[]) => {
+    const { accepted, errors } = validateAttachments(incoming);
+    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
+    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+  };
+  const removeFile = (index: number) => {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachmentError(null);
+  };
 
   // Drag-and-drop onto the composer — same behavior as the in-session
   // composer (drop files anywhere on the box; an inset ring + overlay
@@ -3845,6 +3857,10 @@ export function NewChatLandingScreen() {
               value={message}
               onChange={(e) => {
                 setMessage(e.target.value);
+                // A rejected attachment is never added, so there's no chip to
+                // remove and nothing else would ever clear this. Left sticky it
+                // reads as a blocker on a composer the user can actually submit.
+                if (attachmentError !== null) setAttachmentError(null);
                 // Recompute the active "@"-mention from the caret each keystroke
                 // (native terminal agents with a workspace — ``mentionEnabled``).
                 setMention(
@@ -4033,6 +4049,15 @@ export function NewChatLandingScreen() {
                     </button>
                   </span>
                 ))}
+              </div>
+            )}
+            {/* Rejected-attachment feedback: unsupported type or too large */}
+            {attachmentError !== null && (
+              <div
+                className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap"
+                data-testid="new-chat-landing-attachment-error"
+              >
+                {attachmentError}
               </div>
             )}
             {/* No own bg — the pill paints the surface. An explicit bg-card

@@ -1,9 +1,13 @@
 // Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
-// the archive PATCH (`archived: true`, with an onSettled that clears the
-// "Archiving…" status row). The runner stop is the server's job once the
-// flag commits — a client stop would race the server's against the same
-// runner, and it would also put the runner's stop timeouts in front of the
-// flag flip. The kebab's user-facing "Stop session" action is a separate
+// the archive PATCH (`archived: true`). The "Archiving…" status row stays up
+// until the row LEAVES the sidebar — on success it's held (the row unmounts
+// when the list refetch drops the archived row, taking the spinner with it),
+// and only an error clears it to restore the interactive row for retry.
+// Clearing on settle would flash the row back to its clickable form a
+// round-trip before it actually leaves. The runner stop is the server's job
+// once the flag commits — a client stop would race the server's against the
+// same runner, and it would also put the runner's stop timeouts in front of
+// the flag flip. The kebab's user-facing "Stop session" action is a separate
 // affordance covered by Sidebar.stop.test.tsx. Unarchiving flips the flag
 // back with no status row. See ConversationRow.runArchive in Sidebar.tsx.
 //
@@ -143,7 +147,10 @@ describe("archive flow", () => {
       { id: "conv_1", archived: true },
       expect.objectContaining({
         onSuccess: expect.any(Function),
-        onSettled: expect.any(Function),
+        // Only an error restores the interactive row; success intentionally
+        // leaves the spinner up until the row unmounts (see the "keeps the
+        // 'Archiving…' row up after the archive succeeds" case below).
+        onError: expect.any(Function),
       }),
     );
     // The server owns the stop. A client stop here would race it against
@@ -187,18 +194,40 @@ describe("archive flow", () => {
     expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
   });
 
-  it("clears the 'Archiving…' row once the archive settles", () => {
+  it("keeps the 'Archiving…' row up after the archive succeeds", () => {
+    // On success the spinner must NOT be cleared: the row leaves the sidebar
+    // only when the ['conversations'] refetch drops the archived row (which
+    // unmounts this row and its spinner together). Clearing on success would
+    // flash the row back to its plain, clickable form for the round-trip until
+    // the refetch lands — the exact regression this guards. Here the mocked
+    // list still contains the row (no refetch modeled), so firing onSuccess
+    // must leave the status row in place.
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
     expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
 
-    // Settle the archive → the row returns to its interactive state
-    // (onSettled runs on success or error). The stop's settle is irrelevant
-    // to the row state.
-    const archiveOnSettled = mocks.archive.mutate.mock.calls[0][1].onSettled as () => void;
-    act(() => archiveOnSettled());
+    const archiveOnSuccess = mocks.archive.mutate.mock.calls[0][1].onSuccess as () => void;
+    act(() => archiveOnSuccess());
+
+    // Still archiving, still no interactive link — the row hasn't left yet.
+    expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
+  });
+
+  it("restores the interactive row when the archive errors", () => {
+    // The only escape hatch from the status row: a failed archive clears the
+    // flag so the user gets the clickable row back to retry. Success has no
+    // such clear (see above) — the row instead leaves via the refetch.
+    mockConversations([CONV]);
+    renderSidebar();
+    clickArchive();
+
+    expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
+
+    const archiveOnError = mocks.archive.mutate.mock.calls[0][1].onError as () => void;
+    act(() => archiveOnError());
 
     expect(screen.queryByTestId("conversation-archiving")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();

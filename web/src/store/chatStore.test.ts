@@ -3062,6 +3062,45 @@ describe("chatStore — send (file attachments)", () => {
     await useChatStore.getState().send("look at this", "agent_xyz", [file]);
     expect(uploads).toBe(1);
   });
+
+  it("hands the message back for retry when the upload is rejected", async () => {
+    // A 415 on an unsupported attachment must not swallow the typed text: the
+    // optimistic bubble rolls back, so `failedSendDraft` is the only thing
+    // left holding it. The banner carries the server's reason, not "415".
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return mockResponse(
+          {
+            detail:
+              "Unsupported attachment type 'application/zip'. Only images, " +
+              "PDF, and text/code files can be attached.",
+          },
+          { ok: false, status: 415 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const zip = new File([new Uint8Array(4)], "photos.zip", { type: "application/zip" });
+    await useChatStore.getState().send("summarize these photos", "agent_xyz", [zip]);
+
+    const state = useChatStore.getState();
+    // Optimistic bubble rolled back — the send never reached the server.
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.failedSendDraft).toEqual({
+      conversationId: "conv_existing",
+      text: "summarize these photos",
+      files: [zip],
+    });
+    const error = state.blocks.at(-1) as { type: string; message: string };
+    expect(error.type).toBe("error");
+    expect(error.message).toContain("Unsupported attachment type 'application/zip'");
+  });
 });
 
 describe("chatStore — stop", () => {
