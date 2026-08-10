@@ -8154,7 +8154,10 @@ def _host_http_json(
             timeout=timeout_s,
         ) as client:
             resp = client.request(method, path, params=params, json=json_body)
-    except (httpx.HTTPError, OSError) as exc:
+    except (httpx.HTTPError, OSError, ImportError) as exc:
+        # httpx raises ImportError while building the client when the ambient
+        # environment selects a proxy whose optional extra is missing (e.g. an
+        # ``ALL_PROXY=socks5://…`` shell without ``httpx[socks]`` installed).
         return _HostHttpResult(
             status_code=0,
             body=f"{type(exc).__name__}: {exc}",

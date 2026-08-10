@@ -35,6 +35,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     ToolCallStatus,
     TurnComplete,
+    describe_exception,
 )
 
 # ---------------------------------------------------------------------------
@@ -587,6 +588,38 @@ async def test_end_to_end_denied_permission(tmp_path: Path) -> None:
 
     # Turn still completes even though the tool was rejected.
     assert any(isinstance(e, TurnComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# describe_exception — never report a blank turn error (#4281)
+# ---------------------------------------------------------------------------
+
+
+def test_describe_exception_falls_back_to_repr_for_blank_message():
+    """A bare exception whose ``str()`` is empty is described by ``repr()``.
+
+    Regression for #4281: executors reported failures via ``str(exc)``, so a
+    bare ``RuntimeError()`` reached the operator as "inner executor error: "
+    with no detail. The fallback must at least name the exception type.
+    """
+    assert str(RuntimeError()) == ""  # the exact blank-message case from the bug
+    described = describe_exception(RuntimeError())
+    assert described != ""
+    assert "RuntimeError" in described
+
+
+def test_describe_exception_preserves_a_real_message():
+    """When the exception carries a message, it is used verbatim (no repr noise)."""
+    assert describe_exception(ValueError("boom: bad line")) == "boom: bad line"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError(), TimeoutError(), OSError(), Exception()],
+)
+def test_describe_exception_never_blank(exc: BaseException):
+    """No bare stdlib exception yields an empty description."""
+    assert describe_exception(exc).strip() != ""
 
 
 # ---------------------------------------------------------------------------

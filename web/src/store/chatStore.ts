@@ -427,6 +427,23 @@ export interface ChatState {
    */
   pendingComposerAttachments: ComposerAttachment[];
   /**
+   * The text + attachments of a send that failed before the server took
+   * ownership of it, handed back so the composer can restore them for a
+   * retry. Without this the message is simply gone: `submit` clears the
+   * composer optimistically, and a first message carried in from the
+   * landing screen has already had its draft dropped and its pending
+   * prompt destructively consumed — so an upload 415 or a runner 503 left
+   * the user with an error and nothing to resend. The composer drains this
+   * (matching on conversation id) and clears it.
+   *
+   * Single-slot: a second failure in the same session replaces the first's
+   * retained draft (last failure wins). A send that fails before any session
+   * id resolves isn't captured — there is no composer keyed to restore it
+   * into — but the landing path binds a session first, so the reported flow
+   * is covered.
+   */
+  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
    * the session snapshot on bind; ``null`` before bind or when the
@@ -1064,6 +1081,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
+  failedSendDraft: null,
   llmModel: null,
   sessionHarness: null,
   subAgentName: null,
@@ -1470,6 +1488,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
             tempId,
           ),
         }));
+        // Hand the message back to the composer so the user can retry it.
+        // Nothing else holds it at this point: the optimistic bubble is about
+        // to roll back, and a first message carried in from the landing screen
+        // has already had its draft cleared and its pending prompt consumed.
+        // Keyed by session so it restores into the one it was meant for even
+        // if the user navigated away while the send was in flight.
+        if (text.trim() !== "" || (files?.length ?? 0) > 0) {
+          set({
+            failedSendDraft: { conversationId: stashSessionId, text, files: files ?? [] },
+          });
+        }
       }
       // A queued send can target a session the user has since switched away
       // from (submit-time pin). Only roll back the bubble and settle status

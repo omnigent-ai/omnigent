@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -617,6 +618,71 @@ def test_daemon_host_online_false_when_no_host_id(
         resolved_server_url="http://127.0.0.1:8123",
     )
     assert cli._daemon_host_online(record) is False
+
+
+# Every proxy variable httpx consults, so the cases below see exactly the
+# ambient proxy configuration they set up (a developer's own ``NO_PROXY``
+# would otherwise exempt loopback and skip the proxy transport entirely).
+_PROXY_ENV_VARS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+def _socks_proxy_without_extra(monkeypatch: pytest.MonkeyPatch, base_url: str) -> None:
+    """Point the ambient environment at a SOCKS proxy httpx cannot build.
+
+    Reproduces a shell exporting ``ALL_PROXY=socks5://…`` on an install
+    without the ``httpx[socks]`` extra: httpx raises ``ImportError`` while
+    constructing the client. Blanking ``socksio`` in :data:`sys.modules`
+    makes the extra look absent whether or not it is really installed.
+
+    :param monkeypatch: Fixture used to scope the environment changes.
+    :param base_url: Server URL to pre-seed headers for, so the probe does
+        not resolve real credentials.
+    """
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setitem(sys.modules, "socksio", None)
+    monkeypatch.setitem(cli._host_http_headers_cache, base_url, {})
+
+
+def test_host_http_json_reports_failure_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy httpx cannot build is a transport failure, not a crash."""
+    base_url = "http://127.0.0.1:8123"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert "socksio" in str(result.body)
+
+
+def test_daemon_host_online_false_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse probe degrades to "offline" instead of failing the command.
+
+    ``_daemon_host_online`` runs on the way into every command that ensures
+    the backend, so an unbuildable proxy must not escape as an exception.
+    """
+    _socks_proxy_without_extra(monkeypatch, "http://127.0.0.1:8123")
+
+    assert cli._daemon_host_online(_online_record()) is False
 
 
 def test_daemon_tunnel_recovers_returns_true_on_immediate_online(
