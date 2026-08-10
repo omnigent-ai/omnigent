@@ -10,29 +10,90 @@ import { computeBuildVersion } from "./src/lib/buildVersion";
 
 const OMNIGENT_URL = process.env.OMNIGENT_URL ?? "http://localhost:6767";
 
+/**
+ * Workspace to mint the token against, when that isn't the proxy target.
+ *
+ * A Databricks App is served from `*.databricksapps.com` but authenticates
+ * against the workspace that hosts it, and `databricks auth token` only knows
+ * workspace hosts — so point this at the workspace, e.g.
+ * `OMNIGENT_AUTH_HOST=https://my-workspace.cloud.databricks.com`.
+ */
+const OMNIGENT_AUTH_HOST = process.env.OMNIGENT_AUTH_HOST;
+
+/**
+ * `.databrickscfg` profile to mint against, e.g. `OMNIGENT_AUTH_PROFILE=oss`.
+ *
+ * Preferred over a host: several profiles routinely share one workspace host,
+ * and `databricks auth token --host` refuses to guess between them.
+ */
+const OMNIGENT_AUTH_PROFILE = process.env.OMNIGENT_AUTH_PROFILE;
+
+/** How the token is minted, given what the environment specified. */
+function tokenCliArgs(host: string): string[] {
+  if (OMNIGENT_AUTH_PROFILE) return ["auth", "token", "-p", OMNIGENT_AUTH_PROFILE];
+  return ["auth", "token", "--host", OMNIGENT_AUTH_HOST ?? host];
+}
+
+/** Re-mint this long before expiry, so an in-flight request can't age out. */
+const TOKEN_REFRESH_SKEW_MS = 5 * 60_000;
+
+/** Assumed lifetime when a token carries no readable expiry. */
+const TOKEN_ASSUMED_TTL_MS = 30 * 60_000;
+
 let cachedToken: string | null | undefined;
+let cachedTokenExpiresAt = 0;
 
-function resolveToken(host: string): string | null {
-  if (cachedToken !== undefined) return cachedToken;
-
-  if (process.env.OMNIGENT_AUTH_TOKEN) {
-    cachedToken = process.env.OMNIGENT_AUTH_TOKEN;
-    return cachedToken;
+/** Read a JWT's `exp` (ms since epoch), or null when it isn't a readable JWT. */
+function readJwtExpiry(token: string): number | null {
+  const payload = token.split(".")[1];
+  if (!payload) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+      exp?: number;
+    };
+    return typeof claims.exp === "number" ? claims.exp * 1000 : null;
+  } catch {
+    return null;
   }
+}
+
+/**
+ * The bearer for the proxied request, minted on demand and re-minted before it
+ * expires.
+ *
+ * Workspace OAuth tokens last about an hour. Resolving one once per process
+ * left a long-running dev server sending a dead bearer afterwards, and every
+ * request 302'd to the login page while the server itself looked healthy —
+ * so the cache is keyed on the token's own expiry.
+ *
+ * `OMNIGENT_AUTH_TOKEN` is an explicit override and is used verbatim; nothing
+ * here can refresh it, so a long session should prefer the CLI path.
+ */
+function resolveToken(host: string): string | null {
+  if (process.env.OMNIGENT_AUTH_TOKEN) return process.env.OMNIGENT_AUTH_TOKEN;
+
+  if (cachedToken !== undefined && Date.now() < cachedTokenExpiresAt) return cachedToken;
 
   try {
-    const output = execFileSync(
-      "databricks",
-      ["auth", "token", "--host", host, "--output", "json"],
-      {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+    const output = execFileSync("databricks", [...tokenCliArgs(host), "--output", "json"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     const tokenResponse = JSON.parse(output) as { access_token?: string };
     cachedToken = tokenResponse.access_token ?? null;
-  } catch {
+    const expiry = cachedToken === null ? null : readJwtExpiry(cachedToken);
+    cachedTokenExpiresAt = (expiry ?? Date.now() + TOKEN_ASSUMED_TTL_MS) - TOKEN_REFRESH_SKEW_MS;
+  } catch (err) {
     cachedToken = null;
+    // Retry on the next request rather than wedging the proxy on one failure
+    // (an expired CLI login is fixed by `databricks auth login`, not a restart).
+    cachedTokenExpiresAt = 0;
+    // Surface why. Swallowing this left "no auth token" with no cause, when
+    // the CLI had already said exactly what was wrong (ambiguous profile,
+    // expired login, missing binary).
+    const stderr = (err as { stderr?: Buffer | string }).stderr;
+    const detail = (typeof stderr === "string" ? stderr : stderr?.toString())?.trim();
+    console.error(`[dev-proxy] databricks auth token failed: ${detail || String(err)}`);
   }
 
   return cachedToken;
@@ -106,8 +167,13 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
 const parsed = new URL(OMNIGENT_URL);
 const useAuth =
   !!process.env.OMNIGENT_AUTH_TOKEN ||
+  !!OMNIGENT_AUTH_HOST ||
+  !!OMNIGENT_AUTH_PROFILE ||
   parsed.hostname.endsWith(".databricks.com") ||
-  parsed.hostname.endsWith(".azuredatabricks.net");
+  parsed.hostname.endsWith(".azuredatabricks.net") ||
+  // A deployed Databricks App — OAuth-gated by its workspace, so it needs a
+  // bearer even though the host isn't a workspace host itself.
+  parsed.hostname.endsWith(".databricksapps.com");
 
 if (useAuth) {
   const token = resolveToken(parsed.origin);
@@ -115,8 +181,10 @@ if (useAuth) {
     console.log(`[dev-proxy] target=${OMNIGENT_URL} (authenticated)`);
   } else {
     console.error(
-      `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +
-        `  Set OMNIGENT_AUTH_TOKEN or run:  databricks auth login --host ${parsed.origin}\n`,
+      `\n[dev-proxy] ERROR: No auth token for ${OMNIGENT_AUTH_HOST ?? parsed.origin}.\n` +
+        `  Run:  databricks auth login --host ${OMNIGENT_AUTH_HOST ?? parsed.origin}\n` +
+        `  For a Databricks App, set OMNIGENT_AUTH_PROFILE (or OMNIGENT_AUTH_HOST)\n` +
+        `  to the workspace that hosts it.\n`,
     );
     process.exit(1);
   }
