@@ -171,9 +171,7 @@ class SqlAlchemySessionLifecycleStore(SessionLifecycleStore):
                 # Lost a race with another producer call for the same
                 # transition (the unique constraint is the storage-level
                 # idempotency backstop). Return the winner's row.
-                existing = self._get_by_transition(
-                    session, session_id, event_type, transition_key
-                )
+                existing = self._get_by_transition(session, session_id, event_type, transition_key)
                 assert existing is not None
                 return _outbox_to_entity(existing), False
             return _outbox_to_entity(row), True
@@ -184,9 +182,8 @@ class SqlAlchemySessionLifecycleStore(SessionLifecycleStore):
         stmt = select(SqlSessionLifecycleOutbox).where(
             SqlSessionLifecycleOutbox.workspace_id == current_workspace_id(),
             SqlSessionLifecycleOutbox.session_id == session_id,
-            SqlSessionLifecycleOutbox.event_type == encode_session_lifecycle_event_type(
-                event_type
-            ),
+            SqlSessionLifecycleOutbox.event_type
+            == encode_session_lifecycle_event_type(event_type),
             SqlSessionLifecycleOutbox.transition_key == transition_key,
         )
         return session.execute(stmt).scalar_one_or_none()
@@ -203,9 +200,7 @@ class SqlAlchemySessionLifecycleStore(SessionLifecycleStore):
         now: int,
     ) -> tuple[SessionElicitation, LifecycleOutboxEvent | None, bool]:
         with self._session("record_elicitation_raised") as session:
-            existing = session.get(
-                SqlSessionElicitation, (current_workspace_id(), elicitation_id)
-            )
+            existing = session.get(SqlSessionElicitation, (current_workspace_id(), elicitation_id))
             if existing is not None:
                 return _elicitation_to_entity(existing), None, False
             elicitation = SqlSessionElicitation(
