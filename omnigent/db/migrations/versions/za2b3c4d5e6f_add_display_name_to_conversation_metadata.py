@@ -1,7 +1,7 @@
 """Add display_name to conversation metadata.
 
 Revision ID: za2b3c4d5e6f
-Revises: z9a2b3c4d5e6
+Revises: f7a8b9c0d1e2
 Create Date: 2026-08-10 00:00:00.000000
 
 Adds a nullable ``display_name`` column to ``omnigent_conversation_metadata``.
@@ -22,7 +22,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "za2b3c4d5e6f"
-down_revision: str | None = "z9a2b3c4d5e6"
+down_revision: str | None = "f7a8b9c0d1e2"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
