@@ -256,12 +256,18 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         # the environment. A bad / Copilot-less token surfaces at run time.
         from omnigent.onboarding.copilot_auth import (
             COPILOT_TOKEN_ENV_VARS,
+            copilot_github_host,
             copilot_github_token_configured,
+            gh_cli_github_token,
         )
 
-        return copilot_github_token_configured() or any(
+        if copilot_github_token_configured() or any(
             os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
-        )
+        ):
+            return True
+        # A ``gh auth login`` session is a usable Copilot credential, so a
+        # logged-in user is ready without pasting a token into setup.
+        return gh_cli_github_token(copilot_github_host()) is not None
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES

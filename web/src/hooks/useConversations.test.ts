@@ -224,6 +224,64 @@ describe("useConversations project filter", () => {
   });
 });
 
+describe("useConversations search timeout", () => {
+  function renderSearch(searchQuery: string) {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations(searchQuery, true), { wrapper });
+    return queryClient;
+  }
+
+  it("bounds a search fetch with an AbortSignal", async () => {
+    renderSearch("linear");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // A search request can hang if its server-side index is missing, so it
+    // carries a timeout signal; the URL still requests the search.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("search_query=linear");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("does not bound an ordinary (non-search) list fetch", async () => {
+    renderSearch("");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // Plain pagination is indexed/fast; adding a deadline could abort a
+    // legitimately larger page, so no signal is attached.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain("search_query=");
+    expect(init.signal).toBeUndefined();
+  });
+
+  it("does not retry a client-side search timeout, but retries other errors", () => {
+    const queryClient = renderSearch("linear");
+    const query = queryClient.getQueryCache().find({
+      queryKey: ["conversations", "linear", true],
+    });
+    const retry = (query?.options as { retry?: unknown } | undefined)?.retry as (
+      failureCount: number,
+      error: unknown,
+    ) => boolean;
+    expect(typeof retry).toBe("function");
+
+    // A fired AbortSignal.timeout rejects with a TimeoutError DOMException —
+    // terminal, so retrying would only re-arm the same slow request.
+    const timeoutError = new DOMException("timeout", "TimeoutError");
+    expect(retry(0, timeoutError)).toBe(false);
+
+    // A genuine server/network error still retries (up to the default cap).
+    expect(retry(0, new Error("500 Internal Server Error"))).toBe(true);
+    expect(retry(3, new Error("500 Internal Server Error"))).toBe(false);
+  });
+});
+
 describe("fetchAllArchivedProjectNames", () => {
   it("pages through all archived sessions and returns distinct sorted project names", async () => {
     fetchMock

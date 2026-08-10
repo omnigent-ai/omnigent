@@ -401,6 +401,7 @@ class _InitialAuthTokenFactory:
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
         self._fallback_resolved = False
+        self._no_credential_logged = False
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
@@ -415,22 +416,27 @@ class _InitialAuthTokenFactory:
                     _proxy_bearer=self._last_initial_token,
                 )
                 self._fallback_resolved = True
-            # Managed mint failed because the proxy bearer is expired — the
-            # initial bearer was injected once and cannot self-renew. Skip
-            # managed mint entirely and go straight to SDK/OIDC.
-            if getattr(self._fallback_factory, "proxy_auth_failed", False):
+            token = self._fallback_factory() if self._fallback_factory is not None else None
+            # Managed mint cannot renew itself when its proxy bearer expires —
+            # the injected host bearer before a first mint, or the minted JWT
+            # once a session outlives it. Re-resolve SDK/OIDC in the same call
+            # so the request that hit the failure still gets a credential.
+            if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
                 self._fallback_factory = _make_auth_token_factory(
                     self._server_url,
                     _allow_initial_token=False,
                     _allow_delegated_mint=False,
                 )
-            if self._fallback_factory is None:
+                token = self._fallback_factory() if self._fallback_factory is not None else None
+            if self._fallback_factory is None and not self._no_credential_logged:
+                # This state is terminal for the process, so say it once
+                # rather than on every subsequent callback.
+                self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
                     "to renew it; run `databricks auth login` to re-authenticate"
                 )
-                return None
-            return self._fallback_factory()
+            return token
 
     @property
     def declined(self) -> bool:
@@ -675,7 +681,9 @@ def _make_managed_mint_factory(
         until process restart). If such a post-install mint then gets a
         definitive refusal, the factory latches ``declined`` and returns
         ``None`` thereafter, and :class:`_RunnerDatabricksAuth` falls back to
-        bare requests.
+        bare requests. A post-install 401/403 with no still-valid cache
+        latches ``proxy_auth_failed`` instead, which
+        :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -712,6 +720,11 @@ class _ManagedMintTokenFactory:
     requests instead of failing closed. The latch matters when the
     construction probe loses a boot race (a connection error installs the
     factory, then the first real mint learns the server never mints).
+
+    A mint 401/403 with no still-valid cached token latches
+    :attr:`proxy_auth_failed` instead: the credential presented to the proxy
+    died (the seeded host bearer, or the minted JWT once a session outlives
+    it), so callers should re-resolve SDK/OIDC rather than send bare requests.
     """
 
     def __init__(
@@ -747,8 +760,10 @@ class _ManagedMintTokenFactory:
         """Return a fresh owner JWT, or ``None``.
 
         :returns: The cached or freshly-minted JWT; ``None`` after a
-            definitive server decline (sets :attr:`declined`) or on a
-            transient mint failure with no still-valid cached token.
+            definitive server decline (sets :attr:`declined`), after a mint
+            401/403 with no still-valid cached token (sets
+            :attr:`proxy_auth_failed`), or on a transient mint failure with
+            no still-valid cached token.
         """
         if self.declined:
             return None
@@ -779,13 +794,15 @@ class _ManagedMintTokenFactory:
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
-                # The proxy bearer is expired or invalid. If we have never
-                # successfully minted, there is no self-sustaining refresh
-                # loop to fall back to — signal proxy_auth_failed so the
-                # caller can try SDK/OIDC instead of looping on a dead bearer.
-                if self._cached_token is None:
+                # The proxy bearer is expired or invalid — the seeded host
+                # bearer, or the minted JWT once a session outlives it. With
+                # no still-valid cache left the mint loop cannot renew itself:
+                # latch proxy_auth_failed so the caller re-resolves SDK/OIDC
+                # instead of failing closed on every callback.
+                cached = self._still_valid_cached_token(now)
+                if cached is None:
                     self.proxy_auth_failed = True
-                    return None
+                return cached
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             # Transient mint failure: keep serving the cached token while
