@@ -183,6 +183,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  /**
+   * Hide/show the active embedded browser view while a DOM overlay is open.
+   * The native view paints above the renderer, so this is how overlays
+   * (dialogs, menus, tooltips, toasts) avoid being covered. Absent on shells
+   * predating the feature — callers must optional-chain.
+   */
+  browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */

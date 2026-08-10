@@ -4,6 +4,7 @@ import * as React from "react";
 import * as TooltipPrimitive from "radix-ui/tooltip";
 
 import { getEmbedRoot } from "@/lib/host";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 
 function TooltipProvider({
@@ -35,6 +36,8 @@ function TooltipContent({
   children,
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Content>) {
+  // Hide the native browser view while this tooltip is open (issue #3980).
+  useSuppressBrowserView();
   return (
     <TooltipPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <TooltipPrimitive.Content

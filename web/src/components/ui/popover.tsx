@@ -4,6 +4,7 @@ import * as React from "react";
 import * as PopoverPrimitive from "radix-ui/popover";
 
 import { getEmbedRoot } from "@/lib/host";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 
 function Popover({ ...props }: React.ComponentProps<typeof PopoverPrimitive.Root>) {
@@ -20,6 +21,8 @@ function PopoverContent({
   sideOffset = 4,
   ...props
 }: React.ComponentProps<typeof PopoverPrimitive.Content>) {
+  // Hide the native browser view while this popover is open (issue #3980).
+  useSuppressBrowserView();
   return (
     <PopoverPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <PopoverPrimitive.Content

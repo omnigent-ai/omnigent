@@ -2,6 +2,7 @@ import * as React from "react";
 import * as ContextMenuPrimitive from "radix-ui/context-menu";
 
 import { getEmbedRoot } from "@/lib/host";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
 
@@ -29,6 +30,8 @@ function ContextMenuContent({
   className,
   ...props
 }: React.ComponentProps<typeof ContextMenuPrimitive.Content>) {
+  // Hide the native browser view while this menu is open (issue #3980).
+  useSuppressBrowserView();
   // Context menus position at the pointer (no trigger anchor), so there's no
   // `align`/`sideOffset` and no trigger-width var — the menu sizes to content.
   return (

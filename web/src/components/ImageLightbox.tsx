@@ -12,6 +12,7 @@ import * as DialogPrimitive from "radix-ui/dialog";
 import { XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
 
 import { getEmbedRoot } from "@/lib/host";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -200,6 +201,12 @@ function ZoomViewer({ image }: { image: LightboxImage }) {
  * the second close affordance. The content fills the viewport, so a click never
  * lands "outside" — closing is Escape or the x only, by design.
  */
+/** Renders nothing; suppresses the native browser view for its lifetime. */
+function SuppressBrowserWhileOpen() {
+  useSuppressBrowserView();
+  return null;
+}
+
 export function ImageLightboxProvider({ children }: { children: React.ReactNode }) {
   const [image, setImage] = useState<LightboxImage | null>(null);
 
@@ -239,6 +246,9 @@ export function ImageLightboxProvider({ children }: { children: React.ReactNode 
             // (and elsewhere) from dismissing the preview.
             onInteractOutside={(e) => e.preventDefault()}
           >
+            {/* Hide the native browser view while the lightbox is open (#3980).
+                Not keyed by src, so switching images doesn't toggle suppress. */}
+            <SuppressBrowserWhileOpen />
             <DialogPrimitive.Title className="sr-only">
               {image?.alt || "Image preview"}
             </DialogPrimitive.Title>

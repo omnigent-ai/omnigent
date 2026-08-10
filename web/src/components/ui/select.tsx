@@ -4,6 +4,7 @@ import * as React from "react";
 import * as SelectPrimitive from "radix-ui/select";
 
 import { getEmbedRoot } from "@/lib/host";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react";
 
@@ -58,6 +59,8 @@ function SelectContent({
   align = "center",
   ...props
 }: React.ComponentProps<typeof SelectPrimitive.Content>) {
+  // Hide the native browser view while this select menu is open (issue #3980).
+  useSuppressBrowserView();
   return (
     <SelectPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <SelectPrimitive.Content

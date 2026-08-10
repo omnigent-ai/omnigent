@@ -3,6 +3,7 @@ import * as DialogPrimitive from "radix-ui/dialog";
 
 import { getEmbedRoot } from "@/lib/host";
 import { isIOSShell } from "@/lib/nativeBridge";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { XIcon } from "lucide-react";
@@ -54,6 +55,8 @@ function DialogContent({
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
 }) {
+  // Hide the native browser view while this dialog is open (issue #3980).
+  useSuppressBrowserView();
   // On the iOS shell the layout viewport stays full-height when the soft
   // keyboard opens (the native shell keeps the WKWebView full via
   // `.ignoresSafeArea(.keyboard)`), so a modal centered on `50%` and capped at
