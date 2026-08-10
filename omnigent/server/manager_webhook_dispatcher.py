@@ -143,18 +143,18 @@ async def _deliver_one(
             "data": json.loads(event.payload),
         }
     )
-    secret = signing.current_secret()
+    secret = signing.current_signing_key()
     started = time.monotonic()
     if secret is None:
-        # Configured enabled but no secret in the environment — fail this
-        # attempt like any other delivery failure (retried with backoff);
-        # never send an unsigned request.
+        # Configured enabled but no signing key in the environment — fail
+        # this attempt like any other delivery failure (retried with
+        # backoff); never send an unsigned request.
         store.mark_delivery_failed(
             event.id,
             workspace_id=event.workspace_id,
             next_attempt_at=int(time.time()) + int(_backoff_seconds(event.attempt_count)),
             dead_letter_after_attempts=_DEAD_LETTER_AFTER_ATTEMPTS,
-            error_code="missing_secret",
+            error_code="missing_signing_key",
             error_message=f"{signing.SECRET_ENV_VAR} is not set",
         )
         _log_attempt(
@@ -162,7 +162,7 @@ async def _deliver_one(
             outcome="error",
             latency_ms=0.0,
             http_status=None,
-            error_code="missing_secret",
+            error_code="missing_signing_key",
             endpoint_host=_endpoint_host(endpoint),
         )
         return

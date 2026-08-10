@@ -124,7 +124,7 @@ def store(db_uri: str) -> SqlAlchemySessionLifecycleStore:
 
 
 @pytest.fixture(autouse=True)
-def _webhook_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+def _webhook_signing_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(signing.SECRET_ENV_VAR, _SECRET)
 
 

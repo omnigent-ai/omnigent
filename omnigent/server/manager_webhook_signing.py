@@ -28,8 +28,8 @@ PREVIOUS_SECRET_ENV_VAR = "OMNIGENT_MANAGER_WEBHOOK_SECRET_PREVIOUS"
 DEFAULT_TOLERANCE_SECONDS = 300
 
 
-def current_secret() -> str | None:
-    """The active signing secret, or ``None`` if unset (signing disabled)."""
+def current_signing_key() -> str | None:
+    """The active signing key, or ``None`` if unset (signing disabled)."""
     value = os.environ.get(SECRET_ENV_VAR)
     return value if value else None
 
@@ -49,7 +49,7 @@ def sign(*, secret: str, timestamp: int, event_id: str, raw_json_body: str) -> s
     """
     Compute the ``X-Omnigent-Signature`` header value for one delivery attempt.
 
-    :param secret: The signing secret (:func:`current_secret` — never
+    :param secret: The signing secret (:func:`current_signing_key` — never
         *previous*; only the current secret ever signs).
     :param timestamp: Unix epoch seconds at signing time.
     :param event_id: The event's stable ``event_id``.
