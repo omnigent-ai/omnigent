@@ -4020,7 +4020,7 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
             runner_app._session_inboxes_ref.pop("conv_parent_inbox", None)
 
     assert "sub-agent task conv_child_inbox completed" in inbox_output
-    assert "worker:phase-a returned: CHILD_MARKER" in inbox_output
+    assert "worker:worker-1 returned: CHILD_MARKER" in inbox_output
 
 
 @pytest.mark.asyncio
@@ -4141,7 +4141,7 @@ async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
             runner_app.unregister_subagent_work(child_id)
             runner_app._session_inboxes_ref.pop(parent_id, None)
 
-    assert "worker:repeat returned: FIRST_RESULT" in first_drain
+    assert "worker:worker-1 returned: FIRST_RESULT" in first_drain
     assert "SECOND_RESULT" not in first_drain
     assert "worker:repeat returned: SECOND_RESULT" in second_drain
 
@@ -4786,7 +4786,7 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
         "status": "cancelled",
     }
     assert inbox_output == (
-        "[System: sub-agent task conv_child_cancel cancelled — runner:phase-c]"
+        "[System: sub-agent task conv_child_cancel cancelled — runner:runner-1]"
     ), "Cancelled sub-agent work must produce exactly one cancelled inbox item."
 
 
