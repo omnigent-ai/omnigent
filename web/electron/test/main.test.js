@@ -175,7 +175,7 @@ describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
 });
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
-// (/c/<id>) lives UNDER the server's workspace mount (/ml/omnigents), so it
+// (/c/<id>) lives UNDER the server's workspace mount (/omnigent), so it
 // must be string-concatenated (resolveServerPath) — NOT resolved with
 // `new URL(path, serverUrl)`, which would anchor against the ORIGIN and drop
 // the mount, opening the wrong URL for every workspace deep link. This catches
@@ -187,7 +187,7 @@ describe("deep-link path join wiring (src/main.js)", () => {
       /resolveServerPath\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
-        "resolveServerPath. A deep link to a workspace server (origin + /ml/omnigents",
+        "resolveServerPath. A deep link to a workspace server (origin + /omnigent",
         "mount) would lose the mount and 404. Restore the mount-aware join (see",
         "resolveServerPath); do not replace it with `new URL(path, serverUrl)`.",
       ].join(" "),
@@ -342,5 +342,32 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
         "confirmOpenDeepLink (in the consent-unknown branch), not before chooseDeepLinkStrategy.",
       ].join(" "),
     );
+  });
+});
+
+describe("workspace API URL canonicalization wiring (src/main.js)", () => {
+  it("canonicalizes saved defaults and recents when settings load", () => {
+    assert.match(
+      liveCode,
+      /settings\.server_url\s*=\s*canonicalizeDesktopServerUrl\(settings\.server_url\)/,
+    );
+    assert.match(
+      liveCode,
+      /settings\.recent_servers[\s\S]{0,400}\.map\(canonicalizeDesktopServerUrl\)/,
+    );
+  });
+
+  it("canonicalizes selected and explicit window destinations before navigation", () => {
+    assert.match(
+      liveCode,
+      /const serverUrl\s*=\s*requestedServerUrl\s*\?\s*canonicalizeDesktopServerUrl\(requestedServerUrl\)\s*:\s*null/,
+    );
+    assert.match(liveCode, /explicit\s*\?\s*canonicalizeDesktopServerUrl\(explicit\)\s*:\s*null/);
+  });
+});
+
+describe("fallback JSON document theme wiring (src/main.js)", () => {
+  it("registers the light JSON theme on each shell window", () => {
+    assert.match(liveCode, /registerLightJsonDocumentTheme\(win\.webContents\)/);
   });
 });
