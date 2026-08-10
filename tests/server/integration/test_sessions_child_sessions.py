@@ -1753,20 +1753,11 @@ async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale
     assert recovered_for == [child["id"]]
 
 
-async def test_subagent_background_task_waiting_delivers_to_parent_as_idle(
+async def test_subagent_background_task_waiting_does_not_deliver_to_parent(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A sub-agent's background-task ``waiting`` still delivers terminal status.
-
-    Regression for the parent-orchestrator hang: a claude-native sub-agent
-    relabels its ``Stop`` turn-end ``idle`` to ``waiting`` when a background
-    shell lingers. The terminal-delivery branch only fires for
-    ``idle``/``failed``, so an un-collapsed ``waiting`` would skip delivery and
-    the parent would wait forever. The server must collapse the sub-agent's
-    background-task ``waiting`` to ``idle`` so delivery (here, the recovery
-    path) still runs for the child.
-    """
+    """A live child background task does not terminally deliver to its parent."""
     child = await _create_native_child(client, name="orch-bg-waiting")
 
     async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
@@ -1792,11 +1783,10 @@ async def test_subagent_background_task_waiting_delivers_to_parent_as_idle(
         },
     )
 
-    # Delivery fired despite the incoming `waiting`: the collapse to `idle`
-    # let the terminal-status branch run for THIS child (recovery invoked,
-    # 202 Accepted) instead of silently skipping and stranding the parent.
+    # ``waiting`` remains non-terminal while the child reports a live shell.
+    # The forwarder's bounded fallback handles a missing later Stop edge.
     assert resp.status_code == 202, resp.text
-    assert recovered_for == [child["id"]]
+    assert recovered_for == []
 
 
 async def test_subagent_idle_forward_503s_when_recovery_also_fails(
