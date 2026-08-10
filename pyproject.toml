@@ -151,6 +151,11 @@ all = [
 ]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# Integration credential store cipher: AWS KMS encrypts per-user connection
+# secrets at rest (omnigent/server/secretbox.py). boto3 is imported lazily and
+# only when OMNIGENT_CREDENTIAL_KMS_KEY_ID is set, so only deployments enabling
+# the GitHub / integration Connect features need this extra.
+credentials = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
 # with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
 # lazily, so only users of this backend need the extra.
