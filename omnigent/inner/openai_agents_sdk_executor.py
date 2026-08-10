@@ -500,7 +500,12 @@ def _get_openai_async_client(
             **retry_kwargs,
         )
 
-    allow_ambient_databricks = model is None or model.startswith("databricks-")
+    # An unpinned model is not a Databricks signal: it means "use the
+    # provider's default", which run_turn resolves from the model catalog.
+    # Treating it as Databricks-hosted sent credential-less OpenAI agents into
+    # ambient Databricks auth, surfacing an "install databricks-sdk" error at
+    # users who never configured Databricks.
+    allow_ambient_databricks = model is not None and model.startswith("databricks-")
 
     # An explicit Databricks profile is authoritative; model-service names
     # are opaque Unity Catalog identifiers such as catalog.schema.service.
@@ -552,8 +557,9 @@ def _get_openai_async_client(
     # Without an explicit profile, only legacy Databricks model names opt in
     # to ambient Databricks credentials.
     if not profile and not allow_ambient_databricks:
+        target = f"for model {model!r}" if model is not None else "and no model is pinned"
         raise ValueError(
-            f"No provider credentials were configured for model {model!r}. "
+            f"No provider credentials were configured {target}. "
             "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
             "Databricks profile, or use a 'databricks-' prefixed model name "
             "for legacy automatic Databricks routing."
