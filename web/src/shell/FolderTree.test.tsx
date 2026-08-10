@@ -188,15 +188,16 @@ describe("FolderTree trailing column", () => {
       // The copy button lives inside the fixed-width trailing column...
       const slot = button.closest(`.${ROW_META_SLOT_CLASS}`);
       expect(slot, "every row's copy button must sit in the trailing column").not.toBeNull();
-      // ...paired with the download button, or with a spacer standing in for
-      // it (folders, deleted files) so the pair keeps one x on every row.
-      const beside = button.nextElementSibling;
-      expect(beside, "the copy button must be followed by its pair").not.toBeNull();
+      // ...paired with the download button on its LEFT (copy is the rightmost
+      // control), or with a spacer standing in for the download where there is
+      // none (folders, deleted files) so the pair keeps one x on every row.
+      const beside = button.previousElementSibling;
+      expect(beside, "the copy button must be preceded by its pair").not.toBeNull();
       const isDownload = beside?.getAttribute("aria-label")?.startsWith("Download");
       const isReservedSpacer = beside?.classList.contains(ROW_ACTION_SIZE_CLASS);
       expect(
         isDownload || isReservedSpacer,
-        "copy must be adjacent to the download button (or its reserved footprint)",
+        "copy must sit immediately right of the download button (or its reserved footprint)",
       ).toBe(true);
     }
   });

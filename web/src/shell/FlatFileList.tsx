@@ -152,12 +152,12 @@ function FileListItem({
             {gitStatusLetter(file.status)}
           </span>
           <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-            <CopyPathButton path={file.path} revealOnHover />
             {hasDownload && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={file.path} />
             ) : (
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
             )}
+            <CopyPathButton path={file.path} revealOnHover />
           </span>
         </span>
       </div>

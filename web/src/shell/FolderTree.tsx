@@ -528,12 +528,12 @@ function FileRowItem({
             </span>
           )}
           <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-            <CopyPathButton path={path} revealOnHover />
             {!isDeleted && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={path} />
             ) : (
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
             )}
+            <CopyPathButton path={path} revealOnHover />
           </span>
         </span>
       </div>
@@ -733,8 +733,8 @@ function TreeNodeRow({
           className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
         >
           <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-            <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
             <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+            <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
           </span>
         </span>
       </div>
