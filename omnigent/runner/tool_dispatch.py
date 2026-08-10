@@ -20,6 +20,7 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -1992,14 +1993,12 @@ async def _execute_subagent_tool(
         # Store the LLM's semantic title hint as a label so the
         # background display-name generator can use it as context.
         if llm_title_hint:
-            try:
+            with contextlib.suppress(httpx.HTTPError):
                 await server_client.post(
                     f"/v1/sessions/{child_session_id}/labels",
                     json={"omnigent.subagent.hint": llm_title_hint},
                     timeout=10.0,
                 )
-            except httpx.HTTPError:
-                pass
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
