@@ -7012,6 +7012,27 @@
   },
   "openapi": "3.2.0",
   "paths": {
+    "/.well-known/omnigent.json": {
+      "get": {
+        "description": "Version manifest for NON-BROWSER clients \u2014 chiefly the desktop shell.\n\nThe desktop shell ships and updates on its own cadence, so any\ninstalled build can meet any server version. The shell is the side\nthat must adapt (the user may not update it for months), and to adapt\nit first has to know what it is talking to. This endpoint is that\nanswer, fetched BEFORE the SPA loads \u2014 unlike `/v1/info`, which the\nSPA reads after boot and which is therefore useless to the shell when\ndeciding how to open a window in the first place.\n\nContract, in the order a client should apply it:\n\n1. `manifest_version` (int) versions this ENVELOPE. Clients gate on\n   `>=`, never `==`, so a newer server keeps working with an older\n   shell. See `WELL_KNOWN_MANIFEST_VERSION` for when it bumps \u2014\n   adding a field never does.\n2. `server_version` (str) is the installed omnigent package version,\n   the same value as `/api/version` and `/v1/info.server_version`.\n   Informational: for display and bug reports, NOT for gating. Gate on\n   the fields below, which state capability directly rather than making\n   every client hardcode \"which release added X\".\n3. `min_desktop_version` (str | null) is the oldest desktop build this\n   server still supports. Null means no floor \u2014 the overwhelmingly\n   common case, and what every shipped shell must treat as \"fine\".\n   A server sets it only to signal a genuinely breaking change.\n4. Everything else is additive detail an older client may ignore\n   wholesale. `ui` describes where server-driven chrome lives, so a\n   shell can place its own window furniture without guessing from the\n   version number: `server_picker` is `\"sidebar\"` on builds that\n   dock the picker at the sidebar's bottom (it was `\"titlebar\"`,\n   centered in the macOS title-bar strip, before this).\n\nUnknown fields MUST be ignored, and a missing manifest (404 \u2014 every\nserver older than this route) MUST be treated as the pre-manifest\nbaseline, not an error: the shell falls back to its current behavior.\nThat is what makes an old shell + new server and a new shell + old\nserver both work.\n\nAuthentication: intentionally UNAUTHED, like `/v1/info`. A client\nmust be able to read this before it holds a session cookie \u2014 the whole\npoint is to consult it before loading the app. It exposes only the\nversion already public via `/api/version` plus coarse UI-shape\nstrings, so there is nothing here to leak.\n\nServed under `/.well-known/` (RFC 8615) so it sits at a fixed,\nguessable path that never collides with an SPA client route.\n\n**Returns:** The manifest described above.",
+        "operationId": "well_known_manifest__well_known_omnigent_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Well Known Manifest  Well Known Omnigent Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Well Known Manifest"
+      }
+    },
     "/api/version": {
       "get": {
         "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`.",

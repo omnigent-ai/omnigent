@@ -37,7 +37,12 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const {
+  normalizeUrl,
+  expandDatabricksWorkspaceUrl,
+  fetchServerManifest,
+  PRE_MANIFEST_BASELINE,
+} = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
@@ -576,6 +581,34 @@ function setWindowServerUrl(win, serverUrl) {
 }
 
 /**
+ * Record the version manifest of the server a window connected to (see
+ * `fetchServerManifest` in src/url.js). Stored per-window because different
+ * windows can be pinned to different servers — and therefore to servers of
+ * different versions — at the same time.
+ *
+ * @param {Electron.BrowserWindow} win
+ * @param {object} manifest A manifest from `fetchServerManifest`.
+ */
+function setWindowServerManifest(win, manifest) {
+  const state = windows.get(win);
+  if (state) state.serverManifest = manifest;
+}
+
+/**
+ * The server manifest for a window, or the pre-manifest baseline when the
+ * window has none yet (no connect has completed, or the server predates the
+ * manifest route). Never null, so callers can read `.manifestVersion`
+ * unconditionally and gate with `>=`.
+ *
+ * @param {Electron.BrowserWindow | null} win
+ * @returns {object} A manifest-shaped object.
+ */
+function windowServerManifest(win) {
+  const state = win ? windows.get(win) : undefined;
+  return state?.serverManifest ?? PRE_MANIFEST_BASELINE;
+}
+
+/**
  * The full server URL of the window that sent an IPC event, or null. Used by
  * the host/server-management handlers to scope CLI commands to the window's
  * own server.
@@ -1064,6 +1097,16 @@ function createWindow(targetUrl, opts = {}) {
     browserRegistry: createBrowserRegistryForWindow(win),
   });
   if (destination) {
+    // Learn the server's version alongside the load. Every window that opens
+    // straight onto a server (normal app launch with a saved URL, a deep link,
+    // a new window) comes through here — without this the manifest would only
+    // exist after a fresh setup-page connect. Never awaited and never throws
+    // (see fetchServerManifest), so it cannot delay or fail the load.
+    if (serverUrl) {
+      void fetchServerManifest(serverUrl).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
+    }
     void win.loadURL(destination);
   } else {
     // ?ephemeral=1 only changes the setup page's copy (the window's
@@ -2061,6 +2104,14 @@ function registerIpc() {
       // trusted origin for privileged IPC and permission grants.
       pinWindow(win, new URL(target).origin);
       setWindowServerUrl(win, target);
+      // Learn what this server is before deciding anything version-dependent
+      // about the window. Deliberately NOT awaited ahead of loadURL: the
+      // manifest is advisory, and a slow/absent one must not delay (or block)
+      // connecting. fetchServerManifest never rejects — it resolves to the
+      // pre-manifest baseline — so no catch is needed here.
+      void fetchServerManifest(target).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
       win
         .loadURL(target)
         .then(() => {
@@ -2111,9 +2162,9 @@ function registerIpc() {
     clipboard.writeText(text);
   });
 
-  // SPA title-bar server picker → the sender window's pinned origin plus the
-  // persisted recent-servers list, so the picker can render "current server"
-  // and the switch targets. Foreign pages get null (nothing to fingerprint).
+  // SPA server picker → the sender window's pinned origin plus the persisted
+  // recent-servers list, so the picker can render "current server" and the
+  // switch targets. Foreign pages get null (nothing to fingerprint).
   ipcMain.handle("omnigent:get-server-picker", (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] get-server-picker from untrusted sender dropped");
@@ -2125,6 +2176,11 @@ function registerIpc() {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
       recentServers: Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [],
+      // The connected server's manifest, forwarded so the SPA branches on the
+      // same document the shell did rather than re-fetching it (and so an
+      // older shell, which simply omits this field, is detectable as absent —
+      // see nativeBridge's `serverManifest` handling).
+      serverManifest: windowServerManifest(win),
     };
   });
 
@@ -2153,6 +2209,14 @@ function registerIpc() {
     if (win) {
       pinWindow(win, new URL(url).origin);
       setWindowServerUrl(win, url);
+      // Switching servers means a possibly DIFFERENT version: re-read the
+      // manifest so the window never keeps the previous server's answer. Reset
+      // to the baseline first — until the new fetch lands, "unknown" is the
+      // honest state, and stale-but-plausible would be worse than absent.
+      setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+      void fetchServerManifest(url).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
       win
         .loadURL(url)
         .then(() => {

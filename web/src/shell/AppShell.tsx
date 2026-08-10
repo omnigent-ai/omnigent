@@ -76,7 +76,6 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
-import { TitleBarServerPicker } from "./TitleBarServerPicker";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -1354,12 +1353,11 @@ export function AppShell() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* Centered title + server picker in the freed title-bar strip. The
-          open thread's title (snapshot first — it's the only source for
-          child sessions — then the sidebar row) replaces the brand label. */}
-            {isMacElectronShell() && (
-              <TitleBarServerPicker threadTitle={activeSession?.title ?? activeConv?.title} />
-            )}
+            {/* The server picker is NOT here: it lives at the bottom of the
+          sidebar (SidebarServerPicker). This strip is shared with the chat
+          header — which is taller and also anchored at top-0 — so a centered
+          "<thread> — <host>" label here collided with the header's action
+          cluster on a narrow window. The strip stays pure drag surface. */}
             <Sidebar
               open={sidebarOpen}
               onOpen={() => {

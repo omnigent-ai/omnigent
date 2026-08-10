@@ -155,7 +155,17 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+
+# Envelope version of GET /.well-known/omnigent.json (see the route for the
+# full contract). Bump ONLY for a change a client cannot absorb by ignoring
+# what it doesn't recognize: a removed/renamed field, or a changed meaning for
+# an existing one. Adding a new field is invisible to older clients and must
+# NOT bump this — they read the fields they know and skip the rest.
+#
+# Clients gate on `>=`, never `==`: a newer server must keep working with an
+# older desktop shell.
+WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
@@ -1690,6 +1700,67 @@ def create_app(
             e.g. ``{"version": "0.1.0"}``.
         """
         return {"version": _server_version()}
+
+    @app.get("/.well-known/omnigent.json")
+    async def well_known_manifest() -> dict[str, object]:
+        """Version manifest for NON-BROWSER clients — chiefly the desktop shell.
+
+        The desktop shell ships and updates on its own cadence, so any
+        installed build can meet any server version. The shell is the side
+        that must adapt (the user may not update it for months), and to adapt
+        it first has to know what it is talking to. This endpoint is that
+        answer, fetched BEFORE the SPA loads — unlike ``/v1/info``, which the
+        SPA reads after boot and which is therefore useless to the shell when
+        deciding how to open a window in the first place.
+
+        Contract, in the order a client should apply it:
+
+        1. ``manifest_version`` (int) versions this ENVELOPE. Clients gate on
+           ``>=``, never ``==``, so a newer server keeps working with an older
+           shell. See :data:`WELL_KNOWN_MANIFEST_VERSION` for when it bumps —
+           adding a field never does.
+        2. ``server_version`` (str) is the installed omnigent package version,
+           the same value as ``/api/version`` and ``/v1/info.server_version``.
+           Informational: for display and bug reports, NOT for gating. Gate on
+           the fields below, which state capability directly rather than making
+           every client hardcode "which release added X".
+        3. ``min_desktop_version`` (str | null) is the oldest desktop build this
+           server still supports. Null means no floor — the overwhelmingly
+           common case, and what every shipped shell must treat as "fine".
+           A server sets it only to signal a genuinely breaking change.
+        4. Everything else is additive detail an older client may ignore
+           wholesale. ``ui`` describes where server-driven chrome lives, so a
+           shell can place its own window furniture without guessing from the
+           version number: ``server_picker`` is ``"sidebar"`` on builds that
+           dock the picker at the sidebar's bottom (it was ``"titlebar"``,
+           centered in the macOS title-bar strip, before this).
+
+        Unknown fields MUST be ignored, and a missing manifest (404 — every
+        server older than this route) MUST be treated as the pre-manifest
+        baseline, not an error: the shell falls back to its current behavior.
+        That is what makes an old shell + new server and a new shell + old
+        server both work.
+
+        Authentication: intentionally UNAUTHED, like ``/v1/info``. A client
+        must be able to read this before it holds a session cookie — the whole
+        point is to consult it before loading the app. It exposes only the
+        version already public via ``/api/version`` plus coarse UI-shape
+        strings, so there is nothing here to leak.
+
+        Served under ``/.well-known/`` (RFC 8615) so it sits at a fixed,
+        guessable path that never collides with an SPA client route.
+
+        :returns: The manifest described above.
+        """
+        return {
+            "manifest_version": WELL_KNOWN_MANIFEST_VERSION,
+            "server_version": _server_version(),
+            # No floor today: every desktop build in the wild works against
+            # this server. Kept present-but-null so clients can rely on the
+            # key existing and exercise the "no floor" path from day one.
+            "min_desktop_version": None,
+            "ui": {"server_picker": "sidebar"},
+        }
 
     @app.get("/v1/info")
     async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
