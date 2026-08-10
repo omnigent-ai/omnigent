@@ -5111,6 +5111,18 @@
             "description": "Total token count (input + output) from the most recently completed task's `usage`, e.g. `45231`. `None` when no task has completed yet. Lets clients seed their context-ring on conversation resume without waiting for the next `response.completed` SSE event.",
             "title": "Last Total Tokens"
           },
+          "latest_manager_delivery": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Manager Delivery"
+          },
           "llm_model": {
             "anyOf": [
               {
