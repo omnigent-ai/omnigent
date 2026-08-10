@@ -2346,6 +2346,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                scheduled_task_store=scheduled_task_store,
             ),
             prefix="/v1",
             tags=["hosts"],

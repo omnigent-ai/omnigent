@@ -787,10 +787,19 @@ class HostStore:
 
         Managed-host teardown: removes the host from the picker AND
         revokes its launch token in one operation (the row IS the
-        credential). Explicitly nulls ``conversations.host_id`` for any
-        sessions still bound to this host — the DB no longer cascades
-        this via FK. No-op when the row does not exist — deletion is
+        credential). No-op when the row does not exist — deletion is
         invoked from best-effort cleanup paths that may race.
+
+        Fully unbinds every session still pointing at the host, nulling
+        ``host_id``, ``runner_id``, ``workspace``, and ``git_branch``
+        together (the DB no longer cascades this via FK). All four go
+        because the machine behind them is gone: a row keeping its
+        ``runner_id`` can never relaunch, rebind (the atomic bind
+        matches only ``runner_id IS NULL``), or stop (Stop needs both
+        ``host_id`` and ``runner_id``), so a partial unbind wedges the
+        session with no API left to repair it. Clearing ``host_id`` and
+        ``workspace`` in the same statement never violates
+        ``ck_conversation_metadata_workspace_required_for_host``.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
@@ -801,7 +810,7 @@ class HostStore:
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.host_id == host_id,
                 )
-                .values(host_id=None)
+                .values(host_id=None, runner_id=None, workspace=None, git_branch=None)
             )
             session.execute(
                 sql_delete(SqlHost).where(
