@@ -37,4 +37,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Remove ``display_name`` from ``omnigent_conversation_metadata``."""
-    op.drop_column("omnigent_conversation_metadata", "display_name")
+    with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
+        batch_op.drop_column("display_name")
