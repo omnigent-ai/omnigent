@@ -157,7 +157,7 @@ def tool_budget_per_turn(
     max_calls: int = 12,
     max_failures: int = 2,
 ) -> PolicyCallable:
-    """Factory: bound tool calls and failed results within one user turn."""
+    """Factory: bound tool calls and consecutive failed results within one turn."""
     max_calls = max(1, max_calls)
     max_failures = max(1, max_failures)
 
@@ -179,7 +179,8 @@ def tool_budget_per_turn(
                 return {
                     "result": "DENY",
                     "reason": (
-                        f"Stopped after {failures} failed tool calls in this turn. "
+                        f"Stopped after {failures} consecutive failed tool calls "
+                        "in this turn. "
                         "Read the errors and report the blocker."
                     ),
                 }
@@ -197,13 +198,21 @@ def tool_budget_per_turn(
                     {"key": _TURN_TOOL_COUNT_KEY, "action": "increment", "value": 1},
                 ],
             }
-        if event_type == "tool_result" and _tool_result_failed(event.get("data")):
-            return {
-                "result": "ALLOW",
-                "state_updates": [
-                    {"key": _TURN_TOOL_FAILURE_KEY, "action": "increment", "value": 1},
-                ],
-            }
+        if event_type == "tool_result":
+            if _tool_result_failed(event.get("data")):
+                return {
+                    "result": "ALLOW",
+                    "state_updates": [
+                        {"key": _TURN_TOOL_FAILURE_KEY, "action": "increment", "value": 1},
+                    ],
+                }
+            if failures:
+                return {
+                    "result": "ALLOW",
+                    "state_updates": [
+                        {"key": _TURN_TOOL_FAILURE_KEY, "action": "set", "value": 0},
+                    ],
+                }
         return _ALLOW
 
     return evaluate
@@ -770,7 +779,7 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "name": "Limit Tool Calls Per Turn",
         "description": (
             "Resets on each user request, limits tool calls within the turn, "
-            "and stops further calls after a bounded number of failed results."
+            "and stops further calls after a bounded run of consecutive failures."
         ),
         "params_schema": {
             "type": "object",

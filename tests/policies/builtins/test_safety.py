@@ -65,7 +65,7 @@ def test_tool_budget_resets_and_limits_each_turn() -> None:
     assert "3-tool budget" in denied["reason"]
 
 
-def test_tool_budget_stops_after_failed_results() -> None:
+def test_tool_budget_stops_after_consecutive_failed_results() -> None:
     policy = tool_budget_per_turn(max_calls=12, max_failures=2)
     failure = policy(
         {
@@ -85,7 +85,23 @@ def test_tool_budget_stops_after_failed_results() -> None:
         {"key": "_policy_turn_tool_failure_count", "action": "increment", "value": 1}
     ]
     assert denied["result"] == "DENY"
-    assert "2 failed tool calls" in denied["reason"]
+    assert "2 consecutive failed tool calls" in denied["reason"]
+
+
+def test_tool_budget_clears_failure_streak_after_success() -> None:
+    policy = tool_budget_per_turn(max_calls=12, max_failures=2)
+
+    success = policy(
+        {
+            "type": "tool_result",
+            "data": {"result": '{"exit_code":0,"stdout":"ok"}'},
+            "session_state": {"_policy_turn_tool_failure_count": 1},
+        }
+    )
+
+    assert success["state_updates"] == [
+        {"key": "_policy_turn_tool_failure_count", "action": "set", "value": 0}
+    ]
 
 
 # ── ask_on_os_tools: Omnigent sys_os_* tools ─────────────────────────────
