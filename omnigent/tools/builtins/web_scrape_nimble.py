@@ -49,11 +49,9 @@ _VALID_DRIVERS = frozenset({"vx6", "vx8", "vx10"})
 _DEFAULT_OUTPUT_FORMAT = "markdown"
 _VALID_OUTPUT_FORMATS = frozenset({"markdown", "html"})
 
-# A browser-driven extract can be slow; allow a generous read timeout.
+# A browser-driven extract can be slow; allow a generous read timeout. Jina is
+# lighter (no full browser), so its backend uses a shorter timeout.
 _DEFAULT_TIMEOUT_S = 120.0
-
-# Cap the returned content so a large page cannot blow the model context.
-_MAX_CONTENT_CHARS = 50_000
 
 # Substrings that indicate the target site (not Nimble) blocked the fetch, so
 # the tool can say "blocked" rather than returning a captcha/denied page as if
@@ -155,32 +153,35 @@ def _scrape_nimble(url: str, config: dict[str, str]) -> str:
         return "Nimble scrape error: the extract returned a non-JSON response."
     if not isinstance(payload, dict):
         return "Nimble scrape error: the extract returned an unexpected response shape."
-    return _format_scrape(payload, url, driver)
+    return _format_scrape(payload, url, driver, output_format)
 
 
-def _format_scrape(payload: dict[str, Any], url: str, driver: str) -> str:
+def _format_scrape(payload: dict[str, Any], url: str, driver: str, output_format: str) -> str:
     """
     Pull the extracted content out of Nimble's ``/v2/extract`` response.
 
-    The page body lives under ``data`` — ``data.markdown`` / ``data.html``, or
-    ``data.parsing.content`` for a parsed extract. We take the first present
-    (not merely truthy) one so a legitimately empty field doesn't mask a later
-    non-empty one. A body that is only a block marker (captcha/denied) is
-    reported as blocked so the model doesn't treat it as real content.
+    The page body lives under ``data`` as ``data.markdown`` / ``data.html``. We
+    read the field matching the format we requested, falling back to the other
+    if it is absent, using "first present" (not "first truthy") so a
+    legitimately empty page doesn't get masked. A body that is only a block
+    marker (captcha/denied) is reported as blocked so the model doesn't treat it
+    as real content.
 
     :param payload: The parsed JSON response.
     :param url: The requested URL (for the blocked-message text).
     :param driver: The driver used (named in the blocked message so the caller
         can retry a stronger tier).
+    :param output_format: The requested format (``markdown`` or ``html``), read
+        preferentially from the response.
     :returns: The content, or a blocked/empty message. Central truncation is
         applied by the dispatcher, not here.
     """
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    parsing = data.get("parsing") if isinstance(data.get("parsing"), dict) else {}
-    # First value that is present (not None) — an empty string is a real answer
-    # (empty page), so ``or``-chaining would wrongly skip it for a later field.
+    # Prefer the format we asked for; fall back to the other if it's missing.
+    # "First present" (not None), so an empty string (empty page) isn't skipped.
+    other = "html" if output_format == "markdown" else "markdown"
     content: object = ""
-    for candidate in (data.get("markdown"), data.get("html"), parsing.get("content")):
+    for candidate in (data.get(output_format), data.get(other)):
         if candidate is not None:
             content = candidate
             break

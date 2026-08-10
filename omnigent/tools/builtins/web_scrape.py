@@ -26,8 +26,9 @@ Responsible use:
     This tool performs a single, user-initiated fetch of one URL — it is not a
     crawler. It is intended for public, non-authenticated pages, and it does not
     bypass logins or paywalls: it reads a page as an unauthenticated visitor
-    would. Fetching is delegated to the configured provider, which honors the
-    site's ``robots.txt``. You remain responsible for using it in line with the
+    would. Fetching is delegated to the configured provider, which is expected
+    to honor the site's ``robots.txt``. You remain responsible for using it in
+    line with the
     target site's Terms of Service and applicable law (e.g. not scraping
     personal data without a lawful basis). This is general guidance, not legal
     advice.
@@ -96,14 +97,15 @@ class WebScrapeTool(Tool):
         """
         return (
             "Fetch one web page's content as clean markdown, rendering "
-            "JavaScript and (on the keyed backends) getting past bot "
-            "protection that blocks a plain fetch. Use for reading a specific "
-            "URL you already have — articles, docs, product pages — especially "
-            "when a plain fetch returns a 403 or an empty page. This is a "
-            "single-page read, not a crawler, and it calls a rate-limited or "
-            "paid backend, so use it deliberately. To find URLs, use "
-            "web_search first; for a quick unprotected fetch, web_fetch may "
-            "suffice."
+            "JavaScript so client-side pages return real text. The keyed "
+            "backends also handle bot protection (challenges / IP reputation) "
+            "that blocks a plain fetch. Use for reading a specific URL you "
+            "already have — articles, docs, product pages — especially when a "
+            "plain fetch (web_fetch) returns a 403, 429, or an empty page. "
+            "This is a single-page read, not a crawler, and it calls a "
+            "rate-limited or paid backend, so prefer web_fetch for simple "
+            "public pages and reach for web_scrape when that fails. To find "
+            "URLs, use web_search first."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -160,6 +162,10 @@ class WebScrapeTool(Tool):
         url = url.strip()
         if not url.startswith(("http://", "https://")):
             return "Error: 'url' must be an http:// or https:// URL."
+        # Reject embedded control chars/whitespace: a newline would otherwise
+        # break the "Source:" header line and let a caller forge a second one.
+        if any(ch.isspace() or ord(ch) < 0x20 for ch in url):
+            return "Error: 'url' must not contain spaces or control characters."
 
         return _scrape(url, self._config)
 

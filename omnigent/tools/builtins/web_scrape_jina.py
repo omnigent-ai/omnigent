@@ -53,10 +53,13 @@ def _scrape_jina(url: str, config: dict[str, str]) -> str:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    # Percent-encode the target URL so its own query string / fragment is not
-    # parsed as r.jina.ai's — otherwise "https://r.jina.ai/https://site?q=x"
-    # would attach "?q=x" to the Reader request, not the page being scraped.
-    target = f"{_base_url()}/{quote(url, safe='')}"
+    # Append the target URL to Reader's canonical form
+    # ("https://r.jina.ai/https://site/page"), but percent-encode the parts that
+    # would otherwise bind to r.jina.ai instead of the page: a raw "?"/"&"/"#"
+    # makes "https://r.jina.ai/https://site?q=x" attach "?q=x" to the Reader
+    # request, not the scraped page. Keeping ":" and "/" literal preserves the
+    # documented scheme+path form so this works whether or not Reader re-decodes.
+    target = f"{_base_url()}/{quote(url, safe=':/')}"
 
     try:
         resp = httpx.get(
@@ -69,10 +72,10 @@ def _scrape_jina(url: str, config: dict[str, str]) -> str:
         content = (resp.text or "").strip()
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
-        if code == 429:
+        if code in (401, 403, 429):
             return (
-                "Jina scrape error: HTTP 429 (rate limited). Set an api_key in the "
-                "web_scrape config to raise the limit."
+                f"Jina scrape error: HTTP {code} (rate/tier limit). Set an api_key in "
+                "the web_scrape config to raise the limit."
             )
         return f"Jina scrape error: HTTP {code}"
     except httpx.RequestError as exc:
