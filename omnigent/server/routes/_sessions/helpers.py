@@ -3166,7 +3166,7 @@ def _background_task_delivery_status(
     background_task_count: int | None,
     conv: Conversation,
 ) -> str:
-    """Collapse a background-task ``waiting`` back to ``idle``.
+    """Collapse a top-level background-task ``waiting`` back to ``idle``.
 
     A claude-native session relabels its ``Stop`` turn-end ``idle`` to
     ``waiting`` (in the forwarder) while background shells linger. The turn
@@ -3174,10 +3174,11 @@ def _background_task_delivery_status(
     misreports the session as mid-turn everywhere the status is read as a
     turn gate: the composer queues each send behind "Steer", the sidebar dot
     spins, and because ``waiting`` keeps ``_session_active_response_cache``
-    populated a reconnect reopens the settled turn's streaming bubble. For a
-    sub-agent it also hangs the orchestrator — the terminal-delivery branch
-    in ``post_event`` keys off ``idle``/``failed`` and no follow-up ``Stop``
-    ever comes.
+    populated a reconnect reopens the settled turn's streaming bubble.
+    A Claude-native sub-agent is different: terminal delivery is one-shot,
+    so collapsing its live background-task wait would falsely tell its parent
+    that work completed. The forwarder's durable timeout supplies a bounded
+    fallback if Claude never emits the later terminal edge.
 
     The tally alone already drives every background-shell affordance at
     ``idle`` (the in-chat "N background tasks still running" indicator reads
@@ -3185,21 +3186,21 @@ def _background_task_delivery_status(
     for the shells. Normalizing here rather than in the forwarder also covers
     runners that predate the change.
 
-    Codex-internal children keep ``waiting``: they never emit a claude-native
-    ``Stop`` hook, and their status is consumed inside the app-server thread
-    tree rather than through this delivery branch.
+    All children keep ``waiting``. Codex-internal children never emit a
+    claude-native ``Stop`` hook, and Claude-native children must not terminally
+    deliver until their background shell completes.
 
     :param status: The incoming external status, e.g. ``"waiting"``.
     :param background_task_count: Parsed background-shell tally, or ``None``.
     :param conv: The conversation the status is for.
-    :returns: ``"idle"`` for a background-task ``waiting`` on any non-codex
-        session; otherwise ``status`` unchanged.
+    :returns: ``"idle"`` for a top-level background-task ``waiting``;
+        otherwise ``status`` unchanged.
     """
     if (
         status == "waiting"
         and background_task_count is not None
         and background_task_count > 0
-        and not _is_codex_native_subagent(conv)
+        and conv.kind != "sub_agent"
     ):
         return "idle"
     return status

@@ -7766,6 +7766,56 @@ async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
 
 
 @pytest.mark.asyncio
+async def test_background_task_wait_fallback_is_durable_and_fires_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stranded background-task wait gets one bounded terminal fallback."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    started_at = 100.0
+    monkeypatch.setattr(forwarder, "_background_wait_wall_time", lambda: started_at)
+    state = forwarder.HookForwardState(
+        event_cursor=4,
+        byte_offset=12,
+        cursor_fingerprint="cursor",
+        background_task_wait_started_at=started_at,
+    )
+    forwarder._write_hook_state(bridge_dir, state)
+    assert forwarder._read_hook_state(bridge_dir) == state
+
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(
+        forwarder,
+        "_background_wait_wall_time",
+        lambda: started_at + forwarder._BACKGROUND_TASK_WAIT_MAX_S,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        settled = await forwarder._maybe_fire_background_task_wait_fallback(
+            client=client, session_id="conv_abc", bridge_dir=bridge_dir, state=state
+        )
+        assert (
+            await forwarder._maybe_fire_background_task_wait_fallback(
+                client=client, session_id="conv_abc", bridge_dir=bridge_dir, state=settled
+            )
+        ) == settled
+
+    assert settled.background_task_wait_started_at is None
+    assert bodies == [
+        {
+            "type": "external_session_status",
+            "data": {"status": "idle", "background_task_count": 0},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_post_external_session_status_includes_and_omits_response_id() -> None:
     """
     ``post_external_session_status`` attaches ``response_id`` only when given.

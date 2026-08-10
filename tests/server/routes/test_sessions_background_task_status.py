@@ -102,12 +102,9 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
 # ── background-task delivery status (ended-turn collapse) ───────────────────
 
 
-def test_subagent_background_waiting_delivers_as_idle() -> None:
-    # Regression: a claude-native sub-agent relabels its Stop turn-end to
-    # `waiting` for background shells, but the parent's terminal-delivery gate
-    # keys off idle/failed — `waiting` would hang the orchestrator. The turn
-    # ended, so deliver `idle` (the tally still drives the child spinner).
-    assert _background_task_delivery_status("waiting", 1, _conv("sub_agent")) == "idle"
+def test_subagent_background_waiting_remains_non_terminal() -> None:
+    # A live Claude-native child shell must not terminally deliver its parent.
+    assert _background_task_delivery_status("waiting", 1, _conv("sub_agent")) == "waiting"
 
 
 def test_top_level_background_waiting_delivers_as_idle() -> None:
