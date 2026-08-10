@@ -104,17 +104,18 @@ def test_background_task_indicator_label_lifecycle(
     expect(working).to_have_count(0, timeout=15_000)
 
 
-def test_sidebar_spinner_tracks_background_tasks(
+def test_sidebar_spinner_ignores_background_tasks(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The sidebar row's running spinner tracks background shells too.
+    """The sidebar row stays idle while background shells outlive a turn.
 
-    A claude-native turn settles to ``idle`` while shells keep running; the
-    sidebar row must show the grey running spinner (``SessionStateBadge``
-    ``data-state="running"``), matching the in-chat indicator — not fall idle.
-    When the last shell finishes, the ``Stop`` hook's authoritative ``0``
-    clears the tally and both the spinner and the chat indicator go out.
+    The turn is over — the session takes a new message immediately — so the
+    row must NOT show the running spinner (``SessionStateBadge``
+    ``data-state="running"``); a spinner there reads as "still working" and
+    the tally that would drive it only refreshes on the next ``Stop`` hook,
+    so it can outlive the shells. The in-chat indicator is the honest place
+    for the shells, and it stays lit.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server
@@ -128,16 +129,20 @@ def test_sidebar_spinner_tracks_background_tasks(
     # is this session's. Idle rows render no badge at all.
     running_badge = page.locator('[data-testid="session-state-badge"][data-state="running"]')
 
-    # 1. Background shells outlive the turn → both the chat indicator and the
-    #    sidebar row's running spinner light up.
+    # 1. Background shells outlive the turn → the chat indicator lights up, the
+    #    sidebar row does not.
     _publish_status(base_url, session_id, "idle", background_task_count=1)
     page.goto(f"{base_url}/c/{session_id}")
     expect(working).to_contain_text("1 background task still running", timeout=15_000)
+    expect(running_badge).to_have_count(0)
+
+    # 2. A real turn still lights the row, so the assertion above is about
+    #    background work and not a badge that never renders.
+    _publish_status(base_url, session_id, "running")
     expect(running_badge).to_have_count(1, timeout=15_000)
 
-    # 2. The last shell finishes: the Stop hook reports an authoritative `0`,
-    #    which clears the tally — both the chat indicator and the sidebar
-    #    spinner go out (idle rows render no badge).
+    # 3. The turn ends with the last shell finished: the Stop hook's
+    #    authoritative `0` clears the tally, so both go out.
     _publish_status(base_url, session_id, "idle", background_task_count=0)
     expect(working).to_have_count(0, timeout=15_000)
     expect(running_badge).to_have_count(0, timeout=15_000)

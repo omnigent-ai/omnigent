@@ -102,6 +102,8 @@ export async function listPermissions(sessionId: string): Promise<Permission[]> 
   // cursor and concatenate so callers always see the full grant list.
   const all: Permission[] = [];
   let after: string | null = null;
+  // Each page provides the cursor for the next request.
+  /* oxlint-disable no-await-in-loop */
   do {
     const path = `/v1/sessions/${encodeURIComponent(sessionId)}/permissions${
       after !== null ? `?after=${encodeURIComponent(after)}` : ""
@@ -115,6 +117,7 @@ export async function listPermissions(sessionId: string): Promise<Permission[]> 
     all.push(...data.permissions);
     after = data.next_cursor;
   } while (after !== null);
+  /* oxlint-enable no-await-in-loop */
   return all;
 }
 
@@ -139,8 +142,8 @@ export async function grantPermission(
     },
   );
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
+    const responseBody = await res.json().catch(() => ({}));
+    throw new Error(responseBody?.error?.message ?? `${res.status} ${res.statusText}`);
   }
   return (await res.json()) as Permission;
 }

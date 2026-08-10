@@ -55,6 +55,60 @@ when the bridge methods are absent, so the Android shell omits them for now:
 - **Native floating server switcher** and **Chat/Terminal bar.** Rendered
   in-page by the SPA.
 
+## Managed configuration (org-preset servers)
+
+Organizations can preconfigure server URLs so users don't type one. The app
+publishes an [Android managed
+configuration](https://developer.android.com/work/managed-configurations)
+(`app/src/main/res/xml/app_restrictions.xml`) with a single key, which any EMM
+(Intune, Jamf, Workspace ONE, Google Workspace, Android Management API) can push
+to enrolled devices:
+
+| Key          | Type   | Value                                                           |
+| ------------ | ------ | --------------------------------------------------------------- |
+| `serverUrls` | string | Server URLs, comma- or newline-separated, most preferred first. |
+
+```json
+{ "serverUrls": "https://omnigent.corp.example.com" }
+```
+
+Behaviour (`ManagedConfig` + `ServerStore`):
+
+- The URLs are **offered**, listed ahead of the user's recent servers on the
+  connect screen and in the server switcher. The user still taps one to connect —
+  this is true for a single URL as much as for several.
+- The app never auto-connects to a preset and never skips the connect screen, so
+  a policy can't silently move someone onto a different server.
+- Presets are not a lock either: a user can still type any other server, and the
+  one they picked stays current.
+- A preset is never written to the app's prefs, so an admin's later edit is
+  picked up the next time the list is shown.
+- Unparseable entries are dropped; an entry without a scheme gets `https://`;
+  same-origin duplicates collapse; the list is capped at 8.
+
+To test without an EMM, use Google's **Test DPC** on an emulator with no
+accounts (a wiped AVD):
+
+```bash
+adb install -r TestDPC_<ver>.apk      # github.com/googlesamples/android-testdpc releases
+adb shell dpm set-device-owner com.afwsamples.testdpc/.DeviceAdminReceiver
+```
+
+Then Test DPC → _Managed configurations_ → pick Omnigent → **Load manifest
+restrictions** (this renders our schema, confirming the manifest wiring) → set
+`serverUrls` → **Save**. Verify the policy actually landed with:
+
+```bash
+adb shell dumpsys device_policy | grep serverUrls
+```
+
+A physical device that already has a corporate work profile can't be used for
+this: Test DPC can't take over an existing managed profile, and device-owner
+mode requires a device with no accounts.
+
+iOS has no equivalent yet; when it lands it should reuse the `serverUrls` key
+verbatim via Managed App Configuration.
+
 ### Known parity gaps
 
 - **App badge count.** Android has no universal numeric badge API. We set

@@ -95,7 +95,7 @@ export function NewTerminalButton({
         onClick={onTriggerClick}
       >
         <PlusIcon className="size-3.5 shrink-0" />
-        <span className="text-xs">
+        <span className="text-sm">
           {create.isError ? `Failed: ${create.error.message}` : "New shell"}
         </span>
       </button>

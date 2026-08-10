@@ -11,7 +11,10 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from omnigent.codex_native_bridge import CodexNativeBridgeState
 
 from fastapi.responses import JSONResponse, Response
 
@@ -27,7 +30,7 @@ class BridgeStateForSession(Protocol):
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> Any | None: ...
+    ) -> CodexNativeBridgeState | None: ...
 
 
 class ClientSafeErrorDetail(Protocol):
@@ -51,7 +54,7 @@ class CodexGoalRunner:
         self._logger = logger
 
     @staticmethod
-    def _goal_to_api(goal: dict[str, Any]) -> dict[str, Any]:
+    def _goal_to_api(goal: dict[str, object]) -> dict[str, object]:
         """
         Convert a Codex app-server goal object to Omnigent API field names.
 
@@ -100,7 +103,7 @@ class CodexGoalRunner:
         }
 
     @staticmethod
-    def _goal_result(response: dict[str, Any], *, action: str) -> dict[str, Any]:
+    def _goal_result(response: dict[str, object], *, action: str) -> dict[str, object]:
         """Extract a JSON-RPC ``result`` object from a Codex goal response."""
         result = response.get("result")
         if not isinstance(result, dict):
@@ -135,8 +138,8 @@ class CodexGoalRunner:
         *,
         action: str,
         method: str,
-        params: dict[str, Any],
-    ) -> dict[str, Any] | JSONResponse:
+        params: dict[str, object],
+    ) -> dict[str, object] | JSONResponse:
         """Execute one Codex app-server goal JSON-RPC request."""
         from omnigent.codex_native_app_server import client_for_transport
 
@@ -205,7 +208,7 @@ class CodexGoalRunner:
         status: str | None,
     ) -> Response:
         """Create or replace the current Codex app-server goal for a thread."""
-        params: dict[str, Any] = {
+        params: dict[str, object] = {
             "objective": objective,
         }
         if token_budget_provided:
@@ -276,7 +279,7 @@ class CodexGoalRunner:
         self,
         conv_id: str,
         body_type: str | None,
-        body: Any,
+        body: object,
         *,
         session_harness_name: Callable[[str], str | None],
     ) -> Response | None:
@@ -302,7 +305,8 @@ class CodexGoalRunner:
         if body_type == "goal_set":
             # The AP route validates this too, but direct runner callers should
             # get a clear 400 instead of an app-server validation error.
-            objective = body.get("objective") if isinstance(body, dict) else None
+            body_payload = body if isinstance(body, dict) else {}
+            objective = body_payload.get("objective")
             if not isinstance(objective, str) or not objective.strip():
                 return JSONResponse(
                     status_code=400,
@@ -319,8 +323,8 @@ class CodexGoalRunner:
                         "detail": "Body 'objective' must be at most 4000 characters",
                     },
                 )
-            token_budget_provided = isinstance(body, dict) and "token_budget" in body
-            token_budget = body.get("token_budget") if token_budget_provided else None
+            token_budget_provided = "token_budget" in body_payload
+            token_budget = body_payload.get("token_budget") if token_budget_provided else None
             if token_budget is not None and (
                 isinstance(token_budget, bool)
                 or not isinstance(token_budget, int)
@@ -333,7 +337,7 @@ class CodexGoalRunner:
                         "detail": "Body 'token_budget' must be a positive integer or null",
                     },
                 )
-            status = body.get("status") if isinstance(body, dict) else None
+            status = body_payload.get("status")
             if status is not None and status not in ("active", "paused"):
                 return JSONResponse(
                     status_code=400,

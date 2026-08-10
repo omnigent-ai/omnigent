@@ -18,7 +18,7 @@ import sys
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TextIO
+from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
 
 from omnigent_client import (
     BlockContext,
@@ -26,6 +26,7 @@ from omnigent_client import (
     OmnigentClient,
     OmnigentError,
     ReasoningBlock,
+    RegisteredAgent,
     ResponseEndBlock,
     ResponseStartBlock,
     Session,
@@ -70,6 +71,8 @@ from rich.text import Text
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
+    from omnigent_client._tool_handler import ToolCallInfo
+
     from omnigent.server.schemas import SessionStatusEvent
 
 _log = logging.getLogger(__name__)
@@ -126,15 +129,6 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
     return False
 
 
-# Type aliases for the slash-command dispatch contract. Every
-# ``_cmd_*`` handler binds these in the same order; centralizing
-# the alias keeps a future signature change to a single edit.
-SlashCommandHandler = Callable[
-    [str, Session, OmnigentClient, TerminalHost, RichBlockFormatter],
-    Awaitable[None],
-]
-
-
 class _SessionSnapshot(Protocol):
     """
     Minimal snapshot shape returned by ``client.sessions``.
@@ -159,13 +153,32 @@ class _SessionSnapshot(Protocol):
         context-ring on resume without waiting for the first response.
     """
 
-    agent_id: str
-    agent_name: str | None
-    runner_id: str | None
-    reasoning_effort: str | None
-    llm_model: str | None
-    context_window: int | None
-    last_total_tokens: int | None
+    @property
+    def agent_id(self) -> str: ...
+
+    @property
+    def agent_name(self) -> str | None: ...
+
+    @property
+    def runner_id(self) -> str | None: ...
+
+    @property
+    def reasoning_effort(self) -> str | None: ...
+
+    @property
+    def model_override(self) -> str | None: ...
+
+    @property
+    def llm_model(self) -> str | None: ...
+
+    @property
+    def harness(self) -> str | None: ...
+
+    @property
+    def context_window(self) -> int | None: ...
+
+    @property
+    def last_total_tokens(self) -> int | None: ...
 
 
 # Key-binding hints rendered on the welcome panel's second line.
@@ -662,9 +675,7 @@ def _humanize_agent_name(agent_name: str) -> str:
 class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
     """Shows final elapsed time after response completes."""
 
-    def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self._start_time: float | None = None
+    _start_time: float | None = None
 
     def format_response_start(self, block: ResponseStartBlock) -> list[FormattedItem]:
         self._start_time = block.ctx.timestamp
@@ -953,7 +964,7 @@ class _FieldInputState:
 
 def _build_elicitation_content_from_schema(
     schema: dict[str, object],
-) -> dict[str, object] | None:
+) -> dict[str, str | int | float | bool | list[str] | None] | None:
     """
     Delegate to the shared schema auto-fill utility.
 
@@ -966,7 +977,7 @@ def _build_elicitation_content_from_schema(
     """
     from omnigent.tools._elicitation_schema import build_accept_content_from_schema
 
-    return build_accept_content_from_schema(schema)  # type: ignore[arg-type]
+    return build_accept_content_from_schema(schema)
 
 
 def _make_elicitation_prompt(
@@ -1071,9 +1082,11 @@ def _make_elicitation_prompt(
             ctx.mode == "url"
             and isinstance(ctx.url, str)
             and not ctx.url.startswith("/approve/")
-            and server_url
+            and server_url is not None
         )
         if _is_external_url:
+            assert server_url is not None
+            assert isinstance(ctx.url, str)
             # External URL (OAuth, MCP server, etc.) — show the link,
             # block keyboard approval.
             full_url = f"{server_url.rstrip('/')}{ctx.url}"
@@ -1256,7 +1269,11 @@ class _SessionsChatReplAdapter:
         self,
         client: OmnigentClient,
         agent_name: str,
-        tool_callables: dict[str, object] | None = None,
+        tool_callables: dict[
+            str,
+            Callable[[ToolCallInfo], object | Awaitable[object]],
+        ]
+        | None = None,
         hooks: StreamHooks | None = None,
         session_id: str | None = None,
         session_bundle: bytes | None = None,
@@ -1377,6 +1394,7 @@ class _SessionsChatReplAdapter:
         self._context_window: int | None = None
         self._last_total_tokens: int | None = None
         self._pending_local_tasks: dict[str, asyncio.Task[None]] = {}
+        self._turn_done: asyncio.Event
         # FIFO counter: local sends are already echoed by ``on_input``,
         # so their ``session.input.consumed`` events are suppressed.
         self._pending_local_user_sends: int = 0
@@ -1668,64 +1686,10 @@ class _SessionsChatReplAdapter:
             if self._session_id is not None and self._stream_task is not None:
                 return self._session_id
             if self._session_id is None:
-                if self._session_bundle is None:
-                    raise RuntimeError(
-                        "Sessions API fresh session creation requires a local agent bundle. "
-                        "Start the REPL from `omnigent run <agent.yaml>` so the CLI can "
-                        "upload the bundle through POST /v1/sessions."
-                    )
-                if _dbg:
-                    print(
-                        "[sessions-adapter] POST /v1/sessions multipart bundle",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                # Snapshot pre-create /model pick before hydration
-                # clobbers it; PATCHed below since create() has no
-                # model_override metadata field.
-                pending_model_override = self._model_override
-                session = await self._client.sessions.create(
-                    self._session_bundle,
-                    filename=self._session_bundle_filename,
-                    reasoning_effort=self._reasoning_effort,
-                    # Record the user's terminal cwd so the Web UI
-                    # can show "running locally in <workspace>" for
-                    # CLI sessions. Doesn't drive any behavior —
-                    # CLI sessions don't bind to a host_id, so the
-                    # ck_conversations_workspace_required_for_host
-                    # constraint isn't active.
-                    workspace=os.getcwd(),
-                )
-                self._session_id = session.id
-                self._hydrate_from_session_snapshot(session)
-                if pending_model_override is not None and session.model_override is None:
-                    # PATCH the pre-session ``/model`` pick so the
-                    # first event picks it up via conv.model_override.
-                    # ``silent`` skips the tmux ``/model`` forward —
-                    # the user already typed the command locally; we
-                    # don't want a second copy injected into the pane.
-                    try:
-                        patched = await self._client.sessions.set_model_override(
-                            self._session_id,
-                            model_override=pending_model_override,
-                            silent=True,
-                        )
-                        self._model_override = patched.model_override
-                    except Exception:  # noqa: BLE001 — REPL boundary; log and clear
-                        _log.warning(
-                            "Failed to apply pending /model=%r to session %s; "
-                            "clearing local cache.",
-                            pending_model_override,
-                            self._session_id,
-                            exc_info=True,
-                        )
-                        self._model_override = None
-                if _dbg:
-                    print(
-                        f"[sessions-adapter] session created id={self._session_id!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                if self._session_bundle is not None:
+                    await self._create_session_from_bundle(pending_debug=_dbg)
+                else:
+                    await self._create_session_from_registered_agent(pending_debug=_dbg)
             else:
                 if _dbg:
                     print(
@@ -1747,7 +1711,144 @@ class _SessionsChatReplAdapter:
                     name=f"sessions-adapter-recover-{self._session_id}",
                 )
             self._notify_session_start_once()
+            assert self._session_id is not None
             return self._session_id
+
+    async def _create_session_from_registered_agent(self, *, pending_debug: bool) -> None:
+        """
+        Create a session bound to an agent already registered server-side.
+
+        The remote-URL path: there is no local bundle to upload, so
+        resolve the picked name to its id and use the JSON create route.
+        A remote client also has no runner of its own, so adopt one the
+        server already has online — otherwise the first turn fails the
+        runner-binding precondition.
+
+        :param pending_debug: Whether to emit adapter debug lines.
+        :returns: None.
+        """
+        if pending_debug:
+            print(
+                "[sessions-adapter] POST /v1/sessions json agent_id",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Skip the name lookup only when nothing needs it: we already know
+        # the id, and a bound runner means we don't need the harness either.
+        agent: RegisteredAgent | None = None
+        if self._agent_id is None or self._runner_id is None:
+            agent = await self._client.sessions.resolve_agent(self._agent_name)
+        agent_id = self._agent_id or (agent.id if agent is not None else None)
+        if agent_id is None:
+            raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        if self._runner_id is None:
+            from omnigent.harness_aliases import canonicalize_harness
+
+            self._runner_id = await self._client.sessions.resolve_online_runner(
+                harness=agent.harness if agent is not None else None,
+                canonicalize=lambda name: canonicalize_harness(name) or name,
+            )
+            if pending_debug:
+                print(
+                    f"[sessions-adapter] adopted server runner {self._runner_id!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        # Snapshot the pre-create /model pick before hydration clobbers
+        # it; applied after create since create has no such field.
+        pending_model_override = self._model_override
+        session = await self._client.sessions.create_from_agent_id(
+            agent_id,
+            reasoning_effort=self._reasoning_effort,
+            workspace=os.getcwd(),
+        )
+        self._session_id = session.id
+        self._hydrate_from_session_snapshot(session)
+        await self._apply_pending_model_override(pending_model_override, session)
+        if pending_debug:
+            print(
+                f"[sessions-adapter] session created id={self._session_id!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    async def _create_session_from_bundle(self, *, pending_debug: bool) -> None:
+        """
+        Create a session by uploading the local agent bundle.
+
+        :param pending_debug: Whether to emit adapter debug lines.
+        :returns: None.
+        :raises RuntimeError: If called with no bundle available.
+        """
+        if self._session_bundle is None:
+            raise RuntimeError("Cannot create a bundled session without a bundle")
+        if pending_debug:
+            print(
+                "[sessions-adapter] POST /v1/sessions multipart bundle",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Snapshot the pre-create /model pick before hydration clobbers
+        # it; applied after create since create has no such field.
+        pending_model_override = self._model_override
+        session = await self._client.sessions.create(
+            self._session_bundle,
+            filename=self._session_bundle_filename,
+            reasoning_effort=self._reasoning_effort,
+            # Record the user's terminal cwd so the Web UI can show
+            # "running locally in <workspace>" for CLI sessions. Doesn't
+            # drive any behavior — CLI sessions don't bind to a host_id,
+            # so the ck_conversations_workspace_required_for_host
+            # constraint isn't active.
+            workspace=os.getcwd(),
+        )
+        self._session_id = session.id
+        self._hydrate_from_session_snapshot(session)
+        await self._apply_pending_model_override(pending_model_override, session)
+        if pending_debug:
+            print(
+                f"[sessions-adapter] session created id={self._session_id!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    async def _apply_pending_model_override(
+        self, pending_model_override: str | None, session: _SessionSnapshot
+    ) -> None:
+        """
+        Apply a pre-session ``/model`` pick to a freshly created session.
+
+        Neither create route carries a ``model_override`` field, so a
+        ``/model`` typed before the first turn has to be PATCHed after
+        create for the first event to pick it up via
+        ``conv.model_override``. ``silent`` skips the tmux ``/model``
+        forward: the user already typed the command locally and we don't
+        want a second copy injected into the pane.
+
+        :param pending_model_override: The pick captured before create,
+            e.g. ``"opus"``. ``None`` is a no-op.
+        :param session: The created session snapshot.
+        :returns: None.
+        """
+        if pending_model_override is None or session.model_override is not None:
+            return
+        if self._session_id is None:
+            return
+        try:
+            patched = await self._client.sessions.set_model_override(
+                self._session_id,
+                model_override=pending_model_override,
+                silent=True,
+            )
+            self._model_override = patched.model_override
+        except Exception:  # noqa: BLE001 — REPL boundary; log and clear
+            _log.warning(
+                "Failed to apply pending /model=%r to session %s; clearing local cache.",
+                pending_model_override,
+                self._session_id,
+                exc_info=True,
+            )
+            self._model_override = None
 
     def _notify_session_start_once(self) -> None:
         """
@@ -1784,6 +1885,14 @@ class _SessionsChatReplAdapter:
             if self._session_id is None:
                 raise RuntimeError("Cannot bind runner before a session exists")
             if self._runner_id is None:
+                if self._session_bundle is None:
+                    # Remote target: we tried to adopt one of the server's
+                    # online runners at create time and found none.
+                    raise RuntimeError(
+                        "This server has no online runner to run the turn. Start one "
+                        "against it with `omnigent host --server <url>` (or run the "
+                        "agent locally with `omnigent run <agent.yaml>`), then retry."
+                    )
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
                     "Start through `omnigent run <agent>` or pass --server so the CLI "
@@ -2108,7 +2217,7 @@ class _SessionsChatReplAdapter:
         input: str | list[dict[str, object]],
         *,
         files: list[str] | None = None,
-    ):
+    ) -> AsyncGenerator[object, None]:
         """
         Post a user message. Rendering is push-based via ``_on_event``.
 
@@ -2154,7 +2263,7 @@ class _SessionsChatReplAdapter:
                             "filename": pathlib.Path(path).name,
                         }
                     )
-            input = content_blocks  # type: ignore[assignment]
+            input = content_blocks
 
         if isinstance(input, str):
             content: list[dict[str, object]] = [{"type": "input_text", "text": input}]
@@ -2171,7 +2280,7 @@ class _SessionsChatReplAdapter:
         # uses this to know it should handle streaming text deltas
         # and tool rendering inline rather than as history items.
         self._is_streaming = True
-        self._turn_done: asyncio.Event = asyncio.Event()
+        self._turn_done = asyncio.Event()
         self._pending_local_user_sends += 1
 
         try:
@@ -2269,7 +2378,7 @@ class _SessionsChatReplAdapter:
             event_payload["model_override"] = self._model_override
 
         self._is_streaming = True
-        self._turn_done: asyncio.Event = asyncio.Event()
+        self._turn_done = asyncio.Event()
         command_key = (skill_name, arguments)
         self._pending_local_skill_slash_commands.append(command_key)
 
@@ -2309,7 +2418,7 @@ class _SessionsChatReplAdapter:
                 self._pending_local_skill_slash_commands.remove(command_key)
             self._is_streaming = False
 
-    async def cancel(self):
+    async def cancel(self) -> None:
         """
         Interrupt the running turn (if any).
 
@@ -2348,7 +2457,7 @@ class _SessionsChatReplAdapter:
         import inspect
         import json as _json
 
-        callable_fn = self._tool_callables.get(name) if self._tool_callables else None  # type: ignore[union-attr]
+        callable_fn = self._tool_callables.get(name) if self._tool_callables else None
         if callable_fn is None:
             return
 
@@ -2383,7 +2492,11 @@ class _SessionsChatReplAdapter:
 
         task = asyncio.create_task(_run(), name=f"client-tool-{call_id}")
         self._pending_local_tasks[call_id] = task
-        task.add_done_callback(lambda _t, _k=call_id: self._pending_local_tasks.pop(_k, None))
+
+        def _discard_task(_task: asyncio.Task[None]) -> None:
+            self._pending_local_tasks.pop(call_id, None)
+
+        task.add_done_callback(_discard_task)
 
     async def _handle_elicitation(
         self,
@@ -2487,7 +2600,8 @@ class _SessionsChatReplAdapter:
         if not properties or not isinstance(properties, dict):
             return None
 
-        required = set(schema.get("required", []))  # type: ignore[arg-type]
+        required_value = schema.get("required", [])
+        required = set(required_value) if isinstance(required_value, list) else set()
         content: dict[str, str | int | float | bool | list[str] | None] = {}
 
         for key, prop in properties.items():
@@ -2714,6 +2828,15 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         self._session_id = new_session_id
         self._bound_runner_id = None  # Force re-bind on next send
+
+
+_ReplSession: TypeAlias = Session | _SessionsChatReplAdapter
+
+# Every slash-command handler binds these parameters in the same order.
+SlashCommandHandler = Callable[
+    [str, _ReplSession, OmnigentClient, TerminalHost, RichBlockFormatter],
+    Awaitable[None],
+]
 
 
 @dataclass(frozen=True)
@@ -3086,7 +3209,7 @@ async def run_repl(
     if debug_events:
         _pipeline_counters = PipelineCounters()
         _event_tape = EventTape(counters=_pipeline_counters)
-        host.pipeline_counters = _pipeline_counters  # type: ignore[attr-defined]
+        host.pipeline_counters = _pipeline_counters
 
     # Ctrl+T: toggle tool-output panels in the formatter.
     def _toggle_tool_output() -> None:
@@ -3120,21 +3243,20 @@ async def run_repl(
     # The ToolHandler's ``execute`` callable matches the
     # SessionsChat ToolCallable contract closely enough; the
     # name → callable indirection is what SessionsChat expects.
-    tool_callables: dict[str, object] | None = None
+    tool_callables: (
+        dict[
+            str,
+            Callable[[ToolCallInfo], object | Awaitable[object]],
+        ]
+        | None
+    ) = None
     if tool_handler is not None:
-        tool_callables = {
-            schema["name"]: tool_handler.execute  # type: ignore[index]
-            for schema in tool_handler.schemas
-            if isinstance(schema, dict) and "name" in schema
-        }
-    # ``Session`` typing here is intentional: the adapter
-    # is duck-compatible with the legacy surface the REPL
-    # uses (send/cancel/current_response_id/model/
-    # is_streaming/reset/resume_from_response/
-    # set_reasoning_effort/reasoning_effort). mypy is
-    # appeased via the runtime cast; the static type
-    # mismatch surfaces in tests, not at runtime.
-    session = _SessionsChatReplAdapter(  # type: ignore[assignment]
+        tool_callables = {}
+        for schema in tool_handler.schemas:
+            name = schema.get("name")
+            if isinstance(name, str):
+                tool_callables[name] = tool_handler.execute
+    session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
         tool_callables=tool_callables,
@@ -3295,7 +3417,7 @@ async def run_repl(
                 # Local name distinct from run_repl's `agent_name` param:
                 # assigning to `agent_name` here would shadow it for the
                 # whole handler, leaving it unbound in other branches.
-                current_agent = session._agent_name  # type: ignore[union-attr]
+                current_agent = session._agent_name
                 items_out = list(
                     fmt.format_response_start(
                         ResponseStartBlock(
@@ -3385,8 +3507,8 @@ async def run_repl(
                     _maybe_log_tape_entry(tape_entry)
                 return
             if event.data.type == "message" and event.data.data.get("role") == "user":
-                if session._pending_local_user_sends > 0:  # type: ignore[union-attr]
-                    session._pending_local_user_sends -= 1  # type: ignore[union-attr]
+                if session._pending_local_user_sends > 0:
+                    session._pending_local_user_sends -= 1
                 else:
                     text = _extract_message_text(event.data.data)
                     items_out = [fmt.user_message(text)]
@@ -3509,7 +3631,7 @@ async def run_repl(
                 fmt.format_reasoning_start(
                     ReasoningStartBlock(
                         ctx=BlockContext(
-                            agent=session._agent_name,  # type: ignore[union-attr]
+                            agent=session._agent_name,
                             depth=0,
                             turn=0,
                         ),
@@ -3535,7 +3657,7 @@ async def run_repl(
                     _RC(
                         text=sdk_ev.delta,
                         ctx=BlockContext(
-                            agent=session._agent_name,  # type: ignore[union-attr]
+                            agent=session._agent_name,
                             depth=0,
                             turn=0,
                         ),
@@ -3558,14 +3680,14 @@ async def run_repl(
                 if (
                     item.get("type") == "function_call"
                     and item.get("status") == "action_required"
-                    and session._tool_callables  # type: ignore[union-attr]
+                    and session._tool_callables
                 ):
                     call_id = item.get("call_id", "")
                     name = item.get("name", "")
                     args_str = item.get("arguments", "{}")
                     sid = getattr(session, "session_id", None) or ""
                     if isinstance(call_id, str) and isinstance(name, str):
-                        session._spawn_client_tool(  # type: ignore[union-attr]
+                        session._spawn_client_tool(
                             sid,
                             call_id,
                             name,
@@ -3642,14 +3764,14 @@ async def run_repl(
                         if isinstance(call_id, str) and name is not None:
                             call_id_to_tool_metadata[call_id] = (name, arguments or {})
                     if tape_entry is not None:
-                        captured: list[object] = []
+                        captured: list[FormattedItem | None] = []
                         original_output = host.output
 
-                        def _capturing_output(it: object) -> None:
-                            captured.append(it)
-                            original_output(it)
+                        def _capturing_output(item: FormattedItem | None) -> None:
+                            captured.append(item)
+                            original_output(item)
 
-                        host.output = _capturing_output  # type: ignore[assignment]
+                        host.output = _capturing_output
                         try:
                             if plan.flush_inflight_text:
                                 # Commit in-flight streamed prose before
@@ -3664,7 +3786,7 @@ async def run_repl(
                                 call_id_to_tool_metadata=call_id_to_tool_metadata,
                             )
                         finally:
-                            host.output = original_output  # type: ignore[assignment]
+                            host.output = original_output
                         _event_tape.update_format(tape_entry, captured)  # type: ignore[union-attr]
                         _event_tape.mark_rendered(tape_entry, len(captured))  # type: ignore[union-attr]
                     else:
@@ -3685,7 +3807,7 @@ async def run_repl(
             return
 
         if isinstance(sdk_ev, _Created):
-            session._current_response_id = sdk_ev.response.id  # type: ignore[union-attr]
+            session._current_response_id = sdk_ev.response.id
             if tape_entry is not None:
                 _maybe_log_tape_entry(tape_entry)
             return
@@ -3771,7 +3893,7 @@ async def run_repl(
                 sdk_ev, getattr(session, "session_id", None) or ""
             )
             elicit_task = asyncio.create_task(
-                session._handle_elicitation(sid, sdk_ev),  # type: ignore[union-attr]
+                session._handle_elicitation(sid, sdk_ev),
             )
             _background_event_tasks.add(elicit_task)
             elicit_task.add_done_callback(_background_event_tasks.discard)
@@ -3790,7 +3912,7 @@ async def run_repl(
                 _maybe_log_tape_entry(tape_entry)
             return
 
-    session._on_event = _render_session_event  # type: ignore[union-attr]
+    session._on_event = _render_session_event
 
     def _maybe_log_tape_entry(entry: TapeEntry) -> None:
         """Write a tape entry to the JSONL log if the handle is open.
@@ -3800,7 +3922,7 @@ async def run_repl(
         if _event_log_fh is not None:
             from omnigent.repl._event_tape import log_entry_jsonl
 
-            log_entry_jsonl(_event_log_fh, entry)  # type: ignore[arg-type]
+            log_entry_jsonl(_event_log_fh, entry)
 
     is_streaming = False
 
@@ -4077,9 +4199,11 @@ async def run_repl(
     # Warp) and prompt-toolkit binds it cleanly.
     from omnigent_ui_sdk import Overlay
 
-    async def _overview_builder(target: OverlayTarget) -> RenderableType:
+    async def _overview_builder(target: OverlayTarget | None) -> RenderableType:
         from omnigent.cli_diagnostics import current_cli_log_path
 
+        if target is None:
+            return Text.from_markup("[dim]No debug target available.[/dim]")
         return await _build_debug_overview(
             target,
             client=client,
@@ -4306,7 +4430,7 @@ async def run_repl(
             return build_tape_detail(
                 _event_tape,
                 target.key,
-                fmt,  # type: ignore[arg-type]
+                fmt,
             )
 
         async def _tape_targets() -> list[OverlayTarget]:
@@ -4317,7 +4441,7 @@ async def run_repl(
             from omnigent.repl._event_tape import _OverlayTargetLike
 
             raw_targets: list[_OverlayTargetLike] = build_tape_targets(
-                _event_tape,  # type: ignore[arg-type]
+                _event_tape,
             )
             return [OverlayTarget(key=t.key, label=t.label, icon=t.icon) for t in raw_targets]
 
@@ -4460,7 +4584,7 @@ async def run_repl(
                     await _task
             # Close the JSONL event log file handle if it was opened.
             if _event_log_fh is not None:
-                _event_log_fh.close()  # type: ignore[union-attr]
+                _event_log_fh.close()
     close_session = getattr(session, "aclose", None)
     if close_session is not None:
         result = close_session()
@@ -4499,7 +4623,7 @@ async def run_repl(
 
 async def _maybe_write_session_log(
     client: OmnigentClient,
-    session: Session,
+    session: _ReplSession,
     agent_name: str,
     log_dir: pathlib.Path,
     host: TerminalHost,
@@ -4590,7 +4714,7 @@ def _cmd(
 @_cmd("/help", "Show this help")
 async def _cmd_help(
     arg: str,  # noqa: ARG001 — dispatch-contract params (see COMMANDS docstring)
-    session: Session,  # noqa: ARG001
+    session: _ReplSession,  # noqa: ARG001
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4639,7 +4763,7 @@ _THEME_CLEAR_ALIASES = {"default", "auto", "reset"}
 @_cmd("/theme", "Show/set terminal theme; /theme light or /theme dark")
 async def _cmd_theme(
     arg: str,
-    session: Session,  # noqa: ARG001 — dispatch-contract params
+    session: _ReplSession,  # noqa: ARG001 — dispatch-contract params
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4694,7 +4818,7 @@ _EFFORT_CLEAR_ALIASES = {"default", "off", "reset"}
 
 
 async def _set_session_reasoning_effort(
-    session: Session,
+    session: _ReplSession,
     effort: str | None,
 ) -> None:
     """
@@ -4719,7 +4843,7 @@ async def _set_session_reasoning_effort(
 @_cmd("/effort", "Show/set reasoning effort; /effort lists options")
 async def _cmd_effort(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4801,7 +4925,7 @@ def _model_readout_harness(active_model: str | None) -> str:
     return "claude-sdk"
 
 
-def _session_readout_harness(session: Session) -> str:
+def _session_readout_harness(session: _ReplSession) -> str:
     """Resolve the harness the ``/model`` readout should describe.
 
     Prefers the session's actual bound harness
@@ -5051,7 +5175,7 @@ def _model_validation_warning(model: str) -> str | None:
 @_cmd("/model", "Show/set the LLM model for this session")
 async def _cmd_model(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5125,7 +5249,12 @@ async def _cmd_model(
 
     candidate = value.split("/", 1)[0] if "/" in value else value
     matched = _match_configured_provider(config, candidate)
-    if matched is not None and active_name is not None and matched != active_name:
+    if (
+        matched is not None
+        and active is not None
+        and active_name is not None
+        and matched != active_name
+    ):
         active_label = f"{kind_glyph(active.kind)} {provider_display_name(active_name)}".strip()
         target_label = f"{provider_display_name(matched)}"
         host.output(
@@ -5191,7 +5320,7 @@ async def _cmd_model(
 
 
 async def _start_new_conversation(
-    session: Session,
+    session: _ReplSession,
     host: TerminalHost,
     fmt: RichBlockFormatter,  # noqa: ARG001 — reserved for future banner styling
 ) -> bool:
@@ -5202,10 +5331,9 @@ async def _start_new_conversation(
     """
     from rich.text import Text
 
-    starter = getattr(session, "start_new_conversation", None)
-    if callable(starter):
+    if isinstance(session, _SessionsChatReplAdapter):
         try:
-            await starter()
+            await session.start_new_conversation()
         except Exception as exc:  # noqa: BLE001 — REPL boundary
             _log.exception("New conversation failed")
             host.output(Text.from_markup(f"  [bold red]New conversation failed: {exc}[/]"))
@@ -5221,7 +5349,7 @@ async def _start_new_conversation(
 @_cmd("/new", "Start a new conversation (keeps scrollback)")
 async def _cmd_new(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5241,7 +5369,7 @@ async def _cmd_new(
 @_cmd("/clear", "Clear the screen and start a new conversation")
 async def _cmd_clear(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5263,12 +5391,12 @@ async def _cmd_clear(
 @_cmd("/switch", "List or switch conversations")
 async def _cmd_switch(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
 ) -> None:
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     from rich.table import Table
     from rich.text import Text
@@ -5283,7 +5411,11 @@ async def _cmd_switch(
             table.add_column("Status", style="dim")
             table.add_column("Created", style="dim")
             for i, s in enumerate(sessions_list, 1):
-                when = datetime.fromtimestamp(s.created_at).strftime("%b %d %H:%M")
+                when = (
+                    datetime.fromtimestamp(s.created_at, tz=timezone.utc)
+                    .astimezone()
+                    .strftime("%b %d %H:%M")
+                )
                 table.add_row(str(i), s.id, s.title or "(untitled)", s.status, when)
             host.output(table)
             host.output(
@@ -5311,7 +5443,9 @@ async def _cmd_switch(
             # session.reset() / resume_from_response() are no-ops
             # in sessions mode, so without this the REPL keeps
             # sending to the original session.
-            await session.switch_to_session(arg)  # type: ignore[attr-defined]
+            if not isinstance(session, _SessionsChatReplAdapter):
+                raise RuntimeError("Session switching requires the sessions API.")
+            await session.switch_to_session(arg)
             # Drop the prior session's sub-agent tree so its agents don't
             # linger under the switched-to session's root.
             host.clear_subagents()
@@ -5336,7 +5470,7 @@ async def _cmd_switch(
 
 async def _attach_to_conversation(
     conversation_id: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5408,9 +5542,8 @@ async def _attach_to_conversation(
     # local REPL right away — without this, they only surface after
     # the local user sends a message and triggers the lazy bind.
     # Idempotent: a later ``send()`` short-circuits in ``_ensure_session``.
-    ensure = getattr(session, "_ensure_session", None)
-    if callable(ensure):
-        await ensure()
+    if isinstance(session, _SessionsChatReplAdapter):
+        await session._ensure_session()
 
     items = await _list_all_conversation_items(client, conversation_id)
 
@@ -5474,8 +5607,10 @@ async def _attach_to_conversation(
 
             effective = _items_for_context_token_count(items)
             llm = getattr(session, "llm_model", None) or getattr(session, "_agent_name", "")
+            if not isinstance(llm, str):
+                llm = ""
             tokens = count_tokens(
-                [dict(i) for i in effective],  # type: ignore[arg-type]
+                [dict(i) for i in effective],
                 llm,
             )
         host.update_context_usage(tokens, cw)
@@ -5484,7 +5619,7 @@ async def _attach_to_conversation(
 @_cmd("/fork", "Fork the current conversation into a new session")
 async def _cmd_fork(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5545,7 +5680,7 @@ async def _cmd_fork(
 @_cmd("/history", "Show current conversation history")
 async def _cmd_history(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5619,7 +5754,7 @@ class _ContextItems:
 
 
 async def _fetch_context_items(
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
 ) -> _ContextItems:
     """
@@ -5711,7 +5846,7 @@ def _items_for_context_token_count(
 
 
 async def _refresh_session_metadata(
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5764,7 +5899,7 @@ async def _refresh_session_metadata(
 
 
 async def _update_context_ring_estimate(
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     context_window: int,
@@ -5798,7 +5933,7 @@ async def _update_context_ring_estimate(
     # time, not captured at task-spawn time, so they stay current.
     llm = getattr(session, "llm_model", None) or session.model
     tokens = count_tokens(
-        [dict(i) for i in effective],  # type: ignore[arg-type]
+        [dict(i) for i in effective],
         llm,
     )
     host.update_context_usage(tokens, context_window)
@@ -5913,7 +6048,7 @@ def _render_context_tree(
 @_cmd("/compact", "Compact conversation context now")
 async def _cmd_compact(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5952,7 +6087,7 @@ async def _cmd_compact(
 @_cmd("/context", "Show context window usage")
 async def _cmd_context(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -6007,7 +6142,7 @@ async def _cmd_context(
         # recognised LLM identifier — good enough for an estimate.
         effective_items = _items_for_context_token_count(result.items)
         message_tokens = count_tokens(
-            [dict(item) for item in effective_items],  # type: ignore[arg-type]
+            [dict(item) for item in effective_items],
             llm_model or agent_name,
         )
     _render_context_tree(agent_name, llm_model, message_tokens, context_window, host, fmt)
@@ -6016,7 +6151,7 @@ async def _cmd_context(
 @_cmd("/cancel", "Cancel the current response")
 async def _cmd_cancel(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -6091,7 +6226,7 @@ def _build_github_issue_url(
 @_cmd("/logs", "Collect current session logs into a zip")
 async def _cmd_logs(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -6156,7 +6291,7 @@ async def _cmd_logs(
 @_cmd("/report", "Open a pre-filled GitHub issue for this session")
 async def _cmd_report(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract param
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -6202,7 +6337,7 @@ async def _cmd_report(
 @_cmd("/quit", "Exit")
 async def _cmd_quit(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,  # noqa: ARG001
+    session: _ReplSession,  # noqa: ARG001
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,  # noqa: ARG001
@@ -6381,7 +6516,7 @@ async def _refresh_subagent_tree(
 
 async def _collect_overview_targets(
     client: OmnigentClient,
-    session: Session,
+    session: _ReplSession,
 ) -> list[OverlayTarget]:
     """
     Enumerate the debug overview's sidebar targets.
@@ -7290,7 +7425,7 @@ async def _build_debug_overview(
     target: OverlayTarget,
     *,
     client: OmnigentClient,
-    session: Session,
+    session: _ReplSession,
     agent_name: str,
     fmt: RichBlockFormatter,
     server_log_path: pathlib.Path | None = None,
@@ -8242,13 +8377,12 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
 
             async def _skill_handler(
                 arg: str,
-                session: Session,
+                session: _ReplSession,
                 client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
                 host: TerminalHost,
                 fmt: RichBlockFormatter,
             ) -> None:
-                send_skill = getattr(session, "send_skill_slash_command", None)
-                if not callable(send_skill):
+                if not isinstance(session, _SessionsChatReplAdapter):
                     raise RuntimeError("Skill slash commands require the sessions API adapter")
                 if arg:
                     host.output(Text.from_markup(f"  [{fmt.muted}]/{sk.name}[/{fmt.muted}]"))
@@ -8260,7 +8394,7 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
                     )
                 host.start_timer()
                 await asyncio.sleep(0)
-                async for _ in send_skill(sk.name, arg):
+                async for _ in session.send_skill_slash_command(sk.name, arg):
                     pass
 
             return _skill_handler
@@ -8577,7 +8711,7 @@ async def _run_bang_command(
 
 async def handle_slash_command(
     line: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,

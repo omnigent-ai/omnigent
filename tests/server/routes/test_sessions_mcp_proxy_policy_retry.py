@@ -76,6 +76,29 @@ class _StubConversationStore:
         return None
 
 
+def _engine_factory_expecting_preload(engine: object):
+    """Return a `_build_policy_engine_from_spec` double that requires the row.
+
+    Every production caller of that wrapper has already loaded the
+    conversation to resolve the spec, and passes it so the builder can skip
+    its own read and confirm the agent binding. A double that merely
+    *accepts* ``conversation=None`` asserts nothing: dropping the preload at
+    the call site leaves every test here green, which is exactly what
+    happened. This one fails if the row does not arrive, so the contract is
+    observed by all seven tests rather than described by none.
+    """
+
+    def _factory(spec, session_id, conversation_store, conversation=None):
+        assert conversation is not None, (
+            "the handler must pass the conversation row it already read; "
+            "without it the builder re-reads and loses the agent-binding check"
+        )
+        assert conversation.id == session_id, (conversation.id, session_id)
+        return engine
+
+    return _factory
+
+
 @dataclass
 class _StubAgentStore:
     """
@@ -209,7 +232,7 @@ async def test_forged_retry_with_deny_policy_is_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        _engine_factory_expecting_preload(deny_engine),
     )
 
     response = await _handle_mcp_tools_call(
@@ -266,7 +289,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        _engine_factory_expecting_preload(ask_engine),
     )
 
     forged_eid = "elicit_FORGED_never_issued"
@@ -318,7 +341,7 @@ async def test_retry_with_allow_policy_falls_through(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: allow_engine,
+        _engine_factory_expecting_preload(allow_engine),
     )
 
     response = await _handle_mcp_tools_call(
@@ -374,7 +397,7 @@ async def test_retry_session_mismatch_still_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        _engine_factory_expecting_preload(deny_engine),
     )
 
     params = _forged_retry_params()
@@ -432,7 +455,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        _engine_factory_expecting_preload(ask_engine),
     )
 
     eid = "elicit_LEGITIMATE_server_issued"
@@ -533,8 +556,8 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: _FixedPolicyEngine(
-            result=PolicyResult(action=PolicyAction.ALLOW, reason=None)
+        _engine_factory_expecting_preload(
+            _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
         ),
     )
 
@@ -612,7 +635,7 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: engine,
+        _engine_factory_expecting_preload(engine),
     )
 
     params = {"name": "sys_os_shell", "arguments": {"command": "echo hi"}}

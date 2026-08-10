@@ -124,6 +124,48 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
   });
 
+  it("shows the base-branch field only when the worktree default is on, and saves it", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    // Base branch is hidden while the worktree default is OFF (nothing to fork).
+    expect(screen.queryByTestId("project-settings-base-branch")).not.toBeInTheDocument();
+
+    // Turning the worktree default ON reveals the base-branch field.
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    const input = screen.getByTestId("project-settings-base-branch");
+    fireEvent.change(input, { target: { value: "  main  " } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    // Trimmed and stored alongside the worktree default.
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true, base_branch: "main" }),
+    );
+  });
+
+  it("drops the base branch when the worktree default is off", async () => {
+    // A base branch stored from an earlier ON state must not linger as an
+    // invisible default once the worktree toggle is turned back off.
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { use_worktree: true, base_branch: "develop" },
+    });
+    renderDialog();
+    // Seeded ON → the base-branch field shows its stored value.
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-base-branch")).toHaveValue("develop"),
+    );
+    // Turn the worktree default OFF → base branch drops, config clears to {}.
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
   it("hides the sandbox option when managed sandboxes are disabled", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
     renderDialog();

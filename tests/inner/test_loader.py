@@ -444,6 +444,57 @@ class TestLoadFromDict(unittest.TestCase):
             ),
         )
 
+    def test_os_env_auto_sandbox_uses_platform_default(self):
+        from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+        agent = load_agent_def(
+            {
+                "name": "t",
+                "os_env": {
+                    "type": "caller_process",
+                    "sandbox": {"type": "auto", "write_paths": ["."]},
+                },
+            }
+        )
+
+        self.assertIsNotNone(agent.os_env)
+        self.assertIsNotNone(agent.os_env.sandbox)
+        self.assertEqual(agent.os_env.sandbox.type, _default_sandbox_for_platform().type)
+        self.assertEqual(agent.os_env.sandbox.write_paths, ["."])
+
+    def test_os_env_omitted_sandbox_type_uses_platform_default(self):
+        from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+        agent = load_agent_def(
+            {
+                "name": "t",
+                "os_env": {
+                    "type": "caller_process",
+                    "sandbox": {"write_paths": ["."]},
+                },
+            }
+        )
+
+        self.assertIsNotNone(agent.os_env)
+        self.assertIsNotNone(agent.os_env.sandbox)
+        self.assertEqual(agent.os_env.sandbox.type, _default_sandbox_for_platform().type)
+        self.assertEqual(agent.os_env.sandbox.write_paths, ["."])
+
+    def test_os_env_null_sandbox_type_disables_sandbox(self):
+        agent = load_agent_def(
+            {
+                "name": "t",
+                "os_env": {
+                    "type": "caller_process",
+                    "sandbox": {"type": None},
+                },
+            }
+        )
+
+        self.assertIsNotNone(agent.os_env)
+        self.assertIsNotNone(agent.os_env.sandbox)
+        self.assertEqual(agent.os_env.sandbox.type, "none")
+
     def test_params(self):
         a = load_agent_def(
             {"name": "t", "params": {"u": {"type": "string", "description": "User"}}}

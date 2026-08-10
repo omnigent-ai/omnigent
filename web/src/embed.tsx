@@ -42,6 +42,8 @@ import {
   reactRouterRouting,
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
@@ -112,6 +114,7 @@ const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  smart_routing_sources: { external: false, oss: false },
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
@@ -137,9 +140,9 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
     // main.tsx) so the chat UI still paints instead of hanging on "loading".
     void Promise.race([
       resolveServerInfo(),
-      new Promise<ServerInfo>((resolve) =>
-        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500),
-      ),
+      new Promise<ServerInfo>((resolve) => {
+        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500);
+      }),
     ]).then((resolved) => {
       if (alive) setInfo(resolved);
     });
@@ -163,9 +166,9 @@ function OmnigentProviders({
   // one-time side effects (wire the chat store to that client + resolve
   // identity). `initChatStore` only stashes the client for later cache
   // invalidation, so doing this in a mount-once initializer is fine.
-  const queryClient = useQueryClient();
+  const hostQueryClient = useQueryClient();
   useState(() => {
-    initChatStore(queryClient);
+    initChatStore(hostQueryClient);
     void resolveIdentity();
     return null;
   });

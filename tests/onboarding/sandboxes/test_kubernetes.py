@@ -10,6 +10,7 @@ fakes — there is no exec transport to fake.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -290,6 +291,128 @@ def test_build_pod_manifest_without_pvc_mounts_is_unchanged() -> None:
     ]
 
 
+def test_build_pod_manifest_secret_mounts_land_on_host_container_only() -> None:
+    """Each secret_mounts entry becomes a read-only secret volume mounted on host only."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        secret_mounts=[
+            {"secret_name": "git-token", "mount_path": "/mnt/secrets/git"},
+            {"secret_name": "npm-token", "mount_path": "/mnt/secrets/npm"},
+        ],
+    )
+    spec = manifest["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["secret-0"]["secret"] == {
+        "secretName": "git-token",
+        "optional": False,
+        "defaultMode": 0o440,
+    }
+    assert volumes["secret-1"]["secret"] == {
+        "secretName": "npm-token",
+        "optional": False,
+        "defaultMode": 0o440,
+    }
+    host_mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
+    assert host_mounts["secret-0"] == {
+        "name": "secret-0",
+        "mountPath": "/mnt/secrets/git",
+        "readOnly": True,
+    }
+    assert host_mounts["secret-1"] == {
+        "name": "secret-1",
+        "mountPath": "/mnt/secrets/npm",
+        "readOnly": True,
+    }
+    # Init container keeps only HOME — no credential exposure at clone time.
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_pvc_and_secret_mounts_coexist() -> None:
+    """PVC and Secret mounts get independent name spaces (pvc-N / secret-N) on the host."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        pvc_mounts=[{"claim_name": "datasets", "mount_path": "/mnt/datasets", "read_only": True}],
+        secret_mounts=[{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+    )
+    volume_names = {v["name"] for v in manifest["spec"]["volumes"]}
+    assert volume_names == {"home", "pvc-0", "secret-0"}
+    host_mount_names = {m["name"] for m in manifest["spec"]["containers"][0]["volumeMounts"]}
+    assert host_mount_names == {"home", "pvc-0", "secret-0"}
+
+
+def test_build_pod_manifest_without_secret_mounts_is_unchanged() -> None:
+    """No secret_mounts → the single home emptyDir, exactly as before."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["spec"]["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert manifest["spec"]["containers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_stamps_agent_label_alongside_reserved_pair() -> None:
+    """A valid agent name adds the omnigent.ai/agent classifier; reserved pair stays."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="research-agent")
+    assert manifest["metadata"]["labels"] == {
+        "app.kubernetes.io/managed-by": "omnigent",
+        "omnigent.ai/role": "sandbox-host",
+        "omnigent.ai/agent": "research-agent",
+    }
+
+
+def test_build_pod_manifest_echoes_valid_agent_name_verbatim() -> None:
+    """The label value equals the agent name exactly — case, dots, and underscores
+    are all valid label characters, so a valid name is never rewritten."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="Research.Agent_v2")
+    assert manifest["metadata"]["labels"]["omnigent.ai/agent"] == "Research.Agent_v2"
+
+
+def test_build_pod_manifest_without_agent_label_keeps_only_reserved_pair() -> None:
+    """No agent → labels are exactly the reserved managed-by/role pair."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["metadata"]["labels"] == {
+        "app.kubernetes.io/managed-by": "omnigent",
+        "omnigent.ai/role": "sandbox-host",
+    }
+
+
+def test_build_pod_manifest_empty_agent_label_is_omitted() -> None:
+    """An empty agent name is treated as no agent — no omnigent.ai/agent key."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="")
+    assert "omnigent.ai/agent" not in manifest["metadata"]["labels"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Research Agent",  # space is not a valid label character
+        "agent/v2:beta",  # '/' and ':' are not valid label characters
+        "--weird__name..",  # does not start/end alphanumeric
+        "a" * 64,  # exceeds the 63-char label-value limit
+        "///...---",  # nothing valid survives
+    ],
+)
+def test_build_pod_manifest_omits_agent_label_needing_transformation(
+    raw: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A name that is not ALREADY a valid label value is omitted, never coerced —
+    two distinct names must never collapse onto one credential-selecting value.
+
+    The omission is WARNED, not silent: the resolve upstream has already logged
+    this agent as classified, so a silent drop here would point an operator
+    debugging an uninjected credential at a log line claiming success.
+    """
+    with caplog.at_level(logging.WARNING):
+        manifest = build_pod_manifest(**_MANIFEST_KW, agent_name=raw)
+    assert "omnigent.ai/agent" not in manifest["metadata"]["labels"]
+    assert any(
+        "stays unclassified" in r.getMessage() and r.levelno == logging.WARNING
+        for r in caplog.records
+    ), f"the dropped label was not warned about: {[r.getMessage() for r in caplog.records]}"
+
+
 def test_build_pod_manifest_is_restricted_and_least_privilege() -> None:
     """The Pod satisfies Pod Security 'restricted' and mounts no SA token."""
     manifest = build_pod_manifest(**_MANIFEST_KW)
@@ -544,6 +667,58 @@ def test_launch_host_threads_pvc_mounts_into_the_pod(fake_core: _FakeCore) -> No
     } in fake_core.created_pods[0]["spec"]["volumes"]
 
 
+def test_launch_host_threads_secret_mounts_into_the_pod(fake_core: _FakeCore) -> None:
+    """A launcher built with secret_mounts creates Pods carrying the secret volume."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        secret_mounts=[{"secret_name": "git-token", "mount_path": "/mnt/secrets/git"}],
+    )
+    launcher.start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert {
+        "name": "secret-0",
+        "secret": {"secretName": "git-token", "optional": False, "defaultMode": 0o440},
+    } in fake_core.created_pods[0]["spec"]["volumes"]
+
+
+def test_launch_host_threads_agent_label_into_the_pod(fake_core: _FakeCore) -> None:
+    """start_host stamps the resolved agent on the created Pod's labels."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        agent_name="research-agent",
+    )
+    labels = fake_core.created_pods[0]["metadata"]["labels"]
+    assert labels["omnigent.ai/agent"] == "research-agent"
+    assert labels["app.kubernetes.io/managed-by"] == "omnigent"
+
+
+def test_launch_host_without_agent_label_keeps_reserved_labels(fake_core: _FakeCore) -> None:
+    """No agent_name → the created Pod carries only the reserved managed-by/role pair."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert "omnigent.ai/agent" not in fake_core.created_pods[0]["metadata"]["labels"]
+
+
 def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:
     """With a repo, the returned workspace is the cloned directory under the workspace."""
     fake_core.read_queue = [_pod(phase="Running")]
@@ -695,3 +870,6 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
     assert not hasattr(launcher, "run")
     # CLI bootstrap is not supported.
     assert launcher.capabilities.cli_bootstrap is False
+    # It classifies runners by agent, so the managed launch path threads
+    # ``agent_name`` into its ``start_host`` (exec-model providers do not).
+    assert launcher.capabilities.classifies_runner_by_agent is True

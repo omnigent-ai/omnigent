@@ -60,6 +60,7 @@ stores into ``create_app``):
          boxlite:                 # optional block (provider: boxlite)
            image: docker.io/me/omnigent-host:latest    # shared; default: official
            env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
+           disk_size_gb: 100                           # shared; default: SDK default
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -132,16 +133,17 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import click
 from fastapi import HTTPException
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
-    from omnigent.onboarding.sandboxes import SandboxLauncher
+    from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
 
@@ -243,12 +245,87 @@ _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 # genuinely slow launch.
 MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
+# Server-internal sandbox lifecycle labels — currently the repository a relaunch
+# re-clones. A client seed would forge that reconstruction, so session
+# create/patch reject any client label here, closing future keys by default.
+MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
+
 # Session label recording the repository-URL workspace a managed
 # session was created with (the raw ``<url>[#<branch>]`` request
 # value). ``conversations.workspace`` is overwritten with the CLONED
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+
+def resolve_managed_agent_label(
+    agent_store: AgentStore,
+    agent_id: str | None,
+    *,
+    session_id: str,
+) -> str | None:
+    """
+    Resolve the agent-classifier value for a managed runner Pod, gated to
+    genuine built-ins.
+
+    The runner Pod's ``omnigent.ai/agent`` label is what an admission policy
+    selects on to inject a privileged credential (e.g. a scoped git token).
+    That is only trustworthy for a genuine BUILT-IN (operator-seeded) agent:
+    a user can create a *session-scoped* agent whose name matches a built-in's,
+    so name alone is spoofable. The gate is ``session_id is None AND id ==
+    builtin_agent_id(name)`` — the same identity built-in seeding uses. A
+    session-scoped or user-uploaded agent (random id, and/or an owning
+    conversation) fails it and its runner gets NO agent label.
+
+    The label is an optimization, never a launch precondition: any failure to
+    resolve (no agent, unknown id, not a built-in, or a store error) returns
+    ``None`` so the caller omits the label rather than stamping something
+    unmatchable or failing the create. The decision is logged either way (the
+    "why did this runner get no credential" line).
+
+    :param agent_store: Store to resolve the agent record from.
+    :param agent_id: The session's bound agent id, or ``None``.
+    :param session_id: Session id, for log correlation only.
+    :returns: The built-in agent's registered name to stamp, or ``None`` to
+        omit the classifier.
+    """
+    if agent_id is None:
+        _logger.info("session %s: no agent label (session has no bound agent)", session_id)
+        return None
+    try:
+        agent = agent_store.get(agent_id)
+    except Exception:  # noqa: BLE001 — the label is an optimization, never a
+        # create precondition. Any store failure degrades to an unlabeled runner
+        # (the admission policy skips it) rather than 500-ing a create that has
+        # already committed and announced the session.
+        _logger.warning(
+            "session %s: agent-label resolve failed for agent %s; omitting label",
+            session_id,
+            agent_id,
+            exc_info=True,
+        )
+        return None
+    if agent is None:
+        _logger.warning(
+            "session %s: agent id %s did not resolve to an agent; omitting label",
+            session_id,
+            agent_id,
+        )
+        return None
+    if agent.session_id is not None or agent.id != builtin_agent_id(agent.name):
+        _logger.info(
+            "session %s: agent %r (%s) is not a genuine built-in; omitting agent label",
+            session_id,
+            agent.name,
+            agent.id,
+        )
+        return None
+    _logger.info(
+        "session %s: classifying runner with built-in agent label %r",
+        session_id,
+        agent.name,
+    )
+    return agent.name
 
 
 @dataclass
@@ -402,7 +479,7 @@ class ManagedSandboxConfig:
     """
 
     server_url: str
-    launcher_factory: Callable[[], SandboxLauncher]
+    launcher_factory: Callable[[], SandboxHostLauncher]
     token_ttl_s: int
     managed_launch_supported: bool = True
     provider: str | None = None
@@ -585,7 +662,7 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
 def _modal_launcher_factory(
     image: str | None,
     secrets: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: modal`` path.
 
@@ -600,7 +677,7 @@ def _modal_launcher_factory(
     :returns: A factory producing parameterized Modal launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Modal launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.modal import ModalSandboxLauncher
 
@@ -609,7 +686,7 @@ def _modal_launcher_factory(
     return _build
 
 
-def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher]:
+def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLauncher]:
     """
     Build a factory that rejects launch for a not-yet-supported provider.
 
@@ -621,7 +698,7 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher
     :returns: A factory that raises ``HTTPException`` 400 when called.
     """
 
-    def _reject() -> SandboxLauncher:
+    def _reject() -> SandboxHostLauncher:
         """Reject the launch with the provider named."""
         raise HTTPException(
             status_code=400,
@@ -744,7 +821,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
     if not isinstance(raw, dict):
         raise ValueError("server config 'sandbox' must be a mapping")
     provider = raw.get("provider")
-    if provider not in SUPPORTED_SANDBOX_PROVIDERS:
+    if not isinstance(provider, str) or provider not in SUPPORTED_SANDBOX_PROVIDERS:
         supported = ", ".join(sorted(SUPPORTED_SANDBOX_PROVIDERS))
         raise ValueError(
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"
@@ -770,7 +847,9 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "boxlite":
         section = _boxlite_section(raw)
-        _reject_unknown_keys(section, {"image", "env", "local", "cloud"}, "sandbox.boxlite")
+        _reject_unknown_keys(
+            section, {"image", "env", "local", "cloud", "disk_size_gb"}, "sandbox.boxlite"
+        )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
             endpoint,
@@ -778,6 +857,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_boxlite_env(section),
             home_dir,
             registry,
+            _parse_provider_positive_int(raw, "boxlite", "disk_size_gb"),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -818,6 +898,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             image=_parse_provider_image(raw, "openshell"),
             env=_parse_provider_env(raw, "openshell"),
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
+            workspace=_parse_provider_string(raw, "openshell", "workspace"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider == "kubernetes":
@@ -836,9 +917,13 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
                     "in_cluster",
                     "resources",
                     "pvc_mounts",
+                    "secret_mounts",
                 },
                 "sandbox.kubernetes",
             )
+        pvc_mounts = _parse_kubernetes_pvc_mounts(raw)
+        secret_mounts = _parse_kubernetes_secret_mounts(raw)
+        _reject_overlapping_kubernetes_mounts(pvc_mounts, secret_mounts)
         launcher_factory = _kubernetes_launcher_factory(
             image=_parse_provider_image(raw, "kubernetes"),
             env=_parse_provider_env(raw, "kubernetes"),
@@ -849,7 +934,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
-            pvc_mounts=_parse_kubernetes_pvc_mounts(raw),
+            pvc_mounts=pvc_mounts,
+            secret_mounts=secret_mounts,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -942,7 +1028,7 @@ def _parse_modal_secrets(raw: dict[str, object]) -> list[str] | None:
 def _daytona_launcher_factory(
     image: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: daytona`` path.
 
@@ -958,7 +1044,7 @@ def _daytona_launcher_factory(
     :returns: A factory producing parameterized Daytona launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Daytona launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
@@ -1049,7 +1135,8 @@ def _boxlite_launcher_factory(
     env: list[str] | None,
     home_dir: str | None,
     registry: dict[str, object] | None,
-) -> Callable[[], SandboxLauncher]:
+    disk_size_gb: int | None,
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
 
@@ -1067,15 +1154,21 @@ def _boxlite_launcher_factory(
     :param registry: LOCAL-mode private-registry config for the host image
         (``host`` + optional ``transport`` / ``skip_verify`` / ``*_env``
         credential names), or ``None`` for anonymous pulls.
+    :param disk_size_gb: Box disk size in GB, or ``None`` for the SDK default.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the boxlite launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.boxlite import BoxliteSandboxLauncher
 
         return BoxliteSandboxLauncher(
-            endpoint=endpoint, image=image, env=env, home_dir=home_dir, registry=registry
+            endpoint=endpoint,
+            image=image,
+            env=env,
+            home_dir=home_dir,
+            registry=registry,
+            disk_size_gb=disk_size_gb,
         )
 
     return _build
@@ -1280,10 +1373,10 @@ def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | Non
 def _cwsandbox_launcher_factory(
     image: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """Build the launcher factory for the YAML ``provider: cwsandbox`` path."""
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         from omnigent.onboarding.sandboxes.cwsandbox import CWSandboxLauncher
 
         return CWSandboxLauncher(image=image, env=env)
@@ -1332,7 +1425,7 @@ def _parse_cwsandbox_env(raw: dict[str, object]) -> list[str] | None:
 def _e2b_launcher_factory(
     template: str | None,
     env: list[str] | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: e2b`` path.
 
@@ -1350,7 +1443,7 @@ def _e2b_launcher_factory(
     :returns: A factory producing parameterized E2B launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the E2B launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
 
@@ -1429,7 +1522,7 @@ def _islo_launcher_factory(
     memory_mb: int | None,
     disk_gb: int | None,
     idle_pause_after_s: int | None,
-) -> Callable[[], SandboxLauncher]:
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: islo`` path.
 
@@ -1453,7 +1546,7 @@ def _islo_launcher_factory(
     :returns: A factory producing parameterized Islo launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Islo launcher."""
         from omnigent.onboarding.sandboxes.islo import IsloSandboxLauncher
 
@@ -1478,7 +1571,8 @@ def _openshell_launcher_factory(
     image: str | None,
     env: list[str] | None,
     cluster: str | None,
-) -> Callable[[], SandboxLauncher]:
+    workspace: str | None,
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: openshell`` path.
 
@@ -1491,14 +1585,17 @@ def _openshell_launcher_factory(
     :param cluster: OpenShell gateway name to connect to, or ``None`` to
         use the active gateway (``$OPENSHELL_GATEWAY`` /
         ``~/.config/openshell/active_gateway``).
+    :param workspace: OpenShell workspace for sandbox lifecycle, or
+        ``None`` to resolve from ``$OMNIGENT_OPENSHELL_WORKSPACE``
+        then ``"default"``.
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
-        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster)
+        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
 
     return _build
 
@@ -1914,6 +2011,125 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
     return normalized or None
 
 
+def _parse_kubernetes_secret_mounts(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.secret_mounts`` list.
+
+    Each entry references a Kubernetes Secret the operator pre-created in the
+    runner namespace and projects it as a **file volume** on the host
+    container: ``{secret_name, mount_path}``. A Secret volume is refreshed in
+    place by the kubelet, so a long-lived runner picks up a rotated credential
+    without a restart — unlike ``envFrom``, frozen at container start. Refresh
+    is eventually consistent (kubelet sync, up to ~1 min), so the consumer
+    must re-read the file each use. Secret volumes are read-only, so there is
+    no ``read_only`` knob. Validated at parse time so an operator typo fails
+    server startup, not the first launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, a name
+        or path is malformed, a path is reserved, or paths collide.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("secret_mounts")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.secret_mounts' must be a list of "
+            "{secret_name, mount_path} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.secret_mounts[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(entry, {"secret_name", "mount_path"}, path_prefix)
+        secret = entry.get("secret_name")
+        if not isinstance(secret, str) or not secret.strip():
+            raise ValueError(
+                f"server config '{path_prefix}.secret_name' must name a "
+                "Secret pre-created in the runner namespace"
+            )
+        secret = secret.strip()
+        _validate_dns1123_subdomain(secret, f"secret_mounts[{i}].secret_name")
+        mount = entry.get("mount_path")
+        if not isinstance(mount, str) or not mount.startswith("/"):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be an absolute "
+                "in-Pod path, e.g. '/mnt/secrets/git'"
+            )
+        # normpath preserves exactly two leading slashes (POSIX), but the
+        # kernel collapses them at mount time — reject them explicitly so
+        # '//home/omnigent' cannot slip past the reserved-prefix check.
+        if mount.startswith("//") or mount != posixpath.normpath(mount):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be a normalized "
+                f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
+            )
+        if mount == "/" or any(
+            mount == p or mount.startswith(p + "/") or p.startswith(mount + "/")
+            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' overlaps a reserved "
+                f"path: {mount!r} (the runner's HOME, Secret projections, and OS "
+                "directories cannot be shadowed or mounted over)"
+            )
+        normalized.append({"secret_name": secret, "mount_path": mount})
+    for a, b in itertools.combinations(normalized, 2):
+        pa, pb = str(a["mount_path"]), str(b["mount_path"])
+        if pa == pb:
+            raise ValueError(
+                "server config 'sandbox.kubernetes.secret_mounts' has a "
+                f"duplicate mount_path: {pa!r}"
+            )
+        low, high = sorted((pa, pb), key=len)
+        if high.startswith(low + "/"):
+            raise ValueError(
+                "server config 'sandbox.kubernetes.secret_mounts' has nested "
+                f"mount_paths: {low!r} contains {high!r}"
+            )
+    return normalized or None
+
+
+def _reject_overlapping_kubernetes_mounts(
+    pvc_mounts: list[dict[str, object]] | None,
+    secret_mounts: list[dict[str, object]] | None,
+) -> None:
+    """
+    Reject a ``pvc_mounts`` path that duplicates or nests with a ``secret_mounts`` path.
+
+    Each list is already de-conflicted internally by its own parser; this
+    catches a collision *across* the two mount types (e.g. a PVC at ``/mnt/x``
+    and a Secret at ``/mnt/x/token``), which would otherwise produce nested
+    volume mounts on the host container.
+
+    :param pvc_mounts: Normalized PVC mounts, or ``None``.
+    :param secret_mounts: Normalized Secret mounts, or ``None``.
+    :raises ValueError: When a PVC and a Secret mount_path are equal or nested.
+    """
+    if not pvc_mounts or not secret_mounts:
+        return
+    for pvc in pvc_mounts:
+        pa = str(pvc["mount_path"])
+        for secret in secret_mounts:
+            sb = str(secret["mount_path"])
+            if pa == sb:
+                raise ValueError(
+                    "server config 'sandbox.kubernetes' uses the same mount_path "
+                    f"for a PVC and a Secret: {pa!r}"
+                )
+            low, high = sorted((pa, sb), key=len)
+            if high.startswith(low + "/"):
+                raise ValueError(
+                    "server config 'sandbox.kubernetes' has nested pvc_mounts / "
+                    f"secret_mounts paths: {low!r} contains {high!r}"
+                )
+
+
 def _kubernetes_launcher_factory(
     *,
     image: str | None,
@@ -1926,7 +2142,8 @@ def _kubernetes_launcher_factory(
     in_cluster: bool | None,
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
-) -> Callable[[], SandboxLauncher]:
+    secret_mounts: list[dict[str, object]] | None,
+) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
 
@@ -1949,12 +2166,14 @@ def _kubernetes_launcher_factory(
     :param resources: Validated ``resources`` block, or ``None`` for defaults.
     :param pvc_mounts: Normalized PVC mount entries added to every runner Pod,
         or ``None``.
+    :param secret_mounts: Normalized Secret file-mount entries added to every
+        runner Pod (rotation-friendly credential volumes), or ``None``.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
     _validate_kubernetes_identifiers(namespace, secret_name, service_account, node_selector)
 
-    def _build() -> SandboxLauncher:
+    def _build() -> SandboxHostLauncher:
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
 
@@ -1969,6 +2188,7 @@ def _kubernetes_launcher_factory(
             in_cluster=in_cluster,
             resources=resources,
             pvc_mounts=pvc_mounts,
+            secret_mounts=secret_mounts,
         )
 
     return _build
@@ -1980,6 +2200,7 @@ async def launch_managed_host(
     owner: str,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2008,6 +2229,10 @@ async def launch_managed_host(
         host image's git credential helper when the sandbox env
         carries ``GIT_TOKEN`` (injected through Modal secrets — see
         deploy/modal/README.md "Git credentials").
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        stamped as the runner Pod's ``omnigent.ai/agent`` classifier by
+        providers that declare ``classifies_runner_by_agent`` (Kubernetes),
+        or ``None`` to leave it unstamped.
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
         *repo* is set) then ``"starting"``. May be called from a
@@ -2043,6 +2268,7 @@ async def launch_managed_host(
         owner=owner,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
@@ -2054,6 +2280,7 @@ async def relaunch_managed_host(
     host: Host,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2081,6 +2308,9 @@ async def relaunch_managed_host(
     :param host_store: Persistent host registrations.
     :param repo: Repository to re-clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        re-stamped as the new runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     :param on_stage: Progress observer forwarded to
         :func:`_arm_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
@@ -2119,15 +2349,109 @@ async def relaunch_managed_host(
         owner=host.user_id,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
         keep_host_on_failure=True,
     )
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
 
+async def _start_sandbox_host(
+    launcher: SandboxHostLauncher,
+    sandbox_id: str,
+    *,
+    token: str,
+    host_id: str,
+    host_name: str,
+    server_url: str,
+    repo_url: str | None,
+    repo_branch: str | None,
+    repo_name: str | None,
+    host_config: dict[str, object] | None,
+    agent_name: str | None = None,
+    on_stage: Callable[[str], None] | None = None,
+) -> str:
+    """Start a host without sending absent optional arguments to legacy launchers."""
+    # Gated on the capability, not on the value: start_host is side-effecting and
+    # non-idempotent, so we never probe the signature by passing then retrying.
+    # `agent_name` is declared on the classifying launcher's `start_host` alone,
+    # so the abstract signature does not carry it and the call is cast: the
+    # capability is the runtime guarantee the static type cannot express. A
+    # launcher declaring it is in-tree and current, so it also takes
+    # `host_config`/`on_stage`, keeping the legacy-omission fan-out below
+    # one-dimensional.
+    if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
+        start_classified = cast(Callable[..., str], launcher.start_host)
+        return await asyncio.to_thread(
+            start_classified,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+            on_stage=on_stage,
+            agent_name=agent_name,
+        )
+    if host_config is None and on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+        )
+    if host_config is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            on_stage=on_stage,
+        )
+    if on_stage is None:
+        return await asyncio.to_thread(
+            launcher.start_host,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+        )
+    return await asyncio.to_thread(
+        launcher.start_host,
+        sandbox_id,
+        token=token,
+        host_id=host_id,
+        host_name=host_name,
+        server_url=server_url,
+        repo_url=repo_url,
+        repo_branch=repo_branch,
+        repo_name=repo_name,
+        host_config=host_config,
+        on_stage=on_stage,
+    )
+
+
 async def _arm_and_start_host(
     *,
-    launcher: SandboxLauncher,
+    launcher: SandboxHostLauncher,
     config: ManagedSandboxConfig,
     host_store: HostStore,
     host_id: str,
@@ -2135,6 +2459,7 @@ async def _arm_and_start_host(
     owner: str,
     sandbox_id: str,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
 ) -> str:
@@ -2162,6 +2487,10 @@ async def _arm_and_start_host(
     :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
     :param repo: Repository to clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        forwarded to ``start_host`` only for launchers that declare
+        ``classifies_runner_by_agent`` (Kubernetes stamps it as the runner
+        Pod's ``omnigent.ai/agent`` classifier). ``None`` leaves it unstamped.
     :param on_stage: Progress observer forwarded to the launcher's
         ``start_host``; see :func:`launch_managed_host`. ``None``
         disables progress reporting.
@@ -2189,8 +2518,8 @@ async def _arm_and_start_host(
         # a token that already resolves. The exec-model default execs in; the
         # entrypoint model (k8s) creates the Pod that boots the host. *repo* is
         # unpacked into primitives — the launcher API takes no RepoWorkspace.
-        workspace = await asyncio.to_thread(
-            launcher.start_host,
+        workspace = await _start_sandbox_host(
+            launcher,
             sandbox_id,
             token=token,
             host_id=host_id,
@@ -2199,10 +2528,9 @@ async def _arm_and_start_host(
             repo_url=repo.url if repo is not None else None,
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
+            host_config=config.host_config,
+            agent_name=agent_name,
             on_stage=on_stage,
-            # Omitted entirely when unset: a deployment-injected launcher
-            # predating the host_config parameter must keep launching.
-            **({"host_config": config.host_config} if config.host_config is not None else {}),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
@@ -2255,7 +2583,7 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
 def _launcher_for_teardown(
     host: Host,
     config: ManagedSandboxConfig | None,
-) -> SandboxLauncher | None:
+) -> SandboxHostLauncher | None:
     """
     Resolve the launcher that can terminate a managed host's sandbox.
 
@@ -2346,6 +2674,7 @@ async def resume_managed_host(
     config: ManagedSandboxConfig | None,
     *,
     force: bool = False,
+    on_stage: Callable[[str], None] | None = None,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -2375,6 +2704,12 @@ async def resume_managed_host(
         the ``sandbox:`` section has been removed since launch.
     :param force: Skip the DB-liveness no-op gate when the caller has local
         evidence that the tunnel is gone.
+    :param on_stage: Progress observer forwarded to the launcher's
+        ``start_host`` (via :func:`_start_sandbox_host`), so a wake reports the
+        launch-pipeline ``"starting"`` stage to the caller's progress surface
+        exactly like a fresh launch (:func:`_arm_and_start_host`) — without it a
+        wake shows a single frozen ``"provisioning"`` band for its whole
+        duration. ``None`` disables progress reporting.
     :raises HTTPException: 502 when the resume or host restart fails.
     """
     if config is None:
@@ -2422,21 +2757,18 @@ async def resume_managed_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
-            await asyncio.to_thread(
-                launcher.start_host,
+            await _start_sandbox_host(
+                launcher,
                 sandbox_id,
                 token=token,
                 host_id=host.host_id,
                 host_name=host.name,
                 server_url=config.server_url,
                 repo_url=None,  # the persistent volume already holds the workspace
-                # Re-materialized on every wake, so an operator's host_config
-                # change lands on the next resume without a new sandbox.
-                # Omitted entirely when unset: a deployment-injected launcher
-                # predating the host_config parameter must keep resuming.
-                # (Base start_host still cleans up previously injected entries
-                # on resumable launchers when the block is removed.)
-                **({"host_config": config.host_config} if config.host_config is not None else {}),
+                repo_branch=None,
+                repo_name=None,
+                host_config=config.host_config,
+                on_stage=on_stage,
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
@@ -2479,7 +2811,7 @@ async def terminate_managed_host(
 
 
 async def _terminate_sandbox_best_effort(
-    launcher: SandboxLauncher | None,
+    launcher: SandboxHostLauncher | None,
     host: Host,
 ) -> None:
     """

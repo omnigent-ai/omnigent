@@ -486,10 +486,12 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
-        # Advise-models is capability-gated: expose it only when the server
-        # has a routing client configured. Hiding the tool prevents agents
-        # from probing router_on via a no-op call when routing is disabled.
-        if get_caps().routing_client is not None:
+        # Advise-models is capability-gated: expose it only when some router can
+        # answer. Hiding the tool prevents agents from probing router_on via a
+        # no-op call when routing is disabled.
+        from omnigent.server.routing_backend import routing_available
+
+        if routing_available(get_caps()):
             self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents

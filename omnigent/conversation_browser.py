@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -14,6 +15,38 @@ from collections.abc import Callable
 # instead of the JSON API.
 WORKSPACE_API_PATH = "/api/2.0/omnigent"
 WORKSPACE_UI_PATH = "/omnigent"
+
+# Client-side SPA route for one conversation (see web/src/App.tsx's
+# ``c/:conversationId``). ``conversation_url`` appends it; ``strip_conversation_path``
+# is the inverse, for a URL copied out of the browser's address bar.
+_CONVERSATION_PATH_RE = re.compile(r"/c/[^/]+/?$")
+
+
+def strip_conversation_path(url: str) -> str:
+    """
+    Drop a trailing ``/c/<conversation_id>`` from a server URL.
+
+    The web UI's address bar shows ``<base>/c/<id>`` for an open
+    conversation, so that is what a user copies when asked for "the
+    omnigent URL". It is a client-side route, not a server mount: the SPA
+    catch-all answers ``GET <base>/c/<id>/v1/me`` with a ``200`` HTML shell,
+    so such a URL passes an auth probe and is accepted as a server, then
+    every real API call 404s because no router owns that prefix. Trimming
+    the route recovers the base the API actually lives on.
+
+    :param url: A server URL, possibly a copied conversation link, e.g.
+        ``"https://app.databricksapps.com/c/9bed9ec6"``.
+    :returns: The URL without the conversation route, e.g.
+        ``"https://app.databricksapps.com"``.
+    """
+    stripped = url.rstrip("/")
+    parsed = urllib.parse.urlsplit(stripped)
+    trimmed = _CONVERSATION_PATH_RE.sub("", parsed.path)
+    if trimmed == parsed.path:
+        return stripped
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, trimmed, parsed.query, parsed.fragment)
+    )
 
 
 def is_workspace_hosted_url(base_url: str) -> bool:

@@ -1,17 +1,14 @@
 // Layout regression tests for the sidebar's bulk-action bar (selection
-// mode). The reported bug: on mobile the Archive/Delete buttons floated
-// *over* other controls. The cause was that the mobile copy of those
-// buttons lived inline in the same flex row as the "Exit selection"
-// button, which is absolutely positioned (`absolute right-0`) — so the
-// inline buttons overflowed underneath it. The fix removes the duplicated
-// mobile-only inline copy and renders the Archive/Delete buttons once, on
-// their own row below the count/select-all row, visible at every
-// breakpoint. These tests lock that structure in:
-//   1. The action buttons sit on a row that does NOT contain the
-//      absolutely-positioned Exit button (no overlap).
-//   2. That row is not breakpoint-gated (no `hidden`/`md:hidden`) and is
-//      in normal flow (not `absolute`), so it shows on mobile.
-//   3. The actions render exactly once (no mobile/desktop duplication).
+// mode). The bar is a single bordered pill rendered under the Sessions
+// header: an inline Exit (X) button, the "N selected" count, and the
+// icon-only Archive/Delete actions grouped at the trailing edge. It lives
+// entirely in normal flow (no absolutely-positioned control, no
+// breakpoint-gated duplicate), which is what kept an earlier mobile-overflow
+// bug from recurring. These tests lock that structure in:
+//   1. The whole bar is in normal flow (no `absolute`), so nothing floats
+//      over its neighbours at any breakpoint.
+//   2. The actions render exactly once (no mobile/desktop duplication).
+//   3. Exit / count / actions share the one pill row.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -134,46 +131,85 @@ afterEach(() => {
 });
 
 describe("bulk-action bar layout", () => {
-  it("renders Archive/Delete on a row separate from the absolutely-positioned Exit button", () => {
+  it("groups Exit, count, and the Archive/Delete actions in one pill, no floating control", () => {
     renderSidebar();
     enterSelectionModeAndSelect();
 
     const exitBtn = screen.getByRole("button", { name: "Exit selection mode" });
-    // The exit button is the absolutely-positioned control that the action
-    // buttons used to overflow under.
-    expect(exitBtn.className).toContain("absolute");
-
     const deleteBtn = screen.getByTestId("bulk-delete");
-    const actionRow = deleteBtn.parentElement as HTMLElement;
+    const archiveBtn = screen.getByTestId("bulk-archive");
 
-    // The fix: the action buttons live on their own row, NOT inside the
-    // row that holds the floating Exit button. If they shared a row again,
-    // the overlap would return.
-    expect(actionRow).not.toContainElement(exitBtn);
-    expect(screen.getByTestId("bulk-archive").parentElement).toBe(actionRow);
+    // Archive and Delete share the trailing action group.
+    const actionGroup = deleteBtn.parentElement as HTMLElement;
+    expect(archiveBtn.parentElement).toBe(actionGroup);
+
+    // Exit, count, and the action group all live in the single pill row —
+    // and nothing is absolutely positioned, so nothing can float over its
+    // neighbours (the mobile-overflow bug this guards against).
+    const pill = actionGroup.parentElement as HTMLElement;
+    expect(pill).toContainElement(exitBtn);
+    expect(pill).toHaveClass("bg-transparent");
+    expect(pill).not.toHaveClass("bg-background");
+    for (const el of [exitBtn, deleteBtn, archiveBtn, actionGroup, pill]) {
+      expect(el.className).not.toMatch(/\babsolute\b/);
+    }
   });
 
-  it("keeps the action row visible at every breakpoint and in normal flow", () => {
+  it("keeps the bar visible at every breakpoint and in normal flow", () => {
     renderSidebar();
     enterSelectionModeAndSelect();
 
-    const actionRow = screen.getByTestId("bulk-delete").parentElement as HTMLElement;
+    const pill = (screen.getByTestId("bulk-delete").parentElement as HTMLElement)
+      .parentElement as HTMLElement;
 
-    // Must not be breakpoint-gated — the old desktop copy was `md:flex`
-    // (hidden on mobile) and the mobile copy was the overlapping inline one.
-    expect(actionRow.className).not.toMatch(/\bhidden\b/);
-    expect(actionRow.className).not.toMatch(/\bmd:hidden\b/);
-    // Must stay in normal flow so it can't float over neighbours.
-    expect(actionRow.className).not.toMatch(/\babsolute\b/);
+    // Not breakpoint-gated and not floated, so it renders identically on
+    // mobile and desktop without overlapping neighbours.
+    expect(pill.className).not.toMatch(/\bhidden\b/);
+    expect(pill.className).not.toMatch(/\bmd:hidden\b/);
+    expect(pill.className).not.toMatch(/\babsolute\b/);
   });
 
   it("renders the Archive and Delete actions exactly once (no mobile/desktop duplication)", () => {
     renderSidebar();
     enterSelectionModeAndSelect();
 
-    // The pre-fix layout shipped two copies (mobile inline + desktop row);
-    // there must now be a single instance of each action.
-    expect(screen.getAllByRole("button", { name: /^Archive$/ })).toHaveLength(1);
-    expect(screen.getAllByRole("button", { name: /^Delete/ })).toHaveLength(1);
+    // The actions are icon-only buttons labelled for assistive tech; there
+    // must be a single instance of each (no breakpoint-duplicated copies).
+    // With a single owned selection the Delete label carries no count ("Delete").
+    expect(screen.getAllByRole("button", { name: "Archive selected" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
+  });
+
+  it("shows Archive and Delete disabled at zero selection, enabling them once a row is picked", () => {
+    renderSidebar();
+    // Enter selection mode WITHOUT selecting anything yet.
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+
+    // Both actions are present up front (not conditionally hidden) but
+    // disabled while nothing is selected.
+    const archiveBtn = screen.getByTestId("bulk-archive");
+    const deleteBtn = screen.getByTestId("bulk-delete");
+    expect(archiveBtn).toBeDisabled();
+    expect(deleteBtn).toBeDisabled();
+    expect(screen.getByText("0 selected")).toBeInTheDocument();
+
+    // Selecting a row enables both.
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+    expect(archiveBtn).toBeEnabled();
+    expect(deleteBtn).toBeEnabled();
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("renders the row checkbox to the LEFT of the session title", () => {
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+
+    // The checkbox marker sits at the row's leading edge (left-2), not the
+    // trailing edge — so the title indents to make room after it.
+    const row = screen.getByRole("link", { name: /My Session/ });
+    const li = row.closest("li") as HTMLElement;
+    const marker = li.querySelector("svg.lucide-square")?.parentElement as HTMLElement;
+    expect(marker.className).toMatch(/\bleft-2\b/);
+    expect(marker.className).not.toMatch(/\bright-/);
   });
 });

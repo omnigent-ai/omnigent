@@ -28,13 +28,21 @@ import os
 import re
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol, cast
+
+from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
+    from omnigent.spec.types import AgentSpec, SkillSpec
+    from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
 
@@ -58,7 +66,7 @@ from omnigent.session_lifecycle import (
     title_without_closed_marker,
 )
 from omnigent.tools import ToolManager
-from omnigent.tools.base import ToolContext
+from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
@@ -102,6 +110,56 @@ from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 
 _logger = logging.getLogger(__name__)
+
+_EventPublisher = Callable[[str, _JsonObject], None]
+
+
+class _DynamicCallable(Protocol):
+    """Callable loaded from an agent spec's dotted Python path."""
+
+    def __call__(self, **kwargs: object) -> object:
+        raise NotImplementedError
+
+
+class _AsyncDynamicCallable(Protocol):
+    """Async callable loaded from an agent spec's dotted Python path."""
+
+    def __call__(self, **kwargs: object) -> Awaitable[object]:
+        raise NotImplementedError
+
+
+def _string_object_dict(value: object) -> _JsonObject | None:
+    """Return *value* as a string-keyed object mapping when valid."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("_JsonObject", value)
+
+
+def _optional_string(value: object) -> str | None:
+    """Return *value* when it is a string, otherwise ``None``."""
+    return value if isinstance(value, str) else None
+
+
+def _json_object_list(value: object) -> list[_JsonObject]:
+    """Return the object entries from a JSON array."""
+    if not isinstance(value, list):
+        return []
+    objects: list[_JsonObject] = []
+    for entry in value:
+        parsed = _string_object_dict(entry)
+        if parsed is not None:
+            objects.append(parsed)
+    return objects
+
+
+def _string_mapping(value: object) -> dict[str, str] | None:
+    """Return the string entries from a mapping-like JSON object."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)
+    }
+
 
 _INBOX_OUTPUT_MAX_CHARS = 12000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
@@ -157,7 +215,7 @@ class _SubagentInboxEvaluation:
         be requeued for a future drain attempt.
     """
 
-    payload: dict[str, Any]
+    payload: _JsonObject
     retry_original: bool = False
 
 
@@ -266,6 +324,15 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # branch and errored "tool unavailable" — the gap behind the non-OpenAI
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
+
+# nimble_research — Nimble Agent API v2 research runs (start → poll → result).
+# Runner-local so a non-OpenAI model's nimble_research call resolves to
+# NimbleResearchTool.invoke, the same posture as web_search.
+_NIMBLE_RESEARCH_TOOLS = frozenset({"nimble_research"})
+
+# nimble_extract — Nimble Extract Templates (template run → structured JSON).
+# Runner-local for the same reason.
+_NIMBLE_EXTRACT_TOOLS = frozenset({"nimble_extract"})
 
 # Hindsight long-term memory builtins. Runner-local (like web_search) so that a
 # wrapped harness's (claude-sdk / codex / cursor / pi) tool call resolves to the
@@ -407,7 +474,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
 )
 
 
-def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
+def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -445,26 +512,32 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
     )
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
-    schemas: list[dict[str, Any]] = []
+    schemas: list[_JsonObject] = []
 
-    def _append(function_dict: dict[str, Any]) -> None:
+    def _append(function_dict: _JsonObject) -> None:
+        name = function_dict.get("name")
+        if not isinstance(name, str):
+            return
+        description = function_dict.get("description")
+        parameters = _string_object_dict(function_dict.get("parameters")) or {
+            "type": "object",
+            "properties": {},
+        }
         schemas.append(
             {
-                "name": function_dict["name"],
-                "description": function_dict.get("description", ""),
-                "parameters": function_dict.get(
-                    "parameters", {"type": "object", "properties": {}}
-                ),
+                "name": name,
+                "description": description if isinstance(description, str) else "",
+                "parameters": parameters,
             }
         )
 
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for _schema in ToolManager(spec).get_tool_schemas():
-            _fn = _schema["function"]
-            if _fn["name"] in _NATIVE_RELAY_BUILTIN_TOOLS:
-                _append(_fn)
+        for schema in ToolManager(spec).get_tool_schemas():
+            function = _string_object_dict(schema.get("function"))
+            if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
+                _append(function)
     else:
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
@@ -481,7 +554,12 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
             SysAddPolicyTool,
             SysPolicyRegistryTool,
         ):
-            _append(_cls().get_schema()["function"])
+            fallback_schema = _string_object_dict(_cls().get_schema())
+            if fallback_schema is None:
+                continue
+            function = _string_object_dict(fallback_schema.get("function"))
+            if function is not None:
+                _append(function)
 
     # OS tools (sys_os_*), relayed unconditionally to override any harness-static
     # versions and centralize policy enforcement. Create a minimal OSEnvironment
@@ -497,14 +575,23 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
     )
     try:
         _os_env = create_os_environment(_os_spec)
-        for _tool in (
-            SysOsReadTool(_os_env),
-            SysOsWriteTool(_os_env),
-            SysOsEditTool(_os_env),
-            SysOsShellTool(_os_env),
-        ):
-            _append(_tool.get_schema()["function"])
-        _os_env.close()
+        if _os_env is None:
+            raise RuntimeError("OSEnvironment factory returned None")
+        try:
+            for tool in (
+                SysOsReadTool(_os_env),
+                SysOsWriteTool(_os_env),
+                SysOsEditTool(_os_env),
+                SysOsShellTool(_os_env),
+            ):
+                tool_schema = _string_object_dict(tool.get_schema())
+                function = (
+                    _string_object_dict(tool_schema.get("function")) if tool_schema else None
+                )
+                if function is not None:
+                    _append(function)
+        finally:
+            _os_env.close()
     except Exception:  # noqa: BLE001 — OS env setup is best-effort for schema only
         _logger.debug("Could not create OSEnvironment for native relay OS tool schemas")
 
@@ -536,6 +623,8 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _NIMBLE_RESEARCH_TOOLS
+    | _NIMBLE_EXTRACT_TOOLS
     | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
@@ -548,27 +637,35 @@ _ALL_LOCAL_TOOLS = (
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
 
-def is_action_required(event: dict[str, Any]) -> bool:
+def _event_item(event: _JsonObject) -> _JsonObject:
+    """Return an event's item object, or an empty object when malformed."""
+    return _string_object_dict(event.get("item")) or {}
+
+
+def is_action_required(event: _JsonObject) -> bool:
     """Check if an SSE event is an action_required tool call."""
     if event.get("type") != "response.output_item.done":
         return False
-    item = event.get("item") or {}
+    item = _event_item(event)
     return item.get("type") == "function_call" and item.get("status") == "action_required"
 
 
-def get_tool_name(event: dict[str, Any]) -> str:
+def get_tool_name(event: _JsonObject) -> str:
     """Extract the tool name from an action_required event."""
-    return (event.get("item") or {}).get("name", "")
+    name = _event_item(event).get("name")
+    return name if isinstance(name, str) else ""
 
 
-def get_call_id(event: dict[str, Any]) -> str:
+def get_call_id(event: _JsonObject) -> str:
     """Extract the call_id from an action_required event."""
-    return (event.get("item") or {}).get("call_id", "")
+    call_id = _event_item(event).get("call_id")
+    return call_id if isinstance(call_id, str) else ""
 
 
-def get_arguments(event: dict[str, Any]) -> str:
+def get_arguments(event: _JsonObject) -> str:
     """Extract the arguments JSON string from an action_required event."""
-    return (event.get("item") or {}).get("arguments", "{}")
+    arguments = _event_item(event).get("arguments")
+    return arguments if isinstance(arguments, str) else "{}"
 
 
 def should_dispatch_locally(tool_name: str) -> bool:
@@ -582,8 +679,8 @@ def should_dispatch_locally(tool_name: str) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
-def _is_spec_local_python_tool(tool_name: str, agent_spec: Any | None) -> bool:
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+def _is_spec_local_python_tool(tool_name: str, agent_spec: AgentSpec | None) -> bool:
+    local_tools = agent_spec.local_tools if agent_spec is not None else []
     return any(
         getattr(info, "name", None) == tool_name
         and getattr(info, "language", None) == "python"
@@ -596,7 +693,7 @@ async def _execute_local_python_tool(
     tool_name: str,
     args: str,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
@@ -612,7 +709,7 @@ async def _execute_local_python_tool(
             workspace.mkdir(parents=True, exist_ok=True)
         ctx = ToolContext(
             task_id=task_id or conversation_id or "runner-local-tool",
-            agent_id=agent_id or getattr(agent_spec, "name", "runner-agent") or "runner-agent",
+            agent_id=agent_id or agent_spec.name or "runner-agent",
             workspace=workspace,
             conversation_id=conversation_id,
         )
@@ -626,13 +723,13 @@ async def _execute_local_python_tool(
 
 # Cache of resolved callables keyed by dotted path. Avoids
 # re-importing on every invocation of the same tool.
-_callable_cache: dict[str, Callable[..., Any]] = {}
+_callable_cache: dict[str, _DynamicCallable] = {}
 
 
 def _resolve_spec_callable(
     tool_name: str,
-    agent_spec: Any | None,
-) -> Callable[..., Any] | str:
+    agent_spec: AgentSpec | None,
+) -> _DynamicCallable | str:
     """
     Look up a custom callable tool in the agent spec and resolve it.
 
@@ -650,7 +747,7 @@ def _resolve_spec_callable(
 
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+    local_tools = agent_spec.local_tools or []
     tool_info = next((lt for lt in local_tools if lt.name == tool_name), None)
     if tool_info is None or not tool_info.path:
         return f"Error: {tool_name} not in local dispatch table"
@@ -663,17 +760,18 @@ def _resolve_spec_callable(
         return f"Error: {tool_name} has invalid callable path {dotted_path!r}"
     mod = importlib.import_module(module_name)
     fn = getattr(mod, attr_name, None)
-    if fn is None:
+    if not callable(fn):
         return f"Error: {tool_name}: module {module_name!r} has no attribute {attr_name!r}"
-    _callable_cache[dotted_path] = fn
-    return fn
+    resolved = cast("_DynamicCallable", fn)
+    _callable_cache[dotted_path] = resolved
+    return resolved
 
 
 async def _execute_spec_callable_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Execute a custom callable tool defined in the agent spec YAML.
@@ -693,7 +791,8 @@ async def _execute_spec_callable_tool(
     if isinstance(resolved, str):
         return resolved
     if asyncio.iscoroutinefunction(resolved):
-        result = await resolved(**args)
+        async_callable = cast("_AsyncDynamicCallable", resolved)
+        result = await async_callable(**args)
     else:
         result = await asyncio.to_thread(resolved, **args)
     return str(result) if result is not None else ""
@@ -707,7 +806,7 @@ async def _execute_spec_callable_tool(
 
 def _is_uc_function_tool(
     tool_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
 ) -> bool:
     """
     Check whether *tool_name* is a UC function tool in the spec.
@@ -721,7 +820,7 @@ def _is_uc_function_tool(
     """
     if agent_spec is None:
         return False
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+    local_tools = agent_spec.local_tools
     from omnigent.spec.types import ToolRuntime
 
     return any(
@@ -729,7 +828,7 @@ def _is_uc_function_tool(
     )
 
 
-def _resolve_uc_profile(agent_spec: Any) -> str | None:
+def _resolve_uc_profile(agent_spec: AgentSpec) -> str | None:
     """
     Extract the Databricks profile from the agent spec's executor
     auth configuration.
@@ -742,27 +841,28 @@ def _resolve_uc_profile(agent_spec: Any) -> str | None:
     :returns: The profile name, e.g. ``"oss"``, or ``None`` for
         SDK default resolution.
     """
-    executor = getattr(agent_spec, "executor", None)
-    if executor is None:
-        return None
+    executor = agent_spec.executor
     # Preferred: executor.auth.profile (DatabricksAuth).
-    auth = getattr(executor, "auth", None)
-    if auth is not None and hasattr(auth, "profile"):
-        return auth.profile
+    auth = executor.auth
+    auth_profile = getattr(auth, "profile", None)
+    if isinstance(auth_profile, str) and auth_profile:
+        return auth_profile
     # Deprecated: executor.profile.
-    profile = getattr(executor, "profile", None)
-    if profile:
-        return profile
+    if executor.profile:
+        return executor.profile
     # Compat bridge: executor.config["profile"].
-    config = getattr(executor, "config", None) or {}
-    return config.get("profile")
+    config = _string_object_dict(getattr(executor, "config", None))
+    if config is None:
+        return None
+    profile = config.get("profile")
+    return profile if isinstance(profile, str) and profile else None
 
 
 async def _execute_uc_function_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Execute a Unity Catalog function tool and return the output
@@ -783,7 +883,9 @@ async def _execute_uc_function_tool(
     """
     from omnigent.runner.uc_function import execute_uc_function
 
-    local_tools = getattr(agent_spec, "local_tools", None) or []
+    if agent_spec is None:
+        return f"Error: {tool_name} is not a UC function tool"
+    local_tools = agent_spec.local_tools
     tool_info = next((lt for lt in local_tools if lt.name == tool_name), None)
     if tool_info is None or tool_info.catalog_path is None:
         return f"Error: {tool_name} is not a UC function tool"
@@ -814,7 +916,7 @@ class _SubagentLabel:
     title: str | None
 
 
-def _subagent_label(child: dict[str, Any]) -> _SubagentLabel:
+def _subagent_label(child: _JsonObject) -> _SubagentLabel:
     """
     Extract child identity fields from a child-session summary.
 
@@ -831,7 +933,7 @@ def _subagent_label(child: dict[str, Any]) -> _SubagentLabel:
     )
 
 
-def _session_wrapper_label(session_payload: dict[str, Any]) -> str | None:
+def _session_wrapper_label(session_payload: _JsonObject) -> str | None:
     """
     Extract the native terminal wrapper label from a session payload.
 
@@ -839,8 +941,8 @@ def _session_wrapper_label(session_payload: dict[str, Any]) -> str | None:
         ``{"labels": {"omnigent.wrapper": "codex-native-ui"}}``.
     :returns: Wrapper label value, or ``None`` when absent.
     """
-    labels = session_payload.get("labels")
-    if not isinstance(labels, dict):
+    labels = _string_object_dict(session_payload.get("labels"))
+    if labels is None:
         return None
     wrapper = labels.get(_SESSION_WRAPPER_LABEL_KEY)
     return wrapper if isinstance(wrapper, str) and wrapper else None
@@ -853,7 +955,7 @@ def _publish_child_launching_update(
     title: str,
     tool: str,
     session_name: str,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    publish_event: _EventPublisher | None,
 ) -> None:
     """
     Publish the honest pre-start child state to the parent stream.
@@ -862,7 +964,7 @@ def _publish_child_launching_update(
     a busy edge yet. Surfacing ``launching`` prevents the UI/orchestrator from
     mistaking session bookkeeping for a running worker.
     """
-    event = {
+    event: _JsonObject = {
         "type": "session.child_session.updated",
         "conversation_id": parent_session_id,
         "child_session_id": child_session_id,
@@ -890,7 +992,7 @@ async def _list_child_sessions(
     limit: int = 100,
     tool: str | None = None,
     session_name: str | None = None,
-) -> list[dict[str, Any]] | str:
+) -> list[_JsonObject] | str:
     """
     Fetch child-session summaries for a parent session.
 
@@ -903,7 +1005,7 @@ async def _list_child_sessions(
     :param session_name: See ``tool``.
     :returns: List of child summary dicts, or an error string.
     """
-    params: dict[str, Any] = {"limit": limit, "order": "desc"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if tool and session_name:
         params["tool"] = tool
         params["session_name"] = session_name
@@ -914,11 +1016,12 @@ async def _list_child_sessions(
     )
     if resp.status_code >= 400:
         return f"Error: failed to list child sessions: {resp.status_code} {resp.text[:200]}"
-    payload = resp.json()
-    data = payload.get("data")
+    decoded: object = resp.json()
+    payload = _string_object_dict(decoded)
+    data = payload.get("data") if payload is not None else None
     if not isinstance(data, list):
         return "Error: server child_sessions response missing data list"
-    return [item for item in data if isinstance(item, dict)]
+    return [item for raw in data if (item := _string_object_dict(raw)) is not None]
 
 
 async def _find_existing_child_session(
@@ -927,7 +1030,7 @@ async def _find_existing_child_session(
     conversation_id: str,
     agent: str,
     title: str,
-) -> dict[str, Any] | str | None:
+) -> _JsonObject | str | None:
     """
     Find an existing child session by ``(agent, title)``.
 
@@ -954,13 +1057,21 @@ async def _find_existing_child_session(
     if isinstance(children, str):
         return children
     for child in children:
-        if is_session_closed(child.get("labels"), child.get("title")):
+        raw_labels = _string_object_dict(child.get("labels"))
+        labels = (
+            {key: value for key, value in raw_labels.items() if isinstance(value, str)}
+            if raw_labels is not None
+            else None
+        )
+        title_value = child.get("title")
+        session_title = title_value if isinstance(title_value, str) else None
+        if is_session_closed(labels, session_title):
             continue
         return child
     return None
 
 
-def _subagent_message_from_args(args: dict[str, Any]) -> str | None:
+def _subagent_message_from_args(args: _JsonObject) -> str | None:
     """
     Extract the user message from ``sys_session_send`` arguments.
 
@@ -994,8 +1105,10 @@ async def _session_turn_actor(
         return None
     if resp.status_code != 200:
         return None
-    labels = resp.json().get("labels")
-    if not isinstance(labels, dict):
+    decoded: object = resp.json()
+    payload = _string_object_dict(decoded)
+    labels = _string_object_dict(payload.get("labels")) if payload is not None else None
+    if labels is None:
         return None
     actor = labels.get(_TURN_ACTOR_LABEL)
     return actor if isinstance(actor, str) and actor else None
@@ -1005,12 +1118,12 @@ async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
     *,
-    content: list[dict[str, Any]],
+    content: list[_JsonObject],
     created_by: str | None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
 
-    def _payload(actor: str | None) -> dict[str, Any]:
+    def _payload(actor: str | None) -> _JsonObject:
         return {
             "type": "message",
             "data": {
@@ -1044,7 +1157,7 @@ async def _post_child_message_event(
     )
 
 
-def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
+def _subagent_model_from_args(args: _JsonObject) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
 
@@ -1070,7 +1183,7 @@ def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
     return validate_model_override(raw_model)
 
 
-def _subagent_file_ids_from_args(args: dict[str, Any]) -> list[str]:
+def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
 
@@ -1171,7 +1284,7 @@ class CopyResult:
     :param error: A human-readable error string, or ``None`` on success.
     """
 
-    content: list[dict[str, Any]] | None = None
+    content: list[_JsonObject] | None = None
     error: str | None = None
 
 
@@ -1208,7 +1321,7 @@ async def _build_subagent_message_content(
     :returns: A :class:`CopyResult` — ``content`` set on success, ``error``
         set when the copy fails (surfaced to the parent agent).
     """
-    content: list[dict[str, Any]] = [{"type": "input_text", "text": str(message)}]
+    content: list[_JsonObject] = [{"type": "input_text", "text": str(message)}]
     if not file_ids:
         return CopyResult(content=content)
 
@@ -1230,13 +1343,15 @@ async def _build_subagent_message_content(
             )
         )
 
-    mapping = copy_resp.json().get("mapping")
-    if not isinstance(mapping, dict):
+    decoded: object = copy_resp.json()
+    payload = _string_object_dict(decoded)
+    mapping = _string_object_dict(payload.get("mapping")) if payload is not None else None
+    if mapping is None:
         return CopyResult(error="Error: file copy response missing 'mapping'")
 
     for old_id in file_ids:
-        entry = mapping.get(old_id)
-        if not isinstance(entry, dict):
+        entry = _string_object_dict(mapping.get(old_id))
+        if entry is None:
             return CopyResult(error=f"Error: file copy mapping missing entry for {old_id!r}")
         new_id = entry.get("new_id")
         if not isinstance(new_id, str) or not new_id:
@@ -1244,7 +1359,8 @@ async def _build_subagent_message_content(
         # The copy response preserves the source's content_type, so the
         # image-vs-file split uses the true type — no per-file metadata GET.
         # Fall back to a filename guess only when the source had none.
-        content_type = entry.get("content_type")
+        raw_content_type = entry.get("content_type")
+        content_type = raw_content_type if isinstance(raw_content_type, str) else ""
         if not content_type:
             filename = entry.get("filename")
             guessed, _ = (
@@ -1257,7 +1373,7 @@ async def _build_subagent_message_content(
     return CopyResult(content=content)
 
 
-def _find_subagent_spec(sub_agent_name: str, agent_spec: Any | None) -> Any | None:
+def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> AgentSpec | None:
     """
     Look up a named sub-agent's spec in the parent's ``sub_agents`` list.
 
@@ -1269,13 +1385,13 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: Any | None) -> Any | No
     """
     if agent_spec is None:
         return None
-    for sa in getattr(agent_spec, "sub_agents", None) or []:
-        if getattr(sa, "name", None) == sub_agent_name:
-            return sa
+    for sub_agent in agent_spec.sub_agents:
+        if sub_agent.name == sub_agent_name:
+            return sub_agent
     return None
 
 
-def _subagent_harness(sub_agent_name: str, agent_spec: Any | None) -> str | None:
+def _subagent_harness(sub_agent_name: str, agent_spec: AgentSpec | None) -> str | None:
     """
     Resolve the declared harness for a named sub-agent.
 
@@ -1296,7 +1412,7 @@ def _subagent_harness(sub_agent_name: str, agent_spec: Any | None) -> str | None
     return spec_harness(sub_spec) if sub_spec is not None else None
 
 
-def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
+def _subagent_harness_override_from_args(args: _JsonObject) -> str | None:
     """
     Extract a per-dispatch harness override from ``sys_session_send`` args.
 
@@ -1321,8 +1437,8 @@ def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
 
 
 def _subagent_cost_budget_from_args(
-    args: dict[str, Any],
-) -> dict[str, Any] | None:
+    args: _JsonObject,
+) -> _JsonObject | None:
     """
     Extract and validate the per-dispatch cost budget from ``sys_session_send`` args.
 
@@ -1344,16 +1460,19 @@ def _subagent_cost_budget_from_args(
         if not isinstance(budget, dict):
             raise ValueError("cost_budget must be an object")
 
-        result: dict[str, Any] = {}
+        result: _JsonObject = {}
+        max_cost_value: float | None = None
 
         # Extract and validate max_cost_usd if present.
         if "max_cost_usd" in budget:
             max_cost = budget["max_cost_usd"]
             if max_cost is not None:
-                max_cost = float(max_cost)
-                if max_cost <= 0:
+                if not isinstance(max_cost, str | int | float):
+                    raise ValueError("cost_budget.max_cost_usd must be numeric")
+                max_cost_value = float(max_cost)
+                if max_cost_value <= 0:
                     raise ValueError("cost_budget.max_cost_usd must be > 0")
-                result["max_cost_usd"] = max_cost
+                result["max_cost_usd"] = max_cost_value
 
         # Extract and validate ask_thresholds_usd if present.
         if "ask_thresholds_usd" in budget:
@@ -1361,14 +1480,16 @@ def _subagent_cost_budget_from_args(
             if thresholds is not None:
                 if not isinstance(thresholds, list):
                     raise ValueError("cost_budget.ask_thresholds_usd must be an array")
-                thresholds = [float(t) for t in thresholds]
-                if not all(t > 0 for t in thresholds):
+                if not all(isinstance(threshold, str | int | float) for threshold in thresholds):
+                    raise ValueError("cost_budget.ask_thresholds_usd values must be numeric")
+                threshold_values = [float(threshold) for threshold in thresholds]
+                if not all(threshold > 0 for threshold in threshold_values):
                     raise ValueError("cost_budget.ask_thresholds_usd values must be > 0")
                 # Check that thresholds are less than max if both are set.
-                if "max_cost_usd" in result and result["max_cost_usd"] is not None:
-                    if any(t >= result["max_cost_usd"] for t in thresholds):
+                if max_cost_value is not None:
+                    if any(threshold >= max_cost_value for threshold in threshold_values):
                         raise ValueError("ask_thresholds_usd values must be < max_cost_usd")
-                result["ask_thresholds_usd"] = thresholds
+                result["ask_thresholds_usd"] = threshold_values
 
         # At least one must be present.
         if not result:
@@ -1378,7 +1499,9 @@ def _subagent_cost_budget_from_args(
     return None
 
 
-def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> frozenset[str]:
+def _subagent_allowed_harnesses(
+    sub_agent_name: str, agent_spec: AgentSpec | None
+) -> frozenset[str]:
     """
     Resolve the canonical harness allowlist a sub-agent opts into.
 
@@ -1393,13 +1516,7 @@ def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> 
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None:
         return frozenset()
-    executor = getattr(sub_spec, "executor", None)
-    config = getattr(executor, "config", None)
-    raw_allowed: Any = None
-    if isinstance(config, dict):
-        raw_allowed = config.get("allowed_harnesses")
-    elif config is not None:
-        raw_allowed = getattr(config, "allowed_harnesses", None)
+    raw_allowed: object = sub_spec.executor.config.get("allowed_harnesses")
     if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
         return frozenset()
     return frozenset(
@@ -1413,7 +1530,7 @@ def _normalize_subagent_model(
     model: str,
     *,
     sub_agent_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     harness: str | None,
 ) -> str:
     """
@@ -1456,7 +1573,7 @@ def _normalize_subagent_model(
     return normalized
 
 
-async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
+async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
     """
     Dispatch ``sys_list_models``: per-worker model availability.
 
@@ -1478,13 +1595,13 @@ async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
 
 
 async def _execute_subagent_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
-    agent_spec: Any | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    agent_spec: AgentSpec | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
 ) -> str:
     """
     Dispatch a sub-agent tool call (``sys_session_send``).
@@ -1602,7 +1719,7 @@ async def _execute_subagent_tool(
     # Named mode: (agent, title) spawn-or-continue.
     sub_agent_name = args.get("agent")
     session_name = args.get("title")
-    if not sub_agent_name:
+    if not isinstance(sub_agent_name, str) or not sub_agent_name:
         return "Error: sys_session_send requires 'agent' (or 'session_id')"
     if not session_name or not isinstance(session_name, str):
         return "Error: sys_session_send requires non-empty 'title' string"
@@ -1767,7 +1884,7 @@ async def _execute_subagent_tool(
         # Create child session on the server (no initial items —
         # those go via a separate POST so the server forwards them
         # to the runner and triggers a turn).
-        create_body: dict[str, Any] = {
+        create_body: _JsonObject = {
             "agent_id": parent_agent_id,
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
@@ -1804,9 +1921,11 @@ async def _execute_subagent_tool(
         resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
-        child_data = resp.json()
+        child_data = _string_object_dict(resp.json())
+        if child_data is None:
+            return "Error: server returned malformed child session data"
         child_session_id = child_data.get("session_id") or child_data.get("id")
-        if not child_session_id:
+        if not isinstance(child_session_id, str) or not child_session_id:
             return "Error: server did not return child session_id"
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
@@ -1923,6 +2042,7 @@ async def _execute_subagent_tool(
             return f"{copy_result.error}\n{teardown_warning}"
         return copy_result.error
     message_content = copy_result.content
+    assert message_content is not None
 
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
@@ -1984,7 +2104,7 @@ async def _send_to_existing_session(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
     created_by: str | None = None,
 ) -> str:
     """
@@ -2118,10 +2238,10 @@ async def _send_to_existing_session(
 def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
-    title: Any,
-    message: Any,
-    model: Any = None,
-) -> dict[str, Any]:
+    title: object,
+    message: object,
+    model: object = None,
+) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
@@ -2141,7 +2261,7 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :returns: The JSON request body.
     """
-    body: dict[str, Any] = {
+    body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
     }
@@ -2160,12 +2280,12 @@ def _build_session_create_body(
 
 
 def _finalize_created_session(
-    data: dict[str, Any],
+    data: _JsonObject,
     *,
     conversation_id: str,
     agent_id: str,
-    title: Any,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    title: object,
+    publish_event: Callable[[str, _JsonObject], None] | None,
 ) -> str:
     """
     Register fan-out, emit ``session.created``, and build the handle.
@@ -2188,13 +2308,17 @@ def _finalize_created_session(
     from omnigent.runner import app as _runner_app
     from omnigent.server.schemas import SessionCreatedEvent
 
-    child_id = data["id"]
+    child_id = data.get("id")
+    if not isinstance(child_id, str) or not child_id:
+        return json.dumps({"error": "server did not return child session id"})
+    agent_name = data.get("agent_name")
+    agent_label = agent_name if isinstance(agent_name, str) and agent_name else "agent"
     label = title if isinstance(title, str) else ""
     _runner_app.register_child_session(
         child_id,
         parent_session_id=conversation_id,
         title=label,
-        tool=data.get("agent_name") or "agent",
+        tool=agent_label,
         session_name=label,
     )
     evt = SessionCreatedEvent(
@@ -2219,12 +2343,12 @@ def _finalize_created_session(
 
 
 async def _execute_session_create(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
-    agent_spec: Any | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
+    agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
 ) -> str:
     """
@@ -2419,13 +2543,13 @@ async def _post_child_first_message(
 
 async def _upload_config_bundle(
     config_path: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
-) -> dict[str, Any] | str:
+) -> _JsonObject | str:
     """
     Resolve, bundle, and upload a local agent config as a child session.
 
@@ -2447,6 +2571,7 @@ async def _upload_config_bundle(
         JSON error string otherwise.
     """
     os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert os_spec.cwd is not None
     resolved_cwd = Path(os_spec.cwd).resolve()
     source = (resolved_cwd / config_path).resolve()
     if not source.is_relative_to(resolved_cwd):
@@ -2460,7 +2585,7 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
-    metadata: dict[str, Any] = {"parent_session_id": conversation_id}
+    metadata: _JsonObject = {"parent_session_id": conversation_id}
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
@@ -2479,18 +2604,18 @@ async def _upload_config_bundle(
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
         )
-    data: dict[str, Any] = resp.json()
+    data: _JsonObject = resp.json()
     return data
 
 
 async def _session_create_from_config_path(
     config_path: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
-    agent_spec: Any | None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
+    agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
 ) -> str:
     """
@@ -2561,14 +2686,14 @@ async def _session_create_from_config_path(
 
 
 async def _execute_web_fetch_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     task_id: str | None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
 ) -> str:
     """
     Dispatch a ``web_fetch`` tool call.
@@ -2627,7 +2752,7 @@ async def _execute_web_fetch_tool(
     )
 
 
-def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+def _web_search_config_from_spec(agent_spec: AgentSpec | None) -> dict[str, str]:
     """
     Return the ``web_search`` builtin's config dict from the parent spec.
 
@@ -2651,9 +2776,9 @@ def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
 
 
 async def _execute_web_search_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -2704,7 +2829,125 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
-def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
+def _nimble_research_config_from_spec(agent_spec: AgentSpec | None) -> dict[str, str]:
+    """
+    Return the ``nimble_research`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_web_search_config_from_spec`: scans ``spec.tools.builtins``
+    for the entry named ``"nimble_research"`` and returns its ``config``
+    (credentials + agent instance id + polling knobs). Empty dict when the
+    builtin is a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The nimble_research config dict, e.g.
+        ``{"api_key": "...", "agent_id": "wsa_..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "nimble_research":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_nimble_research_tool(
+    args: _JsonObject,
+    *,
+    agent_spec: AgentSpec | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``nimble_research`` tool call to Nimble's Agent API v2.
+
+    Builds ``NimbleResearchTool`` from the spec's ``nimble_research`` builtin config
+    and runs its synchronous ``invoke`` off the event loop (the backend blocks
+    on the start → poll → result lifecycle), mirroring
+    :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``task`` (required), ``effort`` (optional).
+    :param agent_spec: Parent agent's spec; carries the nimble_research config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The JSON envelope, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.nimble_research import NimbleResearchTool
+
+    config = _nimble_research_config_from_spec(agent_spec)
+    tool = NimbleResearchTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "nimble_research",
+        agent_id=agent_id or "nimble_research",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
+def _nimble_extract_config_from_spec(agent_spec: AgentSpec | None) -> dict[str, str]:
+    """
+    Return the ``nimble_extract`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_nimble_research_config_from_spec`: scans
+    ``spec.tools.builtins`` for the entry named ``"nimble_extract"`` and
+    returns its ``config`` (credentials + optional template/timeout). Empty
+    dict when the builtin is a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The nimble_extract config dict, e.g.
+        ``{"api_key": "...", "template": "google_search"}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "nimble_extract":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_nimble_extract_tool(
+    args: _JsonObject,
+    *,
+    agent_spec: AgentSpec | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``nimble_extract`` tool call to Nimble's Extract Templates run
+    endpoint.
+
+    Builds ``NimbleExtractTool`` from the spec's ``nimble_extract`` builtin
+    config and runs its synchronous ``invoke`` off the event loop (the backend
+    makes a blocking HTTP call), mirroring :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``params`` (required object).
+    :param agent_spec: Parent agent's spec; carries the nimble_extract config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The structured JSON, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
+
+    config = _nimble_extract_config_from_spec(agent_spec)
+    tool = NimbleExtractTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "nimble_extract",
+        agent_id=agent_id or "nimble_extract",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
+def _hindsight_config_from_spec(agent_spec: AgentSpec | None, tool_name: str) -> dict[str, str]:
     """
     Return a Hindsight builtin's config dict from the parent spec.
 
@@ -2727,10 +2970,10 @@ def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[
 
 
 async def _execute_hindsight_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     tool_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
@@ -2768,7 +3011,7 @@ async def _execute_hindsight_tool(
 
 def _has_subagent(
     sub_agent_name: str,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
 ) -> bool:
     """
     Check whether a sub-agent name exists in the parent spec.
@@ -2803,7 +3046,7 @@ def _has_subagent(
 
 
 async def _execute_timer_set(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
@@ -2910,7 +3153,7 @@ async def _timer_loop(
 
 
 async def _execute_timer_cancel(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     conversation_id: str | None = None,
 ) -> str:
@@ -2962,32 +3205,33 @@ async def _execute_comment_tool(
         return json.dumps({"error": f"{tool_name} requires a session id"})
 
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
     base = f"/v1/sessions/{conversation_id}/comments"
 
     if tool_name == ListCommentsTool.name():
         params: dict[str, str] = {}
-        if args.get("path"):
-            params["path"] = args["path"]
+        path = args.get("path")
+        if isinstance(path, str) and path:
+            params["path"] = path
         try:
             resp = await server_client.get(base, params=params, timeout=30.0)
             if resp.status_code != 200:
                 return json.dumps({"error": f"list_comments returned {resp.status_code}"})
-            all_comments: list[dict[str, Any]] = resp.json()
+            all_comments: list[_JsonObject] = resp.json()
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": f"list_comments failed: {exc}"})
         # The server's GET endpoint only supports ?path= filtering;
         # apply status filter client-side.
-        status_filter: str | None = args.get("status")
+        status_filter = _optional_string(args.get("status"))
         if status_filter is not None:
             all_comments = [c for c in all_comments if c.get("status") == status_filter]
         return json.dumps({"comments": all_comments})
 
     # update_comment
-    comment_id: str | None = args.get("comment_id")
-    status: str | None = args.get("status")
+    comment_id = _optional_string(args.get("comment_id"))
+    status = _optional_string(args.get("status"))
     if not comment_id:
         return json.dumps({"error": "missing required argument: comment_id"})
     if not status:
@@ -3014,7 +3258,7 @@ async def _execute_comment_tool(
 
 async def _execute_browser_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
@@ -3107,7 +3351,7 @@ async def _execute_policy_tool(
         return json.dumps({"error": f"{tool_name} requires a session id"})
 
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
@@ -3134,7 +3378,7 @@ async def _execute_list_policies(
 
 
 async def _execute_add_policy(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
@@ -3155,7 +3399,7 @@ async def _execute_add_policy(
         return json.dumps(
             {"error": "sys_add_policy requires 'handler' (dotted path from sys_policy_registry)"}
         )
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "name": args.get("name", ""),
         "type": "python",
         "handler": handler,
@@ -3251,7 +3495,7 @@ async def _execute_scheduled_task_tool(
     if server_client is None:
         return json.dumps({"error": f"{tool_name} requires server access"})
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
@@ -3345,7 +3589,7 @@ def _truncate_activity(text: str | None) -> str | None:
     return text[:_ACTIVITY_MAX_CHARS] + " [truncated]"
 
 
-def _text_from_api_content(content: Any) -> str:
+def _text_from_api_content(content: object) -> str:
     """
     Join the text blocks of an API message ``content`` array.
 
@@ -3363,7 +3607,7 @@ def _text_from_api_content(content: Any) -> str:
     return " ".join(parts)
 
 
-def _project_api_item(item: dict[str, Any]) -> dict[str, str | None]:
+def _project_api_item(item: _JsonObject) -> _JsonObject:
     """
     Project a REST API conversation item into the compact peek shape.
 
@@ -3378,12 +3622,12 @@ def _project_api_item(item: dict[str, Any]) -> dict[str, str | None]:
         ``{type, output}`` for tool results, ``{type, role, text}`` for
         messages.
     """
-    itype = item.get("type")
+    itype = _optional_string(item.get("type"))
     if itype == "function_call":
         return {
             "type": "function_call",
-            "tool": item.get("name"),
-            "args": _truncate_activity(item.get("arguments")),
+            "tool": _optional_string(item.get("name")),
+            "args": _truncate_activity(_optional_string(item.get("arguments"))),
         }
     if itype == "function_call_output":
         output = item.get("output")
@@ -3392,7 +3636,7 @@ def _project_api_item(item: dict[str, Any]) -> dict[str, str | None]:
     if itype == "message":
         return {
             "type": "message",
-            "role": item.get("role"),
+            "role": _optional_string(item.get("role")),
             "text": _truncate_activity(_text_from_api_content(item.get("content"))),
         }
     return {"type": itype}
@@ -3404,7 +3648,7 @@ async def _execute_session_query_tool(
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Runner-local handler for ``sys_session_get_history`` / ``sys_session_list`` /
@@ -3452,7 +3696,7 @@ async def _execute_session_query_tool(
     if conversation_id is None:
         return json.dumps({"error": f"{tool_name} requires a session id"})
     try:
-        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
@@ -3496,7 +3740,7 @@ async def _runner_online_or_none(
 
 
 async def _session_get_info_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
@@ -3507,8 +3751,9 @@ async def _session_get_info_via_rest(
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host, reasoning effort, effective model,
-    parent linkage, workspace / git branch, and the outstanding approval
-    prompts (the prompts themselves plus a count). Runner connectivity
+    parent linkage, workspace / git branch, persisted last-activity time,
+    and the outstanding approval prompts (the prompts themselves plus a
+    count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound). The full transcript is
@@ -3530,7 +3775,11 @@ async def _session_get_info_via_rest(
             {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
         )
     try:
-        resp = await server_client.get(f"/v1/sessions/{raw_target}", timeout=30.0)
+        resp = await server_client.get(
+            f"/v1/sessions/{raw_target}",
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_get_info failed: {exc}"})
     if resp.status_code == 404:
@@ -3539,12 +3788,19 @@ async def _session_get_info_via_rest(
         return json.dumps({"error": "access_denied", "session_id": raw_target})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_session_get_info returned {resp.status_code}"})
-    snap: dict[str, Any] = resp.json()
-    pending = snap.get("pending_elicitations") or []
+    snap: _JsonObject = resp.json()
+    pending_value = snap.get("pending_elicitations")
+    pending = pending_value if isinstance(pending_value, list) else []
+    snap_agent_name = _optional_string(snap.get("agent_name"))
+    snap_runner_id = _optional_string(snap.get("runner_id"))
     return json.dumps(
         {
             "session_id": snap.get("id"),
             "status": snap.get("status"),
+            # Persisted conversation activity is distinct from lifecycle
+            # status: repeated polls with an unchanged value let an
+            # orchestrator detect a running session that is not advancing.
+            "last_activity_at": snap.get("updated_at"),
             "title": snap.get("title"),
             "agent_id": snap.get("agent_id"),
             # Present the public agent name: a native-UI wrapper session
@@ -3552,9 +3808,9 @@ async def _session_get_info_via_rest(
             # so the internal ``-native-ui`` wrapper name never leaks to the
             # model answering "what agent are you?". Non-wrapper names are
             # unchanged.
-            "agent_name": public_agent_name(snap.get("agent_name")),
+            "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
-            "runner_online": await _runner_online_or_none(snap.get("runner_id"), server_client),
+            "runner_online": await _runner_online_or_none(snap_runner_id, server_client),
             "host_id": snap.get("host_id"),
             "parent_session_id": snap.get("parent_session_id"),
             "sub_agent_name": snap.get("sub_agent_name"),
@@ -3606,10 +3862,10 @@ def _omnigent_error_message(resp: httpx.Response) -> str | None:
 
 
 async def _session_share_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
 ) -> str:
     """
     Grant a user access to a session via ``PUT /v1/sessions/{id}/permissions``.
@@ -3718,10 +3974,10 @@ async def _session_share_via_rest(
 
 async def _execute_agent_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
 ) -> str:
@@ -3806,7 +4062,7 @@ async def _agent_get_via_rest(
         return json.dumps({"error": "access_denied", "session_id": session_id})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_agent_get returned {resp.status_code}"})
-    agent: dict[str, Any] = resp.json()
+    agent: _JsonObject = resp.json()
     return json.dumps(
         {
             "session_id": session_id,
@@ -3822,7 +4078,7 @@ async def _agent_get_via_rest(
 
 
 def _agent_bundle_filename(
-    dest_filename: Any,
+    dest_filename: object,
     agent_name: str,
     agent_version: str,
 ) -> str | None:
@@ -3856,10 +4112,10 @@ def _agent_bundle_filename(
 
 async def _agent_download_via_rest(
     session_id: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
 ) -> str:
@@ -3911,6 +4167,7 @@ async def _agent_download_via_rest(
             {"error": "sys_agent_download dest_filename must be a bare filename, not a path"}
         )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert spec.cwd is not None
     cwd = Path(spec.cwd)
     await asyncio.to_thread(cwd.mkdir, parents=True, exist_ok=True)
     # Resolve symlinks on the realized cwd and confirm the destination
@@ -3938,7 +4195,7 @@ async def _agent_download_via_rest(
 async def _agent_list_fetch(
     path: str,
     server_client: httpx.AsyncClient,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """
     Fetch one page of a paginated list endpoint, returning its ``data``.
 
@@ -3962,11 +4219,11 @@ async def _agent_list_fetch(
         return []
     if resp.status_code != 200:
         return []
-    data = resp.json().get("data", [])
-    return data if isinstance(data, list) else []
+    body = _string_object_dict(resp.json())
+    return _json_object_list(body.get("data")) if body is not None else []
 
 
-def _scan_local_agent_configs(configs_dir: Path) -> list[dict[str, str | None]]:
+def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
     """
     Scan a directory for locally-authored agent config YAMLs.
 
@@ -3984,7 +4241,7 @@ def _scan_local_agent_configs(configs_dir: Path) -> list[dict[str, str | None]]:
 
     if not configs_dir.is_dir():
         return []
-    entries: list[dict[str, str | None]] = []
+    entries: list[_JsonObject] = []
     for path in sorted(configs_dir.glob("*.yaml")):
         try:
             loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -4002,10 +4259,127 @@ def _scan_local_agent_configs(configs_dir: Path) -> list[dict[str, str | None]]:
     return entries
 
 
+#: Budget for the confinement lookup. Short on purpose: a slow or wedged
+#: server must not hold an agent listing open, and an unanswered lookup
+#: fails open to the unfiltered list.
+_SPAWN_FAMILY_TIMEOUT_S = 5.0
+
+#: Resolved confinement per session. Routing state is stamped at create and
+#: never changes, so one lookup serves every later ``sys_agent_list``. Only
+#: sessions with routing armed locally reach it, and only answered lookups
+#: are stored, so a fail-open miss is retried next call.
+_spawn_family_cache: dict[str, str | None] = {}
+
+
+async def _spawn_family(
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> str | None:
+    """Return the model family a session's spawns are confined to.
+
+    Only a session running Smart Routing on a PINNED harness confines
+    them: its spawns are routed inside its own family, so an agent from
+    another family has no candidate model it could be routed onto and
+    must never be offered as spawnable in the first place. An
+    auto-harness session hands the family choice to the router, and a
+    plain session is not routed at all — both see the whole surface, byte
+    for byte as before.
+
+    The runner-local routing class answers for those two cases without
+    touching the server, so a plain session — the overwhelming majority —
+    pays nothing for a feature it does not use. Only a locally pinned
+    routed session spends the one cached lookup that reads the
+    subagent-routing switch.
+
+    Best-effort: an unreadable or slow session read fails open to "no
+    confinement", because a discovery listing must not block on the
+    routing lookup. The child-create gate is the enforcement.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session's id, or ``None``.
+    :returns: ``"claude"`` / ``"gpt"`` / ``"pi"`` when the caller's spawns
+        are confined to that family, else ``None``.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.runner.subagent_routing import (
+        auto_harness_session,
+        harness_family,
+        session_routing_class,
+        subagent_routing_enabled,
+    )
+
+    if conversation_id is None:
+        return None
+    local = session_routing_class(conversation_id)
+    if not local.routing_enabled or local.auto_harness:
+        return None
+    if conversation_id in _spawn_family_cache:
+        return _spawn_family_cache[conversation_id]
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            # Only the routing fields are read, so skip the history and
+            # runner-liveness work the full snapshot would do.
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=_SPAWN_FAMILY_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — discovery must not fail on this read
+        return None
+    if resp.status_code != 200:
+        return None
+    snapshot = _string_object_dict(resp.json())
+    if snapshot is None:
+        return None
+    family: str | None = None
+    if subagent_routing_enabled(_optional_string(snapshot.get("subagent_routing_override"))):
+        harness = _optional_string(snapshot.get("harness"))
+        labels = _string_object_dict(snapshot.get("labels")) or {}
+        # The shared predicate reads the same two fields off a conversation row.
+        row = SimpleNamespace(
+            labels={key: value for key, value in labels.items() if isinstance(value, str)},
+            harness_override=harness,
+        )
+        if not auto_harness_session(row):
+            family = harness_family(harness)
+    _spawn_family_cache[conversation_id] = family
+    return family
+
+
+def forget_spawn_family(conversation_id: str) -> None:
+    """Drop the cached spawn confinement for a finished session.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    _spawn_family_cache.pop(conversation_id, None)
+
+
+def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_JsonObject]:
+    """Drop built-in agents *family* cannot serve.
+
+    :param builtins: Projected ``builtins`` rows, each carrying ``harness``.
+    :param family: The caller's confined family, or ``None`` to keep all.
+    :returns: The rows a session confined to *family* may spawn. An agent
+        whose harness has no family (unknown, or multi-family like pi) is
+        kept: nothing proves it is out of family.
+    """
+    if family is None:
+        return builtins
+    from omnigent.runner.subagent_routing import harness_family
+
+    kept: list[_JsonObject] = []
+    for row in builtins:
+        harness = row.get("harness")
+        row_family = harness_family(harness) if isinstance(harness, str) else None
+        if row_family is None or row_family == family:
+            kept.append(row)
+    return kept
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
 ) -> str:
@@ -4026,6 +4400,12 @@ async def _agent_list_via_rest(
       (YAMLs authored with ``sys_os_write`` per the agent-authoring
       skill), projected to ``{name, path, description}``.
 
+    On a pinned Smart Routing session the ``builtins`` section is confined
+    to the caller's own model family (:func:`_spawn_family`) — an agent it
+    could never route a spawn onto is not a launchable agent for it. The
+    other two sections carry no harness to filter on; the child-create gate
+    refuses those.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_spec: The running agent's spec, for os_env cwd
         resolution of the local-config scan.
@@ -4036,16 +4416,21 @@ async def _agent_list_via_rest(
     builtins_raw = await _agent_list_fetch("/v1/agents", server_client)
     sessions_raw = await _agent_list_fetch("/v1/sessions", server_client)
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
-    return json.dumps(_project_agent_list(builtins_raw, sessions_raw, local_configs))
+    listing = _project_agent_list(builtins_raw, sessions_raw, local_configs)
+    listing["builtins"] = _in_spawn_family(
+        listing["builtins"], await _spawn_family(server_client, conversation_id)
+    )
+    return json.dumps(listing)
 
 
 def _project_agent_list(
-    builtins_raw: list[dict[str, Any]],
-    sessions_raw: list[dict[str, Any]],
-    local_configs: list[dict[str, str | None]],
-) -> dict[str, list[dict[str, Any]]]:
+    builtins_raw: list[_JsonObject],
+    sessions_raw: list[_JsonObject],
+    local_configs: list[_JsonObject],
+) -> dict[str, list[_JsonObject]]:
     """
     Project the three raw ``sys_agent_list`` sources into the tool result.
 
@@ -4060,7 +4445,7 @@ def _project_agent_list(
     :param local_configs: Entries from :func:`_scan_local_agent_configs`.
     :returns: ``{builtins, session_agents, local_configs}``.
     """
-    builtins = [
+    builtins: list[_JsonObject] = [
         {
             "agent_id": a.get("id"),
             "name": a.get("name"),
@@ -4069,7 +4454,7 @@ def _project_agent_list(
         }
         for a in builtins_raw
     ]
-    session_agents = [
+    session_agents: list[_JsonObject] = [
         {
             "session_id": s.get("id"),
             "agent_id": s.get("agent_id"),
@@ -4088,7 +4473,7 @@ def _project_agent_list(
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
-    agent_name: Any = None,
+    agent_name: object = None,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4114,7 +4499,7 @@ async def _session_list_via_rest(
 
 
 async def _rename_current_session_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> str:
@@ -4212,7 +4597,7 @@ async def _collect_sub_agents(
 
 
 async def _resolve_runner_online_map(
-    rows: list[dict[str, Any]],
+    rows: list[_JsonObject],
     server_client: httpx.AsyncClient,
 ) -> dict[str, bool | None]:
     """
@@ -4245,8 +4630,8 @@ async def _resolve_runner_online_map(
 
 async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
-    agent_name: Any,
-) -> list[dict[str, Any]]:
+    agent_name: object,
+) -> list[_JsonObject]:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
@@ -4263,7 +4648,7 @@ async def _collect_global_sessions(
         non-empty string.
     :returns: The projected global session entries.
     """
-    params: dict[str, Any] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
+    params: dict[str, str | int] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     try:
@@ -4272,9 +4657,10 @@ async def _collect_global_sessions(
         return []
     if resp.status_code != 200:
         return []
-    rows = resp.json().get("data", [])
-    if not isinstance(rows, list):
+    body = _string_object_dict(resp.json())
+    if body is None:
         return []
+    rows = _json_object_list(body.get("data"))
     online = await _resolve_runner_online_map(rows, server_client)
     return [
         {
@@ -4283,11 +4669,11 @@ async def _collect_global_sessions(
             # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
             # ``sys_session_get_info``. The server-side ``agent_name`` filter
             # above still receives the caller's raw argument unchanged.
-            "agent_name": public_agent_name(r.get("agent_name")),
+            "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
             "title": r.get("title"),
             "status": r.get("status"),
             "runner_id": r.get("runner_id"),
-            "runner_online": online.get(r.get("runner_id")),
+            "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
             "parent_session_id": r.get("parent_session_id"),
         }
         for r in rows
@@ -4295,7 +4681,7 @@ async def _collect_global_sessions(
 
 
 def _child_rows_to_entries(
-    rows: list[dict[str, Any]],
+    rows: list[_JsonObject],
 ) -> list[dict[str, str | None]]:
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
@@ -4309,14 +4695,15 @@ def _child_rows_to_entries(
     """
     entries: list[dict[str, str | None]] = []
     for row in rows:
-        title = row.get("title")
-        if not title or ":" not in title or is_session_closed(row.get("labels"), title):
+        title = _optional_string(row.get("title"))
+        labels = _string_mapping(row.get("labels"))
+        if not title or ":" not in title or is_session_closed(labels, title):
             continue
         entries.append(
             {
-                "agent": row.get("tool"),
-                "title": row.get("session_name"),
-                "conversation_id": row.get("id"),
+                "agent": _optional_string(row.get("tool")),
+                "title": _optional_string(row.get("session_name")),
+                "conversation_id": _optional_string(row.get("id")),
             }
         )
     return entries
@@ -4348,7 +4735,7 @@ async def _session_parent_id(
 
 
 async def _session_get_history_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient,
 ) -> str:
     """
@@ -4389,10 +4776,10 @@ async def _session_get_history_via_rest(
         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_session_get_history returned {resp.status_code}"})
-    data: list[dict[str, Any]] = resp.json().get("data", [])
+    data: list[_JsonObject] = resp.json().get("data", [])
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
-    items: list[dict[str, Any]] = [_project_api_item(it) for it in reversed(data)]
+    items: list[_JsonObject] = [_project_api_item(it) for it in reversed(data)]
     meta = await _fetch_peek_meta(target_id, server_client)
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
@@ -4414,7 +4801,7 @@ async def _session_get_history_via_rest(
 async def _fetch_close_target(
     target_id: str,
     server_client: httpx.AsyncClient,
-) -> dict[str, Any] | str:
+) -> _JsonObject | str:
     """
     Fetch + status-classify the close target's session snapshot.
 
@@ -4435,11 +4822,14 @@ async def _fetch_close_target(
         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
     if snap.status_code != 200:
         return json.dumps({"error": f"sys_session_close returned {snap.status_code}"})
-    return snap.json()
+    body = _string_object_dict(snap.json())
+    if body is None:
+        return json.dumps({"error": "sys_session_close returned malformed session data"})
+    return body
 
 
 async def _close_tree_scope_error(
-    target_snap: dict[str, Any],
+    target_snap: _JsonObject,
     caller_conversation_id: str,
     target_id: str,
     server_client: httpx.AsyncClient,
@@ -4490,7 +4880,7 @@ async def _close_tree_scope_error(
 
 
 async def _session_close_via_rest(
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
@@ -4537,7 +4927,7 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(target_snap.get("title"))
+    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
     if parsed.agent is None or parsed.title is None:
         return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
     new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
@@ -4582,7 +4972,7 @@ class _PeekMeta:
 
     agent: str | None
     title: str | None
-    pending_elicitations: list[dict[str, Any]]
+    pending_elicitations: list[_JsonObject]
 
 
 async def _fetch_peek_meta(
@@ -4609,12 +4999,12 @@ async def _fetch_peek_meta(
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
     if snap.status_code != 200:
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    body = snap.json()
-    parsed = _parse_session_title(body.get("title"))
+    body = _string_object_dict(snap.json())
+    if body is None:
+        return _PeekMeta(agent=None, title=None, pending_elicitations=[])
+    parsed = _parse_session_title(_optional_string(body.get("title")))
     raw_pending = body.get("pending_elicitations")
-    pending = (
-        [e for e in raw_pending if isinstance(e, dict)] if isinstance(raw_pending, list) else []
-    )
+    pending = _json_object_list(raw_pending)
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)
 
 
@@ -4623,19 +5013,19 @@ async def execute_tool(
     tool_name: str,
     arguments: str,
     server_client: httpx.AsyncClient | None = None,
-    terminal_registry: Any | None = None,
-    resource_registry: Any | None = None,
-    agent_spec: Any | None = None,
+    terminal_registry: TerminalRegistry | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
+    agent_spec: AgentSpec | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
-    mcp_manager: Any | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    mcp_manager: RunnerMcpManager | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
     harness_client: httpx.AsyncClient | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
 ) -> str:
     """
@@ -4675,6 +5065,8 @@ async def execute_tool(
             # /mcp endpoint, which enforces TOOL_CALL and TOOL_RESULT
             # policies centrally before forwarding to the runner's
             # /mcp/execute. No runner-side policy gate needed.
+            if agent_spec is None:
+                return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)
         elif tool_name in _OS_ENV_TOOLS:
             output = await _execute_os_env_tool(
@@ -4781,6 +5173,22 @@ async def execute_tool(
             )
         elif tool_name in _WEB_SEARCH_TOOLS:
             output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _NIMBLE_RESEARCH_TOOLS:
+            output = await _execute_nimble_research_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _NIMBLE_EXTRACT_TOOLS:
+            output = await _execute_nimble_extract_tool(
                 args,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
@@ -4900,7 +5308,7 @@ _CHANGED_FILES_TOOLS = frozenset(
 
 def _maybe_signal_changed_files(
     conversation_id: str | None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
     *,
     now: float,
 ) -> None:
@@ -4941,18 +5349,18 @@ async def dispatch_tool_locally(
     response_id: str,
     harness_client: httpx.AsyncClient,
     server_client: httpx.AsyncClient | None = None,
-    terminal_registry: Any | None = None,
-    resource_registry: Any | None = None,
-    agent_spec: Any | None = None,
+    terminal_registry: TerminalRegistry | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
+    agent_spec: AgentSpec | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
-    mcp_manager: Any | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    mcp_manager: RunnerMcpManager | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
 ) -> str:
     """Execute a tool locally and PATCH the result to the harness.
@@ -5043,7 +5451,7 @@ async def dispatch_tool_locally(
 # ── OS env tools (OSEnvironment-backed) ──────────────────
 
 
-def _clone_os_env_spec(spec: Any) -> Any:
+def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
     """Return a defensive copy of an OSEnvSpec-like object.
 
     Uses :func:`dataclasses.replace` so any field added to
@@ -5097,10 +5505,10 @@ def _runner_default_os_env_cwd(conversation_id: str | None) -> str:
 
 
 def _effective_runner_os_env_spec(
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None = None,
-) -> Any:
+) -> OSEnvSpec:
     """
     Build the OSEnvSpec used by runner-local sys_os_* dispatch.
 
@@ -5153,7 +5561,7 @@ def _effective_runner_os_env_spec(
 
 
 async def _seed_os_env_snapshot(
-    os_env: Any,
+    os_env: OSEnvironment,
     path: str,
     filesystem_registry: FilesystemRegistry,
     conversation_id: str,
@@ -5184,9 +5592,9 @@ async def _seed_os_env_snapshot(
 
 async def _execute_os_env_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
     conversation_id: str | None = None,
     runner_workspace: Path | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
@@ -5222,20 +5630,26 @@ async def _execute_os_env_tool(
 
         if tool_name == SysOsReadTool.name():
             result = await os_env.read(
-                path=args.get("path", ""),
-                offset=args.get("offset", 1),
+                path=cast("str", args.get("path", "")),
+                offset=cast("int", args.get("offset", 1)),
                 # Unspecified limit → agent-tool default (2 000 lines).
                 # None is now "unlimited" in _read_impl, so we must be explicit.
                 # Use is-None check (not `or`) so that invalid values like 0 are
                 # forwarded to os_env.read for validation rather than silently
                 # replaced with the default.
-                limit=(lv if (lv := args.get("limit")) is not None else _DEFAULT_READ_LIMIT),
+                limit=cast(
+                    "int | None",
+                    lv if (lv := args.get("limit")) is not None else _DEFAULT_READ_LIMIT,
+                ),
             )
         elif tool_name == SysOsWriteTool.name():
-            _path = args.get("path", "")
+            _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
                 await _seed_os_env_snapshot(os_env, _path, filesystem_registry, conversation_id)
-            result = await os_env.write(path=_path, content=args.get("content", ""))
+            result = await os_env.write(
+                path=_path,
+                content=cast("str", args.get("content", "")),
+            )
             if filesystem_registry is not None and conversation_id is not None:
                 # _write_impl returns {"created": True} when the file did not
                 # previously exist, {"created": False} for an overwrite.
@@ -5243,21 +5657,21 @@ async def _execute_os_env_tool(
                 status = "created" if was_created else "modified"
                 filesystem_registry.record_change(_path, status, conversation_id)
         elif tool_name == SysOsEditTool.name():
-            _path = args.get("path", "")
+            _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
                 await _seed_os_env_snapshot(os_env, _path, filesystem_registry, conversation_id)
             result = await os_env.edit(
                 path=_path,
-                old_text=args.get("oldText") or args.get("old_string"),
-                new_text=args.get("newText") or args.get("new_string"),
-                edits=args.get("edits"),
+                old_text=cast("str | None", args.get("oldText") or args.get("old_string")),
+                new_text=cast("str | None", args.get("newText") or args.get("new_string")),
+                edits=cast("list[dict[str, str]] | None", args.get("edits")),
             )
             if filesystem_registry is not None and conversation_id is not None:
                 filesystem_registry.record_change(_path, "modified", conversation_id)
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
-                command=args.get("command", ""),
-                timeout=args.get("timeout"),
+                command=cast("str", args.get("command", "")),
+                timeout=cast("int | None", args.get("timeout")),
             )
         else:
             return f"Error: {tool_name} not implemented"
@@ -5276,7 +5690,7 @@ async def _execute_os_env_tool(
 
 async def _execute_rest_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient | None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
@@ -5350,7 +5764,7 @@ async def _execute_rest_tool(
             content = input_items
             if isinstance(content, str):
                 content = [{"type": "input_text", "text": content}]
-            event_body: dict[str, Any] = {
+            event_body: _JsonObject = {
                 "type": "message",
                 "data": {
                     "role": "user",
@@ -5401,11 +5815,11 @@ async def _execute_rest_tool(
 
 async def _execute_file_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     server_client: httpx.AsyncClient | None,
     *,
     conversation_id: str | None,
-    agent_spec: Any | None = None,
+    agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
 ) -> str:
     """
@@ -5434,7 +5848,7 @@ async def _execute_file_tool(
 
     if tool_name == UploadFileTool.name():
         path = args.get("path")
-        if not path:
+        if not isinstance(path, str) or not path:
             return "Error: sys_upload_file failed: empty path"
         # Resolve the agent-supplied path against the session workspace
         # (the same cwd the sys_os_* tools operate in) and reject any
@@ -5443,9 +5857,9 @@ async def _execute_file_tool(
         # exfiltrate arbitrary host files. Mirrors the
         # builtin UploadFileTool's safe_resolve / sys_agent_download
         # containment checks.
-        workspace = Path(
-            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace).cwd
-        )
+        os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+        assert os_spec.cwd is not None
+        workspace = Path(os_spec.cwd)
         try:
             resolved = safe_resolve(path, workspace)
         except ValueError as exc:
@@ -5496,17 +5910,17 @@ async def _execute_file_tool(
 
 async def _execute_terminal_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    terminal_registry: Any | None,
-    resource_registry: Any | None = None,
-    agent_spec: Any | None,
+    terminal_registry: TerminalRegistry | None,
+    resource_registry: SessionResourceRegistry | None = None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
     runner_workspace: Path | None = None,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
-    publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
 ) -> str:
     """Execute a terminal tool using the runner's TerminalRegistry.
 
@@ -5546,7 +5960,7 @@ async def _execute_terminal_tool(
 
     del session_inbox
     if tool_name == SysTerminalLaunchTool.name():
-        tool_instance: Any = SysTerminalLaunchTool(
+        tool_instance: Tool = SysTerminalLaunchTool(
             spec=agent_spec,
             registry=terminal_registry,
         )
@@ -5594,11 +6008,11 @@ async def _emit_terminal_resource_event(
     *,
     tool_name: str,
     output: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     conversation_id: str,
-    terminal_registry: Any,
-    resource_registry: Any | None,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    terminal_registry: TerminalRegistry,
+    resource_registry: SessionResourceRegistry | None,
+    publish_event: Callable[[str, _JsonObject], None],
 ) -> None:
     """Emit a ``session.resource.{created,deleted}`` event for a terminal tool.
 
@@ -5664,9 +6078,9 @@ async def _publish_terminal_created_event(
     conversation_id: str,
     terminal_name: str,
     session_key: str,
-    terminal_registry: Any,
-    resource_registry: Any | None,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    terminal_registry: TerminalRegistry,
+    resource_registry: SessionResourceRegistry | None,
+    publish_event: Callable[[str, _JsonObject], None],
 ) -> None:
     """Build and publish ``session.resource.created`` for a fresh launch.
 
@@ -5733,14 +6147,15 @@ async def _publish_terminal_created_event(
         loop = asyncio.get_running_loop()
 
         def _on_activity() -> None:
+            event: _JsonObject = {
+                "type": "session.terminal.activity",
+                "session_id": conversation_id,
+                "terminal_id": resource_id,
+            }
             loop.call_soon_threadsafe(
                 publish_event,
                 conversation_id,
-                {
-                    "type": "session.terminal.activity",
-                    "session_id": conversation_id,
-                    "terminal_id": resource_id,
-                },
+                event,
             )
 
         instance.start_idle_watcher_thread(on_activity=_on_activity)
@@ -5751,7 +6166,7 @@ def _publish_terminal_deleted_event(
     conversation_id: str,
     terminal_name: str,
     session_key: str,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, _JsonObject], None],
 ) -> None:
     """Build and publish ``session.resource.deleted`` for a closed terminal.
 
@@ -5783,20 +6198,20 @@ def _publish_terminal_deleted_event(
 
 async def _execute_async_inbox_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None,
+    session_inbox: asyncio.Queue[_JsonObject] | None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
-    terminal_registry: Any | None,
-    resource_registry: Any | None,
-    agent_spec: Any | None,
+    terminal_registry: TerminalRegistry | None,
+    resource_registry: SessionResourceRegistry | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
     agent_name: str | None,
     runner_workspace: Path | None,
-    mcp_manager: Any | None,
+    mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
 ) -> str:
@@ -5856,7 +6271,7 @@ async def _execute_async_inbox_tool(
 
 
 def _format_terminal_idle_item(
-    payload: dict[str, Any],
+    payload: _JsonObject,
 ) -> str:
     """
     Render a terminal-idle inbox item for ``sys_read_inbox``.
@@ -5904,7 +6319,7 @@ def _truncate_inbox_output(output: object) -> str:
     )
 
 
-def _format_async_task_item(payload: dict[str, Any]) -> str:
+def _format_async_task_item(payload: _JsonObject) -> str:
     """
     Render a completed/failed/cancelled async-task inbox payload.
 
@@ -5947,7 +6362,7 @@ def _format_async_task_item(payload: dict[str, Any]) -> str:
     return f"[System: task {handle_id} {status} — {tool}: {output}]"
 
 
-def _subagent_child_id(payload: dict[str, Any]) -> str | None:
+def _subagent_child_id(payload: _JsonObject) -> str | None:
     """
     Extract the child session id from a sub-agent inbox payload.
 
@@ -5961,7 +6376,7 @@ def _subagent_child_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _subagent_policy_failure_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _subagent_policy_failure_payload(payload: _JsonObject) -> _JsonObject:
     """
     Return a fail-closed copy of a sub-agent inbox payload.
 
@@ -5973,9 +6388,9 @@ def _subagent_policy_failure_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _subagent_tool_result_policy_request(
-    payload: dict[str, Any],
+    payload: _JsonObject,
     output: str,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """
     Build the Omnigent policy-evaluation request for delayed child output.
 
@@ -6004,9 +6419,9 @@ async def _post_subagent_policy_verdict(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-    payload: dict[str, Any],
+    payload: _JsonObject,
     output: str,
-) -> dict[str, Any] | None:
+) -> _JsonObject | None:
     """
     POST delayed sub-agent output to Omnigent policy evaluation.
 
@@ -6040,7 +6455,7 @@ async def _post_subagent_policy_verdict(
         )
         return None
     try:
-        return resp.json()
+        return _string_object_dict(resp.json())
     except (json.JSONDecodeError, ValueError):
         _logger.warning(
             "Sub-agent inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
@@ -6050,8 +6465,8 @@ async def _post_subagent_policy_verdict(
 
 
 def _apply_subagent_policy_verdict(
-    payload: dict[str, Any],
-    verdict: dict[str, Any],
+    payload: _JsonObject,
+    verdict: _JsonObject,
 ) -> _SubagentInboxEvaluation:
     """
     Apply an Omnigent policy verdict to a sub-agent inbox payload.
@@ -6093,7 +6508,7 @@ def _apply_subagent_policy_verdict(
 
 
 async def _evaluate_subagent_inbox_output(
-    payload: dict[str, Any],
+    payload: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
@@ -6133,7 +6548,7 @@ async def _evaluate_subagent_inbox_output(
     return _apply_subagent_policy_verdict(payload, verdict)
 
 
-def _cleanup_drained_subagent_work(payload: dict[str, Any]) -> None:
+def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
     """
     Remove terminal sub-agent work after its inbox item is drained.
 
@@ -6160,7 +6575,7 @@ def _cleanup_drained_subagent_work(payload: dict[str, Any]) -> None:
 
 
 async def _drain_inbox(
-    inbox: asyncio.Queue[dict[str, Any]] | None,
+    inbox: asyncio.Queue[_JsonObject] | None,
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
@@ -6180,7 +6595,7 @@ async def _drain_inbox(
     if inbox is None or inbox.empty():
         return "Inbox is empty — no completed tasks."
     items: list[str] = []
-    retry_payloads: list[dict[str, Any]] = []
+    retry_payloads: list[_JsonObject] = []
     while not inbox.empty():
         try:
             payload = inbox.get_nowait()
@@ -6212,21 +6627,81 @@ async def _drain_inbox(
     return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
 
 
-def _spawn_async_tool(
-    args: dict[str, Any],
+async def _evaluate_async_tool_call_policy(
+    tool_name: str,
+    tool_args: str,
     *,
-    session_inbox: asyncio.Queue[dict[str, Any]] | None,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> bool:
+    """
+    Evaluate PHASE_TOOL_CALL policy for an out-of-turn background dispatch.
+
+    Calls the AP server's policy-evaluate endpoint directly (no SSE
+    round-trip, since the originating turn has already ended).
+
+    ``arguments`` is sent as a dict (not a JSON string) so the server's policy
+    context builder and argument-aware built-in policies (e.g. safety rules
+    that inspect ``arguments.command``) see the same structure every in-turn
+    evaluation path delivers.
+
+    An ASK verdict parks the gate server-side (up to the policy's
+    ``ask_timeout``) and blocks the background task until resolved or timed
+    out — ``sys_cancel_async`` cannot interrupt a parked evaluation.
+
+    :returns: ``True`` when the tool may proceed; ``False`` to DENY.
+    """
+    evaluation_id = f"poleval_async_{uuid.uuid4().hex[:12]}"
+    phase = "PHASE_TOOL_CALL"
+    try:
+        try:
+            arguments_dict: _JsonObject = json.loads(tool_args)
+            if not isinstance(arguments_dict, dict):
+                arguments_dict = {}
+        except (json.JSONDecodeError, ValueError):
+            arguments_dict = {}
+        resp = await server_client.post(
+            f"/v1/sessions/{conversation_id}/policies/evaluate",
+            json={
+                "event": {"type": phase, "data": {"name": tool_name, "arguments": arguments_dict}}
+            },
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            result = _string_object_dict(resp.json())
+            if result is None:
+                return False
+            action = result.get("result", "POLICY_ACTION_DENY")
+            return bool(action == "POLICY_ACTION_ALLOW" or action == "POLICY_ACTION_UNSPECIFIED")
+        _logger.warning(
+            "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
+            resp.status_code,
+            evaluation_id,
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
+            evaluation_id,
+            exc_info=True,
+        )
+    return False
+
+
+def _spawn_async_tool(
+    args: _JsonObject,
+    *,
+    session_inbox: asyncio.Queue[_JsonObject] | None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     server_client: httpx.AsyncClient | None,
-    terminal_registry: Any | None,
-    resource_registry: Any | None,
-    agent_spec: Any | None,
+    terminal_registry: TerminalRegistry | None,
+    resource_registry: SessionResourceRegistry | None,
+    agent_spec: AgentSpec | None,
     conversation_id: str | None,
     task_id: str | None,
     agent_id: str | None,
     agent_name: str | None,
     runner_workspace: Path | None,
-    mcp_manager: Any | None,
+    mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
 ) -> str:
     """
@@ -6252,8 +6727,10 @@ def _spawn_async_tool(
     """
     target_tool = args.get("tool")
     target_args = args.get("args", "{}")
-    if not target_tool:
+    if not isinstance(target_tool, str) or not target_tool:
         return 'Error: sys_call_async requires "tool" argument'
+    if not isinstance(target_args, str):
+        return 'Error: sys_call_async requires string "args" argument'
     if target_tool == SysCallAsyncTool.name():
         return "Error: sys_call_async cannot dispatch itself"
     if session_inbox is None or session_async_tasks is None:
@@ -6274,6 +6751,29 @@ def _spawn_async_tool(
         :returns: The tool output string.
         """
         try:
+            # Evaluate PHASE_TOOL_CALL policy before executing. The originating
+            # turn has already ended, so we call the AP server directly instead
+            # of going through the SSE round-trip. ASK is treated as DENY —
+            # there is no active turn to surface an approval prompt.
+            if server_client is not None and conversation_id is not None:
+                allowed = await _evaluate_async_tool_call_policy(
+                    target_tool,
+                    target_args,
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                )
+                if not allowed:
+                    result = "[Result suppressed by policy: PHASE_TOOL_CALL denied]"
+                    session_inbox.put_nowait(
+                        {
+                            "handle_id": handle_id,
+                            "tool_name": target_tool,
+                            "status": "failed",
+                            "output": result,
+                        }
+                    )
+                    return result
+
             # Race the tool execution against the cancel event.
             exec_coro = execute_tool(
                 tool_name=target_tool,
@@ -6291,14 +6791,13 @@ def _spawn_async_tool(
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
             )
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.ensure_future(exec_coro),
-                    asyncio.ensure_future(cancel_event.wait()),
-                ],
+            execution_task = asyncio.create_task(exec_coro)
+            cancellation_task = asyncio.create_task(cancel_event.wait())
+            _done, pending = await asyncio.wait(
+                [execution_task, cancellation_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if cancel_event.is_set():
+            if cancellation_task.done():
                 # Drop the losing future (the tool coro). This cancels the
                 # task/coroutine but cannot interrupt an underlying
                 # asyncio.to_thread, so that thread may run to completion.
@@ -6317,7 +6816,7 @@ def _spawn_async_tool(
             # linger as a pending task for the life of the session.
             for fut in pending:
                 fut.cancel()
-            result = next(iter(done)).result()
+            result = execution_task.result()
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,
@@ -6371,7 +6870,7 @@ def _spawn_async_tool(
 
 
 def _cancel_async_tool_result(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
 ) -> _CancelAsyncToolResult:
@@ -6388,7 +6887,7 @@ def _cancel_async_tool_result(
         is true only when no local async task matched.
     """
     handle_id = args.get("handle_id") or args.get("task_id")
-    if not handle_id:
+    if not isinstance(handle_id, str) or not handle_id:
         return _CancelAsyncToolResult('Error: sys_cancel_async requires "handle_id"')
     if session_async_tasks is None:
         return _CancelAsyncToolResult("Error: async inbox not initialized for this session")
@@ -6407,7 +6906,7 @@ def _cancel_async_tool_result(
 
 
 def _cancel_async_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
 ) -> str:
@@ -6427,7 +6926,7 @@ def _cancel_async_tool(
 
 
 async def _execute_task_lifecycle_tool(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
     conversation_id: str | None,
@@ -6463,7 +6962,7 @@ async def _execute_task_lifecycle_tool(
 
 
 async def _cancel_subagent_task(
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
@@ -6575,9 +7074,9 @@ async def _cancel_subagent_task(
 
 
 def _inject_orchestrator_skills(
-    skills: list[Any],
-    agent_spec: Any | None,
-) -> list[Any]:
+    skills: list[SkillSpec],
+    agent_spec: AgentSpec | None,
+) -> list[SkillSpec]:
     """
     Auto-inject built-in platform skills for every omnigent agent.
 
@@ -6615,9 +7114,9 @@ def _inject_orchestrator_skills(
 
 def _execute_skill_tool(
     tool_name: str,
-    args: dict[str, Any],
+    args: _JsonObject,
     *,
-    agent_spec: Any | None,
+    agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
 ) -> str:
     """
@@ -6645,6 +7144,7 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
+    tool: Tool
     if tool_name == "load_skill":
         tool = LoadSkillTool(
             bundled_skills,

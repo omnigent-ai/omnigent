@@ -136,6 +136,12 @@ class _GenerateBuildInfo(build_py):
           a silent API-only install that surfaces later as "the web
           UI doesn't load".
 
+        The pnpm commands run with ``COREPACK_ENABLE_DOWNLOAD_PROMPT=0``
+        and no stdin: corepack (whether reached via its ``pnpm`` shim or
+        as ``corepack pnpm``) otherwise blocks on an interactive
+        confirmation before downloading the pinned pnpm, which a
+        non-interactive install can never answer.
+
         :raises SystemExit: If Node.js < 22 (or absent), pnpm is not
             on PATH (and corepack can't supply it), or the web UI
             build fails, and no skip condition applies.
@@ -192,22 +198,32 @@ class _GenerateBuildInfo(build_py):
                 "without the web UI (API-only server), set "
                 "OMNIGENT_SKIP_WEB_UI=true."
             )
+        # A ``pnpm`` on PATH is often a corepack shim, which asks "Do you
+        # want to continue? [Y/n]" before fetching the pinned pnpm. That
+        # prompt is invisible under a build backend, so the install looks
+        # hung; "0" downloads without asking (shims default it to "1").
+        env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
         try:
             # Workspace root, not ``web/``: the lockfile and workspace
             # manifest live at the repo root. ``--frozen-lockfile``
             # matches CI and guarantees the build is reproducible from
-            # the committed ``pnpm-lock.yaml``.
+            # the committed ``pnpm-lock.yaml``. No stdin, so nothing in
+            # the toolchain can block on input we can never deliver.
             subprocess.run(
                 [*pnpm_cmd, "install", "--frozen-lockfile", "--filter", "web"],
                 cwd=root,
                 check=True,
                 timeout=600,
+                stdin=subprocess.DEVNULL,
+                env=env,
             )
             subprocess.run(
                 [*pnpm_cmd, "--filter", "web", "run", "build"],
                 cwd=root,
                 check=True,
                 timeout=600,
+                stdin=subprocess.DEVNULL,
+                env=env,
             )
         except (subprocess.SubprocessError, OSError) as exc:
             raise SystemExit(
@@ -229,6 +245,7 @@ class _GenerateBuildInfo(build_py):
         any later non-build code path that does ``from omnigent
         import _build_info`` works without re-running the build.
         """
+        # Keep generated names and types aligned with omnigent/_build_info.pyi.
         target = Path(__file__).resolve().parent / "omnigent" / "_build_info.py"
         commit = _git_sha()
         # Use repr() for the SHA so quoting is always correct, even

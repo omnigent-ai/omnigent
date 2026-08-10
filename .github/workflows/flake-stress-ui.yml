@@ -15,7 +15,11 @@ name: Flake stress (E2E UI)
 # but needs the full UI toolchain: a built SPA, Playwright Chromium, and — for
 # the native render-parity / Codex goal-mode tests — the Claude Code / Codex
 # CLIs and the Rust parity sidecar. This workflow mirrors e2e-ui.yml's setup
-# exactly, then runs ONE target N times instead of the sharded full suite.
+# exactly (including the dedicated build-sidecar job that compiles the
+# codex-parity sidecar ONCE and hands each attempt the prebuilt binary via
+# CODEX_PARITY_SIDECAR_BIN — otherwise the fixture's inline cargo build runs on
+# every attempt and blows past the per-test timeout on a cold Rust cache), then
+# runs ONE target N times instead of the sharded full suite.
 #
 # Examples:
 #   gh workflow run flake-stress-ui.yml --ref main \
@@ -140,9 +144,58 @@ jobs:
           echo "attempts_json=$ARR" >> "$GITHUB_OUTPUT"
           echo "Will run $ATTEMPTS attempts of: $TEST_TARGET  extra='$EXTRA_ARGS'"
 
+  build-sidecar:
+    # Build the Codex-parity sidecar ONCE and publish the binary, exactly like
+    # e2e-ui.yml. The mocked_native_codex_goal_session fixture needs it, but
+    # compiling it pulls openai/codex's core_test_support (~1100 crates). Done
+    # lazily inside pytest it runs ~7 min cold — past the per-test --timeout, so
+    # every attempt would die at fixture setup on a cold Rust cache. Building it
+    # here once and handing every attempt the ~10MB binary (via the artifact +
+    # CODEX_PARITY_SIDECAR_BIN below) keeps the sidecar off the attempt's
+    # critical path. Checks out target_branch so the sidecar matches the code
+    # under test.
+    name: build codex-parity sidecar
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.target_branch }}
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+      - name: Capture Rust version
+        id: rustc
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      # Same cache key as e2e-ui.yml / ci.yml so a main-populated cache restores:
+      # the binary is a pure function of sidecar/** + the toolchain, so cache the
+      # built binary (not the 1.6 GB target dir) and skip the compile on a hit.
+      - name: Cache parity sidecar binary
+        id: sidecar-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        with:
+          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
+          key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+      - name: Build parity sidecar
+        if: steps.sidecar-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
+      - name: Upload sidecar binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: codex-parity-sidecar
+          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
+          if-no-files-found: error
+          retention-days: 1
+
   repro:
     name: Attempt ${{ matrix.attempt }}
-    needs: prep
+    needs: [prep, build-sidecar]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -190,20 +243,17 @@ jobs:
           sudo apt-get install -y bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-      - name: Set up Rust toolchain
-        # The mocked_native_codex_goal_session fixture builds the Codex parity
-        # sidecar via `cargo build`; pin the toolchain for a stable cache key
-        # (mirrors e2e-ui.yml / ci.yml's codex-parity job).
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Download codex-parity sidecar binary
+        # Prebuilt once by the build-sidecar job. The goal-mode fixture uses this
+        # (via CODEX_PARITY_SIDECAR_BIN on the pytest step) instead of running a
+        # multi-minute cargo build on each attempt's critical path.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          toolchain: stable
+          name: codex-parity-sidecar
+          path: .tmp-codex-parity-target/debug
 
-      - name: Cache Rust build
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
-        with:
-          path: .tmp-codex-parity-target
-          # Identical key to e2e-ui.yml / ci.yml so a populated cache restores.
-          key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
+      - name: Make sidecar binary executable
+        run: chmod +x .tmp-codex-parity-target/debug/codex-parity-sidecar
 
       - name: Cache Playwright browsers
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
@@ -259,6 +309,10 @@ jobs:
         env:
           TEST_TARGET: ${{ github.event.inputs.test_target }}
           EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
+          # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture uses
+          # this instead of running cargo build. Absolute path: the fixture
+          # resolves it as-is, and pytest may run from a different cwd.
+          CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
         run: |
           mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
           # shellcheck disable=SC2086

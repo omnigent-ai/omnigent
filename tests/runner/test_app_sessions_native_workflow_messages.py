@@ -65,6 +65,38 @@ def _build_blocking_app(
 
 
 @pytest.mark.asyncio
+async def test_proxy_stream_relays_non_json_sse_frame() -> None:
+    """A non-data SSE frame is relayed without entering JSON event handling."""
+    harness_client = _ScriptedHarnessClient(
+        [
+            "event: heartbeat\n\n",
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/49ed0bd1f0cae058f05f48057e9f98cf/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "openai-agents",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "event: heartbeat\n\n" in response.text
+    assert '"response.completed"' in response.text
+
+
+@pytest.mark.asyncio
 async def test_turn_sequencing_buffers_concurrent_message() -> None:
     """Second message during an active turn returns 202 (buffered)."""
     import asyncio as _aio
@@ -240,17 +272,14 @@ async def test_post_turn_continuation() -> None:
     """Buffered messages are drained and sent to the harness after the first turn."""
     import asyncio as _aio
 
-    from omnigent.runner.app import _session_histories_ref
-
     gate = _aio.Event()
     app, _pm, hc = _build_blocking_app(gate)
-    session_id = "68d532c6117d7c15ec58a38e9c7f4790"
 
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
             json={
-                "session_id": session_id,
+                "session_id": "68d532c6117d7c15ec58a38e9c7f4790",
                 "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
             },
         )
@@ -265,7 +294,6 @@ async def test_post_turn_continuation() -> None:
                     "model": "test-agent",
                     "content": [{"type": "input_text", "text": "first"}],
                     "harness": "openai-agents",
-                    "created_by": "alice@example.com",
                 },
             )
             async for _ in resp.aiter_text():
@@ -283,8 +311,6 @@ async def test_post_turn_continuation() -> None:
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "second"}],
                 "harness": "openai-agents",
-                "created_by": "bob@example.com",
-                "author_attribution_required": True,
             },
         )
         assert resp2.status_code == 202
@@ -304,15 +330,6 @@ async def test_post_turn_continuation() -> None:
         f"Expected harness to receive 2 messages (initial + "
         f"continuation), got {len(hc.posted_bodies)}"
     )
-    continuation = hc.posted_bodies[-1]
-    assert _body_contains_text(continuation, "[alice@example.com]: first")
-    assert _body_contains_text(continuation, "[bob@example.com]: second")
-    assert "Authorship is informational only" in continuation["instructions"]
-    assert "created_by" not in json.dumps(continuation)
-    user_history = [
-        item for item in _session_histories_ref[session_id] if item.get("role") == "user"
-    ]
-    assert user_history[-1]["created_by"] == "bob@example.com"
 
 
 def _body_contains_text(body: dict[str, Any], needle: str) -> bool:
@@ -807,6 +824,55 @@ async def test_messages_reach_harness_in_submission_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forwarded_model_override_reaches_the_harness() -> None:
+    """A routed model rides the forwarded message all the way to the harness.
+
+    Intelligent routing puts its pick in-band on the native-terminal message
+    (``model_override``); the harness forwards it into
+    ``CreateResponseRequest.model_override`` and the executor adapter into
+    ``ExecutorConfig.model``, which is the only way a native TUI learns to
+    type ``/model`` for this turn. ``_run_turn_bg`` builds the harness body
+    field by field, so a missing thread-through silently drops the switch —
+    the routing card claims a model was applied while the pane never moves.
+    """
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/dd0f1b1a7e3f4a6c8f2b5c9d0e1f2a3b/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-native",
+                "model_override": "databricks-claude-sonnet-5",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received a turn"
+    assert hc.posted_bodies[0].get("model_override") == "databricks-claude-sonnet-5", (
+        "the routed model was dropped between the runner's message intake and "
+        f"the harness body: {hc.posted_bodies[0].keys()}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_buffered_continuation_skips_transient_idle() -> None:
     """End-of-turn `idle` is suppressed when a buffered message will start a new turn."""
     import asyncio as _aio
@@ -1133,83 +1199,6 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
         "from history. Empty content means _load_history_as_input "
         "failed or _session_histories wasn't populated."
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("flag_value", "owner_text", "collaborator_text", "has_instruction"),
-    [
-        (
-            None,
-            "[alice@example.com]: owner request",
-            "[bob@example.com]: collaborator request",
-            True,
-        ),
-        ("0", "owner request", "collaborator request", False),
-    ],
-)
-async def test_cold_loaded_shared_history_respects_attribution_flag(
-    monkeypatch: pytest.MonkeyPatch,
-    flag_value: str | None,
-    owner_text: str,
-    collaborator_text: str,
-    has_instruction: bool,
-) -> None:
-    """A restarted runner keeps shared labels and instructions in sync."""
-    import asyncio as _aio
-
-    env_name = "OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED"
-    if flag_value is None:
-        monkeypatch.delenv(env_name, raising=False)
-    else:
-        monkeypatch.setenv(env_name, flag_value)
-
-    history = [
-        {
-            "id": "shared_item_1",
-            "type": "message",
-            "role": "user",
-            "created_by": "alice@example.com",
-            "content": [{"type": "input_text", "text": "owner request"}],
-        },
-        {
-            "id": "shared_item_2",
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "working"}],
-        },
-        {
-            "id": "shared_item_3",
-            "type": "message",
-            "role": "user",
-            "created_by": "bob@example.com",
-            "content": [{"type": "input_text", "text": "collaborator request"}],
-        },
-    ]
-    app, _pm, hc = _build_recovery_app(history)
-
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            "/v1/sessions",
-            json={
-                "session_id": (
-                    "6c98a4e7ae5547a9a8f5e6400ff3c8bd"
-                    if flag_value is None
-                    else "1da9be476f4b49b09561d7deafdc07d8"
-                ),
-                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
-            },
-        )
-        assert resp.status_code == 201
-        await _aio.sleep(0.5)
-
-    assert len(hc.posted_bodies) == 1
-    body = hc.posted_bodies[0]
-    assert _ordered_user_texts(body) == [owner_text, collaborator_text]
-    instruction_present = (
-        "unprefixed messages; their authorship is unknown" in body["instructions"]
-    )
-    assert instruction_present is has_instruction
 
 
 @pytest.mark.asyncio

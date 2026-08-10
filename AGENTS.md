@@ -67,6 +67,15 @@ Keep comments short and focused on the code, not on the change history.
   issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
   should be clear without chasing external links.
 
+## Database query names
+
+Application stores use `make_named_managed_session_maker` and give every
+session a stable semantic operation name. The session-level name must describe
+the caller's intent rather than repeat SQL syntax; use a nested
+`query_name_scope` only when one transaction needs distinct names for important
+subqueries. Because the named session covers implicit flush and commit, don't
+add an explicit `flush()` only to make a query name observable.
+
 ## Framework-owned instructions
 
 Keep runtime lifecycle and metadata instructions separate from portable agent

@@ -26,7 +26,7 @@ export function PWAUpdateBanner() {
         "supports-[backdrop-filter]:bg-background/80",
       )}
     >
-      <span className="text-sm text-foreground">A new version of Omnigent is available.</span>
+      <span className="text-ui text-foreground">A new version of Omnigent is available.</span>
       <Button size="sm" onClick={reload}>
         Reload
       </Button>

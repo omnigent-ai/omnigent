@@ -11,13 +11,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import PI_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -29,6 +29,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -47,6 +48,7 @@ from omnigent.native_terminal import url_component
 from omnigent.pi_native_bridge import bridge_dir_for_session_id
 
 _logger = logging.getLogger(__name__)
+
 
 _DEFAULT_PI_COMMAND = "pi"
 _PI_PATH_ENV = "OMNIGENT_PI_PATH"
@@ -124,7 +126,7 @@ def resolve_pi_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_pi_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
             "Native Pi requires the 'pi' CLI on PATH. Install Pi, add it to PATH, "
@@ -246,7 +248,7 @@ def _materialize_pi_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "pi-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Pi is running in the session terminal. Web UI messages are "
@@ -459,7 +461,7 @@ async def _create_pi_session(
     :param terminal_launch_args: Pass-through Pi CLI args to persist.
     :returns: New Omnigent session id.
     """
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -479,7 +481,7 @@ async def _create_pi_session(
     return new_session_id
 
 
-async def _fetch_pi_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_pi_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

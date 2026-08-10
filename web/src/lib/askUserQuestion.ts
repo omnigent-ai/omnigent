@@ -135,13 +135,13 @@ export function parseAskUserQuestionPreview(preview: string): AskUserQuestionPay
       const label = optRec.label;
       if (typeof label !== "string" || !label) continue;
       const description = optRec.description;
-      const preview = optRec.preview;
+      const optionPreview = optRec.preview;
       const option: ClaudeQuestionOption = {
         label,
         description: typeof description === "string" ? description : "",
       };
-      if (typeof preview === "string" && preview) {
-        option.preview = preview;
+      if (typeof optionPreview === "string" && optionPreview) {
+        option.preview = optionPreview;
       }
       options.push(option);
     }

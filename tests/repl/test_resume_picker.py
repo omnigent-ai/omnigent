@@ -24,9 +24,11 @@ Three layers:
 from __future__ import annotations
 
 import io
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -839,7 +841,7 @@ class _BadgeRow:
     id: str = "e1f7c651c9f97fac088ea70ef633409d"
     title: str | None = "test"
     created_at: int = 0
-    labels: dict[str, str] | None = None
+    labels: Mapping[str, str] | None = None
 
 
 def test_runtime_badge_claude_native() -> None:
@@ -867,6 +869,22 @@ def test_runtime_badge_codex_native() -> None:
     assert _runtime_badge(row) == "[codex]"
 
 
+def test_read_only_mapping_labels_drive_badge_and_launch_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All Mapping implementations follow the same wrapper-label paths."""
+    from omnigent.repl import _resume_picker
+
+    state = SimpleNamespace(working_directory="/tmp/workspace")
+    monkeypatch.setattr(_resume_picker, "_read_codex_launch_state", lambda _session_id: state)
+    row = _BadgeRow(
+        labels=MappingProxyType({"omnigent.wrapper": "codex-native-ui"}),
+    )
+
+    assert _resume_picker._runtime_badge(row) == "[codex]"
+    assert _resume_picker._launch_state_for_row(row) is state
+
+
 @pytest.mark.parametrize(
     "labels",
     [
@@ -878,7 +896,7 @@ def test_runtime_badge_codex_native() -> None:
         None,
     ],
 )
-def test_runtime_badge_non_claude_native(labels: dict[str, str] | None) -> None:
+def test_runtime_badge_non_claude_native(labels: Mapping[str, str] | None) -> None:
     """
     Everything that isn't explicitly claude-native renders as
     ``[chat]``. Covers the empty-labels case (no labels written
