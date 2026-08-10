@@ -161,6 +161,12 @@ class AcpAgentConfig:
     :param omnigent_mcp: Expose Omnigent's builtin tools to the agent via
         ``session/new.mcpServers`` (the shared ``serve-mcp`` relay). On by
         default; the global ``OMNIGENT_ACP_MCP=0`` kill switch also disables it.
+    :param env_passthrough: Environment variable *names* this agent may read at
+        spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
+        this executor drives an arbitrary agent, so it cannot infer the family
+        the agent authenticates with — an agent that reads a variable must name
+        it here (or in ``os_env.sandbox.env_passthrough``) or it starts
+        unauthenticated. Names only; values come from the host environment.
     """
 
     command: str
@@ -169,6 +175,7 @@ class AcpAgentConfig:
     session_id_mode: str = "server"
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
+    env_passthrough: tuple[str, ...] = ()
 
 
 class _AcpRequestError(Exception):
@@ -491,9 +498,14 @@ class AcpExecutor(Executor):
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             self._pending.pop(req_id, None)
-            raise
+            # asyncio.TimeoutError carries no message, so a caller reporting it
+            # by str() would surface a blank failure. Name the stalled call.
+            raise TimeoutError(
+                f"ACP agent {self._config.name!r} did not answer {method} "
+                f"within {timeout:g}s (command: {self._config.command!r})"
+            ) from exc
 
     # ------------------------------------------------------------------
     # ACP handshake
@@ -502,17 +514,24 @@ class AcpExecutor(Executor):
     def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the generic ACP subprocess.
 
-        Deny-by-default: base + the spec's ``env_passthrough``. No prefix family
-        is added because the executor cannot know which vendor an arbitrary ACP
-        agent belongs to. Previously ``os.environ.copy()`` handed the CLI every
-        host secret (#3445).
+        Deny-by-default: base + the names declared by the agent's own config and
+        by the spec's ``os_env.sandbox.env_passthrough``. No prefix family is
+        added because the executor cannot know which vendor an arbitrary ACP
+        agent belongs to; an agent that authenticates from a variable names it
+        instead, which keeps every *other* provider's secret out.
 
         Kept as a named builder so the spawn-env canary can drive the real thing
-        rather than a hand-copied prefix list.
+        rather than a hand-copied prefix list. The canary constructs a bare
+        executor carrying only what the builder reads, so the agent config is
+        read defensively rather than assumed present.
         """
+        config = getattr(self, "_config", None)
         return clean_agent_env(
             allow_prefixes=(),
-            extra_allowed=declared_passthrough(self._os_env),
+            extra_allowed=(
+                *getattr(config, "env_passthrough", ()),
+                *declared_passthrough(self._os_env),
+            ),
         )
 
     def _warn_initialize_failed(self, reason: str) -> None:
