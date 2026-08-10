@@ -1,10 +1,15 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { ROW_META_SLOT_CLASS } from "./fileStatusUtils";
 import { FolderTree } from "./FolderTree";
 
 afterEach(cleanup);
+beforeEach(() => copyTextMock.mockClear());
 
 /** Render FolderTree (the "All" files tab) with defaults, overriding per test.
  *  Wrapped in a QueryClientProvider because rendered rows call
@@ -165,5 +170,35 @@ describe("FolderTree file size / download alignment", () => {
     const dot = screen.getByText("●");
     const slot = dot.parentElement;
     expect(slot).toHaveClass("w-[22px]");
+  });
+});
+
+describe("FolderTree trailing column", () => {
+  it("gives folders and files alike the same fixed-width trailing slot", () => {
+    // The size label is variable width ("985 B" vs "463 KB"). Letting it size
+    // the column dragged the copy button, the download button and the status
+    // marker to a different x on every row (~16px of measured drift). Every
+    // row -- including folders, which show no size at all -- now renders the
+    // same fixed slot, so those controls line up in one column.
+    renderTree({ files: [file("tiny.txt", 985), file("huge.json", 474_000), dir("src")] });
+
+    const copyButtons = screen.getAllByRole("button", { name: /^Copy (path|folder path):/ });
+    expect(copyButtons).toHaveLength(3);
+    for (const button of copyButtons) {
+      const slot = button.nextElementSibling;
+      expect(slot, "every row needs a trailing slot after the copy button").not.toBeNull();
+      expect(slot).toHaveClass(ROW_META_SLOT_CLASS);
+    }
+  });
+
+  it("offers a copy button on directory rows, not just files", () => {
+    // Directories are paths worth copying too. The row used to be a single
+    // <button>, so a copy control could not be nested inside it at all --
+    // hence the wrapper-div restructure.
+    renderTree({ files: [dir("src")] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy folder path: src" }));
+
+    expect(copyTextMock).toHaveBeenCalledWith("src");
   });
 });

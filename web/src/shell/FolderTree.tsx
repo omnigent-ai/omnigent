@@ -10,7 +10,12 @@ import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { type ChangedSort, compareChangedFiles, type SortableFile } from "./FlatFileList";
-import { formatBytes, gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
+import {
+  ROW_META_SLOT_CLASS,
+  formatBytes,
+  gitStatusLabel,
+  gitStatusLetter,
+} from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
@@ -511,21 +516,22 @@ function FileRowItem({
           )}
         </button>
         <CopyPathButton path={path} revealOnHover />
-        {bytes !== null && !isDeleted ? (
-          <div className="relative shrink-0 flex items-center">
+        {/* Always rendered, even when there is no size to show, so every row
+            (including directories) shares one trailing column. */}
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
+          {bytes !== null && !isDeleted && (
             <span className="text-muted-foreground text-[10px] group-hover:invisible">
               {formatBytes(bytes)}
             </span>
-            {conversationId && (
-              <span className="absolute inset-0 flex items-center justify-center">
-                <FileDownloadButton conversationId={conversationId} path={path} />
-              </span>
-            )}
-          </div>
-        ) : (
-          !isDeleted &&
-          conversationId && <FileDownloadButton conversationId={conversationId} path={path} />
-        )}
+          )}
+          {!isDeleted && conversationId && (
+            <span className="absolute inset-0 flex items-center justify-end">
+              <FileDownloadButton conversationId={conversationId} path={path} />
+            </span>
+          )}
+        </span>
       </div>
       {tooltip}
     </li>
@@ -679,35 +685,47 @@ function TreeNodeRow({
 
   return (
     <li>
-      <button
-        type="button"
-        className="group relative flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-md py-1 pr-2 text-left hover:bg-muted"
+      {/* The row is a div, not a button: the copy button below is a sibling of
+          the toggle, and a button nested inside a button is invalid HTML. The
+          toggle still spans everything up to the copy button, so the clickable
+          area is effectively unchanged. */}
+      <div
+        className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
         style={{ paddingLeft: `${indentFor(depth)}px` }}
-        onClick={() => onTogglePath(node.path)}
-        aria-expanded={open}
       >
         <IndentGuides depth={depth} />
-        <ChevronRightIcon
-          className={cn(
-            "size-3.5 shrink-0 text-muted-foreground transition-transform",
-            open && "rotate-90",
-          )}
-        />
-        <span
-          className={cn(
-            "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
-            dirStatus === "created" && "font-semibold",
-            dirDotClass,
-          )}
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+          onClick={() => onTogglePath(node.path)}
+          aria-expanded={open}
         >
-          {node.name}/
-        </span>
-        {dirStatus && (
-          <span className="flex w-[22px] shrink-0 items-center justify-center" aria-hidden>
-            <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
+          <ChevronRightIcon
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground transition-transform",
+              open && "rotate-90",
+            )}
+          />
+          <span
+            className={cn(
+              "min-w-0 flex-1 truncate font-mono text-ui md:text-sm",
+              dirStatus === "created" && "font-semibold",
+              dirDotClass,
+            )}
+          >
+            {node.name}/
           </span>
-        )}
-      </button>
+          {dirStatus && (
+            <span className="flex w-[22px] shrink-0 items-center justify-center" aria-hidden>
+              <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
+            </span>
+          )}
+        </button>
+        <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
+        {/* Empty, but present: keeps folders on the same trailing column as
+            files, which carry a size here. */}
+        <span className={cn("shrink-0", ROW_META_SLOT_CLASS)} />
+      </div>
       {open && (
         <ul className="flex flex-col gap-0.5">
           {lazyLoading && (

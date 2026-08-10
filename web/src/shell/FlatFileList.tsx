@@ -3,7 +3,7 @@ import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorksp
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
+import { ROW_META_SLOT_CLASS, gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
@@ -104,25 +104,30 @@ function FileListItem({
           </span>
           {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
         </button>
-        {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
-          <span
-            className="shrink-0 font-mono text-[10px]"
-            aria-label={[
-              file.lines_added !== null && `${file.lines_added} lines added`,
-              file.lines_removed !== null && `${file.lines_removed} removed`,
-            ]
-              .filter(Boolean)
-              .join(", ")}
-          >
-            {file.lines_added !== null && (
-              <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-            )}
-            {file.lines_added !== null && file.lines_removed !== null && " "}
-            {file.lines_removed !== null && (
-              <span className="text-destructive">&minus;{file.lines_removed}</span>
-            )}
-          </span>
-        )}
+        {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
+            "+1204 −318") would otherwise shift the copy button and status
+            letter to a different x on every row. */}
+        <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
+          {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
+            <span
+              className="font-mono text-[10px]"
+              aria-label={[
+                file.lines_added !== null && `${file.lines_added} lines added`,
+                file.lines_removed !== null && `${file.lines_removed} removed`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+            >
+              {file.lines_added !== null && (
+                <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+              )}
+              {file.lines_added !== null && file.lines_removed !== null && " "}
+              {file.lines_removed !== null && (
+                <span className="text-destructive">&minus;{file.lines_removed}</span>
+              )}
+            </span>
+          )}
+        </span>
         <CopyPathButton path={file.path} revealOnHover />
         <span className="relative flex shrink-0 items-center justify-center">
           <span

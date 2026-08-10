@@ -944,11 +944,15 @@ describe("FilesPanel tree (Explore) search", () => {
 
     // src/ (folder) and README.md (file) are both top-level → same depth, so
     // the chevron and the file icon start at the same x (BASE_PAD = 8px).
+    // Both row types are a wrapper div carrying the indent, with the clickable
+    // element nested inside — folders included, so the copy button can be a
+    // sibling of the toggle rather than a button inside a button.
     const folderButton = screen.getByRole("button", { name: /src\//i });
+    const folderRow = folderButton.closest("div");
     const fileRow = screen.getByText("README.md").closest("div");
-    if (!fileRow) throw new Error("file row container not found");
-    expect(folderButton.style.paddingLeft).toBe(fileRow.style.paddingLeft);
-    expect(folderButton.style.paddingLeft).toBe("8px");
+    if (!folderRow || !fileRow) throw new Error("row container not found");
+    expect(folderRow.style.paddingLeft).toBe(fileRow.style.paddingLeft);
+    expect(folderRow.style.paddingLeft).toBe("8px");
 
     // Minimal layout: folders show ONLY a chevron (no folder icon) before the
     // name. The folder row should contain exactly one svg (the chevron).
