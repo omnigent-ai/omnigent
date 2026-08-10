@@ -51,6 +51,7 @@ import {
   SquarePenIcon,
   Trash2Icon,
   XIcon,
+  PanelLeftOpenIcon,
 } from "lucide-react";
 import {
   DndContext,
@@ -154,6 +155,11 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import {
+  type SessionFilter,
+  readSessionFilter,
+  writeSessionFilter,
+} from "@/lib/sessionFilterPreferences";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
@@ -220,9 +226,10 @@ function SidebarRowDataProvider({
 /**
  * Which slice of sessions the sidebar shows. ``"mine"``/``"shared"`` split by
  * ownership (see :func:`isOwnedByViewer`); ``"archived"`` is the only slice
- * that includes archived sessions.
+ * that includes archived sessions. The vocabulary lives with the persistence
+ * helpers, which validate a stored value against it.
  */
-type SidebarTab = "all" | "mine" | "shared" | "archived";
+type SidebarTab = SessionFilter;
 
 const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
   { value: "all", label: "All sessions" },
@@ -248,6 +255,12 @@ interface SidebarProps {
   open: boolean;
   onClose: () => void;
   /**
+   * Pin a peeking sidebar fully open (the in-sidebar toggle shown while
+   * peeking). Optional (defaults to a no-op) so the sidebar renders standalone
+   * in tests.
+   */
+  onOpen?: () => void;
+  /**
    * Live open fraction (0 = closed, 1 = open) while the iOS shell's left-edge
    * swipe is dragging the sidebar; `null` when not dragging. When set, the
    * mobile overlay tracks it directly (transition suppressed) so the drawer
@@ -262,6 +275,10 @@ interface SidebarProps {
    * Optional (defaults to a no-op) so the sidebar renders standalone in tests.
    */
   onOpenSearch?: () => void;
+  /**
+   * Whether the sidebar is peeking.
+   */
+  peek?: boolean;
 }
 
 /**
@@ -445,18 +462,27 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored]);
 }
 
-export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
+export function Sidebar({
+  open,
+  onClose,
+  onOpen,
+  dragProgress = null,
+  onOpenSearch,
+  peek,
+}: SidebarProps) {
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
   // (from the Sessions header or the Projects header kebab, respectively).
   const [selectionScope, setSelectionScope] = useState<SelectionScope>("sessions");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  // Active filter from the Sessions heading's menu.
-  const [activeTab, setActiveTab] = useState<SidebarTab>("all");
   // A loopback-only server has one user, so "Shared" is meaningless there —
   // the filter menu drops that option. Mirrors AppShell's `shareDisabled`.
+  // Read before the filter state, which validates a stored "shared" against it.
   const multiUser = !isCurrentServerLocal();
+  // Active filter from the Sessions heading's menu, seeded from the persisted
+  // preference so a reload keeps the slice the viewer was last on.
+  const [activeTab, setActiveTab] = useState<SidebarTab>(() => readSessionFilter(multiUser));
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
@@ -507,11 +533,13 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // switch keeps the bulk-action count honest with the visible tab (the viewer
   // re-enters per tab) instead of carrying stale rows across. Every path that
   // changes the tab must go through here — not a bare setActiveTab — or the
-  // selection cleanup is skipped (e.g. the "New session" snap-back below).
+  // selection cleanup and the persisted preference are skipped (e.g. the
+  // "New session" snap-back below).
   const switchTab = useCallback(
     (tab: SidebarTab) => {
       if (selectionMode) exitSelectionMode();
       setActiveTab(tab);
+      writeSessionFilter(tab);
     },
     [selectionMode, exitSelectionMode],
   );
@@ -636,11 +664,37 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // interactive even though `open` hasn't flipped yet — treat a live drag as
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
-  const effectiveOpen = open || dragging;
+  const effectiveOpen = open || dragging || peek;
+
+  // While peeking, leaving the card closes it after a short grace period;
+  // re-entering before that fires cancels the close so a wobble doesn't
+  // dismiss it.
+  const peekCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPeekClose = useCallback(() => {
+    if (peekCloseTimer.current) {
+      clearTimeout(peekCloseTimer.current);
+      peekCloseTimer.current = null;
+    }
+  }, []);
+  useEffect(() => cancelPeekClose, [cancelPeekClose]);
 
   return (
     <aside
       aria-label="Conversations"
+      onPointerEnter={cancelPeekClose}
+      onPointerLeave={() => {
+        if (!peek) return;
+        cancelPeekClose();
+        // Defer closing if any context menu is open
+        const tryClose = () => {
+          if (document.querySelector('[role="menu"][data-state="open"]')) {
+            peekCloseTimer.current = setTimeout(tryClose, 200);
+            return;
+          }
+          onClose();
+        };
+        peekCloseTimer.current = setTimeout(tryClose, 200);
+      }}
       className={cn(
         // Base: bg + flex column. No transition — expand/collapse snaps
         // instantly (animating the width also lagged drag-to-resize).
@@ -671,8 +725,17 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // divider — no outer margin or rounding. Width (the user-resizable
         // variable) animates →0 to push main; when closed the border
         // collapses too so nothing lingers.
-        "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
-        open ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+        "md:translate-x-0 md:overflow-hidden",
+        // Normal desktop flow: relative panel that pushes main. Suppressed while
+        // peeking so its `md:inset-auto`/`md:relative` don't override the
+        // floating-card positioning below (same `md:` layer, source order wins).
+        !peek && "md:relative md:inset-auto",
+        open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+        // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
+        // ringed and shadowed, sliding+fading in from the left so it reads as an
+        // overlay rather than a push.
+        peek &&
+          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
       )}
       style={
         {
@@ -695,11 +758,15 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
       {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
           full-screen overlay with no resize affordance; the parent's ``inert``
-          when closed also keeps it from being draggable while collapsed. */}
-      <div
-        {...resizeHandleProps}
-        className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
-      />
+          when closed also keeps it from being draggable while collapsed.
+          Hidden while peeking too — the peek card is a fixed-width flyout, not
+          a resizable panel. */}
+      {!peek && (
+        <div
+          {...resizeHandleProps}
+          className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+        />
+      )}
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
@@ -758,26 +825,49 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Settings</TooltipContent>
               </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Close sidebar"
-                    onClick={onClose}
-                    className="size-6 text-muted-foreground hover:text-foreground"
-                  >
-                    {/* panel-right-open while the sidebar IS open — this button
+              {!peek ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Close sidebar"
+                      onClick={onClose}
+                      className="size-6 text-muted-foreground hover:text-foreground"
+                    >
+                      {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
                     covers the collapsed state). */}
-                    <PanelRightOpenIcon className="ui-icon" />
-                  </Button>
-                </TooltipTrigger>
-                {/* Bottom placement keeps the tooltip clear of the macOS
+                      <PanelRightOpenIcon className="ui-icon" />
+                    </Button>
+                  </TooltipTrigger>
+                  {/* Bottom placement keeps the tooltip clear of the macOS
                 Electron shell's traffic lights at the window's top edge. */}
-                <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
-              </Tooltip>
+                  <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
+                </Tooltip>
+              ) : (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Open sidebar"
+                      onClick={onOpen}
+                      className="size-6 text-muted-foreground hover:text-foreground"
+                    >
+                      {/* panel-right-open while the sidebar IS open — this button
+                    only renders in the open state (ChatHeader's PanelLeftIcon
+                    covers the collapsed state). */}
+                      <PanelLeftOpenIcon className="ui-icon" />
+                    </Button>
+                  </TooltipTrigger>
+                  {/* Bottom placement keeps the tooltip clear of the macOS
+                Electron shell's traffic lights at the window's top edge. */}
+                  <TooltipContent side="bottom">Open sidebar</TooltipContent>
+                </Tooltip>
+              )}
             </div>
           </div>
 
@@ -878,7 +968,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                         ? "1 inbox item waiting"
                         : `${inboxCount} inbox items waiting`
                     }
-                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-accent/15 px-1 text-10 font-medium text-brand-accent tabular-nums"
                   >
                     {inboxCount}
                   </span>
@@ -3307,7 +3397,12 @@ function ConversationRow({
             : sessionState !== null
               ? "pr-28 md:pr-8"
               : "pr-28 md:pr-2"),
-        !selectionMode && "md:group-hover:pr-14 md:group-focus-within:pr-14",
+        // The narrowed reserve must track exactly when the trailing controls
+        // appear and the state marker fades — both keyed on `:focus-visible`.
+        // `focus-within` also fires for a plain click, which shrank the reserve
+        // on the selected row while the marker stayed put, sliding the title
+        // under it.
+        !selectionMode && "md:group-hover:pr-14 md:group-has-[:focus-visible]:pr-14",
         !selectionMode && menuOpen && "md:pr-14",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,

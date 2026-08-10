@@ -1595,6 +1595,7 @@ def _build_acp_spawn_env(
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
         acp_agents,
+        parse_env_passthrough,
         resolve_acp_agent,
     )
 
@@ -1618,6 +1619,7 @@ def _build_acp_spawn_env(
             name=name.strip(),
             command=command.strip(),
             omnigent_mcp=omnigent_mcp,
+            env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
@@ -1632,6 +1634,9 @@ def _build_acp_spawn_env(
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
+        if agent.env_passthrough:
+            # Names only; the harness reads each value from its own environment.
+            env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
 
         model = _resolve_spec_model(spec)
         if model is not None and not model.startswith(("databricks-", "databricks/")):

@@ -433,6 +433,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # not match what the host owner configured (e.g. a non-standard
         # kubeconfig location or a colon-separated multi-file list).
         "KUBECONFIG",
+        # ssh-agent socket path. Same class as KUBECONFIG above: a path to a
+        # unix socket, not a bearer secret. Without it every runner-spawned
+        # context (sys_os_shell, terminal panes, coding sub-agents) loses
+        # ssh-agent auth, so git-over-SSH and SSH-cert-authenticated tooling
+        # fail with "dial unix: missing address".
+        "SSH_AUTH_SOCK",
         # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
         # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
         # telemetry.init() no-ops there and omni-runner / omni-harness export

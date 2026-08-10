@@ -436,3 +436,65 @@ async def test_web_ui_serves_pwa_service_worker_and_manifest(
     # is no-cache for the same reason as sw.js — a stale sentinel must not linger.
     assert version.status_code == 200
     assert version.headers["cache-control"] == app_module._WEB_UI_HTML_CACHE_CONTROL
+
+
+async def test_unmatched_api_path_404s_for_every_method(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unmatched ``/v1`` path 404s regardless of HTTP method.
+
+    The web UI is mounted at ``/`` and sees every unmatched request.
+    Starlette's ``StaticFiles`` answers any non-GET with 405, which reads as
+    "the endpoint exists, wrong method", so a client pointed at the wrong
+    base URL (e.g. one carrying the workspace web-UI path) sees
+    ``405 Method Not Allowed`` from ``POST /v1/sessions`` and blames the
+    server instead of its own URL.
+
+    :param runtime_init: Fixture that initializes the runtime with a mock LLM.
+    :param db_uri: Test database URI.
+    :param tmp_path: Pytest temporary directory fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    web_ui_dist = tmp_path / "web-ui"
+    web_ui_dist.mkdir(parents=True)
+    (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
+    monkeypatch.setattr(app_module, "_WEB_UI_DIST", web_ui_dist)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = app_module.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # The reported crash: a base URL carrying the web-UI path, so the
+        # bundled-create route never matches.
+        prefixed = await client.post(
+            "/omnigent/v1/sessions",
+            data={"metadata": "{}"},
+            files={"bundle": ("agent.tar.gz", b"x", "application/gzip")},
+        )
+        unmatched_post = await client.post("/v1/nope", json={})
+        unmatched_get = await client.get("/v1/nope")
+        # OPTIONS is covered too. No CORS middleware is installed, so a
+        # preflight reaching this mount was already a 405 that no browser
+        # could use; 404 is the more accurate answer, not a lost capability.
+        unmatched_options = await client.request("OPTIONS", "/v1/nope")
+        # An extensionless non-API path still gets the SPA shell.
+        spa = await client.get("/c/conv_abc123")
+
+    for resp in (prefixed, unmatched_post, unmatched_get, unmatched_options):
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["error"]["code"] == "not_found"
+    assert spa.status_code == 200
+    assert "<div id='root'>" in spa.text

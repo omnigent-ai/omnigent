@@ -58,9 +58,10 @@ def test_files_rail_working_folder_header_is_a_static_label(
     expect(rail.get_by_text("Working folder")).to_be_visible(timeout=30_000)
     expect(rail.get_by_role("button", name=re.compile("Working folder"))).to_have_count(0)
 
-    # The content is always shown: the file-scope switch (Changed | All) is
-    # visible with no toggle needed.
-    expect(rail.get_by_role("radiogroup", name="File scope")).to_be_visible()
+    # The content is always shown: the Files (tree) search box is visible with
+    # no toggle needed. Scope is the rail tab now (Files vs Changes), not an
+    # in-panel switch.
+    expect(rail.get_by_role("searchbox", name="Search all files")).to_be_visible()
 
 
 _FAKE_HOST_ID = "host_files_panel_browse"
@@ -179,9 +180,9 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
+    # The Files tab is the folder tree (not the changed-files list) -- the
+    # tree is what re-roots.
     rail.get_by_role("tab", name=re.compile("^Files")).click()
-    # The folder tree (not the changed-files list) is what re-roots.
-    rail.get_by_role("radio", name="All").click()
 
     # The header path is the control: it shows where we are and opens the
     # browser. (The test above is this same header with the host binding

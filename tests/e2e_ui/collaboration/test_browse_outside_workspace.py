@@ -199,7 +199,6 @@ def _open_files_tree(page: Page, base_url: str, session_id: str) -> None:
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Files")).click()
-    rail.get_by_role("radio", name="All").click()
 
 
 def _absolute_fs_url(base_url: str, session_id: str, target: Path) -> str:
@@ -270,7 +269,9 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         # Positive signal first: bob's panel really rendered. Without this the
         # "control is absent" assertion below would also pass on a panel that
         # failed to load at all.
-        expect(bob_rail.get_by_role("radiogroup", name="File scope")).to_be_visible(timeout=30_000)
+        expect(bob_rail.get_by_role("searchbox", name="Search all files")).to_be_visible(
+            timeout=30_000
+        )
 
         # The control is not offered at all. `reachable` is identical for every
         # viewer (it describes the ENVIRONMENT), so the panel must additionally
