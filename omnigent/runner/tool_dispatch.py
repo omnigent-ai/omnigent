@@ -1769,6 +1769,7 @@ async def _execute_subagent_tool(
         )
         if isinstance(existing, str):
             return existing
+    assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
     if existing is not None:
