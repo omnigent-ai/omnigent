@@ -5411,6 +5411,30 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
+# Transient runner-tunnel drops (Apps ingress recycles, sleep-wake
+# reconnects) usually re-register in well under a second, and the worst
+# observed ingress-recycle burst took ~5s of failed attempts before the
+# tunnel was back. Hold the user-visible failure surface for double that
+# so those drops resolve silently; a runner still gone afterwards fails
+# as before. Crash-reported runner deaths bypass this grace entirely.
+RUNNER_DISCONNECT_GRACE_S: float = 10.0
+# Delay between relay stream reconnect attempts inside the grace window.
+_RELAY_RETRY_INTERVAL_S: float = 0.5
+
+
+class _RelayTransportLost(Exception):
+    """Runner stream transport dropped mid-relay.
+
+    :param intentional: Whether the session carried the intentional-stop
+        marker when the transport dropped, snapshotted before the relay
+        teardown consumes it.
+    """
+
+    def __init__(self, *, intentional: bool) -> None:
+        super().__init__("runner stream transport lost")
+        self.intentional = intentional
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -5418,7 +5442,107 @@ async def _relay_runner_stream(
     ready: asyncio.Event | None = None,
 ) -> None:
     """
+    Run the runner-stream relay, riding out transient tunnel drops.
+
+    Transport drops from ingress recycles and sleep-wake reconnects
+    re-register the runner within :data:`RUNNER_DISCONNECT_GRACE_S`, so a
+    lost stream retries inside that window instead of failing the
+    session. The ``failed`` status (with durable ``runner_disconnected``
+    labels) publishes only when the runner stays gone past the grace; an
+    intentional Stop still exits quietly at once.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param runner_client: HTTP client pointed at the runner.
+    :param conversation_store: Store for persisting conversation items
+        extracted from the runner's SSE stream.
+    :param ready: Optional event set once the runner stream emits its
+        ready heartbeat; see :func:`_relay_runner_stream_once`.
+    """
+    loop = asyncio.get_running_loop()
+    deadline: float | None = None
+    while True:
+        started = loop.time()
+        try:
+            await _relay_runner_stream_once(
+                session_id,
+                runner_client,
+                conversation_store,
+                ready,
+            )
+            return
+        except _RelayTransportLost as lost:
+            now = loop.time()
+            # An attempt that streamed longer than the grace was a live
+            # tunnel dropping anew — give the new outage a fresh window.
+            if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
+                deadline = now + RUNNER_DISCONNECT_GRACE_S
+            if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
+                _logger.info(
+                    "Relay: runner transport lost for session=%s; retrying for %.1fs",
+                    session_id,
+                    deadline - now,
+                )
+                await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
+                continue
+            _logger.warning(
+                "Relay: runner transport lost for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            if lost.intentional:
+                # User clicked Stop: the Stop handler brought this runner's
+                # tunnel down on purpose (see _stop_session_host_runner), so
+                # the drop is expected — not a failure. Publish a quiet idle
+                # and clear any error label so the chat and sidebar settle
+                # to a stopped state instead of rendering
+                # "Error · runner_disconnected". The one-shot marker was
+                # already consumed by the relay teardown, so a genuine later
+                # disconnect surfaces normally.
+                _publish_status(session_id, "idle")
+                await _persist_session_status_error_labels(
+                    session_id,
+                    None,
+                    conversation_store,
+                )
+            else:
+                # Publish a failed status so the client's SSE stream sees a
+                # clean error event instead of silent truncation (#1114).
+                disconnect_error = ErrorDetail(
+                    code="runner_disconnected",
+                    message="Runner disconnected unexpectedly.",
+                )
+                _publish_status(session_id, "failed", disconnect_error)
+                # Persist the disconnect cause as durable labels so the
+                # distinction survives into snapshots and child-session
+                # summaries. Without this the relay-fed cache only carries a
+                # generic ``failed`` and ``last_task_error`` is dropped,
+                # leaving the UI unable to tell a benign runner disconnect
+                # from a real task failure (Option B: render a "Disconnected"
+                # pill, not the red "Failed" pill). Cleared on the next
+                # ``running`` edge by the session.status handler, exactly
+                # like other failure labels.
+                await _persist_session_status_error_labels(
+                    session_id,
+                    disconnect_error,
+                    conversation_store,
+                )
+            return
+
+
+async def _relay_runner_stream_once(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
+    ready: asyncio.Event | None = None,
+) -> None:
+    """
     Subscribe to the runner's SSE stream and relay events locally.
+
+    One connection attempt: transport loss raises
+    :class:`_RelayTransportLost` for the :func:`_relay_runner_stream`
+    supervisor, which retries inside the disconnect grace and owns the
+    terminal failure / quiet-stop handling.
 
     Long-lived background task that opens
     ``GET /v1/sessions/{id}/stream`` on the runner and publishes
@@ -5455,8 +5579,8 @@ async def _relay_runner_stream(
     # (15s). Between turns the runner emits ``session.heartbeat`` every
     # 15s to keep proxies from dropping the idle connection. If 3
     # consecutive heartbeats are missed (45s), the connection is likely
-    # dead — let the relay exit so ``_ensure_runner_relay`` can restart
-    # it on the next ``POST /events``. ``connect`` stays at httpx's
+    # dead — surface it so the supervising retry loop reconnects (or,
+    # past the grace, fails the session). ``connect`` stays at httpx's
     # default (5s); ``write``/``pool`` are not rate-limiting here.
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
     try:
@@ -5870,50 +5994,12 @@ async def _relay_runner_stream(
                         continue
                     session_stream.publish(session_id, event)
 
-    except (httpx.HTTPError, ConnectionError):
-        # WSTunnelTransport raises bare ConnectionError on tunnel
-        # close; treat the same as HTTPError so the task exits
-        # gracefully instead of leaving an unretrieved exception.
-        _logger.warning(
-            "Relay: runner transport lost for session=%s",
-            session_id,
-            exc_info=True,
-        )
-        if session_id in _intentional_stop_sessions:
-            # User clicked Stop: the Stop handler brought this runner's tunnel
-            # down on purpose (see _stop_session_host_runner), so the drop is
-            # expected — not a failure. Publish a quiet idle and clear any error
-            # label so the chat and sidebar settle to a stopped state instead of
-            # rendering "Error · runner_disconnected". One-shot: discard the
-            # marker so a genuine later disconnect surfaces normally.
-            _intentional_stop_sessions.discard(session_id)
-            _publish_status(session_id, "idle")
-            await _persist_session_status_error_labels(
-                session_id,
-                None,
-                conversation_store,
-            )
-        else:
-            # Publish a failed status so the client's SSE stream sees a
-            # clean error event instead of silent truncation (#1114).
-            disconnect_error = ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            )
-            _publish_status(session_id, "failed", disconnect_error)
-            # Persist the disconnect cause as durable labels so the
-            # distinction survives into snapshots and child-session
-            # summaries. Without this the relay-fed cache only carries a
-            # generic ``failed`` and ``last_task_error`` is dropped, leaving
-            # the UI unable to tell a benign runner disconnect from a real
-            # task failure (Option B: render a "Disconnected" pill, not the
-            # red "Failed" pill). Cleared on the next ``running`` edge by the
-            # session.status handler, exactly like other failure labels.
-            await _persist_session_status_error_labels(
-                session_id,
-                disconnect_error,
-                conversation_store,
-            )
+    except (httpx.HTTPError, ConnectionError) as exc:
+        # WSTunnelTransport raises bare ConnectionError on tunnel close;
+        # treat the same as HTTPError. The finally below consumes the
+        # intentional-stop marker, so snapshot it now for the supervisor's
+        # retry-vs-quiet-exit decision.
+        raise _RelayTransportLost(intentional=session_id in _intentional_stop_sessions) from exc
     except asyncio.CancelledError:
         raise
     finally:

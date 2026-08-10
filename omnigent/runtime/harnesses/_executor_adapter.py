@@ -457,7 +457,14 @@ class ExecutorAdapter(HarnessApp):
                                 error=event.message,
                             )
                             agent_span = None
-                        raise RuntimeError(f"inner executor error: {event.message}")
+                        # Never surface a blank "inner executor error: " to the
+                        # operator: an ExecutorError whose message is empty (e.g.
+                        # built from a bare exception) would otherwise report a
+                        # failure with no detail at all (#4281). Executors now
+                        # fall back to repr() at the source; this is the last-line
+                        # guard for any other empty-message path.
+                        detail = event.message or "no detail reported (see runner/harness logs)"
+                        raise RuntimeError(f"inner executor error: {detail}")
         except ElicitationDeclinedError:
             # Fallback for executors that propagate the exception directly
             # (non-SDK / non-spawned-task paths). SDK-based executors use

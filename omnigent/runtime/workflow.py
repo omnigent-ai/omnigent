@@ -2124,6 +2124,16 @@ def _build_copilot_spawn_env(
                 if os.environ.get(_env_var):
                     env["HARNESS_COPILOT_GITHUB_TOKEN"] = os.environ[_env_var]
                     break
+            # No token anywhere: leave it unset so the harness falls back to the
+            # ``gh`` CLI login itself (it may run on a different host than the
+            # runner, where a different ``gh`` session applies).
+    # GitHub Enterprise hostname, when configured — auth and API calls must
+    # target the user's own host rather than github.com.
+    from omnigent.onboarding.copilot_auth import copilot_github_host
+
+    copilot_host = copilot_github_host()
+    if copilot_host is not None:
+        env["HARNESS_COPILOT_GITHUB_HOST"] = copilot_host
     # Always set so the wrap doesn't fall back to ``"all"`` and override an
     # explicit ``skills: none`` from the spec (parity with the peer builders).
     env["HARNESS_COPILOT_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
