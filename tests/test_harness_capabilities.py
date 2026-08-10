@@ -189,6 +189,19 @@ def test_catalog_includes_hermes() -> None:
     assert "capabilities" in hermes
 
 
+def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
+    """A picker row is only honest if the session's choices reach the harness.
+
+    Hermes' model env key is what both threads ``/model`` into the spawn env and
+    (via ``_SDK_MODEL_OVERRIDE_HARNESSES``) makes the server accept the override
+    instead of rejecting it up front."""
+    from omnigent.harness_plugins import model_env_keys
+    from omnigent.model_override import harness_supports_model_override
+
+    assert model_env_keys()["hermes"] == "HARNESS_HERMES_MODEL"
+    assert harness_supports_model_override("hermes")
+
+
 def test_catalog_rows_carry_setup_steps() -> None:
     """Every row exposes an ordered, JSON-serializable setup checklist."""
     rows = {row["id"]: row for row in harness_catalog()}
