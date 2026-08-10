@@ -1789,7 +1789,9 @@ def test_get_openai_client_databricks_model_still_uses_ambient_auth(monkeypatch)
     client = _get_openai_async_client(model="databricks-gpt-5-5")
 
     assert calls == [None], "a 'databricks-' model must still resolve ambient Databricks auth"
-    assert "example.databricks.com" in str(client.base_url)
+    assert (
+        str(client.base_url).rstrip("/") == "https://example.databricks.com/ai-gateway/openai/v1"
+    )
 
 
 def test_get_openai_client_invalid_profile_raises_auth_error(monkeypatch):
