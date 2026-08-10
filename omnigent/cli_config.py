@@ -2701,9 +2701,12 @@ def _manage_copilot_harness() -> None:
     from omnigent.onboarding.copilot_auth import (
         COPILOT_CONFIG_KEY,
         COPILOT_SECRET_NAME,
+        copilot_github_host,
         copilot_github_token_configured,
         copilot_github_token_ref,
         copilot_sdk_installed,
+        copilot_token_removal_settings,
+        gh_cli_github_token,
     )
     from omnigent.onboarding.interactive import select
 
@@ -2727,11 +2730,26 @@ def _manage_copilot_harness() -> None:
         ]
         if token_set:
             rows.append(_HarnessMenuRow("Remove GitHub token", action="remove_key"))
+        host = copilot_github_host(config)
+        rows.append(
+            _HarnessMenuRow(
+                f"Change GitHub Enterprise host ({host})"
+                if host
+                else "Set GitHub Enterprise host",
+                action="set_host",
+            )
+        )
+        if host:
+            rows.append(_HarnessMenuRow("Clear GitHub Enterprise host", action="clear_host"))
         rows.append(_HarnessMenuRow("← Back", action="back"))
 
-        header = (
-            "Copilot — GitHub token configured" if token_set else "Copilot — no GitHub token yet"
-        )
+        if token_set:
+            header = "Copilot — GitHub token configured"
+        elif gh_cli_github_token(host) is not None:
+            # No stored token, but a ``gh auth login`` session works as one.
+            header = "Copilot — using your GitHub CLI login"
+        else:
+            header = "Copilot — no GitHub token yet"
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
             return
@@ -2740,6 +2758,13 @@ def _manage_copilot_harness() -> None:
             return
         if action == "set_key":
             status = _set_copilot_github_token()
+        elif action == "set_host":
+            status = _set_copilot_github_host()
+        elif action == "clear_host":
+            from omnigent.onboarding.copilot_auth import copilot_github_host_settings
+
+            _save_global_config(copilot_github_host_settings(None))
+            status = "✓ Cleared Copilot GitHub Enterprise host"
         elif action == "remove_key":
             ref = copilot_github_token_ref(config)
             # Only the secret we own (``keychain:copilot``) is ours to delete: a
@@ -2748,8 +2773,35 @@ def _manage_copilot_harness() -> None:
             # those cases just drop the config block and leave the secret.
             if ref == f"keychain:{COPILOT_SECRET_NAME}":
                 secret_store.delete_secret(COPILOT_SECRET_NAME)
-            _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            # Keep a configured GHE host: the saver replaces the whole block, so
+            # unsetting it wholesale would discard the host along with the token.
+            if (remaining := copilot_token_removal_settings()) is not None:
+                _save_global_config(remaining)
+            else:
+                _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
             status = "✓ Removed Copilot GitHub token"
+
+
+def _set_copilot_github_host() -> str | None:
+    """Prompt for and store the Copilot GitHub Enterprise host; return a status line.
+
+    Organizations reaching Copilot through a GHE (data-residency) instance need
+    auth and API calls pointed at their own hostname. Stored as
+    ``copilot.github_host`` and forwarded to the Copilot CLI as
+    ``COPILOT_GH_HOST``.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding.copilot_auth import copilot_github_host_settings
+    from omnigent.onboarding.interactive import prompt_text
+
+    entered = prompt_text("GitHub Enterprise hostname (e.g. acme.ghe.com)").strip()
+    if not entered:
+        return None
+    _save_global_config(copilot_github_host_settings(entered))
+    from omnigent.onboarding.copilot_auth import copilot_github_host
+
+    return f"✓ Copilot GitHub Enterprise host set ({copilot_github_host()})"
 
 
 def _set_copilot_github_token() -> str | None:
