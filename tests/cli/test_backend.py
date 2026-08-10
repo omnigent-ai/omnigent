@@ -657,8 +657,13 @@ def _socks_proxy_without_extra(monkeypatch: pytest.MonkeyPatch, base_url: str) -
 def test_host_http_json_reports_failure_when_socks_extra_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A proxy httpx cannot build is a transport failure, not a crash."""
-    base_url = "http://127.0.0.1:8123"
+    """A proxy httpx cannot build is a transport failure, not a crash.
+
+    Uses a remote server because that is where a proxy still applies:
+    loopback targets bypass proxies outright (see the companion test), so
+    there is no proxy transport left to fail to build.
+    """
+    base_url = "https://server.example.com"
     _socks_proxy_without_extra(monkeypatch, base_url)
 
     result = cli._host_http_json(
@@ -670,6 +675,31 @@ def test_host_http_json_reports_failure_when_socks_extra_missing(
 
     assert result.status_code == 0
     assert "socksio" in str(result.body)
+
+
+def test_host_http_json_ignores_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local server is reached directly, never through a proxy.
+
+    A proxy resolves ``127.0.0.1`` against itself, so honoring one here
+    means a developer who exports ``ALL_PROXY`` cannot reach their own
+    server at all — every call fails before it leaves the machine.
+    """
+    base_url = "http://127.0.0.1:8123"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    # The SOCKS transport was never built, so this is an ordinary refused
+    # connection rather than the missing-extra ImportError.
+    assert "socksio" not in str(result.body)
 
 
 def test_daemon_host_online_false_when_socks_extra_missing(

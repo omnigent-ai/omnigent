@@ -849,6 +849,8 @@ def _mint_managed_owner_token(
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
     """
+    from omnigent_client._http import is_loopback_url
+
     from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -860,7 +862,7 @@ def _mint_managed_owner_token(
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
-    with httpx.Client(timeout=10.0) as client:
+    with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()
@@ -1196,6 +1198,8 @@ def create_app(
     # tunnel the runner opened to the Omnigent server at startup).
     # stdio_cwd=runner_workspace ensures relative command paths like
     # ".venv/bin/python" resolve against the user's project root.
+    from omnigent_client._http import is_loopback_url
+
     from omnigent.runner.mcp_manager import RunnerMcpManager
 
     # Reuse the caller's factory when given (shares one resolved SDK auth +
@@ -1205,6 +1209,8 @@ def create_app(
     binding_token = _runner_tunnel_binding_token_from_env()
     server_client = httpx.AsyncClient(
         base_url=server_url,
+        # A proxy cannot reach a loopback server, so local targets bypass it.
+        trust_env=not is_loopback_url(server_url),
         auth=_RunnerDatabricksAuth(auth_token_factory),
         # Announce the runner as a first-party non-browser client via the
         # sentinel Origin. The server's require_trusted_origin CSRF guard on

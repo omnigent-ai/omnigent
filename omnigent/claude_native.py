@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
@@ -1480,7 +1481,12 @@ def _fetch_external_session_id_for_redirect(
     if base_url is None:
         return None
     try:
-        with httpx.Client(base_url=base_url, headers=headers, timeout=10.0) as client:
+        with httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=10.0,
+            trust_env=not is_loopback_url(base_url),
+        ) as client:
             resp = client.get(f"/v1/sessions/{url_component(session_id)}")
         if resp.status_code >= 400:
             return None
@@ -2987,6 +2993,7 @@ async def _is_terminal_resource_gone(
     try:
         async with httpx.AsyncClient(
             base_url=base_url,
+            trust_env=not is_loopback_url(base_url),
             headers=headers,
             timeout=httpx.Timeout(timeout_s),
         ) as client:
@@ -3088,7 +3095,10 @@ async def _close_claude_terminal(
     )
     with contextlib.suppress(Exception):
         async with httpx.AsyncClient(
-            base_url=base_url, headers=headers, timeout=httpx.Timeout(10.0)
+            base_url=base_url,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+            trust_env=not is_loopback_url(base_url),
         ) as client:
             await client.delete(path)
 
@@ -3226,7 +3236,12 @@ async def _prepare_claude_terminal_via_daemon(
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     persist_args = list(_strip_resume_from_claude_args(claude_args))
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         startup_profiler.mark("daemon prepare http client ready")
         # Resuming an existing session must not re-close its terminal on
         # exit; a fresh launch owns teardown.
@@ -3630,7 +3645,12 @@ async def _prepare_claude_terminal(
     """
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         startup_profiler.mark("prepare http client ready")
         cold_resume_args: tuple[str, ...] = ()
         # Cold resume = session existed but no live terminal. Even when

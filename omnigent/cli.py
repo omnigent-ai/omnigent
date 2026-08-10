@@ -5933,7 +5933,10 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
     base_url = base_url.rstrip("/")
 
     with httpx.Client(
-        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=60.0
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url),
+        timeout=60.0,
+        trust_env=_trust_env_for(base_url),
     ) as client:
         resp = client.get("/v1/usage")
         resp.raise_for_status()
@@ -6014,7 +6017,10 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     out_path = Path(output) if output else Path(f"{session_id}.jsonl")
 
     with httpx.Client(
-        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=30.0
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url),
+        timeout=30.0,
+        trust_env=_trust_env_for(base_url),
     ) as client:
         # Fetch session metadata (items fetched separately via pagination).
         resp = client.get(
@@ -6253,7 +6259,10 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
         return client.post("/v1/sessions", json=body)
 
     with httpx.Client(
-        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=120.0
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url),
+        timeout=120.0,
+        trust_env=_trust_env_for(base_url),
     ) as client:
         candidates = [a for a in (exported_agent_id, fallback_agent_id) if a]
         if not candidates:
@@ -8114,6 +8123,21 @@ _host_http_headers_cache: dict[str, dict[str, str]] = {}
 _host_http_headers_lock = threading.Lock()
 
 
+def _trust_env_for(base_url: str) -> bool:
+    """
+    Report whether calls to *base_url* should honor environment proxies.
+
+    A proxy resolves ``127.0.0.1`` against itself, so it can never reach
+    our local server; loopback targets opt out of proxying entirely.
+
+    :param base_url: Server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :returns: ``False`` for a loopback target, ``True`` otherwise.
+    """
+    from omnigent_client._http import is_loopback_url
+
+    return not is_loopback_url(base_url)
+
+
 def _host_http_json(
     *,
     base_url: str,
@@ -8152,6 +8176,7 @@ def _host_http_json(
             base_url=base_url,
             headers=headers,
             timeout=timeout_s,
+            trust_env=_trust_env_for(base_url),
         ) as client:
             resp = client.request(method, path, params=params, json=json_body)
     except (httpx.HTTPError, OSError, ImportError) as exc:
