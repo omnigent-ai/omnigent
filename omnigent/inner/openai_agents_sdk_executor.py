@@ -1025,7 +1025,9 @@ class OpenAIAgentsSDKExecutor(Executor):
         """Create an OpenAIAgentsSDKExecutor.
 
         :param client: A preconfigured ``openai.AsyncOpenAI`` client.  When
-            ``None`` the executor calls :func:`_get_openai_async_client`.
+            ``None`` the executor calls :func:`_get_openai_async_client` and
+            closes the resulting client when the executor is closed. An
+            injected client remains owned by the caller.
         :param profile: Optional ``~/.databrickscfg`` profile name for the
             Databricks fallback path, e.g. ``"<your-profile>"``.
         :param api_key: Direct OpenAI-compatible API key, e.g.
@@ -1089,6 +1091,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         self._client = (
             _wrap_client_for_reasoning_models(raw_client) if not use_responses else raw_client
         )
+        self._owns_client = client is None
         self._profile = profile
         self._use_responses = use_responses
         self._model_override = model
@@ -1181,6 +1184,12 @@ class OpenAIAgentsSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._session_states.pop(session_key, None)
+
+    async def close(self) -> None:
+        """Release session state and the client created by this executor."""
+        self._session_states.clear()
+        if self._owns_client:
+            await self._client.close()
 
     async def interrupt_session(self, session_key: str) -> bool:
         """

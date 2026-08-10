@@ -420,6 +420,31 @@ def test_wrap_client_non_streaming_create_not_wrapped() -> None:
 
 
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
+    def test_close_closes_owned_client_but_not_injected_client(self):
+        class _ClosableClient:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+
+        async def _t():
+            owned_client = _ClosableClient()
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._get_openai_async_client",
+                return_value=owned_client,
+            ):
+                executor = OpenAIAgentsSDKExecutor()
+            await executor.close()
+            self.assertEqual(owned_client.close_calls, 1)
+
+            injected_client = _ClosableClient()
+            executor = OpenAIAgentsSDKExecutor(client=injected_client)
+            await executor.close()
+            self.assertEqual(injected_client.close_calls, 0)
+
+        _run(_t())
+
     def test_sanitize_replay_item_drops_long_ids(self):
         item = {
             "type": "message",
