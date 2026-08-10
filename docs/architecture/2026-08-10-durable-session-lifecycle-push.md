@@ -6,10 +6,17 @@ Linear: [OMN-104](https://linear.app/silica-v1/issue/OMN-104/push-durable-omnige
 
 This document was produced with Debby's two-head debate process (Claude + GPT,
 independently grounded in the current tree, two rounds: opening positions +
-one cross-critique round). Both heads converged on almost everything; the one
-substantive disagreement that survived a full critique round is called out
-explicitly in §5 rather than papered over, with the resolution and its
-rationale.
+one cross-critique round). Both heads' opening positions disagreed sharply on
+whether a durable elicitation table was needed (§5.4) — and, after critique,
+fully converged on building it, with a sharper mechanistic justification
+(two separate in-memory registries, server- and runner-side) than either
+heads' opening answer had. The critique round also caught and corrected a
+real design error (§5.1's now-removed `background_task_count` gate) and an
+incorrect base-class attribution in the original grounding brief (§2.4).
+That process — not just the final answer — is why this went through a full
+debate rather than a single pass: both corrections were caught by one head
+re-verifying a citation against the live tree rather than trusting the other
+head's or the brief's claim at face value.
 
 All file:line citations below were read directly from the current tree
 (`git rev-parse HEAD` == `origin/main` == `b5adc79e8a76a41ffe4ca09799dc852dfc7ca7f5`,
@@ -219,7 +226,9 @@ This precedent's own justification is also its own scope limit (§5, §7).
   never silently changes `data`'s shape under the same version.
 - `sequence` — per-`(workspace_id, session_id)` monotonic integer; see §6.
 - `data` shape per `event_type`:
-  - `session.completed`: `{ "response_id": "...", "background_task_count": 0 }`
+  - `session.completed`: `{ "response_id": "..." }` (informational
+    `background_task_count` may be included from the same `_publish_status`
+    call if non-null, but it is never a gating condition — see §5.1)
   - `session.failed`: `{ "response_id": "...", "reason": { "code": "...", "message": "..." } }`
     (reason is the *same* `ErrorDetail` object already passed into
     `_publish_status` — not re-derived from the `conversation_labels`
@@ -343,6 +352,27 @@ the request/hook path that previously only wrote an in-memory dict. Every
 other `_publish_status` call (the common case — plain `running` mid-turn)
 pays nothing extra, since it doesn't match any of the four gates.
 
+What happens if that synchronous write fails is call-site-dependent, not
+uniform, verified against the two shapes `_publish_status` is actually
+called from:
+
+- **Call sites that originate from a POST handler with existing ack
+  semantics** — e.g. `routes_events.py`'s relay/hook endpoints (which
+  already return a small acknowledgement body per their own
+  `response_model=None` handler comments, around `routes_events.py:239`) —
+  withhold the 200 and return a retryable non-2xx on an outbox-write
+  failure, requiring the runner/relay to replay its stable event. This
+  reuses ack semantics that already exist at those call sites rather than
+  inventing a new protocol, conditional on the calling runner's HTTP client
+  actually retrying on a non-2xx (verify/add this at implementation time).
+- **Internal call sites with no network round trip of their own**
+  (disconnect handling, snapshot reconstruction, native-forwarder code in
+  `orchestration.py`/`helpers.py`) — let the write's exception propagate
+  uncaught into whatever request *did* originate that call chain, and let
+  that outer request's own existing failure/retry semantics handle it. No
+  new protocol needed here; this is the plain "synchronous,
+  error-propagating" behavior, correctly scoped to where it's sufficient.
+
 ---
 
 ## 5. Transition → event mapping, idempotency, terminal-reason derivation
@@ -359,12 +389,23 @@ read is wrong):
   not `None` (a turn was actually open) — read that value *before* the
   existing cache `.pop()` a few lines later, and use it as `response_id` /
   the transition key. A session that never opened a turn, or an `idle`→`idle`
-  no-op write, has no cached `response_id` and correctly emits nothing. Gate
-  additionally on `background_task_count in (None, 0)` and no `blocked_on`
-  value — both already threaded as parameters into `_publish_status`, so
-  this reuses the caller's own "is it really done" resolution
-  (`_background_task_delivery_status()`, `routes_events.py:889`) instead of
-  re-deriving it from a second, driftable source.
+  no-op write, has no cached `response_id` and correctly emits nothing.
+  **No secondary gate on `background_task_count`/`blocked_on`.** An earlier
+  draft of this design proposed additionally gating on
+  `background_task_count in (None, 0)`, reasoning that a lingering
+  background shell means the turn isn't "really" done. That gate is wrong,
+  verified against `_background_task_delivery_status()`
+  (`helpers.py:3164-3199`): its own docstring states it deliberately
+  collapses a claude-native `waiting` back to `idle` *specifically because*
+  "the turn itself is over... deliver idle and let the count speak for the
+  shells." `_publish_status` is called with `idle` only once that
+  resolution has already happened upstream — gating on the count again
+  inside the outbox hook would silently swallow `session.completed` for
+  every claude-native session that ends its turn with a dev-server/watcher
+  still running, which is the common case, not an edge case. Trust the
+  status string `_publish_status` was called with; do not re-derive
+  "is it really done" a second time from the same parameters a caller
+  already resolved it from.
 - `session.failed`: fires on any transition **into** `failed` (not
   swallowed by the sticky guard), using the `ErrorDetail` parameter already
   passed to `_publish_status` verbatim as the `reason` (§3.1) — not
@@ -471,21 +512,51 @@ hard requirement rather than a fallback.** Reasoning:
 3. So: add `session_elicitations` (schema below), written transactionally
    alongside the `session.awaiting_decision` / `session.resumed` outbox
    rows. On the decision endpoint, **always** persist the verdict first.
-   Then attempt reconnection per harness class, with the outcome
-   *explicitly classified in both the API response and the test matrix
-   (§12)* rather than uniformly promised:
-   - Live in-memory `Future` still parked (no restart occurred): resolve it
+   Then attempt reconnection, with the outcome *explicitly classified in
+   both the API response and the test matrix (§12)* rather than uniformly
+   promised.
+
+   **The precise classification axis, sharpened during the debate's second
+   round, is not "harness type" but "which process died."** There are two
+   separate in-memory elicitation registries, not one, verified against the
+   current tree: the **server-side** registry
+   (`_harness_elicitation_registry: dict[str, asyncio.Future[ElicitationResult]]`,
+   `_elicitation_registry.py:15`) and a **runner-side** registry
+   (`_pending: dict[str, asyncio.Future[bool]]`,
+   `omnigent/runner/pending_approvals.py:48`), resolved when the server
+   POSTs an approval event to `/v1/sessions/{id}/events`. That split maps
+   directly onto three distinct restart scenarios:
+   - **No restart**: the server-side `Future` is still parked — resolve it
      immediately, same as today.
-   - Native/tmux-attached harness, `Future` gone but process alive: replay
-     the persisted decision through that harness's existing native-resume
-     path on its next reconnect/hook-registration (this is genuinely new
-     wiring, but reuses an existing per-harness mechanism rather than
-     inventing a generic one).
-   - Subprocess-backed harness, process gone: return `410 Gone` with
-     `error_code = "elicitation_not_resolvable"` — the verdict is durably
-     recorded (audit trail, and idempotent if the manager retries), but the
-     endpoint does not claim the session resumed, because it structurally
-     did not.
+   - **Server restarts, runner/host process stays alive** (a routine
+     rolling redeploy under the confirmed multi-replica topology — the
+     dominant real-world restart case). The runner-side `Future` in
+     `pending_approvals.py` is still alive and parked; only the *delivery*
+     to it was lost when the server-side registry that would have sent it
+     restarted. A durable `session_elicitations` row plus "on tunnel
+     reconnect, re-POST any decided-but-undelivered row to the runner"
+     **genuinely resolves this case** — it completes an existing pattern
+     (the `_harness_pre_resolved_elicitations` tombstone already handles the
+     analogous case of a dropped-and-reparked *hook* long-poll) rather than
+     inventing a new one, and covers native/tmux-attached *and*
+     subprocess-backed harnesses alike, since the runner process itself
+     never died.
+   - **The runner process itself dies** (host crash, subprocess killed).
+     The runner-side `Future` and the coroutine stack awaiting it are
+     unrecoverably gone — no durable row can rebind a coroutine that no
+     longer exists, regardless of harness type. Return `410 Gone` with
+     `error_code = "elicitation_not_resolvable"` here — the verdict is
+     durably recorded (audit trail, and idempotent if the manager retries),
+     but the endpoint does not claim the session resumed, because it
+     structurally did not. Emit `session.resumed` only on the runner's
+     acknowledgement of having consumed the decision, never on the manager
+     HTTP call being accepted — that ack is what makes the event truthful.
+
+   Implementation note: the reconnect-redelivery path in the middle case is
+   genuinely new wiring (a tunnel-reconnect hook that queries
+   `session_elicitations` for `decided`-but-undelivered rows and re-POSTs
+   them), but it reuses the runner's own existing approval-POST contract
+   rather than inventing a second delivery mechanism.
 
 This makes the acceptance test for "restart before verdict" an explicitly
 harness-classified test (§12), rather than either quietly failing to build
@@ -758,12 +829,12 @@ Covered in full in §5.4; summarized here as a flow:
 
 | Acceptance bullet | Test |
 |---|---|
-| Completion wake | Turn reaches `idle` from an open `response_id` with `background_task_count in (None, 0)` → exactly one `session.completed` row, delivered; a mid-turn quiescence blip (background task still running) → zero rows |
+| Completion wake | Turn reaches `idle` from an open `response_id` → exactly one `session.completed` row, delivered, **including** when a background shell is still running (asserts the fix in §5.1: this must NOT be swallowed); a session that never opened a turn, or a same-status no-op republish → zero rows |
 | Decision payload/context | `session.awaiting_decision` payload round-trips the allowlisted request fields; a field outside the allowlist (e.g. raw env dict on the harness side) is asserted absent from the payload |
 | Restart/network replay | Kill dispatcher mid-delivery (lease held, no ack) → row remains `leased` until `lease_expires_at`, then is reclaimed and re-delivered with the same `event_id`/`sequence`; server process restart between outbox insert and first delivery attempt → row survives (durable), dispatcher picks it up on the next claim cycle |
 | Duplicate delivery / stable IDs | Manager 2xxs but the ack is lost (simulated) → dispatcher retries, receiver-side dedupe on `event_id` proven via a test double manager that idempotency-checks |
 | Signature/redaction security | Tampered body/timestamp fails verification; timestamp outside tolerance is rejected by the reference-verification test even with a valid signature; log lines for a delivery attempt assert absence of payload body, secret, signature, full URL |
-| End-to-end decision response resuming the exact session, **classified by harness** | (a) live Future, no restart: verdict resolves immediately, `session.resumed` fires. (b) native/tmux harness, restart before verdict: verdict persists, replays on reconnect, `session.resumed` fires once resolved. (c) subprocess harness, restart before verdict, process gone: decision endpoint returns `410 elicitation_not_resolvable`; verdict is still durably recorded (assert via direct row read, not via the HTTP response); poll/reconcile subsequently reflects the session's real post-restart state |
+| End-to-end decision response resuming the exact session, **classified by which process died (§5.4)** | (a) no restart: server-side Future still parked, verdict resolves immediately, `session.resumed` fires. (b) server restarts, runner/host process alive: verdict persists, redelivered to the runner's still-live `pending_approvals` Future on tunnel reconnect, `session.resumed` fires on runner ack — this is the dominant real-world case and must pass for BOTH native/tmux and subprocess-backed harnesses. (c) runner process itself dies: decision endpoint returns `410 elicitation_not_resolvable`; verdict is still durably recorded (assert via direct row read, not via the HTTP response); poll/reconcile subsequently reflects the session's real post-restart state |
 | Ordering / non-regression | Two events for one session enqueued out of delivery order (simulated retry timing) → manager-side stable-ID + sequence dedupe test proves a lower `sequence` arriving after a higher one is a documented no-op for the consumer; dispatcher never issues session event N+1 before N reaches a terminal delivery state |
 | Callback never blocks terminal transitions | Manager endpoint made to hang/timeout; assert `_publish_status`, the SSE stream, and `conversation_labels`/`live_status` writes complete with unchanged latency |
 | Poll/reconcile stays enabled | With `manager_webhook.enabled=false` and with the manager endpoint permanently down, existing reconciliation-dependent behavior (session-state correctness) is unaffected |
