@@ -899,11 +899,23 @@ class ErrorDetail(BaseModel):
 
     :param code: Error code string, e.g. ``"server_error"``,
         ``"invalid_input"``.
-    :param message: Human-readable error description.
+    :param message: Human-readable error description. Always populated; older
+        clients render this verbatim.
+    :param title: Optional short headline naming what went wrong, e.g.
+        ``"Claude Code can't run as root"``. Present when the runner
+        recognized the failure (see ``omnigent.runner.launch_failure``); lets
+        the UI show a clear card title instead of the raw ``code``.
+    :param cause: Optional one/two-sentence explanation of why it failed.
+        Paired with ``title``.
+    :param remediation: Optional concrete next step to fix it, e.g. a command
+        to run. ``None`` when there is no single clear fix.
     """
 
     code: str
     message: str
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
 
 class IncompleteDetails(BaseModel):

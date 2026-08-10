@@ -158,7 +158,13 @@ interface SessionResponseWire {
    * `total_cost_usd`). Absent/`null` when no per-model usage was recorded.
    */
   usage_by_model?: Record<string, ModelUsageWire> | null;
-  last_task_error?: { code: string; message: string } | null;
+  last_task_error?: {
+    code: string;
+    message: string;
+    title?: string;
+    cause?: string;
+    remediation?: string;
+  } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
    * moment the snapshot was built. The live SSE stream has no
