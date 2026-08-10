@@ -614,16 +614,75 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * to the right of the sidebar keeps its normal top alignment. Inert in a
  * plain browser and on other platforms. */
 @media (min-width: 48rem) {
-  /* md+: matches the sidebar's own desktop breakpoint. */
+  /* md+: matches the sidebar's own desktop breakpoint.
+   *
+   * The sidebar now starts at the window's top edge rather than below the
+   * lights: its header row is TALL enough (h-12 = 3rem vs the 2.25rem strip) to
+   * hold the traffic lights inside itself, so the row doubles as the title bar
+   * instead of leaving an empty band of canvas above it. The rules below clear
+   * the lights' footprint within that row and drop the brand mark, which no
+   * longer has anywhere to sit. */
   [data-electron-mac] .conversations-sidebar {
-    margin-top: 2.25rem;
+    margin-top: 0;
+  }
+  /* The lights occupy the row's left end, so the action cluster (Collapse,
+   * Search, Settings) slides left to sit just right of them — the whole point
+   * of reclaiming this row. justify-content: flex-start overrides the row's
+   * justify-between, which would otherwise pin the cluster to the far right and
+   * leave a gap where the wordmark used to be. */
+  [data-electron-mac] .sidebar-header-row {
+    justify-content: flex-start;
+    /* ~5rem clears the three lights plus their inset; the row's own pl-4 is
+     * replaced (not added to) so the first button lands beside the green one. */
+    padding-left: 5rem;
+  }
+  /* No brand mark on the desktop shell: this row is the title bar now, and the
+   * lights own its left end. `display: none` rather than removing it from the
+   * JSX so the browser keeps the wordmark (and its home link) untouched. */
+  [data-electron-mac] .sidebar-brand {
+    display: none;
+  }
+  /* Mirror the visual order from the design: Collapse, Search, Settings —
+   * reading outward from the window controls. The DOM keeps Search → Settings →
+   * Collapse (tab order follows importance, and the collapse button swaps
+   * between two elements depending on peek state), so reorder visually rather
+   * than reshuffling the markup. */
+  [data-electron-mac] [data-testid="sidebar-header-actions"] {
+    /* Explicit flex ordering: the collapse/open toggle is the last child in the
+     * DOM and moves to the front here. */
+    & > *:last-child {
+      order: -1;
+    }
+    /* Align the buttons to the TRAFFIC LIGHTS, not to this row.
+     *
+     * The row is 3rem tall and centers its children, which lands them at y=24 —
+     * about 5px below the lights, a gap that reads as broken once the two sit
+     * side by side. The lights are drawn by macOS OUTSIDE the page (they are not
+     * in the DOM and don't appear in a page screenshot), so the web layer can't
+     * measure them; anchor instead to the 2.25rem title-bar strip whose height
+     * the drag-strip rule below already uses for exactly this band. Centering a
+     * 1.5rem button in that strip gives y=18, on the lights' centre line.
+     *
+     * flex-start + margin-top rather than a shorter row: the row's 3rem height
+     * is what gives the sidebar enough headroom to host the lights at all.
+     * Mirrors the .traffic-light-clearance pattern used for the chat header. */
+    align-self: flex-start;
+    /* (2.25rem strip − 1.5rem button) / 2 */
+    margin-top: 0.375rem;
+  }
+  /* The settings sidebar swaps the header row for a "Back" row, which would now
+   * sit under the traffic lights. Push it below them — it has no cluster to
+   * align beside the lights, so it clears them vertically instead. */
+  [data-electron-mac] .settings-sidebar-header {
+    padding-top: 2.75rem;
   }
 }
 /* The strip spans the top of the window but stops 20rem short of the right
  * edge, keeping the chat header's action cluster (share, panel toggles) and
  * devtools chrome clear of the drag region. Interactive elements that
  * overlap the strip elsewhere stay clickable via the blanket no-drag rule
- * below. */
+ * below — including the sidebar's own header buttons, which now live inside
+ * this strip's band since the sidebar starts at the window's top edge. */
 [data-electron-mac] .electron-drag-strip {
   position: absolute;
   inset: 0 20rem auto 0;

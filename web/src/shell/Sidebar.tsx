@@ -772,7 +772,12 @@ export function Sidebar({
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
         <>
-          <div className="flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+          {/* sidebar-header-row is the hook for the macOS Electron shell, where
+          this row shares the window's top strip with the traffic lights: the
+          brand mark is dropped and the actions slide left to sit beside the
+          window controls (see the [data-electron-mac] rules in index.css).
+          Inert in a browser and on other platforms, which keep the row below. */}
+          <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -782,7 +787,8 @@ export function Sidebar({
             <Link
               to="/"
               onClick={onNavClick}
-              className="rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
+              data-testid="sidebar-brand"
+              className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
               <img
                 src={omnigentWordmark}

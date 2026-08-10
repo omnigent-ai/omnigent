@@ -407,3 +407,78 @@ describe("index.css text selection colors", () => {
     expect(cssSource).not.toContain(".dark ::selection");
   });
 });
+
+/* The macOS desktop shell's sidebar header shares the window's top strip with
+ * the OS traffic lights: no wordmark, and the action buttons sit beside the
+ * window controls. Asserted at the CSS level because the whole change is CSS —
+ * and because the lights are painted by macOS OUTSIDE the page, so no DOM test
+ * (and no page screenshot) can see them. These values ARE the alignment.
+ */
+describe("index.css electron-mac sidebar header", () => {
+  const sidebarRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar \{[^}]*\}/,
+  )?.[0];
+  const headerRowRule = cssSource.match(
+    /\[data-electron-mac\] \.sidebar-header-row \{[^}]*\}/,
+  )?.[0];
+  const brandRule = cssSource.match(/\[data-electron-mac\] \.sidebar-brand \{[^}]*\}/)?.[0];
+  const actionsRule = cssSource.match(
+    /\[data-electron-mac\] \[data-testid="sidebar-header-actions"\] \{(?:[^{}]|\{[^{}]*\})*\}/,
+  )?.[0];
+  const dragStripRule = cssSource.match(
+    /\[data-electron-mac\] \.electron-drag-strip \{[^}]*\}/,
+  )?.[0];
+  const settingsHeaderRule = cssSource.match(
+    /\[data-electron-mac\] \.settings-sidebar-header \{[^}]*\}/,
+  )?.[0];
+
+  it("starts the sidebar at the window's top edge (no empty strip above it)", () => {
+    // Was 2.25rem, which left the band of blank canvas this change removes: the
+    // 3rem header row is tall enough to host the lights itself.
+    expect(sidebarRule).toContain("margin-top: 0");
+  });
+
+  it("clears the traffic lights and left-aligns the action cluster", () => {
+    // justify-content must be overridden — the row's own justify-between would
+    // pin the buttons to the far right, leaving a gap where the wordmark was.
+    expect(headerRowRule).toContain("justify-content: flex-start");
+    expect(headerRowRule).toContain("padding-left: 5rem");
+  });
+
+  it("drops the brand mark, which has nowhere to sit in the title-bar row", () => {
+    expect(brandRule).toContain("display: none");
+  });
+
+  it("aligns the buttons to the lights' centre line, not the row's", () => {
+    // The row centres its children at y=24; the lights sit ~y=19. Centring a
+    // 1.5rem button in the 2.25rem title-bar strip gives y=18 instead:
+    // (2.25rem − 1.5rem) / 2 = 0.375rem.
+    expect(actionsRule).toContain("align-self: flex-start");
+    expect(actionsRule).toContain("margin-top: 0.375rem");
+    // Anchored to the SAME strip height the drag region uses, so the two can't
+    // drift apart if that band is ever retuned.
+    expect(dragStripRule).toContain("height: 2.25rem");
+  });
+
+  it("orders the cluster Collapse, Search, Settings left-to-right", () => {
+    // The DOM order is Search → Settings → Collapse (tab order follows
+    // importance), so the toggle is reordered visually rather than moved.
+    expect(actionsRule).toMatch(/&\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
+  });
+
+  it("pushes the settings sidebar's Back row below the lights", () => {
+    // /settings swaps the header row out entirely; without this its Back row
+    // would sit underneath the window controls.
+    expect(settingsHeaderRule).toContain("padding-top: 2.75rem");
+  });
+
+  it("keeps every header rule scoped to the desktop shell", () => {
+    // A browser tab has no window controls to align to, so none of this may
+    // apply there. Each rule must carry the [data-electron-mac] scope.
+    for (const selector of [".sidebar-header-row", ".sidebar-brand", ".settings-sidebar-header"]) {
+      const occurrences = cssSource.split(selector).length - 1;
+      const scoped = cssSource.split(`[data-electron-mac] ${selector}`).length - 1;
+      expect(scoped, `${selector} must always be [data-electron-mac]-scoped`).toBe(occurrences);
+    }
+  });
+});
