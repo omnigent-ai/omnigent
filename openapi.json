@@ -1506,15 +1506,54 @@
       "ErrorDetail": {
         "description": "Machine-readable error information attached to a failed response.",
         "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional one/two-sentence explanation of why it failed. Paired with `title`.",
+            "title": "Cause"
+          },
           "code": {
             "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`.",
             "title": "Code",
             "type": "string"
           },
           "message": {
-            "description": "Human-readable error description.",
+            "description": "Human-readable error description. Always populated; older clients render this verbatim.",
             "title": "Message",
             "type": "string"
+          },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional concrete next step to fix it, e.g. a command to run. `None` when there is no single clear fix.",
+            "title": "Remediation"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional short headline naming what went wrong, e.g. `\"Claude Code can't run as root\"`. Present when the runner recognized the failure (see `omnigent.runner.launch_failure`); lets the UI show a clear card title instead of the raw `code`.",
+            "title": "Title"
           }
         },
         "required": [

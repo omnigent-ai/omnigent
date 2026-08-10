@@ -144,6 +144,10 @@ class TerminalExitEvent:
         specs may contain credentials or other launch-only secrets.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
+    :param exit_status: The inner process's exit code, when tmux captured one
+        from ``#{pane_dead_status}`` (terminals with ``keep_alive_after_exit``).
+        ``None`` when unknown — e.g. the tmux server vanished before the status
+        could be read, or the terminal doesn't keep the pane alive after exit.
     :param session_was_idle: Whether the session's last PTY-derived status was
         ``idle`` at exit. ``True`` marks a clean shutdown after the turn
         finished; ``False`` (the default — last seen ``running``, or never
@@ -159,6 +163,7 @@ class TerminalExitEvent:
     args_count: int | None = None
     cwd: str | None = None
     last_output: str | None = None
+    exit_status: int | None = None
     session_was_idle: bool = False
 
 
@@ -170,27 +175,32 @@ def _trim_terminal_exit_output(text: str | None) -> str | None:
     if not stripped:
         return None
     lines = stripped.splitlines()
+    omitted_lines = 0
     if len(lines) > _TERMINAL_EXIT_OUTPUT_MAX_LINES:
-        lines = [
-            f"... omitted {len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES} earlier line(s) ...",
-            *lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:],
-        ]
-    clipped = "\n".join(lines)
-    if len(clipped) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
-        clipped = (
-            f"... omitted {len(clipped) - _TERMINAL_EXIT_OUTPUT_MAX_CHARS} "
-            "earlier character(s) ...\n"
-            f"{clipped[-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]}"
-        )
-    return clipped
+        omitted_lines = len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES
+        lines = lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:]
+    # Drop whole leading lines until the body fits the char budget, so the
+    # first surviving line is never a mid-word fragment (the "rity reasons"
+    # cut). One line longer than the budget is hard-clipped as a last resort.
+    while len(lines) > 1 and len("\n".join(lines)) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
+        lines.pop(0)
+        omitted_lines += 1
+    if len(lines) == 1 and len(lines[0]) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
+        lines[0] = lines[0][-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]
+    if omitted_lines:
+        lines.insert(0, f"... omitted {omitted_lines} earlier line(s) ...")
+    return "\n".join(lines)
 
 
 def _terminal_exit_diagnostics(
     instance: TerminalInstance | None,
-) -> tuple[str | None, int | None, str | None, str | None]:
-    """Extract generic launch/output diagnostics from a terminal instance."""
+) -> tuple[str | None, int | None, str | None, str | None, int | None]:
+    """Extract generic launch/output diagnostics from a terminal instance.
+
+    :returns: ``(command, args_count, cwd, last_output, exit_status)``.
+    """
     if instance is None:
-        return None, None, None, None
+        return None, None, None, None, None
 
     raw_command = getattr(instance, "command", None)
     command = raw_command if isinstance(raw_command, str) and raw_command else None
@@ -212,7 +222,18 @@ def _terminal_exit_diagnostics(
             if isinstance(raw_last_output, str):
                 last_output = _trim_terminal_exit_output(raw_last_output)
 
-    return command, args_count, cwd, last_output
+    exit_status: int | None = None
+    read_exit_status = getattr(instance, "last_exit_status", None)
+    if callable(read_exit_status):
+        try:
+            raw_exit_status = read_exit_status()
+        except Exception:
+            _logger.exception("Failed to read terminal exit status")
+        else:
+            if isinstance(raw_exit_status, int):
+                exit_status = raw_exit_status
+
+    return command, args_count, cwd, last_output, exit_status
 
 
 def _monotonic() -> float:
@@ -1324,7 +1345,7 @@ class SessionResourceRegistry:
             )
             lifecycle = observed
 
-        command, args_count, cwd, last_output = _terminal_exit_diagnostics(instance)
+        command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
         session_was_idle = self._take_session_status_memo(session_id) == "idle"
@@ -1353,6 +1374,7 @@ class SessionResourceRegistry:
                     args_count=args_count,
                     cwd=cwd,
                     last_output=last_output,
+                    exit_status=exit_status,
                     session_was_idle=session_was_idle,
                 )
             )
