@@ -54,6 +54,31 @@ export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
 
 /**
+ * Client-side deadline for a *search* page fetch (`?search_query=`). Content
+ * search is a substring scan server-side; if its trigram index is ever missing
+ * the query can run for tens of seconds, and the palette would otherwise sit on
+ * "Searching…" forever (the fetch has no timeout of its own). Aborting here
+ * settles the query to a terminal state so the user sees "No results found"
+ * rather than an endless spinner. Deliberately shorter than the server's own
+ * search `statement_timeout` (see `_SEARCH_STATEMENT_TIMEOUT_MS` in the store)
+ * so the client gives up first and the row-limited fast path still has room.
+ * Only search fetches are bounded — ordinary (indexed) list pagination is left
+ * untouched.
+ */
+export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * True for the DOMException a fetch raises when its `AbortSignal.timeout`
+ * fires. Used to keep the query layer from retrying a client-side search
+ * timeout: retrying would just re-arm the same slow request three more times
+ * (React Query's default), turning one hung spinner into a retry storm. A real
+ * server/network error still retries normally.
+ */
+function isAbortTimeout(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "TimeoutError";
+}
+
+/**
  * Query key for the archived-project-names scan (see `useArchivedProjectNames`).
  *
  * Deliberately NOT under the `["projects"]` prefix: that scan pages the whole
@@ -268,7 +293,12 @@ async function fetchConversationsPage({
   // query key (which drops `project`) and the cache-membership check. This
   // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  // Bound search fetches with a client-side deadline (see
+  // SEARCH_FETCH_TIMEOUT_MS): a search whose server-side index is missing can
+  // hang, and the palette shows "Searching…" for the whole in-flight window.
+  // Plain list pagination is indexed/fast, so it keeps no timeout.
+  const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : undefined;
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
 }
@@ -327,6 +357,10 @@ export function useConversations(
     // share the cache instead of each triggering a background refetch.
     // The WS stream handles real-time updates within that window.
     staleTime: 30_000,
+    // A client-side search timeout is terminal — retrying would just re-arm the
+    // same slow request (default 3×) and prolong the spinner. Any other failure
+    // keeps React Query's default retry behaviour.
+    retry: (failureCount, error) => !isAbortTimeout(error) && failureCount < 3,
     refetchInterval: streamConnected
       ? options.reconcileWhileConnected
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS

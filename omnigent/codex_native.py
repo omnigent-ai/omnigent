@@ -22,6 +22,7 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
@@ -839,7 +840,12 @@ async def _prepare_codex_terminal_via_daemon(
     """
     persist_args = list(codex_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         reattached = session_id is not None
         if session_id is None:
             if session_bundle is None:
@@ -1012,6 +1018,7 @@ async def _post_initial_prompt(
     """
     async with httpx.AsyncClient(
         base_url=base_url,
+        trust_env=not is_loopback_url(base_url),
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(30.0),
@@ -1060,7 +1067,12 @@ async def _prepare_codex_terminal(
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         bridge_id: str
         thread_id: str | None = None
         if session_id is None:
@@ -1391,6 +1403,7 @@ async def _initialize_fresh_terminal_thread(
     thread_id = await _wait_for_thread_started(prepared.event_client)
     async with httpx.AsyncClient(
         base_url=base_url,
+        trust_env=not is_loopback_url(base_url),
         headers=headers,
         timeout=httpx.Timeout(30.0),
     ) as client:
@@ -2699,6 +2712,7 @@ async def _close_codex_terminal(
     with contextlib.suppress(Exception):
         async with httpx.AsyncClient(
             base_url=base_url,
+            trust_env=not is_loopback_url(base_url),
             headers=headers,
             timeout=httpx.Timeout(10.0),
         ) as client:

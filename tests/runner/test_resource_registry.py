@@ -16,11 +16,14 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
+    _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
+    _terminal_exit_diagnostics,
+    _trim_terminal_exit_output,
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
@@ -675,6 +678,53 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
 
     assert len(exits) == 1
     assert exits[0].session_was_idle is False
+
+
+def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
+    # Over the char budget: the first surviving line must be a WHOLE line, never
+    # a mid-word fragment (the "rity reasons" cut). The final line — the one that
+    # matters — stays intact.
+    filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
+    text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
+    trimmed = _trim_terminal_exit_output(text)
+    assert trimmed is not None
+    assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
+    assert trimmed.startswith("... omitted ")
+    # The last line survived whole (not clipped mid-word).
+    assert trimmed.endswith("for security reasons")
+    # The first content line after the marker is a complete line.
+    first_content = trimmed.splitlines()[1]
+    assert first_content.startswith("line ")
+
+
+def test_trim_terminal_exit_output_hard_clips_single_overlong_line() -> None:
+    # A single line longer than the budget has no line boundary to snap to, so
+    # it's clipped from the tail as a last resort.
+    line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
+    trimmed = _trim_terminal_exit_output(line)
+    assert trimmed is not None
+    assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+
+
+def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "claude"
+    instance.args = ["--dangerously-skip-permissions"]
+    instance._remember_pane_snapshot("boom")
+    # Simulate tmux having reported a dead pane with a captured status.
+    instance._remember_exit_status("1 42")
+    command, args_count, _cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+    assert command == "claude"
+    assert args_count == 1
+    assert last_output == "boom"
+    assert exit_status == 42
+
+
+def test_remember_exit_status_ignores_live_pane() -> None:
+    instance = make_test_terminal_instance("claude", "main", tmp_path=Path("/tmp"))
+    # Live pane: pane_dead=0, empty status → nothing recorded.
+    instance._remember_exit_status("0 ")
+    assert instance.last_exit_status() is None
 
 
 @pytest.mark.asyncio
