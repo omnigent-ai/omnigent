@@ -339,6 +339,24 @@ def _looks_like_error(result: str) -> bool:
     lower = result[:500].lower().lstrip()
     if any(lower.startswith(p) for p in _ERROR_PREFIXES):
         return True
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        exit_code = payload.get("exit_code")
+        if (
+            payload.get("isError") is True
+            or payload.get("is_error") is True
+            or payload.get("success") is False
+            or payload.get("error") not in (None, False, "", {}, [])
+            or (isinstance(exit_code, int | float) and exit_code != 0)
+            or str(payload.get("status", "")).lower()
+            in {"error", "failed", "failure", "cancelled"}
+            or str(payload.get("outcome", "")).lower()
+            in {"error", "failed", "failure", "cancelled"}
+        ):
+            return True
     if _ERROR_JSON_RE.match(result[:500]):
         return True
     return False
@@ -350,6 +368,7 @@ def detect_thrashing(
     window: int = 10,
     window_error_rate: float = 0.8,
     action: str = "ASK",
+    reset_on_request: bool = True,
 ) -> PolicyCallable:
     """Factory: detect when an agent is failing repeatedly.
 
@@ -381,6 +400,7 @@ def detect_thrashing(
         the rate check.  Defaults to ``0.8`` (80%).
     :param action: Response when thrashing is detected — ``"ASK"``
         (default) or ``"DENY"``.
+    :param reset_on_request: Clear result history for each user turn.
     :returns: A policy callable that fires on ``tool_result`` events.
     """
     normalised_action = _normalise_action(action, policy_name="detect_thrashing")
@@ -398,7 +418,19 @@ def detect_thrashing(
             (abstain) for non-``tool_result`` events; ALLOW with
             updated state otherwise.
         """
-        if event.get("type") != "tool_result":
+        event_type = event.get("type")
+        if event_type == "request" and reset_on_request:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {
+                        "key": _THRASHING_HISTORY_KEY,
+                        "action": "set",
+                        "value": [],
+                    }
+                ],
+            }
+        if event_type != "tool_result":
             return None
 
         data = event.get("data")
@@ -439,9 +471,9 @@ def detect_thrashing(
                 return {
                     "result": normalised_action,
                     "reason": (
-                        f"The agent has hit {consecutive_threshold} consecutive "
-                        f"tool errors. It may be stuck — review and redirect, "
-                        f"or start a fresh session."
+                        f"Loop guard: the agent produced {consecutive_threshold} "
+                        "consecutive tool errors. End this approach and provide "
+                        "an incomplete-stop handoff."
                     ),
                     "state_updates": state_update["state_updates"],
                 }
@@ -455,9 +487,9 @@ def detect_thrashing(
                 return {
                     "result": normalised_action,
                     "reason": (
-                        f"The agent has a {pct}% error rate over the last "
-                        f"{effective_window} tool calls. It may be stuck — "
-                        f"review and redirect, or start a fresh session."
+                        f"Loop guard: tool results had a {pct}% error rate over "
+                        f"the last {effective_window} calls. End this approach "
+                        "and provide an incomplete-stop handoff."
                     ),
                     "state_updates": state_update["state_updates"],
                 }
@@ -577,6 +609,11 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                         "ASK escalates to the user (default); "
                         "DENY blocks the next tool result outright."
                     ),
+                },
+                "reset_on_request": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Clear result history for each user turn.",
                 },
             },
             "required": [],

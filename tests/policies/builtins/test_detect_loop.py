@@ -31,7 +31,7 @@ def test_detect_loop_triggers_on_repeated_calls() -> None:
 
     result = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
     assert result["result"] == "ASK"
-    assert "retry loop" in result["reason"]
+    assert "Loop guard" in result["reason"]
     assert "sys_os_shell" in result["reason"]
 
 
@@ -200,6 +200,57 @@ def test_detect_loop_custom_threshold() -> None:
     state = _state_with_hashes([h, h, h])
     result = policy(tc("Bash", {"command": "x"}, state))
     assert result["result"] == "ALLOW"
+
+
+def test_detect_loop_can_deny_without_user_prompt() -> None:
+    policy = detect_loop(window=5, threshold=2, action="DENY")
+    h = _args_hash("sys_os_read", {"path": "README.md"})
+
+    result = policy(
+        tc(
+            "sys_os_read",
+            {"path": "README.md"},
+            _state_with_hashes([h]),
+        )
+    )
+
+    assert result["result"] == "DENY"
+    assert "incomplete-stop handoff" in result["reason"]
+
+
+def test_detect_loop_exempts_bounded_poll_tool() -> None:
+    policy = detect_loop(
+        window=5,
+        threshold=2,
+        action="DENY",
+        exempt_tools=["sys_read_inbox"],
+    )
+    h = _args_hash("sys_read_inbox", {})
+
+    result = policy(
+        tc(
+            "sys_read_inbox",
+            {},
+            _state_with_hashes([h, h, h]),
+        )
+    )
+
+    assert result["result"] == "ALLOW"
+    assert "state_updates" not in result
+
+
+def test_detect_loop_resets_on_user_request() -> None:
+    policy = detect_loop(reset_on_request=True)
+
+    result = policy(
+        {
+            "type": "request",
+            "data": {"user_content": "continue"},
+            "session_state": _state_with_hashes(["old"]),
+        }
+    )
+
+    assert result["state_updates"] == [{"key": _LOOP_STATE_KEY, "action": "set", "value": []}]
 
 
 # ── Args hash determinism ──────────────────────────────────────────────────

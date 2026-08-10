@@ -8,6 +8,8 @@ import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
 from omnigent.runtime.prompt import (
+    PI_AGENT_COMPLETION_INSTRUCTION,
+    PI_TOOL_TURN_CONTINUATION,
     SHARED_MESSAGE_ATTRIBUTION_ENV,
     SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
     append_framework_instructions,
@@ -237,6 +239,21 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
     )
 
     assert result == "Agent prompt\n\nRequest prompt\n\nFramework prompt"
+
+
+def test_pi_completion_instruction_is_progress_based() -> None:
+    assert "Progress means new evidence, changed state, or completed work" in (
+        PI_AGENT_COMPLETION_INSTRUCTION
+    )
+    assert "declared deadline and polling interval" in PI_AGENT_COMPLETION_INSTRUCTION
+    assert "Loop guard denial" in PI_AGENT_COMPLETION_INSTRUCTION
+    assert "try a different permitted approach" not in PI_AGENT_COMPLETION_INSTRUCTION
+
+
+def test_pi_continuation_honors_declared_boundaries() -> None:
+    assert "declared retry count" in PI_TOOL_TURN_CONTINUATION
+    assert "maximum polls" in PI_TOOL_TURN_CONTINUATION
+    assert "switch tool categories merely to keep acting" in PI_TOOL_TURN_CONTINUATION
 
 
 def test_empty_framework_instructions_do_not_change_default() -> None:

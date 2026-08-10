@@ -37,20 +37,22 @@ _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 PI_AGENT_COMPLETION_INSTRUCTION = (
     "Work autonomously until the user's request is resolved. Use tools when they "
     "can establish facts or complete work. Do not stop at intermediate progress, "
-    "raw tool output, or uncertainty. If an approach fails, inspect the result and "
-    "try a different permitted approach instead of repeating the same call unchanged. "
-    "End the turn only with the completed outcome, or after reasonable permitted "
-    "alternatives are exhausted with the exact blocker, supporting evidence, and "
-    "the alternatives already tried."
+    "raw tool output, or uncertainty. Progress means new evidence, changed state, "
+    "or completed work. Classify a retry before making it: deterministic failures "
+    "need a different approach, transient failures need a declared maximum attempt "
+    "count, and dependent running work needs a declared deadline and polling interval. "
+    "Do not switch tools merely to evade a failure. If a Loop guard denial appears, "
+    "make no more tool calls. Use the one final response for an incomplete-stop "
+    "handoff covering Done, Intended next, Stopped because, and Need from you."
 )
 
 PI_TOOL_TURN_CONTINUATION = (
-    "The prior agent loop ended before task closure. Continue working from the tool "
-    "results. If the current approach failed or was inconclusive, diagnose why and "
-    "try a different permitted tool, query, or path. Do not repeat successful calls "
-    "or retry a failed call unchanged. Finish the user's request. If no permitted "
-    "route remains after trying alternatives, state the exact blocker, evidence, and "
-    "attempts in the final response."
+    "The prior model step ended before task closure. Continue from the tool results "
+    "only when the next action advances the task. Honor any declared retry count, "
+    "deadline, polling interval, and maximum polls. Do not repeat a successful call, "
+    "retry a deterministic failure unchanged, or switch tool categories merely to "
+    "keep acting. Finish the request, or provide the incomplete-stop handoff when the "
+    "declared boundary is exhausted."
 )
 
 

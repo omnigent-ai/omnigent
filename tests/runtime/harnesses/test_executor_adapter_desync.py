@@ -178,23 +178,23 @@ async def test_orphan_tool_callback_safe_fails() -> None:
     assert adapter._orphan_callback_count == 1
 
 
-async def test_terminal_tool_budget_denial_requests_final_handoff(
+async def test_terminal_tool_guard_denial_requests_final_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bridged budget denial marks the active turn for one final handoff."""
+    """A bridged loop denial marks the active turn for one final handoff."""
 
     async def _deny(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
         return {
             "error": (
-                "Denied by policy: Stopped after 2 consecutive failed tool "
-                "calls in this turn. Read the errors and report the blocker."
+                "Denied by policy: Loop guard: sys_os_shell repeated without "
+                "progress. End this approach and provide an incomplete-stop handoff."
             )
         }
 
     monkeypatch.setattr(adapter_module, "_bridge_one_dispatch", _deny)
     adapter = ExecutorAdapter(executor_factory=_FakeExecutor)
-    ctx = _ctx("resp_budget")
+    ctx = _ctx("resp_loop_guard")
     adapter._current_ctx = ctx
     adapter._current_agent = "watchdog"
 
@@ -203,8 +203,8 @@ async def test_terminal_tool_budget_denial_requests_final_handoff(
         {"command": "git status"},
     )
 
-    assert "Stopped after 2 consecutive failed tool calls" in result["error"]
-    assert adapter._terminal_tool_budget_ctx is ctx
+    assert "Loop guard" in result["error"]
+    assert adapter._terminal_tool_guard_ctx is ctx
     assert not ctx.cancelled.is_set()
 
 
@@ -233,16 +233,16 @@ async def test_nonterminal_policy_denial_keeps_turn_active(
         {"command": "git commit -m bad"},
     )
 
-    assert adapter._terminal_tool_budget_ctx is None
+    assert adapter._terminal_tool_guard_ctx is None
     assert not ctx.cancelled.is_set()
 
 
-async def test_native_tool_budget_denial_requests_final_handoff(
+async def test_native_tool_guard_denial_requests_final_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The native-tool policy bridge requests the same final handoff."""
     adapter = ExecutorAdapter(executor_factory=_FakeExecutor)
-    ctx = _ctx("resp_native_budget")
+    ctx = _ctx("resp_native_loop_guard")
     adapter._current_ctx = ctx
 
     async def _deny(
@@ -254,8 +254,8 @@ async def test_native_tool_budget_denial_requests_final_handoff(
         return adapter_module.PolicyVerdictPayload(
             action="POLICY_ACTION_DENY",
             reason=(
-                "Exceeded the 12-tool budget for this turn. "
-                "Checkpoint progress and continue in a new turn."
+                "Loop guard: the agent produced 5 consecutive tool errors. "
+                "End this approach and provide an incomplete-stop handoff."
             ),
         )
 
@@ -266,18 +266,18 @@ async def test_native_tool_budget_denial_requests_final_handoff(
         {"name": "read", "arguments": {}},
     )
 
-    assert adapter._terminal_tool_budget_ctx is ctx
+    assert adapter._terminal_tool_guard_ctx is ctx
     assert not ctx.cancelled.is_set()
 
 
-async def test_terminal_budget_summary_ends_turn_before_more_tools() -> None:
-    """A summary after budget exhaustion completes the turn before another tool."""
-    ctx = _ctx("resp_budget_handoff")
+async def test_terminal_guard_summary_ends_turn_before_more_tools() -> None:
+    """A summary after loop detection completes the turn before another tool."""
+    ctx = _ctx("resp_loop_handoff")
     adapter: ExecutorAdapter | None = None
 
-    def _mark_budget_exhausted() -> None:
+    def _mark_loop_detected() -> None:
         assert adapter is not None
-        adapter._terminal_tool_budget_ctx = ctx
+        adapter._terminal_tool_guard_ctx = ctx
 
     executor = _FakeExecutor(
         events=[
@@ -288,7 +288,7 @@ async def test_terminal_budget_summary_ends_turn_before_more_tools() -> None:
             ),
             ToolCallRequest(name="sys_os_read", args={"path": "README.md"}),
         ],
-        on_iter=_mark_budget_exhausted,
+        on_iter=_mark_loop_detected,
     )
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
 
@@ -303,7 +303,7 @@ async def test_terminal_budget_summary_ends_turn_before_more_tools() -> None:
     )
     assert executor.interrupt_calls == [adapter._session_key]
     assert not ctx.cancelled.is_set()
-    assert adapter._terminal_tool_budget_ctx is None
+    assert adapter._terminal_tool_guard_ctx is None
 
 
 async def test_watchdog_resync_is_idempotent() -> None:

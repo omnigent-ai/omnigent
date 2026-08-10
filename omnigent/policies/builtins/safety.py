@@ -232,14 +232,20 @@ def _args_hash(tool_name: str, arguments: object) -> str:
     return _hashlib.sha256(blob.encode()).hexdigest()
 
 
-def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
+def detect_loop(
+    window: int = 10,
+    threshold: int = 3,
+    action: Literal["ASK", "DENY"] = "ASK",
+    exempt_tools: list[str] | None = None,
+    reset_on_request: bool = True,
+) -> PolicyCallable:
     """Factory: detect repeated identical tool calls.
 
     Tracks recent tool-call hashes in ``session_state`` as a
     bounded list of SHA-256 hex digests keyed by
     ``_policy_loop_recent_hashes``.  When the same hash
     appears *threshold* times within the last *window* calls,
-    returns ASK so the user can break the loop.
+    returns the configured action so the loop can end with a handoff.
 
     This catches the #1 token-waste pattern — an agent retrying
     the exact same failing tool call — which
@@ -251,11 +257,16 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
     :param threshold: How many times a call must repeat within
         *window* to trigger. Defaults to ``3``. Clamped to a
         minimum of ``1``.
-    :returns: A policy callable that ASKs when a loop is
-        detected.
+    :param action: ``"ASK"`` or ``"DENY"`` when a loop is detected.
+    :param exempt_tools: Tool names allowed to repeat, such as a bounded
+        async-result poll.
+    :param reset_on_request: Clear loop history for each user turn.
+    :returns: A policy callable that detects identical retries.
     """
     window = max(1, window)
     threshold = max(1, threshold)
+    normalized_action = action.upper() if action.upper() in {"ASK", "DENY"} else "ASK"
+    exempt = frozenset(exempt_tools or [])
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the current tool call is a repeated loop.
@@ -263,13 +274,23 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
         :param event: Policy event dict.
         :returns: ASK if loop detected, ALLOW otherwise.
         """
-        if event.get("type") != "tool_call":
+        event_type = event.get("type")
+        if event_type == "request" and reset_on_request:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _LOOP_STATE_KEY, "action": "set", "value": []},
+                ],
+            }
+        if event_type != "tool_call":
             return _ALLOW
         data = event.get("data")
         if not isinstance(data, dict):
             return _ALLOW
 
         tool_name = data.get("name", "")
+        if tool_name in exempt:
+            return _ALLOW
         arguments = data.get("arguments", {})
         h = _args_hash(tool_name, arguments)
 
@@ -288,11 +309,11 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
         count = recent.count(h)
         if count >= threshold:
             return {
-                "result": "ASK",
+                "result": normalized_action,
                 "reason": (
-                    f"The agent appears stuck in a retry loop — "
-                    f"tool '{tool_name}' called with identical arguments "
-                    f"{count} times in the last {len(recent)} calls."
+                    f"Loop guard: tool '{tool_name}' was called with identical "
+                    f"arguments {count} times in the last {len(recent)} calls. "
+                    "End this approach and provide an incomplete-stop handoff."
                 ),
                 "state_updates": [
                     {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
@@ -804,8 +825,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "factory",
         "name": "Detect Tool Call Retry Loops",
         "description": "Detects when the agent is stuck retrying the same tool call with "
-        "identical arguments. ASKs for user approval when the same (tool, args) "
-        "repeats N times within a sliding window of recent calls",
+        "identical arguments. Returns the configured action when the same "
+        "(tool, args) repeats N times within a sliding window of recent calls",
         "params_schema": {
             "type": "object",
             "properties": {
@@ -820,6 +841,23 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "minimum": 1,
                     "description": "Number of identical repeats within the window to trigger",
                     "default": 3,
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ASK", "DENY"],
+                    "description": "Response when a repeated-call loop is detected",
+                    "default": "ASK",
+                },
+                "exempt_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names allowed to repeat without loop detection",
+                    "default": [],
+                },
+                "reset_on_request": {
+                    "type": "boolean",
+                    "description": "Clear recent-call history for each user turn",
+                    "default": True,
                 },
             },
         },

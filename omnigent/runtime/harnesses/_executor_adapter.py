@@ -117,19 +117,21 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 
-def _is_terminal_tool_budget_reason(value: object) -> bool:
+def _is_terminal_tool_guard_reason(value: object) -> bool:
     if not isinstance(value, str):
         return False
     return (
-        "Stopped after " in value and "failed tool calls" in value and "in this turn" in value
-    ) or ("Exceeded the " in value and "-tool budget for this turn" in value)
+        "Loop guard:" in value
+        or ("Stopped after " in value and "failed tool calls" in value and "in this turn" in value)
+        or ("Exceeded the " in value and "-tool budget for this turn" in value)
+    )
 
 
-def _is_terminal_tool_budget_result(result: dict[str, Any]) -> bool:
+def _is_terminal_tool_guard_result(result: dict[str, Any]) -> bool:
     error = result.get("error")
     if isinstance(error, str):
-        return "Denied by policy" in error and _is_terminal_tool_budget_reason(error)
-    return bool(result.get("denied_by_policy")) and _is_terminal_tool_budget_reason(
+        return "Denied by policy" in error and _is_terminal_tool_guard_reason(error)
+    return bool(result.get("denied_by_policy")) and _is_terminal_tool_guard_reason(
         result.get("reason")
     )
 
@@ -269,9 +271,9 @@ class ExecutorAdapter(HarnessApp):
         # deliver.
         self._current_ctx: TurnContext | None = None
         self._current_agent: str | None = None
-        # A terminal budget denial grants the model one final assistant
+        # A terminal loop-guard denial grants the model one final assistant
         # message for its handoff, then ends the turn before another tool.
-        self._terminal_tool_budget_ctx: TurnContext | None = None
+        self._terminal_tool_guard_ctx: TurnContext | None = None
         # FIFO queue of inner-SDK tool-use ids, one entry per
         # ToolCallRequest the executor parses. Populated by
         # :meth:`_translate_event` whenever ``event.metadata``
@@ -402,7 +404,7 @@ class ExecutorAdapter(HarnessApp):
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
         self._current_agent = request.model
-        self._terminal_tool_budget_ctx = None
+        self._terminal_tool_guard_ctx = None
         # Reset the MCP call-id queue at turn start. A prior turn
         # that errored mid-stream (e.g. cancelled while a tool_use
         # block had been parsed but its MCP-handler hadn't fired
@@ -576,7 +578,7 @@ class ExecutorAdapter(HarnessApp):
                         )
 
                 response_text: str | None = None
-                budget_handoff_text_seen = False
+                guard_handoff_text_seen = False
                 async for event in executor.run_turn(
                     messages=messages,
                     tools=tools,
@@ -606,13 +608,13 @@ class ExecutorAdapter(HarnessApp):
                         await executor.interrupt_session(self._session_key)
                         clean_exit = True
                         return
-                    budget_handoff_active = self._terminal_tool_budget_ctx is ctx
-                    if budget_handoff_active and isinstance(event, TextChunk):
+                    guard_handoff_active = self._terminal_tool_guard_ctx is ctx
+                    if guard_handoff_active and isinstance(event, TextChunk):
                         if event.text.strip():
-                            budget_handoff_text_seen = True
-                    if budget_handoff_active and isinstance(event, LLMCallComplete):
+                            guard_handoff_text_seen = True
+                    if guard_handoff_active and isinstance(event, LLMCallComplete):
                         if (
-                            not budget_handoff_text_seen
+                            not guard_handoff_text_seen
                             and isinstance(event.response, str)
                             and event.response.strip()
                         ):
@@ -622,9 +624,9 @@ class ExecutorAdapter(HarnessApp):
                                     delta=event.response,
                                 )
                             )
-                            budget_handoff_text_seen = True
-                    if budget_handoff_active and isinstance(event, ToolCallRequest):
-                        if budget_handoff_text_seen:
+                            guard_handoff_text_seen = True
+                    if guard_handoff_active and isinstance(event, ToolCallRequest):
+                        if guard_handoff_text_seen:
                             continue
                         ctx.cancelled.set()
                         await executor.interrupt_session(self._session_key)
@@ -696,16 +698,16 @@ class ExecutorAdapter(HarnessApp):
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if (
-                        self._terminal_tool_budget_ctx is ctx
+                        self._terminal_tool_guard_ctx is ctx
                         and isinstance(event, LLMCallComplete)
-                        and budget_handoff_text_seen
+                        and guard_handoff_text_seen
                     ):
                         _logger.warning(
-                            "tool budget handoff completed for response %s; "
+                            "tool loop handoff completed for response %s; "
                             "ending the active generation",
                             ctx.response_id,
                         )
-                        self._terminal_tool_budget_ctx = None
+                        self._terminal_tool_guard_ctx = None
                         await executor.interrupt_session(self._session_key)
                         clean_exit = True
                         return
@@ -827,8 +829,8 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
-            if self._terminal_tool_budget_ctx is ctx:
-                self._terminal_tool_budget_ctx = None
+            if self._terminal_tool_guard_ctx is ctx:
+                self._terminal_tool_guard_ctx = None
             # P0.2: on an abnormal exit (CancelledError unwinding the task,
             # ExecutorError, transport drop) the cached inner-SDK generation
             # may still be live and would later flush queued tool_use as
@@ -1214,12 +1216,12 @@ class ExecutorAdapter(HarnessApp):
             call_id=dispatch_call_id,
             traceparent=traceparent,
         )
-        if _is_terminal_tool_budget_result(result):
+        if _is_terminal_tool_guard_result(result):
             _logger.warning(
-                "tool budget exhausted for response %s; requesting a final handoff",
+                "tool loop guard triggered for response %s; requesting a final handoff",
                 ctx.response_id,
             )
-            self._terminal_tool_budget_ctx = ctx
+            self._terminal_tool_guard_ctx = ctx
         return result
 
     async def _stable_elicitation_handler(
@@ -1352,13 +1354,13 @@ class ExecutorAdapter(HarnessApp):
         if (
             phase == "PHASE_TOOL_CALL"
             and verdict.action == "POLICY_ACTION_DENY"
-            and _is_terminal_tool_budget_reason(verdict.reason)
+            and _is_terminal_tool_guard_reason(verdict.reason)
         ):
             _logger.warning(
-                "native tool budget exhausted for response %s; requesting a final handoff",
+                "native tool loop guard triggered for response %s; requesting a final handoff",
                 ctx.response_id,
             )
-            self._terminal_tool_budget_ctx = ctx
+            self._terminal_tool_guard_ctx = ctx
         return verdict
 
     def _ensure_executor(self) -> Executor:
