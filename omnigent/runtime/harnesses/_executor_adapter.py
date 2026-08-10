@@ -36,7 +36,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import secrets
 import uuid
 from collections import deque
@@ -62,7 +61,11 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
-from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.inner.tracing import (
+    TracingContext,
+    is_tracing_enabled,
+    llm_generation_name,
+)
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
@@ -112,11 +115,6 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
-
-
-def _llm_trace_unit() -> str:
-    unit = os.environ.get("OMNIGENT_LLM_UNIT", "").strip().lower()
-    return unit if unit in {"gpu", "npu"} else "llm"
 
 
 # Bounds on the detached, abnormal-exit executor cleanup scheduled from
@@ -448,12 +446,11 @@ class ExecutorAdapter(HarnessApp):
             if tctx is None or llm_span is not None:
                 return
             resolved_model = model or request.model_override or request.model
-            agent_name = request.model or "unknown"
             traced_input = input_value if input_value is not None else llm_fallback_input
             llm_parent = tctx._current_span
             llm_span = tctx.start_llm_span(
                 model=resolved_model,
-                name=(f"{_llm_trace_unit()}:{agent_name}/{resolved_model or 'unknown'}"),
+                name=llm_generation_name(resolved_model),
                 input_value=traced_input,
             )
             llm_fallback_input = None

@@ -1722,9 +1722,9 @@ async def test_executor_adapter_traces_model_tool_model_sequence(
             key=lambda span: span.start_time or 0,
         )
         assert [span.name for span in children] == [
-            "gpu:watchdog/openai/gpt-5.4-mini",
+            "gpu:openai-gpt-5.4-mini:thinking",
             "tool:sys_os_read",
-            "gpu:watchdog/openai/gpt-5.4-mini",
+            "gpu:openai-gpt-5.4-mini:thinking",
         ]
         assert all(
             span.parent is not None and span.parent.span_id == agent.context.span_id

@@ -523,7 +523,7 @@ For a single agent turn that calls one tool and one LLM:
   session.id            = conv_e4f5a6b7c8d9e0f1
   task.id               = resp_d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3
 
-[llm_call]                            (child span)
+[gpu:databricks-claude-sonnet-4:thinking]  (child span)
   gen_ai.operation.name              = chat
   gen_ai.provider.name               = databricks
   gen_ai.request.model               = databricks-claude-sonnet-4
@@ -555,8 +555,8 @@ Total traces found: 1
   spans: 3
     'agent:debby' attrs: ['gen_ai.agent.name', 'gen_ai.operation.name',
                           'gen_ai.provider.name', 'gen_ai.request.model']
-    'llm_call' attrs: ['gen_ai.operation.name', 'gen_ai.provider.name',
-                       'gen_ai.request.model']
+    'gpu:databricks-claude-sonnet-4:thinking' attrs:
+      ['gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model']
     'tool:calculator' attrs: ['gen_ai.operation.name', 'tool.name']
 ```
 
@@ -569,8 +569,8 @@ in the experiment table:
 
 ![MLflow Traces list](images/databricks/mlflow-trace-list.png)
 
-Trace detail view with the `llm_call` and `tool:calculator` child spans
-expanded:
+Trace detail view with the `gpu:databricks-claude-sonnet-4:thinking` and
+`tool:calculator` child spans expanded:
 
 ![MLflow Trace detail](images/databricks/mlflow-trace-detail.png)
 

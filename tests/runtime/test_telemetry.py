@@ -895,23 +895,29 @@ def test_inject_extract_frame_round_trip(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:
     """
-    A frame injected under a span and consumed via ``consume_frame_span``
-    nests under the same trace — the JSON-frame websocket propagation
-    invariant (host tunnel, session-updates) holds end to end.
+    A host frame propagates its parent without exporting a transport span.
     """
     tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with tracer.start_as_current_span("producer"):
+        with tracer.start_as_current_span("producer") as producer:
+            producer_span_id = producer.get_span_context().span_id
             frame = telemetry.inject_trace_context({"kind": "host.launch_runner"})
     assert "traceparent" in frame
 
     with telemetry.consume_frame_span("host.launch_runner", frame) as span:
         consumed_hex = format(span.get_span_context().trace_id, "032x")
+        with tracer.start_as_current_span("host-child"):
+            pass
 
     assert consumed_hex == _RESP_HEX, (
         f"consumer trace {consumed_hex!r} should match producer trace "
         f"{_RESP_HEX!r} — frame trace-context propagation is broken."
     )
+    spans = list(in_memory_exporter.get_finished_spans())
+    assert all(not exported.name.startswith("host.") for exported in spans)
+    child = next(exported for exported in spans if exported.name == "host-child")
+    assert child.parent is not None
+    assert child.parent.span_id == producer_span_id
 
 
 def test_inject_trace_context_noop_without_active_span() -> None:
@@ -933,7 +939,10 @@ def test_consume_frame_span_roots_new_trace_without_carrier(
     raising — a frame from a peer that never injected context is still
     handled, just without an upstream parent.
     """
-    with telemetry.consume_frame_span("host.hello", {"kind": "host.hello"}) as span:
+    with telemetry.consume_frame_span(
+        "session_updates.watch",
+        {"kind": "session_updates.watch"},
+    ) as span:
         assert span.get_span_context().trace_id != 0
 
 
@@ -947,8 +956,8 @@ def test_consume_frame_span_omits_payload_when_capture_off(
     """
     monkeypatch.setattr(telemetry, "_capture_content", False)
     with telemetry.consume_frame_span(
-        "host.launch_runner",
-        {"kind": "host.launch_runner", "workspace": "/tmp"},
+        "session_updates.watch",
+        {"kind": "session_updates.watch", "workspace": "/tmp"},
     ):
         pass
     span = in_memory_exporter.get_finished_spans()[-1]
@@ -966,9 +975,9 @@ def test_consume_frame_span_records_redacted_payload_when_capture_on(
     """
     monkeypatch.setattr(telemetry, "_capture_content", True)
     with telemetry.consume_frame_span(
-        "host.launch_runner",
+        "session_updates.watch",
         {
-            "kind": "host.launch_runner",
+            "kind": "session_updates.watch",
             "binding_token": "SUPER_SECRET",
             "workspace": "/tmp/ws",
             "traceparent": "00-abc-def-01",

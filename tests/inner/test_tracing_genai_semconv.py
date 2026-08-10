@@ -21,7 +21,11 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from omnigent.inner.tracing import TracingContext, enable_tracing
+from omnigent.inner.tracing import (
+    TracingContext,
+    enable_tracing,
+    llm_generation_name,
+)
 
 
 @pytest.fixture
@@ -52,6 +56,17 @@ def exporter() -> Iterator[InMemorySpanExporter]:
 
 def _spans_by_name(exporter: InMemorySpanExporter, name_prefix: str):
     return [s for s in exporter.get_finished_spans() if s.name.startswith(name_prefix)]
+
+
+def test_llm_generation_name_normalizes_model_and_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_LLM_UNIT", "npu")
+
+    assert llm_generation_name("qwen3.5:9B", step="gathering") == "npu:qwen3.5-9b:gathering"
+    assert llm_generation_name("openai/GPT-5.4 Mini", unit="gpu") == (
+        "gpu:openai-gpt-5.4-mini:thinking"
+    )
 
 
 # ---
@@ -241,12 +256,12 @@ def test_llm_span_is_a_langfuse_generation_with_exact_usage(
 ):
     """LLM spans carry model, content, and exclusive usage buckets."""
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+    monkeypatch.setenv("OMNIGENT_LLM_UNIT", "gpu")
 
     ctx = TracingContext()
     agent = ctx.start_agent_span(agent_name="watchdog", user_message="inspect")
     llm = ctx.start_llm_span(
         model="openai/gpt-5.4-mini",
-        name="gpu:watchdog/openai/gpt-5.4-mini",
         input_value=[{"role": "user", "content": "inspect"}],
     )
     ctx.end_llm_span(
@@ -264,7 +279,7 @@ def test_llm_span_is_a_langfuse_generation_with_exact_usage(
     )
     ctx.end_agent_span(agent, response="done")
 
-    llm_spans = _spans_by_name(exporter, "gpu:watchdog/")
+    llm_spans = _spans_by_name(exporter, "gpu:openai-gpt-5.4-mini:thinking")
     assert len(llm_spans) == 1
     attrs = dict(llm_spans[0].attributes or {})
     assert attrs["openinference.span.kind"] == "LLM"

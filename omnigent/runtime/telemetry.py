@@ -195,7 +195,7 @@ def _payload_to_attribute(payload: Mapping[str, Any]) -> str:
     :param payload: The message dict to record.
     :returns: A JSON string, truncated to :data:`_CONTENT_MAX_LEN`.
     """
-    return redact_and_cap_payload(payload, _CONTENT_MAX_LEN)
+    return redact_and_cap_payload(_redact_payload(payload), _CONTENT_MAX_LEN)
 
 
 def redact_and_cap_text(value: Any, max_length: int = _CONTENT_MAX_LEN) -> str:
@@ -888,13 +888,13 @@ def consume_frame_span(
     attributes: Mapping[str, Any] | None = None,
 ) -> Iterator[Any]:
     """
-    Open a CONSUMER span parented on a received frame's trace context.
+    Consume a frame under its received trace context.
 
     The receive-side wrapper for the JSON-frame websockets: extracts the
-    W3C context that :func:`inject_trace_context` wrote into ``carrier``,
-    then opens a span that nests under the sender's trace. Any frame
-    encoded while this span is active (e.g. a result frame sent back in
-    reply) inherits it, so request/response round trips stay linked.
+    W3C context that :func:`inject_trace_context` wrote into ``carrier``.
+    Host control frames attach that context without exporting a ``host.*``
+    span. Other frames open a CONSUMER span. Replies and child work inherit
+    the received context in both cases.
 
     :param name: Span name, e.g. ``"host.launch_runner"``.
     :param carrier: The decoded inbound frame (a JSON dict) that may
@@ -903,6 +903,18 @@ def consume_frame_span(
         ``{"host.request_id": "req_1"}``.
     :returns: A context manager yielding the started span.
     """
+    parent = extract_trace_context(carrier)
+    if name.startswith("host."):
+        from opentelemetry import context as otel_context
+        from opentelemetry import trace as otel_trace
+
+        token = otel_context.attach(parent)
+        try:
+            yield otel_trace.get_current_span()
+        finally:
+            otel_context.detach(token)
+        return
+
     if not telemetry_enabled():
         from opentelemetry.trace import INVALID_SPAN
 
@@ -910,7 +922,6 @@ def consume_frame_span(
         return
     from opentelemetry import trace as otel_trace
 
-    parent = extract_trace_context(carrier)
     tracer = otel_trace.get_tracer("omnigent.frames")
     with tracer.start_as_current_span(
         name,

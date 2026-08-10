@@ -26,9 +26,9 @@ Or per-session::
 Span hierarchy for a typical turn::
 
     agent:<name>  (openinference.span.kind=AGENT)
-    ├── gpu:<agent>/<model>  (openinference.span.kind=LLM)
+    ├── gpu:<model-slug>:thinking  (openinference.span.kind=LLM)
     ├── tool:<tool_name>  (openinference.span.kind=TOOL)
-    ├── gpu:<agent>/<model>
+    ├── gpu:<model-slug>:thinking
     └── policy:<policy_name>  (openinference.span.kind=GUARDRAIL)
 """
 
@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 if TYPE_CHECKING:
@@ -50,6 +52,30 @@ logger = logging.getLogger(__name__)
 
 # OTel span attributes accept arbitrary JSON-ish values.
 TraceValue: TypeAlias = Any  # type: ignore[explicit-any]
+
+_TRACE_SLUG_PART = re.compile(r"[^a-z0-9._-]+")
+
+
+def llm_generation_name(
+    model: str | None,
+    *,
+    unit: str | None = None,
+    step: str | None = None,
+) -> str:
+    """Build the Langfuse generation name for one model call."""
+    resolved_unit = (unit or os.environ.get("OMNIGENT_LLM_UNIT", "")).strip().lower()
+    if resolved_unit not in {"gpu", "npu"}:
+        resolved_unit = "gpu"
+
+    model_slug = _TRACE_SLUG_PART.sub("-", (model or "unknown").strip().lower()).strip("-")
+    if not model_slug:
+        model_slug = "unknown"
+
+    step_slug = _TRACE_SLUG_PART.sub("-", (step or "thinking").strip().lower()).strip("-")
+    if not step_slug:
+        step_slug = "thinking"
+    return f"{resolved_unit}:{model_slug}:{step_slug}"
+
 
 # OpenInference semantic conventions for span kinds.
 _SPAN_KIND_ATTR = "openinference.span.kind"
@@ -253,7 +279,7 @@ class TracingContext:
         self,
         model: str | None = None,
         *,
-        name: str = "llm_call",
+        name: str | None = None,
         input_value: TraceValue = None,
     ) -> Span:
         """Begin one LLM generation span under the active agent span."""
@@ -281,7 +307,7 @@ class TracingContext:
                 attrs[_LANGFUSE_OBSERVATION_MODEL] = model_name
 
         span = _tracer().start_span(
-            name=name,
+            name=name or llm_generation_name(model),
             context=ctx_carrier,
             attributes=attrs,
         )

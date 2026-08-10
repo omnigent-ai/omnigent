@@ -1040,6 +1040,37 @@ class _FakeServerClient:
 
         return _Resp()
 
+    async def put(self, url: str, **kwargs: Any) -> Any:
+        """Accept checkpoint writes made by completed recovery turns."""
+        del url, kwargs
+
+        class _Resp:
+            status_code = 200
+
+        return _Resp()
+
+
+def _interruption_marker(item_id: str) -> dict[str, Any]:
+    """Build the persisted marker written after an interrupted turn."""
+    return {
+        "id": item_id,
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": (
+                    "[System: interrupted]\n"
+                    "The user interrupted and abandoned their previous request "
+                    "(the user message immediately before this one). Do not resume "
+                    "or act on that interrupted request unless the user asks for it "
+                    "again; treat the next user message as the current instruction. "
+                    "The preceding assistant message may be incomplete."
+                ),
+            }
+        ],
+    }
+
 
 def _build_recovery_app(
     history_items: list[dict[str, Any]],
@@ -1166,6 +1197,101 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
         "from history. Empty content means _load_history_as_input "
         "failed or _session_histories wasn't populated."
     )
+    assert hc.posted_bodies[0]["model"] == "recovery-test"
+
+
+@pytest.mark.asyncio
+async def test_session_creation_does_not_recover_interruption_marker() -> None:
+    """A persisted interruption marker waits for the next real user message."""
+    import asyncio as _aio
+
+    app, _pm, hc = _build_recovery_app([_interruption_marker("item_interrupted")])
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "4ff09a9cc5054a2b86bda1cfb89e4889",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "idle"
+        await _aio.sleep(0.1)
+
+    assert hc.posted_bodies == []
+
+
+@pytest.mark.asyncio
+async def test_catch_up_scan_attaches_message_after_interruption_to_agent() -> None:
+    """Catch-up skips the marker and dispatches the next message as the real agent."""
+    import asyncio as _aio
+
+    from omnigent.runner import app as runner_app_mod
+
+    session_id = "7e868910757a458fb3f5ee91814a3a2a"
+    agent_id = "880b5afda28ad55ff74cbeb9b5fc67fb"
+    saved_histories = dict(runner_app_mod._session_histories_ref)
+    runner_app_mod._session_histories_ref.clear()
+    server_client = _FakeServerClient([])
+    spec = AgentSpec(spec_version=1, name="recovery-test")
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_catchup"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_catchup"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+
+    async def _resolver(
+        resolved_agent_id: str,
+        resolved_session_id: str | None = None,
+    ) -> AgentSpec:
+        del resolved_agent_id, resolved_session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": agent_id},
+            )
+            assert resp.status_code == 201
+            assert resp.json()["status"] == "idle"
+            runner_app_mod._session_histories_ref[session_id] = []
+
+            server_client._items.append(_interruption_marker("item_interrupted_catchup"))
+            await app.state.catch_up_scan()
+            await _aio.sleep(0.1)
+            assert hc.posted_bodies == []
+
+            server_client._items.append(
+                {
+                    "id": "item_real_followup",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Continue by fixing the open pull request.",
+                        }
+                    ],
+                }
+            )
+            await app.state.catch_up_scan()
+            await _aio.sleep(0.2)
+    finally:
+        runner_app_mod._session_histories_ref.clear()
+        runner_app_mod._session_histories_ref.update(saved_histories)
+
+    assert len(hc.posted_bodies) == 1
+    assert hc.posted_bodies[0]["model"] == "recovery-test"
 
 
 @pytest.mark.asyncio

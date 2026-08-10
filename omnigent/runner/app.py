@@ -359,6 +359,26 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
     return entry.spec if isinstance(entry, ResolvedSpec) else entry
 
 
+def _agent_name_for_turn(
+    spec: AgentSpec | None,
+    *,
+    fallback: object = None,
+    agent_id: str | None = None,
+) -> str:
+    """Return an agent display name without exposing an internal id."""
+    candidate = spec.name if spec is not None else fallback
+    if not isinstance(candidate, str):
+        return "unknown"
+    candidate = candidate.strip()
+    if (
+        not candidate
+        or candidate == agent_id
+        or re.fullmatch(r"[0-9a-f]{32}", candidate.lower()) is not None
+    ):
+        return "unknown"
+    return candidate
+
+
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
@@ -3356,7 +3376,11 @@ def create_runner_app(
             last_type = last.get("type")
             last_role = last.get("role")
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                (
+                    last_type == "message"
+                    and last_role == "user"
+                    and not _is_cancellation_marker(last)
+                )
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
@@ -3365,7 +3389,11 @@ def create_runner_app(
                 _publish_turn_status(session_id, "running")
                 msg_body = {
                     "agent_id": agent_id,
-                    "model": body.get("model", agent_id),
+                    "model": _agent_name_for_turn(
+                        spec,
+                        fallback=body.get("model"),
+                        agent_id=agent_id,
+                    ),
                 }
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(msg_body, session_id),
@@ -3946,6 +3974,19 @@ def create_runner_app(
         "user message as the current instruction. The preceding assistant "
         "message may be incomplete."
     )
+
+    def _is_cancellation_marker(item: Mapping[str, object]) -> bool:
+        if item.get("type") != "message" or item.get("role") != "user":
+            return False
+        content = item.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(block, dict)
+            and block.get("type") == "input_text"
+            and block.get("text") == _CANCELLATION_MARKER_TEXT
+            for block in content
+        )
 
     def _append_cancellation_items(conv_id: str) -> None:
         history = _session_histories.get(conv_id, [])
@@ -9303,13 +9344,18 @@ def create_runner_app(
                     session_id not in _active_turns
                     and new_items
                     and new_items[-1].get("role") == "user"
+                    and not _is_cancellation_marker(new_items[-1])
                 ):
                     _begin_turn_slot(session_id)
                     _publish_turn_status(session_id, "running")
                     agent_id = _session_agent_ids.get(session_id)
+                    cached_spec = _unwrap_resolved_spec(_session_spec_cache.get(session_id))
                     msg_body: _JsonObject = {
                         "agent_id": agent_id,
-                        "model": agent_id or "",
+                        "model": _agent_name_for_turn(
+                            cached_spec,
+                            agent_id=agent_id,
+                        ),
                     }
                     _turn_task = asyncio.create_task(
                         _run_turn_bg(msg_body, session_id),
