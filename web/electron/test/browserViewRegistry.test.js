@@ -332,3 +332,95 @@ describe("browserViewRegistry — child window.open is denied (S3)", () => {
     assert.deepEqual(windowOpen("https://example.com/ok"), { action: "deny" });
   });
 });
+
+describe("browserViewRegistry — overlay suppression (modal above the native view)", () => {
+  // The native WebContentsView paints above ALL renderer DOM, so an open
+  // modal (e.g. the share dialog) must hide the view for its lifetime. These
+  // tests drive setOverlaySuppressed with setVisible-recording stub views.
+  function makeVisibilityRegistry() {
+    const attached = [];
+    const makeStubView = () => {
+      let visible = true;
+      return {
+        setVisible(v) {
+          visible = v;
+        },
+        getVisible: () => visible,
+      };
+    };
+    const registry = createBrowserViewRegistry({
+      WebContentsViewCtor: () => makeStubView(),
+      createBoundsController: () => ({ setRendererBounds() {}, resync() {}, clear() {} }),
+      attachToHost() {},
+      detachFromHost() {},
+      sendToRenderer() {},
+    });
+    // Helper: create a view so setActive has something to toggle.
+    registry.openOrNavigate("conv_1", "https://example.com");
+    return registry;
+  }
+
+  it("setOverlaySuppressed(true) hides the active view", () => {
+    const registry = makeVisibilityRegistry();
+    registry.setActive("conv_1");
+    const entry = registry.get("conv_1");
+    assert.equal(entry.view.getVisible(), true);
+
+    registry.setOverlaySuppressed(true);
+    assert.equal(entry.view.getVisible(), false);
+  });
+
+  it("setOverlaySuppressed(false) restores the active view", () => {
+    const registry = makeVisibilityRegistry();
+    registry.setActive("conv_1");
+    const entry = registry.get("conv_1");
+    registry.setOverlaySuppressed(true);
+    assert.equal(entry.view.getVisible(), false);
+
+    registry.setOverlaySuppressed(false);
+    assert.equal(entry.view.getVisible(), true);
+  });
+
+  it("a view activated while suppressed attaches hidden", () => {
+    const registry = makeVisibilityRegistry();
+    registry.setOverlaySuppressed(true);
+
+    registry.setActive("conv_1");
+    const entry = registry.get("conv_1");
+    assert.equal(entry.view.getVisible(), false);
+  });
+
+  it("suppressed flag outlives a swap — new active view inherits hidden state", () => {
+    const registry = makeVisibilityRegistry();
+    registry.openOrNavigate("conv_2", "https://example.org");
+    registry.setActive("conv_1");
+    registry.setOverlaySuppressed(true);
+
+    // Swap to conv_2 while suppressed
+    registry.setActive("conv_2");
+    const entry = registry.get("conv_2");
+    assert.equal(entry.view.getVisible(), false);
+
+    // Restore
+    registry.setOverlaySuppressed(false);
+    assert.equal(entry.view.getVisible(), true);
+  });
+
+  it("setOverlaySuppressed(false) is a no-op on a view that was never hidden", () => {
+    const registry = makeVisibilityRegistry();
+    registry.setActive("conv_1");
+    const entry = registry.get("conv_1");
+
+    registry.setOverlaySuppressed(false);
+    assert.equal(entry.view.getVisible(), true);
+  });
+
+  it("overlaySuppressed() introspection reflects the current state", () => {
+    const registry = makeVisibilityRegistry();
+    assert.equal(registry.overlaySuppressed(), false);
+    registry.setOverlaySuppressed(true);
+    assert.equal(registry.overlaySuppressed(), true);
+    registry.setOverlaySuppressed(false);
+    assert.equal(registry.overlaySuppressed(), false);
+  });
+});

@@ -6,6 +6,7 @@ import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { XIcon } from "lucide-react";
+import { useSuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 
 function Dialog({ ...props }: React.ComponentProps<typeof DialogPrimitive.Root>) {
   return <DialogPrimitive.Root data-slot="dialog" {...props} />;
@@ -33,6 +34,14 @@ function DialogOverlay({
   className,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Overlay>) {
+  // The embedded browser's native WebContentsView paints above ALL renderer
+  // DOM — no z-index can put a modal over it. Suppress the view (hide it in
+  // place) for the overlay's lifetime so the dialog appears on top. Mounted
+  // only while the dialog is open (Radix portals the overlay content), so
+  // `true` is the correct active signal: mount → suppress, unmount → restore.
+  // Ref-counted: overlapping overlays keep the view hidden until the last one
+  // closes. No-op outside Electron / on shells without the browser bridge.
+  useSuppressBrowserView(true);
   return (
     <DialogPrimitive.Overlay
       data-slot="dialog-overlay"
