@@ -1421,7 +1421,6 @@ describe("FilesPanel browse location", () => {
                 onSortChange={vi.fn()}
                 flatView={false}
                 onFileSelect={vi.fn()}
-                onFlatViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
