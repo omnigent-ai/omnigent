@@ -75,6 +75,22 @@ def test_claude_gateway_backed_for_gateway_env_with_helper(
     assert calls == [{"spec": None, "refresh_models": False}]
 
 
+def test_claude_not_gateway_backed_for_resolved_non_databricks_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    _stub_claude(
+        monkeypatch,
+        ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            api_key_helper="databricks auth token --profile dev",
+        ),
+    )
+    _stub_managed_settings(monkeypatch, tmp_path, None)
+
+    assert claude_gateway_inference_backed() is False
+
+
 def test_claude_not_gateway_backed_without_api_key_helper(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
