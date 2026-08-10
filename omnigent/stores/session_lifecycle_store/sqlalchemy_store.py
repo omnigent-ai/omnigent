@@ -27,6 +27,17 @@ from omnigent.stores.session_lifecycle_store import SessionLifecycleStore
 _LEASE_BLOCKING_STATUSES = (
     encode_session_lifecycle_outbox_status("pending"),
     encode_session_lifecycle_outbox_status("leased"),
+    # dead_letter is NOT a terminal state (§7.4: escalation, never
+    # abandonment — a dead-lettered row keeps retrying at the capped
+    # backoff floor indefinitely). Excluding it here would let a later
+    # sequence number for the same session be claimed/delivered while an
+    # earlier one is still retryable, violating per-session ordering
+    # (requirement #2) and letting the manager's view regress backward in
+    # time if the earlier row later succeeds. Keeping it in the blocking
+    # set (rather than making it stop retrying once superseded) is what
+    # keeps it consistent with claim_batch's own retry semantics below,
+    # which never stops retrying a dead_letter row on its own account.
+    encode_session_lifecycle_outbox_status("dead_letter"),
 )
 _CLAIMABLE_STATUSES = (
     encode_session_lifecycle_outbox_status("pending"),
@@ -277,7 +288,22 @@ class SqlAlchemySessionLifecycleStore(SessionLifecycleStore):
     ) -> SessionElicitation | None:
         pending_code = encode_session_elicitation_status("pending")
         with self._session("record_decision") as session:
-            row = session.get(SqlSessionElicitation, (current_workspace_id(), elicitation_id))
+            # Lock the row before the read-then-write below (same idiom as
+            # _allocate_sequence): without this, two concurrent decision
+            # callbacks for the same elicitation_id can both read "pending"
+            # under READ COMMITTED and both write, with the later commit
+            # silently overwriting the first-committed verdict instead of
+            # being rejected. On Postgres this blocks the second caller
+            # until the first commits, so it re-reads the FRESH (already
+            # "decided") row below and correctly takes the no-op path
+            # instead of clobbering it. On SQLite, BEGIN IMMEDIATE (see
+            # make_managed_session_maker) already serializes this at the
+            # transaction level, so with_for_update is a no-op there.
+            row = session.get(
+                SqlSessionElicitation,
+                (current_workspace_id(), elicitation_id),
+                with_for_update=self._supports_for_update,
+            )
             if row is None:
                 return None
             if row.status == pending_code:
@@ -299,7 +325,21 @@ class SqlAlchemySessionLifecycleStore(SessionLifecycleStore):
     ) -> tuple[SessionElicitation | None, LifecycleOutboxEvent | None, bool]:
         decided_code = encode_session_elicitation_status("decided")
         with self._session("record_elicitation_resolved") as session:
-            row = session.get(SqlSessionElicitation, (current_workspace_id(), elicitation_id))
+            # Same row-lock idiom as record_decision: without it, two
+            # overlapping successful deliveries can both observe "decided"
+            # and both attempt to insert a session.resumed row. Locking
+            # here means the loser's read (after the winner commits) sees
+            # "delivered_to_runner" and correctly takes the no-op branch
+            # below instead of reaching the insert at all. The IntegrityError
+            # guard further down is defense in depth, matching this file's
+            # own pattern elsewhere (record_lifecycle_event,
+            # record_elicitation_raised) of never trusting a lock alone to
+            # prevent a duplicate-key insert.
+            row = session.get(
+                SqlSessionElicitation,
+                (current_workspace_id(), elicitation_id),
+                with_for_update=self._supports_for_update,
+            )
             if row is None:
                 return None, None, False
             if row.status != decided_code:
@@ -328,8 +368,24 @@ class SqlAlchemySessionLifecycleStore(SessionLifecycleStore):
                 next_attempt_at=resolved_at,
                 created_at=resolved_at,
             )
-            session.add(outbox_row)
-            session.flush()
+            try:
+                with session.begin_nested():
+                    session.add(outbox_row)
+                    session.flush()
+            except IntegrityError:
+                # Lost a race with another concurrent resolve for the same
+                # transition_key — the row lock above should already make
+                # this unreachable in practice, but guard it explicitly
+                # rather than let a duplicate-key insert surface as an
+                # unhandled 500. Surface the winner's outbox row.
+                existing_outbox = self._get_by_transition(
+                    session, row.session_id, "session.resumed", transition_key
+                )
+                return (
+                    _elicitation_to_entity(row),
+                    _outbox_to_entity(existing_outbox) if existing_outbox is not None else None,
+                    False,
+                )
             return _elicitation_to_entity(row), _outbox_to_entity(outbox_row), True
 
     # ── Outbox: dispatcher side ─────────────────────────────────

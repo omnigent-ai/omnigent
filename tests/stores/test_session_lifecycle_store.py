@@ -1,17 +1,24 @@
 """Tests for :class:`SqlAlchemySessionLifecycleStore`.
 
 Exercises the transactional outbox (producer + dispatcher sides) and the
-durable elicitation ledger against a real SQLite database. See
+durable elicitation ledger against a real database — SQLite by default, or
+Postgres when ``OMNIGENT_TEST_DB_URI`` is set (see ``tests/conftest.py``'s
+``db_uri`` fixture; the CI ``stores-postgres`` lane reruns this whole file
+against real Postgres). See
 ``docs/architecture/2026-08-10-durable-session-lifecycle-push.md``.
 """
 
 from __future__ import annotations
 
 import hashlib
+import threading
+from collections.abc import Callable
+from typing import TypeVar
 
 import pytest
 
 from omnigent.db.db_models import workspace_scope
+from omnigent.entities import LifecycleOutboxEvent, SessionElicitation
 from omnigent.stores.session_lifecycle_store.sqlalchemy_store import (
     SqlAlchemySessionLifecycleStore,
 )
@@ -523,6 +530,62 @@ def test_dead_letter_row_is_claimed_again_escalation_not_abandonment(
     assert reclaimed_again[0].id == _eid("m1")
 
 
+def test_claim_batch_blocks_later_sequence_while_earlier_is_dead_letter(
+    store: SqlAlchemySessionLifecycleStore,
+) -> None:
+    """A retryable dead_letter row must still block a later sequence number
+    for the same session, exactly like pending/leased do.
+
+    Cross-vendor review P1: dead_letter is NOT a terminal delivery state in
+    this design (§7.4 — escalation, never abandonment; a dead-lettered row
+    keeps retrying at the capped backoff floor indefinitely). Excluding it
+    from the ordering-blocking set would let event N+1 be claimed/delivered
+    while event N is still retryable, violating requirement #2 ("never issue
+    event N+1 before N reaches a terminal delivery state") and letting the
+    manager's view of session state regress backward in time if N later
+    succeeds after N+1 already delivered.
+    """
+    store.record_lifecycle_event(
+        event_id=_eid("dl1"),
+        session_id=SID_A,
+        event_type="session.completed",
+        transition_key="turn:rdl1:completed",
+        payload="{}",
+        now=1000,
+    )
+    store.record_lifecycle_event(
+        event_id=_eid("dl2"),
+        session_id=SID_A,
+        event_type="session.failed",
+        transition_key="turn:rdl2:failed",
+        payload="{}",
+        now=1000,
+    )
+
+    # Dead-letter sequence=1 (still retryable at the capped floor).
+    first_claim = store.claim_batch(limit=10, now=2000, lease_owner="r1", lease_seconds=60)
+    assert [c.sequence for c in first_claim] == [1]
+    store.mark_delivery_failed(
+        first_claim[0].id, workspace_id=0, next_attempt_at=2001, dead_letter_after_attempts=1
+    )
+    row = store.latest_delivery(SID_A)
+    # latest_delivery orders by sequence desc, so this is sequence=2 (still
+    # pending) — confirm sequence=1 is genuinely dead_letter via a direct claim.
+    assert row is not None and row.sequence == 2 and row.status == "pending"
+
+    # sequence=2 must NOT be claimable while sequence=1 sits dead_letter —
+    # only sequence=1 (dead_letter, retryable) comes back.
+    second_claim = store.claim_batch(limit=10, now=2002, lease_owner="r2", lease_seconds=60)
+    assert [c.sequence for c in second_claim] == [1]
+    assert second_claim[0].status == "leased"
+
+    # Once sequence=1 genuinely reaches a terminal state (delivered),
+    # sequence=2 becomes claimable.
+    store.mark_delivered(second_claim[0].id, workspace_id=0, delivered_at=2003, http_status=200)
+    third_claim = store.claim_batch(limit=10, now=2004, lease_owner="r3", lease_seconds=60)
+    assert [c.sequence for c in third_claim] == [2]
+
+
 # ── reclaim_expired_leases ────────────────────────────────────────
 
 
@@ -637,3 +700,187 @@ def test_mark_delivered_uses_explicit_workspace_id_not_ambient_scope(
         row = store.latest_delivery(SID_A)
     assert row is not None
     assert row.status == "delivered"
+
+
+# ── Concurrency: record_decision / record_elicitation_resolved races ──
+#
+# Cross-vendor review P2 (x2): both are read-then-write with no lock or
+# conditional update, so two concurrent duplicate callbacks can both observe
+# the pre-write state and both write, with the later commit silently
+# overwriting the first-committed value (record_decision) or racing to
+# insert the same session.resumed outbox row (record_elicitation_resolved,
+# previously surfacing as an unhandled IntegrityError). These tests use
+# real OS threads with a barrier so both callers' store calls genuinely
+# overlap in flight against the SAME row — not a sequential call-twice
+# simulation — against whichever backend `db_uri` resolves to (SQLite
+# locally, real Postgres in the CI `stores-postgres` lane, where this is
+# the only backend that can exhibit true interleaved reads: SQLite's
+# `BEGIN IMMEDIATE` already serializes every write transaction at the
+# database level, so on SQLite this proves the same converged-outcome
+# contract under real blocking rather than true interleaving).
+
+
+_T = TypeVar("_T")
+
+
+def _run_concurrently(fn_a: Callable[[], _T], fn_b: Callable[[], _T]) -> tuple[_T, _T]:
+    """Run two zero-arg callables on their own threads, synchronized to
+    start together via a barrier, and return both return values (or
+    re-raise the first exception either thread raised)."""
+    barrier = threading.Barrier(2)
+    results: list[_T | None] = [None, None]
+    errors: list[BaseException | None] = [None, None]
+
+    def _wrapped(index: int, fn: Callable[[], _T]) -> None:
+        barrier.wait()
+        try:
+            results[index] = fn()
+        except BaseException as exc:  # captured for the main thread to re-raise
+            errors[index] = exc
+
+    threads = [
+        threading.Thread(target=_wrapped, args=(i, fn)) for i, fn in enumerate((fn_a, fn_b))
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    for err in errors:
+        if err is not None:
+            raise err
+    return results[0], results[1]  # type: ignore[return-value]
+
+
+def test_record_decision_concurrent_same_decision_converges(
+    store: SqlAlchemySessionLifecycleStore,
+) -> None:
+    """Two concurrent callbacks racing to record the IDENTICAL decision
+    must both complete without error and converge on one committed value —
+    no lost update, no crash, no diverging state between the two callers'
+    returned views."""
+    store.record_elicitation_raised(
+        elicitation_id=EID_1,
+        session_id=SID_A,
+        request_payload="{}",
+        outbox_event_id=_eid("cc-o1"),
+        transition_key=f"elicitation:{EID_1}:awaiting_decision",
+        outbox_payload="{}",
+        now=1000,
+    )
+
+    # Same substantive verdict (content), but a DIFFERENT `now` per call —
+    # simulating two independent delivery attempts of the identical
+    # underlying decision (e.g. an idempotent retry racing with itself).
+    # Using the same `now` for both would make this test unable to
+    # distinguish buggy from fixed behavior: a single atomic UPDATE can't
+    # produce a torn write, so identical content *and* identical timestamp
+    # would converge trivially either way. Differing `now` values make
+    # `decided_at` an observable proxy for "which caller's write actually
+    # committed" — under the bug, a caller that read stale "pending" state
+    # would report its OWN `now` instead of the winner's.
+    def _decide(now: int) -> SessionElicitation | None:
+        return store.record_decision(
+            EID_1, decision_payload='{"action":"accept"}', decided_by="mgr@example.com", now=now
+        )
+
+    result_a, result_b = _run_concurrently(lambda: _decide(1005), lambda: _decide(1006))
+    assert result_a is not None and result_b is not None
+    # Both callers converge on the SAME committed verdict — whichever one
+    # actually won the write, the other observes it rather than clobbering
+    # or diverging from it.
+    assert result_a.decision_payload == result_b.decision_payload == '{"action":"accept"}'
+    assert result_a.decided_at == result_b.decided_at
+    assert result_a.decided_at in (1005, 1006)
+    assert result_a.status == result_b.status == "decided"
+
+    final = store.get_elicitation(EID_1)
+    assert final is not None
+    assert final.decision_payload == '{"action":"accept"}'
+
+
+def test_record_decision_concurrent_conflicting_decisions_exactly_one_wins(
+    store: SqlAlchemySessionLifecycleStore,
+) -> None:
+    """Two concurrent callbacks racing with DIFFERENT verdicts (accept vs
+    decline) must have exactly one win; the loser must observe the winner's
+    committed value cleanly, never silently overwrite it and never crash."""
+    store.record_elicitation_raised(
+        elicitation_id=EID_1,
+        session_id=SID_A,
+        request_payload="{}",
+        outbox_event_id=_eid("cd-o1"),
+        transition_key=f"elicitation:{EID_1}:awaiting_decision",
+        outbox_payload="{}",
+        now=1000,
+    )
+
+    def _accept() -> SessionElicitation | None:
+        return store.record_decision(
+            EID_1, decision_payload='{"action":"accept"}', decided_by="mgr-a@example.com", now=1005
+        )
+
+    def _decline() -> SessionElicitation | None:
+        return store.record_decision(
+            EID_1,
+            decision_payload='{"action":"decline"}',
+            decided_by="mgr-b@example.com",
+            now=1006,
+        )
+
+    result_accept, result_decline = _run_concurrently(_accept, _decline)
+    assert result_accept is not None and result_decline is not None
+
+    # Both callers' returned views must agree on the SAME winning verdict —
+    # whichever it is — never a mix of the two, and never each caller
+    # believing its OWN verdict won when the other's actually committed.
+    assert result_accept.decision_payload == result_decline.decision_payload
+    assert result_accept.decision_payload in ('{"action":"accept"}', '{"action":"decline"}')
+    assert result_accept.decided_by == result_decline.decided_by
+
+    final = store.get_elicitation(EID_1)
+    assert final is not None
+    assert final.decision_payload == result_accept.decision_payload
+    assert final.decided_by == result_accept.decided_by
+
+
+def test_record_elicitation_resolved_concurrent_double_resolve_no_crash(
+    store: SqlAlchemySessionLifecycleStore,
+) -> None:
+    """Two overlapping successful deliveries racing to resolve the SAME
+    already-decided elicitation must not both insert a session.resumed row
+    (previously an unhandled IntegrityError on the loser) — exactly one
+    reports the insert, the other observes a clean idempotent no-op."""
+    store.record_elicitation_raised(
+        elicitation_id=EID_1,
+        session_id=SID_A,
+        request_payload="{}",
+        outbox_event_id=_eid("cr-o1"),
+        transition_key=f"elicitation:{EID_1}:awaiting_decision",
+        outbox_payload="{}",
+        now=1000,
+    )
+    store.record_decision(EID_1, decision_payload='{"action":"accept"}', decided_by=None, now=1005)
+
+    def _resolve() -> tuple[SessionElicitation | None, LifecycleOutboxEvent | None, bool]:
+        return store.record_elicitation_resolved(
+            EID_1,
+            outbox_event_id=_eid("cr-o2"),
+            transition_key=f"elicitation:{EID_1}:resumed",
+            outbox_payload="{}",
+            resolved_at=1010,
+        )
+
+    result_a, result_b = _run_concurrently(_resolve, _resolve)
+
+    inserted_flags = sorted([result_a[2], result_b[2]])
+    assert inserted_flags == [False, True], (result_a, result_b)
+
+    winner = result_a if result_a[2] else result_b
+    loser = result_b if result_a[2] else result_a
+    assert winner[0] is not None and winner[0].status == "delivered_to_runner"
+    assert loser[0] is not None and loser[0].status == "delivered_to_runner"
+    assert winner[0].resolved_at == loser[0].resolved_at
+
+    deliveries, _ = store.list_deliveries(SID_A, limit=100)
+    resumed = [d for d in deliveries if d.event_type == "session.resumed"]
+    assert len(resumed) == 1, deliveries
