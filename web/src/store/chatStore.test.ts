@@ -8763,6 +8763,30 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  it("enqueueMessageForConversation preserves the supplied conversation and agent", () => {
+    const screenshot = new File(["png"], "element.png", { type: "image/png" });
+    useChatStore.setState({
+      conversationId: "conv_active",
+      boundAgentId: "agent_active",
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+
+    useChatStore
+      .getState()
+      .enqueueMessageForConversation("conv_browser", "change this", "agent_browser", [screenshot]);
+
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({
+        text: "change this",
+        conversationId: "conv_browser",
+        agentId: "agent_browser",
+        files: [screenshot],
+      }),
+    ]);
+  });
+
   it("dequeueMessage removes the message with the given id, keeping order", () => {
     useChatStore.setState({
       conversationId: "conv_abc",

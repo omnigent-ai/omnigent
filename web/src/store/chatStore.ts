@@ -179,6 +179,29 @@ export interface QueuedMessage {
 }
 
 /**
+ * Whether a submitted message should be queued rather than POSTed now.
+ *
+ * Queue when busy, or when this conversation already has a queued message even
+ * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
+ * later direct send could overtake a still-queued earlier one when status
+ * flickers idle mid-queue. A new chat always sends.
+ *
+ * ``waiting`` is not busy for queueing: the turn already ended and only
+ * background work remains, so the server can accept a new turn immediately.
+ */
+export function shouldQueueMessage(
+  conversationId: string | null,
+  status: "idle" | "streaming",
+  sessionStatus: SessionStatus,
+  queuedMessages: QueuedMessage[],
+): boolean {
+  if (conversationId === null) return false;
+  const isBusy = status === "streaming" || sessionStatus === "running";
+  const hasQueued = queuedMessages.some((message) => message.conversationId === conversationId);
+  return isBusy || hasQueued;
+}
+
+/**
  * A conversation's in-flight optimistic bubbles, stashed so they survive
  * in-app navigation. See {@link ChatState.pendingByConversation}.
  */
@@ -561,6 +584,16 @@ export interface ChatState {
    * turn) when the session next goes idle — see the `session_status` handler.
    */
   enqueueMessage: (text: string, files?: File[]) => void;
+  /**
+   * Queue a message for an explicit conversation and agent. Used by shell-level
+   * interaction surfaces whose event already carries its owning conversation.
+   */
+  enqueueMessageForConversation: (
+    conversationId: string,
+    text: string,
+    agentId: string | null,
+    files?: File[],
+  ) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1085,6 +1118,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   enqueueMessage: (text, files) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
+    get().enqueueMessageForConversation(conversationId, text, boundAgentId, files);
+  },
+
+  enqueueMessageForConversation: (conversationId, text, agentId, files) => {
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     set((s) => ({
@@ -1094,7 +1131,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           queueId,
           text,
           conversationId,
-          ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
+          ...(agentId !== null ? { agentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
         },
       ],
