@@ -1755,6 +1755,33 @@ def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypat
     assert "Custom ACP agent" not in names
 
 
+def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "OpenClaw",
+                            "command": "openclaw acp",
+                            "omnigent_mcp": "false",
+                        }
+                    ]
+                }
+            },
+            f,
+        )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+
+    assert result.exit_code != 0
+    assert (
+        "Invalid acp.agents configuration: acp agent omnigent_mcp must be a boolean"
+        in result.output
+    )
+
+
 def test_overview_always_lists_openclaw_import_row(isolated_config, monkeypatch) -> None:
     """OpenClaw import remains available even when discovery finds nothing."""
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
@@ -2101,11 +2128,17 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     not a green ``Installed`` row that implies the harness is ready to use.
     (Hermes, like Goose, *does* have a config probe now — its ``model`` is read
     from ``~/.hermes/config.yaml`` — so its ready/unconfigured split is covered
-    by ``test_overview_hermes_row_reflects_configured_model`` instead.)
+    by ``test_overview_hermes_row_reflects_configured_model`` instead. Kimi now
+    has a file-based login probe too, so its signed-in split is covered by
+    ``test_overview_kimi_row_reflects_detected_login`` — here we pin the
+    not-signed-in case, so ``kimi_login_detected`` is forced ``False``.)
     """
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
+    # Kimi's row now consults a file-based login probe; force "no login" so the
+    # not-configured assertion is deterministic regardless of the dev machine.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -2113,6 +2146,28 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     assert "[yellow]✗ Not configured[/]" in options[row_index]
     assert "[green]✓ Installed[/]" not in options[row_index]
     assert descriptions[row_index]
+
+
+def test_overview_kimi_row_reflects_detected_login(isolated_config, monkeypatch) -> None:
+    """An installed kimi with a detected ``kimi login`` renders green "Signed in".
+
+    Bug fix: the kimi row was hardcoded to yellow "Not configured" whenever the
+    CLI was installed, so a successful ``kimi login`` never showed. It now
+    consults the subprocess-free file probe ``kimi_login_detected`` and renders
+    a green ready row when a credential is present.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: True)
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    row_index = _overview_row_names(options, selectable).index("Kimi Code")
+    assert "[green]✓ Signed in[/]" in options[row_index]
+    assert "[yellow]✗ Not configured[/]" not in options[row_index]
+    # A ready row carries no next-step hint.
+    assert descriptions[row_index] == ""
 
 
 def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -> None:
@@ -2139,6 +2194,9 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
         lambda family: family != GEMINI_FAMILY,
     )
     monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    # Kimi's row consults a file-based login probe; force "no login" so the
+    # "Sign in with `kimi login`" hint is asserted deterministically.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
@@ -2451,18 +2509,18 @@ def test_add_key_does_not_steal_pi_from_fallback_default(isolated_config) -> Non
 # ── cli-config labels + entry builder ───────────────────────────────────────
 
 
-def test_credential_label_cli_config_uses_display_name() -> None:
-    """A cli-config credential labels as the provider's own display name.
+def test_credential_label_cli_config_uses_provider_name() -> None:
+    """A cli-config credential labels from the provider entry name.
 
-    Failure means configure-harnesses shows the raw entry id instead of
-    the friendly name isaac wrote into the provider table.
+    The display_name is ignored so cli-config providers show consistently
+    alongside other kinds (e.g. isaac-databricks-codex → Isaac-Databricks-Codex).
     """
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "codex-databricks", display_name="Databricks AI Gateway"
+        "cli-config", "isaac-databricks-codex", display_name="Databricks AI Gateway"
     )
-    assert label == "Databricks AI Gateway"
+    assert label == "Isaac-Databricks-Codex"
 
 
 def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
@@ -2472,7 +2530,7 @@ def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
     """
     from omnigent.onboarding.configure_models import credential_label
 
-    assert credential_label("cli-config", "codex-myproxy") == "codex-myproxy"
+    assert credential_label("cli-config", "codex-myproxy") == "Codex-Myproxy"
 
 
 def test_build_cli_config_provider_entry_shapes() -> None:

@@ -9,7 +9,7 @@ import socket
 import tempfile
 import textwrap
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -595,6 +595,34 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
         self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
 
+    def test_generic_openai_providers_include_auth_header(self):
+        # Generic (non-Databricks) OpenAI-compatible gateways expect
+        # ``Authorization: Bearer <token>``.  The "databricks" and
+        # "databricks-completions" provider entries must carry
+        # ``authHeader: True`` so Pi sends that header rather than the
+        # Databricks-native auth scheme which the gateway does not recognise
+        # (resulting in a 401 "Missing Authentication header").
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://openrouter.ai/api/v1"},
+        )
+        p = result["providers"]
+        self.assertTrue(p["databricks"].get("authHeader"), "databricks entry missing authHeader")
+        self.assertTrue(
+            p["databricks-completions"].get("authHeader"),
+            "databricks-completions entry missing authHeader",
+        )
+
+    def test_databricks_native_providers_omit_auth_header(self):
+        # On the Databricks-native path (no openai base_url), the "databricks"
+        # and "databricks-completions" entries must NOT carry ``authHeader``
+        # (the workspace endpoint uses a different auth scheme).
+        result = _build_models_json("https://host.example.com", "tok")
+        p = result["providers"]
+        self.assertNotIn("authHeader", p["databricks"])
+        self.assertNotIn("authHeader", p["databricks-completions"])
+
     def test_generic_openai_model_uses_configured_responses_wire(self):
         result = _build_models_json(
             "https://unused.example.com",
@@ -912,7 +940,10 @@ class TestToolServer(unittest.TestCase):
 
             async def executor(name, args):
                 # A dict carrying values json.dumps rejects by default.
-                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "tags": {1, 2, 3},
+                }
 
             server._tool_executor = executor
 
@@ -946,7 +977,7 @@ class TestToolServer(unittest.TestCase):
         still yield a valid frame rather than re-raising the very crash the
         guard exists to prevent. The id is stringified in that envelope.
         """
-        bad_id = datetime(2026, 6, 18, 12, 0, 0)
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
         out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
         payload = json.loads(out)
         self.assertEqual(payload["id"], str(bad_id))
@@ -967,7 +998,10 @@ class TestToolServer(unittest.TestCase):
             await server.start()
 
             async def executor(name, args):
-                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "tags": {1, 2, 3},
+                }
 
             server._tool_executor = executor
             try:

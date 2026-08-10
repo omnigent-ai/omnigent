@@ -29,6 +29,7 @@ import os
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
+import omnigent.onboarding.kimi_auth as _kimi_auth
 from omnigent._platform import resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.harness_availability import (
@@ -48,6 +49,7 @@ from omnigent.onboarding.harness_install import (
     OPENCODE_KEY,
     PI_KEY,
     QWEN_KEY,
+    READINESS_CLI_PROBE_TIMEOUT_S,
     harness_cli_installed,
     harness_install_spec,
     required_cli_for_harness,
@@ -77,16 +79,20 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
     {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
 )
 
-# Families whose CLIs authenticate via file-based credentials rather than a CLI
-# login command. For these, ``harness_is_configured`` checks BOTH the binary
-# (via ``harness_cli_installed``) AND the credential (via the callable here).
-# The ``anthropic`` / ``openai`` families authenticate via subscription provider
-# config and do not appear here. The lambda resolves through the module at call
-# time so a test can monkeypatch
-# ``omnigent.onboarding.gemini_auth.gemini_login_detected`` and have the patch
-# take effect without this dict caching the old function object.
+# Families/harnesses whose CLIs authenticate via file-based credentials rather
+# than a CLI login-status command. For these, ``harness_is_configured`` checks
+# BOTH the binary (via ``harness_cli_installed``) AND the credential (via the
+# callable here). ``agy`` writes an OAuth token on its first interactive run;
+# ``kimi login`` writes ``~/.kimi-code/credentials/kimi-code.json`` (kimi has no
+# login-status probe). The ``anthropic`` / ``openai`` families authenticate via
+# subscription provider config and do not appear here. Each lambda resolves
+# through its module at call time so a test can monkeypatch
+# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_login_detected``
+# and have the patch take effect without this dict caching the old function
+# object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
+    KIMI_KEY: lambda: _kimi_auth.kimi_login_detected(),
 }
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native
@@ -250,12 +256,18 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         # the environment. A bad / Copilot-less token surfaces at run time.
         from omnigent.onboarding.copilot_auth import (
             COPILOT_TOKEN_ENV_VARS,
+            copilot_github_host,
             copilot_github_token_configured,
+            gh_cli_github_token,
         )
 
-        return copilot_github_token_configured() or any(
+        if copilot_github_token_configured() or any(
             os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
-        )
+        ):
+            return True
+        # A ``gh auth login`` session is a usable Copilot credential, so a
+        # logged-in user is ready without pasting a token into setup.
+        return gh_cli_github_token(copilot_github_host()) is not None
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
@@ -368,7 +380,7 @@ def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
     to upgrade rather than "binary-missing".
     """
-    if harness_cli_installed(install_key):
+    if harness_cli_installed(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
         return True
     spec = harness_install_spec(install_key)
     if spec is not None and resolve_cli_binary(spec.binary) is not None:
@@ -401,7 +413,11 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
     if _family_provider_configured(canonical):
         return True
-    return True if harness_cli_logged_in(install_key) else "needs-auth"
+    return (
+        True
+        if harness_cli_logged_in(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+        else "needs-auth"
+    )
 
 
 def _harness_availability(canonical: str) -> HarnessAvailability:

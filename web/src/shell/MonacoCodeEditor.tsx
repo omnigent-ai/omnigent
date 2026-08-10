@@ -312,7 +312,7 @@ function MonacoCodeEditorInner({
       // Route ⌘S through the same single-flight + trailing-save engine as
       // auto-save, so a manual save during an in-flight/debounced auto-save can't
       // start an overlapping PUT.
-      // oxlint-disable-next-line eslint(no-bitwise) -- Monaco keybindings are bit-OR'd flags.
+      // Monaco keybindings are bitwise OR'd flags.
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
         flushRef.current();
       });
@@ -420,10 +420,12 @@ function MonacoCodeEditorInner({
     else status = "idle";
     onSaveStatusChangeRef.current?.(status);
     // "Saved" is transient: clear it back to idle so the chip doesn't linger.
-    if (status === "saved") {
-      const t = window.setTimeout(() => onSaveStatusChangeRef.current?.("idle"), SAVED_BADGE_MS);
-      return () => window.clearTimeout(t);
-    }
+    if (status !== "saved") return undefined;
+    const timeout = window.setTimeout(
+      () => onSaveStatusChangeRef.current?.("idle"),
+      SAVED_BADGE_MS,
+    );
+    return () => window.clearTimeout(timeout);
   }, [writePending, writeError, writeSuccess, saveDisabled, isDirty]);
 
   // Clear the toolbar chip when this editor goes away (file switch / mode change
@@ -486,7 +488,7 @@ function MonacoCodeEditorInner({
       {canEdit &&
         isDirty &&
         (hasExternalUpdate ? (
-          <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground shrink-0">
+          <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground shrink-0">
             <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
             <span className="flex-1">
               This file was modified externally while you were editing.
@@ -507,19 +509,19 @@ function MonacoCodeEditorInner({
             </button>
           </div>
         ) : (
-          <div className="flex items-center gap-1.5 border-b border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground shrink-0">
+          <div className="flex items-center gap-1.5 border-b border-border bg-muted/50 px-4 py-1.5 text-sm text-muted-foreground shrink-0">
             <MessageSquareOffIcon className="size-3.5 shrink-0" />
             Save your changes to enable commenting on selections.
           </div>
         ))}
       <div className="relative min-h-0 flex-1">
         {loadError && (
-          <div className="flex items-center justify-center p-8 text-destructive text-sm">
+          <div className="flex items-center justify-center p-8 text-destructive text-ui">
             Failed to load the editor.
           </div>
         )}
         {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         )}

@@ -271,6 +271,30 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.agent_id).toBe("ag_other");
   });
 
+  it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
+    const EDITED_REPO = "/Users/corey/projects/alpha-edited";
+    // First open reads the original config.
+    setProjectConfig({ host_id: "host_1", workspace: REPO });
+    const rerender = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    // User edits the project's defaults; the save seeds the fresh config into
+    // the cache, so a re-open of the SAME project (`?project=Alpha` unchanged)
+    // must pick up the new workspace rather than latch onto the settled seed.
+    setProjectConfig({ host_id: "host_1", workspace: EDITED_REPO });
+    rerender(<NewChatLandingScreen />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "alpha-edited",
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(EDITED_REPO);
+  });
+
   it("does not seed an offline config host (falls back to the generic default)", async () => {
     vi.mocked(useHosts).mockReturnValue({
       data: [host(), host({ host_id: "host_off", name: "sleepy", status: "offline" })],
@@ -281,5 +305,117 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
+  });
+
+  // A repo with a main work tree plus one linked worktree. `git worktree list`
+  // returns both for any path inside the repo, so the probe (keyed on the
+  // recent-workspace path) and the post-redirect main query both resolve here.
+  const MAIN_REPO = "/Users/corey/projects/gamma";
+  const LINKED_WORKTREE = "/Users/corey/projects/gamma-worktrees/feature-x";
+  const WORKTREE_LIST: HostWorktree[] = [
+    { path: MAIN_REPO, branch: "main", is_main: true, detached: false },
+    { path: LINKED_WORKTREE, branch: "feature/x", is_main: false, detached: false },
+  ];
+
+  function setWorktreeRepo(): void {
+    vi.mocked(useHostWorktrees).mockImplementation((hostId, path) => {
+      const inRepo = hostId === "host_1" && (path === MAIN_REPO || path === LINKED_WORKTREE);
+      return {
+        data: inRepo ? WORKTREE_LIST : ([] as HostWorktree[]),
+        isPlaceholderData: false,
+        isError: false,
+      } as ReturnType<typeof useHostWorktrees>;
+    });
+  }
+
+  it("forks fresh from the project default when the last-used workspace is a worktree", async () => {
+    // The most-recent workspace is a linked worktree. Without the fork-fresh
+    // redirect the composer would land in it (bind mode) and never apply the
+    // project's default base branch. With a default set it must instead seed
+    // the MAIN repo, auto-name a branch, and fork off that default.
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
+    setWorktreeRepo();
+    setProjectConfig({ host_id: "host_1", base_branch: "develop" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("gamma"),
+    );
+    const body = await submitAndReadBody();
+    // Redirected to the main repo, not the linked worktree.
+    expect(body.workspace).toBe(MAIN_REPO);
+    const git = body.git as { branch_name: string; base_branch?: string; existing_worktree?: true };
+    // A brand-new worktree (create, not a bind) forked off the project default.
+    expect(git.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+    expect(git.base_branch).toBe("develop");
+    expect(git.existing_worktree).toBeUndefined();
+  });
+
+  it("keeps landing in the last-used worktree when the project has no default base branch", async () => {
+    // No default base branch → the fork-fresh redirect stays off, preserving the
+    // prior behavior: land directly in the recent worktree (git bind mode).
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
+    setWorktreeRepo();
+    setProjectConfig({ host_id: "host_1" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "feature-x",
+      ),
+    );
+    const body = await submitAndReadBody();
+    // Bound straight to the worktree dir; the worktree's branch rides along and
+    // no base branch is set (it's a bind, not a fork).
+    expect(body.workspace).toBe(LINKED_WORKTREE);
+    const git = body.git as { branch_name: string; base_branch?: string; existing_worktree?: true };
+    expect(git.existing_worktree).toBe(true);
+    expect(git.branch_name).toBe("feature/x");
+    expect(git.base_branch).toBeUndefined();
+  });
+
+  it("does not fork-fresh when the project config supplies its own workspace", async () => {
+    // The config seeds its own workspace (MAIN_REPO) even though a default base
+    // branch is set and the recent path is a linked worktree. The fork-fresh
+    // redirect must NOT hijack that into a worktree launch: the auto-seed is a
+    // no-op on a non-empty field, so no branch is generated and the session
+    // starts plainly in the configured directory.
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
+    setWorktreeRepo();
+    setProjectConfig({ host_id: "host_1", workspace: MAIN_REPO, base_branch: "develop" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("gamma"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(MAIN_REPO);
+    // Plain launch — no worktree fork was manufactured from the config workspace.
+    expect(body.git).toBeUndefined();
+  });
+
+  it("still seeds the recent workspace when the worktree probe errors", async () => {
+    // A non-400 failure from /worktrees leaves the hook's data undefined for
+    // good. The seed must fall back to the candidate as-is (treat the probe
+    // error as "no redirect") rather than blocking on data that never arrives
+    // and leaving the working directory blank forever.
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [LINKED_WORKTREE] }));
+    vi.mocked(useHostWorktrees).mockReturnValue({
+      data: undefined,
+      isPlaceholderData: false,
+      isError: true,
+    } as ReturnType<typeof useHostWorktrees>);
+    setProjectConfig({ host_id: "host_1", base_branch: "develop" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "feature-x",
+      ),
+    );
+    const body = await submitAndReadBody();
+    // Seeded the recent path as-is; no redirect, no fabricated fork.
+    expect(body.workspace).toBe(LINKED_WORKTREE);
+    expect(body.git).toBeUndefined();
   });
 });

@@ -36,6 +36,8 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = Any  # type: ignore[explicit-any]
 ToolCallMetadata: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ExecutorExtra: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+ExecutorUsage: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+CompactedMessages: TypeAlias = list[Message]
 
 # ``enqueue_session_message`` content — arbitrary user-supplied payload
 # (string text or a structured JSON value).
@@ -47,6 +49,22 @@ EnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
 # provider-opaque via this TypeAlias — callers narrow with their own ``cast``
 # or per-event isinstance checks, matching the existing peer-file pattern.
 ProviderStreamItem: TypeAlias = Any  # type: ignore[explicit-any]
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, human-readable description of *exc*.
+
+    ``str(exc)`` is empty for several stdlib exceptions raised without a
+    message (a bare ``RuntimeError()``, ``TimeoutError()``, etc.). Executors
+    that report a failure by ``str(exc)`` then surface a blank error to the
+    operator (issue #4281: "inner executor error: " with no detail). Fall back
+    to ``repr(exc)`` — which always includes the class name — so a failure is
+    never reported without at least naming its type.
+
+    :param exc: The exception to describe.
+    :returns: ``str(exc)`` when non-empty, otherwise ``repr(exc)``.
+    """
+    return str(exc) or repr(exc)
 
 
 @runtime_checkable
@@ -172,7 +190,7 @@ class TurnComplete(ExecutorEvent):
     response: str | None = None
     modified_by_policy: bool = False
     continue_turn: bool = False
-    usage: dict[str, Any] | None = None
+    usage: ExecutorUsage | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
@@ -230,7 +248,7 @@ class CompactionComplete(ExecutorEvent):
     summary: str
     token_count: int
     model: str | None = None
-    compacted_messages: list[dict[str, Any]] | None = None
+    compacted_messages: CompactedMessages | None = None
 
 
 @dataclass

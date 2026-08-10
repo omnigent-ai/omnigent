@@ -11,7 +11,6 @@
 // wire fields.
 
 import type { ConversationItem } from "./conversationItems";
-import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
@@ -148,6 +147,8 @@ interface SessionResponseWire {
   model_override?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
+  /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
+  subagent_routing_override?: "on" | "off" | null;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -157,7 +158,13 @@ interface SessionResponseWire {
    * `total_cost_usd`). Absent/`null` when no per-model usage was recorded.
    */
   usage_by_model?: Record<string, ModelUsageWire> | null;
-  last_task_error?: { code: string; message: string } | null;
+  last_task_error?: {
+    code: string;
+    message: string;
+    title?: string;
+    cause?: string;
+    remediation?: string;
+  } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
    * moment the snapshot was built. The live SSE stream has no
@@ -185,8 +192,6 @@ interface SessionResponseWire {
    * entirely, and absent on older recorded fixtures.
    */
   permission_level?: number | null;
-  /** Whether this viewer may accept privileged actions for the session. */
-  can_approve?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` (or absent on older fixtures)
@@ -300,6 +305,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     harness: wire.harness ?? null,
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
+    subagentRoutingOverride: wire.subagent_routing_override,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -312,7 +318,6 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
     })),
     permissionLevel: wire.permission_level ?? null,
-    canApprove: wire.can_approve ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
@@ -358,13 +363,25 @@ export class ApiError extends Error {
  * server's `error.message` / `error.code` over the bare status line.
  * Falls back to ``"<status> <statusText>"`` when the body is missing or
  * not the AP error shape.
+ *
+ * Routes that raise FastAPI's `HTTPException` directly (the upload route's
+ * 415/413, the 501 "not configured" guards) serialize as `{"detail": "…"}`
+ * instead, so that shape is read too — otherwise those failures reach the
+ * user as a bare status line ("415 ", with statusText empty over HTTP/2)
+ * rather than the reason the server actually gave.
  */
-async function apiErrorFromResponse(res: Response): Promise<ApiError> {
-  let message = `${res.status} ${res.statusText}`;
+export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  let message = `${res.status} ${res.statusText}`.trim();
   let code: string | null = null;
   try {
-    const body = (await res.json()) as { error?: { code?: string; message?: string } };
+    const body = (await res.json()) as {
+      error?: { code?: string; message?: string };
+      detail?: unknown;
+    };
+    // FastAPI's validation errors put a list in `detail`; only a plain
+    // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
+    else if (typeof body.detail === "string" && body.detail) message = body.detail;
     if (body.error?.code) code = body.error.code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
@@ -636,9 +653,11 @@ export async function launchRunner(
  *
  * `null` on `reasoningEffort` / `modelOverride` sends the server's
  * ``"default"`` clear alias (matches the REPL's ``/effort | /model
- * default``). `null` on `costControlModeOverride` is sent as a JSON
- * ``null`` — for that field, "off" is a real value, so explicit null
- * (not an alias) is the server's clear signal.
+ * default``). `null` on `costControlModeOverride` /
+ * `subagentRoutingOverride` is sent as a JSON ``null`` — for those fields
+ * "off" is a real value, so explicit null (not an alias) is the server's
+ * clear signal. Clearing sub-agent routing lands the session on Default,
+ * the same place ``"off"`` does.
  *
  * `silent: true` persists without firing the claude-native tmux
  * forward — use for bind-time auto-apply (e.g. the sticky-pref
@@ -653,6 +672,7 @@ export async function updateSession(
     modelOverride?: string | null;
     codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
+    subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -670,6 +690,9 @@ export async function updateSession(
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
+  }
+  if ("subagentRoutingOverride" in updates) {
+    body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
@@ -820,64 +843,21 @@ export async function fetchSessionItemsPage(
   return { items: [...page.data].reverse(), hasMore: page.has_more };
 }
 
-/** Pages allowed while looking for the previous user-message boundary. */
-export const MAX_INITIAL_PAGES = 8;
-
-/** A real (non-meta) user prompt — the boundary the initial window snaps to. */
-function isUserPrompt(item: ConversationItem): boolean {
-  return isMessageItem(item) && item.role === "user" && !item.is_meta;
-}
-
 /**
- * The prompt boundary is complete after two real prompts or the page cap.
- * The cap applies only to this semantic target, not viewport filling.
+ * Items the initial window requests, in one round trip.
+ *
+ * Opening a session must not keep fetching afterwards: growing the window
+ * from the transcript's layout effect meant the reader watched history land
+ * for seconds after the page had already settled, with the content shifting
+ * under them each time — and they never asked for it. So the open pays for a
+ * single, larger page instead, and older history is fetched only when they
+ * actually scroll up.
+ *
+ * Sized to cover the previous prompt for a normal turn without the walk this
+ * replaces; a tool-heavy turn can still run longer, and reaching further back
+ * is then the reader's scroll, not a background fetch.
  */
-export function initialWindowComplete(userPromptCount: number, pagesFetched: number): boolean {
-  return userPromptCount >= 2 || pagesFetched >= MAX_INITIAL_PAGES;
-}
-
-/**
- * Hydrate the initial conversation window: at least
- * `SESSION_HISTORY_PAGE_SIZE` items, but extended further back when
- * needed so the *previous* user prompt is included — i.e.
- * `max(one page, back-to-previous-user-message)`.
- *
- * Why: the flat page size can land mid-turn for a long turn (many tool
- * calls after the last user message), so the user opens the chat to a
- * response with no visible prompt above it. We page backward until we've
- * collected two non-meta user messages (the last turn's prompt plus the
- * one before it) AND met the item floor, so the last full exchange and
- * its preceding prompt are always on screen.
- *
- * Cost: the common case (a page that already holds ≥2 user prompts) is a
- * single request, identical to `fetchSessionItemsPage`. Extra requests
- * fire only for long single turns — exactly the case this targets.
- * Bounded by `MAX_INITIAL_PAGES`.
- *
- * Returns the same `{ items, hasMore }` shape as `fetchSessionItemsPage`
- * so callers feed `oldestItemId` / `hasMoreHistory` from it unchanged.
- */
-export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
-  let items: ConversationItem[] = [];
-  let hasMore = true;
-  // Each page starts before the cursor returned by the prior page.
-  /* oxlint-disable no-await-in-loop */
-  for (let pagesFetched = 1; pagesFetched <= MAX_INITIAL_PAGES; pagesFetched += 1) {
-    const cursor = items[0]?.id;
-    const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
-    items = [...page.items, ...items]; // prepend the older page
-    hasMore = page.hasMore;
-    if (!hasMore) break; // reached the start of the conversation
-    const userPromptCount = items.filter(isUserPrompt).length;
-    if (initialWindowComplete(userPromptCount, pagesFetched)) break;
-    if (!items[0]?.id) break; // no cursor to page further; avoid a spin
-  }
-  /* oxlint-enable no-await-in-loop */
-  // If the cap stopped us before the previous user prompt (a pathological
-  // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
-  // the rest remains reachable via scroll-up — same fallback as the default.
-  return { items, hasMore };
-}
+export const INITIAL_WINDOW_ITEMS = 100;
 
 /**
  * Flatten a `GET /v1/sessions/{id}` item into the flat

@@ -105,14 +105,6 @@ def resolved_level(access: ResolvedAccess) -> int | None:
     return access.public_grant_level
 
 
-def resolved_can_approve(access: ResolvedAccess) -> bool:
-    """Whether a resolved top-level access snapshot may approve actions."""
-    return access.is_admin or (
-        access.user_grant_level is not None
-        and (access.user_grant_level >= LEVEL_OWNER or access.user_can_approve)
-    )
-
-
 def check_is_manager(
     user_id: str | None,
     conversation_id: str,
@@ -135,28 +127,3 @@ def check_is_manager(
         permission_store,
         conversation_store,
     )
-
-
-def check_session_approval_access(
-    user_id: str | None,
-    conversation_id: str,
-    permission_store: PermissionStore,
-    conversation_store: ConversationStore,
-) -> bool:
-    """Return whether a user may approve privileged session actions."""
-    if user_id is not None and permission_store.is_admin(user_id):
-        return True
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is None:
-        return False
-    if conv.parent_conversation_id is not None:
-        return check_session_approval_access(
-            user_id,
-            conv.parent_conversation_id,
-            permission_store,
-            conversation_store,
-        )
-    if user_id is None:
-        return False
-    grant = permission_store.get(user_id, conversation_id)
-    return grant is not None and (grant.level >= LEVEL_OWNER or grant.can_approve)

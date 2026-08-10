@@ -229,7 +229,7 @@ export function ScheduleFields({
               value={timeText}
               data-testid="schedule-minute"
               placeholder="0"
-              className="text-sm"
+              className="text-ui"
               aria-invalid={error ? true : undefined}
               onChange={(e) => handleTimeTextChange(e.target.value)}
               onBlur={canonicalizeTimeText}
@@ -244,7 +244,7 @@ export function ScheduleFields({
                     value={timeText}
                     data-testid="schedule-time"
                     placeholder="5:00 PM"
-                    className="pr-8 text-sm"
+                    className="pr-8 text-ui"
                     aria-invalid={error ? true : undefined}
                     onFocus={() => handleTimePickerOpenChange(true)}
                     onChange={(e) => handleTimeTextChange(e.target.value)}
@@ -336,7 +336,7 @@ export function ScheduleFields({
                   data-testid={`weekday-${code}`}
                   onClick={() => toggleWeekday(code)}
                   className={cn(
-                    "h-8 min-w-11 rounded-md border px-2 text-xs font-medium transition-colors",
+                    "h-8 min-w-11 rounded-md border px-2 text-sm font-medium transition-colors",
                     selected
                       ? "border-primary bg-primary text-primary-foreground"
                       : "border-border bg-background text-muted-foreground hover:bg-muted",
@@ -353,7 +353,7 @@ export function ScheduleFields({
       {/* describeSchedule/buildRRule stay in the lib for list rows and possible
           future previews; only the inline validation error renders here now. */}
       {error && (
-        <p className="text-xs text-destructive" data-testid="schedule-error">
+        <p className="text-sm text-destructive" data-testid="schedule-error">
           {error}
         </p>
       )}
@@ -423,7 +423,7 @@ function PickerCell({
       data-selected={selected ? "true" : undefined}
       data-testid={testId}
       className={cn(
-        "flex h-8 w-full items-center justify-center rounded-sm text-sm transition-colors",
+        "flex h-8 w-full items-center justify-center rounded-sm text-ui transition-colors",
         selected ? "bg-primary text-primary-foreground" : "text-foreground hover:bg-muted",
       )}
       onClick={onClick}

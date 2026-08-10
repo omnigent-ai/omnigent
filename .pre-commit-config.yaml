@@ -1,6 +1,5 @@
-# Pre-commit hooks for this repository: ruff (format + check) plus standard
-# file-hygiene checks. Heavier validation (typing, lockfile freshness,
-# OpenAPI drift) runs in CI rather than as commit-time hooks.
+# Pre-commit hooks for this repository: ruff, Pyrefly, project-specific lint,
+# and standard file-hygiene checks.
 #
 # A built web-UI bundle may be committed at this path (vendored, minified
 # JS/CSS) — never lint or "fix" it.
@@ -19,6 +18,13 @@ repos:
         language: system
         entry: .venv/bin/python -m ruff check --fix --force-exclude
         types: [python]
+
+      - id: pyrefly
+        name: pyrefly
+        language: system
+        entry: .venv/bin/pyrefly check
+        pass_filenames: false
+        files: ^(omnigent/.*\.pyi?|sdks/python-client/.*\.py|pyproject\.toml|pyrefly\.toml|uv\.lock)$
 
       # Project-specific test-quality lint rules (dev/lint/). Run on test
       # files only — the patterns never occur in production code.
@@ -41,7 +47,8 @@ repos:
         language: system
         entry: .venv/bin/python dev/lint/lint_no_hardcoded_models.py
         pass_filenames: false
-        files: ^((omnigent|scripts|examples|\.github|dev/lint)/.*\.(py|ya?ml|json|toml|sh)|dev/lint/hardcoded_model_allowlist\.txt)$
+        files: \.(py|ya?ml|json|toml|sh)$
+        exclude: (^|/)tests/|^openapi\.json$
 
       - id: web-prettier
         name: web prettier
@@ -56,8 +63,22 @@ repos:
       - id: web-oxlint
         name: web oxlint
         language: system
-        entry: bash -c 'test -x web/node_modules/.bin/oxlint && cd web && node_modules/.bin/oxlint --deny-warnings .'
+        entry: bash -c 'test -x web/node_modules/.bin/oxlint && cd web && node_modules/.bin/oxlint --deny-warnings --report-unused-disable-directives .'
         files: ^(web/.*\.[cm]?[jt]sx?|web/\.oxlintrc\.json|web/package\.json|pnpm-lock\.yaml)$
+        pass_filenames: false
+
+      - id: web-tsc
+        name: web TypeScript type check
+        language: system
+        entry: bash -c 'test -x web/node_modules/.bin/tsc && cd web && node_modules/.bin/tsc -b'
+        files: ^(web/.*\.[cm]?[jt]sx?|web/tsconfig(?:\.[^.]+)?\.json|web/package\.json|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
+      - id: vscode-tsc
+        name: VS Code extension TypeScript type check
+        language: system
+        entry: bash -c 'test -x editors/vscode/node_modules/.bin/tsc && cd editors/vscode && node_modules/.bin/tsc --noEmit'
+        files: ^(editors/vscode/.*\.[cm]?[jt]sx?|editors/vscode/tsconfig\.json|editors/vscode/package\.json|pnpm-(?:lock|workspace)\.yaml)$
         pass_filenames: false
 
       # Android Kotlin formatting + linting via ktlint (config:

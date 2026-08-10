@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
@@ -667,6 +667,7 @@ def test_append_error_item_round_trips_for_history(
         "response_id": "resp_failed",
         "type": "error",
         "status": "completed",
+        "created_at": read_back.created_at,
         "source": "execution",
         "code": "native_terminal_start_failed",
         "message": "Native Codex requires the 'codex' CLI on PATH.",
@@ -751,9 +752,9 @@ def test_position_not_enforced_by_db(
 
     # Neither a same-second nor a later-second duplicate is rejected now: the
     # index is not UNIQUE, and distinct ids keep the PK unique so both persist.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at))
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at + 1))
 
 
@@ -1345,6 +1346,72 @@ def test_list_conversations_search_snippet_absent_without_query(
     )
     page = conversation_store.list_conversations()
     assert all(c.search_snippet is None for c in page.data)
+
+
+def _captured_sql(store: SqlAlchemyConversationStore, run) -> list[str]:
+    """
+    Capture every SQL statement the conversation engine executes during ``run``.
+
+    Attaches a ``before_cursor_execute`` listener to the store's conversation
+    engine, invokes ``run()``, then detaches. Used to assert which session-level
+    SET statements the search path emits.
+    """
+    statements: list[str] = []
+
+    def _before(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(store._conv_engine, "before_cursor_execute", _before)
+    try:
+        run()
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", _before)
+    return statements
+
+
+@pytest.mark.databricks
+def test_list_conversations_search_sets_statement_timeout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A content search bounds itself with ``SET LOCAL statement_timeout`` on
+    Postgres, so an unindexed scan can't run unbounded (the query runs in a
+    worker thread a client disconnect wouldn't stop).
+
+    Postgres-only: SQLite has no ``statement_timeout``; the search path skips
+    the SET there, which the companion assertion below guards.
+    """
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("statement_timeout is a Postgres feature")
+
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, title="deployment runbook")
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    assert any("statement_timeout" in s.lower() for s in statements), statements
+
+
+def test_list_conversations_no_search_skips_statement_timeout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A plain (non-search) listing never sets ``statement_timeout``.
+
+    Ordinary pagination is indexed and fast; bounding it could abort a
+    legitimately larger page. Holds on every dialect — the SET is gated on
+    ``search_query`` being set, not just on Postgres.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, title="deployment runbook")
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(),
+    )
+    assert not any("statement_timeout" in s.lower() for s in statements), statements
 
 
 def test_list_conversations_search_snippet_uses_earliest_match(
@@ -3278,6 +3345,23 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+def test_fork_conversation_files_into_project(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``project_id=`` files the fork; the default leaves it unfiled even
+    when the source itself is filed (the route resolves ownership)."""
+    project_id = "b" * 32
+    source = conversation_store.create_conversation(title="src")
+    conversation_store.set_conversation_project(source.id, project_id)
+
+    filed_fork = conversation_store.fork_conversation(source.id, project_id=project_id)
+    assert filed_fork.project_id == project_id
+    assert conversation_store.get_conversation(filed_fork.id).project_id == project_id
+
+    unfiled_fork = conversation_store.fork_conversation(source.id)
+    assert unfiled_fork.project_id is None
+
+
 def test_fork_copies_terminal_launch_args_by_default(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -4516,7 +4600,7 @@ def _stored_next_position(
     """Read the raw ``conversations.next_position`` counter for assertions."""
     from omnigent.db.db_models import SqlConversation
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         row = session.get(SqlConversation, (0, conversation_id))
         assert row is not None
         return row.next_position
@@ -4531,7 +4615,7 @@ def _stored_positions(
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         return sorted(
             session.execute(
                 select(SqlConversationItem.position).where(
@@ -4586,7 +4670,7 @@ def test_append_reads_counter_not_max_scan(
     conv = conversation_store.create_conversation()
     conversation_store.append(conv.id, [_user_message("a"), _user_message("b")])
     # Real max position is 1; jump the counter ahead to 100.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = 100
 
     conversation_store.append(conv.id, [_user_message("c")])
@@ -4612,7 +4696,7 @@ def test_append_falls_back_to_scan_when_counter_null(
     if preexisting:
         conversation_store.append(conv.id, [_user_message(f"pre{i}") for i in range(preexisting)])
     # Simulate a pre-counter row: clear the maintained counter.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = None
     assert _stored_next_position(conversation_store, conv.id) is None
 
@@ -5213,7 +5297,7 @@ def _stored_item_data(store: SqlAlchemyConversationStore, conversation_id: str) 
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         return list(
             session.execute(
                 select(SqlConversationItem.data)
@@ -5328,7 +5412,7 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
         ],
     )
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         stored = list(
             session.execute(
                 select(SqlConversationItem.search_text).where(

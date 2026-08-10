@@ -19,6 +19,9 @@ export interface BaseItem {
   type: string;
   response_id: string;
   status: string;
+  /** Server-side creation time (unix epoch seconds). Drives the
+   *  completed-turn "Worked for" duration for reloaded history. */
+  created_at?: number;
 }
 
 export interface MessageItem extends BaseItem {
@@ -59,6 +62,12 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
+  /** Friendly headline for a classified failure. Present when the runner classified it. */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
 }
 
 export interface ReasoningItem extends BaseItem {

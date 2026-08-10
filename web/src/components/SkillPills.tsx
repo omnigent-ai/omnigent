@@ -35,14 +35,14 @@ export function SkillPills({
               type="button"
               data-testid={`skill-pill-${skill.name}`}
               onClick={() => onPick(skill.name)}
-              className="pointer-events-auto rounded-md bg-brand-accent/10 px-2 py-1 text-13 leading-none text-brand-accent transition-colors hover:bg-brand-accent/15"
+              className="pointer-events-auto rounded-md bg-brand-accent/10 px-2 py-1 text-ui leading-none text-brand-accent transition-colors hover:bg-brand-accent/15"
             >
               /{skill.name}
             </button>
           </TooltipTrigger>
           <TooltipContent side="top" align="start" className="block max-w-80 p-3">
-            <p className="text-sm font-semibold text-foreground">/{skill.name}</p>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            <p className="text-ui font-semibold text-foreground">/{skill.name}</p>
+            <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
               {skill.description}
             </p>
           </TooltipContent>

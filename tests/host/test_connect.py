@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
 
+from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
@@ -506,6 +509,38 @@ async def test_handle_model_options_rejects_unsupported_harness() -> None:
     )
 
 
+async def test_handle_model_options_reports_the_endpoints_wider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generations no picker row names are still launchable, so they ship too."""
+    from omnigent import claude_native
+
+    monkeypatch.setattr(
+        claude_native,
+        "resolve_native_claude_config",
+        lambda *, spec: claude_native.ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5"},
+            model="system.ai.claude-opus-5",
+            routable_models=("system.ai.claude-opus-5", "system.ai.claude-opus-4-8"),
+        ),
+    )
+    monkeypatch.setattr(
+        claude_native,
+        "claude_native_model_options",
+        lambda config: [{"id": "opus", "model": "system.ai.claude-opus-5"}],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+    )
+
+    assert result.routable_models == [
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
+    ]
+
+
 def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 
@@ -610,6 +645,14 @@ async def test_handle_launch_spawns_subprocess(
         "runner subprocess must be spawned with stdin=subprocess.DEVNULL"
     )
 
+    # Runners must start in the session workspace, not the daemon's inherited
+    # cwd: a daemon launched from a directory that was later deleted (temp
+    # checkout, removed worktree) makes every Path.cwd() in the runner raise
+    # FileNotFoundError, and native terminals then fail to start.
+    assert spawned_kwargs.get("cwd") == str(workspace), (
+        "runner subprocess must be spawned with cwd=<session workspace>"
+    )
+
     # Clean up the spawned sleep process (and its exit watcher).
     _cleanup_host(host)
 
@@ -635,6 +678,9 @@ async def test_handle_launch_fails_for_bad_workspace() -> None:
     assert result.status == "failed", "Should fail for nonexistent workspace"
     assert "does not exist" in (result.error or ""), (
         f"Error should mention path doesn't exist, got: {result.error!r}"
+    )
+    assert result.error_code == "workspace_missing", (
+        f"Should carry workspace_missing error_code, got: {result.error_code!r}"
     )
     assert result.runner_id is None
 
@@ -922,27 +968,45 @@ class _FakeTunnel:
         raise ConnectionError("test disconnect")
 
 
-class _ReadinessChangingTunnel(_FakeTunnel):
-    """Trigger one idle refresh before disconnecting the fake tunnel."""
+class _RecordingWS:
+    """Fake tunnel that records frames the readiness loop sends.
+
+    The readiness loop (:meth:`HostProcess._harness_readiness_loop`) only ever
+    calls ``send``; ``first_send`` lets a test await the first update frame
+    deterministically instead of sleeping for a fixed interval.
+    """
 
     def __init__(self) -> None:
-        """Initialize the frame log and receive counter."""
-        super().__init__()
-        self.recv_count = 0
+        """Initialize the frame log and first-send signal."""
+        self.sent: list[str] = []
+        self.first_send = asyncio.Event()
 
-    async def recv(self) -> str:
-        """Simulate one idle interval followed by a disconnect."""
-        self.recv_count += 1
-        if self.recv_count == 1:
-            await asyncio.Future()
-        raise ConnectionError("test disconnect")
+    async def send(self, data: str) -> None:
+        """Record an outbound frame and signal the first send.
+
+        :param data: Encoded frame text.
+        """
+        self.sent.append(data)
+        self.first_send.set()
+
+
+async def _cancel(task: asyncio.Task[None]) -> None:
+    """Cancel *task* and await its unwinding, swallowing the cancellation."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 async def test_live_host_refreshes_harness_readiness_without_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A setup completed after connect must replace the advertised readiness."""
-    readiness = iter(({"pi": False}, {"pi": True}))
+    """A setup completed after connect pushes a replacement readiness frame.
+
+    The refresh now runs in :meth:`HostProcess._harness_readiness_loop`, off the
+    receive loop, so a slow probe can never stall the tunnel keepalive.
+    """
+    readiness = iter(({"pi": True},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -956,25 +1020,27 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
         0.01,
     )
     host = _make_host_process()
-    tunnel = _ReadinessChangingTunnel()
+    ws = _RecordingWS()
 
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"pi": False}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
 
-    assert len(tunnel.sent) == 2
-    hello = decode_host_frame(tunnel.sent[0])
-    refresh = decode_host_frame(tunnel.sent[1])
-    assert isinstance(hello, HostHelloFrame)
-    assert hello.configured_harnesses == {"pi": False}
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
     assert isinstance(refresh, HostHarnessReadinessFrame)
     assert refresh.configured_harnesses == {"pi": True}
+    _cleanup_host(host)
 
 
 async def test_live_host_full_refresh_detects_auth_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The full-refresh fallback catches readiness changes beyond binary installs."""
-    readiness = iter(({"codex": "needs-auth"}, {"codex": True}))
+    readiness = iter(({"codex": True},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -984,38 +1050,87 @@ async def test_live_host_full_refresh_detects_auth_completion(
         0.01,
     )
     host = _make_host_process()
-    tunnel = _ReadinessChangingTunnel()
+    ws = _RecordingWS()
 
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
 
-    assert len(tunnel.sent) == 2
-    refresh = decode_host_frame(tunnel.sent[1])
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
     assert isinstance(refresh, HostHarnessReadinessFrame)
     assert refresh.configured_harnesses == {"codex": True}
+    _cleanup_host(host)
 
 
 async def test_live_host_does_not_repeat_unchanged_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A periodic full refresh sends nothing when the readiness map is unchanged."""
-    readiness = iter(({"codex": "needs-auth"}, {"codex": "needs-auth"}))
+    calls = {"n": 0}
+
+    def _unchanged_map() -> dict[str, str]:
+        calls["n"] += 1
+        return {"codex": "needs-auth"}
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    try:
+        # Let at least two full refreshes recompute-and-compare before stopping.
+        for _ in range(400):
+            if calls["n"] >= 2:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        await _cancel(task)
+
+    assert calls["n"] >= 2
+    assert ws.sent == []
+    _cleanup_host(host)
+
+
+async def test_live_host_repushes_when_only_gateway_inference_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway-inference flip alone must reach the server, readiness unchanged."""
+    gateway = iter(({"codex": False}, {"codex": True}))
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
-        lambda: next(readiness),
+        lambda: {"codex": True},
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.gateway_inference_map",
+        lambda: next(gateway, {"codex": True}),
     )
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
     )
     host = _make_host_process()
-    tunnel = _ReadinessChangingTunnel()
+    ws = _RecordingWS()
 
-    with pytest.raises(ConnectionError, match="test disconnect"):
-        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": True}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
 
-    assert len(tunnel.sent) == 1
-    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+    assert refresh.gateway_inference == {"codex": True}
+    _cleanup_host(host)
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
@@ -1185,7 +1300,7 @@ async def test_watch_runner_silent_on_intentional_stop(
     assert result.status == "launched", result.error
 
     runner_id = token_bound_runner_id("tok_stop")
-    stop_result = host._handle_stop(
+    stop_result = await host._handle_stop(
         HostStopRunnerFrame(request_id="req_stop_2", runner_id=runner_id)
     )
     assert stop_result.status == "stopped"
@@ -1312,7 +1427,7 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
-def test_handle_stop_terminates_process(tmp_path: Path) -> None:
+async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
     returns status='stopped'.
@@ -1332,7 +1447,7 @@ def test_handle_stop_terminates_process(tmp_path: Path) -> None:
         request_id="req_003",
         runner_id="runner_aaa",
     )
-    result = host._handle_stop(frame)
+    result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "stopped"
@@ -1342,7 +1457,7 @@ def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     assert "runner_aaa" not in host._runners
 
 
-def test_handle_stop_unknown_runner() -> None:
+async def test_handle_stop_unknown_runner() -> None:
     """
     Verify that _handle_stop returns status='failed' for an
     unknown runner_id.
@@ -1355,14 +1470,14 @@ def test_handle_stop_unknown_runner() -> None:
         request_id="req_004",
         runner_id="runner_nonexistent",
     )
-    result = host._handle_stop(frame)
+    result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
 
 
-def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
     """
     Verify ``_handle_runner_status`` reports ``alive`` for a tracked
     runner whose process is still running.
@@ -1380,7 +1495,7 @@ def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
         host._runners["runner_live"] = _RunnerHandle(
             proc=proc, log_path=tmp_path / "runner-live.log"
         )
-        result = host._handle_runner_status(
+        result = await host._handle_runner_status(
             HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
         )
         assert isinstance(result, HostRunnerStatusResultFrame)
@@ -1391,7 +1506,7 @@ def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
         proc.wait()
 
 
-def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+async def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
     """
     Verify ``_handle_runner_status`` reports ``dead`` for a tracked
     runner whose process has exited.
@@ -1408,14 +1523,14 @@ def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
     )
     proc.wait()  # ensure the process has exited before we query
     host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
-    result = host._handle_runner_status(
+    result = await host._handle_runner_status(
         HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
     )
     assert isinstance(result, HostRunnerStatusResultFrame)
     assert result.status == "dead"
 
 
-def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+async def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     """
     Verify ``_handle_runner_status`` reports ``unknown`` for a runner
     this host has no record of.
@@ -1426,7 +1541,7 @@ def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     grace. Both must read ``unknown`` so the server relaunches at once.
     """
     host = _make_host_process()
-    result = host._handle_runner_status(
+    result = await host._handle_runner_status(
         HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
     )
     assert isinstance(result, HostRunnerStatusResultFrame)
@@ -1940,6 +2055,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "KUBECONFIG": "/home/alice/.kube/config",
+        "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
         "OMNIGENT_LOG_LEVEL": "DEBUG",
@@ -1986,6 +2102,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # SSH_AUTH_SOCK is a socket path on the same footing. Dropping it leaves
+    # every runner-spawned context without ssh-agent auth, so git-over-SSH and
+    # SSH-cert tooling fail with "dial unix: missing address".
+    assert env["SSH_AUTH_SOCK"] == "/private/tmp/com.apple.launchd.7Qk/Listeners"
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
@@ -2130,6 +2250,44 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert env["MY_GATEWAY_URL"] == "https://llm.internal.example.com"
     # Anything unnamed stays behind the allowlist.
     assert "UNLISTED_SECRET" not in env
+
+
+def test_build_runner_env_passthrough_survives_remote_daemon_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_RUNNER_ENV_PASSTHROUGH forwards a named var through BOTH hops.
+
+    In ``--server`` mode the env crosses two strips: CLI→daemon
+    (``_build_host_daemon_env``) then daemon→runner (``_build_runner_env``). The
+    control var must survive the first hop or the second never sees the names it
+    lists. A named var travels via the ``DATABRICKS_`` prefix on the first hop and
+    the passthrough on the second, so it must reach the runner; an unnamed secret
+    must not.
+    """
+    from omnigent.cli import _build_host_daemon_env
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
+    monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
+    monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
+
+    server = "https://example.databricksapps.com"
+    daemon_env = _build_host_daemon_env(server_url=server)
+    # The first hop must keep the control var (regression guard for the remote no-op).
+    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server,
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    # The named var reaches the runner; an unnamed one does not.
+    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
+    assert "DATABRICKS_UNNAMED" not in runner_env
 
 
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:
@@ -3322,6 +3480,88 @@ async def test_connected_host_retries_login_redirects_indefinitely(
     assert spy.call_count == 6
 
 
+@pytest.mark.parametrize("status", [401, 403])
+async def test_connected_host_retries_auth_rejection_indefinitely(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """401/403 after a successful connect never turns fatal.
+
+    A host that already completed an upgrade proved its credentials and
+    authorization are valid. A later 401/403 is almost always a dropped
+    VPN whose corporate proxy answers the upgrade before it reaches the
+    server — killing the host would drop its live runners and force a
+    manual ``omnigent host`` restart once the VPN reconnects. It must keep
+    retrying past the fresh-host fatal threshold instead.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    rejection = _invalid_status(status)
+    # Accepted upgrade first (None), then several rejections (more than the
+    # fresh-host login-redirect fatal threshold of 3 to prove there is no
+    # cap), then a cancel to end the test.
+    spy = _ConnectSpy([None, rejection, rejection, rejection, rejection, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: if the post-connect rejections were still treated as
+    # fatal this would raise HostConnectError on the first one (call_count 2).
+    await host.run()
+
+    # 6 = accepted connect + 4 retried rejections + the ending cancel.
+    assert spy.call_count == 6
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_connected_host_auth_rejection_prints_notice_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+) -> None:
+    """The first auth rejection of an outage warns on stderr, exactly once.
+
+    ``_logger.warning`` goes to the CLI log file, so a foreground
+    ``omnigent host`` would sit silent while it retried a dropped VPN. The
+    terminal notice must name the cause and mention VPN/network, and must
+    print only once per outage (not on every retry) so it doesn't spam
+    stderr while connectivity is down.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    rejection = _invalid_status(status)
+    spy = _ConnectSpy([None, rejection, rejection, rejection, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # The cause reached the terminal, naming the transient network hint.
+    assert f"HTTP {status}" in err
+    assert "VPN" in err
+    # Printed once for the whole outage, not once per retry — three
+    # consecutive rejections must yield a single notice line.
+    assert err.count(f"HTTP {status}") == 1
+
+
+async def test_fresh_host_still_fails_loud_on_auth_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-connected host still fails loud on 401/403.
+
+    The connected-host retry keys on a prior successful upgrade. A host
+    that has NEVER connected and is rejected with 401/403 is genuinely
+    unauthenticated / unauthorized — it must still raise HostConnectError
+    on the first attempt (→ exit 1 with the fix printed), not loop.
+    """
+    spy = _ConnectSpy([_invalid_status(403)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError):
+        await host.run()
+
+    # Exactly one attempt → no silent retry for the fresh-host case.
+    assert spy.call_count == 1
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
@@ -3430,11 +3670,14 @@ async def test_run_reconnects_on_transient_upgrade_failure(
 def test_run_host_process_exits_nonzero_on_fatal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """run_host_process surfaces a fatal tunnel failure as exit code 1.
+    """run_host_process surfaces a fatal tunnel failure as its own exit code.
 
     The CLI entry point must print the cause + fix and exit non-zero, not
-    hang silently. Driven through the real ``asyncio.run``
-    path, so this is a sync test.
+    hang silently. The code is the dedicated fatal one rather than a bare
+    1, so an in-sandbox supervisor can tell "this can never succeed" from
+    "this crashed" and stand down instead of restarting a bad credential
+    forever. Driven through the real ``asyncio.run`` path, so this is a
+    sync test.
     """
     _patch_connect(monkeypatch, _ConnectSpy([_invalid_status(403)]))
 
@@ -3444,8 +3687,10 @@ def test_run_host_process_exits_nonzero_on_fatal(
             config_path=tmp_path / "config.yaml",
         )
 
-    # Non-zero exit so callers/CI see the failure.
-    assert excinfo.value.code == 1
+    # Non-zero exit so callers/CI see the failure, and distinguishable
+    # from a crash so supervision doesn't retry it.
+    assert excinfo.value.code == HOST_FATAL_EXIT_CODE
+    assert HOST_FATAL_EXIT_CODE != 1
     err = capsys.readouterr().err
     # The actionable message reached stderr (banner + the 403 cause).
     assert "Could not connect" in err
@@ -3477,3 +3722,65 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
+    tmp_path: Path,
+) -> None:
+    """Cancelling a launch mid-spawn tears the runner down instead of leaking it.
+
+    ``_handle_launch`` registers the handle in ``_runners`` only after the spawn
+    thread returns, so a cancellation in that window used to leave a live runner
+    that was never watched, stopped, or reaped (and whose exit status the zygote
+    would retain forever). The spawn is shielded and the abandoned process is
+    terminated.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+    spawn_started = threading.Event()
+
+    def _slow_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a long-lived process, signalling once it exists.
+
+        :param args: Command args (ignored — a real sleep stands in).
+        :param kwargs: Popen kwargs (ignored).
+        :returns: A real subprocess handle.
+        """
+        proc = original_popen(
+            ["sleep", "60"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        spawned.append(proc)
+        spawn_started.set()
+        return proc
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cancel",
+        binding_token="tok_cancel",
+        workspace=str(workspace),
+    )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_slow_popen):
+        task = asyncio.create_task(host._handle_launch(frame))
+        # Cancel only once the spawn thread has actually created the process,
+        # so we exercise the real leak window rather than a pre-spawn cancel.
+        await asyncio.to_thread(spawn_started.wait, 10.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert spawned, "the spawn thread should have created a process"
+    # Never registered (that is the leak window) ...
+    assert not host._runners
+    # ... but also not left running: the shield's done-callback terminates it.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and spawned[0].poll() is None:
+        await asyncio.sleep(0.05)
+    assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"

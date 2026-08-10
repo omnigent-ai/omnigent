@@ -1,0 +1,130 @@
+# resolve-agent (local) — take a reproduced bug to resolution and prove it with a
+# fail→pass test transition: review an existing fix PR if one exists, else author
+# the fix and open a PR.
+#
+# This is the step AFTER repro-agent. It consumes repro-agent's handoff (the
+# live-confirmed reproduction and its e2e test). It first checks whether an open
+# PR already fixes the bug: if so, it REVIEWS that PR — running the repro test
+# against it and checking the diff — instead of writing a competing fix. If none
+# exists, it finds the root cause, implements a fix in a fresh worktree, adds
+# targeted unit/regression tests at the layer it changed, proves the whole set
+# goes fail→pass, then commits, pushes, and opens a ready-for-review PR so the
+# repo's automated review runs on it.
+#
+# It is invoked with a pointer to a completed repro run — either a `session`
+# link (local: right after `dev/repro.py`) or a `ci_link` (a CI run URL, when the
+# repro ran in throwaway CI and its worktree is gone). From that pointer it
+# recovers the verdict/facets/journey and re-materializes the repro test.
+#
+# Usage (run from the root of your omnigent-ai/omnigent checkout, so the agent's
+# working directory is this repo):
+#
+#   # From a local repro session (the session dev/repro.py just produced):
+#   omnigent run dev/resolve-agent \
+#     -p '{"session":"http://localhost:6767/c/dc59e331-..."}'
+#
+#   # From a CI run that executed repro-agent:
+#   omnigent run dev/resolve-agent \
+#     -p '{"ci_link":"https://github.com/omnigent-ai/omnigent-internal/actions/runs/30974269184"}'
+#
+# The brain runs on the Claude Agent SDK, so configure a Claude provider first
+# (`omnigent setup` — an Anthropic key, a Claude subscription, an
+# OpenAI-compatible gateway, or a Databricks workspace). It reads the repro
+# session via sys_session_*, uses the shell for `git` / `gh` / running tests, and
+# writes the fix and its tests into this checkout.
+
+spec_version: 1
+name: resolve_agent
+description: >-
+  Takes a bug that repro-agent has already reproduced to resolution, and proves
+  it with a fail→pass test transition. Given a pointer to a completed repro run —
+  a session link (local) or a CI run URL (ci_link) — it recovers the reproduction
+  (verdict, per-facet breakdown, journey) and the authored e2e test. It then
+  checks whether an open PR already fixes the bug: if so it REVIEWS that PR by
+  running the repro test against it and checking the diff; if not it audits the
+  test against the unfixed tree, root-causes and implements the fix, adds targeted
+  unit/regression tests at the layer it changed, re-runs the set to confirm every
+  live facet goes fail→pass, then commits, pushes, and opens a ready-for-review
+  pull request. It does not merge.
+
+# Runs on the Claude Agent SDK. No model is pinned, so the configured provider's
+# default model is used. The large context window holds the repro session
+# transcript, the code it reads to root-cause, the fix, and the tests together.
+executor:
+  type: omnigent
+  context_window: 1000000
+  config:
+    harness: claude-sdk
+
+# The full operating procedure lives in AGENTS.md, read at startup.
+instructions: AGENTS.md
+
+async: true
+cancellable: true
+
+# spawn: true registers sys_session_create so the agent can launch a child
+# session it defines. Before opening the PR (author path), it spawns ONE
+# cross-vendor reviewer child — a different-model bundle (examples/polly/agents/
+# codex, codex-native) given the same diff-review prompt polly-review.yml uses —
+# to double-check its own fix, the way polly has an independent reviewer vet the
+# work. This reuses the server + runner it already runs on; no new infra. The
+# reviewer only reads and comments — it authors no code.
+spawn: true
+
+# Declaring os_env registers sys_os_read / sys_os_write / sys_os_edit /
+# sys_os_shell. The agent uses the shell for `git` (branch/commit/push), `gh`
+# (find/review an existing fix PR, recover a CI run's artifacts, and open the
+# PR), and to run tests and write the fix + its tests into this checkout; it
+# reads the repro session via sys_session_*. `cwd: .` runs in the caller's
+# working directory — run `omnigent run dev/resolve-agent` from the root of your
+# omnigent checkout so the agent lands in this repo. `sandbox: none` runs
+# unsandboxed with unrestricted network so it can reach the repro session, run
+# tests, and reach GitHub.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Block only the catastrophic shell set (force-push, `rm -rf /`, hard reset to a
+# remote ref); everything else runs without an ASK gate so the agent stays
+# non-interactive. This agent DOES push, comment on PRs, and open a PR — but with
+# `gate_pushes: false` those outward commands run unattended instead of
+# ASK-prompting mid-run, which is required for the CI (`ci_link`) path where
+# nobody is at a terminal to approve. The human gate is moved up-front:
+# `dev/resolve.py` confirms before it launches the agent (skip with `--yes`), and
+# the ready-for-review PR is reviewed after the fact. Force-push and the other
+# catastrophic set stay DENY-listed.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+    # Bound the fan-out: this agent spawns at most one reviewer child, so a
+    # low per-turn cap is plenty and stops a runaway create loop. sys_session_create
+    # is counted (like polly) so a self-defined child can't bypass the cap.
+    spawn_bounds:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.spawn_bounds
+        arguments:
+          max_dispatches_per_turn: 2
+          dispatch_tools: [sys_session_send, sys_session_create]
+    # Require `review` on any sys_session_SEND dispatch. Note this guard only
+    # inspects sys_session_send, NOT the sys_session_create that launches the
+    # reviewer child (create carries no purpose arg) — so it does not itself
+    # constrain that child. spawn_bounds (which counts sys_session_create) caps
+    # the fan-out; the reviewer being read-only rests on its prompt and the codex
+    # bundle's own guardrails. This guard is a backstop for any follow-up sends.
+    headless_subagent_purpose_guard:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
+        arguments:
+          allowed_purposes: [review]

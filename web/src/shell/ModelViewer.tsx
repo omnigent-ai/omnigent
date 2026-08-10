@@ -389,7 +389,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         className="absolute inset-0 cursor-grab active:cursor-grabbing"
       />
       {errored && (
-        <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-sm">
+        <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-ui">
           {errorMessage}
         </div>
       )}

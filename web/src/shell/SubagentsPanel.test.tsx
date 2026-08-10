@@ -1467,6 +1467,30 @@ describe("SubagentsPanel", () => {
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
   });
 
+  it("shows the router's model on a routed sub-agent row, and nothing when unrouted", () => {
+    // Per-subagent routing visibility: the row carries the short model name
+    // the router picked. An unrouted sibling must stay unchanged — the pill
+    // would otherwise imply a decision that never happened.
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "conv_routed",
+          tool: "researcher",
+          routed_model: "databricks-claude-sonnet-5",
+        }),
+        childInfo({ id: "conv_plain", tool: "researcher" }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const routed = childRow(container, "conv_routed");
+    expect(within(routed).getByTestId("subagent-routed-model").textContent).toBe("sonnet");
+    expect(
+      within(childRow(container, "conv_plain")).queryByTestId("subagent-routed-model"),
+    ).toBeNull();
+  });
+
   it("highlights the active grandchild row", () => {
     mockChildTree({
       conv_root: [childInfo({ id: "conv_child", tool: "researcher" })],

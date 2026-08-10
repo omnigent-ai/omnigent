@@ -493,7 +493,7 @@ function MarkdownRichTextViewerInner({
             type="button"
             title="Copy"
             onClick={handleCopyContent}
-            className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
           >
             {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             {isCopied ? "Copied!" : "Copy"}
@@ -501,14 +501,14 @@ function MarkdownRichTextViewerInner({
         )}
         <EditorContent
           editor={editor}
-          className="outline-none max-w-none text-sm text-foreground [&_*::selection]:bg-blue-300/40 [&_*::selection]:text-foreground [&::selection]:bg-blue-300/40 [&::selection]:text-foreground tiptap-md-content"
+          className="outline-none max-w-none text-ui text-foreground [&_*::selection]:bg-blue-300/40 [&_*::selection]:text-foreground [&::selection]:bg-blue-300/40 [&::selection]:text-foreground tiptap-md-content"
         />
       </div>
       {canEdit && editor && (
         <TableHandles editor={editor} scrollContainerRef={scrollContainerRef} />
       )}
       {canEdit && isDirty && hasExternalUpdate && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
           <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
           <span className="flex-1">This file was modified externally while you were editing.</span>
           <button
@@ -528,13 +528,13 @@ function MarkdownRichTextViewerInner({
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && saveDisabled && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0 text-warning" />
           Runner offline — changes save and commenting resumes once it reconnects.
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && !saveDisabled && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-sm text-muted-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0" />
           {writeFile.isPending ? "Saving…" : "Unsaved changes —"} commenting is available once
           saved.

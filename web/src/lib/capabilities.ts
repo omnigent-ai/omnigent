@@ -32,6 +32,19 @@ import { hostFetch } from "./host";
 export type SharingMode = "on" | "read_only" | "restricted_read_only" | "off";
 const SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
 
+/**
+ * Which router can back a Smart Routing pick on this server.
+ *
+ * ``external`` is the Databricks AI-Gateway ``task_v1`` router (only usable for
+ * a harness family the host runs through the gateway); ``oss`` is the built-in
+ * judge, which needs no gateway backing. A server that predates the field
+ * reports neither, so the parser degrades from ``smart_routing_enabled``.
+ */
+export interface SmartRoutingSources {
+  external: boolean;
+  oss: boolean;
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
@@ -104,6 +117,15 @@ export interface ServerInfo {
    */
   smart_routing_enabled: boolean;
   /**
+   * Which router backs Smart Routing on this server — the external Databricks
+   * AI-Gateway ``task_v1`` router, the built-in judge, or both. Only the
+   * external router needs the host's harness family on the gateway, so this is
+   * what decides whether an off-gateway family can still be routed. A server
+   * that predates the field reports neither, and the parser degrades from
+   * ``smart_routing_enabled``.
+   */
+  smart_routing_sources: SmartRoutingSources;
+  /**
    * True when the server accepts UI-driven harness installs
    * (``OMNIGENT_HARNESS_INSTALL_ENABLED=1``). Gates the New Chat dialog's
    * one-click "Install" action for a missing harness. Fails to ``false`` so a
@@ -144,10 +166,26 @@ const FALLBACK_SERVER_INFO: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  smart_routing_sources: { external: false, oss: false },
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
 };
+
+/**
+ * Read ``smart_routing_sources`` off the probe payload.
+ *
+ * Missing or non-object (a server that predates the field) degrades to
+ * ``smart_routing_enabled`` on both keys: a server that can route is assumed
+ * able to serve either source, so nothing is hidden on an older build.
+ */
+function parseSmartRoutingSources(raw: unknown, routingEnabled: boolean): SmartRoutingSources {
+  if (typeof raw !== "object" || raw === null) {
+    return { external: routingEnabled, oss: routingEnabled };
+  }
+  const sources = raw as Partial<Record<keyof SmartRoutingSources, unknown>>;
+  return { external: sources.external === true, oss: sources.oss === true };
+}
 
 let cachedServerInfo: ServerInfo | null = null;
 let pendingServerInfo: Promise<ServerInfo> | null = null;
@@ -171,6 +209,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       const res = await hostFetch("/v1/info");
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
+        const smartRoutingEnabled = data.smart_routing_enabled === true;
         cachedServerInfo = {
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
@@ -186,7 +225,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
-          smart_routing_enabled: data.smart_routing_enabled === true,
+          smart_routing_enabled: smartRoutingEnabled,
+          smart_routing_sources: parseSmartRoutingSources(
+            data.smart_routing_sources,
+            smartRoutingEnabled,
+          ),
           harness_install_enabled: data.harness_install_enabled === true,
           installable_harnesses: Array.isArray(data.installable_harnesses)
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")

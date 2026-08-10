@@ -444,6 +444,95 @@ async def test_inline_launch_binds_runner_and_returns_host(
     assert conv.workspace == _WORKSPACE
 
 
+async def test_inline_launch_stamps_terminal_view_label_at_creation(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A host-launched SDK session carries ``omnigent.ui: terminal`` in
+    the create response itself.
+
+    The runner stamps this label only *after* auto-creating its REPL
+    terminal, which is too late for the Web UI's "Starting up…"
+    indicator: that needs the label while the terminal is still missing,
+    so the window was empty by construction and these sessions fell back
+    to the passive "Connecting…" row under the composer. Asserting on the
+    create response (not a later snapshot) is the whole point — a
+    regression that defers the stamp restores the wrong spinner.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"env": "test"},
+        },
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["labels"].get("omnigent.ui") == "terminal", (
+        f"create response must carry the terminal-view label; got {body['labels']}"
+    )
+    # The stamp merges over caller labels rather than replacing them.
+    assert body["labels"].get("env") == "test"
+    # Persisted, not just echoed — the snapshot a reloading UI reads is the row.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.labels.get("omnigent.ui") == "terminal"
+
+
+async def test_inline_launch_skips_terminal_view_label_for_native_harness(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A native-harness agent does not get the terminal-view label here.
+
+    Native harnesses run a vendor TUI instead of the omnigent REPL
+    terminal, so their runner never auto-creates one. Stamping the label
+    for them would leave the Web UI's spin-up spinner waiting on a
+    terminal that never arrives; they get terminal-first labels from the
+    native wrapper path instead.
+    """
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    assert "omnigent.ui" not in resp.json()["labels"]
+
+
+async def test_unbound_session_skips_terminal_view_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """A session created without a host must not carry the label.
+
+    With no host there is no runner to auto-create a REPL terminal, so
+    the label would leave the Web UI showing a Terminal pill that can
+    never open.
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    assert "omnigent.ui" not in resp.json()["labels"]
+
+
 async def test_inline_launch_failure_still_returns_bound_session(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -493,6 +582,7 @@ async def test_inline_launch_failure_still_returns_bound_session(
 _HARNESS_REFUSAL = (
     "harness 'codex' is not configured on host 'laptop' — run `omnigent setup` on that machine"
 )
+_WORKSPACE_MISSING_ERROR = "workspace path does not exist: /deleted/worktree"
 
 
 async def test_inline_create_harness_not_configured_stays_lenient(
@@ -1793,3 +1883,91 @@ async def test_offline_runner_no_host_still_returns_503(
     finally:
         set_runner_router(prior_router)
     assert resp.status_code == 503, resp.text
+
+
+async def test_message_relaunch_workspace_missing_persists_error_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace-missing refusal at relaunch persists user msg + error turn.
+
+    When the session workspace has been deleted on the host (e.g. the
+    worktree was pruned), the host returns ``workspace_missing`` and the
+    runner will never appear. The server must:
+    - NOT wait out the full connect timeout (which would hang every message);
+    - Persist the user message together with a ``runner_failed_to_start``
+      error item carrying the host's actionable "workspace does not exist"
+      message instead of the generic fallback.
+
+    Mutation check: drop the ``_WORKSPACE_MISSING_ERROR_CODE`` branch in
+    ``_ensure_runner_relay_ready`` and the message 503s with
+    ``runner_unavailable`` and no error item is written.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_WORKSPACE_MISSING_ERROR,
+            launch_error_code="workspace_missing",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+
+    assert msg_resp.status_code == 202, (
+        f"expected 202, got {msg_resp.status_code}: {msg_resp.text}"
+    )
+
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    data = items.json()["data"]
+    user_texts = [
+        part.get("text", "")
+        for item in data
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+    ]
+    assert "hello" in user_texts, f"user message should be persisted, got {user_texts!r}"
+    error_items = [item for item in data if item.get("type") == "error"]
+    assert len(error_items) == 1, (
+        f"expected exactly one error item for the workspace-missing refusal, got {error_items!r}"
+    )
+    assert error_items[0]["code"] == "runner_failed_to_start"
+    assert "does not exist" in error_items[0]["message"], (
+        f"error message should mention workspace does not exist, got {error_items[0]['message']!r}"
+    )
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.host_id == _HOST_ID

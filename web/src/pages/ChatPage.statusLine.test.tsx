@@ -55,6 +55,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   }),
 }));
 
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
@@ -319,20 +320,30 @@ describe("Composer status line (branch + context ring)", () => {
   });
 
   it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
-    // host_offline surfaces the reconnect affordance in the host badge (in
-    // place of the old banner below the composer): the tray shows even with
-    // no branch/ring, and clicking the badge opens the reconnect help.
+    // An offline host surfaces the reconnect affordance in the host badge (in
+    // place of the old banner below the composer) while keeping the host name:
+    // the tray shows even with no branch/ring, and clicking opens the help.
     bindHost("mac-laptop");
     useSessionHostOnlineMock.mockReturnValue(false);
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
     const onShowReconnectHelp = vi.fn();
-    renderComposer({ hostOffline: true, onShowReconnectHelp });
+    renderComposer({ onShowReconnectHelp });
 
     expect(statusLine()).not.toBeNull();
     const badge = screen.getByTestId("host-badge");
     expect(badge.tagName).toBe("BUTTON");
-    expect(badge).toHaveTextContent(/Host is offline/);
+    expect(badge).toHaveTextContent("mac-laptop");
     badge.click();
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the tray hidden for a session with no host and nothing else to show", () => {
+    // onShowReconnectHelp is now passed for every session, so it must not
+    // resurrect an empty tray on a session with no host badge to hang it on.
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer({ onShowReconnectHelp: vi.fn() });
+
+    expect(statusLine()).toBeNull();
   });
 
   it("hides the host badge on a sub-agent session", () => {
@@ -358,6 +369,31 @@ describe("composerHarnessLabel", () => {
 
   it("reads SDK agents as '<Agent> (<Harness>)'", () => {
     expect(composerHarnessLabel(null, "polly", "pi")).toBe("Polly (Pi)");
+  });
+
+  // A Claude Code sub-agent's sub_agent_name is the Task tool's
+  // `subagent_type` ("general-purpose"), and the child reuses the parent's
+  // claude-native agent row — so without the wrapper the label reads
+  // "General-purpose" instead of naming the product running it.
+  it("reads a native sub-agent child as its vendor, not the vendor-side agent type", () => {
+    expect(
+      composerHarnessLabel(
+        null,
+        "general-purpose",
+        "claude-native",
+        BRAIN_HARNESS_LABELS,
+        "claude-code-native-ui-subagent",
+      ),
+    ).toBe("Claude Code");
+    expect(
+      composerHarnessLabel(
+        null,
+        "reviewer",
+        null,
+        BRAIN_HARNESS_LABELS,
+        "codex-native-ui-subagent",
+      ),
+    ).toBe("Codex");
   });
 
   it("falls back to the agent name alone when the harness is unmapped", () => {

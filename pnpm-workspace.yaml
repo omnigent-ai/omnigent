@@ -10,7 +10,6 @@ settings:
   minimumReleaseAge: 10080
   autoInstallPeers: false
   strictPeerDependencies: false
-  nodeLinker: hoisted
 
 # jest-dom doesn't declare vitest as a (peer) dependency, so under pnpm's store
 # layout its `declare module "vitest"` matcher-type augmentation can't resolve

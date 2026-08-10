@@ -67,6 +67,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { routingExtrasFromWire } from "./routingDecision";
 import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
@@ -438,22 +439,27 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? data.background_task_count
           : undefined;
       const rawError = data.error;
+      // Parse via parseErrorInfo so a classified failure's optional
+      // title/cause/remediation flow through, but keep the guard that both
+      // code and message are present (a bare/blank error object is dropped).
       const error =
         rawError != null &&
         typeof rawError === "object" &&
         typeof (rawError as Record<string, unknown>).code === "string" &&
         typeof (rawError as Record<string, unknown>).message === "string"
-          ? {
-              code: (rawError as Record<string, unknown>).code as string,
-              message: (rawError as Record<string, unknown>).message as string,
-            }
+          ? parseErrorInfo(rawError)
           : undefined;
+      // Absent = not parked. An empty string is treated the same, so a
+      // blank reason never renders as a dangling parenthetical.
+      const rawBlockedOn = data.blocked_on;
+      const blockedOn = typeof rawBlockedOn === "string" && rawBlockedOn ? rawBlockedOn : undefined;
       return {
         type: "session_status",
         conversationId,
         status,
         responseId,
         backgroundTaskCount,
+        ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }
@@ -1065,6 +1071,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
       ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),
+      routing: routingExtrasFromWire(rec),
       itemId,
       responseId,
     } satisfies RoutingDecision;
@@ -1160,7 +1167,11 @@ function responseFromJson(d: Record<string, unknown>): Response {
 function parseErrorInfo(raw: unknown): ErrorInfo {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const r = raw as Record<string, unknown>;
-    return { code: String(r.code ?? ""), message: String(r.message ?? "") };
+    const info: ErrorInfo = { code: String(r.code ?? ""), message: String(r.message ?? "") };
+    if (typeof r.title === "string" && r.title) info.title = r.title;
+    if (typeof r.cause === "string" && r.cause) info.cause = r.cause;
+    if (typeof r.remediation === "string" && r.remediation) info.remediation = r.remediation;
+    return info;
   }
   return { code: "", message: String(raw ?? "") };
 }

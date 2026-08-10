@@ -17,7 +17,13 @@
 // chat's row is held in place via an in-memory override (sidebarNav
 // `ActiveChatOverride`) so sends don't reorder it.
 
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
@@ -46,6 +52,31 @@ import { markConversationSeen } from "./useUnseenConversations";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
+
+/**
+ * Client-side deadline for a *search* page fetch (`?search_query=`). Content
+ * search is a substring scan server-side; if its trigram index is ever missing
+ * the query can run for tens of seconds, and the palette would otherwise sit on
+ * "Searching…" forever (the fetch has no timeout of its own). Aborting here
+ * settles the query to a terminal state so the user sees "No results found"
+ * rather than an endless spinner. Deliberately shorter than the server's own
+ * search `statement_timeout` (see `_SEARCH_STATEMENT_TIMEOUT_MS` in the store)
+ * so the client gives up first and the row-limited fast path still has room.
+ * Only search fetches are bounded — ordinary (indexed) list pagination is left
+ * untouched.
+ */
+export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * True for the DOMException a fetch raises when its `AbortSignal.timeout`
+ * fires. Used to keep the query layer from retrying a client-side search
+ * timeout: retrying would just re-arm the same slow request three more times
+ * (React Query's default), turning one hung spinner into a retry storm. A real
+ * server/network error still retries normally.
+ */
+function isAbortTimeout(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "TimeoutError";
+}
 
 /**
  * Query key for the archived-project-names scan (see `useArchivedProjectNames`).
@@ -89,8 +120,6 @@ export interface Conversation {
   updated_at: number;
   labels: Record<string, string>;
   permission_level: number | null;
-  /** Whether this viewer may accept privileged actions for the session. */
-  can_approve?: boolean | null;
   owner?: string | null;
   runner_id?: string | null;
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
@@ -219,7 +248,6 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
-    can_approve: wire.can_approve ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
@@ -265,7 +293,12 @@ async function fetchConversationsPage({
   // query key (which drops `project`) and the cache-membership check. This
   // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  // Bound search fetches with a client-side deadline (see
+  // SEARCH_FETCH_TIMEOUT_MS): a search whose server-side index is missing can
+  // hang, and the palette shows "Searching…" for the whole in-flight window.
+  // Plain list pagination is indexed/fast, so it keeps no timeout.
+  const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : undefined;
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
 }
@@ -324,6 +357,10 @@ export function useConversations(
     // share the cache instead of each triggering a background refetch.
     // The WS stream handles real-time updates within that window.
     staleTime: 30_000,
+    // A client-side search timeout is terminal — retrying would just re-arm the
+    // same slow request (default 3×) and prolong the spinner. Any other failure
+    // keeps React Query's default retry behaviour.
+    retry: (failureCount, error) => !isAbortTimeout(error) && failureCount < 3,
     refetchInterval: streamConnected
       ? options.reconcileWhileConnected
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS
@@ -916,6 +953,29 @@ export async function setConversationPinned(
 }
 
 /**
+ * Locate the fullest cached copy of a session row across the sidebar's list
+ * caches: the pinned section, every `["conversations", ...]` variant, and the
+ * `["project-sessions", name]` folder lists (a filed session outside the main
+ * window lives only in its folder's cache). Used by the pin and move overlays
+ * to read the row's current fields before patching them optimistically.
+ */
+function findCachedConversationRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  return (
+    queryClient
+      .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+      ?.conversations.find((c) => c.id === id) ??
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
+      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
+      .find((c) => c.id === id) ??
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
+      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
+      .find((c) => c.id === id)
+  );
+}
+
+/**
  * Pin / unpin a session via `PATCH /v1/sessions/{id}` (the `omnigent.pinned`
  * label). Overlays only the `labels` field onto cached rows and patches the
  * pinned-list query directly (adding the row on pin, removing it on unpin)
@@ -956,22 +1016,9 @@ export function useTogglePinnedConversation() {
     true;
 
   // Locate the fullest cached row for an id, so the pinned insert keeps a real
-  // `updated_at` (the PATCH snapshot lacks it). A project session lives only in
-  // its folder's ["project-sessions", name] cache when it's outside the main
-  // window, so that cache is searched too — otherwise its pinned row would be
-  // built from the timestamp-less snapshot.
+  // `updated_at` (the PATCH snapshot lacks it).
   const findRow = (id: string): Conversation | undefined =>
-    queryClient
-      .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
-      ?.conversations.find((c) => c.id === id) ??
-    queryClient
-      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
-      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
-      .find((c) => c.id === id) ??
-    queryClient
-      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
-      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
-      .find((c) => c.id === id);
+    findCachedConversationRow(queryClient, id);
 
   // Apply a pin/unpin to every cache that renders the row. `labels` is the
   // authoritative label map to write; membership in the Pinned section is
@@ -1230,16 +1277,145 @@ export async function moveConversationToProject(
 /**
  * Move a session to a project (or remove it from all projects when `project=""`).
  *
- * Invalidates both the conversations list (so sidebar sections re-group) and
- * the projects list (so counts update). Patch-in-place is skipped here — project
- * changes affect which sidebar section a session belongs to, so a full
- * re-render of the list is correct.
+ * Optimistic: the sidebar derives folder grouping from each row's `project_id`
+ * (or legacy `omni_project` label), so `onMutate` overlays the new membership
+ * onto every cached copy of the row and it regroups on the next frame — rather
+ * than after the PATCH + list refetches round-trip, which parked the row in
+ * its old section for the whole request (multi-second against a slow server).
+ * The target id is read from the cached `["projects"]` list, the same data the
+ * move UI rendered its targets from. A name with no cached first-class id yet
+ * (label-only folder or brand-new name) is created over the network inside the
+ * mutation, so that path skips the overlay and regroups on the reconcile
+ * below, exactly as before.
+ *
+ * `onSuccess` still invalidates: membership pagination, project counts, and
+ * ordering are server-owned, and those refetches start after the PATCH commits
+ * so they confirm (not clobber) the overlay. `onError` restores the snapshot.
  */
 export function useMoveToProject() {
   const queryClient = useQueryClient();
+
+  // Write a membership (project_id + labels) onto the row in every list cache
+  // that may hold it, plus the pinned-row backfill cache. Fields are overlaid
+  // in place. Folder-page membership is a move: the target folder's cache
+  // gains the row when nothing else could render it there (a row outside the
+  // flat window has no other source — the sidebar unions folder pages with
+  // the window's members), and folders the row just left drop it, but only
+  // while it stays visible somewhere else — a briefly-stale old folder beats
+  // the row vanishing from the sidebar until the reconcile refetches land.
+  const overlayMembership = (
+    row: Conversation,
+    projectId: string | null | undefined,
+    labels: Record<string, string>,
+    targetProjectName: string | null,
+  ) => {
+    const id = row.id;
+    const itemsById = new Map<string, SessionListWireItem>([
+      [id, { id, project_id: projectId, labels }],
+    ]);
+    let inWindow = false;
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["conversations"],
+    })) {
+      const { data: next, found } = mergeItemsIntoPages(
+        data,
+        itemsById,
+        filtersFromConversationQueryKey(key),
+        undefined,
+      );
+      if (found.has(id)) inWindow = true;
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+    // Target folder cache: overlay the row's fields if already present, and
+    // insert a deep row (outside the flat window) into the first page.
+    let visibleOutsideOldFolders = inWindow;
+    if (targetProjectName !== null) {
+      const targetKey = ["project-sessions", targetProjectName];
+      const targetData = queryClient.getQueryData<ConversationsInfiniteData>(targetKey);
+      if (targetData) {
+        const { data: merged, found } = mergeItemsIntoPages(
+          targetData,
+          itemsById,
+          PROJECT_FOLDER_FILTERS,
+          undefined,
+        );
+        let next = merged ?? targetData;
+        const [first, ...rest] = next.pages;
+        if (!found.has(id) && !inWindow && first) {
+          next = {
+            ...next,
+            pages: [
+              { ...first, data: [{ ...row, project_id: projectId, labels }, ...first.data] },
+              ...rest,
+            ],
+          };
+        }
+        if (next !== targetData) queryClient.setQueryData(targetKey, next);
+        if (found.has(id) || first !== undefined) visibleOutsideOldFolders = true;
+      }
+    }
+    if (visibleOutsideOldFolders) {
+      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+        queryKey: ["project-sessions"],
+      })) {
+        if (key[1] === targetProjectName) continue;
+        const { data: next, removed } = removeIdsFromPages(data, new Set([id]));
+        if (removed) queryClient.setQueryData(key, next);
+      }
+    }
+    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+      old ? { ...old, project_id: projectId, labels } : old,
+    );
+  };
+
   return useMutation({
     mutationFn: ({ id, project }: { id: string; project: string }) =>
       moveConversationToProject(id, project),
+    onMutate: async ({ id, project }) => {
+      // `""` unfiles (no id needed); a file target must resolve to a cached
+      // first-class id for the overlay to be truthful about the outcome. The
+      // `?? undefined` folds a label-only folder's null id into "unknown".
+      const target =
+        project === ""
+          ? null
+          : (queryClient
+              .getQueryData<ProjectSummary[]>(["projects"])
+              ?.find((p) => p.name === project)?.id ?? undefined);
+      if (target === undefined) return undefined;
+      // Cancel in-flight list refetches so a response that started before the
+      // overlay can't resolve after it and snap the row back to its old spot.
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["conversations"] }),
+        queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+      ]);
+      const row = findCachedConversationRow(queryClient, id);
+      if (!row) return undefined;
+      // Wholesale snapshots for rollback: the overlay also drops the row from
+      // other folders' pages, which a field-level revert couldn't restore.
+      const previous = {
+        conversations: queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey: ["conversations"],
+        }),
+        projectSessions: queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey: ["project-sessions"],
+        }),
+        backfill: queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]),
+      };
+      const labels = Object.fromEntries(
+        Object.entries(row.labels).filter(([labelKey]) => labelKey !== PROJECT_LABEL_KEY),
+      );
+      overlayMembership(row, target, labels, project === "" ? null : project);
+      return previous;
+    },
+    onError: (_err, { id }, previous) => {
+      if (previous === undefined) return;
+      for (const [key, data] of [...previous.conversations, ...previous.projectSessions]) {
+        if (data !== undefined) queryClient.setQueryData(key, data);
+      }
+      if (previous.backfill !== undefined) {
+        queryClient.setQueryData(["conversation-backfill", id], previous.backfill);
+      }
+    },
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });

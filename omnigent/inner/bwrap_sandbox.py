@@ -69,7 +69,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from ._cwd_scan import MaskedEntry, MaskKind, scan_cwd_mask_entries
+from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
 from ._seccomp import (
     SCMP_CMP_EQ,
     SCMP_CMP_GE,
@@ -496,9 +496,9 @@ class BwrapSandboxBackend(SandboxBackend):
             for root in policy.read_roots:
                 bwrap_args += ["--ro-bind-try", str(root), str(root)]
 
-        # Mask dotfiles anywhere under cwd OR under any ``read_paths``
-        # root that aren't on the allowlist, plus any symlink (at any
-        # depth) whose target escapes the sandbox mount set
+        # Mask dotfiles anywhere under cwd OR under any ``read_paths`` /
+        # ``write_paths`` root that aren't on the allowlist, plus any
+        # symlink (at any depth) whose target escapes the sandbox mount set
         # (host-relative dereference defense). The walker prunes at
         # masked dot-directories so ``.git/objects`` etc. don't count
         # toward the cap.
@@ -1139,8 +1139,8 @@ def _dotfile_and_symlink_mask_args(
 ) -> list[str]:
     """
     Build the bwrap mount args needed to mask dotfile / escaping
-    entries the helper must not see, across BOTH cwd and every
-    spec-supplied ``read_paths`` root.
+    entries the helper must not see, across cwd and every spec-supplied
+    ``read_paths`` / ``write_paths`` root.
 
     Thin emitter over :func:`omnigent.inner._cwd_scan.scan_cwd_mask_entries`:
     the shared walker decides *which* paths to mask (dotfiles by
@@ -1161,12 +1161,15 @@ def _dotfile_and_symlink_mask_args(
       may vanish between the scan and the ``bwrap`` exec; the
       ``-try`` variant silently skips the mount instead of aborting.
 
-    S5 (security): the walk covers each ``read_paths`` root in
-    addition to ``cwd`` so a broad grant like ``read_paths: ["~/"]``
-    does NOT leave ``~/.aws``, ``~/.ssh``, ``~/.config/gcloud`` etc.
-    readable just because the dotfile masker used to be cwd-only.
-    Roots that live under ``cwd`` are skipped — the cwd pass already
-    covered them. Per-path dedup runs across both passes.
+    S5 (security): the walk covers each ``read_paths`` AND
+    ``write_paths`` root in addition to ``cwd`` so a broad grant like
+    ``read_paths: ["~/"]`` — or a ``write_paths`` dir outside cwd — does
+    NOT leave ``~/.aws``, ``~/.ssh``, ``~/.config/gcloud`` etc. readable
+    (or writable) just because the dotfile masker used to be cwd-only.
+    :func:`omnigent.inner._cwd_scan.merge_scan_roots` folds both grant
+    lists into one deduplicated set: roots under ``cwd`` are dropped (the
+    cwd pass covered them) and a root nested under another kept root is
+    walked once. Per-path dedup runs across all passes.
 
     See :mod:`omnigent.inner._cwd_scan` for the masking-decision
     semantics, walk-cap behaviour, and the
@@ -1203,12 +1206,18 @@ def _dotfile_and_symlink_mask_args(
     )
     for entry in entries:
         seen_mask_paths.add(str(entry.path))
-    # Extend the mask to every read_paths root that the cwd scan
-    # didn't already cover (skip roots that live under cwd — those
-    # were walked in the cwd pass).
-    for root in policy.read_roots or []:
-        if _is_within(root, cwd):
-            continue
+    # Extend the mask to every read_paths AND write_paths root that the
+    # cwd scan didn't already cover. ``merge_scan_roots`` folds both
+    # grant lists into one deduplicated, ancestor-first set (dropping
+    # roots under cwd and roots nested under another kept root) so an
+    # overlapping or doubly-granted path is walked once, not per-lever.
+    for root in merge_scan_roots(
+        cwd,
+        policy.read_roots,
+        policy.write_roots,
+        recursive=policy.cwd_hidden_scan_recursive,
+        skip_roots=policy.mask_scan_skip_roots,
+    ):
         try:
             extra = scan_cwd_mask_entries(
                 root,
@@ -1218,17 +1227,17 @@ def _dotfile_and_symlink_mask_args(
                 overflow=policy.cwd_hidden_scan_overflow,
                 recursive=policy.cwd_hidden_scan_recursive,
                 logger_name=__name__,
-                scope_label="read_paths",
+                scope_label="read_paths/write_paths",
             )
         except OSError as err:
-            # Re-raise with read_paths-specific advice, forwarding the
+            # Re-raise with grant-specific advice, forwarding the
             # walker's own message verbatim — it already names the
             # overflowed root (passed as the walk's scope) and the
             # unfinished directories, so we don't want to drop that
             # detail by rewriting the text from scratch.
             raise OSError(
-                f"dotfile mask scan overflowed while walking read_paths root "
-                f"{root}. Narrow the grant or tune the scan limits. {err}"
+                f"dotfile mask scan overflowed while walking read_paths/write_paths "
+                f"root {root}. Narrow the grant or tune the scan limits. {err}"
             ) from err
         for entry in extra:
             key = str(entry.path)
@@ -1258,6 +1267,15 @@ def _dotfile_and_symlink_mask_args(
         # target is safe — persistent host dotfiles still exist and are
         # still masked.
         if not _path_exists_lstat(entry.path):
+            continue
+        # Symlinks are skipped: bwrap resolves a mount destination through
+        # the final symlink, so both mask shapes abort the whole namespace
+        # ("Can't create file at <link>" / "Can't mount tmpfs on <link>")
+        # and kill the launcher at spawn. Skipping is safe because the mount
+        # namespace already confines symlink resolution — the link is
+        # followed inside the sandbox view, where an escaping target is
+        # either unmounted or independently masked.
+        if entry.path.is_symlink():
             continue
         if entry.kind == "dir":
             args.extend(["--tmpfs", str(entry.path)])

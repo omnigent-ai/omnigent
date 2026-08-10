@@ -887,6 +887,8 @@ def create_app(
             from omnigent.server.accounts_bootstrap import bootstrap_admin
 
             _accounts_cfg = auth_provider._accounts_config
+            if _accounts_cfg is None:
+                raise ValueError("accounts auth provider requires accounts_config")
             _bootstrap_result = bootstrap_admin(
                 account_store,
                 init_admin_password=_accounts_cfg.init_admin_password,
@@ -1157,6 +1159,7 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
@@ -1335,7 +1338,7 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=True)
+            _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
@@ -1373,7 +1376,7 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=True)
+        _logger.error("Database error: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1398,7 +1401,7 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=True)
+        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1652,8 +1655,13 @@ def create_app(
         # Missing ids default to reachable / no-host, matching the bulk
         # lookup's own missing-row terminal.
         _missing = SessionLiveness(runner_online=True, host_online=None)
+
+        def _liveness_or_missing(sid: str) -> SessionLiveness:
+            found = liveness.get(sid)
+            return found if found is not None else _missing
+
         if session_id is not None:
-            single = liveness.get(session_id, _missing)
+            single = _liveness_or_missing(session_id)
             result["session"] = {
                 "id": session_id,
                 "runner_online": single.runner_online,
@@ -1663,7 +1671,7 @@ def create_app(
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
-                    "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
+                    "runner_online": (sl := _liveness_or_missing(sid)).runner_online,
                     "host_online": sl.host_online,
                     "host_version": sl.host_version,
                 }
@@ -1684,7 +1692,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | None]:
+    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1747,16 +1755,17 @@ def create_app(
         # config is wired AND its provider can actually serve a managed
         # launch (staged providers parse but reject at launch — they
         # must not advertise the option).
-        managed_sandboxes_enabled = (
-            sandbox_config is not None and sandbox_config.managed_launch_supported
-        )
         # sandbox_provider names the backing provider (e.g. "modal",
         # "islo") so the web UI can label the option per provider
         # ("Modal Sandbox" / "Islo Sandbox") instead of the
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
-        sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        managed_sandboxes_enabled = False
+        sandbox_provider = None
+        if sandbox_config is not None and sandbox_config.managed_launch_supported:
+            managed_sandboxes_enabled = True
+            sandbox_provider = sandbox_config.provider
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -1769,19 +1778,26 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is configured (a server llm: block, or a
-        # routing.provider=external block) or the managed deployment registered
-        # a policy_llm_connection_factory (which means it has LLM capability
-        # and will supply its own RoutingClient).
+        # smart_routing_enabled: true when the server can route from ANY source
+        # — a configured RoutingClient (a server llm: block, routing.provider=
+        # external, or an explicit routing_backends pair) or a managed
+        # deployment's policy_llm_connection_factory.
+        # smart_routing_sources names WHICH router can answer: "external" is the
+        # workspace AI-Gateway task_v1 client, "oss" the built-in judge. A
+        # harness whose inference is not gateway-backed can only be served by
+        # the built-in one, so the SPA and the CLI read this to pick a source
+        # instead of hiding the surface.
+        # Both come from one helper, so the flag can never claim routing is off
+        # for a deployment whose sources say a router would answer.
         try:
             from omnigent.runtime._globals import _caps
+            from omnigent.server.routing_backend import routing_available, routing_sources
 
-            smart_routing_enabled = _caps is not None and (
-                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
-            )
+            smart_routing_enabled = routing_available(_caps)
+            smart_routing_sources = routing_sources(_caps)
         except ImportError:
             smart_routing_enabled = False
+            smart_routing_sources = {"external": False, "oss": False}
         # harness_install_enabled gates the web UI's "Install" action for a
         # missing, npm-installable harness on a connected host. Off by default
         # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
@@ -1822,6 +1838,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "smart_routing_sources": smart_routing_sources,
             "harness_install_enabled": harness_install_enabled,
             "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,
@@ -2049,24 +2066,90 @@ def create_app(
         )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
+
+    # Pending per-runner grace timers: a disconnect schedules the
+    # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
+    # immediately, so transient tunnel drops (ingress recycles,
+    # sleep-wake reconnects) that re-register within the grace never
+    # flap their sessions to failed.
+    _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _cancel_disconnect_grace(runner_id: str) -> None:
+        """Cancel and forget the pending disconnect-grace timer, if any."""
+        pending = _disconnect_grace_tasks.pop(runner_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
+        """Reconcile a dropped runner's sessions once the grace expires.
+
+        A runner that re-registered inside the grace makes this a no-op
+        via the live-tunnel re-check (the same newest-wins rule the
+        immediate path used); one still gone hands its bound sessions to
+        :func:`_mark_runner_sessions_offline`, which fails only the
+        interrupted turns and stamps the disconnect cause.
+
+        :param runner_id: The disconnected runner's id.
+        """
+        from omnigent.server.routes.sessions import (
+            RUNNER_DISCONNECT_GRACE_S,
+            _mark_runner_sessions_offline,
+        )
+        from omnigent.server.schemas import ErrorDetail
+
+        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
+                runner_id,
+            )
+            return
+        # Direct by-runner lookup: read-after-write consistent (the
+        # listing path may be served from an eventually-consistent
+        # search index in alternate store backends) and
+        # O(sessions-on-this-runner) instead of a 500-row scan.
+        # Archived sessions are included by construction — an archived
+        # session can still be runner-bound, and skipping it here would
+        # leave it stuck "running" forever.
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
+        _logger.warning(
+            "Runner %s disconnected; reconciling %d bound session(s)",
+            runner_id,
+            len(affected),
+        )
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            ),
+            conversation_store,
+        )
+
     async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark sessions pinned to *this* runner as offline.
+        """Schedule offline-marking for the turns *this* runner interrupted.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
         disconnect on one runner does not flip every cached session
         (e.g. sessions owned by other runners on the same server, or
         sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``. The cache is updated
-        in lockstep with the publish so the list endpoint stays
-        coherent.
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
+
+        The user-visible failed flip waits out a reconnect grace
+        (``RUNNER_DISCONNECT_GRACE_S``): transient drops re-register
+        well inside it and the timer's live-tunnel re-check turns them
+        into no-ops, so routine recycles never flap sessions to failed.
+        Runner invalidation and liveness clearing stay immediate so
+        reconnect re-initialization still happens.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
-
         # Newest-wins guard: a superseded tunnel's teardown fires this
         # hook after a fresh tunnel for the same ``runner_id`` already
         # registered (``TunnelRegistry.register`` retires the old
@@ -2090,27 +2173,20 @@ def create_app(
         # replicas flip offline immediately rather than after the TTL.
         session_live_state.clear_runner_liveness(runner_id)
 
-        # Direct by-runner lookup: read-after-write consistent (the
-        # listing path may be served from an eventually-consistent
-        # search index in alternate store backends) and
-        # O(sessions-on-this-runner) instead of a 500-row scan.
-        # Archived sessions are included by construction — an archived
-        # session can still be runner-bound, and skipping it here would
-        # leave it stuck "running" forever.
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
-        _logger.warning(
-            "Runner %s disconnected; marking %d session(s) offline",
-            runner_id,
-            len(affected),
+        # Replace any pending timer so a rapid drop-reconnect-drop gives
+        # each outage a full grace window.
+        _cancel_disconnect_grace(runner_id)
+        task = asyncio.create_task(
+            _mark_disconnected_runner_failed(runner_id),
+            name=f"runner-disconnect-grace-{runner_id}",
         )
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed")
+        _disconnect_grace_tasks[runner_id] = task
+
+        def _clear_grace_slot(t: asyncio.Task[None]) -> None:
+            if _disconnect_grace_tasks.get(runner_id) is t:
+                _disconnect_grace_tasks.pop(runner_id, None)
+
+        task.add_done_callback(_clear_grace_slot)
 
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
@@ -2121,34 +2197,37 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout.
+        instead of spinning on "starting" until a timeout. An idle
+        top-level session is included for exactly that reason; an idle
+        sub-agent is not, since its work finished on a runner that was
+        already live.
 
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        # The crash report is authoritative and carries the richer cause;
+        # cancel any pending disconnect-grace timer so it can't re-run the
+        # disconnect reconciliation on top of it.
+        _cancel_disconnect_grace(runner_id)
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s reported crashed; marking %d session(s) failed: %s",
+            "Runner %s reported crashed; reconciling %d bound session(s): %s",
             runner_id,
             len(affected),
             error,
         )
-        detail = ErrorDetail(code="runner_failed_to_start", message=error)
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed", error=detail)
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(code="runner_failed_to_start", message=error),
+            conversation_store,
+            fail_idle_top_level=True,
+        )
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -2164,6 +2243,7 @@ def create_app(
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            prefetch_session_routing_catalogs,
         )
 
         # Stamp liveness immediately so other replicas see the runner
@@ -2230,6 +2310,12 @@ def create_app(
                 routed.client,
                 conversation_store,
             )
+            # The session's terminal exists as of the handshake above, so its
+            # model catalogs are answerable now. Warming them here is what
+            # keeps the first routed message off the runner round trip. The
+            # helper self-gates on routing state, so the plain sessions in this
+            # loop (and any archived row) cost nothing.
+            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
             # Reconcile the persisted pending-elicitation count with this
             # pod's live index. A runner that crashed with prompts parked
             # leaves a stale row (no decrement is ever written on a crash),
@@ -2356,7 +2442,7 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
-        else:
+        elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 
             # OIDC invites are opt-in (OMNIGENT_OIDC_ALLOW_INVITES) and
@@ -2385,6 +2471,11 @@ def create_app(
                 ),
                 prefix="/auth",
                 tags=["auth"],
+            )
+        else:
+            _logger.debug(
+                "Skipping built-in auth routes for custom provider %s",
+                type(auth_provider).__name__,
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
@@ -2448,7 +2539,7 @@ def create_app(
     all_extra_routers = list(extra_routers or [])
     all_extra_routers.extend(_load_debug_routers(debug_router_modules))
     for router, prefix, tags in all_extra_routers:
-        app.include_router(router, prefix=prefix, tags=tags)
+        app.include_router(router, prefix=prefix, tags=[*tags])
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
@@ -2506,12 +2597,20 @@ class _SPAStaticFiles(StaticFiles):
             return
         await super().__call__(scope, receive, send)
 
-    async def get_response(self, path: str, scope: Scope) -> Response:  # type: ignore[override]
+    async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+            # StaticFiles only serves GET/HEAD, so it answers every other
+            # method with 405, which reads as "this endpoint exists, wrong
+            # method" and sends a client pointed at the wrong base URL
+            # hunting a server bug instead. Nothing reaching this catch-all
+            # exists, and a non-GET is never an SPA navigation, so answer
+            # 404 whatever the path looks like.
+            if exc.status_code == 405 or (
+                exc.status_code == 404 and _is_web_ui_api_fallback_path(path)
+            ):
                 return JSONResponse(
                     status_code=404,
                     content={

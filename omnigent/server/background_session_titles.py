@@ -289,6 +289,8 @@ def prepare_background_session_title(
         return None
 
     expected_seed_title = synthesize_conversation_title([{"type": "input_text", "text": prompt}])
+    if expected_seed_title is None:
+        return None
     return PendingBackgroundSessionTitle(
         coordinator=coordinator,
         request=BackgroundTitleRequest(

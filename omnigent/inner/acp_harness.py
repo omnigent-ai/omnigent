@@ -24,8 +24,14 @@ Env vars read at startup:
   configured to accept one in ``session/new``).
 - ``HARNESS_ACP_SESSION_ID_MODE``: ``server`` (default) or ``client``.
 - ``HARNESS_ACP_SEND_MODEL``: ``"1"`` to send the model in ``session/new``.
+- ``HARNESS_ACP_OMNIGENT_MCP``: ``"0"`` to disable Omnigent's MCP relay;
+  ``session/new`` still receives an empty ``mcpServers`` array.
 - ``HARNESS_ACP_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
   back to ``caller_process`` + ``sandbox=none``.
+- ``HARNESS_ACP_ENV_PASSTHROUGH``: comma-separated environment variable *names*
+  the agent may read at spawn (the spawn env is otherwise deny-by-default, so an
+  agent authenticating from a variable needs it named here). Names only — each
+  value is read from this process's own environment.
 - ``HARNESS_ACP_PROMPT_TIMEOUT_S``: optional idle (time-without-progress) deadline in
   seconds for a prompt turn (default 300); must be positive and finite or the child aborts.
 """
@@ -50,8 +56,27 @@ _ENV_NAME = "HARNESS_ACP_NAME"
 _ENV_MODEL = "HARNESS_ACP_MODEL"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
 _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
+_ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
 _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
+_ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_passthrough_names() -> tuple[str, ...]:
+    """Variable names the configured agent may read, from the spawn env.
+
+    Comma-separated names (never values — the parent forwards only names, and
+    the value is read from this process's own environment at spawn).
+    """
+    raw = os.environ.get(_ENV_ENV_PASSTHROUGH, "")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -99,7 +124,8 @@ def _build_acp_executor() -> Executor:
     name = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
     model = os.environ.get(_ENV_MODEL, "").strip() or None
     session_id_mode = os.environ.get(_ENV_SESSION_ID_MODE, "").strip() or "server"
-    send_model = os.environ.get(_ENV_SEND_MODEL, "").strip() in ("1", "true", "yes")
+    send_model = _env_enabled(_ENV_SEND_MODEL, default=False)
+    omnigent_mcp = _env_enabled(_ENV_OMNIGENT_MCP, default=True)
     cwd = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None
 
     config = AcpAgentConfig(
@@ -108,6 +134,8 @@ def _build_acp_executor() -> Executor:
         model=model,
         session_id_mode=session_id_mode,
         send_model_in_session_new=send_model,
+        omnigent_mcp=omnigent_mcp,
+        env_passthrough=_env_passthrough_names(),
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

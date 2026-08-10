@@ -229,6 +229,9 @@ describe("ForkSessionDialog", () => {
     expect(forkSessionMock).toHaveBeenCalledWith("conv_src", "My clone", undefined, undefined);
     // Session list refreshed so the fork shows in the sidebar, then navigated.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    // A fork inherits the source's project, so the project-folder lists must
+    // refetch too — otherwise a filed fork stays missing from its folder.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
   });
 

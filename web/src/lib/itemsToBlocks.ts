@@ -26,6 +26,7 @@ import {
   type UserMessageBlock,
   slashCommandEchoItemId,
   slashCommandEchoText,
+  structuredErrorFields,
 } from "./blocks";
 import { formatNativeLabel, formatToolArgsBrief } from "./blockStream";
 import {
@@ -51,6 +52,7 @@ import {
   isSlashCommandItem,
   isTerminalCommandItem,
 } from "./conversationItems";
+import { routingExtrasFromWire } from "./routingDecision";
 
 /**
  * Walk persisted items in arrival order and emit a flat block list.
@@ -236,6 +238,7 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     source: item.source,
     code: item.code,
     message: item.message,
+    ...structuredErrorFields(item),
   };
 }
 
@@ -309,6 +312,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
     applied: item.applied,
     rationale: typeof item.rationale === "string" ? item.rationale : "",
     ...(item.agent !== undefined && { agent: item.agent }),
+    routing: routingExtrasFromWire(item as unknown as Record<string, unknown>),
   };
 }
 
@@ -324,11 +328,11 @@ function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock
 }
 
 function ctxFor(item: ConversationItem): BlockContext {
-  // Items don't carry timestamps in the API surface — use 0 as a
-  // stable sentinel. `BlockContext.timestamp` is only meaningful for
-  // live streaming (drives the reasoning timer); historical blocks
-  // render without that affordance. `agent` comes from the item's
-  // `model` field when present.
+  // `BlockContext.timestamp` is the page-relative live-streaming clock —
+  // use 0 as a stable sentinel for historical items so timer affordances
+  // stay live-only. The server's epoch `created_at` travels separately as
+  // `createdAtS` (drives the completed-turn "Worked for" duration).
+  // `agent` comes from the item's `model` field when present.
   const agent = "model" in item && typeof item.model === "string" ? item.model : null;
   const depth = agent ? (agent.match(/\./g)?.length ?? 0) : 0;
   // Preserve human authorship only when the server sent it.
@@ -342,5 +346,8 @@ function ctxFor(item: ConversationItem): BlockContext {
     responseId: item.response_id,
     itemId: item.id,
     ...(createdBy !== undefined ? { createdBy } : {}),
+    ...(typeof item.created_at === "number" && item.created_at > 0
+      ? { createdAtS: item.created_at }
+      : {}),
   };
 }

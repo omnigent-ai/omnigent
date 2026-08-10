@@ -12,6 +12,7 @@ import pytest
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
+    read_codex_config_model,
     write_bridge_startup_error,
     write_bridge_state,
 )
@@ -836,6 +837,61 @@ def test_web_model_pick_applied_via_thread_settings_update(
             },
         ),
     ]
+
+
+def test_model_settings_update_mirrors_model_into_config_toml(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    An applied model switch is mirrored into codex-home/config.toml.
+
+    ``thread/settings/update`` changes the live thread but not
+    ``config.toml`` — the file the forwarder's model mirror and the
+    cost-gate hook treat as source of truth. Without the mirror write, the
+    next ``turn/started`` re-reads the stale launch model and posts an
+    ``external_model_change`` back to Omnigent, silently reverting a routed
+    or web-picked model to the spawn default.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "databricks-gpt-5-5"\n')
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    _run_turn_with_config(executor, "hello", ExecutorConfig(model="gpt-5.6-luna"))
+
+    assert read_codex_config_model(tmp_path) == "gpt-5.6-luna"
+
+
+def test_effort_only_settings_update_leaves_config_toml_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An effort-only settings update must not rewrite the config model."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "databricks-gpt-5-5"\n')
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    _run_turn_with_config(executor, "hello", ExecutorConfig(extra={"reasoning_effort": "high"}))
+
+    assert read_codex_config_model(tmp_path) == "databricks-gpt-5-5"
 
 
 def test_no_settings_update_when_overrides_unset(

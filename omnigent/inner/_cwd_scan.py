@@ -302,11 +302,11 @@ def scan_cwd_mask_entries(
                     continue
                 seen.add(key)
                 # ``is_dir`` follows symlinks by default — matches what
-                # the agent would observe through the bind. For broken
-                # symlinks it returns False; the backend's "file"
-                # emitter handles both (``--bind /dev/null`` works on
-                # a broken symlink; SBPL ``(literal ...)`` denies the
-                # path regardless of what it points at).
+                # the agent would observe through the bind. Backends decide
+                # how to act on a symlink entry: SBPL ``(literal ...)``
+                # denies the path itself, while bwrap cannot mount onto a
+                # symlink at all and skips it (the mount namespace already
+                # confines where the link resolves).
                 kind: MaskKind = "dir" if child.is_dir() else "file"
                 entries.append(MaskedEntry(path=child_path, kind=kind))
                 # Prune: don't descend into a masked dir.
@@ -505,3 +505,147 @@ def _is_within(path: Path, root: Path) -> bool:
         return True
     except (ValueError, OSError):
         return False
+
+
+def merge_scan_roots(
+    cwd: Path,
+    *root_lists: Sequence[Path] | None,
+    recursive: bool,
+    skip_roots: Sequence[Path] | None = None,
+) -> list[Path]:
+    """
+    Merge the extra roots a backend must mask-scan (beyond *cwd*) into
+    one deduplicated, ancestor-first list.
+
+    Every supplied list — e.g. ``read_paths`` then ``write_paths`` — is
+    folded together so a path granted by more than one lever is walked
+    once, not once per lever. A root is always dropped when it is *cwd*
+    or lives under *cwd*: the caller scans *cwd* itself, so that subtree
+    is covered (this predates the ``write_paths`` extension).
+
+    A root is also dropped when it is at or under any *skip_roots* entry.
+    ``skip_roots`` carries the framework's own scratch / runtime write
+    roots (see
+    :attr:`~omnigent.inner.sandbox.SandboxPolicy.mask_scan_skip_roots`):
+    they hold sandbox scaffolding — the egress ``.egress.sock``, CA
+    bundle, credential-proxy files — not pre-existing user secrets, so
+    scanning them is pointless and masking their dotfiles breaks the
+    sandbox's own machinery.
+
+    Whether a *granted* root nested under ANOTHER kept grant is dropped
+    depends on *recursive* — and getting this wrong un-masks secrets:
+
+    - ``recursive=True``: a kept root's walk descends its whole subtree,
+      so a grant nested under it is redundant and dropped.
+    - ``recursive=False`` (the default; see
+      :attr:`~omnigent.inner.datamodel.OSEnvSandboxSpec.cwd_hidden_scan_recursive`):
+      each walk masks only a root's IMMEDIATE children, so a parent walk
+      never reaches ``parent/deep/nested/.env``. Dropping the nested
+      grant would leave its top-level dotfiles visible. In this mode we
+      therefore keep every distinct granted root and drop only EXACT
+      duplicates.
+
+    Kept roots are returned outermost-first, so a parent is always
+    yielded before any descendant.
+
+    :param cwd: The working directory the caller scans separately.
+    :param root_lists: One or more lists of roots (``None`` entries and
+        empty lists are ignored). Order between lists matters only for
+        stability — the dedup result is the same set either way.
+    :param recursive: Whether the backend walks each root recursively.
+        Must match ``cwd_hidden_scan_recursive`` so the nested-grant
+        drop only fires when a parent walk actually covers the child.
+    :param skip_roots: Framework write roots to exclude entirely. A
+        candidate at or under any of these is dropped from the scan.
+    :returns: The roots to walk, deduplicated and ordered outermost-first.
+    """
+    # Resolve each distinct root exactly once (symlink-free) so the
+    # dedup below is pure string work — a naive pairwise ``_is_within``
+    # would re-``resolve`` O(n^2) times and stall on the big grant lists
+    # the profile-size guard tests deliberately feed in.
+    cwd_str = _resolve_str(cwd)
+    skip_strs = {_resolve_str(root) for root in skip_roots or []}
+    seen_input: set[str] = set()
+    resolved: list[tuple[str, Path]] = []
+    for roots in root_lists:
+        for root in roots or []:
+            key = str(root)
+            if key in seen_input:
+                continue
+            seen_input.add(key)
+            resolved.append((_resolve_str(root), root))
+    # Sort so a parent is processed before its descendants; the
+    # ancestor check below then sees the parent already in ``kept_strs``.
+    resolved.sort(key=lambda pair: pair[0])
+    kept: list[Path] = []
+    kept_strs: set[str] = set()
+    for root_str, root in resolved:
+        if _within_str(root_str, cwd_str):
+            continue
+        # Drop framework scratch / runtime roots and anything nested
+        # under them — masking their dotfiles (e.g. ``.egress.sock``)
+        # would break the sandbox's own machinery.
+        if skip_strs and _path_has_ancestor(root_str, skip_strs):
+            continue
+        if recursive:
+            # A recursive walk of a kept ancestor covers this root. Walk
+            # the parent chain against the kept set (not just the last
+            # kept root) so an interleaving sibling name — e.g. ``/a-b``
+            # sorting between ``/a`` and ``/a/b`` — cannot hide the true
+            # ancestor and leave a redundant walk.
+            if _path_has_ancestor(root_str, kept_strs):
+                continue
+        elif root_str in kept_strs:
+            # Top-level-only: keep every distinct grant (a parent walk
+            # would not reach a nested grant's children); drop only an
+            # exact duplicate, which a parent walk does cover.
+            continue
+        kept.append(root)
+        kept_strs.add(root_str)
+    return kept
+
+
+def _resolve_str(path: Path) -> str:
+    """Return the symlink-free string form of *path* (best effort)."""
+    try:
+        return str(path.resolve(strict=False))
+    except OSError:
+        return str(path)
+
+
+def _within_str(path_str: str, root_str: str) -> bool:
+    """
+    Return whether *path_str* equals *root_str* or lives under it,
+    comparing already-resolved path strings (no syscalls).
+
+    :param path_str: Candidate resolved path string.
+    :param root_str: Prefix resolved path string.
+    :returns: ``True`` when *path_str* is *root_str* or a descendant.
+    """
+    if path_str == root_str:
+        return True
+    return path_str.startswith(root_str.rstrip(os.sep) + os.sep)
+
+
+def _path_has_ancestor(path_str: str, roots: set[str]) -> bool:
+    """
+    Return whether *path_str* itself, or any of its parent directories,
+    is present in *roots* — a pure string walk up the path components.
+
+    Unlike a single-prefix compare against the most recent kept root,
+    this checks the whole ancestor chain, so an unrelated sibling that
+    happens to sort in between (e.g. ``/a-b`` between ``/a`` and
+    ``/a/b``) cannot mask a real ancestor (``/a``).
+
+    :param path_str: Candidate resolved path string.
+    :param roots: Set of resolved root strings to test ancestry against.
+    :returns: ``True`` when *path_str* is at-or-under any entry in *roots*.
+    """
+    current = path_str
+    while True:
+        if current in roots:
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent

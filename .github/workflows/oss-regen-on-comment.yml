@@ -4,8 +4,8 @@
 # oss-regenerate-and-smoke.yml (standalone rolling PR on dispatch).
 #
 # Two forms:
-#   /regen                      re-resolve, preserving existing pins.
-#   /regen upgrade <pkg> [pkg]  additionally force uv to take the newest allowed
+#   /regen                      re-resolve BOTH lockfiles, preserving existing pins.
+#   /regen upgrade <pkg> [pkg]  uv.lock ONLY: force uv to take the newest allowed
 #                               version of each named package (uv lock
 #                               --upgrade-package). Use for a transitive pip
 #                               security bump Dependabot can't land on this uv
@@ -189,8 +189,17 @@ jobs:
           else
             uv lock
           fi
-          rm -f pnpm-lock.yaml
-          pnpm install --lockfile-only
+          # uv may emit non-canonical lockfile fields (e.g. size on file
+          # entries); normalize like the pre-commit fixer, then hard-verify.
+          python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+          python3 scripts/normalize_uv_lock_registry.py --check uv.lock
+          # `/regen upgrade <py pkgs>` is a targeted Python bump: leave the npm
+          # lockfile alone so the PR diff stays reviewable. Plain `/regen`
+          # refreshes both lockfiles, as before.
+          if [ "$REGEN_MODE" != "upgrade" ]; then
+            rm -f pnpm-lock.yaml
+            pnpm install --lockfile-only
+          fi
 
       # Mint the App token only AFTER `uv lock` so untrusted PR build backends
       # never see it. Skipped when the App isn't configured (push then falls back

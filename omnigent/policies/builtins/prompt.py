@@ -29,7 +29,6 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-from typing import Any
 
 from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
 
@@ -71,7 +70,7 @@ the agent should do instead. Leave reason empty for ALLOW.
 """
 
 # Structured output schema for the classifier response.
-_CLASSIFIER_SCHEMA: dict[str, Any] = {
+_CLASSIFIER_SCHEMA: dict[str, object] = {
     "format": {
         "type": "json_schema",
         "name": "policy_verdict",
@@ -175,6 +174,7 @@ def prompt_policy(
                         ],
                     },
                 ],
+                text=_CLASSIFIER_SCHEMA,
             )
             raw_text = _extract_response_text(response)
             if not raw_text:
@@ -254,7 +254,7 @@ def _strip_code_fences(text: str) -> str:
     return stripped
 
 
-def _serialize_content(content: Any) -> str:
+def _serialize_content(content: object) -> str:
     """
     Render content for the classifier prompt.
 
@@ -271,7 +271,7 @@ def _serialize_content(content: Any) -> str:
     return repr(content)
 
 
-def _extract_response_text(response: Any) -> str:
+def _extract_response_text(response: object) -> str:
     """
     Extract text from an LLM response.
 
@@ -288,12 +288,13 @@ def _extract_response_text(response: Any) -> str:
     content = getattr(first, "content", None)
     if not isinstance(content, list) or not content:
         return ""
-    return getattr(content[0], "text", "") or ""
+    content_text = getattr(content[0], "text", "")
+    return content_text if isinstance(content_text, str) else ""
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.prompt.prompt_policy",
         "kind": "factory",

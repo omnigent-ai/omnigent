@@ -54,10 +54,12 @@ from omnigent.onboarding.sandboxes.base import (
     foreground_pidfile,
     foreground_record_prefix,
     host_image_wheel_install_command,
+    supervise_host_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
+    import threading
     from pathlib import Path
 
     from openshell import ExecResult
@@ -156,7 +158,7 @@ class _OpenShellClient:
         # exec_background): OpenShell kills an exec's processes when the
         # ExecSandbox RPC returns, so a backgrounded host must be kept on
         # an open stream for its lifetime.
-        self._bg_threads: list[object] = []
+        self._bg_threads: list[threading.Thread] = []
 
     def close(self) -> None:
         """Release the gRPC channel and any bearer-auth resources."""
@@ -421,8 +423,13 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         base class's ``setsid nohup`` detach pattern doesn't work. Instead
         the command runs in the foreground of an ``exec_stream`` drained on
         a daemon thread — the stream stays open for the process's lifetime.
+
+        The supervisor wrapper still applies, so a host crash restarts within
+        the open stream. A dropped RPC remains fatal here — it kills the
+        supervisor along with the host, which no in-sandbox loop can survive.
         """
-        bg_command = f"{command} > {log_path} 2>&1 < /dev/null"
+        script = supervise_host_command(command)
+        bg_command = f"{script} > {log_path} 2>&1 < /dev/null"
         self._openshell().exec_background(
             sandbox_id, ["bash", "-lc", bg_command], timeout=_FOREGROUND_TIMEOUT_S
         )

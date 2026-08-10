@@ -38,6 +38,7 @@ NULL/short blobs cost only their bytes).
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -66,9 +67,10 @@ def _as_uuid_bytes(value: object) -> bytes | None:
 
     Accepts whatever the driver returns for the source column, regardless of
     its declared type: ``None``; 16 raw bytes / ``memoryview`` (binary column);
-    or a 32-char hex string, optionally dashed / legacy-prefixed, possibly
-    delivered as ``bytes`` (varchar column). This lets the copy target a binary
-    column on every dialect without relying on implicit type coercion.
+    a ``uuid.UUID``; or a 32-char hex string, optionally dashed /
+    legacy-prefixed, possibly delivered as ``bytes`` (varchar column). This
+    lets the copy target a binary column on every dialect without relying on
+    implicit type coercion.
     """
     if value is None:
         return None
@@ -78,7 +80,9 @@ def _as_uuid_bytes(value: object) -> bytes | None:
             return raw
         # A varchar id surfaced as bytes (e.g. hex text) — decode then normalise.
         return uuid_to_bytes(raw.decode("ascii"))
-    return uuid_to_bytes(value)  # str / uuid.UUID
+    if isinstance(value, (str, uuid.UUID)):
+        return uuid_to_bytes(value)
+    raise TypeError(f"Unsupported UUID value: {type(value).__name__}")
 
 
 def _encode_overrides(values: dict[str, str | None]) -> str | None:

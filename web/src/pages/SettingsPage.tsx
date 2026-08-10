@@ -4,7 +4,7 @@
  * Renders into the AppShell chat outlet (see App.tsx) so the conversations
  * sidebar stays put when you enter settings — only the main area swaps to
  * this view. Inside, a section nav (left) drives a content panel (right),
- * modeled on a desktop-app settings window; a "← Back to Omnigent" link
+ * modeled on a desktop-app settings window; a Back link
  * returns to the composer.
  *
  * Sections:
@@ -23,7 +23,8 @@
  *   entering them stays inside settings — the sidebar keeps the section nav
  *   instead of snapping back to the conversation list.
  * - **Archived sessions** — archived sessions, moved out of the sidebar
- *   list. Not clickable; each row reveals Delete / Unarchive on hover.
+ *   list. Not clickable; each row reveals Delete / Unarchive on hover, and
+ *   Unarchive opens the restored session.
  */
 
 import {
@@ -81,6 +82,7 @@ import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
   useArchiveConversation,
@@ -90,6 +92,7 @@ import {
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
+import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import {
   normalizeResolvedTheme,
@@ -97,8 +100,8 @@ import {
   type ThemeMode,
 } from "@/components/theme/themeMode";
 import {
+  applyDesktopUiFontSize,
   applyUiFontFamily,
-  applyUiFontScale,
   clampUiFontSizePx,
   readUiFontFamily,
   readUiFontSizePx,
@@ -197,6 +200,10 @@ export function SettingsPage() {
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
   const { section } = useSettingsRoute();
+  // Per-section page view: `settings.appearance`, `settings.account`, etc. The
+  // hook re-keys on pathname, so switching sections re-fires under the new id.
+  // `section` is a closed SettingsSectionId union (no PII / unbounded values).
+  useOmnigentPageView(`settings.${section}`);
 
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
@@ -236,16 +243,22 @@ export function SettingsPage() {
 function Section({
   title,
   description,
+  descriptionClassName,
   children,
 }: {
   title: string;
   description?: string;
+  descriptionClassName?: string;
   children: ReactNode;
 }) {
   return (
     <section>
       <h1 className="text-2xl font-semibold">{title}</h1>
-      {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
+      {description && (
+        <p className={cn("mt-1 text-muted-foreground", descriptionClassName ?? "text-ui")}>
+          {description}
+        </p>
+      )}
       <div className="mt-6">{children}</div>
     </section>
   );
@@ -308,7 +321,7 @@ function iconCardBody(Icon: typeof SunIcon, label: string) {
   return (
     <>
       <Icon className="size-6 text-muted-foreground" />
-      <span className="text-sm font-medium">{label}</span>
+      <span className="text-ui font-medium">{label}</span>
     </>
   );
 }
@@ -323,7 +336,7 @@ const LIGHT_MODE_PREVIEW: PaletteSwatch = {
   text: "#11171c",
 };
 const DARK_MODE_PREVIEW: PaletteSwatch = {
-  bg: "#0d1218",
+  bg: "#0e1013",
   card: "#232a33",
   accent: "#5b6672",
   border: "#2b333d",
@@ -453,7 +466,7 @@ function ThemeSubsection({
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col">
-        <span id={labelId} className="text-sm font-medium">
+        <span id={labelId} className="text-ui font-medium">
           {title}
         </span>
         <span className="text-sm text-muted-foreground">{helper}</span>
@@ -486,7 +499,7 @@ function ModeControl() {
           body: (
             <>
               <ModePreview variant={card.mode} />
-              <span className="text-center text-sm font-medium">{card.label}</span>
+              <span className="text-center text-ui font-medium">{card.label}</span>
             </>
           ),
         }))}
@@ -627,8 +640,8 @@ function ColorThemeControl() {
               <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
             </div>
             <div className="min-w-0">
-              <div className="text-sm font-medium">Theme palette</div>
-              <div className="truncate text-xs text-muted-foreground">
+              <div className="text-ui font-medium">Theme palette</div>
+              <div className="truncate text-sm text-muted-foreground">
                 {selection === "custom"
                   ? `Based on ${PALETTES.find((palette) => palette.id === customTheme.basePalette)?.label ?? "Omnigent"}`
                   : selectedPalette?.blurb}
@@ -685,8 +698,8 @@ function ColorThemeControl() {
           />
           <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
             <div>
-              <div className="text-sm font-medium">Contrast</div>
-              <div className="text-xs text-muted-foreground">
+              <div className="text-ui font-medium">Contrast</div>
+              <div className="text-sm text-muted-foreground">
                 Separates text, borders, and surfaces.
               </div>
             </div>
@@ -705,7 +718,7 @@ function ColorThemeControl() {
               <output
                 htmlFor="custom-theme-contrast"
                 data-testid="custom-theme-contrast-value"
-                className="w-7 text-right text-xs font-medium tabular-nums"
+                className="w-7 text-right text-sm font-medium tabular-nums"
               >
                 {editableTheme.contrast}
               </output>
@@ -713,8 +726,8 @@ function ColorThemeControl() {
           </div>
           <div className="flex items-center justify-between gap-4 py-4">
             <div>
-              <div className="text-sm font-medium">Translucent sidebars</div>
-              <div className="text-xs text-muted-foreground">
+              <div className="text-ui font-medium">Translucent sidebars</div>
+              <div className="text-sm text-muted-foreground">
                 Lets the canvas show through the conversation and workspace rails.
               </div>
             </div>
@@ -791,7 +804,7 @@ function HideUnconfiguredHarnessesControl() {
   return (
     <div className="flex items-start justify-between gap-6">
       <div className="flex flex-col">
-        <span id={labelId} className="text-sm font-medium">
+        <span id={labelId} className="text-ui font-medium">
           Hide unconfigured harnesses
         </span>
         <span className="text-sm text-muted-foreground">
@@ -835,7 +848,7 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
-    applyUiFontScale(UI_FONT_SIZE_DEFAULT);
+    applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
@@ -876,11 +889,15 @@ function AppearanceSection() {
   };
 
   return (
-    <Section title="Appearance" description="Choose how Omnigent looks on this device.">
+    <Section
+      title="Appearance"
+      description="Choose how Omnigent looks on this device."
+      descriptionClassName="text-sm"
+    >
       <div key={resetKey} className="flex flex-col gap-8">
         {isEmbedded ? (
           <div className="flex flex-col gap-3">
-            <span className="text-sm font-medium">Theme</span>
+            <span className="text-ui font-medium">Theme</span>
             <p className="text-sm text-muted-foreground">
               Theme is controlled by the host application.
             </p>
@@ -974,8 +991,8 @@ function DefaultBaseBranchControl() {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-sm font-medium">Default base branch</span>
-        <span className="text-sm text-muted-foreground">
+        <span className="text-ui font-medium">Default base branch</span>
+        <span className="text-ui text-muted-foreground">
           Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill.
         </span>
       </div>
@@ -996,10 +1013,10 @@ function DefaultBaseBranchControl() {
 }
 
 /**
- * UI font size stepper. Scales the whole rem-based UI via the --ui-font-scale
- * variable (see lib/uiFontPreferences.ts). Applied live and persisted on every
- * change; unlike the theme picker it stays visible when embedded, since it's a
- * per-device readability pref that doesn't conflict with host theming.
+ * Desktop UI font size stepper. Maps one of the supported discrete px values
+ * into typography tokens via --desktop-ui-font-size (see
+ * lib/uiFontPreferences.ts) without resizing layout or icons. Mobile keeps its
+ * independent responsive size.
  */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.
@@ -1016,7 +1033,7 @@ function UiFontSizeControl() {
     setPx(clamped);
     setDraft(String(clamped));
     writeUiFontSizePx(clamped);
-    applyUiFontScale(clamped);
+    applyDesktopUiFontSize(clamped);
   }, []);
 
   const onDraftChange = useCallback((text: string) => {
@@ -1028,7 +1045,7 @@ function UiFontSizeControl() {
       if (value >= UI_FONT_SIZE_MIN && value <= UI_FONT_SIZE_MAX) {
         setPx(value);
         writeUiFontSizePx(value);
-        applyUiFontScale(value);
+        applyDesktopUiFontSize(value);
       }
     }
   }, []);
@@ -1046,9 +1063,9 @@ function UiFontSizeControl() {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <div className="flex flex-col">
-        <span className="text-sm font-medium">Interface font size</span>
+        <span className="text-ui font-medium">Interface font size</span>
         <span className="text-sm text-muted-foreground">
-          Scale text and spacing across the rest of the interface.
+          Set text across the desktop interface. Icons and spacing stay fixed.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
@@ -1067,7 +1084,7 @@ function UiFontSizeControl() {
           disabled={atMin}
           onClick={() => commit(px - UI_FONT_SIZE_STEP)}
         >
-          <MinusIcon className="size-4" />
+          <MinusIcon className="ui-icon" />
         </StepperButton>
         <div className="flex items-center border-x border-input px-2 tabular-nums">
           <input
@@ -1078,7 +1095,7 @@ function UiFontSizeControl() {
             step={UI_FONT_SIZE_STEP}
             aria-label="Interface font size in pixels"
             data-testid="ui-font-size-input"
-            className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+            className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
             onChange={(e) => onDraftChange(e.target.value)}
             onBlur={commitDraft}
@@ -1093,7 +1110,7 @@ function UiFontSizeControl() {
           disabled={atMax}
           onClick={() => commit(px + UI_FONT_SIZE_STEP)}
         >
-          <PlusIcon className="size-4" />
+          <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
     </div>
@@ -1125,7 +1142,7 @@ function UiFontFamilyControl() {
           this column) so the input stays inline instead of dropping to its own
           row — matches the font-size row's alignment. */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-sm font-medium">Font family</span>
+        <span className="text-ui font-medium">Font family</span>
         <span className="text-sm text-muted-foreground">
           Use any font installed on this device. Leave blank for the system default.
         </span>
@@ -1164,8 +1181,8 @@ function UiFontFamilyControl() {
 
 /**
  * Code font size stepper. Sizes the code editor (Monaco) and terminal (xterm)
- * — fixed-pixel widgets that can't ride the chrome's --ui-font-scale variable,
- * so writing the pref emits to already-mounted editors/terminals (see
+ * — fixed-pixel widgets that don't inherit the desktop UI typography tokens, so
+ * writing the pref emits to already-mounted editors/terminals (see
  * lib/codeFontPreferences.ts). Same free-editing draft/commit + blur-clamp
  * behavior as UiFontSizeControl; only the bounds and storage differ.
  */
@@ -1210,7 +1227,7 @@ function UiCodeFontSizeControl() {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <div className="flex flex-col">
-        <span className="text-sm font-medium">Code font size</span>
+        <span className="text-ui font-medium">Code font size</span>
         <span className="text-sm text-muted-foreground">
           Size of code in the editor and terminal.
         </span>
@@ -1231,7 +1248,7 @@ function UiCodeFontSizeControl() {
           disabled={atMin}
           onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
         >
-          <MinusIcon className="size-4" />
+          <MinusIcon className="ui-icon" />
         </StepperButton>
         <div className="flex items-center border-x border-input px-2 tabular-nums">
           <input
@@ -1242,7 +1259,7 @@ function UiCodeFontSizeControl() {
             step={CODE_FONT_SIZE_STEP}
             aria-label="Code font size in pixels"
             data-testid="code-font-size-input"
-            className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+            className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
             onChange={(e) => onDraftChange(e.target.value)}
             onBlur={commitDraft}
@@ -1257,7 +1274,7 @@ function UiCodeFontSizeControl() {
           disabled={atMax}
           onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
         >
-          <PlusIcon className="size-4" />
+          <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
     </div>
@@ -1283,7 +1300,7 @@ function UiCodeFontFamilyControl() {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-sm font-medium">Code font family</span>
+        <span className="text-ui font-medium">Code font family</span>
         <span className="text-sm text-muted-foreground">
           Font for the code editor and terminal. Leave blank for the default.
         </span>
@@ -1385,7 +1402,7 @@ function LocalCliSection() {
   if (status === "loading") {
     return (
       <Section title="Local CLI">
-        <p className="text-sm text-muted-foreground">Checking…</p>
+        <p className="text-ui text-muted-foreground">Checking…</p>
       </Section>
     );
   }
@@ -1396,10 +1413,10 @@ function LocalCliSection() {
       description="The Omnigent command-line tool this app uses to run a local server and connect this machine as a runner."
     >
       {status === null ? (
-        <p className="text-sm text-muted-foreground">CLI status is unavailable.</p>
+        <p className="text-ui text-muted-foreground">CLI status is unavailable.</p>
       ) : (
         <div className="flex flex-col gap-4">
-          <div className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-2 text-ui">
             <span
               aria-hidden
               className={cn(
@@ -1416,28 +1433,28 @@ function LocalCliSection() {
 
           {status.path ? (
             <div className="flex flex-col gap-1">
-              <span className="text-xs text-muted-foreground">
+              <span className="text-sm text-muted-foreground">
                 {status.source === "configured" ? "Path (custom)" : "Path (auto-detected)"}
               </span>
-              <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+              <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
                 {status.path}
               </code>
             </div>
           ) : (
             <div className="flex flex-col gap-2">
-              <p className="text-sm text-muted-foreground">
+              <p className="text-ui text-muted-foreground">
                 The Omnigent CLI wasn't found. Install it, then set its path from the connect
                 screen:
               </p>
               {status.installCommand && (
-                <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+                <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
                   {status.installCommand}
                 </code>
               )}
             </div>
           )}
 
-          <p className="text-xs text-muted-foreground">
+          <p className="text-sm text-muted-foreground">
             For security, a custom path can only be set from the connect screen — this prevents a
             connected server from pointing the app at a different binary. Open it from the Server
             menu (Change Server…) and use the settings gear.
@@ -1534,7 +1551,7 @@ function UpdatesSection() {
   if (config === "loading") {
     return (
       <Section title="Updates">
-        <p className="text-sm text-muted-foreground">Checking…</p>
+        <p className="text-ui text-muted-foreground">Checking…</p>
       </Section>
     );
   }
@@ -1545,11 +1562,11 @@ function UpdatesSection() {
       description="Desktop app update preferences for this installed Omnigent shell."
     >
       {config === null ? (
-        <p className="text-sm text-muted-foreground">Update settings are unavailable.</p>
+        <p className="text-ui text-muted-foreground">Update settings are unavailable.</p>
       ) : (
         <div className="flex max-w-2xl flex-col gap-5">
           <label className="flex flex-col gap-2">
-            <span className="text-sm font-medium">Update mode</span>
+            <span className="text-ui font-medium">Update mode</span>
             <Select
               value={config.mode}
               onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
@@ -1570,8 +1587,8 @@ function UpdatesSection() {
 
           <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
             <div className="flex flex-col gap-1">
-              <span className="text-sm font-medium">Install downloaded updates on next quit</span>
-              <span className="text-xs text-muted-foreground">
+              <span className="text-ui font-medium">Install downloaded updates on next quit</span>
+              <span className="text-sm text-muted-foreground">
                 Applies only after you choose to download an update.
               </span>
             </div>
@@ -1587,11 +1604,11 @@ function UpdatesSection() {
             <Button onClick={() => void onCheck()} loading={checking}>
               Check for updates now
             </Button>
-            {saving && <span className="text-xs text-muted-foreground">Saving…</span>}
+            {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
           </div>
 
           {lastCheckError && (
-            <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-sm">
+            <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-ui">
               <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
               <div>
                 <div className="font-medium">Last check failed</div>
@@ -1688,7 +1705,7 @@ function AccountSection() {
             <div className="truncate font-medium">
               {me.id}
               {me.is_admin && (
-                <span className="ml-1 text-xs font-normal text-muted-foreground">(admin)</span>
+                <span className="ml-1 text-sm font-normal text-muted-foreground">(admin)</span>
               )}
             </div>
           </div>
@@ -1779,7 +1796,7 @@ function AccountSection() {
               {pwError !== null && (
                 <div
                   role="alert"
-                  className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                  className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
                 >
                   {pwError}
                 </div>
@@ -1907,7 +1924,7 @@ function ArchivedSection() {
     >
       {items.length > 0 && (
         <div className="mb-4 flex items-center gap-2">
-          <label htmlFor="archived-project-filter" className="text-sm text-muted-foreground">
+          <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
             Project
           </label>
           <Select
@@ -1939,11 +1956,11 @@ function ArchivedSection() {
       )}
 
       {listQuery.isLoading ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <p className="text-ui text-muted-foreground">Loading…</p>
       ) : archived.length === 0 && !listQuery.hasNextPage ? (
         // Definitive empty only when there are no archived rows AND no further
         // pages to fetch.
-        <p className="text-sm text-muted-foreground">
+        <p className="text-ui text-muted-foreground">
           {project ? "No archived sessions in this project." : "No archived sessions."}
         </p>
       ) : (
@@ -1952,7 +1969,7 @@ function ArchivedSection() {
             <div className="flex flex-col gap-4">
               {groupedArchived.map((group) => (
                 <div key={group.label}>
-                  <h3 className="mb-1 px-3 text-xs font-medium text-muted-foreground">
+                  <h3 className="mb-1 px-3 text-sm font-medium text-muted-foreground">
                     {group.label}
                   </h3>
                   <ul className="flex flex-col gap-0.5">
@@ -1969,7 +1986,7 @@ function ArchivedSection() {
             // to archived client-side; archived sessions are older and can sort
             // onto later pages, so a page with none isn't the end. Offer to page
             // forward instead of dead-ending on the definitive empty state.
-            <p className="text-sm text-muted-foreground">
+            <p className="text-ui text-muted-foreground">
               {project
                 ? "No archived sessions in this project on this page."
                 : "No archived sessions on this page."}
@@ -2002,8 +2019,10 @@ function ArchivedSection() {
  * One archived-session row. Not clickable (archived sessions aren't a
  * navigation target here); the title + timestamp read as a record, and the
  * Delete / Unarchive controls reveal on hover (always visible on touch).
+ * Unarchive navigates to the restored session once the PATCH lands.
  */
 function ArchivedRow({ conversation }: { conversation: Conversation }) {
+  const navigate = useNavigate();
   const archive = useArchiveConversation();
   const del = useStopAndDeleteConversation();
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -2016,10 +2035,10 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
       className="group relative flex items-center gap-2 rounded-md px-3 py-2 hover:bg-muted"
     >
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium" title={label}>
+        <div className="truncate text-ui font-medium" title={label}>
           {label}
         </div>
-        <div className="text-xs text-muted-foreground">
+        <div className="text-sm text-muted-foreground">
           {absoluteTime(conversation.updated_at * 1000)}
         </div>
       </div>
@@ -2046,7 +2065,14 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
           className="gap-1.5 dark:bg-secondary dark:hover:bg-secondary/80"
           data-testid="unarchive-conversation"
           disabled={busy}
-          onClick={() => archive.mutate({ id: conversation.id, archived: false })}
+          onClick={() =>
+            archive.mutate(
+              { id: conversation.id, archived: false },
+              // Unarchiving is how a user brings a session back into play, so
+              // land them in it — the row leaves this list either way.
+              { onSuccess: () => navigate(`/c/${conversation.id}`) },
+            )
+          }
         >
           <ArchiveRestoreIcon className="size-3.5" />
           Unarchive
