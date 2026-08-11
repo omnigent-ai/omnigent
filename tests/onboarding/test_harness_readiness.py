@@ -320,8 +320,9 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Kiro (``omni kiro``) — gates on the kiro-cli binary.
         "kiro-native",
         "native-kiro",
-        # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
-        # on the goose CLI.
+        # Goose (``goose acp``) gates on the goose CLI; its retired native
+        # spellings canonicalize to it and stay in the map so an existing
+        # ``harness: goose-native`` session still resolves readiness.
         "goose",
         "goose-native",
         "native-goose",

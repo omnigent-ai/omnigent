@@ -53,12 +53,12 @@ _HERMES_OS_TOOLS = frozenset(
     {"terminal", "execute_code", "read_file", "write_file", "search_files"}
 )
 
-# Goose native tool names. Goose namespaces its built-in "developer" extension
+# Goose tool names. Goose namespaces its built-in "developer" extension
 # tools as ``developer__<tool>``; ``shell`` is the terminal tool and
 # ``write`` / ``edit`` / ``text_editor`` / ``read_image`` / ``tree`` are the file
 # tools (names vary slightly by Goose version, so cover both the split write/edit
 # and the unified text_editor spellings).
-_GOOSE_NATIVE_OS_TOOLS = frozenset(
+_GOOSE_OS_TOOLS = frozenset(
     {
         "developer__shell",
         "developer__write",
@@ -259,7 +259,7 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         | _CURSOR_NATIVE_OS_TOOLS
         | _PI_NATIVE_OS_TOOLS
         | _HERMES_OS_TOOLS
-        | _GOOSE_NATIVE_OS_TOOLS
+        | _GOOSE_OS_TOOLS
         | _OPENCODE_NATIVE_OS_TOOLS
     )
     if tool in _all_os_tools:

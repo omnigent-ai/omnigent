@@ -11,7 +11,7 @@ by ``omnigent qwen`` in the session terminal). The bridge dir is read from
 :data:`~omnigent.qwen_native_bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
 
 Tool policies: in this first cut, qwen runs its tools inside its own TUI and
-gates them with its own in-terminal approval (like goose-/cursor-native), which
+gates them with its own in-terminal approval (like cursor-/kiro-native), which
 Omnigent does not intercept. qwen *can* delegate approval externally
 (``can_use_tool`` control requests on ``--json-file``, answered via
 ``confirmation_response`` on ``--input-file``) — wiring that through Omnigent's

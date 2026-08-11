@@ -590,7 +590,7 @@ def _paste_literal_text(socket_path: str, tmux_target: str, bridge_dir: Path, te
     web message submits line-by-line on the first break. ``load-buffer`` +
     ``paste-buffer -p`` wraps the text in bracketed-paste markers so Kiro's
     composer keeps the line breaks (encoded as CR by :func:`_paste_payload_bytes`)
-    as draft data, not submits. Mirrors cursor-native / goose-native; the trailing
+    as draft data, not submits. Mirrors cursor-native / hermes-native; the trailing
     newline absorbs any trailing backslash so it can't escape the follow-up Enter.
     """
     with tempfile.NamedTemporaryFile(
@@ -680,7 +680,7 @@ def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT
     running Kiro turn and (verified against kiro-cli 2.10.0) leaves the composer
     at an empty prompt, so no draft-clear is needed afterwards: unlike
     cursor-native, Kiro does not restore the interrupted prompt. Mirrors
-    :func:`omnigent.goose_native_bridge.inject_interrupt`.
+    :func:`omnigent.hermes_native_bridge.inject_interrupt`.
 
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
     """
@@ -694,7 +694,7 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
 
     Terminates ``kiro-cli`` and the pane outright — the analog of the user
     manually exiting the attached TUI, for the web UI's "Stop session"
-    affordance. Mirrors :func:`omnigent.goose_native_bridge.kill_session`.
+    affordance. Mirrors :func:`omnigent.hermes_native_bridge.kill_session`.
 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.
     """

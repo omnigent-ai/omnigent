@@ -1,6 +1,6 @@
 """File + tmux bridge for the qwen-native terminal harness.
 
-Unlike goose-/cursor-native (which simulate keystrokes via ``tmux send-keys``),
+Unlike cursor-/hermes-native (which simulate keystrokes via ``tmux send-keys``),
 ``qwen`` ships a built-in remote-control protocol that we drive through two files
 the TUI is launched against:
 

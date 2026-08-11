@@ -227,7 +227,6 @@ for _builder_name in (
     "_auto_create_claude_terminal",
     "_auto_create_codex_terminal",
     "_auto_create_cursor_terminal",
-    "_auto_create_goose_terminal",
     "_auto_create_hermes_terminal",
     "_auto_create_kimi_terminal",
     "_auto_create_kiro_terminal",
@@ -1969,7 +1968,6 @@ def create_runner_app(
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
-    _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2842,7 +2840,6 @@ def create_runner_app(
                 "kiro": _kiro_terminal_ensure_locks,
                 "antigravity": _antigravity_terminal_ensure_locks,
                 "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
                 "hermes": _hermes_terminal_ensure_locks,
                 "qwen": _qwen_terminal_ensure_locks,
                 "kimi": _kimi_terminal_ensure_locks,
@@ -3313,7 +3310,6 @@ def create_runner_app(
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
-        _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
@@ -3877,7 +3873,6 @@ def create_runner_app(
             "pi-native",
             "cursor-native",
             "kiro-native",
-            "goose-native",
             "qwen-native",
             "kimi-native",
             "hermes-native",
@@ -6829,7 +6824,7 @@ def create_runner_app(
         ):
             # Each native harness contributes only the ensure hooks that differ
             # from the uniform base; a single _ensure_native_terminal call runs
-            # them. The 4 uniform harnesses (goose/kiro/hermes/qwen) need only the
+            # them. The 3 uniform harnesses (kiro/hermes/qwen) need only the
             # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
             # via build_context; codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
@@ -6841,7 +6836,6 @@ def create_runner_app(
                 "kiro": _kiro_terminal_ensure_locks,
                 "antigravity": _antigravity_terminal_ensure_locks,
                 "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
                 "hermes": _hermes_terminal_ensure_locks,
                 "qwen": _qwen_terminal_ensure_locks,
                 "kimi": _kimi_terminal_ensure_locks,
@@ -8324,7 +8318,6 @@ def create_runner_app(
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
-        _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
@@ -8351,7 +8344,6 @@ def create_runner_app(
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
-        _goose_terminal_ensure_locks.pop(session_id, None)
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)

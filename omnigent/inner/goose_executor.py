@@ -2,10 +2,12 @@
 
 Spawns Goose (``goose acp``) as a subprocess and communicates via the Agent
 Client Protocol (ACP) — a JSON-RPC 2.0 protocol over newline-delimited JSON on
-stdin/stdout. This is the *headless* Goose harness (``harness: goose``), the
-chat-first counterpart to the terminal-first ``goose-native`` TUI harness:
-output streams into the Omnigent conversation as chat, and Goose's mid-turn tool
+stdin/stdout. This is the only Goose harness (``harness: goose``): output
+streams into the Omnigent conversation as chat, and Goose's mid-turn tool
 approvals surface as web elicitation cards rather than in-terminal prompts.
+ACP is what makes Omnigent's policy gates reachable at all: a tool call
+arrives as a ``session/request_permission`` the executor can DENY, and file
+I/O is delegated to an Omnigent ``OSEnvironment``.
 
 Protocol flow (verified against Goose 1.38):
   1. ``initialize``   — handshake; learn ``agentCapabilities`` (prompt image
@@ -124,6 +126,16 @@ _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
 
 # Server-initiated request methods (agent → client).
 _AGENT_REQUEST_REQUEST_PERMISSION = "session/request_permission"
+
+# Goose's approval mode. Goose defaults to Auto, which never sends
+# ``session/request_permission``, leaving the TOOL_CALL policy gate in
+# :meth:`GooseExecutor._decide_permission` with nothing to gate. Forced on so
+# sensitive tool calls reach Omnigent policy before they run; an ambient
+# ``GOOSE_MODE=auto`` must not be able to switch enforcement off. ``approve``
+# (every call) is deliberately not used: a policy ALLOW still falls through to
+# human elicitation, so it would prompt on every tool.
+_GOOSE_MODE_ENV = "GOOSE_MODE"
+_GOOSE_APPROVAL_MODE = "smart_approve"
 
 # session/update.update.sessionUpdate values we map.
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
@@ -314,9 +326,9 @@ class GooseExecutor(Executor):
         """The env handed to the goose subprocess.
 
         Deny-by-default: base + goose's own ``GOOSE_`` family + the spec's
-        ``env_passthrough``, then goose's provider/gateway overrides on top so
-        the intentionally-set values still win. Previously ``os.environ.copy()``
-        handed the goose CLI every host secret (#3445).
+        ``env_passthrough``, then goose's approval-mode and provider/gateway
+        overrides on top so the intentionally-set values still win. Previously
+        ``os.environ.copy()`` handed the goose CLI every host secret (#3445).
 
         Kept as a named builder so the spawn-env canary can drive the real thing
         rather than a hand-copied prefix list.
@@ -325,6 +337,7 @@ class GooseExecutor(Executor):
             allow_prefixes=("GOOSE_",),
             extra_allowed=declared_passthrough(self._os_env),
         )
+        env[_GOOSE_MODE_ENV] = _GOOSE_APPROVAL_MODE
         env.update(self._provider_env())
         return env
 

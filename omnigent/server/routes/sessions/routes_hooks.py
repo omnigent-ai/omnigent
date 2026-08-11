@@ -1259,8 +1259,8 @@ def register_hooks_routes(
         Generic native-TUI tool-approval hook (TUI → web elicitation).
 
         The vendor-agnostic counterpart of
-        :func:`cursor_permission_request_hook`, used by the hermes- and
-        goose-native approval mirrors. The runner-side mirror detects the
+        :func:`cursor_permission_request_hook`, used by the hermes-, kiro- and
+        qwen-native approval mirrors. The runner-side mirror detects the
         vendor's in-terminal approval prompt, POSTs it here, and the server
         publishes ``response.elicitation_request`` and parks for the web verdict
         — the same registry/publish/cleanup path as the cursor/codex/claude
@@ -1268,7 +1268,7 @@ def register_hooks_routes(
         native prompt authoritative.
 
         Unlike the cursor hook, the card label / policy name come from the
-        payload (``agent`` / ``policy_name``) so a Hermes or Goose approval is
+        payload (``agent`` / ``policy_name``) so a Hermes or Qwen approval is
         labelled as such, not "Cursor".
 
         :param request: FastAPI request carrying the detected prompt

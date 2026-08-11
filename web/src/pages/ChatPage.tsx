@@ -6569,11 +6569,11 @@ function useResolvedComposerModel(
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 
-  // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
+  // qwen/cursor/pi/opencode native wrappers pick their model inside
   // the vendor TUI, so the bound `llmModel` is an unused default — don't
   // surface it as if it were live; claude-/codex-native and SDK agents
   // resolve to a real model.
-  // cursor-native is a vendor-owns-model wrapper, but unlike qwen/goose/pi/
+  // cursor-native is a vendor-owns-model wrapper, but unlike qwen/pi/
   // opencode it mirrors its live TUI model into the session override
   // (`sessionModelOverride` / `model_override`), kept current both by the
   // forwarder's terminal→web mirror and by web-side picks. Surface *that* as

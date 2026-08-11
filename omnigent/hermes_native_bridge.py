@@ -4,7 +4,7 @@ The runner launches the ``hermes`` TUI in a private tmux pane and records that
 pane's socket + target here via :func:`write_tmux_target`. The harness executor
 then delivers Omnigent web-UI messages into the *same* pane via
 :func:`inject_user_message` (tmux bracketed paste + a single Enter) — the Hermes
-analog of the goose-native tmux bridge. This is what wires the web-UI chat box to
+analog of the cursor-native tmux bridge. This is what wires the web-UI chat box to
 the running Hermes TUI (and, since the web UI embeds that pane, the message shows
 in both surfaces).
 

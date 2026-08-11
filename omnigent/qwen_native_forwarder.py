@@ -8,7 +8,7 @@ surface that reflects the agent's work — the Omnigent conversation view stays
 empty because nothing mirrors the transcript back into the session.
 
 This module is that missing mirror — the qwen analog of
-:mod:`omnigent.goose_native_forwarder`. Where goose has to scrape a SQLite store,
+:mod:`omnigent.hermes_native_forwarder`. Where hermes has to scrape a SQLite store,
 qwen emits a structured **stream-json event stream** (verified Anthropic-shaped
 against ``qwen`` v0.18.1): we tail the ``--json-file`` NDJSON by byte offset and
 POST each new ``user`` / ``assistant`` message as an ``external_conversation_item``
@@ -28,7 +28,7 @@ Event shapes consumed (others are ignored defensively):
 
 Status (``running``/``idle``) is intentionally NOT posted here: the runner's
 PTY-activity watcher owns those edges for qwen-native (see
-:mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+:mod:`omnigent.runner.app`), exactly as for hermes-/cursor-native.
 
 This module also hosts the **compaction mirror** (:func:`supervise_qwen_compaction_mirror`).
 qwen compaction (its *compression*) is invisible on the ``--json-file`` stream
@@ -67,7 +67,7 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
 
-# Supervisor backoff (mirrors goose_native_forwarder.supervise_goose_forwarder).
+# Supervisor backoff (mirrors hermes_native_forwarder.supervise_hermes_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -369,7 +369,7 @@ async def supervise_qwen_forwarder(
 ) -> None:
     """Run :func:`forward_qwen_events_to_session` under a restart supervisor.
 
-    Mirrors :func:`omnigent.goose_native_forwarder.supervise_goose_forwarder`:
+    Mirrors :func:`omnigent.hermes_native_forwarder.supervise_hermes_forwarder`:
     bounded exponential backoff, :class:`asyncio.CancelledError` propagates for
     clean teardown, and the persisted offset means restarts resume exactly where
     they left off.

@@ -183,6 +183,14 @@ approve_file_ops:
   handler: omnigent.policies.builtins.safety.ask_on_os_tools
 ```
 
+It also covers a harness's own equivalents where they are named (e.g. Goose's
+`developer__shell` / `developer__write`). One caveat on **Goose**: Omnigent
+forces `GOOSE_MODE=smart_approve` so Goose asks before its sensitive tools and
+the tool-call gate has something to gate. Tools Goose's own heuristic deems
+safe never reach the policy engine. Goose's file I/O is gated regardless: it is
+delegated to Omnigent's `OSEnvironment`, which also enforces the spec's
+sandbox read/write roots.
+
 #### `block_skills`
 
 Prevents the agent from loading specific skills.

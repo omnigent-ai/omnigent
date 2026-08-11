@@ -1,6 +1,6 @@
 """Unit tests for QwenNativeExecutor — the harness-side input-file injector.
 
-Mirrors ``tests/inner/test_goose_native_executor.py`` (the closest analog), plus
+Mirrors ``tests/inner/test_pi_native_executor.py`` (the closest analog), plus
 qwen-specific coverage for the boot-order readiness gate (``_ensure_ready``) that
 goose/cursor don't have — qwen drops a submit appended before its input watcher
 starts, so the executor must wait for qwen to be ready before the first append.
