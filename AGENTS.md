@@ -20,6 +20,13 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
 - `just lint` / `just lint-all` — run pre-commit
 - `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
 
+## Worker checkout policy
+
+Child sessions must inherit the parent session's active workspace and Git
+branch. Do not reset worker checkouts to `origin/main`. If an isolated
+worktree is required, create it from the parent branch and remove it when the
+worker finishes.
+
 ## Pull requests
 
 When you open a pull request, fill in the repo's PR template at

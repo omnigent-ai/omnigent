@@ -8119,12 +8119,19 @@ async def _create_session_from_existing_agent(
         )
 
     # Inherit runner affinity from the parent session so the child
-    # is assigned to the same runner (sub-agent co-location).
+    # is assigned to the same runner (sub-agent co-location). Keep the
+    # workspace metadata aligned too: a child without it can be treated as
+    # a fresh checkout by downstream worker orchestration.
     inherited_runner_id: str | None = None
+    inherited_workspace: str | None = body.workspace
+    inherited_git_branch: str | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
+            if body.host_id is None and body.workspace is None and body.git is None:
+                inherited_workspace = parent_conv.workspace
+                inherited_git_branch = parent_conv.git_branch
             # Defense-in-depth: don't inherit a runner the
             # caller doesn't own.
             if (
@@ -8143,12 +8150,12 @@ async def _create_session_from_existing_agent(
     # create_conversation so a bad workspace never produces a row.
     # With git worktree creation, the validated path is the source
     # repo; the worktree it produces becomes the stored workspace.
-    canonical_workspace: str | None = body.workspace
+    canonical_workspace: str | None = inherited_workspace
     if body.host_id is not None:
         canonical_workspace = await _validate_session_workspace(
             user_id=user_id,
             host_id=body.host_id,
-            workspace=body.workspace,
+            workspace=inherited_workspace,
             agent=agent,
             agent_cache=agent_cache,
             request=request,
@@ -8159,7 +8166,7 @@ async def _create_session_from_existing_agent(
     #    workspace and its branch is recorded.
     #  - bind (existing_worktree): workspace already IS the worktree;
     #    record its branch only, create nothing.
-    git_branch: str | None = None
+    git_branch: str | None = inherited_git_branch
     # Set to the created worktree path ONLY when Omnigent creates one.
     # Gates create-rollback: an existing worktree bound via
     # existing_worktree must never be force-removed on failure — it is
