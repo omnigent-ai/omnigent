@@ -38,10 +38,12 @@ from omnigent.claude_native_bridge import (
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
+    read_claude_session_id,
     read_hook_events_from_offset,
     read_launch_model,
     read_message_deltas_from_offset,
     read_permission_hook_config,
+    read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since,
     read_transcript_path,
@@ -614,6 +616,103 @@ def test_record_hook_event_updates_transcript_state(tmp_path: Path) -> None:
 
     assert read_transcript_path(bridge_dir) == transcript_path
     assert count_hook_events(bridge_dir) == 1
+
+
+def test_record_hook_event_ignores_foreign_identity(tmp_path: Path) -> None:
+    """
+    A side-channel event cannot re-aim the bridge at a foreign transcript.
+
+    Ordinary mid-session events (tool edges, stops) carry whatever
+    session_id/transcript_path their context reports; one from another
+    session — e.g. a background Task agent's edge — used to silently
+    repoint ``transcript_path``, starving the forwarder on a file that
+    never grows. The event is still recorded; only identity is ignored.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pinned_transcript = tmp_path / "pinned.jsonl"
+    foreign_transcript = tmp_path / "agent-foreign.jsonl"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "pinned-session",
+            "transcript_path": str(pinned_transcript),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "foreign-session",
+            "transcript_path": str(foreign_transcript),
+        },
+    )
+
+    assert read_transcript_path(bridge_dir) == pinned_transcript
+    assert read_claude_session_id(bridge_dir) == "pinned-session"
+    assert read_seen_claude_session_ids(bridge_dir) == {"pinned-session"}
+    # The event itself is still recorded — only its identity is ignored.
+    assert count_hook_events(bridge_dir) == 2
+
+
+def test_record_hook_event_session_start_rotates_identity(tmp_path: Path) -> None:
+    """
+    A SessionStart announcement legitimately moves the bridge's identity.
+
+    /clear, /fork and resume all become a new Claude session announced by
+    a SessionStart hook; the pin must follow the front door so rotation
+    keeps working, and the prior id stays in the seen set for the
+    fork-vs-resume classifier.
+    """
+    bridge_dir = tmp_path / "bridge"
+    old_transcript = tmp_path / "old.jsonl"
+    new_transcript = tmp_path / "new.jsonl"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "old-session",
+            "transcript_path": str(old_transcript),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "new-session",
+            "transcript_path": str(new_transcript),
+        },
+    )
+
+    assert read_transcript_path(bridge_dir) == new_transcript
+    assert read_claude_session_id(bridge_dir) == "new-session"
+    assert read_seen_claude_session_ids(bridge_dir) == {"old-session", "new-session"}
+
+
+def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> None:
+    """
+    With no pin yet, the first identity-bearing event is trusted.
+
+    A fresh bridge may see an ordinary event before SessionStart lands
+    (hook ordering is not guaranteed); refusing it would leave the
+    forwarder with no transcript at all.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+
+    assert read_transcript_path(bridge_dir) == transcript_path
+    assert read_claude_session_id(bridge_dir) == "claude-session"
 
 
 def test_read_assistant_text_since_parses_claude_jsonl(tmp_path: Path) -> None:

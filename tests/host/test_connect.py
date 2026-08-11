@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import subprocess
 import threading
@@ -53,6 +54,7 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
+from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
@@ -643,6 +645,14 @@ async def test_handle_launch_spawns_subprocess(
     # regresses, long-lived daemons intermittently fail to start sessions.
     assert spawned_kwargs.get("stdin") == subprocess.DEVNULL, (
         "runner subprocess must be spawned with stdin=subprocess.DEVNULL"
+    )
+
+    # Runners must start in the session workspace, not the daemon's inherited
+    # cwd: a daemon launched from a directory that was later deleted (temp
+    # checkout, removed worktree) makes every Path.cwd() in the runner raise
+    # FileNotFoundError, and native terminals then fail to start.
+    assert spawned_kwargs.get("cwd") == str(workspace), (
+        "runner subprocess must be spawned with cwd=<session workspace>"
     )
 
     # Clean up the spawned sleep process (and its exit watcher).
@@ -2047,6 +2057,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "KUBECONFIG": "/home/alice/.kube/config",
+        "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
         "OMNIGENT_LOG_LEVEL": "DEBUG",
@@ -2093,6 +2104,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # SSH_AUTH_SOCK is a socket path on the same footing. Dropping it leaves
+    # every runner-spawned context without ssh-agent auth, so git-over-SSH and
+    # SSH-cert tooling fail with "dial unix: missing address".
+    assert env["SSH_AUTH_SOCK"] == "/private/tmp/com.apple.launchd.7Qk/Listeners"
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
@@ -3119,12 +3134,24 @@ class _HandshakeFailingConnect:
 
 
 class _DroppedTunnel:
-    """Fake accepted tunnel whose receive loop drops immediately.
+    """Fake accepted tunnel that drops after *frames_before_drop* frames.
 
     Lets ``_serve_frames`` send the ``host.hello`` frame (proving the
-    upgrade was accepted), then fails the first ``recv()`` like an
-    abruptly closed connection, returning control to the reconnect loop.
+    upgrade was accepted), serves the scripted number of inbound frames
+    (undecodable junk the dispatcher ignores), then fails ``recv()`` like
+    an abruptly closed connection, returning control to the reconnect
+    loop.
+
+    :param frames_before_drop: Inbound frames to deliver before dropping;
+        ``0`` (the default) models an accepted-but-silent connection.
     """
+
+    def __init__(self, frames_before_drop: int = 0) -> None:
+        """Store the inbound-frame script.
+
+        :param frames_before_drop: Frames to serve before dropping.
+        """
+        self._frames_left = frames_before_drop
 
     async def send(self, data: str | bytes) -> None:
         """Accept any outbound frame (the ``host.hello``) silently.
@@ -3134,11 +3161,14 @@ class _DroppedTunnel:
         """
 
     async def recv(self) -> str:
-        """Fail like a connection that closed without a close frame.
+        """Serve scripted frames, then fail like an abrupt close.
 
-        :returns: Never returns — always raises.
-        :raises ConnectionClosedError: Always, with no close frames.
+        :returns: An undecodable frame while any are scripted.
+        :raises ConnectionClosedError: Once the script is exhausted.
         """
+        if self._frames_left > 0:
+            self._frames_left -= 1
+            return "not-a-decodable-frame"
         raise ConnectionClosedError(None, None)
 
 
@@ -3146,16 +3176,26 @@ class _AcceptingConnect:
     """Async-CM stand-in for a *successful* WS upgrade.
 
     ``__aenter__`` hands back a :class:`_DroppedTunnel`, so the host
-    marks the connection authenticated and then immediately loses it —
-    the minimal scripted "connected once" event.
+    marks the connection authenticated and then loses it after the
+    scripted number of inbound frames — the minimal "connected once"
+    event, silent by default.
+
+    :param frames_before_drop: Passed through to :class:`_DroppedTunnel`.
     """
 
+    def __init__(self, frames_before_drop: int = 0) -> None:
+        """Store the tunnel's inbound-frame script.
+
+        :param frames_before_drop: Frames the tunnel serves before dropping.
+        """
+        self._frames_before_drop = frames_before_drop
+
     async def __aenter__(self) -> _DroppedTunnel:
-        """Complete the handshake with a tunnel that drops on first recv.
+        """Complete the handshake with a tunnel that later drops.
 
         :returns: A :class:`_DroppedTunnel`.
         """
-        return _DroppedTunnel()
+        return _DroppedTunnel(self._frames_before_drop)
 
     async def __aexit__(self, *exc_info: object) -> bool:
         """No-op async-CM exit.
@@ -3172,20 +3212,22 @@ class _ConnectSpy:
 
     An exception entry fails that handshake; a ``None`` entry accepts it
     with a tunnel that drops on first ``recv()`` (so the reconnect loop
-    regains control). The last queued entry repeats for any further
-    calls, so a single fatal exception covers the "fails on first
-    attempt" case and a ``[transient, CancelledError]`` pair covers
-    "retried once, then stop".
+    regains control); an int entry accepts it with a tunnel that serves
+    that many inbound frames before dropping. The last queued entry
+    repeats for any further calls, so a single fatal exception covers
+    the "fails on first attempt" case and a ``[transient,
+    CancelledError]`` pair covers "retried once, then stop".
 
     :param exceptions: Per-call handshake script, e.g.
         ``[None, InvalidStatus(resp_503), asyncio.CancelledError()]``.
     """
 
-    def __init__(self, exceptions: list[BaseException | None]) -> None:
+    def __init__(self, exceptions: list[BaseException | int | None]) -> None:
         """Initialize the spy with a handshake script.
 
-        :param exceptions: Exception to raise (or ``None`` to accept) on
-            each successive call; the final entry repeats.
+        :param exceptions: Exception to raise (``None`` or an int frame
+            count to accept) on each successive call; the final entry
+            repeats.
         """
         self._exceptions = exceptions
         self.call_count = 0
@@ -3201,8 +3243,8 @@ class _ConnectSpy:
         """
         exc = self._exceptions[min(self.call_count, len(self._exceptions) - 1)]
         self.call_count += 1
-        if exc is None:
-            return _AcceptingConnect()
+        if exc is None or isinstance(exc, int):
+            return _AcceptingConnect(exc or 0)
         return _HandshakeFailingConnect(exc)
 
 
@@ -3654,6 +3696,130 @@ async def test_run_reconnects_on_transient_upgrade_failure(
     assert spy.call_count == 2
 
 
+def _refused_exc() -> ConnectionRefusedError:
+    """A single-stack connection-refused, as asyncio raises it.
+
+    :returns: ``ConnectionRefusedError`` with the platform's errno set.
+    """
+    return ConnectionRefusedError(errno.ECONNREFUSED, "Connect call failed ('127.0.0.1', 5566)")
+
+
+def _dual_stack_refused_exc() -> OSError:
+    """The combined dual-stack refusal asyncio raises for ``localhost``.
+
+    ``create_connection`` folds the per-address failures into one
+    ``OSError`` whose errno is lost — only the per-address ``[Errno N]``
+    texts survive in the message.
+
+    :returns: ``OSError`` shaped like asyncio's combined failure.
+    """
+    e = errno.ECONNREFUSED
+    return OSError(
+        f"Multiple exceptions: [Errno {e}] Connect call failed ('::1', 5566, 0, 0), "
+        f"[Errno {e}] Connect call failed ('127.0.0.1', 5566)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("refused_exc", "server_url"),
+    [
+        (_refused_exc(), "http://127.0.0.1:5566"),
+        (_dual_stack_refused_exc(), "http://localhost:5566"),
+    ],
+    ids=["single-stack", "dual-stack-combined"],
+)
+async def test_loopback_host_exits_after_sustained_connection_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refused_exc: OSError,
+    server_url: str,
+) -> None:
+    """Persistent connection-refused against a loopback server exits the host.
+
+    A dead local server never comes back on its own, yet the reconnect
+    loop retried forever at the backoff cap — zombie hosts looped for
+    days against dead loopback ports. After a bounded refused streak the
+    host must log one clear ERROR and exit via the permanent-failure
+    path. Dual-stack refusals arrive as asyncio's combined ``OSError``
+    (errno lost) and must count exactly the same.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._LOOPBACK_REFUSED_FATAL_ATTEMPTS", 3)
+    spy = _ConnectSpy([refused_exc])
+    _patch_connect(monkeypatch, spy)
+    host = _host(server_url)
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+        with pytest.raises(HostConnectError) as excinfo:
+            await host.run()
+
+    # Exactly the threshold — no premature death, no infinite loop.
+    assert spy.call_count == 3
+    # The fatal message names the dead address (printed by run_host_process).
+    assert server_url in str(excinfo.value)
+    # ONE clear ERROR explaining the exit, not one per retry.
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert server_url in errors[0].message
+    assert "no server is listening" in errors[0].message
+
+
+async def test_remote_host_retries_connection_refused_past_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection-refused against a REMOTE server never turns fatal.
+
+    A refusal from a remote endpoint can be an outage or a rolling
+    deploy — it recovers, so the host must keep retrying past the
+    loopback fatal threshold. Only loopback refusals prove the server
+    is gone for good.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._LOOPBACK_REFUSED_FATAL_ATTEMPTS", 3)
+    refused = _refused_exc()
+    # More refusals than the threshold, then a cancel to end the test.
+    spy = _ConnectSpy([refused, refused, refused, refused, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: a fatal misfire would raise HostConnectError on
+    # the 3rd refusal (call_count 3) instead of reaching the cancel.
+    await host.run()
+
+    # 5 = 4 retried refusals (past the threshold of 3) + the ending cancel.
+    assert spy.call_count == 5
+
+
+async def test_accepted_connect_resets_loopback_refused_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful connect resets the loopback refused streak.
+
+    Only CONSECUTIVE refusals may kill the host: a streak interrupted by
+    a real connection (server came back, then died again) must start
+    counting from zero, not inherit pre-recovery refusals.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._LOOPBACK_REFUSED_FATAL_ATTEMPTS", 3)
+    # The accepted connect sends a real hello; skip its slow CLI probes —
+    # only the streak accounting is under test here.
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    refused = _refused_exc()
+    # 2 refusals (one short of fatal), an accepted upgrade (its tunnel
+    # drops on first recv), then refusals repeating until fatal.
+    spy = _ConnectSpy([refused, refused, None, refused])
+    _patch_connect(monkeypatch, spy)
+    host = _host("http://localhost:5566")
+
+    with pytest.raises(HostConnectError):
+        await host.run()
+
+    # 6 = 2 refusals + accepted connect + 3 FRESH refusals to reach the
+    # threshold. 5 would mean the accepted connect did not reset the
+    # streak (pre-recovery refusals were counted toward the exit).
+    assert spy.call_count == 6
+
+
 def test_run_host_process_exits_nonzero_on_fatal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3771,3 +3937,213 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     while time.monotonic() < deadline and spawned[0].poll() is None:
         await asyncio.sleep(0.05)
     assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"
+
+
+async def test_silent_connect_streak_escalates_and_slows_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Accepted-but-silent connections escalate past a bounded streak.
+
+    An endpoint that accepts the upgrade and never sends a frame used to
+    classify every drop as a benign ingress recycle and hammer it at the
+    prompt cadence forever (observed: ~6s cycles for 7 hours, silently).
+    Past the streak the host must log ONE error, warn the terminal once,
+    and drop to normal backoff.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    # Five accepted-silent connections (threshold 3), then stop.
+    spy = _ConnectSpy([None, None, None, None, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, "must escalate exactly once per episode"
+    assert "3 consecutive connections but never responded" in errors[0].message
+    # The terminal notice reached stderr exactly once.
+    assert capsys.readouterr().err.count("never responded") == 1
+    # Cadence flip: below the threshold the drops ride the recycle fast
+    # path; at/after it they must not.
+    reconnects = [r.message for r in caplog.records if "Reconnecting in" in r.message]
+    assert len(reconnects) == 5
+    assert "(recycle — prompt reconnect)" in reconnects[1]
+    assert "(recycle — prompt reconnect)" not in reconnects[-1]
+
+
+async def test_inbound_frame_resets_silent_connect_streak(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One received frame proves the endpoint alive and resets the streak.
+
+    Only CONSECUTIVE silent connections may escalate — a healthy
+    connection in between (any inbound frame, even one the dispatcher
+    ignores) restarts the count, so ordinary recycles never trip it.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    # 2 silent, one frame-serving (resets), 2 silent: never 3 in a row.
+    spy = _ConnectSpy([None, None, 1, None, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    assert host._silent_connect_streak == 2
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+class _FakeZygote:
+    """Scripted ZygoteManager stand-in for the spawn-fallback tests.
+
+    :param fail_at: ``"start"`` or ``"fork"`` — which call raises
+        :class:`ZygoteUnavailable`.
+    :param running: What ``is_running()`` reports after the failure.
+    """
+
+    def __init__(self, *, fail_at: str, running: bool) -> None:
+        """Store the failure script.
+
+        :param fail_at: Which call raises.
+        :param running: Post-failure ``is_running()`` answer.
+        """
+        self._fail_at = fail_at
+        self._running = running
+        self.stop_calls = 0
+
+    @property
+    def pid(self) -> int:
+        """A fixed fake zygote pid."""
+        return 4242
+
+    def is_running(self) -> bool:
+        """Report the scripted liveness."""
+        return self._running
+
+    def start(self) -> None:
+        """Raise when scripted to fail at start."""
+        if self._fail_at == "start":
+            raise ZygoteUnavailable("scripted start failure")
+
+    def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> object:
+        """Always raise — the fork channel is scripted broken."""
+        del env, log_path, workspace
+        raise ZygoteUnavailable("scripted fork failure")
+
+    def stop(self) -> None:
+        """Record the reap."""
+        self.stop_calls += 1
+
+
+class _FakeSpawnedProc:
+    """Minimal Popen stand-in for the direct-spawn fallback."""
+
+    pid = 31337
+
+    def poll(self) -> int | None:
+        """Report the fake runner still running."""
+        return None
+
+
+def _spawn_with_fake_zygote(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    zygote: _FakeZygote,
+) -> tuple[HostProcess, list[list[str]]]:
+    """Drive ``_spawn_runner_proc`` with *zygote* and a stubbed direct Popen.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :param tmp_path: Holds the fake runner log file.
+    :param zygote: The scripted zygote installed on the host.
+    :returns: The host and the argv of every direct ``Popen`` call.
+    """
+    host = _make_host_process()
+    host._zygote = zygote  # type: ignore[assignment]
+    host._zygote_disabled = False
+    popen_argvs: list[list[str]] = []
+    log_path = tmp_path / "runner.log"
+
+    def _fake_open_log(
+        destination: str,
+        *,
+        root: object = None,
+        prefix: str | None = None,
+    ) -> tuple[Path, object]:
+        del destination, root, prefix
+        return log_path, open(log_path, "ab", buffering=0)
+
+    def _fake_popen(argv: list[str], **kwargs: object) -> _FakeSpawnedProc:
+        del kwargs
+        popen_argvs.append(list(argv))
+        return _FakeSpawnedProc()
+
+    monkeypatch.setattr("omnigent.host.connect.open_process_log_file", _fake_open_log)
+    monkeypatch.setattr("omnigent.host.connect.subprocess.Popen", _fake_popen)
+    host._spawn_runner_proc({}, "slug", tmp_path)
+    return host, popen_argvs
+
+
+def test_dead_zygote_is_reaped_and_respawnable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A zygote that died mid-life must not disable forking forever.
+
+    Its forked runners self-terminate via their orphan watchdogs the
+    moment it dies, so nothing depends on the dead instance — reap it
+    and leave the zygote enabled so the next launch's ``start()``
+    respawns a fresh one, instead of losing copy-on-write forking for
+    the rest of the daemon's life.
+    """
+    zygote = _FakeZygote(fail_at="fork", running=False)
+
+    host, popen_argvs = _spawn_with_fake_zygote(monkeypatch, tmp_path, zygote)
+
+    assert host._zygote_disabled is False
+    assert zygote.stop_calls == 1
+    # This launch still succeeded, via the direct-spawn fallback.
+    assert len(popen_argvs) == 1
+
+
+def test_alive_zygote_with_broken_channel_is_disabled_not_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An alive zygote with a broken channel is disabled but never stopped.
+
+    Stopping it would orphan the healthy runners already forked from it
+    (their parent-death watchdogs would self-terminate live sessions).
+    """
+    zygote = _FakeZygote(fail_at="fork", running=True)
+
+    host, popen_argvs = _spawn_with_fake_zygote(monkeypatch, tmp_path, zygote)
+
+    assert host._zygote_disabled is True
+    assert zygote.stop_calls == 0
+    assert len(popen_argvs) == 1
+
+
+def test_zygote_start_failure_disables_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A zygote that cannot start is disabled — retrying every launch is waste."""
+    zygote = _FakeZygote(fail_at="start", running=False)
+
+    host, popen_argvs = _spawn_with_fake_zygote(monkeypatch, tmp_path, zygote)
+
+    assert host._zygote_disabled is True
+    assert zygote.stop_calls == 0
+    assert len(popen_argvs) == 1

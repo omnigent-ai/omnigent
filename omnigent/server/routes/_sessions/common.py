@@ -24,9 +24,11 @@ from omnigent.entities.conversation import (
 )
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIMI_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
@@ -196,6 +198,18 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 
+# Optional structured failure fields (present when the runner classified the
+# failure — see ``omnigent.runner.launch_failure``), persisted so a reload
+# renders the same clear failure card instead of only the raw code + message.
+_LAST_TASK_ERROR_TITLE_LABEL_KEY: str = "omnigent.last_task_error_title"
+
+
+_LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
+
+
+_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
@@ -236,6 +250,12 @@ _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 
 
 _CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
+
+
+_KIMI_NATIVE_HARNESS = KIMI_NATIVE_CODING_AGENT.harness
+
+
+_ANTIGRAVITY_NATIVE_HARNESS = ANTIGRAVITY_NATIVE_CODING_AGENT.harness
 
 
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
@@ -725,6 +745,7 @@ __all__ = [
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
+    "_ANTIGRAVITY_NATIVE_HARNESS",
     "_APPROVAL_TYPE",
     "_BROWSER_ACTION_AWAIT_S",
     "_BROWSER_ACTION_TIMEOUT_RESULT",
@@ -800,12 +821,16 @@ __all__ = [
     "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
     "_HOST_RUNNER_STATUS_TIMEOUT_S",
     "_INTERRUPT_TYPE",
+    "_KIMI_NATIVE_HARNESS",
     "_KIRO_NATIVE_WRAPPER_LABEL_VALUE",
     "_LABEL_VALUE_MAX_LEN",
     "_LAST_CONTEXT_TOKENS_LABEL_KEY",
     "_LAST_CONTEXT_WINDOW_LABEL_KEY",
+    "_LAST_TASK_ERROR_CAUSE_LABEL_KEY",
     "_LAST_TASK_ERROR_CODE_LABEL_KEY",
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
+    "_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY",
+    "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",

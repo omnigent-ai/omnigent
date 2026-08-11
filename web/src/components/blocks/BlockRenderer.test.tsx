@@ -154,6 +154,54 @@ describe("BlockRenderer dispatch", () => {
     );
   });
 
+  it("renders a friendly failure card when the error is classified", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "",
+        code: "required_terminal_exited",
+        title: "Claude Code can't run as root",
+        cause:
+          "The agent terminal exited immediately because Claude Code refuses the flag as root.",
+        remediation: "Run the host as a non-root user (uid != 0).",
+        message: "Claude Code can't run as root\n\nTerminal diagnostics:\ncommand: claude",
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    // Headline is the friendly title, not the raw code.
+    expect(screen.getByText("Claude Code can't run as root")).toBeDefined();
+    // Cause is shown in plain English.
+    expect(screen.getByText(/refuses the flag as root/)).toBeDefined();
+    // Remediation is surfaced.
+    expect(screen.getByText(/Run the host as a non-root user/)).toBeDefined();
+    // Raw diagnostics are folded away behind a Details toggle (collapsed).
+    expect(screen.getByText(/Details/)).toBeDefined();
+    // The raw enum is NOT the visible headline.
+    expect(screen.queryByText(/Error · required_terminal_exited/)).toBeNull();
+  });
+
+  it("falls back to a code→sentence description for an unclassified failure", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "",
+        code: "runner_error",
+        message: "",
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    // Even with an empty message, the known code reads as an English headline
+    // instead of the raw enum.
+    expect(screen.getByText("Something went wrong setting up the turn on the host.")).toBeDefined();
+    expect(screen.queryByText(/runner_error/)).toBeNull();
+  });
+
   it("treats a trailing reasoning item as streaming when sessionStatus is running", () => {
     const items: RenderItem[] = [
       { kind: "reasoning", itemId: null, text: "thinking", duration: undefined },

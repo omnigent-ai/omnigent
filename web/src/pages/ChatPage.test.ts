@@ -29,7 +29,11 @@ import {
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
   shouldShowWorkingIndicator,
+  MAX_WARM_TERMINAL_SURFACES,
+  shouldMountTerminalSurface,
   shouldShowTerminalSurface,
+  updateWarmTerminalSurfaces,
+  type WarmTerminalEntry,
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
@@ -121,6 +125,93 @@ describe("Terminal-first surface selection", () => {
     expect(
       shouldShowTerminalSurface("conv_regular", { isTerminalFirst: false, view: "terminal" }, true),
     ).toBe(false);
+  });
+
+  it("pre-warms the surface in chat view once a terminal is reachable", () => {
+    // Mounted (hidden) so the attach dials in the background and the
+    // first flip to Terminal is instant.
+    expect(
+      shouldMountTerminalSurface("conv_terminal", {
+        isTerminalFirst: true,
+        view: "chat",
+        terminalsAvailable: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps the surface mounted while the view is open even with no terminal", () => {
+    // The surface owns the "No terminals available" / reconnect states.
+    expect(
+      shouldMountTerminalSurface("conv_stopped", {
+        isTerminalFirst: true,
+        view: "terminal",
+        terminalsAvailable: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not pre-warm with no reachable terminal or for non-terminal-first sessions", () => {
+    // A hidden mount here would just dial a dead runner…
+    expect(
+      shouldMountTerminalSurface("conv_stopped", {
+        isTerminalFirst: true,
+        view: "chat",
+        terminalsAvailable: false,
+      }),
+    ).toBe(false);
+    // …and non-terminal-first sessions have no main terminal surface at all.
+    expect(
+      shouldMountTerminalSurface("conv_regular", {
+        isTerminalFirst: false,
+        view: "chat",
+        terminalsAvailable: true,
+      }),
+    ).toBe(false);
+    expect(shouldMountTerminalSurface(null, null)).toBe(false);
+  });
+});
+
+describe("Warm terminal-surface LRU", () => {
+  it("moves a revisited session to the most-recent end without duplicating it", () => {
+    const warmed = updateWarmTerminalSurfaces(
+      [
+        { conversationId: "conv_a", readOnly: false },
+        { conversationId: "conv_b", readOnly: false },
+      ],
+      "conv_a",
+      false,
+    );
+    expect(warmed.map((e) => e.conversationId)).toEqual(["conv_b", "conv_a"]);
+  });
+
+  it("evicts the least-recent session past the cap", () => {
+    const ids = Array.from({ length: MAX_WARM_TERMINAL_SURFACES + 1 }, (_, i) => `conv_${i}`);
+    let warmed: WarmTerminalEntry[] = [];
+    for (const id of ids) {
+      warmed = updateWarmTerminalSurfaces(warmed, id, false);
+    }
+    // The oldest fell out: its hidden surface unmounts and its attach is
+    // disposed, keeping the cache from accumulating a tmux attach for
+    // every session ever visited.
+    expect(warmed.map((e) => e.conversationId)).toEqual(ids.slice(1));
+    expect(warmed).toHaveLength(MAX_WARM_TERMINAL_SURFACES);
+  });
+
+  it("refreshes the readOnly snapshot for the re-inserted session only", () => {
+    // Permission hydrates late for the active session; a warm background
+    // session must keep the snapshot from when IT was active.
+    const warmed = updateWarmTerminalSurfaces(
+      [
+        { conversationId: "conv_a", readOnly: true },
+        { conversationId: "conv_b", readOnly: false },
+      ],
+      "conv_b",
+      true,
+    );
+    expect(warmed).toEqual([
+      { conversationId: "conv_a", readOnly: true },
+      { conversationId: "conv_b", readOnly: true },
+    ]);
   });
 });
 
@@ -774,6 +865,54 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
       false,
     );
+  });
+
+  it("an in-flight local send lights the indicator before any server edge", () => {
+    // Pressing Enter sets chatStore.status = "streaming" synchronously, while
+    // `sessionStatus` stays `idle` until the server publishes `running` (for
+    // claude-native, until the status file's next poll). The sidebar row
+    // already lights up off this flag, so the chat pane must too or the two
+    // disagree for the whole dispatch round-trip.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: true }))).toBe(true);
+  });
+
+  it("an in-flight local send survives a stale offline poll", () => {
+    // Sending to an asleep runner relaunches it; `/health` reads stale-offline
+    // during that window (10s cadence). The user dispatched, so the indicator
+    // must not be suppressed — same reasoning as live running/waiting above.
+    expect(
+      computeShowsWorking("idle", opts({ localSendInFlight: true, runnerOnline: false })),
+    ).toBe(true);
+  });
+
+  it("a spin-up in flight yields the slot to the Starting-up cue", () => {
+    // ChatPage passes `localSendInFlight: status === "streaming" && !spinUpInFlight`.
+    // `RunnerStartingIndicator` renders only when the shimmer is absent, and its
+    // copy ("Starting up…" / "Cloning repository…") is strictly more informative
+    // than a generic shimmer — so during a boot the optimistic path stands down.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
+  });
+
+  it("a server-confirmed running still wins during a spin-up", () => {
+    // Once the harness reports work the spin-up cue has self-gated to null, so
+    // suppressing the shimmer too would leave the turn with no indicator at all.
+    // `localSendInFlight` is the only thing the spin-up gate touches.
+    expect(computeShowsWorking("running", opts({ localSendInFlight: false }))).toBe(true);
+  });
+
+  it("a pending elicitation still outranks an in-flight local send", () => {
+    // The elicitation prompt owns the in-progress slot; the two must never
+    // stack, so the suppression applies regardless of how the work was
+    // signalled.
+    expect(
+      computeShowsWorking("idle", opts({ localSendInFlight: true, hasPendingElicitation: true })),
+    ).toBe(false);
+  });
+
+  it("no local send in flight leaves an idle session idle", () => {
+    // The flag is opt-in: a cross-client or TUI-typed turn sets no local
+    // status here, so an idle session with no send stays dark.
+    expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
   });
 });
 

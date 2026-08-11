@@ -1,4 +1,4 @@
-"""Tests for Codex, Claude, and Antigravity terminal runtime behavior."""
+"""Tests for Codex, Claude, Antigravity, and Kimi terminal runtime behavior."""
 
 from __future__ import annotations
 
@@ -1744,6 +1744,7 @@ async def _run_antigravity_auto_create(
     pane: tuple[Path, str] | None = None,
     pane_scoped_port: int | None = None,
     pane_agy_found: bool = True,
+    build_agy_launch_calls: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -1773,6 +1774,10 @@ async def _run_antigravity_auto_create(
     :param pane_agy_found: Whether the pane-scoped resolver found our agy in the
         pane subtree. ``True`` + a port → scoped (state 1); ``True`` + no port →
         candidate fallback (state 2); ``False`` → keep polling (state 3).
+    :param build_agy_launch_calls: When provided, every kwargs dict passed to the
+        stubbed ``build_agy_launch`` is appended here so a test can assert what
+        the auto-create path forwards (e.g. snapshot ``terminal_launch_args`` →
+        ``extra_args``).
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
@@ -1790,9 +1795,12 @@ async def _run_antigravity_auto_create(
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
 
     # No-op the launch builder + onboarding seed so nothing tries to find agy.
-    monkeypatch.setattr(
-        launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
-    )
+    def _fake_build_agy_launch(**kwargs: Any) -> tuple[tuple[str, ...], dict[str, str]]:
+        if build_agy_launch_calls is not None:
+            build_agy_launch_calls.append(kwargs)
+        return (("agy",), {"AGY_ENV": "1"})
+
+    monkeypatch.setattr(launch_mod, "build_agy_launch", _fake_build_agy_launch)
     monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
     # ``supervise_reader`` at its definition module (the helper imports it lazily)
@@ -1943,6 +1951,136 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Snapshot ``terminal_launch_args`` reach ``build_agy_launch`` as ``extra_args``.
+
+    This is the seam the server-derived bypass flag rides: a named
+    antigravity-native sub-agent with ``permission_mode: bypassPermissions``
+    persists ``["--dangerously-skip-permissions"]`` on the session, and the
+    runner's auto-create must forward it verbatim into the agy argv (with the
+    web-attended stance kept: ``permission_mode=None`` / ``headless=False`` so
+    bypass comes ONLY from the pass-through args). A failure means the derived
+    flag is dropped and the worker parks on approval cards.
+    """
+    launch_calls: list[dict[str, Any]] = []
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id="82b5f9222c7ac0f45ba2736b57b51f77",
+        snapshot={"terminal_launch_args": ["--dangerously-skip-permissions"]},
+        candidate_ports=[52549],
+        build_agy_launch_calls=launch_calls,
+    )
+    assert len(launch_calls) == 1
+    call = launch_calls[0]
+    assert call["extra_args"] == ("--dangerously-skip-permissions",)
+    # Bypass must come only from the pass-through args on this attended path.
+    assert call["permission_mode"] is None
+    assert call["headless"] is False
+
+
+@pytest.mark.asyncio
+async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Snapshot ``terminal_launch_args`` reach the launched kimi argv.
+
+    This is the seam the server-derived ``--yolo`` rides: a named kimi-native
+    sub-agent with ``yolo: true`` persists ``["--yolo"]`` on the session, and
+    the runner's auto-create must append it verbatim to the bare ``kimi`` TUI
+    command. A failure means the derived flag is dropped, the worker launches
+    as plain ``kimi``, and every risky tool call parks on an approval prompt
+    no headless pane can answer.
+    """
+    import omnigent.kimi_native as kimi_mod
+    import omnigent.kimi_native_credentials as kimi_creds_mod
+    import omnigent.kimi_native_forwarder as kimi_fwd_mod
+    from omnigent import kimi_native_bridge as kimi_bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.app import _auto_create_kimi_terminal
+    from omnigent.runner.resource_registry import KIMI_NATIVE_TERMINAL_ROLE
+
+    session_id = "92c6f9222c7ac0f45ba2736b57b51f88"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", tmp_path / "kimi-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
+    # Keep the session-home build off the user's real kimi config.
+    monkeypatch.setattr(
+        kimi_creds_mod,
+        "build_kimi_session_home",
+        lambda session_home, **_kwargs: {"KIMI_CODE_HOME": str(session_home)},
+    )
+
+    async def _sleeping_forwarder(**_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(kimi_fwd_mod, "supervise_kimi_forwarder", _sleeping_forwarder)
+
+    snapshot = {"workspace": str(workspace), "terminal_launch_args": ["--yolo"]}
+
+    class _SnapshotServerClient:
+        """Server client returning the persisted session snapshot."""
+
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+    launched_specs: list[Any] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the required-terminal launch spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            assert terminal_name == "kimi"
+            assert session_key == "main"
+            assert resource_role == KIMI_NATIVE_TERMINAL_ROLE
+            launched_specs.append(spec)
+            return SessionResourceView(
+                id="terminal_kimi_main",
+                type="terminal",
+                session_id=session_id,
+                name="Kimi",
+            )
+
+    try:
+        await _auto_create_kimi_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    assert len(launched_specs) == 1
+    spec = launched_specs[0]
+    # Bare ``kimi`` plus the persisted pass-through args, verbatim.
+    assert spec.command == "/fake/bin/kimi"
+    assert spec.args == ["--yolo"]
 
 
 @pytest.mark.asyncio

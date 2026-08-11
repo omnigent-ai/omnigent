@@ -344,3 +344,36 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     );
   });
 });
+
+// pinWindow is the one chokepoint every "leave this server" path routes through
+// (Connect to new server, Change Server…, switch-server, did-fail-load fallback).
+// Those navigations tear down the renderer WITHOUT running BrowserPane's unmount
+// detach, so pinWindow must close the window's browser registry when the origin
+// changes — else the native WebContentsView dangles over the setup/welcome page.
+describe("browser-view teardown on server change (src/main.js)", () => {
+  it("closes the window's browserRegistry when pinWindow changes origin", () => {
+    assert.match(
+      liveCode,
+      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}browserRegistry\?\.closeAll\(/,
+      [
+        "pinWindow no longer closes the window's embedded-browser views when the",
+        "origin changes. Leaving a server (Connect to new server / Change Server / switch)",
+        "navigates the window away and tears down the renderer WITHOUT running",
+        "BrowserPane's unmount detach, so the native WebContentsView keeps painting over",
+        "the setup/welcome page. Restore the closeAll call in pinWindow.",
+      ].join(" "),
+    );
+  });
+
+  it("guards the teardown so the initial cold-connect pin doesn't fire it", () => {
+    assert.match(
+      liveCode,
+      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
+      [
+        "The closeAll in pinWindow is no longer guarded on a prior origin. Without the",
+        "state.origin != null guard the initial pin (setup→first connect) would try to",
+        "close a registry with nothing open. Keep the guard.",
+      ].join(" "),
+    );
+  });
+});

@@ -53,7 +53,7 @@ import type {
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
-import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -427,6 +427,23 @@ export interface ChatState {
    */
   pendingComposerAttachments: ComposerAttachment[];
   /**
+   * The text + attachments of a send that failed before the server took
+   * ownership of it, handed back so the composer can restore them for a
+   * retry. Without this the message is simply gone: `submit` clears the
+   * composer optimistically, and a first message carried in from the
+   * landing screen has already had its draft dropped and its pending
+   * prompt destructively consumed — so an upload 415 or a runner 503 left
+   * the user with an error and nothing to resend. The composer drains this
+   * (matching on conversation id) and clears it.
+   *
+   * Single-slot: a second failure in the same session replaces the first's
+   * retained draft (last failure wins). A send that fails before any session
+   * id resolves isn't captured — there is no composer keyed to restore it
+   * into — but the landing path binds a session first, so the reported flow
+   * is covered.
+   */
+  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
    * the session snapshot on bind; ``null`` before bind or when the
@@ -513,6 +530,17 @@ export interface ChatState {
    * non-terminal-first sessions.
    */
   terminalPending: boolean;
+  /**
+   * Epoch ms when this client last asked a host to launch a runner for the
+   * open session outside the send path — today, a host switch. The runner
+   * is coming up but nothing on the wire says so yet: the session is not
+   * newly created, so the liveness startup grace doesn't apply, and no turn
+   * is in flight, so it would otherwise read as idle `runner_asleep` and
+   * show nothing at all. Feeds `useSessionLiveness` as a `starting` nudge
+   * and self-expires after `STARTING_GRACE_S`. `null` when no such launch
+   * is outstanding.
+   */
+  runnerLaunchedAt: number | null;
   /**
    * Users currently viewing this session (presence circles in the
    * chat header). Replaced wholesale by every `session.presence` SSE
@@ -684,6 +712,9 @@ export interface ChatState {
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
+  /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
+   *  successful `launchRunner` for the open session. */
+  markRunnerLaunched: () => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -707,12 +738,116 @@ let queryClient: QueryClient | null = null;
 const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
 let pendingSeq = 0;
 let queueSeq = 0;
-// Tail of the send chain. Each `send` waits on the previous send's network
-// work before issuing its own POST, so rapid-fire messages reach the server
-// in submission order. Concurrent `fetch` POSTs have no ordering guarantee,
-// which otherwise lets the server accept messages out of order. Module-level
-// (one active chat at a time); the chain only ever resolves, never rejects.
-let sendChain: Promise<void> = Promise.resolve();
+// Tail of each conversation's send chain. A send waits on the previous send
+// TO THE SAME CONVERSATION before issuing its own POST, so rapid-fire messages
+// reach the server in submission order. Concurrent `fetch` POSTs have no
+// ordering guarantee, which otherwise lets the server accept messages out of
+// order. Keyed by the conversation pinned at submit time; `null` is the
+// not-yet-created session, of which a tab can only have one in flight. Order
+// only means anything WITHIN a conversation, so keying per conversation stops
+// a stalled POST in one from delaying every other conversation in the tab.
+const sendChains = new Map<string | null, Promise<void>>();
+
+// A chain link must never be able to deadlock its successors. `postEvent`
+// issues its fetch with no timeout, so a connection that dies mid-flight never
+// settles and the send's `finally` never releases its link. Waiting on the
+// prior send is therefore bounded: past this the successor proceeds anyway and
+// only ordering degrades, which beats a composer that queues forever with no
+// error and no recovery short of a page reload. Set well above any legitimate
+// POST — a message can block on runner session-init or a sandbox-host wake,
+// which take minutes — so this only ever fires on a send that is truly stuck,
+// never reordering a slow one.
+const SEND_CHAIN_MAX_WAIT_MS = 180_000;
+
+// When a send last latched local `status` to "streaming". Stamped on the way in
+// and never cleared on the way out: after a normal turn `status` settles to
+// "idle" on its own, so a leftover value is inert — only a `status` still
+// reading "streaming" long afterwards makes it meaningful.
+let sendLatchedAt: number | null = null;
+
+/**
+ * Read one conversation's server-side status from the sidebar cache.
+ *
+ * The `["conversations"]` cache is kept live by the WS `/v1/sessions/updates`
+ * overlay and the poll, so it is the one view of a session's real status that
+ * does not depend on this tab's own send lifecycle.
+ *
+ * @returns the row's status, or `undefined` when no loaded page holds the row.
+ */
+function cachedConversationStatus(conversationId: string): string | undefined {
+  if (queryClient === null) return undefined;
+  for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    for (const page of data?.pages ?? []) {
+      for (const row of page.data) {
+        if (row.id === conversationId) return row.status;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Whether local `status: "streaming"` is a stranded latch rather than a live send.
+ *
+ * `postEvent` issues its fetch with no timeout, so a POST whose connection dies
+ * mid-flight never settles: `send`'s `finally` never runs and `status` stays
+ * "streaming" forever. That flag gates both the composer and the queue, so every
+ * later message queues with no error and no recovery short of a page reload. A
+ * turn whose terminal SSE edge was lost strands it the same way.
+ *
+ * Nothing separates a stuck send from a slow one except elapsed time, so the
+ * latch is overridden only once it has outlived any plausible POST AND the
+ * session's own row disagrees with it. A live streaming response is never stale.
+ */
+function sendLatchIsStranded(s: ChatState): boolean {
+  if (sendLatchedAt === null || Date.now() - sendLatchedAt < SEND_CHAIN_MAX_WAIT_MS) return false;
+  if (s.activeResponse?.state === "streaming") return false;
+  return s.conversationId !== null && cachedConversationStatus(s.conversationId) === "idle";
+}
+
+/**
+ * Take this send's place in its conversation's POST-ordering chain.
+ *
+ * @param conversationId - Conversation pinned at submit time (`null` for a
+ *   session the send is about to create).
+ * @returns `waitForPrior`, awaited before any network work, and `release`,
+ *   which MUST be called from a `finally` to hand off to the next send.
+ */
+function takeSendChainLink(conversationId: string | null): {
+  waitForPrior: () => Promise<void>;
+  release: () => void;
+} {
+  const prior = sendChains.get(conversationId) ?? Promise.resolve();
+  let resolveLink: () => void = () => {};
+  const link = new Promise<void>((resolve) => {
+    resolveLink = resolve;
+  });
+  sendChains.set(conversationId, link);
+  return {
+    waitForPrior: async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          prior,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, SEND_CHAIN_MAX_WAIT_MS);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    },
+    release: () => {
+      resolveLink();
+      // Drop the bucket once this link is still the tail, so the map doesn't
+      // accumulate an entry per conversation the user ever sends to. A
+      // successor that already took a link owns the tail, so this no-ops.
+      if (sendChains.get(conversationId) === link) sendChains.delete(conversationId);
+    },
+  };
+}
 let flashTimer: ReturnType<typeof setTimeout> | null = null;
 const workspaceInvalidationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -823,9 +958,10 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
-  // Reset the POST-ordering chain so a prior run's unresolved send can't block
+  // Reset the POST-ordering chains so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
-  sendChain = Promise.resolve();
+  sendChains.clear();
+  sendLatchedAt = null;
   queryClient = client;
 }
 
@@ -959,6 +1095,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
+  failedSendDraft: null,
   llmModel: null,
   sessionHarness: null,
   subAgentName: null,
@@ -971,6 +1108,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   skills: [],
   codexModelOptions: [],
   terminalPending: false,
+  runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
@@ -1061,13 +1199,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // sub-agents) outlives it, so the server accepts a new turn immediately —
     // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
     // an actively `running` turn gate the flush. No agent → nothing to send to.
-    if (
-      s.conversationId === null ||
-      s.boundAgentId === null ||
-      s.status === "streaming" ||
-      s.sessionStatus === "running"
-    ) {
+    if (s.conversationId === null || s.boundAgentId === null || s.sessionStatus === "running") {
       return;
+    }
+    if (s.status === "streaming") {
+      // A send owns the latch, so the queue waits for it — that is the
+      // one-message-per-turn contract. Unless the latch is stranded, in which
+      // case waiting is forever: clear it so the composer also stops queueing
+      // (`shouldQueueSend` reads the same flag) and drain below. Only the
+      // ACTIVE conversation can wedge like this; `flushBackgroundQueues`
+      // already drives every other queue off the server's own status.
+      if (!sendLatchIsStranded(s)) return;
+      sendLatchedAt = null;
+      // The stranded send still holds this conversation's chain link, so the
+      // drain below would park on it for another SEND_CHAIN_MAX_WAIT_MS. Same
+      // evidence, same conclusion: drop the link too. If that send ever does
+      // settle, its `release` only clears an entry it still owns, so a fresh
+      // chain started here is safe.
+      sendChains.delete(s.conversationId);
+      set({ status: "idle" });
     }
     // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
     // the global array head. The queue is one flat array across conversations,
@@ -1129,17 +1279,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
       // Join the SAME send chain the foreground path uses. A queued message can
-      // hand off from the foreground flush (send() → sendChain) to here the
+      // hand off from the foreground flush (send() → sendChains) to here the
       // moment the user navigates away, and the two POST paths would otherwise
       // race — a background postEvent could overtake a foreground send() still
-      // awaiting its chain slot, delivering out of FIFO order. Taking a slot
-      // here (await priorSend before the upload/post, release in finally)
-      // serializes every POST across both paths through one ordering primitive.
-      const priorSend = sendChain;
-      let releaseSend: () => void = () => {};
-      sendChain = new Promise<void>((resolve) => {
-        releaseSend = resolve;
-      });
+      // awaiting its chain slot, delivering out of FIFO order. Both paths take
+      // a slot on THIS conversation's chain (wait before the upload/post,
+      // release in finally), so they share one ordering primitive per session.
+      const { waitForPrior, release: releaseSend } = takeSendChainLink(conversationId);
       // Upload any attachments, then post the message referencing their
       // server-assigned file_ids — the same two-phase sequence send() runs
       // (no combined endpoint exists: /resources/files stores the blob and
@@ -1152,7 +1298,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // head (preserving this conversation's FIFO order) and set a cooldown so
       // the next trigger backs off instead of hammering a failing runner.
       void (async () => {
-        await priorSend;
+        await waitForPrior();
         // Reuse prior successful uploads so cooldown-paced retries do not
         // orphan blobs that already landed.
         const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
@@ -1202,6 +1348,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // until its own `response.completed` arrives.
     const alreadyStreaming = get().status === "streaming";
     if (!alreadyStreaming) {
+      sendLatchedAt = Date.now();
       set({ status: "streaming", activeResponse: null });
     }
 
@@ -1243,22 +1390,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // target afterward would leak the message into the now-active session.
     const submitConversationId = get().conversationId;
 
-    // Take our place in the send chain: wait for the prior send's network
-    // work, then hand off to the next via `releaseSend` in the finally
-    // below. This serializes POSTs in submission order without delaying the
-    // optimistic bubble rendered above. `priorSend` only ever resolves.
-    const priorSend = sendChain;
-    let releaseSend: () => void = () => {};
-    sendChain = new Promise<void>((resolve) => {
-      releaseSend = resolve;
-    });
+    // Take our place in this conversation's send chain: wait for its prior
+    // send's network work, then hand off to the next via `releaseSend` in the
+    // finally below. This serializes POSTs in submission order without delaying
+    // the optimistic bubble rendered above.
+    const { waitForPrior, release: releaseSend } = takeSendChainLink(submitConversationId);
 
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
 
     try {
-      await priorSend;
+      await waitForPrior();
       const sessionId = await ensureBoundSession(agentId, set, get, opts, submitConversationId);
       postedSessionId = sessionId;
 
@@ -1360,6 +1503,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
             tempId,
           ),
         }));
+        // Hand the message back to the composer so the user can retry it.
+        // Nothing else holds it at this point: the optimistic bubble is about
+        // to roll back, and a first message carried in from the landing screen
+        // has already had its draft cleared and its pending prompt consumed.
+        // Keyed by session so it restores into the one it was meant for even
+        // if the user navigated away while the send was in flight.
+        if (text.trim() !== "" || (files?.length ?? 0) > 0) {
+          set({
+            failedSendDraft: { conversationId: stashSessionId, text, files: files ?? [] },
+          });
+        }
       }
       // A queued send can target a session the user has since switched away
       // from (submit-time pin). Only roll back the bubble and settle status
@@ -1385,6 +1539,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
             set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
           }
           set({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0, blockedOn: null });
+        } else {
+          // Sent alongside an already-streaming turn (or a stranded latch). The
+          // bubble is rolled back above, so without a block the message vanishes
+          // with no trace — the failure mode that makes this class of bug so
+          // hard to see. Surface it WITHOUT touching the turn lifecycle:
+          // `finalizeActive` would mark a live response failed, and settling
+          // `status` would end a turn that is still running.
+          set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
         }
       }
     } finally {
@@ -1402,6 +1564,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming = get().status === "streaming";
     if (!alreadyStreaming) {
+      sendLatchedAt = Date.now();
       set({ status: "streaming", activeResponse: null });
     }
     // Optimistic echo of the typed command, mirroring `send`. Without it
@@ -1431,17 +1594,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = get().conversationId;
 
-    const priorSend = sendChain;
-    let releaseSend: () => void = () => {};
-    sendChain = new Promise<void>((resolve) => {
-      releaseSend = resolve;
-    });
+    const { waitForPrior, release: releaseSend } = takeSendChainLink(submitConversationId);
 
     // The session this command actually posts to, once resolved.
     let postedSessionId: string | null = null;
 
     try {
-      await priorSend;
+      await waitForPrior();
       const sessionId = await ensureBoundSession(agentId, set, get, opts, submitConversationId);
       postedSessionId = sessionId;
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
@@ -1517,6 +1676,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (stillActive && !alreadyStreaming) {
         finalizeActive(set, "failed", message, null);
         set({ status: "idle" });
+      } else if (stillActive) {
+        // Same reasoning as `send`: surface the failure without settling a turn
+        // that may still be live, so a failed command can't vanish silently.
+        const { code } = describeSendFailure(err);
+        set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
       }
     } finally {
       releaseSend();
@@ -1671,6 +1835,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // session's composer (which drains the store on mount). Same reset
         // discipline as ``viewers`` above.
         pendingComposerAttachments: [],
+        runnerLaunchedAt: null,
         sandboxStatus: null,
         mcpStartup: null,
         abortController: null,
@@ -1750,6 +1915,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   clearPendingComposerAttachments: () => set({ pendingComposerAttachments: [] }),
+
+  markRunnerLaunched: () => set({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();
@@ -2567,6 +2734,7 @@ async function bindStream(
               message: session.lastTaskError.message,
               source: "",
               code: session.lastTaskError.code,
+              ...structuredErrorFields(session.lastTaskError),
             }
           : null;
       return {
@@ -3210,12 +3378,16 @@ export async function startStreamPump(
           // Release the unconsumed error-response body so the underlying fetch
           // connection is freed promptly rather than lingering across retries.
           void streamRes.body?.cancel().catch(() => {});
-          // 401/403 won't fix themselves by retrying — give up and mark the
-          // session failed so the user isn't left on a silent spinner.
+          // 401/403 won't fix themselves by retrying — give up and settle the
+          // local send lifecycle so the user isn't left on a silent spinner.
+          // `sessionStatus` is NOT touched: losing our stream says nothing
+          // about what the agent is doing (it may well still be mid-turn), and
+          // only the server may declare a session failed. The dropped stream
+          // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
             finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
-            set({ sessionStatus: "failed", status: "idle" });
+            set({ status: "idle" });
             break;
           }
           // A reverse proxy routinely serves 404 for the stream route while
@@ -3228,8 +3400,10 @@ export async function startStreamPump(
               console.warn(
                 `Session ${id}: stream unavailable (404) after ${consecutive404s} attempts, giving up`,
               );
+              // Local lifecycle only — see the 401/403 branch above for why
+              // `sessionStatus` is left to the server.
               finalizeActive(set, "failed", "stream unavailable (404)", null);
-              set({ sessionStatus: "failed", status: "idle" });
+              set({ status: "idle" });
               break;
             }
             console.warn(
@@ -3542,23 +3716,15 @@ async function* tapLiveDeltas(
           retired.add(ev.messageId);
           continue;
         }
-        reviveStrayCompletedResponse(set);
         applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
       }
       continue;
     }
     if (ev.type === "tool_output_delta") {
       if (get().conversationId === id && !isStaleCompletedResponse(get())) {
-        reviveStrayCompletedResponse(set);
         applyLiveToolOutputDelta(set, ev.callId, ev.delta);
       }
       continue;
-    }
-    if (
-      (ev.type === "text_delta" || ev.type === "reasoning_delta") &&
-      get().conversationId === id
-    ) {
-      reviveStrayCompletedResponse(set);
     }
     yield ev;
   }
@@ -3604,12 +3770,11 @@ export function adoptTrailingUnattributedBlocks(
   return next;
 }
 
-// How long after a terminal edge a delta still revives the turn. A
-// STRAY mid-turn idle is contradicted by the still-flowing stream
-// within seconds; a scheduled wake (cron / wakeup fires at 60s
-// minimum) streams its FIRST deltas ahead of the transcript batch that
-// names the new turn — reviving the finished turn then popped its
-// "Worked for" fold open at the start of every /loop iteration.
+// How long after a terminal edge a delta still belongs to the finished
+// turn. A scheduled wake (cron / wakeup fires at 60s minimum) streams
+// its FIRST deltas ahead of the transcript batch that names the new
+// turn; attributing those to the previous turn popped its "Worked for"
+// fold open at the start of every /loop iteration.
 const REVIVE_WINDOW_MS = 15_000;
 
 /**
@@ -3622,23 +3787,6 @@ export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | n
     s.activeResponse.completedAt !== undefined &&
     Date.now() - s.activeResponse.completedAt > REVIVE_WINDOW_MS
   );
-}
-
-export function reviveStrayCompletedResponse(set: Setter): void {
-  set((s) => {
-    if (s.activeResponse?.state !== "completed") return {};
-    if (isStaleCompletedResponse(s)) return {};
-    // The delta also proves the SESSION is mid-turn: restore the busy
-    // signal the stray idle edge cleared, so send gating
-    // (shouldQueueSend) queues instead of firing into the live turn and
-    // the Working indicator comes back before the next running edge.
-    // Local `status` stays untouched — it means "this client's send is
-    // in flight", which is false for cross-client and TUI-typed turns.
-    return {
-      activeResponse: { ...s.activeResponse, state: "streaming" },
-      sessionStatus: "running",
-    };
-  });
 }
 
 /**
@@ -3766,6 +3914,35 @@ export async function pumpStreamEvents(
           status: "streaming",
         });
         continue;
+      }
+
+      // Native preview cleanup must run before the generic dedup below:
+      // when a snapshot merge (reconnect/rebind) inserted this
+      // authoritative item while its `live:*` preview was still on
+      // screen, the dedup alone would drop the event and strand the
+      // preview as a trailing duplicate of the assistant text. Remove
+      // the oldest preview and retire its message id, then fall through
+      // so the dedup skips the event as before.
+      if (
+        block.type === "text_done" &&
+        block.ctx.itemId &&
+        get().isNativeTerminalSession &&
+        (seenItemIds.has(block.ctx.itemId) ||
+          get().blocks.some((b) => b.ctx.itemId === block.ctx.itemId))
+      ) {
+        const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
+        if (provIdx !== -1) {
+          const provItemId = get().blocks[provIdx]!.ctx.itemId!;
+          retiredLiveMessages.add(provItemId.slice(LIVE_ITEM_PREFIX.length));
+          flush();
+          set((s) => {
+            const at = s.blocks.findIndex(isLiveProvisionalBlock);
+            if (at === -1) return {};
+            const next = s.blocks.slice();
+            next.splice(at, 1);
+            return { blocks: next };
+          });
+        }
       }
 
       // Stream → snapshot dedup: skip if this itemId is already committed
@@ -4480,17 +4657,14 @@ export function handleSessionEvent(event: StreamEvent): void {
             }
           } else {
             // Terminal edge without a matching response id. This is the
-            // NORMAL turn-end shape for most emitters — the PTY-activity
-            // relay's bare `idle`, orchestration teardown, and mismatched
-            // Stop-hook `waiting` all carry none — so a still-streaming
-            // turn is finalized here rather than left "streaming" forever
-            // (which hid the settled turn's "Worked for" fold and Fork
-            // action until a reload re-derived lifecycle from the
-            // snapshot). The one edge this can misread — the server's
-            // policy-deny short-circuit publishing a stray running→idle
-            // pair while a real turn streams — is healed by
-            // `reviveStrayCompletedResponse`: the live turn's next delta
-            // reopens it. A `cancelled` turn is preserved as-is.
+            // NORMAL turn-end shape for most emitters — the status file's
+            // bare `idle` and orchestration teardown carry none — so a
+            // still-streaming turn is finalized here rather than left
+            // "streaming" forever (which hid the settled turn's "Worked for"
+            // fold and Fork action until a reload re-derived lifecycle from
+            // the snapshot). Every terminal edge that reaches this point is
+            // now a real turn end: control signals (policy deny, compaction)
+            // no longer publish status. A `cancelled` turn is preserved as-is.
             patch.status = "idle";
             if (s.activeResponse?.state === "streaming") {
               patch.activeResponse = {
@@ -4546,6 +4720,7 @@ export function handleSessionEvent(event: StreamEvent): void {
               message: event.error.message,
               source: "",
               code: event.error.code,
+              ...structuredErrorFields(event.error),
             } satisfies ErrorBlock,
           ];
         }
@@ -4625,7 +4800,34 @@ export function handleSessionEvent(event: StreamEvent): void {
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
       useChatStore.setState((s) => {
-        if (hasCommittedItem(s.blocks, event.itemId)) return {};
+        if (hasCommittedItem(s.blocks, event.itemId)) {
+          // The committed copy is already in `blocks` — the forwarder-
+          // mirrored item beat this event through the stream, or a
+          // snapshot merge inserted it. Still ack the optimistic
+          // bubble: returning without dropping it strands a duplicate
+          // user bubble at the transcript tail. Same precision order
+          // as below (named entry, then FIFO head), minus the append.
+          const cleared = event.clearedPendingId;
+          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
+          if (at >= 0) {
+            return {
+              pendingUserMessages: [
+                ...s.pendingUserMessages.slice(0, at),
+                ...s.pendingUserMessages.slice(at + 1),
+              ],
+            };
+          }
+          // FIFO-head fallback — same marker guard as the promote path
+          // below. A mirrored system marker (the vendor CLI's own
+          // `[Request interrupted by user]` record) is synthesized by the
+          // CLI, owns no pending entry, and arrives with clearedPendingId
+          // unset; dropping the head would steal a real queued message's
+          // bubble. Hold the head back for a marker.
+          const eventContent = userContentFromEvent(event);
+          if (eventContent !== null && isSystemUserContent(eventContent)) return {};
+          if (s.pendingUserMessages.length === 0) return {};
+          return { pendingUserMessages: s.pendingUserMessages.slice(1) };
+        }
 
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;

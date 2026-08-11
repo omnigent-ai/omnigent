@@ -51,6 +51,22 @@ EnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
 ProviderStreamItem: TypeAlias = Any  # type: ignore[explicit-any]
 
 
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, human-readable description of *exc*.
+
+    ``str(exc)`` is empty for several stdlib exceptions raised without a
+    message (a bare ``RuntimeError()``, ``TimeoutError()``, etc.). Executors
+    that report a failure by ``str(exc)`` then surface a blank error to the
+    operator (issue #4281: "inner executor error: " with no detail). Fall back
+    to ``repr(exc)`` — which always includes the class name — so a failure is
+    never reported without at least naming its type.
+
+    :param exc: The exception to describe.
+    :returns: ``str(exc)`` when non-empty, otherwise ``repr(exc)``.
+    """
+    return str(exc) or repr(exc)
+
+
 @runtime_checkable
 class _ClosableIterator(Protocol):
     """Iterator that may optionally expose a ``close`` method.

@@ -37,6 +37,7 @@ from omnigent_client import (
 from omnigent_client import (
     OmnigentError as ClientOmnigentError,
 )
+from omnigent_client._http import is_loopback_url
 from rich.console import Console
 
 from omnigent._wrapper_labels import (
@@ -106,6 +107,17 @@ _REMOTE_RUNNER_STOP_GRACE_SECONDS = 8.0
 # is. Fetched ``order="desc"`` (newest first) precisely so the window
 # tracks the end of the conversation, not its start.
 _RECONCILE_ITEMS_LIMIT = 100
+
+# Race-window guard for each headless ``-p`` turn wait (the first turn
+# and the extra-turns loop). Expiry alone does not end the turn — the
+# session status decides whether to keep waiting (turn still running)
+# or reconcile against the durable transcript (terminal event lost).
+# Module-level so tests can patch it.
+_PER_TURN_TIMEOUT_S = 120.0
+
+# Overall budget for following one headless ``-p`` session to idle
+# (first-turn recovery and the extra-turns loop share it).
+_LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
 # Optional bearer token for remote omnigent servers that sit
 # behind an auth proxy (for example Databricks Apps). When set, the
@@ -1393,6 +1405,29 @@ def _await_accounts_first_run_setup(
     )
 
 
+def _unreachable_server_message(base_url: str) -> str:
+    """
+    Build the user-facing message for a server we could not connect to.
+
+    A refused connection is an environment problem, not a bug worth a
+    crash-handler traceback, so name the URL and the likeliest fix.
+
+    :param base_url: Server base URL that refused the connection, e.g.
+        ``"http://127.0.0.1:6767"``.
+    :returns: A message naming the URL and how to recover.
+    """
+    if is_loopback_url(base_url):
+        return (
+            f"Could not connect to the local Omnigent server at {base_url}. "
+            "It may have stopped — run `omnigent stop`, then try again. "
+            "Server logs are under ~/.omnigent/logs/server/."
+        )
+    return (
+        f"Could not connect to the Omnigent server at {base_url}. "
+        "Check the URL, your network connection, and any HTTP proxy settings."
+    )
+
+
 async def _prepare_chat_session_via_daemon(
     *,
     base_url: str,
@@ -1431,8 +1466,8 @@ async def _prepare_chat_session_via_daemon(
         slow cold start is not silent. ``None`` (the default) runs without
         any progress updates.
     :returns: The prepared session id + bound runner id.
-    :raises click.ClickException: If session create/fork or runner launch
-        fails.
+    :raises click.ClickException: If the server is unreachable, or session
+        create/fork or runner launch fails.
     """
     from omnigent_client import OmnigentClient
 
@@ -1447,41 +1482,63 @@ async def _prepare_chat_session_via_daemon(
     )
     from omnigent.native_terminal import bind_session_runner
 
-    async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
-        if fork_session_id is not None:
-            fork_result = await sdk.sessions.fork(fork_session_id)
-            session_id = fork_result["id"]
-        elif resume_conversation_id is not None:
-            session_id = resume_conversation_id
-        else:
-            created = await sdk.sessions.create(
-                bundle, filename="agent.tar.gz", workspace=workspace
-            )
-            session_id = created.id
+    try:
+        async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
+            try:
+                if fork_session_id is not None:
+                    fork_result = await sdk.sessions.fork(fork_session_id)
+                    session_id = fork_result["id"]
+                elif resume_conversation_id is not None:
+                    session_id = resume_conversation_id
+                else:
+                    created = await sdk.sessions.create(
+                        bundle, filename="agent.tar.gz", workspace=workspace
+                    )
+                    session_id = created.id
+            except ClientOmnigentError as exc:
+                # Any create/fork/resume rejection here is a server-side answer, not
+                # a client bug worth a traceback: a wrong base URL that answers
+                # /health but has no session API, a fork of a session that is gone,
+                # a permission refusal. Name the URL, since a wrong one is the case
+                # that looks least like itself, and pass the server's message through.
+                raise click.ClickException(
+                    f"Could not start a session on {base_url}: {exc}"
+                ) from exc
 
-    # A separate raw httpx client for the host-runner protocol (the daemon
-    # launch helpers operate on httpx, not the SDK).
-    timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
-        if progress is not None:
-            progress.update(STARTUP_PHASE_CONNECTING)
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S)
-        if progress is not None:
-            progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
-        runner_id = await launch_or_reuse_daemon_runner(
-            client, host_id=host_id, session_id=session_id, workspace=workspace
-        )
-        await wait_for_runner_online(
-            client, runner_id, timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S
-        )
-        # launch_or_reuse_daemon_runner's atomic-bind / online-reuse paths
-        # don't pass through replace_runner_id, so re-bind via PATCH to
-        # clear the ``omnigent.stopped`` marker on resumed sessions. Must run
-        # AFTER wait_for_runner_online — a freshly launched runner isn't
-        # registered until then, and replace_runner_id 400s on an unregistered id.
-        await bind_session_runner(client, session_id, runner_id)
+        # A separate raw httpx client for the host-runner protocol (the daemon
+        # launch helpers operate on httpx, not the SDK).
+        timeout = httpx.Timeout(30.0, read=120.0)
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            headers=headers,
+            auth=auth,
+            timeout=timeout,
+            trust_env=not is_loopback_url(base_url),
+        ) as client:
+            if progress is not None:
+                progress.update(STARTUP_PHASE_CONNECTING)
+            await wait_for_host_online(
+                client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+            )
+            if progress is not None:
+                progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
+            runner_id = await launch_or_reuse_daemon_runner(
+                client, host_id=host_id, session_id=session_id, workspace=workspace
+            )
+            await wait_for_runner_online(
+                client, runner_id, timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S
+            )
+            # launch_or_reuse_daemon_runner's atomic-bind / online-reuse paths
+            # don't pass through replace_runner_id, so re-bind via PATCH to
+            # clear the ``omnigent.stopped`` marker on resumed sessions. Must run
+            # AFTER wait_for_runner_online — a freshly launched runner isn't
+            # registered until then, and replace_runner_id 400s on an unregistered id.
+            await bind_session_runner(client, session_id, runner_id)
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
+        # No connection was ever established — a stopped local server, a wrong
+        # --server URL, or a proxy refusing the tunnel. These three are
+        # siblings under TransportError, so each has to be named.
+        raise click.ClickException(_unreachable_server_message(base_url)) from exc
     return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
 
 
@@ -2158,13 +2215,61 @@ async def _query_sessions_once(
     # interactive REPL is immune by construction (it renders a ``failed``
     # status as a transient error and polls the snapshot as a backstop),
     # so this brings headless ``-p`` to parity.
+    # Race-window guard for the first turn, mirroring the multi-turn
+    # loop's use of ``_PER_TURN_TIMEOUT_S`` below. Two failure modes are
+    # already reconciled via ``_persisted_turn_text``: an
+    # ``OmnigentError`` (session flipped to ``failed``) and an empty
+    # ``result.text`` (subscribe-after-post race where the SSE
+    # subscription missed ``response.completed`` but the connection
+    # closed promptly). A THIRD variant of the same race is NOT an error
+    # and does NOT close the connection: the runner's terminal event is
+    # dropped, but the stream's periodic heartbeats (``session.heartbeat``,
+    # not a turn-terminal event) keep arriving on schedule forever, so
+    # ``SessionsChat.send`` never raises and never returns. Without a
+    # bound here, a lost terminal event hangs the CLI indefinitely even
+    # though the runner already completed and persisted the turn
+    # server-side. ``asyncio.wait_for`` cancels the underlying ``send()``
+    # generator on timeout, which runs its ``finally`` and closes the SSE
+    # subscription cleanly.
     try:
-        result = await chat.query(prompt)
+        result = await asyncio.wait_for(chat.query(prompt), timeout=_PER_TURN_TIMEOUT_S)
     except ClientOmnigentError:
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
         raise
+    except TimeoutError:
+        # The guard tripping does NOT mean the turn is over: a healthy
+        # first turn can simply outlast it (long generation, slow
+        # tools), and the server persists each assistant item as it
+        # completes, so reconciling immediately would return a
+        # mid-turn fragment as if it were the final answer. The session
+        # status distinguishes the two cases: keep waiting while the
+        # runner reports the turn in flight (mirroring the extra-turns
+        # loop below, which refreshes and continues on ``await_turn``
+        # timeouts), and reconcile only once the session is no longer
+        # running or the overall budget expires. ``await_turn`` here is
+        # a status-change waiter; its text (at most the tail of the
+        # turn, since the subscription is fresh) is discarded because
+        # the transcript read below returns the whole turn's output.
+        # An async orchestrator stays ``running`` until its sub-agents
+        # and synthesis finish, so this also follows those to idle.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_LOOP_TIMEOUT_S):
+                while True:
+                    await chat.refresh()
+                    if chat.status not in ("running", "launching"):
+                        break
+                    await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+        reconciled = await _persisted_turn_text(client, bound.id)
+        if reconciled is not None:
+            return reconciled
+        raise RuntimeError(
+            f"Turn did not complete within {_PER_TURN_TIMEOUT_S:.0f}s and no "
+            "persisted assistant text was found to reconcile against "
+            "(subscribe-after-post race: the terminal event was lost and "
+            "the runner appears not to have completed either)."
+        ) from None
     all_text_parts: list[str] = []
     if result.text:
         all_text_parts.append(result.text)
@@ -2210,8 +2315,8 @@ async def _query_sessions_once(
     # even when await_turn times out (sub-agents still running), unlike the
     # last_turn_saw_waiting flag which would incorrectly exit on timeout.
     _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
-    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard per synthesis turn
-    _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+    # ``_PER_TURN_TIMEOUT_S`` / ``_LOOP_TIMEOUT_S`` are module-level;
+    # they also guard the first-turn query above.
 
     async def _drain_extra_turns() -> None:
         # Probe: collect synthesis text or status events that arrive quickly.

@@ -5075,6 +5075,112 @@ async def test_relay_never_delivers_terminal_on_pty_status(
     assert client.posts == []
 
 
+# ── Offline (agent asleep) environment synthesis ──────────────────────────────
+
+_OFFLINE_SESSION = "b17c0a4f9d2e4c6a8f1b3d5e7a9c0b2d"
+_OFFLINE_WORKSPACE = "/Users/dev/project"
+
+
+class _OfflineRunnerClient:
+    """Runner client whose tunnel is gone, as a sleeping agent's is."""
+
+    async def get(self, url: str, *, params: Any = None, timeout: float | None = None) -> Any:
+        del params, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+
+@pytest.fixture
+def offline_env_app(
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FastAPI:
+    """App whose session is host-bound but whose runner is offline."""
+    del runner_globals_reset
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources as _routes
+
+    conv = Conversation(
+        id=_OFFLINE_SESSION,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=_OFFLINE_SESSION,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        host_id="host_offline",
+        workspace=_OFFLINE_WORKSPACE,
+    )
+    # The seeded native-agent shape: no OS-level sandbox, so the reach the
+    # runner would report is "unconfined, anchored on the workspace".
+    monkeypatch.setattr(
+        _routes,
+        "_load_agent_spec_for_session",
+        lambda _conv, _agent_store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    application = FastAPI()
+
+    @application.exception_handler(OmnigentError)
+    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    application.include_router(
+        create_sessions_router(
+            SimpleNamespace(get_conversation=lambda _sid: conv),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]  — stub agent store
+            host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return application
+
+
+@pytest.fixture
+async def offline_env_client(offline_env_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=offline_env_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_offline_environment_advertises_the_same_reach_as_the_runner(
+    offline_env_client: httpx.AsyncClient,
+) -> None:
+    """A sleeping agent's environment still reports what browsing can reach.
+
+    The file panel gates its navigation affordance on ``metadata.reachable``.
+    When the runner sleeps the server synthesizes this resource itself, and
+    omitting the field there made the panel silently decide "nowhere else to
+    go" and drop the control -- even though the host-served path authorizes
+    and serves absolute browsing exactly as the live runner does.
+
+    Asserted as the full payload, not just presence: a synthesis that
+    advertised a *different* reach from the runner's would be its own bug.
+    """
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert resp.status_code == 200, resp.text
+    metadata = resp.json()["metadata"]
+    assert metadata["root"] == _OFFLINE_WORKSPACE
+    assert metadata["reachable"] == {
+        "unconfined": True,
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
+    }
+
+
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────
 #
 # These exercise the real routes through the real router, because the whole

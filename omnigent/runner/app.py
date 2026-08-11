@@ -81,6 +81,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
@@ -613,6 +614,31 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _CommentRelayBinding:
+    """A running comment relay plus the agent and bridge it was built for.
+
+    A relay advertises the tool surface of one agent spec and writes it into
+    one bridge directory. Recording both lets
+    ``_ensure_comment_relay_started`` notice that the session moved to a
+    different agent and replace the relay, instead of leaving the previous
+    agent's surface advertised to the new harness.
+
+    :param relay: The relay currently serving the session.
+    :param spec_entry: Resolved spec the advertised surface was built from,
+        compared by identity: the session spec cache hands back the same
+        object until an agent switch or an agent update evicts it, so a
+        changed object means the surface has to be rebuilt. ``None`` when
+        the spec could not be resolved and the fallback surface was used.
+    :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
+        e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    """
+
+    relay: ClaudeNativeToolRelay
+    spec_entry: _SpecEntry | None
+    bridge_dir: Path
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1937,7 +1963,7 @@ def create_runner_app(
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
-    _session_comment_relays: dict[str, ClaudeNativeToolRelay] = {}
+    _session_comment_relays: dict[str, _CommentRelayBinding] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2175,17 +2201,35 @@ def create_runner_app(
             "argv omitted because terminal args may contain secrets)"
         )
 
-    def _format_required_terminal_exit_output(event: TerminalExitEvent) -> str:
+    def _format_required_terminal_exit_output(
+        event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
+    ) -> str:
         command = _format_terminal_command_for_failure(event)
         cwd = event.cwd or "unknown"
-        parts = [
-            "Required terminal exited unexpectedly; the session runtime is no longer available.",
-            "",
-            "Terminal diagnostics:",
-            f"terminal: {event.terminal_name}:{event.session_key}",
-            f"command: {command}",
-            f"cwd: {cwd}",
-        ]
+        parts: list[str] = []
+        if diagnosis is not None:
+            # Lead with the human interpretation so the failure reads clearly
+            # even before the raw diagnostics block.
+            parts.extend([diagnosis.title, "", diagnosis.cause])
+            if diagnosis.remediation:
+                parts.extend(["", f"Try this: {diagnosis.remediation}"])
+        else:
+            parts.append(
+                "Required terminal exited unexpectedly; the session runtime is no longer "
+                "available."
+            )
+        exited_with = (
+            f" (exited with status {event.exit_status})" if event.exit_status is not None else ""
+        )
+        parts.extend(
+            [
+                "",
+                "Terminal diagnostics:",
+                f"terminal: {event.terminal_name}:{event.session_key}",
+                f"command: {command}{exited_with}",
+                f"cwd: {cwd}",
+            ]
+        )
         if event.last_output:
             parts.extend(["", "Last captured terminal output:", event.last_output])
         else:
@@ -2197,6 +2241,29 @@ def create_runner_app(
                 ]
             )
         return "\n".join(parts)
+
+    def _build_required_terminal_error(event: TerminalExitEvent) -> dict[str, str]:
+        """Build the structured ``session.status`` error for a required-terminal exit.
+
+        Always carries ``code`` + a fully-composed ``message`` (back-compat: the
+        REPL and older clients render it verbatim). When the failure is
+        recognized, also carries ``title`` / ``cause`` / ``remediation`` so the
+        web UI can render a friendly card instead of the raw enum + blob.
+        """
+        # Classify once; the message formatter reuses the same diagnosis.
+        diagnosis = classify_terminal_failure(
+            command=event.command,
+            exit_status=event.exit_status,
+            output=event.last_output,
+        )
+        message = _format_required_terminal_exit_output(event, diagnosis)
+        error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
+        if diagnosis is not None:
+            error["title"] = diagnosis.title
+            error["cause"] = diagnosis.cause
+            if diagnosis.remediation:
+                error["remediation"] = diagnosis.remediation
+        return error
 
     def _release_required_terminal_session(session_id: str) -> None:
         if process_manager is None:
@@ -2250,22 +2317,19 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        output = _format_required_terminal_exit_output(event)
+        error = _build_required_terminal_error(event)
         _publish_event(
             event.session_id,
             {
                 "type": "session.status",
                 "status": "failed",
-                "error": {
-                    "code": "required_terminal_exited",
-                    "message": output,
-                },
+                "error": error,
             },
         )
         _mark_subagent_terminal_and_wake(
             event.session_id,
             status="failed",
-            output=output,
+            output=error["message"],
         )
         _release_required_terminal_session(event.session_id)
 
@@ -2341,6 +2405,10 @@ def create_runner_app(
     async def _session_workspace_value(session_id: str) -> str | None:
         if session_id not in _session_workspace_cache:
             snapshot = await _session_snapshot(session_id)
+            # A failed fetch carries no workspace. Memoizing its ``None``
+            # would pin the session to the global workspace for its lifetime.
+            if not snapshot.ok:
+                return None
             _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
@@ -2475,12 +2543,20 @@ def create_runner_app(
             FilesystemPathNotFound,
             FileTooLarge,
             InvalidPath,
+            PathUnreachable,
             UnsupportedMediaType,
         )
 
         status = 500
+        error: dict[str, object] = {"code": exc.code, "message": exc.message}
         if isinstance(exc, FilesystemPathNotFound):
             status = 404
+        elif isinstance(exc, PathUnreachable):
+            # 403, not 400: the path is well-formed, the caller just may not
+            # see it. Carries the reachable roots so a UI can say what IS
+            # available without a second round trip.
+            status = 403
+            error["reachable_roots"] = exc.reachable_roots
         elif isinstance(exc, InvalidPath):
             status = 400
         elif isinstance(exc, DirectoryNotEmpty):
@@ -2491,9 +2567,7 @@ def create_runner_app(
             status = 415
         return JSONResponse(
             status_code=status,
-            content={
-                "error": {"code": exc.code, "message": exc.message},
-            },
+            content={"error": error},
         )
 
     @app.get("/health")
@@ -3290,8 +3364,8 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
-        if _relay := _session_comment_relays.pop(session_id, None):
-            _relay.close()
+        if _binding := _session_comment_relays.pop(session_id, None):
+            _binding.relay.close()
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -5004,6 +5078,24 @@ def create_runner_app(
         logger=_logger,
     )
 
+    def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:
+        """Unbind and close *relay*, unless another path already replaced it.
+
+        Removal is by relay instance rather than by session id: a
+        replacement installed while the caller was working owns the entry
+        and has already closed *relay*, so popping the key would tear down
+        the newer relay instead of the intended one.
+
+        :param session_id: Session/conversation id the relay was bound to.
+        :param relay: The relay instance the caller installed.
+        :returns: None.
+        """
+        binding = _session_comment_relays.get(session_id)
+        if binding is None or binding.relay is not relay:
+            return
+        del _session_comment_relays[session_id]
+        relay.close()
+
     async def _ensure_comment_relay_started(
         session_id: str,
         *,
@@ -5012,41 +5104,78 @@ def create_runner_app(
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
     ) -> None:
-        if session_id in _session_comment_relays:
-            return
-
         import json as _json
 
         from omnigent.claude_native_bridge import (
+            BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             post_tools_changed,
             start_tool_relay,
         )
 
+        try:
+            spec_entry = await _resolve_session_spec_entry(session_id)
+        except OmnigentError:
+            # Resolution failed; this is not the same as a session that
+            # resolves to no spec. A relay already serving the session was
+            # built from a real spec, so replacing it with the fallback
+            # surface would withdraw spec-gated tools the agent does grant.
+            # Keep it: once resolution recovers, the resolved spec differs
+            # from the stored one and the relay rebuilds then.
+            if session_id in _session_comment_relays:
+                return
+            spec_entry = None
+
+        # The bridge dir, when the caller pinned it down or handed over the
+        # labels it comes from. Deriving it any other way costs a server
+        # round trip, which a session whose agent has not changed must not
+        # pay on every turn.
+        known_bridge_dir: Path | None = None
         if explicit_bridge_dir is not None:
-            bridge_dir = explicit_bridge_dir
-        else:
-            if bridge_id is None:
-                bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            known_bridge_dir = explicit_bridge_dir
+        elif bridge_id is not None:
+            known_bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
+        elif session_labels is not None:
+            known_bridge_dir = bridge_dir_for_bridge_id(
+                session_labels.get(BRIDGE_ID_LABEL_KEY) or session_id
+            )
+
+        # Same agent and no bridge hint to check against: skip the lookup that
+        # would cost a server round trip. This rests on a bridge id only ever
+        # being reassigned alongside the agent (a native-harness-family
+        # switch), which the spec comparison already caught. The callers that
+        # can reassign it independently — the terminal-launch and per-harness
+        # startup paths — all pass a bridge hint and take the branch below.
+        current = _session_comment_relays.get(session_id)
+        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+            return
+
+        bridge_dir = known_bridge_dir
+        if bridge_dir is None:
+            bridge_dir = bridge_dir_for_bridge_id(
+                await _claude_native_bridge_id_with_optional_labels(
                     server_client=server_client,
                     session_id=session_id,
                     session_labels=session_labels,
                 )
+                or session_id
+            )
 
-            if session_id in _session_comment_relays:
-                return
-
-            bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
-
-        try:
-            relay_spec = await _resolve_session_agent_spec(session_id)
-        except OmnigentError:
-            relay_spec = None
-        if session_id in _session_comment_relays:
+        # Re-read after the awaits above: a concurrent caller may have
+        # installed a relay that already matches the current agent.
+        current = _session_comment_relays.get(session_id)
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.bridge_dir == bridge_dir
+        ):
             return
+
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
+            _unwrap_spec_entry(spec_entry)
+        )
 
         _captured_session_id = session_id
 
@@ -5078,7 +5207,18 @@ def create_runner_app(
                 exc_info=True,
             )
             return
-        _session_comment_relays[session_id] = relay
+        superseded = _session_comment_relays.get(session_id)
+        _session_comment_relays[session_id] = _CommentRelayBinding(
+            relay=relay,
+            spec_entry=spec_entry,
+            bridge_dir=bridge_dir,
+        )
+        # Close last: the new advertisement is already written, and
+        # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
+        # still points at the relay being closed, so a shared bridge dir
+        # keeps the new file.
+        if superseded is not None:
+            superseded.relay.close()
 
         async def _notify_tools_changed() -> None:
             try:
@@ -6568,6 +6708,39 @@ def create_runner_app(
             order=order,
         )
 
+    def _environment_reach(root: str, agent_spec: AgentSpec | None) -> dict[str, object]:
+        """Describe what the default environment's file browsing can reach.
+
+        ``unconfined`` reports that no OS-level sandbox is applied, so the
+        environment's shell already reads anything the runner can and a
+        browser may range beyond the listed roots. ``roots`` always names
+        the grants the environment's own file tools reach, workspace first,
+        so a caller can anchor on the workspace and label the rest.
+
+        :param root: Resolved absolute environment root.
+        :param agent_spec: Agent spec for the session, if any.
+        :returns: JSON-ready ``{"unconfined": bool, "roots": [...]}``.
+        """
+        from omnigent.inner.sandbox import (
+            ReachableRoot,
+            is_unconfined,
+            reach_payload,
+            reachable_roots,
+            resolve_sandbox,
+        )
+
+        root_path = Path(root)
+        spec_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
+        if spec_os_env is None:
+            # No spec to resolve (dev/standalone): report the root alone
+            # rather than guessing a wider reach.
+            return reach_payload(
+                [ReachableRoot(path=root_path, access="write", origin="cwd", kind="tree")],
+                unconfined=False,
+            )
+        policy = resolve_sandbox(spec_os_env, root_path)
+        return reach_payload(reachable_roots(root_path, policy), unconfined=is_unconfined(policy))
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}")
     async def get_session_environment(
         session_id: str,
@@ -6602,6 +6775,7 @@ def create_runner_app(
                 home = os.path.expanduser("~")
                 if os.path.isabs(home):
                     metadata["home"] = home
+                metadata["reachable"] = _environment_reach(root, agent_spec)
                 content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,
@@ -6810,14 +6984,22 @@ def create_runner_app(
             )
         bridge_inject = bool(body.get("bridge_inject_dir"))
         bridge_id = session_id
-        relay_existed = False
+        # Set only when this launch installed the relay, so a failure rolls
+        # back what it started and leaves a relay that was already serving
+        # the session (or that another path installed meanwhile) alone.
+        launched_relay: ClaudeNativeToolRelay | None = None
         if bridge_inject:
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client,
                 session_id=session_id,
             )
-            relay_existed = session_id in _session_comment_relays
+            relay_before = _session_comment_relays.get(session_id)
             await _ensure_comment_relay_started(session_id, bridge_id=bridge_id)
+            relay_after = _session_comment_relays.get(session_id)
+            if relay_after is not None and (
+                relay_before is None or relay_before.relay is not relay_after.relay
+            ):
+                launched_relay = relay_after.relay
 
         try:
             launch_method = (
@@ -6836,10 +7018,8 @@ def create_runner_app(
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
             )
         except RuntimeError as exc:
-            if bridge_inject and not relay_existed:
-                relay = _session_comment_relays.pop(session_id, None)
-                if relay is not None:
-                    relay.close()
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
             return JSONResponse(
                 status_code=500,
                 content={
@@ -7217,6 +7397,49 @@ def create_runner_app(
         exclude: str | None = Query(default=None),
         limit: int = Query(default=500, ge=1, le=500),
     ) -> JSONResponse:
+        return await _fs_search(
+            session_id,
+            environment_id,
+            "",
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    @app.get(
+        "/v1/sessions/{session_id}/resources/environments/{environment_id}/search/{path:path}"
+    )
+    async def search_environment_files_under(
+        session_id: str,
+        environment_id: str,
+        path: str,
+        q: str = Query(min_length=1, pattern=r".*\S.*"),
+        include: str | None = Query(default=None),
+        exclude: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> JSONResponse:
+        """Search under a directory, so results match what the tree shows."""
+        return await _fs_search(
+            session_id,
+            environment_id,
+            path,
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    async def _fs_search(
+        session_id: str,
+        environment_id: str,
+        path: str,
+        *,
+        q: str,
+        include: str | None,
+        exclude: str | None,
+        limit: int,
+    ) -> JSONResponse:
         from omnigent.runner.environment_filesystem import (
             CallerProcessFilesystem,
             split_glob_list,
@@ -7229,8 +7452,9 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env)
-        entries = await fs.search_files(
+        entries, truncated = await fs.search_files(
             q,
+            path=path,
             include=include_patterns,
             exclude=exclude_patterns,
             limit=limit,
@@ -7238,7 +7462,15 @@ def create_runner_app(
         data = [_fs_entry_to_dict(e) for e in entries]
         return JSONResponse(
             status_code=200,
-            content={"object": "list", "data": data, "has_more": len(entries) >= limit},
+            content={
+                "object": "list",
+                "base": str(fs._resolve(path)),
+                "data": data,
+                "has_more": len(entries) >= limit,
+                # The scan budget ran out before the tree did, so "no matches"
+                # here would be a lie — the caller must be able to say so.
+                "truncated": truncated,
+            },
         )
 
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
@@ -7566,7 +7798,10 @@ def create_runner_app(
             return
         snapshot = await _session_snapshot(session_id)
         _session_start_cache[session_id] = snapshot.created_at
-        _session_workspace_cache[session_id] = snapshot.workspace
+        # Only memoize a workspace the server actually returned; a failed
+        # fetch is re-resolved lazily by _session_workspace_value.
+        if snapshot.ok:
+            _session_workspace_cache[session_id] = snapshot.workspace
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:
@@ -7947,6 +8182,9 @@ def create_runner_app(
                 status_code=200,
                 content={
                     "object": "list",
+                    # Absolute base the entry paths are relative to. Callers
+                    # that only ever browse the workspace can keep ignoring it.
+                    "base": str(resolved),
                     "data": data,
                     "first_id": page.first_id,
                     "last_id": page.last_id,
@@ -8586,6 +8824,18 @@ def create_runner_app(
             )
 
     async def _catch_up_scan() -> None:
+        # The tunnel just reconnected, which usually means the SERVER restarted
+        # (deploy, crash, replica failover) and lost its in-memory session-status
+        # cache. This runner did not restart, so every status source still
+        # believes its last edge was delivered and nothing re-asserts — a
+        # native session mid-turn during the restart would sit on a stale
+        # ``idle`` for the rest of the turn. Re-arm them before the item scan
+        # below (which skips native harnesses entirely).
+        if resource_registry is not None:
+            try:
+                resource_registry.resync_session_statuses()
+            except Exception:  # noqa: BLE001 — best-effort; never block catch-up.
+                _logger.warning("Session status resync failed after reconnect", exc_info=True)
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue
@@ -8659,9 +8909,13 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
-        from omnigent.native_cost_popup import _list_tmux_clients
+        from omnigent.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
-        from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
+        from omnigent.terminals.pane_reaper import (
+            PANE_OUTPUT_BUSY_WINDOW_S,
+            NativePaneReaper,
+            PaneRef,
+        )
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -8682,7 +8936,18 @@ def create_runner_app(
             if _native_pane_status.get(conv_id) == "running":
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            return bool(clients)
+            if clients:
+                return True
+            # Primary evidence: tmux stamps window_activity on every byte the
+            # pane emits, so a producing terminal stays busy even when the
+            # status pipeline above has silently stalled (a stalled forwarder
+            # once froze the busy signal and got a live session reaped).
+            activity_at = await asyncio.to_thread(
+                _tmux_window_activity_at, str(pane.socket_path), "main"
+            )
+            return (
+                activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
+            )
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             try:
@@ -8739,9 +9004,13 @@ def create_runner_app_from_env() -> FastAPI:
     server_url = os.environ.get("RUNNER_SERVER_URL", "").strip()
     if not server_url:
         raise RuntimeError("RUNNER_SERVER_URL is required for the runner subprocess factory")
+    from omnigent_client._http import is_loopback_url
+
     server_client = httpx.AsyncClient(
         base_url=server_url,
         timeout=httpx.Timeout(5.0, read=None),
+        # A proxy cannot reach a loopback server, so local targets bypass it.
+        trust_env=not is_loopback_url(server_url),
     )
     return create_runner_app(server_client=server_client)
 
@@ -8951,6 +9220,7 @@ def _build_spawn_env_from_spec(
             _build_copilot_spawn_env,
             _build_cursor_spawn_env,
             _build_goose_spawn_env,
+            _build_hermes_spawn_env,
             _build_kimi_spawn_env,
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
@@ -8971,6 +9241,8 @@ def _build_spawn_env_from_spec(
             env = _build_antigravity_spawn_env(effective_spec)
         elif harness == "kimi":
             env = _build_kimi_spawn_env(effective_spec, cwd=cwd)
+        elif harness == "hermes":
+            env = _build_hermes_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "qwen":
             env = _build_qwen_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "goose":

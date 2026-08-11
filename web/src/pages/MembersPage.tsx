@@ -329,8 +329,8 @@ export function MembersPage() {
             >
               Cancel
             </Button>
-            <Button onClick={() => void onCreateInvite()} disabled={pendingAction}>
-              {pendingAction ? "Creating…" : "Create invite"}
+            <Button onClick={() => void onCreateInvite()} loading={pendingAction}>
+              Create invite
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -419,9 +419,9 @@ export function MembersPage() {
             <Button
               variant="destructive"
               onClick={() => void onConfirmDelete()}
-              disabled={pendingAction}
+              loading={pendingAction}
             >
-              {pendingAction ? "Removing…" : "Remove"}
+              Remove
             </Button>
           </DialogFooter>
         </DialogContent>

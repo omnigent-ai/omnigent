@@ -839,20 +839,38 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     )
 
 
+def _inline_family_order(model: str | None) -> tuple[str, ...]:
+    """Order the inline families to try, model's own family first.
+
+    Only Claude ids prefer the Anthropic family. Everything else — GPT, and the
+    Gemini/Llama/DeepSeek ids that token as ``"other"`` — is served over an
+    OpenAI-compatible wire by nearly every gateway, so it leads with OpenAI.
+    With no model to go on, Anthropic leads: Pi speaks it natively.
+    """
+    # An Anthropic-wire-only non-Claude id would prefer the wrong surface here;
+    # only a dual-surface provider is exposed, since the loop falls through.
+    if model and model_catalog.model_family_token(model) != "claude":
+        return ("openai", "anthropic")
+    return ("anthropic", "openai")
+
+
 def _inline_family_pi_provider(
     entry: ProviderEntry, *, model: str | None
 ) -> PiProviderConfig | None:
     """Resolve a key/gateway/local provider into Pi config from its family.
 
-    Prefers the Anthropic family (Pi speaks ``anthropic-messages`` natively),
-    falling back to the OpenAI family via the Responses API.
+    Tries the family matching the selected model first, so a provider offering
+    both surfaces serves a GPT id from its OpenAI family rather than whichever
+    family happens to be configured first. Falls back to the other family, which
+    keeps protocol-translating proxies working: a LiteLLM ``/anthropic``
+    passthrough is the only configured family and still serves any model.
 
     :param entry: The resolved default provider entry.
     :param model: Session model override, or ``None`` to use the family default.
     :returns: The Pi provider config, or ``None`` when no usable family with a
         base URL and credential is configured.
     """
-    for family_name in ("anthropic", "openai"):
+    for family_name in _inline_family_order(model):
         family = entry.family(family_name)
         if family is None or not family.base_url:
             continue

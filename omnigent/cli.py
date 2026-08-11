@@ -696,6 +696,18 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "OMNIGENT_",
     "OPENAI_",
 )
+_HOST_DAEMON_PROXY_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+)
 _HostJsonValue: TypeAlias = (
     str | int | float | bool | None | list["_HostJsonValue"] | dict[str, "_HostJsonValue"]
 )
@@ -2182,6 +2194,27 @@ _HOST_PID_PATH = Path.home() / ".omnigent" / "host.pid"
 # target (real URLs never collide with the marker).
 _LOCAL_DAEMON_MARKER = "local"
 
+# ``--server`` values that mean "run against a local server" rather than naming a
+# remote one. ``""`` is the historical spelling; ``"local"`` is the readable alias
+# and matches ``_LOCAL_DAEMON_MARKER`` above, the marker local mode already
+# records in host.pid. Neither can be a real target: an empty value has no host,
+# and a bare ``local`` would normalize to the unroutable ``https://local``.
+_LOCAL_SERVER_ALIASES = frozenset({"", _LOCAL_DAEMON_MARKER})
+
+
+def _is_local_server_request(server: str | None) -> bool:
+    """
+    Whether a ``--server`` value asks for a local server.
+
+    :param server: Raw ``--server`` value, e.g. ``""``, ``"local"``, or
+        ``"https://example.databricksapps.com"``. ``None`` (flag absent) is
+        not a request — it leaves the config default free to apply.
+    :returns: ``True`` for a local-server alias, else ``False``.
+    """
+    if server is None:
+        return False
+    return server.strip().casefold() in _LOCAL_SERVER_ALIASES
+
 
 @dataclass(frozen=True)
 class _HostDaemonRecord:
@@ -3021,18 +3054,21 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
+            or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key.startswith(daemon_env_prefixes)
         }
     else:
         # Allowlist the remote daemon's environment (W8): pass process
-        # essentials + TLS trust + the user's Databricks auth (the daemon
-        # authenticates to the server with it), but not unrelated provider
-        # secrets like ANTHROPIC_API_KEY / OPENAI_API_KEY.
+        # essentials + TLS trust + standard proxy selectors + the user's
+        # Databricks auth (the daemon authenticates to the server with it), but
+        # not unrelated provider secrets like ANTHROPIC_API_KEY / OPENAI_API_KEY.
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, "DATABRICKS_")
         env = {
             key: value
             for key, value in os.environ.items()
-            if key in _RUNNER_ENV_ALLOWLIST or key.startswith(daemon_env_prefixes)
+            if key in _RUNNER_ENV_ALLOWLIST
+            or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key.startswith(daemon_env_prefixes)
         }
     return env
 
@@ -5897,7 +5933,10 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
     base_url = base_url.rstrip("/")
 
     with httpx.Client(
-        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=60.0
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url),
+        timeout=60.0,
+        trust_env=_trust_env_for(base_url),
     ) as client:
         resp = client.get("/v1/usage")
         resp.raise_for_status()
@@ -5978,7 +6017,10 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     out_path = Path(output) if output else Path(f"{session_id}.jsonl")
 
     with httpx.Client(
-        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=30.0
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url),
+        timeout=30.0,
+        trust_env=_trust_env_for(base_url),
     ) as client:
         # Fetch session metadata (items fetched separately via pagination).
         resp = client.get(
@@ -6217,7 +6259,10 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
         return client.post("/v1/sessions", json=body)
 
     with httpx.Client(
-        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=120.0
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url),
+        timeout=120.0,
+        trust_env=_trust_env_for(base_url),
     ) as client:
         candidates = [a for a in (exported_agent_id, fallback_agent_id) if a]
         if not candidates:
@@ -6970,7 +7015,10 @@ def _dispatch_run(
         )
 
     if target is None:
-        if server_from_cli and server is not None and harness is None:
+        # Truthiness, not ``is not None``: an empty ``--server ""`` selects local
+        # mode (see ``_ensure_backend``), so it must not be treated as a direct
+        # server URL and normalized into the bare scheme ``"https:"``.
+        if server_from_cli and server and harness is None:
             # Normalize like every other entry point: expand a bare workspace
             # URL to its /api/2.0/omnigent mount and strip any ?o= query. Else
             # a direct ``--server`` request hits the root and bounces to /login.
@@ -7387,8 +7435,9 @@ def attach(
         "Remote omnigent URL. Uploads the local YAML as an ephemeral "
         "agent, spawns a LOCAL runner that tunnels to this server (so "
         "terminals/MCPs run on your laptop), and connects the REPL to it. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and target that instead of a remote one."
+        "Pass --server local to auto-spawn a persistent local server in the "
+        "background and target that instead of a remote one, overriding any "
+        'configured server default (--server "" does the same).'
     ),
 )
 @click.option(
@@ -7464,6 +7513,7 @@ def run(
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
       omnigent run --server http://localhost:6767
+      omnigent run --server local  # local server, ignoring any configured default
       omnigent run examples/databricks_coding_agent.yaml --server https://<app>.databricksapps.com
       omnigent run --server https://<app>.databricksapps.com --profile my-sp -p "hi"
     """
@@ -7484,6 +7534,17 @@ def run(
     # global config, which provides user-level defaults.
     server_source = click.get_current_context().get_parameter_source("server")
     server_from_cli = server_source is not None and server_source.name == "COMMANDLINE"
+    # ``--server local`` (or ``--server ""``) is the documented "ignore any
+    # configured remote and target a local server" request. Collapse it to the
+    # ``None`` local-mode sentinel every downstream consumer already understands,
+    # and remember that it was explicit so the config fallback below cannot put
+    # the remote back. Without this, the value flowed on as a real server and
+    # normalized to a bogus URL — ``""`` became the bare scheme ``"https:"``,
+    # which then landed in the AGENT slot as "Agent path not found: https:".
+    local_server_requested = server_from_cli and _is_local_server_request(server)
+    if local_server_requested:
+        server = None
+        server_from_cli = False
     model_source = click.get_current_context().get_parameter_source("model")
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
@@ -7500,7 +7561,7 @@ def run(
     direct_server_cli = (
         target is None
         and server_from_cli
-        and server is not None
+        and bool(server)
         and not harness_from_cli
         and acp_agent is None
     )
@@ -7513,7 +7574,7 @@ def run(
         # it — but fall back to a built-in launcher when an explicit --harness
         # doesn't match the default agent's harness.
         target = _resolve_default_agent_target(_global_cfg.get("default_agent"), harness)
-    if server is None:
+    if server is None and not local_server_requested:
         server = _global_cfg.get("server")
     if model is None and not direct_server_cli:
         model = _global_cfg.get("model")
@@ -8062,6 +8123,21 @@ _host_http_headers_cache: dict[str, dict[str, str]] = {}
 _host_http_headers_lock = threading.Lock()
 
 
+def _trust_env_for(base_url: str) -> bool:
+    """
+    Report whether calls to *base_url* should honor environment proxies.
+
+    A proxy resolves ``127.0.0.1`` against itself, so it can never reach
+    our local server; loopback targets opt out of proxying entirely.
+
+    :param base_url: Server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :returns: ``False`` for a loopback target, ``True`` otherwise.
+    """
+    from omnigent_client._http import is_loopback_url
+
+    return not is_loopback_url(base_url)
+
+
 def _host_http_json(
     *,
     base_url: str,
@@ -8100,9 +8176,13 @@ def _host_http_json(
             base_url=base_url,
             headers=headers,
             timeout=timeout_s,
+            trust_env=_trust_env_for(base_url),
         ) as client:
             resp = client.request(method, path, params=params, json=json_body)
-    except (httpx.HTTPError, OSError) as exc:
+    except (httpx.HTTPError, OSError, ImportError) as exc:
+        # httpx raises ImportError while building the client when the ambient
+        # environment selects a proxy whose optional extra is missing (e.g. an
+        # ``ALL_PROXY=socks5://…`` shell without ``httpx[socks]`` installed).
         return _HostHttpResult(
             status_code=0,
             body=f"{type(exc).__name__}: {exc}",
@@ -10380,10 +10460,26 @@ def _resolve_server_url(server: str) -> str:
         ``"example.cloud.databricks.com/omnigent"``.
     :returns: The normalized API base URL without a trailing slash, e.g.
         ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
+    :raises click.ClickException: If *server* is a local-server alias (empty or
+        ``"local"``) rather than a URL. Callers route those to local mode before
+        reaching here (see ``_is_local_server_request`` / ``_ensure_backend``);
+        normalizing one would yield a nonsense target — the bare scheme
+        ``"https:"`` for an empty value, or the unroutable ``https://local``.
     """
-    from omnigent.conversation_browser import display_server_url
+    from omnigent.conversation_browser import display_server_url, strip_conversation_path
 
-    normalized = _with_default_scheme(server.rstrip("/"))
+    if _is_local_server_request(server):
+        raise click.ClickException(
+            f"--server was given {server!r}, which selects a local server, where "
+            "a remote URL is required. Pass `--server local` to the command you "
+            "meant to run locally, or give this one a URL."
+        )
+
+    # A URL copied from the browser while a conversation is open carries the
+    # SPA's ``/c/<id>`` route. The SPA catch-all answers any GET under it with
+    # its HTML shell, so it probes as a healthy server and is accepted, then
+    # every API call 404s. Trim it back to the base before anything probes it.
+    normalized = _with_default_scheme(strip_conversation_path(server.rstrip("/")))
     expanded = _workspace_api_server_url(normalized)
     candidate = _canonical_azure_databricks_url(normalized)
     if candidate is None:
