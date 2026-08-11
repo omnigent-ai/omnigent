@@ -253,6 +253,36 @@ def test_polly_test_count_ground_truth_guidance() -> None:
         assert "distinguish collected test cases from test functions" in worker_compact, name
 
 
+def test_cross_review_reviewer_input_pins_leaf_role() -> None:
+    """
+    The cross-review dispatch template pins the reviewer as a leaf agent.
+
+    Reviewers that are not told otherwise narrate a delegation plan or try to
+    spawn their own sub-agents, so the review turn burns a worker and returns
+    no findings. The shipped ``args.input`` must carry the leaf / no-delegation
+    guardrail (and the stale docstring/comment check) so every reviewer
+    dispatch inherits it.
+    """
+    cross_review = (_POLLY_BUNDLE / "skills" / "cross-review" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    # Bound assertions to the shipped reviewer input template, not Notes prose.
+    marker = 'args={purpose: "review", input:'
+    assert marker in cross_review
+    input_template = cross_review.split(marker, 1)[1].split("})", 1)[0]
+    compact = " ".join(input_template.split())
+
+    assert "You are a leaf reviewer" in compact
+    assert "no ability to delegate" in compact
+    assert "do not attempt to dispatch" in compact
+    assert "do not describe a delegation plan" in compact
+    assert "Review the diff in this message yourself" in compact
+    assert "changed docstrings/comments" in compact
+    assert "shipped diff" in compact
+    assert "tried and rejected" in compact
+    assert "Do not edit code" in compact
+
+
 def test_orchestrator_forbids_premature_idle_after_announcing_intent() -> None:
     """
     The base prompt forbids ending a turn after only announcing intent.
